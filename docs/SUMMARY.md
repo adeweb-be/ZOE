@@ -34,3 +34,4 @@
 
 - [Glossary](glossary.md)
 - [Spikes](spikes/README.md)
+  - [Free-threading in persistent, BTrees and zodbpickle](spikes/free-threading-upstream.md)
