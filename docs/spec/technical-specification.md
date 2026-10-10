@@ -223,7 +223,7 @@ The core is a synchronous Rust library, `zoe-core`, with no Python and no tokio 
 | Key space | Key | Value | Notes |
 | --- | --- | --- | --- |
 | `records` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a record frame; its header carries the serial of the previous record, its payload the pickle bytes | one row per object version; a 0-length payload marks deletion by pack or `deleteObject` |
-| `txns` | `tid: u64` big-endian, 8 bytes | a frame whose payload is the status byte, the oid count, then user, description and extension, each with a 4-byte length | the transaction log; status is `committing` until the finish record lands |
+| `txns` | `tid: u64` big-endian, 8 bytes | a frame whose payload is the status byte, the oid count as a `u64`, then user, description and extension, each with a `u32` length; the oid count and the three lengths are little-endian | the transaction log; status is `committing` until the finish record lands |
 | `blobs` | `(oid, tid)` | blob file name + size + checksum | the file itself lives in the blob store |
 | `meta` | fixed text keys | `format` (`ZOE format 1`), `last_tid`, `next_oid`, `pack_watermark`; numbers are 8-byte big-endian | one row each |
 
