@@ -86,4 +86,4 @@ The specification says that free-threaded parallelism in Zope needs `persistent`
 
 ## Upstream
 
-The patches go upstream to zopefoundation as draft pull requests from personal forks: one per package, each with the declaration and the blocking fixes above, `persistent` first. They are not opened yet: opening them is a public action that waits for the human's go.
+The patches go upstream to zopefoundation as draft pull requests from the forks in the `adeweb-be` organisation (`adeweb-be/persistent`, `adeweb-be/BTrees`, `adeweb-be/zodbpickle`): one per package, each with the declaration and the blocking fixes above, `persistent` first. They are not opened yet: opening them is a public action that waits for the human's go.
