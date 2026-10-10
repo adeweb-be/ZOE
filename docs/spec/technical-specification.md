@@ -2,7 +2,7 @@
 
 Oct 10, 2026 · @Antoine Duchêne
 
-This document is the technical specification: what ZOE is and how it works. The way of working, the units of work, the building loops, the roadmap and the project organisation are in ZOE — working methods and roadmap.
+This document is the technical specification: what ZOE is and how it works. The way of working, the units of work, the sessions, the roadmap and the project organisation are in ZOE — working methods and roadmap.
 
 ## Summary
 
@@ -68,7 +68,7 @@ ZOE, the Zope Object Engine, is the project name, chosen on 2026-10-10: an anagr
 | environment | `ZOE_*` in SCREAMING\_SNAKE | every stanza key has an environment twin |
 | protocol extensions | `lock_intent`, `client_resolve`, `trace_context` | snake\_case like ZEO method names |
 | metrics | `zoe_*` Prometheus names | histograms in seconds, counters with `_total` |
-| container image | `ghcr.io/adeweb-be/ZOE` | tags equal release versions |
+| container image | `ghcr.io/adeweb-be/zoe` | tags equal release versions |
 | Kubernetes | `app.kubernetes.io/name: zoe`, role label \`zoe/role: leader | follower\` |
 | on-disk format | `ZOE format 1` in the store header | bumps only with a migration tool |
 | product name in prose | ZOE, expanded once per document as Zope Object Engine | code identifiers stay lowercase `zoe` |
@@ -76,7 +76,7 @@ ZOE, the Zope Object Engine, is the project name, chosen on 2026-10-10: an anagr
 | Plone integration (later) | zoe.plone, an optional extra of the wheel: zoedb\[plone\]; auto-included in Plone through the z3c.autoinclude entry point | phase 3 for the merge policy derived from Dexterity schemas and the reindex queue, phase 5 for the catalog hook and ZoeTextIndex; the wheel itself never imports Plone, only the extra does |
 | tags and versions | v0.3.0 for the Cargo workspace and the zoedb wheel together; loupe-v0.1.0 for Loupe | semantic versioning; the on-disk format version is independent of the release version |
 | licences | Apache-2.0 for everything, the Plone extra included | Apache-2.0 is the Rust ecosystem's norm and keeps the door open to the Plone Foundation and to any adopter |
-| documentation site | GitHub Pages of the adeweb-be/ZOE repository, built with mdBook from docs/ on every merge to trunk | docs/ in git is the source of truth: this specification, the working-methods document and the ADRs live there and the documenter loop keeps them current; nothing is hosted on a private domain |
+| documentation site | GitHub Pages of the adeweb-be/ZOE repository, built with mdBook from docs/ on every merge to trunk | docs/ in git is the source of truth: this specification, the working-methods document and the ADRs live there and the documenter keeps them current; nothing is hosted on a private domain |
 
 ## Context
 

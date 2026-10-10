@@ -30,6 +30,7 @@
   - [0018. The board and trunk-based development](adr/0018-board-and-trunk.md)
   - [0019. MVCC in-process through ZODB's MVCCAdapter](adr/0019-mvcc-through-the-adapter.md)
   - [0020. The record frame](adr/0020-record-frame.md)
+  - [0021. Interactive sessions instead of automated loops](adr/0021-interactive-sessions.md)
 
 # Reference
 

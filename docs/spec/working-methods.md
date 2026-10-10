@@ -2,7 +2,7 @@
 
 Oct 10, 2026 · @Antoine Duchêne
 
-How ZOE gets built: one human, a team of AI agents, cards gated by tests, and loops that run without anyone watching. The technical design lives in Doc.
+How ZOE gets built: one human, a team of AI agents, cards gated by tests, worked in interactive sessions. The technical design lives in Doc.
 
 ## Way of working: one human, a team of agents
 
@@ -28,7 +28,7 @@ The tinted boxes are the only two places the human is in the loop; a card that t
 
 | Rhythm | What happens | Human involvement |
 | --- | --- | --- |
-| continuous | builders pick Ready cards; reviewer and verifier run on every PR; green non-red-zone PRs merge on reviewer approval; the building loops drive this without anyone watching | none |
+| continuous | a session builds a Ready card, a fresh reviewer and CI run on every PR, the human merges | the merge |
 | per batch | the planner's next batch of cards is approved, open questions answered, order re-ranked; batches are as frequent as the human wants them, not calendar-bound | the main touchpoint |
 | per red-zone PR | the human reviews the diff with the reviewer agent's report beside it | minutes per PR |
 | per phase gate | gate check against the testing harness; the documenter reconciles specification and code; ADRs for every decision taken in the phase | an hour or two |
@@ -57,7 +57,7 @@ Two loops. The inner loop, on a laptop or in an agent session, is `devenv shell`
 | pytest | the runner for the project's own Python tests: `zoedb`, `zoe.plone` and the ZODB and ZEO conformance suites (unittest-based, collected unchanged); `pytest-xdist` where the suites allow; run on 3.12, 3.13, 3.14 and 3.14t, Linux x86-64 | new Python tests are plain pytest; a card's Python-side acceptance tests are pytest files named on the card; the Plone suites are the one exception and stay on `bin/test` |
 | Dagger | CI as code in `ci/`: a Dagger module written in Python with the functions `check`, `test`, `conformance`, `plone`, `bench`, `crash` and `release`, each running in containers built from the same `devenv` definition; one cache shared by the runners | CI logic lives here and nowhere else; reviewed like code, red zone; `just ci` runs it locally when a CI failure needs reproducing, never for the edit-test loop |
 | GitHub Actions | thin workflows, one per event (pull request, merge queue, nightly, release), each a few lines that call the Dagger module; the merge queue; the nightly bench on the self-hosted runner | a workflow holds no logic; a workflow change is a human-only change |
-| GitHub | the repository, Issues as cards, the Projects board, pull requests, Releases, Pages for the dashboard, `CODEOWNERS`, branch protection, secret scanning, Dependabot | the board is the only state the loops read; everything else is derived from it |
+| GitHub | the repository, Issues as cards, the Projects board, pull requests, Releases, Pages for the dashboard, `CODEOWNERS`, branch protection, secret scanning, Dependabot | the board holds the state of every card |
 
 Inner loop: `devenv shell`, then `just <recipe>`, which runs `cargo`, `uv run pytest` or `bin/buildout` natively, incremental, seconds per run (minutes for a fresh Plone instance, cached after). CI: a workflow calls `dagger call <function>`, containerised, reproducible, cached. An agent session lives in the inner loop and runs recipes only; it reaches Dagger through `just ci` and nothing else.
 
@@ -95,52 +95,13 @@ Cards come from the roadmap phase and the requirements table of the specificatio
 
 **Process metrics**, on the same dashboard as the benchmarks: cards merged per batch, first-review rejection rate, red-zone PRs waiting on the human, flaky-test count, benchmark drift, cost in tokens per merged card. When rejection rate rises, the retro fixes the card template or the invariants file; when cost per card rises, cards are too big.
 
-## Building loops: automating the development
+## Sessions
 
-The loops turn the way of working into machinery: every state change in the repository (a card moved to Ready, a pull request opened, a CI run finished, a merge) starts an agent run with nobody watching, and the human appears only at the two gates. GitHub owns state; a small conductor owns leases, concurrency, budgets and the kill switch; agents are disposable headless sessions whose memory is files in the repository.
+The work goes through interactive sessions: the human and an agent, with no automated loop and nothing running unattended. A session takes the roles of the table above in turn. As builder, it works on one card in its own worktree on the branch `card/<id>` and opens the pull request. For review, it starts a fresh reviewer session that never shares the builder's context. The human approves red zones, answers the questions on cards and merges. The briefs for each role are in `loops/prompts/<role>.md`.
 
-&#91;embedded content: loop machinery · human, GitHub, conductor, runner\]
+**Guardrails.** `.github/`, `loops/`, `CODEOWNERS` and CI configuration are human-only, red zone or not. Agents never hold production credentials or data (project organisation, below).
 
-GitHub is the single source of state, the conductor never touches code, and every session reaches GitHub only through pull requests and comments.
-
-**Components**
-
-| Component | What it is | Rule |
-| --- | --- | --- |
-| board | GitHub Projects with the columns Backlog, Ready, Building, Review, Verifying, Human, Done; labels for red zones and for leases | the only place state lives; a loop that cannot find its state on the board does nothing |
-| conductor | a GitHub App plus a small service in `loops/` in the monorepo: receives webhooks, grants one lease per card or PR, caps concurrent builders, enforces the daily cost cap, retries once from a handoff, escalates to Human, writes the digest, honours the kill switch | written in Rust so it is reviewed and tested like everything else; it never edits code |
-| agent sessions | Claude Code in headless mode, one session per loop run, started by the conductor on a runner with the role prompt from `loops/prompts/<role>.md`, the card, and the tool allowlist for that role | builders get full tools inside their worktree; reviewers and verifiers are read-only plus comments; planners write issues; documenters write only under `docs/` |
-| runner | self-hosted, provisioned by devenv, with the harness and a warm Dagger cache; a scoped GitHub App token and nothing else | no production data, no secrets beyond that token, every transcript kept as a run artifact for audit |
-| dashboard | the bench-results repository, extended with the loop metrics | the retro loop reads it |
-
-**The loops**
-
-| Loop | Trigger | Actor | Produces | Then | On failure |
-| --- | --- | --- | --- | --- | --- |
-| plan | a phase gate turns green, or Ready drops below a threshold | planner | a batch of cards in Backlog, each with a failing acceptance test skeleton | the human moves cards to Ready | a card the planner cannot write a test for is labelled `needs-spec` and goes to Human |
-| build | a card enters Ready | conductor grants a lease, creates the worktree and branch `card/<id>`, starts the builder | a draft PR, marked ready when the acceptance test is green | Review | budget spent or stop-and-ask: card to Human with the question; crash: one retry from the handoff, then Human |
-| review | a PR is marked ready, or updated after changes | reviewer, fresh session | approve, or a change request with a checklist | approve: Verifying; changes: the builder resumes from the handoff | three rounds without approval: Human |
-| verify | a PR is opened or updated | CI runs the PR harness tier and the benchmark quick set; the verifier reads the results | numbers and a verdict posted on the PR | green: Merge; red or regression: builder with the numbers | a test that fails then passes on one rerun is quarantined with its own card |
-| merge | reviewer approved, verifier green, and either no red zone or the human approved | conductor | squash merge, card to Done, lease released | documenter | merge conflict with trunk: builder rebases, review and verify run again |
-| document | a merge | documenter | a docs PR updating the specification or adding an ADR, or a "no change" note | the normal review and merge loops; `docs/` is never a red zone | — |
-| retro | a metric crosses its threshold: first-review rejection rate, cost per merged card, flaky tests, red-zone queue length | retro agent | a PR editing CLAUDE.md files, invariants, skills or the card template, with the metric that motivated it | the human reads it; the normal loops merge it | — |
-| nightly | the schedule | CI runs the full harness, benchmarks and fuzzing; the planner turns failures into cards | cards in Backlog with the failing evidence attached | the human triages at the next batch | — |
-| release | the human tags | release manager | changelog from merged cards, versions bumped in lockstep, wheels, binaries, images, Helm chart, an install smoke test | artifacts published | a failed smoke test deletes the tag and opens a card |
-
-**Guardrails in the machinery**
-
-- One lease per card and per PR; a loop step that finds no lease exits. Every step is idempotent: a rerun recreates the worktree from the branch and finds the PR by card id.
-- A concurrency cap on builders and a daily cost cap; crossing the cap pauses the build loop and says so in the digest.
-- A kill switch: the repository label `loops:paused`, checked first by every workflow and by the conductor.
-- `.github/`, `loops/`, `CODEOWNERS` and CI configuration are human-only; the merge loop refuses a PR that touches them without the human's approval, red zone or not.
-- The GitHub App token is scoped to the repository; agents never hold production credentials or data (project organisation, below).
-- Transcripts of every run are kept as artifacts, so any merged line can be traced to the session and the card that produced it.
-
-**Handoffs.** A session that ends unfinished (budget, crash, stop-and-ask) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The resumed session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
-
-**The human interface.** One digest per batch, as an issue comment: merged since last time, waiting on you (red-zone PRs, questions on cards), blocked, the metrics. Approving is moving cards to Ready; answering is commenting on the card, which resumes the builder; reviewing is the PR with the reviewer's report beside it. Nothing else is required.
-
-**Bootstrapping.** The loops are built by the same method, on themselves, in phase 0: card 1 is the repository scaffold; card 2 is the build loop with a manual trigger; card 3 is the review loop; card 4 is the verify loop attached to the walking skeleton; card 5 switches the triggers to webhooks. The first card built by the build loop is the review loop.
+**Handoffs.** A session that ends unfinished (budget, crash, stop-and-ask) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The next session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
 
 ## Roadmap
 
@@ -241,19 +202,19 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 | repositories | `adeweb-be/ZOE`, the monorepo: `crates/`, `python/zoedb/`, `apps/loupe/`, `deploy/`, `docs/`, `bench/`, `loops/`; `adeweb-be/zoe-bench-results` for the nightly JSON and the dashboard on GitHub Pages | Loupe stays in the monorepo through phase 3 and splits at phase 4 only if frontend contributors need their own cadence; the phase 0 patches to `persistent`, `BTrees` and `zodbpickle` go upstream to zopefoundation from forks in the `adeweb-be` organisation |
 | tags and versions | `v0.3.0` for the Cargo workspace and the `zoedb` wheel together; `loupe-v0.1.0` for Loupe | semantic versioning; the on-disk format version is independent of the release version |
 | licences | Apache-2.0 for everything, the Plone extra included | the Rust ecosystem's norm; keeps the door open to the Plone Foundation and to any adopter |
-| documentation site | GitHub Pages of `adeweb-be/ZOE`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the documenter loop; nothing is hosted on a private domain |
+| documentation site | GitHub Pages of `adeweb-be/ZOE`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the documenter; nothing is hosted on a private domain |
 | data hygiene | test corpora in public CI come from a synthetic Plone site generator; production copies from an adopting site run only on that site's private runner, whose results are posted as numbers, never as data; secret scanning on every push; builders never hold production data | the one rule that survives every retro |
 
 ## Process risks and open questions
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| The human becomes the bottleneck: batches and red-zone reviews wait | agents idle, the project slows to the approver's pace | the digest keeps approval to minutes; red zones are narrow and listed; the planner batches by dependency so one approval unlocks many cards |
+| The human becomes the bottleneck: batches and red-zone reviews wait | the project slows to the approver's pace | red zones are narrow and listed; the planner batches by dependency so one approval unlocks many cards |
 | Agents optimise for the test, not the goal | green acceptance tests on code that misses the point | acceptance tests written before the build and never editable by the builder; the reviewer checks claims against evidence; shadow runs and differential suites judge behaviour, not coverage |
 | Invariants nobody wrote down | reviewers approve changes that break an unstated rule | per-crate invariants files, grown by every retro and every incident |
-| Cost drift | token spend grows faster than merged work | cost per merged card on the dashboard; the daily cap pauses the build loop; rising cost triggers the retro |
+| Cost drift | token spend grows faster than merged work | cost per merged card on the dashboard; rising cost triggers the retro |
 | Production data or credentials leak into a public repository or a CI log | a data breach, and the adopting site's trust | synthetic corpora in public CI; private runner for production copies; secret scanning; builders have no access to production data at all |
-| Single owner | bus factor | the specification, the harness, the ADRs and the loops are the handover; anyone with the repository can restart the machinery |
+| Single owner | bus factor | the specification, the harness, the ADRs and the role briefs are the handover; anyone with the repository can continue the work |
 
 **Open questions**
 

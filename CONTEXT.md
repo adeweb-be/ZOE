@@ -184,20 +184,8 @@ _Avoid_: MVP, prototype
 A path whose changes need the human's approval before merge.
 _Avoid_: protected area, critical code
 
-**Lease**:
-The right of one loop run to act on one card or one pull request.
-_Avoid_: lock (a lock is a storage term)
-
-**Loop**:
-An automated agent run that a state change on the board starts: plan, build, review, verify, merge, document, retro, nightly or release.
-_Avoid_: pipeline, bot
-
-**Conductor**:
-The service that receives the board events, grants leases, caps cost and concurrency, and starts the loops.
-_Avoid_: orchestrator, scheduler
-
 **Board**:
-The project board whose columns hold the state of every card; the loops read no other state.
+The project board whose columns hold the state of every card.
 _Avoid_: kanban, backlog (Backlog is one column)
 
 **Handoff**:

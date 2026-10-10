@@ -13,4 +13,4 @@ The specification and the working methods were written outside the repository. A
 ## Consequences
 
 - A card that changes behaviour updates the specification in the same pull request.
-- The documenter loop keeps the documents current after every merge.
+- The documenter keeps the documents current after every merge.

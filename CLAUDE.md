@@ -93,5 +93,5 @@ Definition of Done: acceptance test green; unit tests added; TSan and the pull-r
 | `deploy/` | manifests and the Helm chart |
 | `bench/` | the benchmark harness |
 | `ci/` | the Dagger module |
-| `loops/` | the conductor and the role prompts |
+| `loops/` | the role briefs |
 | `docs/` | the specification, the ADRs, spike findings, handoffs; the mdBook source |

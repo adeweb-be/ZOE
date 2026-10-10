@@ -18,7 +18,7 @@
 **/security/ @duchenean
 **/tls/ @duchenean
 
-# The environment, CI, the workflows and the loops. Only a human changes them.
+# The environment, CI, the workflows and the role briefs. Only a human changes them.
 /devenv.nix @duchenean
 /devenv.yaml @duchenean
 /devenv.lock @duchenean
