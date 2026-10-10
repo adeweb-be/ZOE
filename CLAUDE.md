@@ -80,6 +80,7 @@ Definition of Done: acceptance test green; unit tests added; TSan and the pull-r
 - Stay inside the scope fence of the card.
 - Prefer the simplest thing that the specification allows. Add no feature that the specification does not name.
 - `docs/spec/*.md` are living documents. When a card changes behaviour, its pull request updates them.
+- Commit messages, pull requests, issues and comments carry no co-author trailers and no tool attribution: no `Co-Authored-By` line, no "Generated with" line.
 - Code comments use Simplified Technical English: short sentences, one idea each, active voice. A comment describes the code as it is now: no history, no card or issue ids in source code.
 
 ## Layout
