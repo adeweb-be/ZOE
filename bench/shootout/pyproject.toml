@@ -1,0 +1,48 @@
+# The zodbshootout harness of the reference baseline. It is not a package
+# that the project ships, so it is not a member of the uv workspace in python/.
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "zoe-shootout"
+version = "0.0.0"
+description = "Runs zodbshootout against the reference ZODB storages and writes ZOE benchmark results."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "zodbshootout==0.8.0",
+    # pyperf 2.4 and later define a --profile option, and zodbshootout 0.8.0
+    # defines one too. argparse then refuses to start.
+    "pyperf==2.3.0",
+    # zodbshootout imports six but does not declare it.
+    "six",
+    "ZODB>=6",
+    "ZEO>=6",
+    "RelStorage>=4.1",
+    # The binary wheel needs no libpq headers to install.
+    "psycopg2-binary>=2.9",
+    "jsonschema>=4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+]
+
+[tool.uv.build-backend]
+module-name = "shootout"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The acceptance test is planner output, and the builder does not edit it.
+# It sorts shootout with the third-party imports.
+"tests/test_baseline.py" = ["I001"]

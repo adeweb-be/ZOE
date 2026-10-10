@@ -33,9 +33,26 @@ conformance:
 plone:
     @echo "just plone: builds the filestorage, zeo, zoe and zeoclient scenarios under plone/. Not built yet."
 
-# Run the benchmarks.
-bench:
-    @echo "just bench: runs zodbshootout, zoe-bench and the criterion benchmarks. Not built yet."
+# Run the benchmarks. `just bench` runs the zodbshootout baseline into
+# target/bench/results, `just bench run --quick` runs the quick set and
+# `just bench test` runs the tests of the harness. zoe-bench and the
+# criterion benchmarks are not built yet.
+bench *args="run":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export UV_PYTHON="${UV_PYTHON:-3.13}"
+    export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
+    # The RelStorage wheel links libstdc++, which the Nix interpreters do not
+    # find on their own. The compiler of the shell knows where it is.
+    if command -v cc >/dev/null; then
+        libstdcxx="$(dirname "$(cc -print-file-name=libstdc++.so.6)")"
+        export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    shootout=(uv run --locked --project bench/shootout)
+    if [ "{{ args }}" = test ]; then
+        exec "${shootout[@]}" pytest -q bench/shootout/tests
+    fi
+    exec "${shootout[@]}" python -m shootout {{ args }}
 
 # Build and run Loupe.
 loupe:
