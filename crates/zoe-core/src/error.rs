@@ -24,6 +24,14 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// The checksum of a transaction row does not match its bytes, or its
+    /// payload does not decode.
+    #[error("corrupt transaction row: tid {tid:?}")]
+    CorruptTxn {
+        /// The transaction id of the row.
+        tid: Tid,
+    },
+
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
     #[error("conflict: oid {oid:?}")]

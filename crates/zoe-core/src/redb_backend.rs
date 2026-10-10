@@ -162,7 +162,7 @@ impl Backend for RedbBackend {
             for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
                 let (key, value) = entry.map_err(backend)?;
                 let tid = Tid(u64::from_be_bytes(*key.value()));
-                let corrupt = ZoeError::CorruptRecord { oid: Oid(0), tid };
+                let corrupt = ZoeError::CorruptTxn { tid };
                 let row = format::decode_frame(key.value(), value.value())
                     .and_then(|frame| format::decode_txn(tid, frame.payload))
                     .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
@@ -345,6 +345,40 @@ mod tests {
                 })
             ),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_transaction_row_names_its_tid() {
+        let backend = empty();
+        let tid = Tid(5);
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_txn(&TxnMeta {
+                tid,
+                user: b"user".to_vec(),
+                description: Vec::new(),
+                extension: Vec::new(),
+                oid_count: 0,
+                status: TxnStatus::Committed,
+            })
+            .unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.db.begin_write().unwrap();
+        {
+            let mut txns = txn.open_table(TXNS).unwrap();
+            let key = format::txn_key(tid);
+            let mut frame = txns.get(&key).unwrap().unwrap().value().to_vec();
+            *frame.last_mut().unwrap() ^= 1;
+            txns.insert(&key, frame.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rows: Vec<_> = backend.iter_txns(Tid::ZERO, Tid::MAX).collect();
+        assert!(
+            matches!(rows[..], [Err(ZoeError::CorruptTxn { tid: Tid(5) })]),
+            "{rows:?}"
         );
     }
 }
