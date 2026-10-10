@@ -76,13 +76,20 @@ class Ci:
         )
 
     def recipe(
-        self, source: dagger.Directory, name: str, cache_target: bool = True
+        self,
+        source: dagger.Directory,
+        name: str,
+        cache_target: bool = True,
+        privileged: bool = False,
     ) -> dagger.Container:
         """Run one just recipe inside the devenv shell."""
         ctr = self.devenv(source)
         if cache_target:
             ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
-        return ctr.with_exec(["devenv", "shell", "--", "just", name])
+        return ctr.with_exec(
+            ["devenv", "shell", "--", "just", name],
+            insecure_root_capabilities=privileged,
+        )
 
     @function
     async def check(self, source: Source) -> str:
@@ -93,6 +100,13 @@ class Ci:
     async def test(self, source: Source) -> str:
         """Run the Rust tests and the Python tests on every interpreter."""
         return await self.recipe(source, "test").stdout()
+
+    @function
+    async def tsan(self, source: Source) -> str:
+        """Run the zoe-core tests under ThreadSanitizer and check the canary race."""
+        # ThreadSanitizer turns off ASLR for the test process. The seccomp
+        # filter of a normal container refuses that call.
+        return await self.recipe(source, "tsan", privileged=True).stdout()
 
     @function
     def docs(self, source: Source) -> dagger.Directory:
