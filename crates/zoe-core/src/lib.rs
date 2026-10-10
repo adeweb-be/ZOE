@@ -12,6 +12,7 @@ mod commit;
 mod error;
 mod format;
 mod lock;
+pub mod log_backend;
 mod redb_backend;
 mod store;
 mod types;
