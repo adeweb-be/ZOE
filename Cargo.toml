@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 zoe-core = { path = "crates/zoe-core" }
 pyo3 = "0.29"
+redb = "4.3"
 thiserror = "2"
 
 [workspace.lints.rust]

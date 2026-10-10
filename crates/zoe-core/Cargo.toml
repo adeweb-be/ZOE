@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+redb.workspace = true
 thiserror.workspace = true
 
 [lints]

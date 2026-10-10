@@ -12,6 +12,7 @@ mod error;
 mod format;
 mod lock;
 mod types;
+pub mod vfs;
 
 pub use backend::{
     Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
