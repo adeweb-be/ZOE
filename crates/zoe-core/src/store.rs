@@ -21,8 +21,31 @@ const DATABASE: &str = "zoe.redb";
 /// The name under which a new database is written before it is renamed.
 const NEW_DATABASE: &str = "zoe.redb.new";
 
-/// The default lock timeout.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// The options of a store.
+///
+/// Build it from the defaults, for example
+/// `Options { lock_timeout, ..Options::default() }`. Then a new option does
+/// not break the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// The longest time that a vote waits for its locks. A longer wait
+    /// fails the vote with `Conflict`. This is `lock-timeout` in the
+    /// configuration.
+    pub lock_timeout: Duration,
+    /// Not an option. This field makes `..Options::default()` necessary
+    /// when a caller sets every option.
+    #[doc(hidden)]
+    pub _more: (),
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            lock_timeout: Duration::from_secs(10),
+            _more: (),
+        }
+    }
+}
 
 /// An open store.
 pub struct Store {
@@ -41,9 +64,16 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open the store in the directory `dir`, and create it if necessary.
+    /// Open the store in the directory `dir` with the default options, and
+    /// create it if necessary.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_in(OsVfs::new(dir.as_ref())?, SystemClock)
+        Self::open_with(dir, Options::default())
+    }
+
+    /// Open the store in the directory `dir` with `options`, and create it
+    /// if necessary.
+    pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        Self::open_full(OsVfs::new(dir.as_ref())?, SystemClock, options)
     }
 
     /// Open the store in the simulated filesystem `vfs`, and create it if
@@ -52,13 +82,19 @@ impl Store {
         Self::open_in(vfs, SystemClock)
     }
 
-    /// Open the store in `vfs` with the clock `clock`, and create it if
-    /// necessary.
+    /// Open the store in `vfs` with the clock `clock` and the default
+    /// options, and create it if necessary.
+    pub fn open_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Self> {
+        Self::open_full(vfs, clock, Options::default())
+    }
+
+    /// Open the store in `vfs` with the clock `clock` and `options`, and
+    /// create it if necessary.
     ///
     /// A new store is written under a temporary name and renamed into place
     /// after it is durable, so a crash during the creation leaves either
     /// no store or a complete empty one.
-    pub fn open_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Self> {
+    fn open_full<V: Vfs>(vfs: V, clock: impl Clock + 'static, options: Options) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
                 vfs.remove(NEW_DATABASE)?;
@@ -82,7 +118,7 @@ impl Store {
             backend: Box::new(backend),
             clock: Box::new(clock),
             locks: LockManager::default(),
-            lock_timeout: LOCK_TIMEOUT,
+            lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             _vfs: Box::new(vfs),
