@@ -189,6 +189,9 @@ version = "0.0.0"
 [[package]]
 name = "zoe-pickle"
 version = "0.0.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "zoe-py"
