@@ -87,3 +87,17 @@ The specification says that free-threaded parallelism in Zope needs `persistent`
 ## Upstream
 
 The patches go upstream to zopefoundation as draft pull requests from the forks in the `adeweb-be` organisation (`adeweb-be/persistent`, `adeweb-be/BTrees`, `adeweb-be/zodbpickle`): one per package, each with the declaration and the blocking fixes above, `persistent` first. They are not opened yet: opening them is a public action that waits for the human's go.
+
+## Status of the patches
+
+The fixes above are written on the `free-threading` branch of each fork, with the declaration, except the pickle-cache rework:
+
+- `adeweb-be/persistent`: the interned strings and the `TimeStamp` import at module init, `PyType_Ready(TimeStamp_type)`, `PyDict_GetItemRef` in `pickle_slotnames`, and no `Py_DECREF` of the borrowed reference in `cc_new_ghost`, with a test that fails before the fix.
+- `adeweb-be/BTrees`: `set_repr` without a static, and `PyType_Ready` for the items and iterator types.
+- `adeweb-be/zodbpickle`: the lazy statics created at module init, `PyDict_GetItemRef` on the copyreg dicts, `whichmodule` over a copy of `sys.modules`, and `find_class` through `PyImport_GetModule`.
+
+With the GIL off on 3.14t, and on 3.12 and 3.14, the suites pass: persistent 772 tests (778 with the GIL), BTrees 13,721 and zodbpickle 432, with no failures or errors. The acceptance test and the pool stress test pass with the GIL off.
+
+One persistent suite fails with the GIL off: `test_threading.py` segfaults on 3.14t in most runs. Eight threads call `full_sweep`, `minimize` or `incrgc` on one `PickleCache`, whose ring and dict of uncounted references have no locking. Upstream master crashes in the same way under `PYTHON_GIL=0`. This is the blocking pickle-cache rework above. Until it exists, the declaration in persistent makes its own 3.14t suite crash.
+
+The human decided to keep the branches on the forks and to open no pull request upstream for now.
