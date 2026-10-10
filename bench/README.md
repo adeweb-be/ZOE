@@ -49,7 +49,7 @@ Each run of one storage gives one JSON document that validates against [`schema/
 
 ## The results repository
 
-The results go to the `adeweb-be/zoe-bench-results` repository, which keeps only full runs:
+The results go to the [`adeweb-be/zoe-bench-results`](https://github.com/adeweb-be/zoe-bench-results) repository, which keeps only full runs:
 
 ```text
 index.json
@@ -66,9 +66,9 @@ To publish a full run, copy the `results/` tree of the run into a checkout of th
 
 ## The dashboard
 
-The dashboard is the GitHub Pages site of the results repository: one static page with no build step. It reads `index.json`, then the result documents it lists. For each machine and Python build, it plots `ops_per_second` and `p99_seconds` of each scenario and cell against the start of the run, with one line per storage. A point links to its commit. The quick cells are a subset of the full cells, so a regression gate can compare a quick run with the last ten full runs on the same machine.
+The dashboard is the GitHub Pages site of the results repository, <https://adeweb-be.github.io/zoe-bench-results/>: one static page, `index.html`, with no build step. It reads `index.json`, then the result documents it lists. For each machine and Python build, it plots `ops_per_second` and `p99_seconds` of each scenario and cell against the start of the run, with one line per storage. A point links to its commit. The quick cells are a subset of the full cells, so a regression gate can compare a quick run with the last ten full runs on the same machine.
 
-The human creates the repository and its page. Neither is in this directory.
+The page lives in the results repository, not in this directory.
 
 ## The reference machine
 
