@@ -1,0 +1,263 @@
+# ZOE — working methods and roadmap
+
+Oct 10, 2026 · @Antoine Duchêne
+
+How ZOE gets built: one human, a team of AI agents, cards gated by tests, and loops that run without anyone watching. The technical design lives in Doc.
+
+## Way of working: one human, a team of agents
+
+ZOE is built by AI agents with one human as product owner and architect, so the process is designed around what agents are good at (fast, parallel, tireless, literal) and what they are bad at (judgement about scope, invariants nobody wrote down, and knowing when to stop). The rule that follows from this: nothing is a task until it has a test that decides it, and nothing merges on an agent's word.
+
+&#91;embedded content: card lifecycle · two agent approvals, two human gates\]
+
+The tinted boxes are the only two places the human is in the loop; a card that touches no red zone never waits on a person after it is approved.
+
+**Roles**
+
+| Role | Who | Does | Never does |
+| --- | --- | --- | --- |
+| Product owner and architect | the human | owns the technical specification and the ADRs, approves cards, reviews red zones, runs the batch review and the retro | writes code by hand except spikes and acceptance tests |
+| Planner | agent, fresh session per planning run | slices a roadmap phase into cards, orders them by dependency and risk, writes the acceptance test skeleton for each, keeps the board current | starts implementation |
+| Builder | agent, one Claude Code session per card in its own git worktree | implements one card until its acceptance test is green, writes unit tests, opens the PR with a claims-and-evidence section | edits acceptance tests, CI configuration, or files outside the card's scope fence |
+| Reviewer | agent, fresh context, never the builder's session | reviews the diff against the card, the specification and the crate's invariants file; checks the claims against the evidence; requests changes or approves | merges |
+| Verifier | CI, plus an agent that reads the results | runs the harness tier for the PR, the benchmark quick set and the regression gate; posts numbers on the PR | approves on green alone when a red zone is touched |
+| Documenter | agent, after every merge | diffs code against the specification and the ADRs, proposes updates and new ADRs, maintains CONTEXT.md | changes a decision |
+| Release manager | agent, on tag | changelog from merged cards, version bump across crates and wheel, artifacts, signed binaries | tags without the human's go |
+
+**Cadence**
+
+| Rhythm | What happens | Human involvement |
+| --- | --- | --- |
+| continuous | builders pick Ready cards; reviewer and verifier run on every PR; green non-red-zone PRs merge on reviewer approval; the building loops drive this without anyone watching | none |
+| per batch | the planner's next batch of cards is approved, open questions answered, order re-ranked; batches are as frequent as the human wants them, not calendar-bound | the main touchpoint |
+| per red-zone PR | the human reviews the diff with the reviewer agent's report beside it | minutes per PR |
+| per phase gate | gate check against the testing harness; the documenter reconciles specification and code; ADRs for every decision taken in the phase | an hour or two |
+| retro, on the metrics | when rejection rate, cost per card or flaky tests cross a threshold, a retro happens; its output is changes to CLAUDE.md files, invariants files, skills and card templates: the retro improves the agents, not the people | the human reads the proposal |
+
+**Repository conventions that make agents reliable**
+
+- Root `CLAUDE.md`: how to build, test and bench, as just recipes; the red-zone list; the stop-and-ask rules; the claims-and-evidence PR template.
+- One `CLAUDE.md` per crate with its invariants in plain sentences ("locks are acquired in ascending oid order", "the backend never allocates tids"); the reviewer checks diffs against this file.
+- `docs/adr/`: one Architecture Decision Record per decision in the specification, numbered, with context, decision, consequences; new decisions go through a card of their own.
+- `CONTEXT.md`: the domain glossary (oid, tid, serial, ghost, vote, pack, intent lock) so agents and humans use one vocabulary.
+- Skills for the recurring procedures: run the conformance suite, run the benchmark set and compare to baseline, cut a release, write a handoff when a session ends unfinished.
+- Trunk-based: short-lived branch per card, one agent per worktree, squash merge, no force pushes, CI configuration changed only by a human.
+- `CODEOWNERS` marks the red zones: `crates/zoe-core/src/commit`, the lock manager, `zoe-pickle`'s encoder, the on-disk format, the protocol layer, security code. A red-zone PR needs the human's approval; everything else merges on the reviewer agent's approval.
+
+**Tooling**
+
+Two loops. The inner loop, on a laptop or in an agent session, is `devenv shell` plus `just`, running `cargo`, `uv`, `pytest` and `buildout` natively. CI is Dagger, triggered by GitHub Actions. They meet in one recipe, `just ci`, which runs the Dagger pipeline locally to reproduce a CI result before pushing.
+
+| Tool | Role | Rule |
+| --- | --- | --- |
+| devenv | `devenv.nix` at the root pins the Rust toolchain, CPython 3.12, 3.13, 3.14 and 3.14t, Node for Loupe and every CLI below; `devenv shell` gives a laptop, a runner and an agent session the same environment | a tool that is not in `devenv.nix` does not exist for the project; the file is a red zone |
+| just | the `justfile` is the single entry point: `just check` (fmt, clippy, lints), `just test`, `just conformance`, `just plone` (builds the Plone instances), `just bench`, `just loupe`, `just ci`, `just release`; recipes wrap `cargo`, `uv`, `pytest`, `buildout` and `dagger` | `CLAUDE.md` files name recipes, never raw commands; a command an agent needs and cannot find becomes a recipe in the same PR |
+| uv | packaging for what the project ships, under `python/`: a uv workspace holding `zoedb` and `zoe.plone`, a committed `uv.lock`, `uv python install 3.14t` for the free-threaded interpreter, the wheel built with maturin through `uv build` | no pip, no hand-made virtualenvs; a dependency change ships with its lock file in the same commit |
+| zc.buildout | the Plone instances the suites and benchmarks run against, under `plone/`: one `buildout.cfg` per scenario (in-process `<zoe>`, `<zeoclient>` against `zoe serve`, `FileStorage` and ZEO as baselines), `versions.cfg` pinned to a Plone release, `zoedb` taken through `find-links` from the wheel `uv build` just produced, `plone.recipe.zope2instance` writing `zope.conf` and `bin/test`; no mxdev | buildout owns Plone, uv owns the project's own packages, nothing crosses that line; the Plone suites run from `bin/test` (zope.testrunner); the eggs and download caches are Dagger cache volumes |
+| pytest | the runner for the project's own Python tests: `zoedb`, `zoe.plone` and the ZODB and ZEO conformance suites (unittest-based, collected unchanged); `pytest-xdist` where the suites allow; run on 3.12, 3.13, 3.14 and 3.14t, Linux x86-64 | new Python tests are plain pytest; a card's Python-side acceptance tests are pytest files named on the card; the Plone suites are the one exception and stay on `bin/test` |
+| Dagger | CI as code in `ci/`: a Dagger module written in Python with the functions `check`, `test`, `conformance`, `plone`, `bench`, `crash` and `release`, each running in containers built from the same `devenv` definition; one cache shared by the runners | CI logic lives here and nowhere else; reviewed like code, red zone; `just ci` runs it locally when a CI failure needs reproducing, never for the edit-test loop |
+| GitHub Actions | thin workflows, one per event (pull request, merge queue, nightly, release), each a few lines that call the Dagger module; the merge queue; the nightly bench on the self-hosted runner | a workflow holds no logic; a workflow change is a human-only change |
+| GitHub | the repository, Issues as cards, the Projects board, pull requests, Releases, Pages for the dashboard, `CODEOWNERS`, branch protection, secret scanning, Dependabot | the board is the only state the loops read; everything else is derived from it |
+
+Inner loop: `devenv shell`, then `just <recipe>`, which runs `cargo`, `uv run pytest` or `bin/buildout` natively, incremental, seconds per run (minutes for a fresh Plone instance, cached after). CI: a workflow calls `dagger call <function>`, containerised, reproducible, cached. An agent session lives in the inner loop and runs recipes only; it reaches Dagger through `just ci` and nothing else.
+
+## Units of work
+
+The unit is the card: one card, one builder session, one pull request, and a card carries everything a builder needs without the conversation that produced it.
+
+**The task card**
+
+```markdown
+# ZOE-142 — group commit: coalesce concurrent tpc_finish into one fsync
+Phase 2 · crate zoe-core · red zone: yes (2PC)
+
+Goal: 50 concurrent writers on a 10 ms fsync device reach ≥ 1,000 commits/s (N5).
+Acceptance tests (do not edit): tests/commit/group_commit.rs, bench/contention.rs@n5
+Scope fence: crates/zoe-core/src/commit/**, crates/zoe-core/tests/commit/**
+Out of scope: lock manager, backend trait
+Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
+Spike or build: build
+Budget: one session; a spent budget means stop and ask, not try harder
+Done when: acceptance green, TSan green, bench posted, reviewer approved, human approved (red zone)
+```
+
+Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
+
+**Definition of Ready.** A card has a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
+
+**Definition of Done.** Acceptance test green; unit tests added; TSan and the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
+
+**Stop-and-ask rules for builders.** A builder stops and writes a question on the card instead of guessing when a change would alter the on-disk format, the wire protocol, a public Python API, a trait signature used by another crate, or an acceptance test; when the budget is spent; and when the only way to make the test green is to weaken it.
+
+**Spikes.** A time-boxed exploration card ends in a written finding in `docs/spikes/` and no merged code. The big unknowns are spikes before they are builds: redb versus the append-only log, pickle round-trip on a production copy, the early-lock hook in ZODB.
+
+**Order of work inside a phase.** Walking skeleton first: the thinnest end-to-end slice (open store, store one object, finish, reload, kill, reopen) with the crash simulation attached, then widen. Hardest unknowns next, as spikes.
+
+**Process metrics**, on the same dashboard as the benchmarks: cards merged per batch, first-review rejection rate, red-zone PRs waiting on the human, flaky-test count, benchmark drift, cost in tokens per merged card. When rejection rate rises, the retro fixes the card template or the invariants file; when cost per card rises, cards are too big.
+
+## Building loops: automating the development
+
+The loops turn the way of working into machinery: every state change in the repository (a card moved to Ready, a pull request opened, a CI run finished, a merge) starts an agent run with nobody watching, and the human appears only at the two gates. GitHub owns state; a small conductor owns leases, concurrency, budgets and the kill switch; agents are disposable headless sessions whose memory is files in the repository.
+
+&#91;embedded content: loop machinery · human, GitHub, conductor, runner\]
+
+GitHub is the single source of state, the conductor never touches code, and every session reaches GitHub only through pull requests and comments.
+
+**Components**
+
+| Component | What it is | Rule |
+| --- | --- | --- |
+| board | GitHub Projects with the columns Backlog, Ready, Building, Review, Verifying, Human, Done; labels for red zones and for leases | the only place state lives; a loop that cannot find its state on the board does nothing |
+| conductor | a GitHub App plus a small service in `loops/` in the monorepo: receives webhooks, grants one lease per card or PR, caps concurrent builders, enforces the daily cost cap, retries once from a handoff, escalates to Human, writes the digest, honours the kill switch | written in Rust so it is reviewed and tested like everything else; it never edits code |
+| agent sessions | Claude Code in headless mode, one session per loop run, started by the conductor on a runner with the role prompt from `loops/prompts/<role>.md`, the card, and the tool allowlist for that role | builders get full tools inside their worktree; reviewers and verifiers are read-only plus comments; planners write issues; documenters write only under `docs/` |
+| runner | self-hosted, provisioned by devenv, with the harness and a warm Dagger cache; a scoped GitHub App token and nothing else | no production data, no secrets beyond that token, every transcript kept as a run artifact for audit |
+| dashboard | the bench-results repository, extended with the loop metrics | the retro loop reads it |
+
+**The loops**
+
+| Loop | Trigger | Actor | Produces | Then | On failure |
+| --- | --- | --- | --- | --- | --- |
+| plan | a phase gate turns green, or Ready drops below a threshold | planner | a batch of cards in Backlog, each with a failing acceptance test skeleton | the human moves cards to Ready | a card the planner cannot write a test for is labelled `needs-spec` and goes to Human |
+| build | a card enters Ready | conductor grants a lease, creates the worktree and branch `card/<id>`, starts the builder | a draft PR, marked ready when the acceptance test is green | Review | budget spent or stop-and-ask: card to Human with the question; crash: one retry from the handoff, then Human |
+| review | a PR is marked ready, or updated after changes | reviewer, fresh session | approve, or a change request with a checklist | approve: Verifying; changes: the builder resumes from the handoff | three rounds without approval: Human |
+| verify | a PR is opened or updated | CI runs the PR harness tier and the benchmark quick set; the verifier reads the results | numbers and a verdict posted on the PR | green: Merge; red or regression: builder with the numbers | a test that fails then passes on one rerun is quarantined with its own card |
+| merge | reviewer approved, verifier green, and either no red zone or the human approved | conductor | squash merge, card to Done, lease released | documenter | merge conflict with trunk: builder rebases, review and verify run again |
+| document | a merge | documenter | a docs PR updating the specification or adding an ADR, or a "no change" note | the normal review and merge loops; `docs/` is never a red zone | — |
+| retro | a metric crosses its threshold: first-review rejection rate, cost per merged card, flaky tests, red-zone queue length | retro agent | a PR editing CLAUDE.md files, invariants, skills or the card template, with the metric that motivated it | the human reads it; the normal loops merge it | — |
+| nightly | the schedule | CI runs the full harness, benchmarks and fuzzing; the planner turns failures into cards | cards in Backlog with the failing evidence attached | the human triages at the next batch | — |
+| release | the human tags | release manager | changelog from merged cards, versions bumped in lockstep, wheels, binaries, images, Helm chart, an install smoke test | artifacts published | a failed smoke test deletes the tag and opens a card |
+
+**Guardrails in the machinery**
+
+- One lease per card and per PR; a loop step that finds no lease exits. Every step is idempotent: a rerun recreates the worktree from the branch and finds the PR by card id.
+- A concurrency cap on builders and a daily cost cap; crossing the cap pauses the build loop and says so in the digest.
+- A kill switch: the repository label `loops:paused`, checked first by every workflow and by the conductor.
+- `.github/`, `loops/`, `CODEOWNERS` and CI configuration are human-only; the merge loop refuses a PR that touches them without the human's approval, red zone or not.
+- The GitHub App token is scoped to the repository; agents never hold production credentials or data (project organisation, below).
+- Transcripts of every run are kept as artifacts, so any merged line can be traced to the session and the card that produced it.
+
+**Handoffs.** A session that ends unfinished (budget, crash, stop-and-ask) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The resumed session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
+
+**The human interface.** One digest per batch, as an issue comment: merged since last time, waiting on you (red-zone PRs, questions on cards), blocked, the metrics. Approving is moving cards to Ready; answering is commenting on the card, which resumes the builder; reviewing is the PR with the reviewer's report beside it. Nothing else is required.
+
+**Bootstrapping.** The loops are built by the same method, on themselves, in phase 0: card 1 is the repository scaffold; card 2 is the build loop with a manual trigger; card 3 is the review loop; card 4 is the verify loop attached to the walking skeleton; card 5 switches the triggers to webhooks. The first card built by the build loop is the review loop.
+
+## Roadmap
+
+Ten phases, each closed by a measurable gate from the specification's testing harness; the in-process storage ships first because it needs no server and already proves the core. There are no durations: the work is done by agents, and a phase starts as soon as the gates it needs are green, so phases 3, 4 and 5 run in parallel once the server gate is passed.
+
+&#91;embedded content: roadmap · ten phases and their gates\]
+
+Each diamond is a gate from the testing harness; nothing moves to the next band until its gate is green.
+
+| Phase | Scope | Gate | Needs |
+| --- | --- | --- | --- |
+| 0 Groundwork | `Py_mod_gil_not_used` and thread-safety audit upstream in `persistent`, `BTrees`, `zodbpickle`; ConflictError ranking from production logs; reference machine and `zodbshootout` baseline for `FileStorage`, ZEO 6 and RelStorage; repository scaffold for agentic work (devenv, justfile, uv workspace, buildout for the Plone instances, Dagger pipeline, Actions workflows, CLAUDE.md files, ADRs, CONTEXT.md, the board) and the walking-skeleton card | baseline published; upstream PRs opened; top-ten conflict classes known | nothing; starts first |
+| 1 Core and in-process | `zoe-core` with redb backend, 2PC, per-OID locks, pack, blobs, `Vfs` crash simulation; PyO3 `Storage`; `zope.conf` stanza; `zodbconvert` round trip; conformance suites; Loupe v0 (folder mode, browser, time travel); `Data.fs` converter in Rust; record and blob checksums and zstd compression in the on-disk format, size guardrails, pack dry-run; the sequences primitive; clock and I/O traits for deterministic simulation; a codec byte, a branch id and typed field slots reserved per record | `ZODB.tests` green; crash simulation 0 losses; every injected bit flip detected; in-process beats `FileStorage` on `zodbshootout` | phase 0 baseline |
+| 2 Server | tokio server, full protocol matrix, invalidations, blob streaming and shared blob directories, health and metrics, graceful shutdown, `zoe-bench`, ZEO and Plone suites, Tier 1 manifests, named storages for mount points, read-only mode, repozo-style backup and zoe verify, OpenTelemetry traces; Loupe live tail, space and operations; MCP ops tools and prompts, read-only; sequences over the protocol with zoe.plone wiring for intids and \_nextwid; the deterministic simulator over clock and network, with the kill loop run under it | a Plone 6 site runs on `<zeoclient>`; ZEO tests green; ≥ 3× ZEO on `zodbshootout`; a site with a mount point runs on one server; kill loop 0 losses; 0 conflicts on id allocation with 50 concurrent creators | phase 1 gate |
+| 3 Conflicts | structural and field-level merges, the merge policy derived from Dexterity schemas, shadow mode, `client_resolve`, early write-intent locks with the client hook, log-replay harness, undo on top of the merge tiers; Loupe full CRUD and undo-a-transaction and the optional `zoe.plone` reindex hook; append-only fields, CRDT sets and registers, the ephemeral TTL namespace and the registry as durable KV, each with a zoe.plone behaviour; the writes-on-GET report, then incidental writes | differential tests green; ZODB and ZEO undo suites green; ≤ 10% of ZEO's ConflictErrors on replay; 0 on a hot `Length` with early locks; 0 conflicts on workflow\_history and session writes on replay | phase 2 gate; parallel with 4, 5 and 6 |
+| 4 High availability | Tier 2: log shipping, Lease election, follower reads, `kind` cluster tests, Helm chart; read-only fallback during failover; RelStorage converter | failover under 10 s with no acknowledged loss | phase 2 gate; parallel with 3, 5 and 6 |
+| 5 Catalog | `zoe-catalog` mirror (bitmaps, sort arrays, path trie, metadata table, per-tid versions), `catalog_query` protocol extension, `zoe.plone.catalog` hook on `Catalog.search`, native BM25 text index on tantivy with `ZoeTextIndex` and the delta record type, query translator and compatibility switch, `zoe-bench` catalog scenarios; the incremental security index, traversal prefetch from the path trie, the reference index, the order index for ordered folders and shadow rebuilds | differential suite identical on the Plone test suites and a production query log; 5-index intersection with sort on 1M objects under 5 ms p99 warm; mirror ready within 60 s cold; text query under 20 ms p99; security bitmaps identical to reindexObjectSecurity on the corpus; a shadow rebuild with no query downtime | phase 2 gate; the field-store spike verdict; parallel with 3, 4 and 6 |
+| 6 Operations and data tools | copy-on-write forks (zoe fork: a native DemoStorage for test layers and upgrade rehearsals), the change feed (a resumable stream of commits from any tid on the admin port), encryption at rest with keys from file, environment or KMS, scheduled scrub, pack retention window and incremental pack, zoe rename-class, Parquet export, maintenance mode and per-storage quotas; the transactional outbox feeding the feed, derivations keyed (oid, tid, kind) with plone.scale as first consumer, zoe.testing layers on forks, zoe replay with sampled read sets, the versioning behaviour backed by history over the retention window; Loupe screens for each | a rehearsal upgrade runs on a fork of a production copy; an external indexer driven by the feed misses no commit through the kill loop; scrub finds every injected fault; conformance green on an encrypted store; plone.scale writes nothing on GET once on derivations; a production conflict replays on a fork | phase 2 gate; parallel with 3, 4 and 5 |
+| 7 AI-native | MCP content tools, chunking with per-type policies, local ONNX embedding provider behind a build flag plus remote opt-ins, `VectorIndex` trait with the builtin in-store backend and the Qdrant backend, hybrid search through `catalog_query`, `@search` and MCP, security pre-filtering by the roles bitmap, rebuild-vectors; embeddings as a derivation; the tid-stamped answer cache invalidated by the feed | security suite green on every mode and backend; builtin and qdrant agree on top-k; hybrid beats BM25 alone on the labelled query set; lag under 30 s at p99 under write load | phase 5 gate |
+| 8 Scale-out and fast paths | Tier 3 backend on FoundationDB or TiKV, S3 blob store, append-only log backend if phase 2 numbers demand it; the native Rust client with a persistent cache as a ZEO.ClientStorage drop-in; one shared host cache per node for that client; signed blob URLs and blob dedup by hash on the S3 store | conformance green on FDB; stateless fronts serve a cluster; log backend wins its benchmark or is dropped; the native client beats ZEO.ClientStorage on the client benchmark | phase 4 gate |
+| 9 Catalog projection | delta records for every index type, persisted delta log with snapshots, proxy index classes in `zoe.plone`, one-time rebuild migration, catalog BTrees and `Length` counters leave the store | a production site runs on the projection with zero bucket conflicts and identical query results over a full release cycle; started only after the mirror has answered production queries identically for a full release cycle | phase 5 gate plus production use of the mirror |
+| Later | `IMVCCStorage` fast path, async Python client, Rust `persistent` and `BTrees` sharing the merge code; macOS and Windows for the wheels, the server binary and Loupe | — | — |
+
+First usable release: the server gate; the in-process storage is usable from the core gate.
+
+## Feature triage
+
+58 candidate features were triaged on 2026-10-10 against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the ten phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
+
+| Feature | Verdict | Lands in | Note |
+| --- | --- | --- | --- |
+| Server-side sequences | Must | phase 1 primitive, phase 2 protocol | replaces `_nextwid`, intids and `Length` counters; `zoe.plone` wires them |
+| Field-addressable objects | Spike | spike before phase 5 design | conflicts and write amplification, throughput, ergonomics; weighting decided when the numbers exist |
+| Deterministic simulation testing | Should | phase 1 traits, phase 2 simulator | clock and I/O traits in `zoe-core` from the walking skeleton |
+| Compression, zstd now, deltas and dictionaries later | Should | phase 1 zstd; deltas after the bench | codec byte per record |
+| Blob content hashes, dedup later | Should | phase 1 hash; phase 8 dedup | BLAKE3 per blob record |
+| Append-only fields | Should | phase 3 | `workflow_history` first; append primitive in the protocol |
+| CRDT sets and registers | Should | phase 3 | shipped with append-only fields; counters are sequences |
+| Ephemeral namespace with TTL | Should | phase 3 | sessions, CSRF keys, locks; `zoe.plone` session data manager and locking backend |
+| Registry as durable KV | Should | phase 3 | same primitive, durable flavour; `plone.app.registry` storage swap |
+| Incidental writes | Should | phase 3 report; async path after the outbox | writes-on-GET report first |
+| Incremental security index | Should | phase 5 | inherited bitmap pointers; equality with `reindexObjectSecurity` is the test |
+| Traversal pushdown | Should | phase 5 | the client prefetches the chain from the path trie |
+| Reference index | Should | phase 5 | back-references from the mirror's decode pass; link integrity and relations |
+| Ordered folders | Should | phase 5 | order index in the mirror; `zoe.plone` ordering adapter |
+| Shadow indexes | Should | phase 5 | background rebuild, atomic swap |
+| Branches (forks) | Should | phase 6 | branch id reserved in the key layout from phase 1 |
+| Snapshot test fixtures | Should | phase 6 | `zoe.testing` layer on forks; first fork consumer |
+| Commit forensics | Should | phase 6 | `zoe replay`; read sets behind a sampling flag |
+| Transactional outbox | Should | phase 6 | at-least-once post-commit delivery; the feed becomes a consumer |
+| Derivations | Should | phase 6 | keyed (oid, tid, kind); `plone.scale` first, embeddings in phase 7 |
+| Retention rules | Should | phase 6 | `pack --keep`; versioning's prerequisite |
+| Versioning from history | Should | phase 6 | `zoe.plone` behaviour replacing CMFEditions storage; CMFEditions stays available |
+| RAG answer cache | Should | phase 7 | tid-stamped, cited oids, invalidated by the feed |
+| In-process embeddings | Should | phase 7 | the ONNX provider behind a build flag; default build calls an endpoint |
+| Shared host cache | Should | phase 8 | one mmap per node for the native client |
+| Signed blob URLs | Should | phase 8 | `blob_url(oid, ttl)`; `zoe.plone` redirects downloads on the S3 store |
+| Time travel: open at a tid, object diff | Could |  | retention stays in phase 6 |
+| Live queries | Could |  | incremental view maintenance; simple queries first |
+| Write-stream anomaly rules | Could |  | thresholds on the feed, auto-fork, alert |
+| Zope-less anonymous read path | Could |  | needs derivations and the security index proven |
+| Learned co-access prefetch | Could |  |  |
+| Admission control and QoS | Could |  | interactive and batch classes |
+| Hot-set snapshots | Could |  | warm a cold client from the server's working set |
+| Containment-clustered layout | Could |  | only with the log backend |
+| Generational pack | Could |  | incremental pack in phase 6 stays single-generation |
+| Continuous backup and point-in-time restore | Could |  | removed from phase 4; repozo-style backup from phase 2 is the roadmap answer |
+| Hash-chained log, TSA anchoring, legal hold | Could |  |  |
+| Crypto-shredding | Could |  | encryption at rest in phase 6 stays |
+| Public anchoring | Could |  | inherits the chain |
+| Inclusion proofs | Could |  | inherits anchoring |
+| Signed commits | Could |  | optional per-connection key |
+| SQL façade | Could |  | waits on the field-store spike; Parquet export in phase 6 stays |
+| Native multi-tenancy | Won't |  | isolation by process and named storages; per-storage quotas stay |
+| Anonymising clone | Won't |  |  |
+| Agent branches with merge-back | Won't |  | agents commit to main |
+| Permission explainer in Loupe | Won't |  |  |
+| Read replicas with session tokens | Won't |  | plain follower reads with bounded staleness stay in phase 4 |
+| Online backend swap | Won't |  | `zoe convert` with a maintenance window |
+| EUDI wallet attestations | Won't |  |  |
+| Actor-tagged transactions | Won't |  |  |
+| Semantic transaction notes | Won't |  |  |
+| Conflict-resolver synthesis | Won't |  | merge policies are hand-written |
+| Index advisor | Won't |  |  |
+| WASM plugins | Won't |  | embedded Python and Rust are the two extension paths |
+| Server-side subtree clone and move | Won't |  |  |
+| Class rename maps on read | Won't |  | `zoe rename-class` stays a one-shot conversion tool |
+| Portable subtree bundles | Won't |  |  |
+| Blocks as CRDT documents | Won't |  |  |
+
+## Project organisation
+
+ZOE is adeweb's project, built on its owner's own time, hardware and accounts; the first production site is a user, not an owner.
+
+| Thing | Decision | Rule |
+| --- | --- | --- |
+| owner | adeweb; the GitHub organisation is `adeweb-be` | nothing from an adopting site (data, credentials, code) enters the repositories; contributions from adopters or anyone else arrive as pull requests under the repository licence |
+| repositories | `adeweb-be/zoe`, the monorepo: `crates/`, `python/zoedb/`, `apps/loupe/`, `deploy/`, `docs/`, `bench/`, `loops/`; `adeweb-be/zoe-bench-results` for the nightly JSON and the dashboard on GitHub Pages | Loupe stays in the monorepo through phase 3 and splits at phase 4 only if frontend contributors need their own cadence; the phase 0 patches to `persistent`, `BTrees` and `zodbpickle` go upstream to zopefoundation from personal forks |
+| tags and versions | `v0.3.0` for the Cargo workspace and the `zoedb` wheel together; `loupe-v0.1.0` for Loupe | semantic versioning; the on-disk format version is independent of the release version |
+| licences | Apache-2.0 for everything, the Plone extra included | the Rust ecosystem's norm; keeps the door open to the Plone Foundation and to any adopter |
+| documentation site | GitHub Pages of `adeweb-be/zoe`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the documenter loop; nothing is hosted on a private domain |
+| data hygiene | test corpora in public CI come from a synthetic Plone site generator; production copies from an adopting site run only on that site's private runner, whose results are posted as numbers, never as data; secret scanning on every push; builders never hold production data | the one rule that survives every retro |
+
+## Process risks and open questions
+
+| Risk | Impact | Mitigation |
+| --- | --- | --- |
+| The human becomes the bottleneck: batches and red-zone reviews wait | agents idle, the project slows to the approver's pace | the digest keeps approval to minutes; red zones are narrow and listed; the planner batches by dependency so one approval unlocks many cards |
+| Agents optimise for the test, not the goal | green acceptance tests on code that misses the point | acceptance tests written before the build and never editable by the builder; the reviewer checks claims against evidence; shadow runs and differential suites judge behaviour, not coverage |
+| Invariants nobody wrote down | reviewers approve changes that break an unstated rule | per-crate invariants files, grown by every retro and every incident |
+| Cost drift | token spend grows faster than merged work | cost per merged card on the dashboard; the daily cap pauses the build loop; rising cost triggers the retro |
+| Production data or credentials leak into a public repository or a CI log | a data breach, and the adopting site's trust | synthetic corpora in public CI; private runner for production copies; secret scanning; builders have no access to production data at all |
+| Single owner | bus factor | the specification, the harness, the ADRs and the loops are the handover; anyone with the repository can restart the machinery |
+
+**Open questions**
+
+- [ ] Which conflict classes dominate the production logs of a real site? A one-week log sample decides the native-merge list before phase 3.
+- [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
+- [ ] Should the async Python client ship with the server in phase 2 for collective.starlette, or later?
+- [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 5 design.
