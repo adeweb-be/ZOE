@@ -40,6 +40,15 @@ pub enum ZoeError {
         oid: Oid,
     },
 
+    /// Another transaction changed an object that this transaction read as
+    /// current, since the serial that this transaction read. This is the
+    /// `ReadConflictError` of ZODB.
+    #[error("read conflict: oid {oid:?}")]
+    ReadConflict {
+        /// The object id that this transaction read as current.
+        oid: Oid,
+    },
+
     /// A lock request is not in ascending oid order. The lock manager
     /// refuses it and takes no lock.
     #[error("lock request out of oid order: oid {oid:?}")]

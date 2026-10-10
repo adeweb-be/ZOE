@@ -1,11 +1,13 @@
 //! The transaction coordinator: the two-phase commit state machine.
 //!
-//! `store` stages records and makes nothing visible. `vote` takes the
-//! per-OID locks in ascending oid order, then detects conflicts before any
-//! disk write. `finish` allocates the tid and writes the records, the
-//! transaction row and the meta update in one backend write transaction,
-//! durable before it returns. `finish` and `abort` release the locks.
-//! Dropping a transaction aborts it.
+//! `store` stages records and makes nothing visible.
+//! `check_current_serial` adds an oid to the read-current set. `vote` takes
+//! the per-OID locks in ascending oid order over the write and read-current
+//! sets together, then detects conflicts before any disk write. `finish`
+//! allocates the tid and writes the records, the transaction row and the
+//! meta update in one backend write transaction, durable before it returns.
+//! `finish` and `abort` release the locks. Dropping a transaction aborts
+//! it.
 
 use std::collections::BTreeMap;
 
@@ -32,6 +34,9 @@ pub struct Txn<'s> {
     description: Vec<u8>,
     extension: Vec<u8>,
     staged: BTreeMap<Oid, Staged>,
+    /// The oids that the transaction read as current, with the serial that
+    /// it read.
+    read_current: BTreeMap<Oid, Tid>,
     /// The locks of a successful vote. The transaction holds them until
     /// `finish` or `abort`.
     locks: Option<Locks<'s>>,
@@ -45,6 +50,7 @@ impl<'s> Txn<'s> {
             description: description.to_vec(),
             extension: extension.to_vec(),
             staged: BTreeMap::new(),
+            read_current: BTreeMap::new(),
             locks: None,
         }
     }
@@ -69,8 +75,23 @@ impl<'s> Txn<'s> {
         Ok(())
     }
 
-    /// Lock the written oids, then check that no other transaction
-    /// changed them since their serial.
+    /// Declare that the transaction read `oid` at `serial` and depends on
+    /// it. This is `checkCurrentSerialInTransaction` of ZODB.
+    ///
+    /// The vote takes a shared lock on `oid` and checks that `serial` is
+    /// still current. A stale serial fails the vote with `ReadConflict`.
+    /// The lock stays until `finish` or `abort`, so no other transaction
+    /// can change `oid` before this one finishes.
+    pub fn check_current_serial(&mut self, oid: Oid, serial: Tid) -> Result<()> {
+        if self.voted() {
+            return Err(ZoeError::Protocol("check_current_serial after vote"));
+        }
+        self.read_current.insert(oid, serial);
+        Ok(())
+    }
+
+    /// Lock the written and the read-current oids, then check that no
+    /// other transaction changed them since their serial.
     ///
     /// The vote waits for a lock that another transaction holds, at most
     /// the lock timeout of the store. A longer wait fails with `Conflict`.
@@ -90,20 +111,29 @@ impl<'s> Txn<'s> {
     }
 
     /// Return the lock requests of the vote in ascending oid order: an
-    /// exclusive lock for each written oid.
+    /// exclusive lock for each written oid, and a shared lock for each other
+    /// read-current oid.
     fn lock_requests(&self) -> Vec<(Oid, Mode)> {
-        self.staged
+        let mut requests: BTreeMap<Oid, Mode> = self
+            .read_current
             .keys()
-            .map(|&oid| (oid, Mode::Exclusive))
-            .collect()
+            .map(|&oid| (oid, Mode::Shared))
+            .collect();
+        requests.extend(self.staged.keys().map(|&oid| (oid, Mode::Exclusive)));
+        requests.into_iter().collect()
     }
 
-    /// Check that the current serial of each written oid is the serial
-    /// that the client read.
+    /// Check that the current serial of each written oid and of each
+    /// read-current oid is the serial that the client read.
     fn check_serials(&self) -> Result<()> {
         for (&oid, staged) in &self.staged {
             if self.current_serial(oid)? != staged.serial {
                 return Err(ZoeError::Conflict { oid });
+            }
+        }
+        for (&oid, &serial) in &self.read_current {
+            if self.current_serial(oid)? != serial {
+                return Err(ZoeError::ReadConflict { oid });
             }
         }
         Ok(())

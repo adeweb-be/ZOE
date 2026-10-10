@@ -324,6 +324,104 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_transaction_releases_its_locks() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.check_current_serial(Oid(oid.0 + 1), Tid::ZERO).unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        assert!(!store.locks.is_empty());
+        drop(txn);
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_lock_timeout_in_vote_releases_every_lock() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        // The vote takes the lock on `low`, then waits for `high`.
+        let mut waiter = store.tpc_begin(b"", b"", b"").unwrap();
+        waiter.check_current_serial(low, Tid::ZERO).unwrap();
+        waiter.store(high, Tid::ZERO, b"b").unwrap();
+        let error = waiter.vote();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+            "{error:?}"
+        );
+
+        // The lock on `low` is free.
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other.store(low, Tid::ZERO, b"c").unwrap();
+        other.vote().unwrap();
+        other.abort();
+        holder.abort();
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn an_oid_read_and_written_takes_an_exclusive_lock() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let oid = store.new_oid().unwrap();
+        let mut writer = store.tpc_begin(b"", b"", b"").unwrap();
+        writer.check_current_serial(oid, Tid::ZERO).unwrap();
+        writer.store(oid, Tid::ZERO, b"a").unwrap();
+        writer.vote().unwrap();
+
+        let mut reader = store.tpc_begin(b"", b"", b"").unwrap();
+        reader.check_current_serial(oid, Tid::ZERO).unwrap();
+        assert!(matches!(reader.vote(), Err(ZoeError::Conflict { .. })));
+        writer.finish().unwrap();
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_stale_written_serial_wins_over_a_stale_read_serial() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let mut create = store.tpc_begin(b"", b"", b"").unwrap();
+        create.store(low, Tid::ZERO, b"a").unwrap();
+        create.store(high, Tid::ZERO, b"a").unwrap();
+        create.vote().unwrap();
+        create.finish().unwrap();
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.check_current_serial(low, Tid::ZERO).unwrap();
+        txn.store(high, Tid::ZERO, b"b").unwrap();
+        let error = txn.vote();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+            "{error:?}"
+        );
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn calls_after_the_vote_are_refused() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        assert!(matches!(txn.vote(), Err(ZoeError::Protocol(_))));
+        assert!(matches!(
+            txn.store(oid, Tid::ZERO, b"b"),
+            Err(ZoeError::Protocol(_))
+        ));
+        assert!(matches!(
+            txn.check_current_serial(oid, Tid::ZERO),
+            Err(ZoeError::Protocol(_))
+        ));
+        txn.finish().unwrap();
+    }
+
+    #[test]
     fn oids_continue_after_a_reopen() {
         let vfs = MemVfs::new();
         let last = {
