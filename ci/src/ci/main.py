@@ -5,6 +5,9 @@ from dagger import DefaultPath, Doc, Ignore, dag, function, object_type
 
 NIX_IMAGE = "nixos/nix:2.35.2"
 
+# The PostgreSQL of the RelStorage baseline.
+POSTGRES_IMAGE = "postgres:17.10-alpine"
+
 # The devenv release that reads devenv.yaml and devenv.lock. Keep it equal
 # to the devenv version of the developers.
 DEVENV = "github:cachix/devenv/v1.10"
@@ -110,9 +113,40 @@ class Ci:
         return await self.recipe(source, "plone").stdout()
 
     @function
-    async def bench(self, source: Source) -> str:
-        """Run the benchmarks. Not built yet."""
-        return await self.recipe(source, "bench").stdout()
+    def bench(
+        self,
+        source: Source,
+        quick: Annotated[
+            bool, Doc("Run the quick set instead of the full set")
+        ] = False,
+        commit: Annotated[str, Doc("The commit to record in the results")] = "",
+    ) -> dagger.Directory:
+        """Run the harness tests and the zodbshootout baseline.
+
+        Return the results tree, in the layout of the results repository.
+        """
+        postgres = (
+            dag.container()
+            .from_(POSTGRES_IMAGE)
+            # The service is reachable only inside this pipeline.
+            .with_env_variable("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_env_variable("POSTGRES_DB", "zoe_bench")
+            .with_exposed_port(5432)
+            .as_service()
+        )
+        run = ["devenv", "shell", "--", "just", "bench", "run", "--output", "/results"]
+        return (
+            self.devenv(source)
+            .with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
+            .with_service_binding("postgres", postgres)
+            .with_env_variable(
+                "ZOE_BENCH_PG_DSN", "host=postgres dbname=zoe_bench user=postgres"
+            )
+            .with_env_variable("ZOE_BENCH_COMMIT", commit)
+            .with_exec(["devenv", "shell", "--", "just", "bench", "test"])
+            .with_exec(run + (["--quick"] if quick else []))
+            .directory("/results")
+        )
 
     @function
     async def crash(self, source: Source) -> str:
