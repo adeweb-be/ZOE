@@ -76,7 +76,9 @@ fn the_files_follow_zodb_bushy_layout() {
 
     let blobs = dir.join("blobs");
     assert_eq!(
-        std::fs::read_to_string(blobs.join(".layout")).unwrap().trim(),
+        std::fs::read_to_string(blobs.join(".layout"))
+            .unwrap()
+            .trim(),
         "bushy"
     );
     let mut expected = blobs.clone();
@@ -147,7 +149,10 @@ fn a_crash_leaves_no_blob_without_record_and_no_record_without_blob() {
                 assert_eq!(read_blob(&store, oid, tid).unwrap(), bytes, "{image:?}");
             }
             Err(ZoeError::NotFound { .. }) => {
-                assert!(!image.is_after("acknowledged"), "{image:?} lost a blob commit");
+                assert!(
+                    !image.is_after("acknowledged"),
+                    "{image:?} lost a blob commit"
+                );
                 // Opening removed any blob file whose record is missing.
                 assert!(
                     image_vfs
