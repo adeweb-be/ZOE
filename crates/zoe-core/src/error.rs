@@ -24,6 +24,27 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// Another transaction changed the object since the serial that this
+    /// transaction read, or held its lock past the lock timeout.
+    #[error("conflict: oid {oid:?}")]
+    Conflict {
+        /// The object id in conflict.
+        oid: Oid,
+    },
+
+    /// A two-phase commit call came out of order, for example `finish`
+    /// before `vote`.
+    #[error("two-phase commit out of order: {0}")]
+    Protocol(&'static str),
+
+    /// Another process holds the lock of the store.
+    #[error("the store is locked by another process")]
+    Locked,
+
+    /// The store is not in a format that this code reads.
+    #[error("unknown store format: {0}")]
+    Format(String),
+
     /// The backend failed.
     #[error("backend error: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),

@@ -1,0 +1,252 @@
+//! The redb backend.
+//!
+//! Three tables hold the key spaces of the data model: `records`, `txns`
+//! and `meta`. `format` says how keys and values are written.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+use crate::backend::{
+    Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
+};
+use crate::error::{Result, ZoeError};
+use crate::format;
+use crate::types::{Oid, Tid};
+
+const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
+const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+const META_FORMAT: &str = "format";
+const META_LAST_TID: &str = "last_tid";
+const META_NEXT_OID: &str = "next_oid";
+
+/// Wrap a redb error.
+fn backend(error: impl Into<redb::Error>) -> ZoeError {
+    ZoeError::Backend(Box::new(error.into()))
+}
+
+/// A store in one redb database.
+pub(crate) struct RedbBackend {
+    db: Database,
+    last_tid: AtomicU64,
+}
+
+impl RedbBackend {
+    /// Write the tables and the `meta` rows of an empty store.
+    pub(crate) fn initialise(db: &Database) -> Result<()> {
+        let txn = db.begin_write().map_err(backend)?;
+        {
+            txn.open_table(RECORDS).map_err(backend)?;
+            txn.open_table(TXNS).map_err(backend)?;
+            let mut meta = txn.open_table(META).map_err(backend)?;
+            meta.insert(META_FORMAT, format::FORMAT_NAME)
+                .map_err(backend)?;
+            meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
+                .map_err(backend)?;
+            meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .map_err(backend)?;
+        }
+        txn.commit().map_err(backend)
+    }
+
+    /// Open a store that `initialise` wrote, and check its format.
+    pub(crate) fn open(db: Database) -> Result<Self> {
+        let last_tid = {
+            let txn = db.begin_read().map_err(backend)?;
+            let meta = txn.open_table(META).map_err(backend)?;
+            let read = |key: &str| -> Result<Option<Vec<u8>>> {
+                Ok(meta.get(key).map_err(backend)?.map(|v| v.value().to_vec()))
+            };
+            let format_name = read(META_FORMAT)?.unwrap_or_default();
+            if format_name != format::FORMAT_NAME {
+                return Err(ZoeError::Format(
+                    String::from_utf8_lossy(&format_name).into_owned(),
+                ));
+            }
+            read(META_LAST_TID)?
+                .as_deref()
+                .and_then(format::decode_u64)
+                .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?
+        };
+        Ok(Self {
+            db,
+            last_tid: AtomicU64::new(last_tid),
+        })
+    }
+
+    /// Return the next oid that no committed record uses.
+    pub(crate) fn next_oid(&self) -> Result<Oid> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let meta = txn.open_table(META).map_err(backend)?;
+        let value = meta.get(META_NEXT_OID).map_err(backend)?;
+        value
+            .and_then(|v| format::decode_u64(v.value()))
+            .map(Oid)
+            .ok_or_else(|| ZoeError::Format("no next oid".to_owned()))
+    }
+
+    /// Read the record frame stored under `key` for `oid`.
+    fn record(oid: Oid, key: &[u8; 16], bytes: &[u8]) -> Result<Record> {
+        let (_, tid) = format::split_record_key(key);
+        let frame =
+            format::decode_frame(bytes).map_err(|_| ZoeError::CorruptRecord { oid, tid })?;
+        Ok(Record {
+            tid,
+            prev: frame.prev,
+            data: frame.payload.to_vec(),
+        })
+    }
+}
+
+impl Backend for RedbBackend {
+    fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let start = format::record_key(oid, Tid::ZERO);
+        let end = format::record_key(oid, tid);
+        let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
+        match range.next_back() {
+            Some(entry) => {
+                let (key, value) = entry.map_err(backend)?;
+                Self::record(oid, key.value(), value.value()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let key = format::record_key(oid, tid);
+        match records.get(&key).map_err(backend)? {
+            Some(value) => Ok(Some(Self::record(oid, &key, value.value())?.data)),
+            None => Ok(None),
+        }
+    }
+
+    fn last_tid(&self) -> Tid {
+        Tid(self.last_tid.load(Ordering::Acquire))
+    }
+
+    fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>> {
+        Ok(Box::new(RedbWrite {
+            txn: self.db.begin_write().map_err(backend)?,
+            last_tid: &self.last_tid,
+            written_tid: None,
+            max_oid: None,
+        }))
+    }
+
+    fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
+        let read = || -> Result<Vec<Result<TxnMeta>>> {
+            let txn = self.db.begin_read().map_err(backend)?;
+            let txns = txn.open_table(TXNS).map_err(backend)?;
+            let (start, end) = (format::txn_key(from), format::txn_key(to));
+            let mut rows = Vec::new();
+            for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
+                let (key, value) = entry.map_err(backend)?;
+                let tid = Tid(u64::from_be_bytes(*key.value()));
+                let corrupt = ZoeError::CorruptRecord { oid: Oid(0), tid };
+                let row = format::decode_frame(value.value())
+                    .and_then(|frame| format::decode_txn(tid, frame.payload))
+                    .map_err(|_| corrupt);
+                rows.push(row);
+            }
+            Ok(rows)
+        };
+        match read() {
+            Ok(rows) => Box::new(rows.into_iter()),
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
+    }
+
+    fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let start = format::record_key(oid, Tid::ZERO);
+        let end = format::record_key(oid, Tid::MAX);
+        let mut history = Vec::new();
+        for entry in records
+            .range::<&[u8; 16]>(&start..=&end)
+            .map_err(backend)?
+            .rev()
+            .take(limit)
+        {
+            let (key, value) = entry.map_err(backend)?;
+            let record = Self::record(oid, key.value(), value.value())?;
+            history.push(RecordMeta {
+                tid: record.tid,
+                prev: record.prev,
+                size: record.data.len() as u64,
+            });
+        }
+        Ok(history)
+    }
+
+    fn pack(&self, _before: Tid, _reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
+        Err(ZoeError::Backend("pack is not built yet".into()))
+    }
+
+    fn sync(&self) -> Result<()> {
+        // Every commit is durable when it returns, so there is nothing to
+        // flush.
+        Ok(())
+    }
+}
+
+/// One redb write transaction.
+struct RedbWrite<'a> {
+    txn: redb::WriteTransaction,
+    last_tid: &'a AtomicU64,
+    written_tid: Option<Tid>,
+    max_oid: Option<Oid>,
+}
+
+impl WriteTxn for RedbWrite<'_> {
+    fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
+        let frame = format::encode_frame(format::MAIN_BRANCH, prev, data);
+        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        records
+            .insert(&format::record_key(oid, tid), frame.as_slice())
+            .map_err(backend)?;
+        self.max_oid = self.max_oid.max(Some(oid));
+        Ok(())
+    }
+
+    fn put_txn(&mut self, meta: &TxnMeta) -> Result<()> {
+        debug_assert_eq!(meta.status, TxnStatus::Committed);
+        let frame = format::encode_frame(format::MAIN_BRANCH, Tid::ZERO, &format::encode_txn(meta));
+        let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
+        txns.insert(&format::txn_key(meta.tid), frame.as_slice())
+            .map_err(backend)?;
+        self.written_tid = Some(meta.tid);
+        Ok(())
+    }
+
+    fn commit(self: Box<Self>) -> Result<()> {
+        {
+            let mut meta = self.txn.open_table(META).map_err(backend)?;
+            if let Some(tid) = self.written_tid {
+                meta.insert(META_LAST_TID, &format::encode_u64(tid.0)[..])
+                    .map_err(backend)?;
+            }
+            if let Some(oid) = self.max_oid {
+                let stored = meta
+                    .get(META_NEXT_OID)
+                    .map_err(backend)?
+                    .and_then(|v| format::decode_u64(v.value()))
+                    .unwrap_or(1);
+                let next = stored.max(oid.0 + 1);
+                meta.insert(META_NEXT_OID, &format::encode_u64(next)[..])
+                    .map_err(backend)?;
+            }
+        }
+        self.txn.commit().map_err(backend)?;
+        if let Some(tid) = self.written_tid {
+            self.last_tid.store(tid.0, Ordering::Release);
+        }
+        Ok(())
+    }
+}

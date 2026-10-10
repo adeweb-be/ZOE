@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 redb.workspace = true
 thiserror.workspace = true
+xxhash-rust.workspace = true
 
 [lints]
 workspace = true

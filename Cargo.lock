@@ -165,6 +165,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "zoe-bench"
 version = "0.0.0"
 
@@ -186,6 +192,7 @@ version = "0.0.0"
 dependencies = [
  "redb",
  "thiserror",
+ "xxhash-rust",
 ]
 
 [[package]]

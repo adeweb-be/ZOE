@@ -23,3 +23,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0017](0017-names-zoedb-and-zoe.md) | The distribution is zoedb; every identifier uses the stem zoe |
 | [0018](0018-board-and-trunk.md) | GitHub Issues and Projects are the board; trunk-based development |
 | [0019](0019-mvcc-through-the-adapter.md) | MVCC in-process through ZODB's MVCCAdapter |
+| [0020](0020-record-frame.md) | The record frame |

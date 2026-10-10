@@ -1,18 +1,109 @@
-//! The simulated filesystem of the crash tests.
+//! The directory of a store, and the simulated filesystem of the crash
+//! tests.
 //!
-//! `MemVfs` keeps its files in memory and records every write, length
-//! change and sync. `MemVfs::crash_images` replays that record and returns
-//! the states that a crash can leave on disk. A redb database runs on a
-//! `MemFile`, so a test can crash a whole store after every operation.
+//! The core reaches the files of a store only through the `Vfs` trait.
+//! `OsVfs` is a directory of the operating system. `MemVfs` keeps its
+//! files in memory and records every write, length change, sync and
+//! directory change. `MemVfs::crash_images` replays that record and returns
+//! the states that a crash can leave on disk.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::error::{Result, ZoeError};
+
+/// The directory of a store, as the core sees it.
+pub trait Vfs: Send + Sync + 'static {
+    /// An open file. redb stores its database in one.
+    type File: redb::StorageBackend;
+
+    /// Tell if the file `name` exists.
+    fn exists(&self, name: &str) -> io::Result<bool>;
+
+    /// Open the file `name`. Create it empty when it does not exist.
+    fn open(&self, name: &str) -> io::Result<Self::File>;
+
+    /// Rename the file `from` to `to`, and replace `to` if it exists.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+
+    /// Remove the file `name`.
+    fn remove(&self, name: &str) -> io::Result<()>;
+
+    /// Make the creations, renames and removals in the directory durable.
+    fn sync_dir(&self) -> io::Result<()>;
+}
+
+/// A directory of the operating system.
+///
+/// It holds an exclusive lock on the file `lock` in the directory while it
+/// exists, so that only one process writes the store.
+#[derive(Debug)]
+pub struct OsVfs {
+    dir: PathBuf,
+    _lock: File,
+}
+
+impl OsVfs {
+    /// Open the directory `dir`, create it if necessary, and take the lock.
+    pub fn new(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Self {
+                dir: dir.to_owned(),
+                _lock: lock,
+            }),
+            Err(TryLockError::WouldBlock) => Err(ZoeError::Locked),
+            Err(TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+}
+
+impl Vfs for OsVfs {
+    type File = redb::backends::FileBackend;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        fs::exists(self.dir.join(name))
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join(name))?;
+        redb::backends::FileBackend::new(file).map_err(io::Error::other)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        fs::rename(self.dir.join(from), self.dir.join(to))
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        fs::remove_file(self.dir.join(name))
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        File::open(&self.dir)?.sync_all()
+    }
+}
 
 /// One recorded operation.
 #[derive(Clone, Debug)]
 enum Op {
+    Create {
+        file: String,
+    },
     Write {
         file: String,
         offset: u64,
@@ -25,6 +116,14 @@ enum Op {
     Sync {
         file: String,
     },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Remove {
+        file: String,
+    },
+    SyncDir,
     Mark {
         name: String,
     },
@@ -42,7 +141,8 @@ struct State {
 
 /// An in-memory filesystem that records every operation.
 ///
-/// Clones share the same files and the same record.
+/// Clones share the same files and the same record. The files that exist
+/// when the record starts are durable.
 #[derive(Clone, Debug, Default)]
 pub struct MemVfs {
     state: Arc<Mutex<State>>,
@@ -70,8 +170,15 @@ impl MemVfs {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Return the file `name`. The file is empty until something writes it.
+    /// Return the file `name`. Create it empty when it does not exist.
     pub fn file(&self, name: &str) -> MemFile {
+        let mut state = self.lock();
+        if !state.files.contains_key(name) {
+            state.files.insert(name.to_owned(), Vec::new());
+            state.log.push(Op::Create {
+                file: name.to_owned(),
+            });
+        }
         MemFile {
             vfs: self.clone(),
             name: name.to_owned(),
@@ -89,9 +196,12 @@ impl MemVfs {
     /// Return the states that a crash can leave on disk.
     ///
     /// For every crash point (after 0, 1, ... n operations), the synced
-    /// operations are on disk. The pending operations (not followed by a
-    /// sync of their file) can be on disk or not, in any subset: all, none,
-    /// each prefix, each single one, and the last one torn in half.
+    /// operations are on disk. A write or a length change is synced by a
+    /// later sync of its file; a creation, a rename or a removal by a later
+    /// sync of the directory. The pending operations can be on disk or not,
+    /// in any subset: all, none, each prefix, each single one, and the last
+    /// write torn in half. A write to a file whose creation is not on disk
+    /// is lost.
     pub fn crash_images(&self) -> Vec<CrashImage> {
         let state = self.lock();
         let mut images = Vec::new();
@@ -105,59 +215,126 @@ impl MemVfs {
                     _ => None,
                 })
                 .collect();
-            let base = apply(&state.initial, ops, &synced, None);
-            let mut push = |variant: Variant, files| {
+            let mut push = |variant: Variant, chosen: &[usize], torn: Option<usize>| {
+                let mut which: Vec<usize> = synced.iter().chain(chosen).copied().collect();
+                which.sort_unstable();
                 images.push(CrashImage {
                     point,
                     variant,
                     marks: marks.clone(),
-                    files,
+                    files: apply(&state.initial, ops, &which, torn),
                 });
             };
 
-            push(Variant::SyncedOnly, base.clone());
+            push(Variant::SyncedOnly, &[], None);
             if pending.is_empty() {
                 continue;
             }
-            push(Variant::AllPending, apply(&base, ops, &pending, None));
+            push(Variant::AllPending, &pending, None);
             for n in 1..pending.len() {
-                push(
-                    Variant::PendingPrefix(n),
-                    apply(&base, ops, &pending[..n], None),
-                );
+                push(Variant::PendingPrefix(n), &pending[..n], None);
             }
             if pending.len() > 1 {
                 for &i in &pending {
-                    push(Variant::OnlyPending(i), apply(&base, ops, &[i], None));
+                    push(Variant::OnlyPending(i), &[i], None);
                 }
             }
             if let Some(&last) = pending.last()
                 && matches!(&ops[last], Op::Write { data, .. } if data.len() > 1)
             {
-                push(Variant::Torn(last), apply(&base, ops, &pending, Some(last)));
+                push(Variant::Torn(last), &pending, Some(last));
             }
         }
         images
     }
+
+    fn exists(&self, name: &str) -> bool {
+        self.lock().files.contains_key(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        let bytes = state
+            .files
+            .remove(from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, from.to_owned()))?;
+        state.files.insert(to.to_owned(), bytes);
+        state.log.push(Op::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state
+            .files
+            .remove(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?;
+        state.log.push(Op::Remove {
+            file: name.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn sync_dir(&self) {
+        self.lock().log.push(Op::SyncDir);
+    }
 }
 
-/// Split the indexes of the file operations in `ops` into the synced ones
-/// and the pending ones.
+impl Vfs for MemVfs {
+    type File = MemFile;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        Ok(MemVfs::exists(self, name))
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        Ok(self.file(name))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        MemVfs::rename(self, from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        MemVfs::remove(self, name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        MemVfs::sync_dir(self);
+        Ok(())
+    }
+}
+
+/// Split the indexes of the file and directory operations in `ops` into
+/// the synced ones and the pending ones.
 fn split_at_syncs(ops: &[Op]) -> (Vec<usize>, Vec<usize>) {
     let mut last_sync: HashMap<&str, usize> = HashMap::new();
+    let mut last_dir_sync = None;
     for (i, op) in ops.iter().enumerate() {
-        if let Op::Sync { file } = op {
-            last_sync.insert(file, i);
+        match op {
+            Op::Sync { file } => {
+                last_sync.insert(file, i);
+            }
+            Op::SyncDir => last_dir_sync = Some(i),
+            _ => {}
         }
     }
     let mut synced = Vec::new();
     let mut pending = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        let file = match op {
-            Op::Write { file, .. } | Op::SetLen { file, .. } => file,
-            Op::Sync { .. } | Op::Mark { .. } => continue,
+        let is_synced = match op {
+            Op::Write { file, .. } | Op::SetLen { file, .. } => {
+                last_sync.get(file.as_str()).is_some_and(|&s| i < s)
+            }
+            Op::Create { .. } | Op::Rename { .. } | Op::Remove { .. } => {
+                last_dir_sync.is_some_and(|s| i < s)
+            }
+            Op::Sync { .. } | Op::SyncDir | Op::Mark { .. } => continue,
         };
-        if last_sync.get(file.as_str()).is_some_and(|&s| i < s) {
+        if is_synced {
             synced.push(i);
         } else {
             pending.push(i);
@@ -177,21 +354,33 @@ fn apply(
     let mut files = files.clone();
     for &i in which {
         match &ops[i] {
+            Op::Create { file } => {
+                files.entry(file.clone()).or_default();
+            }
             Op::Write { file, offset, data } => {
                 let data = if torn == Some(i) {
                     &data[..data.len() / 2]
                 } else {
                     &data[..]
                 };
-                write_at(files.entry(file.clone()).or_default(), *offset, data);
+                if let Some(bytes) = files.get_mut(file) {
+                    write_at(bytes, *offset, data);
+                }
             }
             Op::SetLen { file, len } => {
-                files
-                    .entry(file.clone())
-                    .or_default()
-                    .resize(to_usize(*len), 0);
+                if let Some(bytes) = files.get_mut(file) {
+                    bytes.resize(to_usize(*len), 0);
+                }
             }
-            Op::Sync { .. } | Op::Mark { .. } => {}
+            Op::Rename { from, to } => {
+                if let Some(bytes) = files.remove(from) {
+                    files.insert(to.clone(), bytes);
+                }
+            }
+            Op::Remove { file } => {
+                files.remove(file);
+            }
+            Op::Sync { .. } | Op::SyncDir | Op::Mark { .. } => {}
         }
     }
     files
@@ -337,79 +526,119 @@ mod tests {
 
     use super::*;
 
-    fn contents(image: &CrashImage, name: &str) -> Vec<u8> {
-        image.files.get(name).cloned().unwrap_or_default()
+    fn contents(image: &CrashImage, name: &str) -> Option<Vec<u8>> {
+        image.files.get(name).cloned()
+    }
+
+    /// Return a filesystem with a durable, empty file `f`.
+    fn with_file() -> (MemVfs, MemFile) {
+        let vfs = MemVfs::new();
+        let file = vfs.file("f");
+        vfs.sync_dir();
+        (vfs, file)
     }
 
     #[test]
     fn synced_writes_are_in_every_later_image() {
-        let vfs = MemVfs::new();
-        let file = vfs.file("f");
+        let (vfs, file) = with_file();
         file.write(0, b"synced").unwrap();
         file.sync_data().unwrap();
+        vfs.mark("synced");
         file.write(6, b"+pending").unwrap();
 
         let images = vfs.crash_images();
-        let after_sync: Vec<_> = images.iter().filter(|i| i.point >= 2).collect();
+        let after: Vec<_> = images.iter().filter(|i| i.is_after("synced")).collect();
         assert!(
-            after_sync
+            after
                 .iter()
-                .all(|i| contents(i, "f").starts_with(b"synced"))
+                .all(|i| contents(i, "f").unwrap().starts_with(b"synced"))
         );
-        assert!(after_sync.iter().any(|i| contents(i, "f") == b"synced"));
+        assert!(after.iter().any(|i| contents(i, "f").unwrap() == b"synced"));
         assert!(
-            after_sync
+            after
                 .iter()
-                .any(|i| contents(i, "f") == b"synced+pending")
+                .any(|i| contents(i, "f").unwrap() == b"synced+pending")
         );
     }
 
     #[test]
     fn a_pending_write_can_land_without_an_earlier_one() {
-        let vfs = MemVfs::new();
-        let file = vfs.file("f");
+        let (vfs, file) = with_file();
         file.write(0, b"a").unwrap();
         file.write(1, b"b").unwrap();
 
         let images = vfs.crash_images();
-        assert!(images.iter().any(|i| contents(i, "f") == b"\0b"));
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(&b"\0b"[..]))
+        );
     }
 
     #[test]
     fn a_torn_write_keeps_its_first_half() {
-        let vfs = MemVfs::new();
-        vfs.file("f").write(0, b"abcd").unwrap();
+        let (vfs, file) = with_file();
+        file.write(0, b"abcd").unwrap();
 
         let images = vfs.crash_images();
-        assert!(images.iter().any(|i| contents(i, "f") == b"ab"));
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(&b"ab"[..]))
+        );
+    }
+
+    #[test]
+    fn a_file_without_a_directory_sync_can_vanish() {
+        let vfs = MemVfs::new();
+        let file = vfs.file("f");
+        file.write(0, b"x").unwrap();
+        file.sync_data().unwrap();
+
+        let images = vfs.crash_images();
+        assert!(images.iter().any(|i| contents(i, "f").is_none()));
+        assert!(
+            images
+                .iter()
+                .any(|i| contents(i, "f").as_deref() == Some(b"x"))
+        );
+    }
+
+    #[test]
+    fn a_rename_is_durable_after_a_directory_sync() {
+        let (vfs, file) = with_file();
+        file.write(0, b"x").unwrap();
+        file.sync_data().unwrap();
+        vfs.rename("f", "g").unwrap();
+        vfs.sync_dir();
+        vfs.mark("renamed");
+
+        let images = vfs.crash_images();
+        let before: Vec<_> = images.iter().filter(|i| !i.is_after("renamed")).collect();
+        assert!(before.iter().any(|i| contents(i, "f").is_some()));
+        assert!(before.iter().any(|i| contents(i, "g").is_some()));
+        for image in images.iter().filter(|i| i.is_after("renamed")) {
+            assert_eq!(contents(image, "f"), None);
+            assert_eq!(contents(image, "g").as_deref(), Some(&b"x"[..]));
+        }
     }
 
     #[test]
     fn marks_split_the_images() {
-        let vfs = MemVfs::new();
-        vfs.file("f").write(0, b"x").unwrap();
+        let (vfs, file) = with_file();
+        file.write(0, b"x").unwrap();
         vfs.mark("done");
-        vfs.file("f").write(1, b"y").unwrap();
+        file.write(1, b"y").unwrap();
 
         let images = vfs.crash_images();
-        assert!(
-            images
-                .iter()
-                .filter(|i| i.point <= 1)
-                .all(|i| !i.is_after("done"))
-        );
-        assert!(
-            images
-                .iter()
-                .filter(|i| i.point >= 2)
-                .all(|i| i.is_after("done"))
-        );
+        let first_after = images.iter().position(|i| i.is_after("done")).unwrap();
+        assert!(images[..first_after].iter().all(|i| !i.is_after("done")));
+        assert!(images[first_after..].iter().all(|i| i.is_after("done")));
     }
 
     #[test]
     fn an_image_starts_a_fresh_record() {
-        let vfs = MemVfs::new();
-        let file = vfs.file("f");
+        let (vfs, file) = with_file();
         file.write(0, b"x").unwrap();
         file.sync_data().unwrap();
 

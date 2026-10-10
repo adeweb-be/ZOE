@@ -13,4 +13,8 @@ impl Tid {
     /// The tid before every transaction. A client gives it as the serial
     /// when it stores a new object.
     pub const ZERO: Tid = Tid(0);
+
+    /// The tid after every transaction. `loadBefore` with it loads the
+    /// current record.
+    pub const MAX: Tid = Tid(u64::MAX);
 }
