@@ -25,6 +25,41 @@ test:
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
     done
 
+# Run the zoe-core tests under ThreadSanitizer. Then run the canary test,
+# which holds a deliberate data race, and pass only when ThreadSanitizer
+# reports it. The build goes to target/tsan, apart from the normal build.
+tsan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # RUSTC_BOOTSTRAP lets the pinned stable toolchain accept the unstable
+    # flags. -Zbuild-std rebuilds the standard library with the sanitizer
+    # from the rust-src component.
+    export RUSTC_BOOTSTRAP=1
+    export RUSTFLAGS="-Zsanitizer=thread"
+    export RUSTDOCFLAGS="-Zsanitizer=thread"
+    tsan=(cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+        --target-dir target/tsan --locked -p zoe-core)
+    "${tsan[@]}"
+    echo "== The canary test must make ThreadSanitizer report a data race"
+    log=target/tsan/canary.log
+    status=0
+    "${tsan[@]}" --test tsan_canary -- --ignored --exact \
+        a_deliberate_data_race_is_reported >"$log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        cat "$log"
+        echo "just tsan: the canary test exited clean, so ThreadSanitizer is off." >&2
+        exit 1
+    fi
+    # The stack of the report must name the canary test.
+    if ! grep -q 'WARNING: ThreadSanitizer: data race' "$log" \
+        || ! grep -q 'tsan_canary::a_deliberate_data_race_is_reported' "$log"; then
+        cat "$log"
+        echo "just tsan: ThreadSanitizer did not report the race of the canary test." >&2
+        exit 1
+    fi
+    grep '^SUMMARY: ThreadSanitizer' "$log"
+    echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
+
 # Run the ZODB and ZEO conformance suites.
 conformance:
     @echo "just conformance: runs ZODB.tests in-process and ZEO.tests against zoe serve. Not built yet."

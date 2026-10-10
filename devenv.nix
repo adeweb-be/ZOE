@@ -22,6 +22,7 @@ in
     enable = true;
     channel = "stable";
     version = "1.99.0";
+    # `just tsan` rebuilds the standard library from rust-src.
     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-src" ];
   };
 
