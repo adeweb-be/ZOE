@@ -7,14 +7,21 @@
 //! owns bytes, behind the [`Backend`] trait.
 
 mod backend;
+mod clock;
 mod commit;
 mod error;
 mod format;
 mod lock;
+mod redb_backend;
+mod store;
 mod types;
+pub mod vfs;
 
 pub use backend::{
     Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
 };
+pub use clock::{Clock, SystemClock, timestamp};
+pub use commit::Txn;
 pub use error::{Result, ZoeError};
+pub use store::Store;
 pub use types::{Oid, Tid};

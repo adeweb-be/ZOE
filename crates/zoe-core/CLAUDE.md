@@ -30,4 +30,7 @@ Red zones in this crate: `src/commit/`, `src/lock/`, `src/format/`.
 - Pack never blocks readers. Writers pause only for the final meta update. A blob file is deleted after its record.
 - A blob file is immutable per `(oid, tid)`. `storeBlob` renames the file into place inside `tpc_finish`.
 - Nothing is undoable past the last pack.
+- A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename.
+- `next_oid` in `meta` is always greater than every committed oid.
+- The core reads the time only through the `Clock` trait and the filesystem only through the `Vfs` trait, so the crash simulation and the deterministic simulator can replace them.
 - A change to the `Backend` or `WriteTxn` signatures is a stop-and-ask: other crates implement and call them.

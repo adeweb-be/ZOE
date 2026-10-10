@@ -13,7 +13,9 @@ publish = false
 [workspace.dependencies]
 zoe-core = { path = "crates/zoe-core" }
 pyo3 = "0.29"
+redb = "4.3"
 thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

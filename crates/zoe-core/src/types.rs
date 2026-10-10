@@ -8,3 +8,13 @@ pub struct Oid(pub u64);
 /// increases. The serial of a record is the tid that wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tid(pub u64);
+
+impl Tid {
+    /// The tid before every transaction. A client gives it as the serial
+    /// when it stores a new object.
+    pub const ZERO: Tid = Tid(0);
+
+    /// The tid after every transaction. `loadBefore` with it loads the
+    /// current record.
+    pub const MAX: Tid = Tid(u64::MAX);
+}
