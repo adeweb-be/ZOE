@@ -101,7 +101,9 @@ impl Vfs for OsVfs {
 /// Create `dir` and its missing parents, one level at a time.
 ///
 /// Each new directory and its parent are synced, so a power loss cannot
-/// remove a directory that holds a durable store.
+/// remove a directory that holds a durable store. `dir` and its parent are
+/// synced also when `dir` exists: a run that stopped before its sync can
+/// leave a directory that is not durable.
 fn create_dir_durable(dir: &Path) -> io::Result<()> {
     let missing: Vec<&Path> = dir
         .ancestors()
@@ -114,14 +116,19 @@ fn create_dir_durable(dir: &Path) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
             Err(e) => return Err(e),
         }
-        File::open(path)?.sync_all()?;
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        File::open(parent)?.sync_all()?;
+        sync_with_parent(path)?;
     }
-    Ok(())
+    sync_with_parent(dir)
+}
+
+/// Sync the directory `path`, then its parent.
+fn sync_with_parent(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
 }
 
 /// The most pending operations for which `MemVfs::crash_images` makes an

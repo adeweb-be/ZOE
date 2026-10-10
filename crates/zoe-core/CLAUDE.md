@@ -25,6 +25,7 @@ Red zones in this crate: `src/commit/`, `src/lock/`, `src/format/`.
 - One thread drives a transaction from `tpc_begin` to `tpc_finish` or `tpc_abort`. A call from another thread is refused with `WrongThread`.
 - The lock manager and group commit are the only shared mutable state. The core is `Send + Sync`.
 - Every read verifies the record checksum. A mismatch raises `CorruptRecord` with the oid and the tid, never `POSKeyError`.
+- An error in `finish` leaves the outcome unknown until the store is reopened. Until then, every later finish is refused with `Halted`.
 - Every record carries a codec byte, a branch id and a typed-field-slot header. Every blob record carries its BLAKE3 hash. This holds from the first store written.
 - `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` before anything is written.
 - Pack never blocks readers. Writers pause only for the final meta update. A blob file is deleted after its record.

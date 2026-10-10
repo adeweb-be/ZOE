@@ -113,6 +113,8 @@ pub fn encode_frame(key: &[u8], branch: u32, prev: Tid, payload: &[u8]) -> Vec<u
 /// of any length are accepted.
 pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameError> {
     let header = bytes.get(..HEADER_LEN).ok_or(FrameError::Truncated)?;
+    // This check comes before the checksum. A newer version and a damaged
+    // version byte look the same here, so both are a corrupt frame.
     if header[0] != FRAME_VERSION {
         return Err(FrameError::Version(header[0]));
     }
