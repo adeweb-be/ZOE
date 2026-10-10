@@ -27,6 +27,7 @@ mod meter;
 mod ram;
 pub mod summary;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use zoe_core::log_backend::LogBackend;
-use zoe_core::vfs::Vfs;
+use zoe_core::vfs::{OsVfs, Vfs};
 use zoe_core::{Backend, Oid, Result, Store, SystemClock, Tid, TxnMeta, TxnStatus};
 
 pub use meter::{Counts, Meter, MeteredFile, MeteredVfs};
@@ -323,6 +324,65 @@ pub fn measure_batched(kind: BackendKind, cell: &Cell, plan: &Plan) -> Result<Ro
         elapsed,
         &latencies,
     ))
+}
+
+/// The size of the pickles that fill a big store on disk.
+const BIG_OBJECT: usize = 1 << 20;
+
+/// Measure one-object commits of 1 KB on a redb store of about `bytes`
+/// bytes in `dir`, with each redb setting.
+///
+/// The default redb commit first fills the store with 1 MiB pickles, 100
+/// per transaction, and the store closes cleanly. Then for each kind of
+/// `kinds`, the store reopens with that setting, and one writer commits
+/// `commits` transactions of one new 1 KB object. The meter counts only
+/// these commits. The fsyncs are real, so the commit rate is the rate of
+/// the disk under `dir`. Return the size of the store file and one row
+/// per kind.
+pub fn measure_big_store(
+    kinds: &[BackendKind],
+    dir: &Path,
+    bytes: u64,
+    commits: u64,
+) -> Result<(u64, Vec<Row>)> {
+    let meter = Arc::new(Meter::new(Duration::ZERO));
+    {
+        let store =
+            BackendKind::Redb.open(MeteredVfs::new(OsVfs::new(dir)?, Arc::clone(&meter)))?;
+        let big = payload(BIG_OBJECT);
+        let mut filled = 0;
+        while filled < bytes {
+            let set = (0..100)
+                .map(|_| store.new_oid().map(|oid| (oid, Tid::ZERO)))
+                .collect::<Result<Vec<_>>>()?;
+            commit(&store, &set, &big)?;
+            filled += 100 * BIG_OBJECT as u64;
+        }
+    }
+    let small = payload(1024);
+    let cell = Cell {
+        object_size: 1024,
+        objects_per_txn: 1,
+        writers: 1,
+    };
+    let mut rows = Vec::new();
+    for &kind in kinds {
+        let store = kind.open(MeteredVfs::new(OsVfs::new(dir)?, Arc::clone(&meter)))?;
+        let mut latencies = Vec::new();
+        meter.arm();
+        let begun = Instant::now();
+        for _ in 0..commits {
+            let started = Instant::now();
+            commit(&store, &[(store.new_oid()?, Tid::ZERO)], &small)?;
+            latencies.push(started.elapsed());
+        }
+        let elapsed = begun.elapsed();
+        let counts = meter.disarm();
+        drop(store);
+        rows.push(row(kind, &cell, 1, commits, &counts, elapsed, &latencies));
+    }
+    let file = std::fs::metadata(dir.join("zoe.redb"))?.len();
+    Ok((file, rows))
 }
 
 /// The objects in each transaction that fills a store with background

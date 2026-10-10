@@ -19,13 +19,15 @@ use zoe_bench::conflicts::Ranking;
 use zoe_bench::record_store::crash::{self, OpenTimes};
 use zoe_bench::record_store::summary::{self, Machine};
 use zoe_bench::record_store::{
-    BackendKind, Cell, Plan, Row, measure_batched, measure_cell, measure_scattered,
+    BackendKind, Cell, Plan, Row, measure_batched, measure_big_store, measure_cell,
+    measure_scattered,
 };
 
 const USAGE: &str = "usage: zoe-bench conflicts <log path>...
        zoe-bench record-store commits [--repeat N] [--fsync-ms MS] [--quick] [--kinds K,...] [--out PATH]
        zoe-bench record-store scattered [--records N,...] [--repeat N] [--fsync-ms MS] [--kinds K,...] [--out PATH]
-       zoe-bench record-store crash --dir DIR [--records N,...] [--repeat N] [--kinds K,...] [--out PATH]";
+       zoe-bench record-store crash --dir DIR [--records N,...] [--repeat N] [--kinds K,...] [--out PATH]
+       zoe-bench record-store big --dir DIR [--gigabytes N,...] [--out PATH]";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -85,6 +87,7 @@ struct Options {
     out: Option<PathBuf>,
     dir: Option<PathBuf>,
     records: Vec<u64>,
+    gigabytes: Vec<u64>,
 }
 
 impl Options {
@@ -97,6 +100,7 @@ impl Options {
             out: None,
             dir: None,
             records: vec![10_000, 100_000],
+            gigabytes: vec![1, 4, 16],
         };
         let mut args = args.iter();
         while let Some(flag) = args.next() {
@@ -112,6 +116,10 @@ impl Options {
                 "--dir" => options.dir = Some(value.into()),
                 "--records" => {
                     options.records = value.split(',').map(str::parse).collect::<Result<_, _>>()?
+                }
+                "--gigabytes" => {
+                    options.gigabytes =
+                        value.split(',').map(str::parse).collect::<Result<_, _>>()?
                 }
                 "--kinds" => {
                     options.kinds = value
@@ -133,6 +141,7 @@ fn record_store(args: &[String]) -> Result<(), Error> {
         Some((command, rest)) if command == "commits" => commits(&Options::parse(rest, 3)?),
         Some((command, rest)) if command == "scattered" => scattered(&Options::parse(rest, 3)?),
         Some((command, rest)) if command == "crash" => crash_opens(&Options::parse(rest, 5)?),
+        Some((command, rest)) if command == "big" => big_stores(&Options::parse(rest, 1)?),
         Some((command, rest)) if command == "writer" => writer(rest),
         _ => Err(USAGE.into()),
     }
@@ -286,6 +295,59 @@ fn scattered(options: &Options) -> Result<(), Error> {
                 .collect(),
         };
         serde_json::to_writer_pretty(File::create(out)?, &run)?;
+    }
+    Ok(())
+}
+
+/// One store of a `big` run.
+#[derive(Serialize)]
+struct BigStore {
+    file_bytes: u64,
+    rows: Vec<Row>,
+}
+
+/// The JSON of a `big` run.
+#[derive(Serialize)]
+struct BigRun {
+    machine: Machine,
+    stores: Vec<BigStore>,
+}
+
+/// Fill a redb store on the disk to each size of `--gigabytes`, and
+/// measure the bytes of a one-object commit with each redb setting.
+fn big_stores(options: &Options) -> Result<(), Error> {
+    let base = options.dir.as_ref().ok_or("big needs --dir")?;
+    std::fs::create_dir_all(base)?;
+    let mut machine = Machine::describe(Some(base));
+    let kinds = [BackendKind::Redb, BackendKind::RedbQuickRepair];
+    let mut stores = Vec::new();
+    println!(
+        "| Store file, MB | Backend | KB written per commit | fsyncs per commit | Commits/s on the disk |"
+    );
+    println!("| --- | --- | --- | --- | --- |");
+    for &gigabytes in &options.gigabytes {
+        let dir = base.join(format!("big-{gigabytes}"));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let (file_bytes, rows) = measure_big_store(&kinds, &dir, gigabytes << 30, 50)?;
+        std::fs::remove_dir_all(&dir)?;
+        for row in &rows {
+            println!(
+                "| {} | {} | {:.1} | {:.2} | {:.1} |",
+                file_bytes >> 20,
+                row.kind.name(),
+                row.bytes_written_per_commit / 1024.0,
+                row.fsyncs_per_commit,
+                row.commits_per_second
+            );
+        }
+        stores.push(BigStore { file_bytes, rows });
+    }
+    machine.finish();
+    println!("\nMachine: {machine:?}");
+    if let Some(out) = &options.out {
+        serde_json::to_writer_pretty(File::create(out)?, &BigRun { machine, stores })?;
     }
     Ok(())
 }
