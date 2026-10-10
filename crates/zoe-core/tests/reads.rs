@@ -55,7 +55,10 @@ fn load_before_returns_the_revision_and_the_next_serial() {
     assert!(store.load_before(oid, t1).unwrap().is_none());
 
     let unknown = store.load_before(Oid(0xdead), Tid::MAX);
-    assert!(matches!(unknown, Err(ZoeError::NotFound { .. })), "{unknown:?}");
+    assert!(
+        matches!(unknown, Err(ZoeError::NotFound { .. })),
+        "{unknown:?}"
+    );
 }
 
 #[test]
@@ -68,7 +71,10 @@ fn load_serial_reads_one_revision() {
     assert_eq!(store.load_serial(oid, t1).unwrap(), pickle("v1"));
     assert_eq!(store.load_serial(oid, t2).unwrap(), pickle("v2"));
     let missing = store.load_serial(oid, Tid(t1.0 + 1));
-    assert!(matches!(missing, Err(ZoeError::NotFound { .. })), "{missing:?}");
+    assert!(
+        matches!(missing, Err(ZoeError::NotFound { .. })),
+        "{missing:?}"
+    );
 }
 
 #[test]
@@ -212,7 +218,11 @@ fn restore_refuses_a_tid_that_is_not_after_the_last_one() {
     let oid = store.new_oid().unwrap();
     let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
     let result = store.tpc_begin_restore(t1, b"", b"", b"");
-    assert!(matches!(result, Err(ZoeError::Protocol(_))), "{:?}", result.err());
+    assert!(
+        matches!(result, Err(ZoeError::Protocol(_))),
+        "{:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -229,7 +239,10 @@ fn a_restored_deletion_removes_the_object() {
     let t2 = delete.finish().unwrap();
 
     let loaded = store.load(oid);
-    assert!(matches!(loaded, Err(ZoeError::NotFound { .. })), "{loaded:?}");
+    assert!(
+        matches!(loaded, Err(ZoeError::NotFound { .. })),
+        "{loaded:?}"
+    );
     // The revision before the deletion stays readable.
     let old = store.load_before(oid, t2).unwrap().unwrap();
     assert_eq!(old.data, pickle("v1"));
