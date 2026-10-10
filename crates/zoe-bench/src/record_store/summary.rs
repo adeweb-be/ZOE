@@ -180,18 +180,59 @@ pub fn commit_table(rows: &[Row], cells: &[Cell], kinds: &[BackendKind], batched
     out
 }
 
+/// Return the Markdown table of the scattered updates. Each entry of
+/// `rows` is the number of background records and a row.
+pub fn scattered_table(rows: &[(u64, Row)], kinds: &[BackendKind]) -> String {
+    let mut keys: Vec<(u64, usize)> = rows
+        .iter()
+        .map(|(background, r)| (*background, r.cell.objects_per_txn))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = String::new();
+    out.push_str(
+        "| Records in the store | Objects per txn | Backend | Write amplification | KB written per commit | fsyncs per commit | Commits/s |\n",
+    );
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+    for (background, objects) in keys {
+        for &kind in kinds {
+            let group: Vec<&Row> = rows
+                .iter()
+                .filter(|(b, r)| {
+                    *b == background && r.cell.objects_per_txn == objects && r.kind == kind
+                })
+                .map(|(_, r)| r)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let spread = |f: fn(&Row) -> f64| Spread::of(group.iter().map(|r| f(r)));
+            let _ = writeln!(
+                out,
+                "| {background} | {objects} | {} | {} | {} | {} | {} |",
+                kind.name(),
+                spread(|r| r.write_amplification).show(2),
+                spread(|r| r.bytes_written_per_commit / 1024.0).show(1),
+                spread(|r| r.fsyncs_per_commit).show(2),
+                spread(|r| r.commits_per_second).show(1),
+            );
+        }
+    }
+    out
+}
+
 /// Return the Markdown table of the open times.
 pub fn open_table(times: &[OpenTimes]) -> String {
     let mut out = String::new();
     out.push_str(
-        "| Backend | Records | Store MB | Crash open, warm ms | Crash open, cold ms | Clean open, warm ms | Clean open, cold ms |\n",
+        "| Backend | Records | Store MB | Crash open, warm ms | Crash open, cold ms | Clean open, warm ms | Clean open, cold ms | Memory growth at open, MB |\n",
     );
-    out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for t in times {
         let show = |values: &[f64]| Spread::of(values.iter().copied()).show(1);
         let _ = writeln!(
             out,
-            "| {} | {} | {:.1} | {} | {} | {} | {} |",
+            "| {} | {} | {:.1} | {} | {} | {} | {} | {:.1} |",
             t.kind.name(),
             t.records,
             t.file_bytes as f64 / f64::from(1 << 20),
@@ -199,6 +240,7 @@ pub fn open_table(times: &[OpenTimes]) -> String {
             show(&t.crash_cold_ms),
             show(&t.clean_warm_ms),
             show(&t.clean_cold_ms),
+            t.rss_growth_bytes as f64 / f64::from(1 << 20),
         );
     }
     out

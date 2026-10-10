@@ -17,6 +17,10 @@
 //! writes the transactions of all the writers in one backend write
 //! transaction, with one commit. That is the best case of a group commit:
 //! every batch is full, and nothing waits for a lock.
+//!
+//! `measure_scattered` fills a store with background records first, then
+//! updates objects spread over it, so that a B-tree commit touches one
+//! path per object.
 
 pub mod crash;
 mod meter;
@@ -224,8 +228,7 @@ pub fn measure_with(kind: BackendKind, cells: &[Cell], plan: &Plan) -> Result<Re
 /// Measure one cell for `kind` with `plan`, in a new store.
 pub fn measure_cell(kind: BackendKind, cell: &Cell, plan: &Plan) -> Result<Row> {
     let meter = Arc::new(Meter::new(Duration::from_secs_f64(plan.fsync_seconds)));
-    let ram = RamVfs::new();
-    let store = kind.open(MeteredVfs::new(ram.clone(), Arc::clone(&meter)))?;
+    let store = kind.open(MeteredVfs::new(RamVfs::new(), Arc::clone(&meter)))?;
     let payload = payload(cell.object_size);
 
     // The setup creates the objects of each writer. The meter is not
@@ -320,6 +323,66 @@ pub fn measure_batched(kind: BackendKind, cell: &Cell, plan: &Plan) -> Result<Ro
         elapsed,
         &latencies,
     ))
+}
+
+/// The objects in each transaction that fills a store with background
+/// records.
+const FILL_BATCH: u64 = 1_000;
+
+/// Measure one writer that updates objects spread over a big store.
+///
+/// The store first gets `background` records of `cell.object_size` bytes,
+/// committed through the store, with the meter disarmed. Each measured
+/// transaction then updates `cell.objects_per_txn` of these records, at
+/// equal distances in the oid order. So in a B-tree, the objects of a
+/// transaction rarely share a leaf. `cell.writers` must be 1.
+pub fn measure_scattered(
+    kind: BackendKind,
+    cell: &Cell,
+    background: u64,
+    plan: &Plan,
+) -> Result<Row> {
+    assert_eq!(cell.writers, 1, "a scattered measurement has one writer");
+    let meter = Arc::new(Meter::new(Duration::from_secs_f64(plan.fsync_seconds)));
+    let store = kind.open(MeteredVfs::new(RamVfs::new(), Arc::clone(&meter)))?;
+    let payload = payload(cell.object_size);
+
+    let mut filled: Vec<(Oid, Tid)> = Vec::with_capacity(background as usize);
+    while (filled.len() as u64) < background {
+        let n = FILL_BATCH.min(background - filled.len() as u64);
+        let created = (0..n)
+            .map(|_| store.new_oid().map(|oid| (oid, Tid::ZERO)))
+            .collect::<Result<Vec<_>>>()?;
+        let tid = commit(&store, &created, &payload)?;
+        filled.extend(created.into_iter().map(|(oid, _)| (oid, tid)));
+    }
+    let stride = (filled.len() / cell.objects_per_txn).max(1);
+    let mut set: Vec<(Oid, Tid)> = filled
+        .iter()
+        .step_by(stride)
+        .take(cell.objects_per_txn)
+        .copied()
+        .collect();
+    drop(filled);
+
+    let commits = plan.min_commits;
+    let mut latencies = Vec::new();
+    meter.arm();
+    let begun = Instant::now();
+    for _ in 0..commits {
+        let started = Instant::now();
+        let tid = commit(&store, &set, &payload)?;
+        latencies.push(started.elapsed());
+        for entry in &mut set {
+            entry.1 = tid;
+        }
+    }
+    let elapsed = begun.elapsed();
+    let counts = meter.disarm();
+    drop(store);
+    let mut cell = *cell;
+    cell.objects_per_txn = set.len();
+    Ok(row(kind, &cell, 1, commits, &counts, elapsed, &latencies))
 }
 
 /// Write one transaction per set in one backend write transaction. Each
@@ -488,6 +551,20 @@ mod tests {
         let row = 1 + 8 + 32 + 21 + 5 + 18;
         assert_eq!(log.bytes_written_per_commit, f64::from(records + row));
         assert_eq!(log.write_calls, log.commits);
+    }
+
+    /// Updates of spread objects in a filled store write their pickles.
+    #[test]
+    fn a_scattered_update_writes_its_objects() {
+        let plan = Plan {
+            min_commits: 3,
+            ..Plan::quick(0.0)
+        };
+        for kind in BackendKind::ALL {
+            let row = measure_scattered(kind, &cell(1024, 10, 1), 2_500, &plan).unwrap();
+            assert_eq!((row.commits, row.cell.objects_per_txn), (3, 10), "{row:?}");
+            assert!(row.write_amplification >= 1.0, "{row:?}");
+        }
     }
 
     /// A batch of 4 transactions costs the syncs of one commit.

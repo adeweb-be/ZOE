@@ -18,10 +18,13 @@ use serde::Serialize;
 use zoe_bench::conflicts::Ranking;
 use zoe_bench::record_store::crash::{self, OpenTimes};
 use zoe_bench::record_store::summary::{self, Machine};
-use zoe_bench::record_store::{BackendKind, Cell, Plan, Row, measure_batched, measure_cell};
+use zoe_bench::record_store::{
+    BackendKind, Cell, Plan, Row, measure_batched, measure_cell, measure_scattered,
+};
 
 const USAGE: &str = "usage: zoe-bench conflicts <log path>...
        zoe-bench record-store commits [--repeat N] [--fsync-ms MS] [--quick] [--kinds K,...] [--out PATH]
+       zoe-bench record-store scattered [--records N,...] [--repeat N] [--fsync-ms MS] [--kinds K,...] [--out PATH]
        zoe-bench record-store crash --dir DIR [--records N,...] [--repeat N] [--kinds K,...] [--out PATH]";
 
 fn main() -> ExitCode {
@@ -128,6 +131,7 @@ impl Options {
 fn record_store(args: &[String]) -> Result<(), Error> {
     match args.split_first() {
         Some((command, rest)) if command == "commits" => commits(&Options::parse(rest, 3)?),
+        Some((command, rest)) if command == "scattered" => scattered(&Options::parse(rest, 3)?),
         Some((command, rest)) if command == "crash" => crash_opens(&Options::parse(rest, 5)?),
         Some((command, rest)) if command == "writer" => writer(rest),
         _ => Err(USAGE.into()),
@@ -215,6 +219,71 @@ fn commits(options: &Options) -> Result<(), Error> {
             plan,
             repeats: options.repeat,
             rows,
+        };
+        serde_json::to_writer_pretty(File::create(out)?, &run)?;
+    }
+    Ok(())
+}
+
+/// One row of a `scattered` run.
+#[derive(Serialize)]
+struct ScatteredRow {
+    records_in_store: u64,
+    row: Row,
+}
+
+/// The JSON of a `scattered` run.
+#[derive(Serialize)]
+struct ScatteredRun {
+    machine: Machine,
+    store: &'static str,
+    plan: Plan,
+    repeats: usize,
+    rows: Vec<ScatteredRow>,
+}
+
+/// Measure one writer that updates 1, 10 or 100 objects of 1 KB spread
+/// over a store of each size in `--records`.
+fn scattered(options: &Options) -> Result<(), Error> {
+    let plan = Plan::full(options.fsync_ms / 1e3);
+    let mut machine = Machine::describe(None);
+    let mut rows = Vec::new();
+    for repeat in 0..options.repeat {
+        for &records in &options.records {
+            for objects_per_txn in [1, 10, 100] {
+                let cell = Cell {
+                    object_size: 1024,
+                    objects_per_txn,
+                    writers: 1,
+                };
+                for &kind in &options.kinds {
+                    let row = measure_scattered(kind, &cell, records, &plan)?;
+                    eprintln!(
+                        "repeat {repeat} {} {records} records, {objects_per_txn} objects: {:.2} WA",
+                        kind.name(),
+                        row.write_amplification
+                    );
+                    rows.push((records, row));
+                }
+            }
+        }
+    }
+    machine.finish();
+    println!("{}", summary::scattered_table(&rows, &options.kinds));
+    println!("Machine: {machine:?}");
+    if let Some(out) = &options.out {
+        let run = ScatteredRun {
+            machine,
+            store: "in memory; each sync sleeps for the fsync time",
+            plan,
+            repeats: options.repeat,
+            rows: rows
+                .into_iter()
+                .map(|(records_in_store, row)| ScatteredRow {
+                    records_in_store,
+                    row,
+                })
+                .collect(),
         };
         serde_json::to_writer_pretty(File::create(out)?, &run)?;
     }

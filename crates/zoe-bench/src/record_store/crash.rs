@@ -44,6 +44,10 @@ pub struct OpenTimes {
     pub clean_warm_ms: Vec<f64>,
     /// Opens after a clean close, with the files out of the page cache.
     pub clean_cold_ms: Vec<f64>,
+    /// The most that the resident memory of this process grew during an
+    /// open, in bytes. It shows the in-memory index of the log and the
+    /// pages that redb caches.
+    pub rss_growth_bytes: u64,
     /// False when the page cache kept a part of a file that a cold open
     /// needed out of it.
     pub evicted: bool,
@@ -121,44 +125,59 @@ pub fn time_opens(
         crash_cold_ms: Vec::new(),
         clean_warm_ms: Vec::new(),
         clean_cold_ms: Vec::new(),
+        rss_growth_bytes: 0,
         evicted: true,
     };
     for _ in 0..repeats {
+        let mut open = |out: &mut Vec<f64>| -> Result<()> {
+            let (ms, rss) = timed_open(kind, work, acknowledged)?;
+            out.push(ms);
+            times.rss_growth_bytes = times.rss_growth_bytes.max(rss);
+            Ok(())
+        };
         copy_image(image, work)?;
-        times.evicted &= evict(work)?;
-        times
-            .crash_cold_ms
-            .push(timed_open(kind, work, acknowledged)?);
-        times
-            .clean_warm_ms
-            .push(timed_open(kind, work, acknowledged)?);
-        times.evicted &= evict(work)?;
-        times
-            .clean_cold_ms
-            .push(timed_open(kind, work, acknowledged)?);
+        let mut evicted = evict(work)?;
+        open(&mut times.crash_cold_ms)?;
+        open(&mut times.clean_warm_ms)?;
+        evicted &= evict(work)?;
+        open(&mut times.clean_cold_ms)?;
 
         copy_image(image, work)?;
-        times
-            .crash_warm_ms
-            .push(timed_open(kind, work, acknowledged)?);
+        open(&mut times.crash_warm_ms)?;
+        times.evicted &= evicted;
     }
     fs::remove_dir_all(work)?;
     Ok(times)
 }
 
-/// Open the store in `dir`, check that it holds `acknowledged`, close it,
-/// and return the time of the open in milliseconds.
-fn timed_open(kind: BackendKind, dir: &Path, acknowledged: Tid) -> Result<f64> {
+/// Open the store in `dir`, check that it holds `acknowledged`, close it.
+/// Return the time of the open in milliseconds, and how much the resident
+/// memory grew while the store was open.
+fn timed_open(kind: BackendKind, dir: &Path, acknowledged: Tid) -> Result<(f64, u64)> {
+    let before = resident_bytes();
     let begun = Instant::now();
     let store = kind.open(OsVfs::new(dir)?)?;
     let elapsed = begun.elapsed();
+    let growth = resident_bytes().saturating_sub(before);
     if store.last_transaction() < acknowledged {
         return Err(ZoeError::Backend(
             format!("{} lost the acknowledged tid {acknowledged:?}", kind.name()).into(),
         ));
     }
     drop(store);
-    Ok(elapsed.as_secs_f64() * 1e3)
+    Ok((elapsed.as_secs_f64() * 1e3, growth))
+}
+
+/// Return the resident memory of this process in bytes, or 0 when it
+/// cannot be read.
+fn resident_bytes() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse::<u64>().ok())
+        .map_or(0, |kib| kib * 1024)
 }
 
 /// Return the name and the length of each store file in `dir`: every
