@@ -24,7 +24,8 @@ fn open(dir: &Path, compression: Compression) -> Store {
 /// A pickle with the repetition of a Plone state: the same keys and
 /// class names many times.
 fn repetitive_pickle() -> Vec<u8> {
-    let mut data = b"\x80\x03cplone.app.contenttypes.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
+    let mut data =
+        b"\x80\x03cplone.app.contenttypes.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
     for i in 0..1_000 {
         data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
         data.extend_from_slice(&(i as u32).to_le_bytes());
@@ -55,7 +56,10 @@ fn commit(store: &Store, oid: Oid, data: &[u8]) -> Tid {
 
 #[test]
 fn zstd_is_the_default() {
-    assert!(matches!(Options::default().compression, Compression::Zstd { .. }));
+    assert!(matches!(
+        Options::default().compression,
+        Compression::Zstd { .. }
+    ));
 }
 
 #[test]
