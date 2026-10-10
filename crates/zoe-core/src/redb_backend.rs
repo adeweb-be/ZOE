@@ -64,6 +64,10 @@ impl RedbBackend {
     }
 
     /// Open a store that `initialise` wrote, and check its format.
+    ///
+    /// The last tid is the greater of `last_tid` in `meta` and the tid of
+    /// the last transaction row. So a damaged `last_tid` cannot give a tid
+    /// a second time.
     pub(crate) fn open(db: Database) -> Result<Self> {
         let last_tid = {
             let txn = db.begin_read().map_err(backend)?;
@@ -77,10 +81,13 @@ impl RedbBackend {
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
             }
-            read(META_LAST_TID)?
+            let stored = read(META_LAST_TID)?
                 .as_deref()
                 .and_then(format::decode_u64)
-                .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?
+                .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?;
+            let txns = txn.open_table(TXNS).map_err(backend)?;
+            let last_row = txns.last().map_err(backend)?;
+            stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())))
         };
         Ok(Self {
             db,
@@ -348,10 +355,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_corrupt_transaction_row_names_its_tid() {
-        let backend = empty();
-        let tid = Tid(5);
+    /// Commit an empty transaction row at `tid`.
+    fn commit_txn(backend: &RedbBackend, tid: Tid) {
         let mut write = backend.begin_write().unwrap();
         write
             .put_txn(&TxnMeta {
@@ -364,6 +369,28 @@ mod tests {
             })
             .unwrap();
         write.commit().unwrap();
+    }
+
+    #[test]
+    fn the_last_transaction_row_raises_a_damaged_last_tid() {
+        let backend = empty();
+        commit_txn(&backend, Tid(500));
+        let txn = backend.db.begin_write().unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert(META_LAST_TID, &format::encode_u64(7)[..])
+            .unwrap();
+        txn.commit().unwrap();
+
+        let reopened = RedbBackend::open(backend.db).unwrap();
+        assert_eq!(reopened.last_tid(), Tid(500));
+    }
+
+    #[test]
+    fn a_corrupt_transaction_row_names_its_tid() {
+        let backend = empty();
+        let tid = Tid(5);
+        commit_txn(&backend, tid);
 
         let txn = backend.db.begin_write().unwrap();
         {
