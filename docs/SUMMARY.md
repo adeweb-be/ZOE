@@ -34,3 +34,4 @@
 
 - [Glossary](glossary.md)
 - [Spikes](spikes/README.md)
+  - [Byte-identical pickle round trip in zoe-pickle](spikes/pickle-round-trip.md)
