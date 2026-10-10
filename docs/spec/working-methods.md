@@ -42,7 +42,7 @@ The tinted boxes are the only two places the human is in the loop; a card that t
 - `CONTEXT.md`: the domain glossary (oid, tid, serial, ghost, vote, pack, intent lock) so agents and humans use one vocabulary.
 - Skills for the recurring procedures: run the conformance suite, run the benchmark set and compare to baseline, cut a release, write a handoff when a session ends unfinished.
 - Trunk-based: short-lived branch per card, one agent per worktree, squash merge, no force pushes, CI configuration changed only by a human.
-- `CODEOWNERS` marks the red zones: `crates/zoe-core/src/commit`, the lock manager, `zoe-pickle`'s encoder, the on-disk format, the protocol layer, security code. A red-zone PR needs the human's approval; everything else merges on the reviewer agent's approval.
+- `CODEOWNERS` marks the red zones: the on-disk format, pack, and the process files (`.github/` and `loops/`). A red-zone PR needs the human's approval; everything else merges on the reviewer agent's approval (ADR 0022).
 
 **Tooling**
 
@@ -50,12 +50,12 @@ Two loops. The inner loop, on a laptop or in an agent session, is `devenv shell`
 
 | Tool | Role | Rule |
 | --- | --- | --- |
-| devenv | `devenv.nix` at the root pins the Rust toolchain, CPython 3.12, 3.13, 3.14 and 3.14t, Node for Loupe and every CLI below; `devenv shell` gives a laptop, a runner and an agent session the same environment | a tool that is not in `devenv.nix` does not exist for the project; the file is a red zone |
+| devenv | `devenv.nix` at the root pins the Rust toolchain, CPython 3.12, 3.13, 3.14 and 3.14t, Node for Loupe and every CLI below; `devenv shell` gives a laptop, a runner and an agent session the same environment | a tool that is not in `devenv.nix` does not exist for the project; the file changes through cards, reviewed like code |
 | just | the `justfile` is the single entry point: `just check` (fmt, clippy, lints), `just test`, `just conformance`, `just plone` (builds the Plone instances), `just bench`, `just loupe`, `just ci`, `just release`; recipes wrap `cargo`, `uv`, `pytest`, `buildout` and `dagger` | `CLAUDE.md` files name recipes, never raw commands; a command an agent needs and cannot find becomes a recipe in the same PR |
 | uv | packaging for what the project ships, under `python/`: a uv workspace holding `zoedb` and `zoe.plone`, a committed `uv.lock`, `uv python install 3.14t` for the free-threaded interpreter, the wheel built with maturin through `uv build` | no pip, no hand-made virtualenvs; a dependency change ships with its lock file in the same commit |
 | zc.buildout | the Plone instances the suites and benchmarks run against, under `plone/`: one `buildout.cfg` per scenario (in-process `<zoe>`, `<zeoclient>` against `zoe serve`, `FileStorage` and ZEO as baselines), `versions.cfg` pinned to a Plone release, `zoedb` taken through `find-links` from the wheel `uv build` just produced, `plone.recipe.zope2instance` writing `zope.conf` and `bin/test`; no mxdev | buildout owns Plone, uv owns the project's own packages, nothing crosses that line; the Plone suites run from `bin/test` (zope.testrunner); the eggs and download caches are Dagger cache volumes |
 | pytest | the runner for the project's own Python tests: `zoedb`, `zoe.plone` and the ZODB and ZEO conformance suites (unittest-based, collected unchanged); `pytest-xdist` where the suites allow; run on 3.12, 3.13, 3.14 and 3.14t, Linux x86-64 | new Python tests are plain pytest; a card's Python-side acceptance tests are pytest files named on the card; the Plone suites are the one exception and stay on `bin/test` |
-| Dagger | CI as code in `ci/`: a Dagger module written in Python with the functions `check`, `test`, `conformance`, `plone`, `bench`, `crash` and `release`, each running in containers built from the same `devenv` definition; one cache shared by the runners | CI logic lives here and nowhere else; reviewed like code, red zone; `just ci` runs it locally when a CI failure needs reproducing, never for the edit-test loop |
+| Dagger | CI as code in `ci/`: a Dagger module written in Python with the functions `check`, `test`, `conformance`, `plone`, `bench`, `crash` and `release`, each running in containers built from the same `devenv` definition; one cache shared by the runners | CI logic lives here and nowhere else; reviewed like code; `just ci` runs it locally when a CI failure needs reproducing, never for the edit-test loop |
 | GitHub Actions | thin workflows, one per event (pull request, merge queue, nightly, release), each a few lines that call the Dagger module; the merge queue; the nightly bench on the self-hosted runner | a workflow holds no logic; a workflow change is a human-only change |
 | GitHub | the repository, Issues as cards, the Projects board, pull requests, Releases, Pages for the dashboard, `CODEOWNERS`, branch protection, secret scanning, Dependabot | the board holds the state of every card |
 
@@ -69,7 +69,7 @@ The unit is the card: one card, one builder session, one pull request, and a car
 
 ```markdown
 # ZOE-142 — group commit: coalesce concurrent tpc_finish into one fsync
-Phase 2 · crate zoe-core · red zone: yes (2PC)
+Phase 2 · crate zoe-core · red zone: no
 
 Goal: 50 concurrent writers on a 10 ms fsync device reach ≥ 1,000 commits/s (N5).
 Acceptance tests (do not edit): tests/commit/group_commit.rs, bench/contention.rs@n5
@@ -78,7 +78,7 @@ Out of scope: lock manager, backend trait
 Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
 Spike or build: build
 Budget: one session; a spent budget means stop and ask, not try harder
-Done when: acceptance green, TSan green, bench posted, reviewer approved, human approved (red zone)
+Done when: acceptance green, TSan green, bench posted, reviewer approved
 ```
 
 Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
@@ -99,7 +99,7 @@ Cards come from the roadmap phase and the requirements table of the specificatio
 
 The work goes through interactive sessions: the human and an agent, with no automated loop and nothing running unattended. A session takes the roles of the table above in turn. As builder, it works on one card in its own worktree on the branch `card/<id>` and opens the pull request. For review, it starts a fresh reviewer session that never shares the builder's context. The human approves red zones, answers the questions on cards and merges. The briefs for each role are in `loops/prompts/<role>.md`.
 
-**Guardrails.** `.github/`, `loops/`, `CODEOWNERS` and CI configuration are human-only, red zone or not. Agents never hold production credentials or data (project organisation, below).
+**Guardrails.** `.github/` (the workflows and `CODEOWNERS`) and `loops/` are human-only. Agents never hold production credentials or data (project organisation, below).
 
 **Handoffs.** A session that ends unfinished (budget, crash, stop-and-ask) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The next session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
 

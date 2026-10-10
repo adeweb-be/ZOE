@@ -1,27 +1,13 @@
 # The red zones. A pull request that touches one of these paths needs the
 # approval of the human owner. Everything else merges on the approval of
-# the reviewer agent.
+# the reviewer agent. ADR 0022 says why the list is short.
 
-# Two-phase commit, the lock manager and the on-disk format.
-/crates/zoe-core/src/commit/ @duchenean
-/crates/zoe-core/src/lock/ @duchenean
+# The on-disk format.
 /crates/zoe-core/src/format/ @duchenean
 
-# The pickle encoder.
-/crates/zoe-pickle/src/encode/ @duchenean
+# Pack: it deletes data.
+/crates/zoe-core/src/pack/ @duchenean
 
-# The protocol layer.
-/crates/zoe-server/src/protocol/ @duchenean
-/crates/zoe-client/src/protocol/ @duchenean
-
-# Security code.
-**/security/ @duchenean
-**/tls/ @duchenean
-
-# The environment, CI, the workflows and the role briefs. Only a human changes them.
-/devenv.nix @duchenean
-/devenv.yaml @duchenean
-/devenv.lock @duchenean
-/ci/ @duchenean
+# The workflows, this file and the role briefs. Only a human changes them.
 /.github/ @duchenean
 /loops/ @duchenean

@@ -2,8 +2,6 @@
 
 The `zoe serve` process: a tokio server that speaks the ZEO 6 msgpack protocol. Specification: "Server mode".
 
-Red zones in this crate: `src/protocol/` and security code (`tls/`, `security/`).
-
 ## Invariants
 
 - This is the only crate that uses tokio.

@@ -1,4 +1,4 @@
-//! The per-OID lock manager. This module is a red zone.
+//! The per-OID lock manager.
 //!
 //! A transaction takes exclusive locks on the oids it writes, in ascending
 //! oid order, so that two transactions cannot deadlock on each other. A

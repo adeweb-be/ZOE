@@ -2,8 +2,6 @@
 
 Decode and encode ZODB records (the class pickle and the state pickle) as a generic tree. Specification: "Loupe", section "Pickle layer".
 
-Red zone in this crate: `src/encode/`.
-
 ## Invariants
 
 - Decode then encode gives the same bytes, for every record of the corpus.

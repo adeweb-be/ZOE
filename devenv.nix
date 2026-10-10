@@ -1,5 +1,5 @@
 # The only environment of the project. A tool that is not here does not
-# exist for the project. This file is a red zone.
+# exist for the project.
 { pkgs, inputs, ... }:
 
 let

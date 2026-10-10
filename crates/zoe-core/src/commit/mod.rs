@@ -1,5 +1,4 @@
-//! The transaction coordinator: the two-phase commit state machine. This
-//! module is a red zone.
+//! The transaction coordinator: the two-phase commit state machine.
 //!
 //! `store` stages records and makes nothing visible. `vote` takes the
 //! per-OID locks in ascending oid order and detects conflicts before any
