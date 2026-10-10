@@ -11,7 +11,9 @@
 //! | `T` | `txn_key(tid)`, 8 bytes | the transaction row |
 //!
 //! A commit appends its records, then its transaction row, in one write,
-//! and syncs the file once. The transaction row is the commit marker.
+//! and syncs the file once. The transaction row is the commit marker. One
+//! write transaction can hold several transactions, each with its records
+//! and then its row, as a group commit writes them.
 //!
 //! Open scans the whole log, checks every frame, and builds the index
 //! `oid -> [(tid, offset, length)]`. A transaction counts only when all
@@ -189,7 +191,8 @@ impl Backend for LogBackend {
             end: self.lock_end(),
             buf: Vec::new(),
             records: Vec::new(),
-            txn: None,
+            txns: Vec::new(),
+            open_records: 0,
         }))
     }
 
@@ -250,8 +253,10 @@ struct LogWrite<'a> {
     buf: Vec<u8>,
     /// The staged records: oid and slot, with offsets relative to `buf`.
     records: Vec<(Oid, Slot)>,
-    /// The staged transaction row, with an offset relative to `buf`.
-    txn: Option<Slot>,
+    /// The staged transaction rows, with offsets relative to `buf`.
+    txns: Vec<Slot>,
+    /// The number of staged records that no transaction row covers yet.
+    open_records: usize,
 }
 
 impl LogWrite<'_> {
@@ -271,33 +276,43 @@ impl LogWrite<'_> {
 
 impl WriteTxn for LogWrite<'_> {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
-        if self.txn.is_some() {
-            return Err(ZoeError::Protocol("record after the transaction row"));
+        let last = self.txns.last().map_or(self.backend.last_tid(), |t| t.tid);
+        if tid <= last {
+            return Err(ZoeError::Protocol("a record tid is not after the last one"));
         }
         let key = format::record_key(oid, tid);
         let frame = format::encode_frame(&key, format::MAIN_BRANCH, prev, data);
         let slot = self.push(RECORD, &key, tid, &frame);
         self.records.push((oid, slot));
+        self.open_records += 1;
         Ok(())
     }
 
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()> {
         debug_assert_eq!(meta.status, TxnStatus::Committed);
-        if self.records.iter().any(|(_, slot)| slot.tid != meta.tid) {
+        let open = &self.records[self.records.len() - self.open_records..];
+        if open.iter().any(|(_, slot)| slot.tid != meta.tid) {
             return Err(ZoeError::Protocol("a record has another tid"));
+        }
+        if meta.oid_count != open.len() as u64 {
+            return Err(ZoeError::Protocol("the oid count is not the record count"));
         }
         let key = format::txn_key(meta.tid);
         let payload = format::encode_txn(meta);
         let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
         let slot = self.push(TXN, &key, meta.tid, &frame);
-        self.txn = Some(slot);
+        self.txns.push(slot);
+        self.open_records = 0;
         Ok(())
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
-        let Some(txn) = self.txn else {
+        let Some(&last) = self.txns.last() else {
             return Err(ZoeError::Protocol("commit without a transaction row"));
         };
+        if self.open_records > 0 {
+            return Err(ZoeError::Protocol("records after the last transaction row"));
+        }
         let base = *self.end;
         let file = &self.backend.file;
         file.write(base, &self.buf)?;
@@ -315,13 +330,15 @@ impl WriteTxn for LogWrite<'_> {
             };
             index.records.entry(oid).or_default().push(slot);
         }
-        index.txns.push(Slot {
-            offset: base + txn.offset,
-            ..txn
-        });
+        for txn in self.txns.drain(..) {
+            index.txns.push(Slot {
+                offset: base + txn.offset,
+                ..txn
+            });
+        }
         drop(index);
         *self.end = base + self.buf.len() as u64;
-        self.backend.last_tid.store(txn.tid.0, Ordering::Release);
+        self.backend.last_tid.store(last.tid.0, Ordering::Release);
         Ok(())
     }
 }
@@ -611,6 +628,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One write transaction holds two transactions, as a group commit
+    /// writes them. Both load after a reopen.
+    #[test]
+    fn a_group_of_transactions_commits_in_one_write() {
+        let vfs = MemVfs::new();
+        let log = LogBackend::open(vfs.clone()).unwrap();
+        let row = |tid: Tid| TxnMeta {
+            tid,
+            user: Vec::new(),
+            description: Vec::new(),
+            extension: Vec::new(),
+            oid_count: 1,
+            status: TxnStatus::Committed,
+        };
+        let mut write = log.begin_write().unwrap();
+        write.put_record(Oid(1), Tid(5), Tid::ZERO, b"a").unwrap();
+        write.put_txn(&row(Tid(5))).unwrap();
+        write.put_record(Oid(2), Tid(6), Tid::ZERO, b"b").unwrap();
+        assert!(write.put_txn(&row(Tid(7))).is_err());
+        write.put_txn(&row(Tid(6))).unwrap();
+        write.commit().unwrap();
+        drop(log);
+
+        let log = LogBackend::open(vfs).unwrap();
+        assert_eq!(log.last_tid(), Tid(6));
+        assert_eq!(
+            log.load_serial(Oid(1), Tid(5)).unwrap(),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            log.load_serial(Oid(2), Tid(6)).unwrap(),
+            Some(b"b".to_vec())
+        );
+        assert_eq!(log.iter_txns(Tid::ZERO, Tid::MAX).count(), 2);
     }
 
     #[test]

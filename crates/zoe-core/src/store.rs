@@ -140,6 +140,13 @@ impl Store {
         self.backend.last_tid()
     }
 
+    /// Return the backend. The record-store measurement writes batches
+    /// of transactions through it, as a group commit would.
+    #[doc(hidden)]
+    pub fn backend(&self) -> &dyn Backend {
+        self.backend.as_ref()
+    }
+
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
     }
