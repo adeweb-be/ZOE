@@ -1,0 +1,213 @@
+# ZOE
+
+ZOE, the Zope Object Engine, is a ZODB storage written in Rust that Plone uses unchanged, in-process or behind a server that speaks the ZEO protocol. This glossary gives agents and humans one vocabulary for the storage and for the way the project is built.
+
+## Storage
+
+**Store**:
+One ZOE database: the records, the transaction log and the blobs in one directory or one backend.
+_Avoid_: database file, Data.fs
+
+**Record**:
+One version of one object in the store: the pickle that one transaction wrote for one oid.
+_Avoid_: row, revision
+
+**Oid**:
+The 8-byte identifier of a persistent object, stable for the life of the object.
+_Avoid_: object id, zoid
+
+**Tid**:
+The 8-byte identifier of a committed transaction, a ZODB `TimeStamp` that always increases.
+_Avoid_: transaction number, timestamp
+
+**Serial**:
+The tid of the transaction that wrote a given record; a client compares the serial it read with the current one to detect a conflict.
+_Avoid_: version number
+
+**Pickle**:
+The bytes of a record: a class pickle followed by a state pickle.
+_Avoid_: payload, blob (a blob is something else)
+
+**Ghost**:
+A persistent object that a Connection knows by oid but whose state is not loaded yet.
+_Avoid_: stub, proxy
+
+**Blob**:
+A file attached to a record and stored beside the store, immutable per oid and tid.
+_Avoid_: attachment, binary
+
+**Backend**:
+The component that keeps the bytes of a store durable under the data model's keys; the core owns everything else.
+_Avoid_: driver, engine
+
+**Skin**:
+One of the two ways in to the core: the in-process storage or the server.
+_Avoid_: frontend, adapter
+
+**Named storage**:
+One of several stores that one server process serves, selected by the client at registration.
+_Avoid_: tenant, database
+
+**Snapshot**:
+The view of the store as of one tid; a reader sees all of a transaction or none of it.
+_Avoid_: checkpoint
+
+## Commit and conflicts
+
+**Two-phase commit**:
+The commit protocol of ZODB: `tpc_begin`, stores, vote, then `tpc_finish` or `tpc_abort`.
+_Avoid_: 2PC (in prose), commit (alone)
+
+**Vote**:
+The second phase of a commit, where the storage takes the locks, detects conflicts and resolves them before anything is durable.
+_Avoid_: prepare
+
+**Finish**:
+The last phase of a commit, where the storage allocates the tid and makes the transaction durable.
+_Avoid_: commit (alone)
+
+**Group commit**:
+A batch of concurrent finishes that share one durable write.
+_Avoid_: batch commit
+
+**Per-OID lock**:
+A lock that one transaction holds on one oid during a commit; exclusive for a write, shared for a read-current check.
+_Avoid_: row lock, commit lock
+
+**Intent lock**:
+An exclusive per-OID lock that a client asks for when a transaction first changes an object, before the vote.
+_Avoid_: early lock, pessimistic lock
+
+**Conflict**:
+Two transactions that write the same oid, where the second one read a serial that is no longer current.
+_Avoid_: collision, ConflictError (that is the exception, not the event)
+
+**Conflict tier**:
+One of the three levels that try to resolve a conflict: structural merges, field-level merges by policy, and resolution on the client.
+_Avoid_: tier (alone; see Deployment tier)
+
+**Merge policy**:
+A versioned object in the store that says which classes merge field by field and with which strategy per field.
+_Avoid_: resolver config, merge rules
+
+**Shadow mode**:
+A mode where the conflict tiers compute a merge but the conflict is still raised, to show what merging would have done.
+_Avoid_: dry run (that word belongs to pack)
+
+**Invalidation**:
+The message that tells every other client which oids a committed transaction changed.
+_Avoid_: cache purge, notification
+
+**Sequence**:
+A named counter in the store that gives monotonic values outside the commit locks.
+_Avoid_: counter, autoincrement
+
+## Operations
+
+**Pack**:
+The removal of record versions that no reader can reach, older than a given tid.
+_Avoid_: garbage collection, compaction, vacuum
+
+**Retention window**:
+The period during which records that a pack removed can still be restored.
+_Avoid_: grace period, trash
+
+**Fork**:
+A copy-on-write store over a base store at a fixed tid; its writes never go back to the base.
+_Avoid_: branch, clone, snapshot
+
+**Feed**:
+The resumable stream of committed transactions, from any tid, in commit order, exactly once.
+_Avoid_: change log, event stream, CDC
+
+**Scrub**:
+A walk of the whole store that verifies every checksum and reports every mismatch.
+_Avoid_: fsck, verify (verify checks references and classes)
+
+**Deployment tier**:
+One of the four Kubernetes shapes: in-process (0), one server (1), leader and follower (2), stateless fronts over a distributed backend (3).
+_Avoid_: tier (alone; see Conflict tier)
+
+**Loupe**:
+The desktop inspector and editor for ZOE stores and servers.
+_Avoid_: GUI, admin app
+
+## Catalog and retrieval
+
+**Mirror**:
+An in-memory copy of the catalog indexes, versioned per tid, that answers catalog queries as of the client's snapshot.
+_Avoid_: cache, replica
+
+**Delta record**:
+A record that says how one index entry changed in a transaction, instead of a rewritten index bucket.
+_Avoid_: patch, diff
+
+**Projection**:
+The catalog kept only as delta records and snapshots, with no index buckets in the store.
+_Avoid_: materialised view
+
+**Derivation**:
+A value computed from one record and keyed by oid, tid and kind, such as an image scale or an embedding.
+_Avoid_: artefact, cache entry
+
+## Way of working
+
+**Card**:
+One unit of work: one requirement, one acceptance test, one builder session, one pull request.
+_Avoid_: ticket, task, story
+
+**Phase**:
+A band of the roadmap that ends with a gate.
+_Avoid_: milestone, sprint, release
+
+**Gate**:
+A measurable check from the testing harness that must be green before the next phase starts.
+_Avoid_: deadline, checkpoint
+
+**Acceptance test**:
+The test named on a card that decides it; it fails before the build and only the planner or the human changes it.
+_Avoid_: spec test, definition test
+
+**Scope fence**:
+The paths a card may change.
+_Avoid_: allowed files
+
+**Spike**:
+A card that ends in a written finding and no merged code.
+_Avoid_: prototype, POC
+
+**Walking skeleton**:
+The thinnest end-to-end slice of a phase, built first, with its crash simulation attached.
+_Avoid_: MVP, prototype
+
+**Red zone**:
+A path whose changes need the human's approval before merge.
+_Avoid_: protected area, critical code
+
+**Lease**:
+The right of one loop run to act on one card or one pull request.
+_Avoid_: lock (a lock is a storage term)
+
+**Loop**:
+An automated agent run that a state change on the board starts: plan, build, review, verify, merge, document, retro, nightly or release.
+_Avoid_: pipeline, bot
+
+**Conductor**:
+The service that receives the board events, grants leases, caps cost and concurrency, and starts the loops.
+_Avoid_: orchestrator, scheduler
+
+**Board**:
+The project board whose columns hold the state of every card; the loops read no other state.
+_Avoid_: kanban, backlog (Backlog is one column)
+
+**Handoff**:
+The file a session writes when it ends unfinished: state, what was tried, what failed, the next step.
+_Avoid_: notes, summary
+
+**Claims and evidence**:
+The section of a pull request that lists what was tested, with the proof, and what was not.
+_Avoid_: test plan
+
+**Adopting site**:
+A site that runs ZOE in production; it is a user of the project, not an owner.
+_Avoid_: customer, client

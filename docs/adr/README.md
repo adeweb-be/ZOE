@@ -1,0 +1,25 @@
+# Architecture decision records
+
+One record per decision taken in the specification, numbered. Each record gives the context, the decision and its consequences. A new decision goes through a card of its own and adds the next number.
+
+| Number | Decision |
+| --- | --- |
+| [0001](0001-synchronous-rust-core.md) | A synchronous Rust core |
+| [0002](0002-redb-first-backend.md) | redb is the first backend |
+| [0003](0003-msgpack-only-zeo-server.md) | The server speaks only the ZEO msgpack protocol |
+| [0004](0004-no-python-on-the-server.md) | No Python on the server; three conflict tiers |
+| [0005](0005-zodb-6-and-zeo-6-only.md) | ZODB 6 and ZEO 6 only |
+| [0006](0006-python-and-platform-targets.md) | CPython 3.12 to 3.14 and 3.14t, on Linux x86-64 |
+| [0007](0007-uv-for-packages-buildout-for-plone.md) | uv for the project's packages, buildout for Plone instances |
+| [0008](0008-dagger-as-the-ci.md) | Dagger is the CI |
+| [0009](0009-checksums-and-zstd-in-the-format.md) | Checksums and zstd in the on-disk format |
+| [0010](0010-named-storages.md) | Named storages instead of multi-tenancy |
+| [0011](0011-apache-2-licence.md) | Apache-2.0 for everything |
+| [0012](0012-docs-in-git-published-to-pages.md) | docs/ in git is the source of truth, published to GitHub Pages |
+| [0013](0013-devenv-and-just.md) | devenv is the only environment, just is the only entry point |
+| [0014](0014-per-oid-locks-and-core-tids.md) | Per-OID locks in oid order; the core allocates tids |
+| [0015](0015-one-format-for-both-shapes.md) | One on-disk format for both shapes |
+| [0016](0016-format-room-per-record.md) | Format room is reserved per record from the first store |
+| [0017](0017-names-zoedb-and-zoe.md) | The distribution is zoedb; every identifier uses the stem zoe |
+| [0018](0018-board-and-trunk.md) | GitHub Issues and Projects are the board; trunk-based development |
+| [0019](0019-mvcc-through-the-adapter.md) | MVCC in-process through ZODB's MVCCAdapter |
