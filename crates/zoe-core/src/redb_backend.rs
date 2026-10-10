@@ -27,6 +27,18 @@ fn backend(error: impl Into<redb::Error>) -> ZoeError {
     ZoeError::Backend(Box::new(error.into()))
 }
 
+/// Return the error for the frame of `row` that `decode_frame` refused.
+/// A frame of a newer format is a format error. Any other refusal is
+/// `corrupt`.
+fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError {
+    match error {
+        format::FrameError::Unsupported { offset, value } => ZoeError::Format(format!(
+            "{row}: header byte {offset} is {value:#04x}, which this build cannot read"
+        )),
+        _ => corrupt,
+    }
+}
+
 /// A store in one redb database.
 pub(crate) struct RedbBackend {
     db: Database,
@@ -52,6 +64,10 @@ impl RedbBackend {
     }
 
     /// Open a store that `initialise` wrote, and check its format.
+    ///
+    /// The last tid is the greater of `last_tid` in `meta` and the tid of
+    /// the last transaction row. So a damaged `last_tid` cannot give a tid
+    /// a second time.
     pub(crate) fn open(db: Database) -> Result<Self> {
         let last_tid = {
             let txn = db.begin_read().map_err(backend)?;
@@ -65,10 +81,13 @@ impl RedbBackend {
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
             }
-            read(META_LAST_TID)?
+            let stored = read(META_LAST_TID)?
                 .as_deref()
                 .and_then(format::decode_u64)
-                .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?
+                .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?;
+            let txns = txn.open_table(TXNS).map_err(backend)?;
+            let last_row = txns.last().map_err(backend)?;
+            stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())))
         };
         Ok(Self {
             db,
@@ -90,8 +109,10 @@ impl RedbBackend {
     /// Read the record frame stored under `key` for `oid`.
     fn record(oid: Oid, key: &[u8; 16], bytes: &[u8]) -> Result<Record> {
         let (_, tid) = format::split_record_key(key);
-        let frame =
-            format::decode_frame(bytes).map_err(|_| ZoeError::CorruptRecord { oid, tid })?;
+        let frame = format::decode_frame(key, bytes).map_err(|e| {
+            let row = format!("record of oid {oid:?}, tid {tid:?}");
+            refused(e, &row, ZoeError::CorruptRecord { oid, tid })
+        })?;
         Ok(Record {
             tid,
             prev: frame.prev,
@@ -148,10 +169,10 @@ impl Backend for RedbBackend {
             for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
                 let (key, value) = entry.map_err(backend)?;
                 let tid = Tid(u64::from_be_bytes(*key.value()));
-                let corrupt = ZoeError::CorruptRecord { oid: Oid(0), tid };
-                let row = format::decode_frame(value.value())
+                let corrupt = ZoeError::CorruptTxn { tid };
+                let row = format::decode_frame(key.value(), value.value())
                     .and_then(|frame| format::decode_txn(tid, frame.payload))
-                    .map_err(|_| corrupt);
+                    .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
                 rows.push(row);
             }
             Ok(rows)
@@ -206,21 +227,21 @@ struct RedbWrite<'a> {
 
 impl WriteTxn for RedbWrite<'_> {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
-        let frame = format::encode_frame(format::MAIN_BRANCH, prev, data);
+        let key = format::record_key(oid, tid);
+        let frame = format::encode_frame(&key, format::MAIN_BRANCH, prev, data);
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
-        records
-            .insert(&format::record_key(oid, tid), frame.as_slice())
-            .map_err(backend)?;
+        records.insert(&key, frame.as_slice()).map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
         Ok(())
     }
 
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()> {
         debug_assert_eq!(meta.status, TxnStatus::Committed);
-        let frame = format::encode_frame(format::MAIN_BRANCH, Tid::ZERO, &format::encode_txn(meta));
+        let key = format::txn_key(meta.tid);
+        let payload = format::encode_txn(meta);
+        let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
         let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
-        txns.insert(&format::txn_key(meta.tid), frame.as_slice())
-            .map_err(backend)?;
+        txns.insert(&key, frame.as_slice()).map_err(backend)?;
         self.written_tid = Some(meta.tid);
         Ok(())
     }
@@ -248,5 +269,143 @@ impl WriteTxn for RedbWrite<'_> {
             self.last_tid.store(tid.0, Ordering::Release);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::backends::InMemoryBackend;
+    use xxhash_rust::xxh3::Xxh3;
+
+    use super::*;
+
+    /// Return an empty store in memory.
+    fn empty() -> RedbBackend {
+        let db = redb::Builder::new()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        RedbBackend::initialise(&db).unwrap();
+        RedbBackend::open(db).unwrap()
+    }
+
+    /// Return the frame of the row `key` with the codec byte `codec` and a
+    /// valid checksum.
+    fn frame_with_codec(key: &[u8], codec: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = format::encode_frame(key, format::MAIN_BRANCH, Tid::ZERO, payload);
+        frame[2] = codec;
+        let mut hasher = Xxh3::new();
+        hasher.update(key);
+        hasher.update(&frame[..24]);
+        hasher.update(payload);
+        let checksum = hasher.digest().to_le_bytes();
+        frame[24..32].copy_from_slice(&checksum);
+        frame
+    }
+
+    #[test]
+    fn a_record_of_a_newer_format_is_a_format_error() {
+        let backend = empty();
+        let (oid, tid) = (Oid(1), Tid(5));
+        let key = format::record_key(oid, tid);
+        let txn = backend.db.begin_write().unwrap();
+        txn.open_table(RECORDS)
+            .unwrap()
+            .insert(&key, frame_with_codec(&key, 1, b"pickle").as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let error = backend.load_before(oid, Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::Format(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_record_under_another_key_is_corrupt() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_record(Oid(1), Tid(5), Tid::ZERO, b"pickle")
+            .unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.db.begin_write().unwrap();
+        {
+            let mut records = txn.open_table(RECORDS).unwrap();
+            let frame = records
+                .get(&format::record_key(Oid(1), Tid(5)))
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            records
+                .insert(&format::record_key(Oid(2), Tid(5)), frame.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let error = backend.load_before(Oid(2), Tid::MAX);
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::CorruptRecord {
+                    oid: Oid(2),
+                    tid: Tid(5)
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Commit an empty transaction row at `tid`.
+    fn commit_txn(backend: &RedbBackend, tid: Tid) {
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_txn(&TxnMeta {
+                tid,
+                user: b"user".to_vec(),
+                description: Vec::new(),
+                extension: Vec::new(),
+                oid_count: 0,
+                status: TxnStatus::Committed,
+            })
+            .unwrap();
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn the_last_transaction_row_raises_a_damaged_last_tid() {
+        let backend = empty();
+        commit_txn(&backend, Tid(500));
+        let txn = backend.db.begin_write().unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert(META_LAST_TID, &format::encode_u64(7)[..])
+            .unwrap();
+        txn.commit().unwrap();
+
+        let reopened = RedbBackend::open(backend.db).unwrap();
+        assert_eq!(reopened.last_tid(), Tid(500));
+    }
+
+    #[test]
+    fn a_corrupt_transaction_row_names_its_tid() {
+        let backend = empty();
+        let tid = Tid(5);
+        commit_txn(&backend, tid);
+
+        let txn = backend.db.begin_write().unwrap();
+        {
+            let mut txns = txn.open_table(TXNS).unwrap();
+            let key = format::txn_key(tid);
+            let mut frame = txns.get(&key).unwrap().unwrap().value().to_vec();
+            *frame.last_mut().unwrap() ^= 1;
+            txns.insert(&key, frame.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rows: Vec<_> = backend.iter_txns(Tid::ZERO, Tid::MAX).collect();
+        assert!(
+            matches!(rows[..], [Err(ZoeError::CorruptTxn { tid: Tid(5) })]),
+            "{rows:?}"
+        );
     }
 }

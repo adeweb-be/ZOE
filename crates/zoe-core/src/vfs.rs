@@ -50,7 +50,7 @@ pub struct OsVfs {
 impl OsVfs {
     /// Open the directory `dir`, create it if necessary, and take the lock.
     pub fn new(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_dir_durable(dir)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,6 +97,37 @@ impl Vfs for OsVfs {
         File::open(&self.dir)?.sync_all()
     }
 }
+
+/// Create `dir` and its missing parents, one level at a time.
+///
+/// Each new directory and its parent are synced, so a power loss cannot
+/// remove a directory that holds a durable store.
+fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|path| !path.as_os_str().is_empty() && !path.is_dir())
+        .collect();
+    for path in missing.into_iter().rev() {
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            // Another process can create the directory first.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        File::open(path)?.sync_all()?;
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// The most pending operations for which `MemVfs::crash_images` makes an
+/// image of every subset. It makes at most 2^10 such images for one crash
+/// point.
+const MAX_SUBSET_PENDING: usize = 10;
 
 /// One recorded operation.
 #[derive(Clone, Debug)]
@@ -195,13 +226,25 @@ impl MemVfs {
 
     /// Return the states that a crash can leave on disk.
     ///
-    /// For every crash point (after 0, 1, ... n operations), the synced
-    /// operations are on disk. A write or a length change is synced by a
-    /// later sync of its file; a creation, a rename or a removal by a later
-    /// sync of the directory. The pending operations can be on disk or not,
-    /// in any subset: all, none, each prefix, each single one, and the last
-    /// write torn in half. A write to a file whose creation is not on disk
-    /// is lost.
+    /// A crash point comes before the first operation and after each
+    /// operation. At a crash point, the synced operations are on disk. A
+    /// write or a length change is synced by a later sync of its file. A
+    /// creation, a rename or a removal is synced by a later sync of the
+    /// directory. The other operations are pending. The images of a crash
+    /// point are these:
+    ///
+    /// - With at most `MAX_SUBSET_PENDING` pending operations, one image
+    ///   for each subset of them, the empty subset and the full one
+    ///   included.
+    /// - With more pending operations, one image with none of them, one
+    ///   with all of them, one for each prefix of 1 to n - 1 of them, and
+    ///   one for each single one.
+    /// - For each pending write of 2 bytes or more, two images with all
+    ///   the pending operations, where only the first half of that write
+    ///   lands in one, and only the second half in the other.
+    ///
+    /// The operations of an image land in their recorded order. A write to
+    /// a file whose creation is not on disk is lost.
     pub fn crash_images(&self) -> Vec<CrashImage> {
         let state = self.lock();
         let mut images = Vec::new();
@@ -215,34 +258,44 @@ impl MemVfs {
                     _ => None,
                 })
                 .collect();
-            let mut push = |variant: Variant, chosen: &[usize], torn: Option<usize>| {
+            let mut push = |variant: Variant| {
+                let (chosen, torn) = match &variant {
+                    Variant::Pending(chosen) => (&chosen[..], None),
+                    Variant::Torn(i, half) => (&pending[..], Some((*i, *half))),
+                };
                 let mut which: Vec<usize> = synced.iter().chain(chosen).copied().collect();
                 which.sort_unstable();
                 images.push(CrashImage {
                     point,
+                    files: apply(&state.initial, ops, &which, torn),
                     variant,
                     marks: marks.clone(),
-                    files: apply(&state.initial, ops, &which, torn),
                 });
             };
 
-            push(Variant::SyncedOnly, &[], None);
-            if pending.is_empty() {
-                continue;
-            }
-            push(Variant::AllPending, &pending, None);
-            for n in 1..pending.len() {
-                push(Variant::PendingPrefix(n), &pending[..n], None);
-            }
-            if pending.len() > 1 {
+            if pending.len() <= MAX_SUBSET_PENDING {
+                for subset in 0..1u32 << pending.len() {
+                    let chosen = (0..pending.len())
+                        .filter(|bit| subset & 1 << bit != 0)
+                        .map(|bit| pending[bit])
+                        .collect();
+                    push(Variant::Pending(chosen));
+                }
+            } else {
+                push(Variant::Pending(Vec::new()));
+                push(Variant::Pending(pending.clone()));
+                for n in 1..pending.len() {
+                    push(Variant::Pending(pending[..n].to_vec()));
+                }
                 for &i in &pending {
-                    push(Variant::OnlyPending(i), &[i], None);
+                    push(Variant::Pending(vec![i]));
                 }
             }
-            if let Some(&last) = pending.last()
-                && matches!(&ops[last], Op::Write { data, .. } if data.len() > 1)
-            {
-                push(Variant::Torn(last), &pending, Some(last));
+            for &i in &pending {
+                if matches!(&ops[i], Op::Write { data, .. } if data.len() > 1) {
+                    push(Variant::Torn(i, Half::First));
+                    push(Variant::Torn(i, Half::Second));
+                }
             }
         }
         images
@@ -344,12 +397,12 @@ fn split_at_syncs(ops: &[Op]) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// Apply the operations `which` of `ops` to a copy of `files`, in order.
-/// The write at index `torn` lands with only the first half of its bytes.
+/// Of the write `torn`, only the given half of its bytes lands.
 fn apply(
     files: &BTreeMap<String, Vec<u8>>,
     ops: &[Op],
     which: &[usize],
-    torn: Option<usize>,
+    torn: Option<(usize, Half)>,
 ) -> BTreeMap<String, Vec<u8>> {
     let mut files = files.clone();
     for &i in which {
@@ -358,13 +411,14 @@ fn apply(
                 files.entry(file.clone()).or_default();
             }
             Op::Write { file, offset, data } => {
-                let data = if torn == Some(i) {
-                    &data[..data.len() / 2]
-                } else {
-                    &data[..]
+                let middle = data.len() / 2;
+                let (offset, data) = match torn {
+                    Some((t, Half::First)) if t == i => (*offset, &data[..middle]),
+                    Some((t, Half::Second)) if t == i => (*offset + middle as u64, &data[middle..]),
+                    _ => (*offset, &data[..]),
                 };
                 if let Some(bytes) = files.get_mut(file) {
-                    write_at(bytes, *offset, data);
+                    write_at(bytes, offset, data);
                 }
             }
             Op::SetLen { file, len } => {
@@ -467,24 +521,32 @@ impl redb::StorageBackend for MemFile {
     }
 }
 
-/// Which pending operations of a crash point reached the disk.
+/// The half of a torn write that lands.
 #[derive(Clone, Copy)]
+enum Half {
+    First,
+    Second,
+}
+
+/// Which pending operations of a crash point reached the disk.
 enum Variant {
-    SyncedOnly,
-    AllPending,
-    PendingPrefix(usize),
-    OnlyPending(usize),
-    Torn(usize),
+    /// These pending operations, each one whole.
+    Pending(Vec<usize>),
+    /// All the pending operations, but only one half of this write.
+    Torn(usize, Half),
 }
 
 impl fmt::Display for Variant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Variant::SyncedOnly => write!(f, "synced operations only"),
-            Variant::AllPending => write!(f, "all pending operations"),
-            Variant::PendingPrefix(n) => write!(f, "the first {n} pending operations"),
-            Variant::OnlyPending(i) => write!(f, "only pending operation {i}"),
-            Variant::Torn(i) => write!(f, "pending operations, operation {i} torn"),
+            Variant::Pending(ops) if ops.is_empty() => write!(f, "synced operations only"),
+            Variant::Pending(ops) => write!(f, "pending operations {ops:?}"),
+            Variant::Torn(i, Half::First) => {
+                write!(f, "all pending operations, first half of operation {i}")
+            }
+            Variant::Torn(i, Half::Second) => {
+                write!(f, "all pending operations, second half of operation {i}")
+            }
         }
     }
 }
@@ -539,6 +601,19 @@ mod tests {
     }
 
     #[test]
+    fn a_store_directory_is_created_with_its_missing_parents() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("a").join("b");
+        drop(OsVfs::new(&dir).unwrap());
+        assert!(dir.join("lock").is_file());
+
+        fs::write(root.join("file"), b"").unwrap();
+        assert!(OsVfs::new(&root.join("file").join("c")).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn synced_writes_are_in_every_later_image() {
         let (vfs, file) = with_file();
         file.write(0, b"synced").unwrap();
@@ -586,6 +661,70 @@ mod tests {
                 .iter()
                 .any(|i| contents(i, "f").as_deref() == Some(&b"ab"[..]))
         );
+    }
+
+    #[test]
+    fn each_pending_write_can_tear_in_either_half() {
+        let (vfs, file) = with_file();
+        file.write(0, b"ab").unwrap();
+        file.write(2, b"cd").unwrap();
+
+        let images = vfs.crash_images();
+        for torn in [&b"a\0cd"[..], b"\0bcd", b"abc", b"ab\0d"] {
+            assert!(
+                images
+                    .iter()
+                    .any(|i| contents(i, "f").as_deref() == Some(torn)),
+                "{torn:?}"
+            );
+        }
+    }
+
+    /// Return the contents of `f` in the images of the last crash point.
+    fn last_point(vfs: &MemVfs) -> Vec<Vec<u8>> {
+        let last = vfs.lock().log.len();
+        vfs.crash_images()
+            .iter()
+            .filter(|i| i.point == last)
+            .map(|i| contents(i, "f").unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_subset_of_few_pending_operations_is_an_image() {
+        let (vfs, file) = with_file();
+        for (offset, byte) in b"abc".iter().enumerate() {
+            file.write(offset as u64, &[*byte]).unwrap();
+        }
+
+        let mut found = last_point(&vfs);
+        found.sort();
+        let mut subsets: Vec<Vec<u8>> = [
+            &b""[..],
+            b"a",
+            b"\0b",
+            b"ab",
+            b"\0\0c",
+            b"a\0c",
+            b"\0bc",
+            b"abc",
+        ]
+        .map(<[u8]>::to_vec)
+        .into();
+        subsets.sort();
+        assert_eq!(found, subsets);
+    }
+
+    #[test]
+    fn many_pending_operations_give_prefixes_and_single_ones() {
+        let (vfs, file) = with_file();
+        let n = MAX_SUBSET_PENDING + 1;
+        for offset in 0..n {
+            file.write(offset as u64, b"x").unwrap();
+        }
+
+        // None, all, the n - 1 proper prefixes and the n single ones.
+        assert_eq!(last_point(&vfs).len(), 2 + (n - 1) + n);
     }
 
     #[test]

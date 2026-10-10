@@ -64,7 +64,7 @@ impl<'s> Txn<'s> {
     }
 
     /// Lock the staged oids and check that no other transaction changed
-    /// them since their serial. A conflict releases the locks.
+    /// them since their serial. A failed vote releases the locks.
     pub fn vote(&mut self) -> Result<()> {
         if self.voted {
             return Err(ZoeError::Protocol("vote twice"));
@@ -72,6 +72,17 @@ impl<'s> Txn<'s> {
         let oids: Vec<Oid> = self.staged.keys().copied().collect();
         self.store.locks.acquire(&oids, self.store.lock_timeout)?;
         self.locked = oids;
+        if let Err(error) = self.check_serials() {
+            self.release();
+            return Err(error);
+        }
+        self.voted = true;
+        Ok(())
+    }
+
+    /// Check that the current serial of each staged oid is the serial that
+    /// the client read.
+    fn check_serials(&self) -> Result<()> {
         for (&oid, staged) in &self.staged {
             let current = self
                 .store
@@ -79,21 +90,27 @@ impl<'s> Txn<'s> {
                 .load_before(oid, Tid::MAX)?
                 .map_or(Tid::ZERO, |record| record.tid);
             if current != staged.serial {
-                self.release();
                 return Err(ZoeError::Conflict { oid });
             }
         }
-        self.voted = true;
         Ok(())
     }
 
     /// Commit the transaction and return its tid. The commit is durable
     /// when this returns.
+    ///
+    /// An error other than `Protocol` and `Halted` leaves the outcome of
+    /// the commit unknown until the store is reopened: the commit can be
+    /// on disk or not. After such an error, the store refuses every later
+    /// finish with `Halted`. Reopen the store to read the outcome and to
+    /// commit again.
     pub fn finish(mut self) -> Result<Tid> {
         if !self.voted {
             return Err(ZoeError::Protocol("finish before vote"));
         }
-        let mut last = self.store.lock_sequencer();
+        let mut sequencer = self.store.lock_sequencer();
+        // The sequencer stays empty if the write below fails.
+        let last = sequencer.take().ok_or(ZoeError::Halted)?;
         let tid = timestamp(self.store.clock.now()).max(Tid(last.0 + 1));
 
         let mut write = self.store.backend.begin_write()?;
@@ -110,8 +127,8 @@ impl<'s> Txn<'s> {
         })?;
         write.commit()?;
 
-        *last = tid;
-        drop(last);
+        *sequencer = Some(tid);
+        drop(sequencer);
         self.release();
         Ok(tid)
     }

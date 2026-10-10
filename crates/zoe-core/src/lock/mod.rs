@@ -24,12 +24,16 @@ impl LockManager {
         self.held.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Lock every oid of `oids`, which are in ascending order.
+    /// Lock every oid of `oids`.
     ///
-    /// A wait longer than `timeout` releases the locks this call took and
-    /// returns a conflict on the oid it waited for.
+    /// The oids must be in strictly ascending order. Otherwise the call
+    /// takes no lock and returns `LockOrder`. A wait longer than `timeout`
+    /// releases the locks this call took and returns a conflict on the oid
+    /// it waited for.
     pub(crate) fn acquire(&self, oids: &[Oid], timeout: Duration) -> Result<()> {
-        debug_assert!(oids.windows(2).all(|w| w[0] < w[1]));
+        if let Some(pair) = oids.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(ZoeError::LockOrder { oid: pair[1] });
+        }
         let deadline = Instant::now() + timeout;
         let mut held = self.held();
         for (i, &oid) in oids.iter().enumerate() {
@@ -86,6 +90,19 @@ mod tests {
         assert!(locks.acquire(&[Oid(2)], Duration::ZERO).is_err());
         locks.release(&[Oid(1), Oid(2)]);
         assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_request_out_of_order_is_refused() {
+        let locks = LockManager::default();
+        for oids in [[Oid(2), Oid(1)], [Oid(1), Oid(1)]] {
+            let error = locks.acquire(&oids, Duration::ZERO);
+            assert!(
+                matches!(error, Err(ZoeError::LockOrder { oid: Oid(1) })),
+                "{oids:?}"
+            );
+            assert!(locks.is_empty());
+        }
     }
 
     #[test]

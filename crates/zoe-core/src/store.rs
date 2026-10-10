@@ -30,8 +30,10 @@ pub struct Store {
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
-    /// The tid of the last commit. Its lock is the commit sequencer.
-    sequencer: Mutex<Tid>,
+    /// The tid of the last commit. Its lock is the commit sequencer. It is
+    /// `None` after a failed finish, because the outcome of that commit is
+    /// unknown.
+    sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
     /// The directory. It holds the single-writer lock while the store is
     /// open.
@@ -81,7 +83,7 @@ impl Store {
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: LOCK_TIMEOUT,
-            sequencer: Mutex::new(last_tid),
+            sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             _vfs: Box::new(vfs),
         })
@@ -111,16 +113,19 @@ impl Store {
         self.backend.last_tid()
     }
 
-    pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Tid> {
+    pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
 
     /// A clock that never moves.
     struct FrozenClock;
@@ -129,6 +134,76 @@ mod tests {
         fn now(&self) -> SystemTime {
             UNIX_EPOCH + Duration::from_secs(1_000_000_000)
         }
+    }
+
+    /// The faults that a test turns on and off.
+    #[derive(Default)]
+    struct Faults {
+        /// `load_before` fails.
+        load: AtomicBool,
+        /// `begin_write` fails.
+        write: AtomicBool,
+    }
+
+    /// A backend that fails when a test turns a fault on.
+    struct Faulty {
+        inner: Box<dyn Backend>,
+        faults: Arc<Faults>,
+    }
+
+    fn injected() -> ZoeError {
+        ZoeError::Backend("injected fault".into())
+    }
+
+    impl Backend for Faulty {
+        fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>> {
+            if self.faults.load.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.load_before(oid, tid)
+        }
+
+        fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
+            self.inner.load_serial(oid, tid)
+        }
+
+        fn last_tid(&self) -> Tid {
+            self.inner.last_tid()
+        }
+
+        fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>> {
+            if self.faults.write.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.begin_write()
+        }
+
+        fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
+            self.inner.iter_txns(from, to)
+        }
+
+        fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
+            self.inner.history(oid, limit)
+        }
+
+        fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
+            self.inner.pack(before, reachable)
+        }
+
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+    }
+
+    /// Open a store whose backend fails when a test turns a fault on.
+    fn faulty_store() -> (Store, Arc<Faults>) {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let faults = Arc::new(Faults::default());
+        let backend = Box::new(Faulty {
+            inner: store.backend,
+            faults: Arc::clone(&faults),
+        });
+        (Store { backend, ..store }, faults)
     }
 
     fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Result<Tid> {
@@ -155,6 +230,48 @@ mod tests {
         let error = commit(&store, oid, Tid::ZERO, b"b");
         assert!(matches!(error, Err(ZoeError::Conflict { .. })));
         assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_backend_error_in_vote_releases_the_locks() {
+        let (mut store, faults) = faulty_store();
+        // A zero lock timeout turns every wait into a conflict.
+        store.lock_timeout = Duration::ZERO;
+        let oid = store.new_oid().unwrap();
+        let mut failed = store.tpc_begin(b"", b"", b"").unwrap();
+        failed.store(oid, Tid::ZERO, b"a").unwrap();
+        faults.load.store(true, Ordering::Relaxed);
+        assert!(matches!(failed.vote(), Err(ZoeError::Backend(_))));
+        assert!(store.locks.is_empty());
+        faults.load.store(false, Ordering::Relaxed);
+
+        // Another transaction locks the same oid at once.
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other.store(oid, Tid::ZERO, b"b").unwrap();
+        other.vote().unwrap();
+        other.abort();
+
+        // A second vote does not wait on a lock of the first one.
+        failed.vote().unwrap();
+        failed.finish().unwrap();
+    }
+
+    #[test]
+    fn a_failed_finish_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(matches!(txn.finish(), Err(ZoeError::Backend(_))));
+        assert!(store.locks.is_empty());
+
+        faults.write.store(false, Ordering::Relaxed);
+        let error = commit(&store, oid, Tid::ZERO, b"b");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert!(store.locks.is_empty());
+        assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
     }
 
     #[test]

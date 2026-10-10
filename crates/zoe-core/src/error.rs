@@ -24,6 +24,14 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// The checksum of a transaction row does not match its bytes, or its
+    /// payload does not decode.
+    #[error("corrupt transaction row: tid {tid:?}")]
+    CorruptTxn {
+        /// The transaction id of the row.
+        tid: Tid,
+    },
+
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
     #[error("conflict: oid {oid:?}")]
@@ -32,10 +40,23 @@ pub enum ZoeError {
         oid: Oid,
     },
 
+    /// A lock request is not in ascending oid order. The lock manager
+    /// refuses it and takes no lock.
+    #[error("lock request out of oid order: oid {oid:?}")]
+    LockOrder {
+        /// The first oid that is not greater than the oid before it.
+        oid: Oid,
+    },
+
     /// A two-phase commit call came out of order, for example `finish`
     /// before `vote`.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
+
+    /// A finish failed before, so the outcome of its commit is unknown.
+    /// The store refuses every finish until it is reopened.
+    #[error("a finish failed: reopen the store to commit again")]
+    Halted,
 
     /// Another process holds the lock of the store.
     #[error("the store is locked by another process")]
