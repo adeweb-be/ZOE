@@ -5,3 +5,4 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 | Finding | Question |
 | --- | --- |
 | [free-threading-upstream.md](free-threading-upstream.md) | Can persistent, BTrees and zodbpickle declare that they need no GIL, and what must change first? |
+| [pickle-round-trip.md](pickle-round-trip.md) | Can zoe-pickle decode a ZODB record into a tree and encode it back to the same bytes, and which constructs must stay opaque? |

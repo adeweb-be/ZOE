@@ -37,3 +37,4 @@
 - [Glossary](glossary.md)
 - [Spikes](spikes/README.md)
   - [Free-threading in persistent, BTrees and zodbpickle](spikes/free-threading-upstream.md)
+  - [Byte-identical pickle round trip in zoe-pickle](spikes/pickle-round-trip.md)
