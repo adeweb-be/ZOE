@@ -3,9 +3,9 @@
 //! The parser reads the text of ZODB's `ConflictError` and
 //! `ReadConflictError`, for example `database conflict error (oid 0x7a3c,
 //! class BTrees.OOBTree.OOBucket, serial ...)`, anywhere in a line. The
-//! details must have the ZODB form: only `oid`, `class` and `serial` parts,
-//! a hexadecimal oid and a dotted class name. Other text is not a conflict,
-//! so free text never reaches the report.
+//! details must have the ZODB form: only `oid`, `class` and `serial` parts.
+//! An oid that is not hexadecimal or a class that is not a dotted name
+//! counts as absent, so free text never reaches the report.
 //!
 //! The readCurrent conflicts of ZODB 6 name no class. A conflict that names
 //! no class takes the class that other lines name for the same oid, or
@@ -36,10 +36,11 @@ pub struct Conflict {
     pub class: Option<String>,
 }
 
-/// Return the first conflict that `line` reports, or `None`.
+/// Return the conflict that `line` reports, or `None`.
 ///
-/// The parser tries each marker in the line, from left to right, and keeps
-/// the first one whose details have the ZODB form.
+/// The parser tries each marker in the line, from right to left, and keeps
+/// the first one whose details have the ZODB form. In the log lines of Zope
+/// the error text comes after the request path, so the last marker wins.
 pub fn parse_line(line: &str) -> Option<Conflict> {
     let mut starts: Vec<usize> = MARKERS
         .iter()
@@ -51,6 +52,7 @@ pub fn parse_line(line: &str) -> Option<Conflict> {
     starts.sort_unstable();
     starts
         .into_iter()
+        .rev()
         .find_map(|start| parse_details(&line[start..]))
 }
 
@@ -63,15 +65,9 @@ fn parse_details(rest: &str) -> Option<Conflict> {
     };
     for part in details.split(',').map(str::trim) {
         if let Some(oid) = part.strip_prefix("oid ") {
-            if !is_oid(oid) {
-                return None;
-            }
-            conflict.oid = Some(oid.to_owned());
+            conflict.oid = is_oid(oid).then(|| oid.to_owned());
         } else if let Some(class) = part.strip_prefix("class ") {
-            if !is_class_name(class) {
-                return None;
-            }
-            conflict.class = Some(class.to_owned());
+            conflict.class = is_class_name(class).then(|| class.to_owned());
         } else if !part.starts_with("serial ") {
             return None;
         }
@@ -126,7 +122,7 @@ impl Ranking {
         *classes.entry(conflict.class).or_default() += 1;
     }
 
-    /// Count the first conflict of every line that `reader` gives. Bytes
+    /// Count the conflict of every line that `reader` gives, one at most. Bytes
     /// that are not UTF-8 do not stop the read.
     pub fn read(&mut self, mut reader: impl BufRead) -> io::Result<()> {
         let mut buf = Vec::new();
@@ -314,33 +310,40 @@ mod tests {
     }
 
     #[test]
-    fn a_class_must_be_a_dotted_name() {
+    fn a_class_that_is_not_a_dotted_name_is_absent() {
         assert_eq!(
             parse_line("database conflict error (oid 0xdead, class jdoe)"),
-            None
+            Some(conflict(Some("0xdead"), None))
         );
         assert_eq!(
-            parse_line("database conflict error (oid 0xdead, class a..b)"),
-            None
+            parse_line("database conflict error (oid 0x01, class .)"),
+            Some(conflict(Some("0x01"), None))
         );
     }
 
     #[test]
-    fn an_oid_must_be_hexadecimal() {
+    fn an_oid_that_is_not_hexadecimal_is_absent() {
         assert_eq!(
             parse_line("database conflict error (oid jdoe, class a.A)"),
-            None
+            Some(conflict(None, Some("a.A")))
         );
         assert_eq!(
-            parse_line("database conflict error (oid 0x, class a.A)"),
+            parse_line("database conflict error (oid 0x, class jdoe)"),
             None
         );
     }
 
     #[test]
-    fn a_bad_marker_gives_way_to_a_good_one_later_in_the_line() {
-        let line = "at /x/database conflict error (oid 0x1, class jdoe)/edit: \
-                    database conflict error (oid 0x02, class a.A)";
+    fn the_last_marker_of_a_line_wins() {
+        let line = "ConflictError at /x/database conflict error (oid 0x1, class jane.doe)/edit: \
+                    database conflict error (oid 0x02, class a.A). Request will be retried.";
+        assert_eq!(parse_line(line), Some(conflict(Some("0x02"), Some("a.A"))));
+    }
+
+    #[test]
+    fn a_bad_last_marker_gives_way_to_an_earlier_one() {
+        let line =
+            "database conflict error (oid 0x02, class a.A); database conflict error (see above)";
         assert_eq!(parse_line(line), Some(conflict(Some("0x02"), Some("a.A"))));
     }
 
