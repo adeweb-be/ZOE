@@ -40,6 +40,14 @@ pub enum ZoeError {
         oid: Oid,
     },
 
+    /// A lock request is not in ascending oid order. The lock manager
+    /// refuses it and takes no lock.
+    #[error("lock request out of oid order: oid {oid:?}")]
+    LockOrder {
+        /// The first oid that is not greater than the oid before it.
+        oid: Oid,
+    },
+
     /// A two-phase commit call came out of order, for example `finish`
     /// before `vote`.
     #[error("two-phase commit out of order: {0}")]
