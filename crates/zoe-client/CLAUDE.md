@@ -2,8 +2,6 @@
 
 A Rust client for the ZEO protocol, with the ZOE extensions. `zoe.zeo.ClientStorage` and the server mode of Loupe use it. Specification: "Async and free-threading" and F28.
 
-Red zone in this crate: `src/protocol/`.
-
 ## Invariants
 
 - The client speaks the same ZEO 6 msgpack protocol as `ZEO.ClientStorage`.

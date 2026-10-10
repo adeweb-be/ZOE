@@ -2,7 +2,7 @@
 
 The storage core. It owns correctness: the data model, two-phase commit, per-OID locks, conflict handling, pack and blobs. Backends own bytes. Specification: "Storage core" and "Async and free-threading".
 
-Red zones in this crate: `src/commit/`, `src/lock/`, `src/format/`.
+Red zones in this crate: `src/format/` and `src/pack/`. A change to the data model is a format change wherever its code lives.
 
 ## Invariants
 

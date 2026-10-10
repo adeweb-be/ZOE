@@ -12,5 +12,5 @@ A laptop, a CI runner and an agent session must have the same tools at the same 
 
 ## Consequences
 
-- `devenv.nix` is a red zone.
+- `devenv.nix` changes through cards, reviewed like code (ADR 0022).
 - A command an agent needs and cannot find becomes a recipe in the same pull request.

@@ -41,14 +41,11 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 
 A pull request that touches a red zone needs the human's approval. `CODEOWNERS` lists them.
 
-- `crates/zoe-core/src/commit/`: two-phase commit and group commit.
-- `crates/zoe-core/src/lock/`: the lock manager.
-- `crates/zoe-core/src/format/`: the on-disk format.
-- `crates/zoe-pickle/src/encode/`: the pickle encoder.
-- `crates/zoe-server/src/protocol/` and `crates/zoe-client/src/protocol/`: the protocol layer.
-- Security code: every `security/` and `tls/` directory.
-- `devenv.nix`, `devenv.yaml`, `devenv.lock`.
-- `ci/`, `.github/` and `loops/`. Only a human changes these, red zone or not.
+- `crates/zoe-core/src/format/`: the on-disk format. A change to the data model (a key space, a `meta` key, a frame field) is a format change wherever its code lives.
+- `crates/zoe-core/src/pack/`: pack, because it deletes data.
+- `.github/` (the workflows and `CODEOWNERS`) and `loops/` (the role briefs). Only a human changes these.
+
+Everything else, `ci/` and `devenv.nix` included, merges on the reviewer's approval with the acceptance test, the crash simulation and TSan green.
 
 ## Stop and ask
 

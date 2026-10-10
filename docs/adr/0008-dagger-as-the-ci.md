@@ -14,4 +14,4 @@ CI is a Dagger module written in Python in `ci/`, with one function per job. Eve
 
 - A CI failure reproduces on any machine with Docker.
 - CI and the developer shell use the same tools from the same definition.
-- `ci/` and `.github/` are red zones that only a human changes.
+- `.github/` is a red zone that only a human changes. `ci/` changes through cards, reviewed like code (ADR 0022).
