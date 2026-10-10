@@ -64,7 +64,7 @@ impl<'s> Txn<'s> {
     }
 
     /// Lock the staged oids and check that no other transaction changed
-    /// them since their serial. A conflict releases the locks.
+    /// them since their serial. A failed vote releases the locks.
     pub fn vote(&mut self) -> Result<()> {
         if self.voted {
             return Err(ZoeError::Protocol("vote twice"));
@@ -72,6 +72,17 @@ impl<'s> Txn<'s> {
         let oids: Vec<Oid> = self.staged.keys().copied().collect();
         self.store.locks.acquire(&oids, self.store.lock_timeout)?;
         self.locked = oids;
+        if let Err(error) = self.check_serials() {
+            self.release();
+            return Err(error);
+        }
+        self.voted = true;
+        Ok(())
+    }
+
+    /// Check that the current serial of each staged oid is the serial that
+    /// the client read.
+    fn check_serials(&self) -> Result<()> {
         for (&oid, staged) in &self.staged {
             let current = self
                 .store
@@ -79,11 +90,9 @@ impl<'s> Txn<'s> {
                 .load_before(oid, Tid::MAX)?
                 .map_or(Tid::ZERO, |record| record.tid);
             if current != staged.serial {
-                self.release();
                 return Err(ZoeError::Conflict { oid });
             }
         }
-        self.voted = true;
         Ok(())
     }
 
