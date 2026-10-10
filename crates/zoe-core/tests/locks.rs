@@ -212,7 +212,10 @@ fn read_current_oids_share_their_lock() {
         thread::sleep(Duration::from_millis(200));
         first.finish().unwrap();
         thread::sleep(Duration::from_millis(200));
-        assert!(waiting.try_recv().is_err(), "the writer did not wait for the second reader");
+        assert!(
+            waiting.try_recv().is_err(),
+            "the writer did not wait for the second reader"
+        );
         second.finish().unwrap();
         let result = waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok(), "{result:?}");
