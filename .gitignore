@@ -1,0 +1,22 @@
+# Build output
+/target/
+
+# devenv
+/.devenv/
+/.devenv.flake.nix
+/.direnv/
+/devenv.local.nix
+
+# Python
+__pycache__/
+# Extension modules that maturin builds into the source tree.
+/python/zoedb/src/zoe/*.so
+/python/.venv*/
+
+# Plone instances built by buildout
+/plone/.installed.cfg
+/plone/bin/
+/plone/develop-eggs/
+/plone/eggs/
+/plone/parts/
+/plone/var/

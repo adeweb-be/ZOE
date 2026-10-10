@@ -1,0 +1,29 @@
+# Thin workflow: all CI logic lives in the Dagger module in ci/.
+name: pull request
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: check
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: test
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: docs

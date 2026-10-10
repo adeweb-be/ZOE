@@ -1,0 +1,47 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "zoedb"
+description = "ZOE, the Zope Object Engine: a ZODB storage written in Rust."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Framework :: ZODB",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Rust",
+]
+
+[project.optional-dependencies]
+plone = ["Products.CMFPlone>=6.1"]
+
+[project.urls]
+Repository = "https://github.com/adeweb-be/zoe"
+Documentation = "https://adeweb-be.github.io/zoe/"
+
+[tool.maturin]
+manifest-path = "../../crates/zoe-py/Cargo.toml"
+module-name = "zoe._zoe"
+python-source = "src"
+
+[tool.uv]
+# Rebuild the extension when the Rust code changes.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+    { file = "../../crates/**/*.rs" },
+    { file = "../../crates/**/Cargo.toml" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

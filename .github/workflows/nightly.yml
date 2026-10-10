@@ -1,0 +1,38 @@
+# Thin workflow: all CI logic lives in the Dagger module in ci/.
+# The nightly jobs belong on the self-hosted reference runner. Until that
+# runner exists, they run on a hosted runner.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: conformance
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: plone
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: bench
+      - uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.10"
+          module: ci
+          call: crash

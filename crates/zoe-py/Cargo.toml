@@ -1,0 +1,19 @@
+[package]
+name = "zoe-py"
+description = "The Python extension module zoe._zoe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_zoe"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
+
+[lints]
+workspace = true

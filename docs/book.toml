@@ -1,0 +1,14 @@
+[book]
+title = "ZOE"
+description = "ZOE, the Zope Object Engine: a ZODB storage written in Rust."
+src = "."
+language = "en"
+
+[build]
+build-dir = "../target/book"
+create-missing = false
+
+[output.html]
+site-url = "/zoe/"
+git-repository-url = "https://github.com/adeweb-be/zoe"
+edit-url-template = "https://github.com/adeweb-be/zoe/edit/main/docs/{path}"
