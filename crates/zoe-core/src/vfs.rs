@@ -50,7 +50,7 @@ pub struct OsVfs {
 impl OsVfs {
     /// Open the directory `dir`, create it if necessary, and take the lock.
     pub fn new(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_dir_durable(dir)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -96,6 +96,32 @@ impl Vfs for OsVfs {
     fn sync_dir(&self) -> io::Result<()> {
         File::open(&self.dir)?.sync_all()
     }
+}
+
+/// Create `dir` and its missing parents, one level at a time.
+///
+/// Each new directory and its parent are synced, so a power loss cannot
+/// remove a directory that holds a durable store.
+fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|path| !path.as_os_str().is_empty() && !path.is_dir())
+        .collect();
+    for path in missing.into_iter().rev() {
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            // Another process can create the directory first.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        File::open(path)?.sync_all()?;
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// One recorded operation.
@@ -536,6 +562,19 @@ mod tests {
         let file = vfs.file("f");
         vfs.sync_dir();
         (vfs, file)
+    }
+
+    #[test]
+    fn a_store_directory_is_created_with_its_missing_parents() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("a").join("b");
+        drop(OsVfs::new(&dir).unwrap());
+        assert!(dir.join("lock").is_file());
+
+        fs::write(root.join("file"), b"").unwrap();
+        assert!(OsVfs::new(&root.join("file").join("c")).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
