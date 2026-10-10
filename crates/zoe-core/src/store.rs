@@ -59,6 +59,18 @@ impl Store {
     /// after it is durable, so a crash during the creation leaves either
     /// no store or a complete empty one.
     pub fn open_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Self> {
+        Self::open_with_quick_repair(vfs, clock, false)
+    }
+
+    /// Open the store in `vfs` like `open_in`. With `quick_repair`, every
+    /// redb commit also saves the allocator state. The record-store
+    /// measurement uses this.
+    #[doc(hidden)]
+    pub fn open_with_quick_repair<V: Vfs>(
+        vfs: V,
+        clock: impl Clock + 'static,
+        quick_repair: bool,
+    ) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
                 vfs.remove(NEW_DATABASE)?;
@@ -75,18 +87,33 @@ impl Store {
         let db = redb::Builder::new()
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
-        let backend = RedbBackend::open(db)?;
+        let mut backend = RedbBackend::open(db)?;
+        backend.set_quick_repair(quick_repair);
         let next_oid = backend.next_oid()?;
+        let mut store = Self::from_backend(Box::new(backend), next_oid, clock);
+        store._vfs = Box::new(vfs);
+        Ok(store)
+    }
+
+    /// Return a store on `backend`. `next_oid` must be greater than every
+    /// committed oid. The record-store measurement uses this to run
+    /// another backend through the same commit path.
+    #[doc(hidden)]
+    pub fn from_backend(
+        backend: Box<dyn Backend>,
+        next_oid: Oid,
+        clock: impl Clock + 'static,
+    ) -> Self {
         let last_tid = backend.last_tid();
-        Ok(Self {
-            backend: Box::new(backend),
+        Self {
+            backend,
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: LOCK_TIMEOUT,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
-            _vfs: Box::new(vfs),
-        })
+            _vfs: Box::new(()),
+        }
     }
 
     /// Return a new oid. An oid that no commit uses can come back after
@@ -315,6 +342,28 @@ mod tests {
         assert_eq!((row.tid, row.oid_count), (tid, 1));
         assert_eq!(row.user, b"user");
         assert_eq!(store.backend.history(oid, 10).unwrap().len(), 1);
+    }
+
+    /// With quick repair on, every crash image opens and keeps every
+    /// acknowledged commit.
+    #[test]
+    fn a_quick_repair_store_survives_every_crash_image() {
+        let vfs = MemVfs::new();
+        let (oid, tid) = {
+            let store = Store::open_with_quick_repair(vfs.clone(), SystemClock, true).unwrap();
+            let oid = store.new_oid().unwrap();
+            let tid = commit(&store, oid, Tid::ZERO, b"b").unwrap();
+            vfs.mark("acknowledged");
+            (oid, tid)
+        };
+
+        for image in &vfs.crash_images() {
+            let store = Store::open_vfs(image.vfs())
+                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            if image.is_after("acknowledged") {
+                assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid), "{image:?}");
+            }
+        }
     }
 
     #[test]

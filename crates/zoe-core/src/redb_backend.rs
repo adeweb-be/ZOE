@@ -43,6 +43,10 @@ fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError 
 pub(crate) struct RedbBackend {
     db: Database,
     last_tid: AtomicU64,
+    /// When true, every commit also saves the allocator state. This adds
+    /// a second fsync, and an open after a crash does not walk the
+    /// database.
+    quick_repair: bool,
 }
 
 impl RedbBackend {
@@ -92,7 +96,13 @@ impl RedbBackend {
         Ok(Self {
             db,
             last_tid: AtomicU64::new(last_tid),
+            quick_repair: false,
         })
+    }
+
+    /// Turn quick repair on or off for the commits that follow.
+    pub(crate) fn set_quick_repair(&mut self, enabled: bool) {
+        self.quick_repair = enabled;
     }
 
     /// Return the next oid that no committed record uses.
@@ -152,8 +162,10 @@ impl Backend for RedbBackend {
     }
 
     fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>> {
+        let mut txn = self.db.begin_write().map_err(backend)?;
+        txn.set_quick_repair(self.quick_repair);
         Ok(Box::new(RedbWrite {
-            txn: self.db.begin_write().map_err(backend)?,
+            txn,
             last_tid: &self.last_tid,
             written_tid: None,
             max_oid: None,
