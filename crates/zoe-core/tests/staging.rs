@@ -50,7 +50,11 @@ fn a_transaction_larger_than_the_limit_spills_and_commits() {
     let mut txn = store.tpc_begin(b"", b"large", b"").unwrap();
     for &oid in &oids {
         txn.store(oid, Tid::ZERO, &pickle(oid)).unwrap();
-        assert!(txn.staged_in_memory() <= LIMIT, "{}", txn.staged_in_memory());
+        assert!(
+            txn.staged_in_memory() <= LIMIT,
+            "{}",
+            txn.staged_in_memory()
+        );
     }
     assert!(spill_files(&dir) > 0, "nothing was spilled");
     txn.vote().unwrap();
