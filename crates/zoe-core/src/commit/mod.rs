@@ -98,11 +98,19 @@ impl<'s> Txn<'s> {
 
     /// Commit the transaction and return its tid. The commit is durable
     /// when this returns.
+    ///
+    /// An error other than `Protocol` and `Halted` leaves the outcome of
+    /// the commit unknown until the store is reopened: the commit can be
+    /// on disk or not. After such an error, the store refuses every later
+    /// finish with `Halted`. Reopen the store to read the outcome and to
+    /// commit again.
     pub fn finish(mut self) -> Result<Tid> {
         if !self.voted {
             return Err(ZoeError::Protocol("finish before vote"));
         }
-        let mut last = self.store.lock_sequencer();
+        let mut sequencer = self.store.lock_sequencer();
+        // The sequencer stays empty if the write below fails.
+        let last = sequencer.take().ok_or(ZoeError::Halted)?;
         let tid = timestamp(self.store.clock.now()).max(Tid(last.0 + 1));
 
         let mut write = self.store.backend.begin_write()?;
@@ -119,8 +127,8 @@ impl<'s> Txn<'s> {
         })?;
         write.commit()?;
 
-        *last = tid;
-        drop(last);
+        *sequencer = Some(tid);
+        drop(sequencer);
         self.release();
         Ok(tid)
     }

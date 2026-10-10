@@ -30,8 +30,10 @@ pub struct Store {
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
-    /// The tid of the last commit. Its lock is the commit sequencer.
-    sequencer: Mutex<Tid>,
+    /// The tid of the last commit. Its lock is the commit sequencer. It is
+    /// `None` after a failed finish, because the outcome of that commit is
+    /// unknown.
+    sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
     /// The directory. It holds the single-writer lock while the store is
     /// open.
@@ -81,7 +83,7 @@ impl Store {
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: LOCK_TIMEOUT,
-            sequencer: Mutex::new(last_tid),
+            sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             _vfs: Box::new(vfs),
         })
@@ -111,7 +113,7 @@ impl Store {
         self.backend.last_tid()
     }
 
-    pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Tid> {
+    pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -139,6 +141,8 @@ mod tests {
     struct Faults {
         /// `load_before` fails.
         load: AtomicBool,
+        /// `begin_write` fails.
+        write: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
@@ -168,6 +172,9 @@ mod tests {
         }
 
         fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>> {
+            if self.faults.write.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
             self.inner.begin_write()
         }
 
@@ -247,6 +254,24 @@ mod tests {
         // A second vote does not wait on a lock of the first one.
         failed.vote().unwrap();
         failed.finish().unwrap();
+    }
+
+    #[test]
+    fn a_failed_finish_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(matches!(txn.finish(), Err(ZoeError::Backend(_))));
+        assert!(store.locks.is_empty());
+
+        faults.write.store(false, Ordering::Relaxed);
+        let error = commit(&store, oid, Tid::ZERO, b"b");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert!(store.locks.is_empty());
+        assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
     }
 
     #[test]

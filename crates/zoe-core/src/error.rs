@@ -53,6 +53,11 @@ pub enum ZoeError {
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
 
+    /// A finish failed before, so the outcome of its commit is unknown.
+    /// The store refuses every finish until it is reopened.
+    #[error("a finish failed: reopen the store to commit again")]
+    Halted,
+
     /// Another process holds the lock of the store.
     #[error("the store is locked by another process")]
     Locked,
