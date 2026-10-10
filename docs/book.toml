@@ -9,6 +9,6 @@ build-dir = "../target/book"
 create-missing = false
 
 [output.html]
-site-url = "/zoe/"
-git-repository-url = "https://github.com/adeweb-be/zoe"
-edit-url-template = "https://github.com/adeweb-be/zoe/edit/main/docs/{path}"
+site-url = "/ZOE/"
+git-repository-url = "https://github.com/adeweb-be/ZOE"
+edit-url-template = "https://github.com/adeweb-be/ZOE/edit/main/docs/{path}"

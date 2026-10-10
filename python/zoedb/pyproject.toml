@@ -25,8 +25,8 @@ classifiers = [
 plone = ["Products.CMFPlone>=6.1"]
 
 [project.urls]
-Repository = "https://github.com/adeweb-be/zoe"
-Documentation = "https://adeweb-be.github.io/zoe/"
+Repository = "https://github.com/adeweb-be/ZOE"
+Documentation = "https://adeweb-be.github.io/ZOE/"
 
 [tool.maturin]
 manifest-path = "../../crates/zoe-py/Cargo.toml"
