@@ -13,11 +13,15 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - The backend never allocates tids. The core allocates the tid at `tpc_finish` under the commit sequencer: `max(now, last_tid + 1 tick)`.
 - Tids always increase.
 - A client passes a tid only through `restore`, never through a normal commit.
-- Locks are acquired in ascending oid order. A request out of order is refused with `LockOrder`, never granted.
+- Locks are acquired in ascending oid order, over the written and the read-current oids together. A request out of order is refused with `LockOrder`, never granted.
+- Written oids take exclusive locks. Oids passed to `checkCurrentSerialInTransaction` take shared locks. An oid that is both takes an exclusive lock. A shared lock is compatible only with shared locks.
+- Each oid has a wait queue in arrival order. A lock request never passes a request that waits for the same oid, so a stream of readers cannot starve a writer.
 - A transaction that must wait releases nothing and queues once.
-- A lock wait longer than `lock-timeout` (default 10 s) becomes a `ConflictError`.
-- Written oids take exclusive locks. Oids passed to `checkCurrentSerialInTransaction` take shared locks.
-- Conflict detection and resolution happen at vote, before any disk write. A failed vote releases its locks.
+- The thread that releases a lock grants it to the waiters at the head of the queue, under the lock-manager mutex, then wakes them. A waiter holds its lock before it wakes up.
+- A lock wait longer than `lock-timeout` (default 10 s) becomes a `ConflictError` on the oid waited for. The timeout covers all the waits of one vote, measured on the monotonic clock from the start of its lock acquisition.
+- Conflict detection and resolution happen at vote, before any disk write. A stale written serial is `Conflict`; a stale read-current serial is `ReadConflict`. The vote checks the written serials first.
+- A failed vote releases every lock that it took. `finish` releases the locks after the commit is durable and the sequencer holds the new tid. `abort` releases them. Dropping a transaction aborts it.
+- The lock table has an entry only for an oid that a transaction holds or waits for.
 - No conflict tier runs Python on the server.
 - One backend write transaction holds the records, the transaction row and the meta update of a commit. It is durable before the client gets the acknowledgement.
 - A crash before the fsync leaves nothing. A crash after it leaves a complete transaction. No repair step exists.
