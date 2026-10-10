@@ -1,17 +1,18 @@
 //! The transaction coordinator: the two-phase commit state machine.
 //!
 //! `store` stages records and makes nothing visible. `vote` takes the
-//! per-OID locks in ascending oid order and detects conflicts before any
+//! per-OID locks in ascending oid order, then detects conflicts before any
 //! disk write. `finish` allocates the tid and writes the records, the
 //! transaction row and the meta update in one backend write transaction,
-//! durable before it returns. Dropping a transaction aborts it and
-//! releases its locks.
+//! durable before it returns. `finish` and `abort` release the locks.
+//! Dropping a transaction aborts it.
 
 use std::collections::BTreeMap;
 
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
+use crate::lock::{Locks, Mode};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -23,14 +24,17 @@ struct Staged {
 }
 
 /// One transaction of a store, from `tpc_begin` to `finish` or `abort`.
+///
+/// Dropping a transaction aborts it.
 pub struct Txn<'s> {
     store: &'s Store,
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
     staged: BTreeMap<Oid, Staged>,
-    locked: Vec<Oid>,
-    voted: bool,
+    /// The locks of a successful vote. The transaction holds them until
+    /// `finish` or `abort`.
+    locks: Option<Locks<'s>>,
 }
 
 impl<'s> Txn<'s> {
@@ -41,15 +45,18 @@ impl<'s> Txn<'s> {
             description: description.to_vec(),
             extension: extension.to_vec(),
             staged: BTreeMap::new(),
-            locked: Vec::new(),
-            voted: false,
+            locks: None,
         }
+    }
+
+    fn voted(&self) -> bool {
+        self.locks.is_some()
     }
 
     /// Stage a new version of `oid`. `serial` is the serial that the client
     /// read; it is `Tid::ZERO` for a new object.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
-        if self.voted {
+        if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
         }
         self.staged.insert(
@@ -62,37 +69,54 @@ impl<'s> Txn<'s> {
         Ok(())
     }
 
-    /// Lock the staged oids and check that no other transaction changed
-    /// them since their serial. A failed vote releases the locks.
+    /// Lock the written oids, then check that no other transaction
+    /// changed them since their serial.
+    ///
+    /// The vote waits for a lock that another transaction holds, at most
+    /// the lock timeout of the store. A longer wait fails with `Conflict`.
+    /// A failed vote releases every lock that it took.
     pub fn vote(&mut self) -> Result<()> {
-        if self.voted {
+        if self.voted() {
             return Err(ZoeError::Protocol("vote twice"));
         }
-        let oids: Vec<Oid> = self.staged.keys().copied().collect();
-        self.store.locks.acquire(&oids, self.store.lock_timeout)?;
-        self.locked = oids;
-        if let Err(error) = self.check_serials() {
-            self.release();
-            return Err(error);
-        }
-        self.voted = true;
+        let locks = self
+            .store
+            .locks
+            .acquire(&self.lock_requests(), self.store.lock_timeout)?;
+        // An error drops `locks`, and that releases them.
+        self.check_serials()?;
+        self.locks = Some(locks);
         Ok(())
     }
 
-    /// Check that the current serial of each staged oid is the serial that
-    /// the client read.
+    /// Return the lock requests of the vote in ascending oid order: an
+    /// exclusive lock for each written oid.
+    fn lock_requests(&self) -> Vec<(Oid, Mode)> {
+        self.staged
+            .keys()
+            .map(|&oid| (oid, Mode::Exclusive))
+            .collect()
+    }
+
+    /// Check that the current serial of each written oid is the serial
+    /// that the client read.
     fn check_serials(&self) -> Result<()> {
         for (&oid, staged) in &self.staged {
-            let current = self
-                .store
-                .backend
-                .load_before(oid, Tid::MAX)?
-                .map_or(Tid::ZERO, |record| record.tid);
-            if current != staged.serial {
+            if self.current_serial(oid)? != staged.serial {
                 return Err(ZoeError::Conflict { oid });
             }
         }
         Ok(())
+    }
+
+    /// Return the serial of the current record of `oid`, or `Tid::ZERO`
+    /// when `oid` has no record.
+    fn current_serial(&self, oid: Oid) -> Result<Tid> {
+        Ok(self
+            .store
+            .backend
+            .load_before(oid, Tid::MAX)?
+            .map_or(Tid::ZERO, |record| record.tid))
     }
 
     /// Commit the transaction and return its tid. The commit is durable
@@ -104,7 +128,7 @@ impl<'s> Txn<'s> {
     /// finish with `Halted`. Reopen the store to read the outcome and to
     /// commit again.
     pub fn finish(mut self) -> Result<Tid> {
-        if !self.voted {
+        if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
         let mut sequencer = self.store.lock_sequencer();
@@ -139,13 +163,6 @@ impl<'s> Txn<'s> {
     }
 
     fn release(&mut self) {
-        self.store.locks.release(&self.locked);
-        self.locked.clear();
-    }
-}
-
-impl Drop for Txn<'_> {
-    fn drop(&mut self) {
-        self.release();
+        self.locks = None;
     }
 }
