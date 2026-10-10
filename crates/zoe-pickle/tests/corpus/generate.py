@@ -166,7 +166,7 @@ def constructs():
         ("persistent-list", PersistentList()),
         ("persistent-list", PersistentList(range(1001))),
         ("persistent-list", PersistentList(range(2001))),
-        # zodbpickle.binary: SHORT_BINSTRING and BINSTRING.
+        # zodbpickle.binary: protocol 3 writes SHORT_BINBYTES and BINBYTES.
         ("zodbpickle-binary", Holder(data=binary(b"short\x00\xff"))),
         ("zodbpickle-binary", Holder(data=binary(b"x" * 300))),
         ("zodbpickle-binary", Holder(data=binary(b""))),
@@ -220,9 +220,13 @@ def constructs():
                 ]
             ),
         ),
-        # Other inline objects: copyreg (NEWOBJ and BUILD) and datetime.
+        # Other inline objects: copyreg (NEWOBJ and BUILD) and datetime. The
+        # datetime is naive on purpose: a tzinfo adds an object to the record.
         ("inline-object", Holder(value=Plain(label="plain-1", size=3))),
-        ("datetime", Holder(value=datetime.datetime(1, 2, 3, 4, 5, 6))),
+        (
+            "datetime",
+            Holder(value=datetime.datetime(1, 2, 3, 4, 5, 6)),  # noqa: DTZ001
+        ),
     ]
 
 
