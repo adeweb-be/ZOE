@@ -52,6 +52,15 @@ pub enum FrameError {
     Version(u8),
     /// The checksum does not match the bytes.
     Checksum,
+    /// The header byte at `offset` is a flag, a codec or a reserved byte
+    /// with a value that this code cannot read. A newer format wrote the
+    /// frame.
+    Unsupported {
+        /// The offset of the byte in the header.
+        offset: usize,
+        /// The value of the byte.
+        value: u8,
+    },
 }
 
 /// A frame that was read and checked.
@@ -91,6 +100,10 @@ pub fn encode_frame(branch: u32, prev: Tid, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Read a frame and verify its checksum.
+///
+/// A frame with a flag, a codec other than `CODEC_NONE` or a non-zero
+/// reserved byte is refused. The typed-field slots are opaque, so slots
+/// of any length are accepted.
 pub fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>, FrameError> {
     let header = bytes.get(..HEADER_LEN).ok_or(FrameError::Truncated)?;
     if header[0] != FRAME_VERSION {
@@ -106,6 +119,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>, FrameError> {
     let stored = u64::from_le_bytes(header[24..32].try_into().unwrap());
     if checksum(&header[..24], slots, payload) != stored {
         return Err(FrameError::Checksum);
+    }
+    for (offset, readable) in [(1, 0), (2, CODEC_NONE), (3, 0), (22, 0), (23, 0)] {
+        if header[offset] != readable {
+            return Err(FrameError::Unsupported {
+                offset,
+                value: header[offset],
+            });
+        }
     }
     Ok(Frame {
         flags: header[1],
@@ -236,6 +257,41 @@ mod tests {
                 assert!(decode_frame(&bad).is_err(), "byte {byte} bit {bit}");
             }
         }
+    }
+
+    /// Build a frame from the first 24 header bytes, the slots and the
+    /// payload, with a valid checksum.
+    fn seal(header: &[u8], slots: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut frame = header[..24].to_vec();
+        frame.extend_from_slice(&checksum(&frame, slots, payload).to_le_bytes());
+        frame.extend_from_slice(slots);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn a_frame_of_a_newer_format_is_refused() {
+        let frame = encode_frame(MAIN_BRANCH, Tid(7), b"pickle");
+        for offset in [1, 2, 3, 22, 23] {
+            let mut header = frame[..24].to_vec();
+            header[offset] = 1;
+            assert_eq!(
+                decode_frame(&seal(&header, &[], b"pickle")),
+                Err(FrameError::Unsupported { offset, value: 1 }),
+                "offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_field_slots_of_any_length_are_read() {
+        let frame = encode_frame(MAIN_BRANCH, Tid(7), b"pickle");
+        let mut header = frame[..24].to_vec();
+        header[20..22].copy_from_slice(&3u16.to_le_bytes());
+        let slotted = seal(&header, b"abc", b"pickle");
+        let read = decode_frame(&slotted).unwrap();
+        assert_eq!(read.slots, b"abc");
+        assert_eq!(read.payload, b"pickle");
     }
 
     #[test]

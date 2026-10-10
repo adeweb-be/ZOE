@@ -27,6 +27,18 @@ fn backend(error: impl Into<redb::Error>) -> ZoeError {
     ZoeError::Backend(Box::new(error.into()))
 }
 
+/// Return the error for the frame of `row` that `decode_frame` refused.
+/// A frame of a newer format is a format error. Any other refusal is
+/// `corrupt`.
+fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError {
+    match error {
+        format::FrameError::Unsupported { offset, value } => ZoeError::Format(format!(
+            "{row}: header byte {offset} is {value:#04x}, which this build cannot read"
+        )),
+        _ => corrupt,
+    }
+}
+
 /// A store in one redb database.
 pub(crate) struct RedbBackend {
     db: Database,
@@ -90,8 +102,10 @@ impl RedbBackend {
     /// Read the record frame stored under `key` for `oid`.
     fn record(oid: Oid, key: &[u8; 16], bytes: &[u8]) -> Result<Record> {
         let (_, tid) = format::split_record_key(key);
-        let frame =
-            format::decode_frame(bytes).map_err(|_| ZoeError::CorruptRecord { oid, tid })?;
+        let frame = format::decode_frame(bytes).map_err(|e| {
+            let row = format!("record of oid {oid:?}, tid {tid:?}");
+            refused(e, &row, ZoeError::CorruptRecord { oid, tid })
+        })?;
         Ok(Record {
             tid,
             prev: frame.prev,
@@ -151,7 +165,7 @@ impl Backend for RedbBackend {
                 let corrupt = ZoeError::CorruptRecord { oid: Oid(0), tid };
                 let row = format::decode_frame(value.value())
                     .and_then(|frame| format::decode_txn(tid, frame.payload))
-                    .map_err(|_| corrupt);
+                    .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
                 rows.push(row);
             }
             Ok(rows)
@@ -248,5 +262,53 @@ impl WriteTxn for RedbWrite<'_> {
             self.last_tid.store(tid.0, Ordering::Release);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::backends::InMemoryBackend;
+    use xxhash_rust::xxh3::Xxh3;
+
+    use super::*;
+
+    /// Return an empty store in memory.
+    fn empty() -> RedbBackend {
+        let db = redb::Builder::new()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        RedbBackend::initialise(&db).unwrap();
+        RedbBackend::open(db).unwrap()
+    }
+
+    /// Return a record frame with the codec byte `codec` and a valid
+    /// checksum.
+    fn frame_with_codec(codec: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = format::encode_frame(format::MAIN_BRANCH, Tid::ZERO, payload);
+        frame[2] = codec;
+        let mut hasher = Xxh3::new();
+        hasher.update(&frame[..24]);
+        hasher.update(payload);
+        let checksum = hasher.digest().to_le_bytes();
+        frame[24..32].copy_from_slice(&checksum);
+        frame
+    }
+
+    #[test]
+    fn a_record_of_a_newer_format_is_a_format_error() {
+        let backend = empty();
+        let (oid, tid) = (Oid(1), Tid(5));
+        let txn = backend.db.begin_write().unwrap();
+        txn.open_table(RECORDS)
+            .unwrap()
+            .insert(
+                &format::record_key(oid, tid),
+                frame_with_codec(1, b"pickle").as_slice(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+
+        let error = backend.load_before(oid, Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::Format(_))), "{error:?}");
     }
 }
