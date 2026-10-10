@@ -1,0 +1,23 @@
+1900-01-01 00:00:01,000 INFO    [Zope:42][waitress-0] Ready to handle requests
+1900-01-01 00:00:02,000 ERROR   [Zope.SiteErrorLog:251][waitress-1] ConflictError: http://localhost:8080/site/folder-a/document-1/edit
+Traceback (innermost last):
+  Module ZPublisher.WSGIPublisher, line 181, in transaction_pubevents
+  Module transaction._manager, line 257, in commit
+ZODB.POSException.ConflictError: database conflict error (oid 0x7a3c, class BTrees.OOBTree.OOBucket, serial this txn started with 0x0000000000000001 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000002 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:03,000 ERROR   [Zope.SiteErrorLog:251][waitress-2] ConflictError: http://localhost:8080/site/folder-a/document-2/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x7a3c, class BTrees.OOBTree.OOBucket, serial this txn started with 0x0000000000000002 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000003 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:04,000 ERROR   [Zope.SiteErrorLog:251][waitress-3] ConflictError: http://localhost:8080/site/folder-b/@@content-status-modify
+ZODB.POSException.ConflictError: database conflict error (oid 0x7a3c, class BTrees.OOBTree.OOBucket, serial this txn started with 0x0000000000000003 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000004 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:05,000 ERROR   [Zope.SiteErrorLog:251][waitress-0] ConflictError: http://localhost:8080/site/folder-b/document-3/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x01f2, class BTrees.Length.Length, serial this txn started with 0x0000000000000004 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000005 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:06,000 ERROR   [Zope.SiteErrorLog:251][waitress-1] ConflictError: http://localhost:8080/site/folder-c/document-4/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x01f2, class BTrees.Length.Length, serial this txn started with 0x0000000000000005 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000006 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:07,000 ERROR   [Zope.SiteErrorLog:251][waitress-2] ConflictError: http://localhost:8080/site/folder-c/document-5/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x8001, class BTrees.IIBTree.IITreeSet, serial this txn started with 0x0000000000000006 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000007 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:08,000 ERROR   [Zope.SiteErrorLog:251][waitress-3] ConflictError: http://localhost:8080/site/folder-c/document-6/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x8002, class BTrees.OOBTree.OOBucket, serial this txn started with 0x0000000000000007 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000008 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:09,000 ERROR   [Zope.SiteErrorLog:251][waitress-0] ReadConflictError: http://localhost:8080/site/search
+ZODB.POSException.ReadConflictError: database read conflict error (oid 0x0010, class persistent.mapping.PersistentMapping)
+1900-01-01 00:00:10,000 ERROR   [Zope.SiteErrorLog:251][waitress-1] ConflictError: http://localhost:8080/site/folder-d/document-7/edit
+ZODB.POSException.ConflictError: database conflict error (oid 0x0abc, serial this txn started with 0x0000000000000008 1900-01-01 00:00:00.000000, serial currently committed 0x0000000000000009 1900-01-01 00:00:00.000000)
+1900-01-01 00:00:11,000 INFO    [Zope:42][waitress-2] A line that mentions ConflictError without the error text

@@ -1,0 +1,18 @@
+{
+  "total": 9,
+  "by_class": [
+    { "class": "BTrees.OOBTree.OOBucket", "count": 4 },
+    { "class": "BTrees.Length.Length", "count": 2 },
+    { "class": "BTrees.IIBTree.IITreeSet", "count": 1 },
+    { "class": "persistent.mapping.PersistentMapping", "count": 1 },
+    { "class": "unknown", "count": 1 }
+  ],
+  "by_oid": [
+    { "oid": "0x7a3c", "class": "BTrees.OOBTree.OOBucket", "count": 3 },
+    { "oid": "0x01f2", "class": "BTrees.Length.Length", "count": 2 },
+    { "oid": "0x0010", "class": "persistent.mapping.PersistentMapping", "count": 1 },
+    { "oid": "0x0abc", "class": "unknown", "count": 1 },
+    { "oid": "0x8001", "class": "BTrees.IIBTree.IITreeSet", "count": 1 },
+    { "oid": "0x8002", "class": "BTrees.OOBTree.OOBucket", "count": 1 }
+  ]
+}

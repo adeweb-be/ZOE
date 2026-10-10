@@ -14,6 +14,8 @@ publish = false
 zoe-core = { path = "crates/zoe-core" }
 pyo3 = "0.29"
 redb = "4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
