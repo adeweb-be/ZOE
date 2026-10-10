@@ -1,5 +1,6 @@
-//! The on-disk format: record framing, checksums and the store header.
-//! This module is a red zone.
+//! The on-disk format: the frame and its checksum, the keys, and the
+//! values of the transaction rows and the `meta` rows. This module is a
+//! red zone.
 //!
 //! Every record and every transaction row is a frame: a 32-byte header,
 //! the typed-field slots, then the payload. The header fields are
