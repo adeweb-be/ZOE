@@ -4,7 +4,7 @@ ZOE, the Zope Object Engine, is a ZODB storage written in Rust. Plone 6.1 and la
 
 Nothing is usable yet: the project is in phase 0 of its roadmap.
 
-- [Documentation](https://adeweb-be.github.io/zoe/): the technical specification, the working methods and roadmap, the architecture decision records.
+- [Documentation](https://adeweb-be.github.io/ZOE/): the technical specification, the working methods and roadmap, the architecture decision records.
 - [CONTEXT.md](CONTEXT.md): the glossary.
 - [CLAUDE.md](CLAUDE.md): how to build and test, for humans and agents.
 
