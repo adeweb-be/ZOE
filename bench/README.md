@@ -14,7 +14,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
 
-The bench project takes `python/zoedb` as a path source. uv builds the zoedb wheel from the source tree with maturin, as it does for the Python tests. A path source is not editable, so maturin builds the release profile into `target/release`. The cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
+The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
 RelStorage runs when `ZOE_BENCH_PG_DSN` (or `--dsn`) names a PostgreSQL database that the harness may empty. Without it, the harness skips RelStorage and says so. The Dagger function `bench` starts PostgreSQL 17 as a service and runs the harness tests, then the baseline, and returns the results tree:
 

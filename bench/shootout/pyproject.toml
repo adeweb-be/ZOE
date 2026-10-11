@@ -23,7 +23,8 @@ dependencies = [
     # The binary wheel needs no libpq headers to install.
     "psycopg2-binary>=2.9",
     "jsonschema>=4",
-    # ZOE in-process. uv builds the wheel from python/zoedb with maturin.
+    # The zoe storage runs in this process. uv builds its extension from
+    # python/zoedb with maturin.
     "zoedb",
 ]
 
@@ -33,8 +34,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-# A path source is not editable, so maturin builds a release wheel.
-zoedb = { path = "../../python/zoedb" }
+# The source is editable, so the harness runs the Python code of the tree.
+# The cache keys of python/zoedb make uv build the extension again when the
+# Rust code changes. maturin builds it in the release profile.
+zoedb = { path = "../../python/zoedb", editable = true }
 
 [tool.uv.build-backend]
 module-name = "shootout"

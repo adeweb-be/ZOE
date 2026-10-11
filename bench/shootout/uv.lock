@@ -738,7 +738,7 @@ requires-dist = [
     { name = "zeo", specifier = ">=6" },
     { name = "zodb", specifier = ">=6" },
     { name = "zodbshootout", specifier = "==0.8.0" },
-    { name = "zoedb", directory = "../../python/zoedb" },
+    { name = "zoedb", editable = "../../python/zoedb" },
 ]
 
 [package.metadata.requires-dev]
@@ -746,7 +746,7 @@ dev = [{ name = "pytest", specifier = ">=9.1" }]
 
 [[package]]
 name = "zoedb"
-source = { directory = "../../python/zoedb" }
+source = { editable = "../../python/zoedb" }
 dependencies = [
     { name = "zconfig" },
     { name = "zodb" },
