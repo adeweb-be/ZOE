@@ -82,6 +82,7 @@ The crash simulation checks this. The acceptance test gives 120 values, so two r
 ## Consequences
 
 - An id allocation never conflicts and never waits for the locks of a transaction.
+- One `next()` in 100 of each name reserves a block, so it waits for the single writer of redb. That can mean a wait for the fsync of a commit or for a pack batch. The other callers of that name wait for it too, because the reservation holds the mutex of the name.
 - Values are unique and strictly increasing per store and per name, but not dense: each crash or reopen can skip up to 100 values of each name that was used, and the skips of reopens in a row add up.
 - The values of an aborted transaction are lost.
 - A store holds one 40-byte row per name, plus the name. Names stay in the store, because nothing deletes a row.
