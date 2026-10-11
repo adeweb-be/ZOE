@@ -1,6 +1,6 @@
 # 0023. The blob record
 
-Status: accepted
+Status: accepted. ADR 0029 amends the checksum input: the blob-record frame starts with the tag 2 of `blobs`, and the intent frame with the tag 4 of the intent files.
 
 ## Context
 

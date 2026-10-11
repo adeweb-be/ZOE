@@ -38,6 +38,7 @@
   - [0026. The transaction index: a (tid, oid) key space](adr/0026-transaction-index.md)
   - [0027. The blob directory](adr/0027-blob-directory.md)
   - [0028. The zoe command](adr/0028-the-zoe-command.md)
+  - [0029. The frame checksum covers the key space](adr/0029-key-space-in-the-checksum.md)
 
 # Reference
 

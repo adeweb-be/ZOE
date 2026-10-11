@@ -25,7 +25,7 @@ use crate::backend::{
     TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
-use crate::format::{self, Compression};
+use crate::format::{self, Compression, KeySpace};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
@@ -189,7 +189,7 @@ impl RedbBackend {
             let last_row = txns.last().map_err(backend)?.filter(|(key, value)| {
                 // A frame of a newer format passed the checksum too.
                 matches!(
-                    format::decode_frame(key.value(), value.value()),
+                    format::decode_frame(KeySpace::Txns, key.value(), value.value()),
                     Ok(_) | Err(format::FrameError::Unsupported { .. })
                 )
             });
@@ -236,7 +236,7 @@ impl RedbBackend {
     fn txn_row(key: &[u8; 8], bytes: &[u8]) -> Result<TxnMeta> {
         let tid = Tid(u64::from_be_bytes(*key));
         let corrupt = ZoeError::CorruptTxn { tid };
-        format::decode_frame(key, bytes)
+        format::decode_frame(KeySpace::Txns, key, bytes)
             .and_then(|frame| format::decode_txn(tid, &frame.data))
             .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt))
     }
@@ -245,7 +245,7 @@ impl RedbBackend {
     /// Return the tid of the key and the frame.
     fn frame<'a>(oid: Oid, key: &[u8; 16], bytes: &'a [u8]) -> Result<(Tid, format::Frame<'a>)> {
         let (_, tid) = format::split_record_key(key);
-        let frame = format::decode_frame(key, bytes).map_err(|e| {
+        let frame = format::decode_frame(KeySpace::Records, key, bytes).map_err(|e| {
             let row = format!("record of oid {oid:?}, tid {tid:?}");
             refused(e, &row, ZoeError::CorruptRecord { oid, tid })
         })?;
@@ -330,7 +330,7 @@ impl Backend for RedbBackend {
         let Some(value) = blobs.get(&key).map_err(backend)? else {
             return Ok(None);
         };
-        let blob = format::decode_frame(&key, value.value())
+        let blob = format::decode_frame(KeySpace::Blobs, &key, value.value())
             .and_then(|frame| format::blob::decode_blob(&frame.data))
             .map_err(|e| {
                 let row = format!("blob record of oid {oid:?}, tid {tid:?}");
@@ -654,7 +654,7 @@ impl Backend for RedbBackend {
         let Some(value) = sequences.get(name).map_err(backend)? else {
             return Ok(None);
         };
-        let end = format::decode_frame(name.as_bytes(), value.value())
+        let end = format::decode_frame(KeySpace::Sequences, name.as_bytes(), value.value())
             .and_then(|frame| format::decode_sequence(&frame.data))
             .map_err(|e| {
                 let corrupt = ZoeError::CorruptSequence {
@@ -679,8 +679,14 @@ struct RedbWrite<'a> {
 impl WriteTxn for RedbWrite<'_> {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
         let key = format::record_key(oid, tid);
-        let frame =
-            format::encode_frame_with(&key, format::MAIN_BRANCH, prev, data, self.compression);
+        let frame = format::encode_frame_with(
+            KeySpace::Records,
+            &key,
+            format::MAIN_BRANCH,
+            prev,
+            data,
+            self.compression,
+        );
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         records.insert(&key, frame.as_slice()).map_err(backend)?;
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
@@ -694,7 +700,13 @@ impl WriteTxn for RedbWrite<'_> {
     fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()> {
         let key = format::record_key(oid, tid);
         let payload = format::blob::encode_blob(blob);
-        let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let frame = format::encode_frame(
+            KeySpace::Blobs,
+            &key,
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &payload,
+        );
         let mut blobs = self.txn.open_table(BLOBS).map_err(backend)?;
         blobs.insert(&key, frame.as_slice()).map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
@@ -705,7 +717,13 @@ impl WriteTxn for RedbWrite<'_> {
         debug_assert_eq!(meta.status, TxnStatus::Committed);
         let key = format::txn_key(meta.tid);
         let payload = format::encode_txn(meta);
-        let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let frame = format::encode_frame(
+            KeySpace::Txns,
+            &key,
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &payload,
+        );
         let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
         txns.insert(&key, frame.as_slice()).map_err(backend)?;
         self.written_tid = Some(meta.tid);
@@ -750,7 +768,7 @@ impl WriteTxn for RedbWrite<'_> {
                 .get(&key)
                 .map_err(backend)?
                 .ok_or(ZoeError::CorruptTxn { tid })?;
-            let frame = format::decode_frame(&key, old.value()).map_err(|e| {
+            let frame = format::decode_frame(KeySpace::Txns, &key, old.value()).map_err(|e| {
                 refused(
                     e,
                     &format!("transaction row {tid:?}"),
@@ -765,7 +783,7 @@ impl WriteTxn for RedbWrite<'_> {
             (frame.branch, frame.prev)
         };
         let payload = format::encode_txn(meta);
-        let frame = format::encode_frame(&key, branch, prev, &payload);
+        let frame = format::encode_frame(KeySpace::Txns, &key, branch, prev, &payload);
         txns.insert(&key, frame.as_slice()).map_err(backend)?;
         Ok(())
     }
@@ -783,7 +801,13 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()> {
         let payload = format::encode_sequence(end);
-        let frame = format::encode_frame(name.as_bytes(), format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let frame = format::encode_frame(
+            KeySpace::Sequences,
+            name.as_bytes(),
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &payload,
+        );
         let mut sequences = self.txn.open_table(SEQUENCES).map_err(backend)?;
         sequences.insert(name, frame.as_slice()).map_err(backend)?;
         Ok(())
@@ -825,7 +849,6 @@ mod tests {
 
     use redb::StorageBackend;
     use redb::backends::InMemoryBackend;
-    use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
     use crate::store::Store;
@@ -850,18 +873,10 @@ mod tests {
         RedbBackend::open(db).unwrap()
     }
 
-    /// Return the frame of the row `key` with the codec byte `codec` and a
+    /// Return the record frame of the row `key` with the codec byte `codec` and a
     /// valid checksum.
     fn frame_with_codec(key: &[u8], codec: u8, payload: &[u8]) -> Vec<u8> {
-        let mut frame = format::encode_frame(key, format::MAIN_BRANCH, Tid::ZERO, payload);
-        frame[2] = codec;
-        let mut hasher = Xxh3::new();
-        hasher.update(key);
-        hasher.update(&frame[..24]);
-        hasher.update(payload);
-        let checksum = hasher.digest().to_le_bytes();
-        frame[24..32].copy_from_slice(&checksum);
-        frame
+        format::encode_stored_frame(KeySpace::Records, key, codec, payload)
     }
 
     /// Store the record frame of `oid` at `tid` with the codec byte `codec`
@@ -1086,7 +1101,8 @@ mod tests {
         // A row of another branch, with a previous serial.
         let key = format::txn_key(tid);
         let row = backend.iter_txns(tid, tid).next().unwrap().unwrap();
-        let frame = format::encode_frame(&key, 7, Tid(3), &format::encode_txn(&row));
+        let frame =
+            format::encode_frame(KeySpace::Txns, &key, 7, Tid(3), &format::encode_txn(&row));
         let txn = backend.database().begin_write().unwrap();
         txn.open_table(TXNS)
             .unwrap()
@@ -1106,7 +1122,7 @@ mod tests {
         let txn = backend.db.begin_read().unwrap();
         let txns = txn.open_table(TXNS).unwrap();
         let stored = txns.get(&key).unwrap().unwrap();
-        let frame = format::decode_frame(&key, stored.value()).unwrap();
+        let frame = format::decode_frame(KeySpace::Txns, &key, stored.value()).unwrap();
         assert_eq!((frame.branch, frame.prev), (7, Tid(3)));
         let replaced = format::decode_txn(tid, &frame.data).unwrap();
         assert_eq!(replaced.oid_count, 4);
@@ -1123,15 +1139,16 @@ mod tests {
         let row = backend.iter_txns(tid, tid).next().unwrap().unwrap();
         // The frame of a newer build: two bytes of typed-field slots.
         let payload = format::encode_txn(&row);
-        let mut frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let mut frame = format::encode_frame(
+            KeySpace::Txns,
+            &key,
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &payload,
+        );
         frame[20..22].copy_from_slice(&2u16.to_le_bytes());
         frame.splice(format::HEADER_LEN..format::HEADER_LEN, [1, 2]);
-        let mut hasher = Xxh3::new();
-        hasher.update(&key);
-        hasher.update(&frame[..24]);
-        hasher.update(&frame[format::HEADER_LEN..]);
-        let checksum = hasher.digest().to_le_bytes();
-        frame[24..32].copy_from_slice(&checksum);
+        format::seal(KeySpace::Txns, &key, &mut frame);
         let txn = backend.database().begin_write().unwrap();
         txn.open_table(TXNS)
             .unwrap()
@@ -2011,6 +2028,7 @@ mod tests {
     fn a_damaged_sequence_row_is_a_corrupt_sequence() {
         let backend = empty();
         let good = format::encode_frame(
+            KeySpace::Sequences,
             b"intids",
             format::MAIN_BRANCH,
             Tid::ZERO,
@@ -2018,7 +2036,13 @@ mod tests {
         );
         let mut flipped = good.clone();
         *flipped.last_mut().unwrap() ^= 1;
-        let short = format::encode_frame(b"intids", format::MAIN_BRANCH, Tid::ZERO, &[1; 7]);
+        let short = format::encode_frame(
+            KeySpace::Sequences,
+            b"intids",
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &[1; 7],
+        );
         for frame in [flipped, short, good[..20].to_vec()] {
             insert_sequence_frame(&backend, "intids", &frame);
             let error = backend.sequence_end("intids");
@@ -2039,7 +2063,12 @@ mod tests {
     #[test]
     fn a_sequence_row_of_a_newer_format_is_a_format_error() {
         let backend = empty();
-        let frame = frame_with_codec(b"intids", 2, &format::encode_sequence(101));
+        let frame = format::encode_stored_frame(
+            KeySpace::Sequences,
+            b"intids",
+            2,
+            &format::encode_sequence(101),
+        );
         insert_sequence_frame(&backend, "intids", &frame);
         let error = backend.sequence_end("intids");
         assert!(

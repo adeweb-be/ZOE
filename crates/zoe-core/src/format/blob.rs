@@ -13,16 +13,17 @@
 //!
 //! The payload of a blob record is 40 bytes: the BLAKE3 hash of the blob
 //! file (32 bytes), then the size of the file in bytes (8 bytes,
-//! little-endian). The blob record is a frame under the 16-byte record key
-//! of `(oid, tid)`, with the previous serial 0 and the codec `CODEC_NONE`:
-//! the compression of the store never applies to it.
+//! little-endian). The blob record is a frame of the key space
+//! `KeySpace::Blobs` under the 16-byte record key of `(oid, tid)`, with the
+//! previous serial 0 and the codec `CODEC_NONE`: the compression of the
+//! store never applies to it.
 //!
 //! An intent file is `blobs/tmp/0x<16 hex digits of the tid>.intent`. It
-//! holds a frame with the codec `CODEC_NONE` under the 8-byte transaction
-//! key of the tid. Its payload
+//! holds a frame of the key space `KeySpace::Intents` with the codec
+//! `CODEC_NONE` under the 8-byte transaction key of the tid. Its payload
 //! is the oids of the blobs of the finish, 8 big-endian bytes each.
 
-use super::{FrameError, MAIN_BRANCH, decode_frame, encode_frame, txn_key};
+use super::{FrameError, KeySpace, MAIN_BRANCH, decode_frame, encode_frame, txn_key};
 use crate::backend::BlobRecord;
 use crate::types::{Oid, Tid};
 
@@ -113,12 +114,18 @@ pub fn intent_tid(file: &str) -> Option<Tid> {
 /// `oids`.
 pub fn encode_intent(tid: Tid, oids: &[Oid]) -> Vec<u8> {
     let payload: Vec<u8> = oids.iter().flat_map(|oid| oid.0.to_be_bytes()).collect();
-    encode_frame(&txn_key(tid), MAIN_BRANCH, Tid::ZERO, &payload)
+    encode_frame(
+        KeySpace::Intents,
+        &txn_key(tid),
+        MAIN_BRANCH,
+        Tid::ZERO,
+        &payload,
+    )
 }
 
 /// Decode the intent file of the finish `tid` and return its oids.
 pub fn decode_intent(tid: Tid, bytes: &[u8]) -> Result<Vec<Oid>, FrameError> {
-    let frame = decode_frame(&txn_key(tid), bytes)?;
+    let frame = decode_frame(KeySpace::Intents, &txn_key(tid), bytes)?;
     let (oids, rest) = frame.data.as_chunks::<8>();
     if !rest.is_empty() {
         return Err(FrameError::Truncated);
@@ -209,5 +216,21 @@ mod tests {
             assert!(decode_intent(tid, &bytes[..len]).is_err(), "{len}");
         }
         assert!(decode_intent(Tid(10), &bytes).is_err());
+    }
+
+    /// An intent file and a transaction row have the same key. Only the
+    /// key space tells them apart.
+    #[test]
+    fn an_intent_and_a_transaction_row_do_not_verify_as_each_other() {
+        let tid = Tid(9);
+        let key = txn_key(tid);
+        let intent = encode_intent(tid, &[Oid(1), Oid(2)]);
+        assert_eq!(
+            decode_frame(KeySpace::Txns, &key, &intent),
+            Err(FrameError::Checksum)
+        );
+        let payload = [1, 2].map(|oid: u64| oid.to_be_bytes()).concat();
+        let row = encode_frame(KeySpace::Txns, &key, MAIN_BRANCH, Tid::ZERO, &payload);
+        assert_eq!(decode_intent(tid, &row), Err(FrameError::Checksum));
     }
 }
