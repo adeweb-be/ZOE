@@ -26,8 +26,9 @@ dependencies = [
     # The zoe storage runs in this process. uv builds its extension from
     # python/zoedb with maturin.
     "zoedb",
-    # A direct dependency, so that the source below selects the fork.
+    # Direct dependencies, so that the sources below select the forks.
     "persistent",
+    "zodbpickle",
 ]
 
 [dependency-groups]
@@ -42,6 +43,8 @@ dev = [
 zoedb = { path = "../../python/zoedb", editable = true }
 # The fork of persistent that the workspace in python/ uses.
 persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
+# The fork of zodbpickle that the workspace in python/ uses.
+zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
 
 [tool.uv.build-backend]
 module-name = "shootout"

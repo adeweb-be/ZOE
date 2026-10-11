@@ -5,8 +5,9 @@ version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "zoedb",
-    # A direct dependency, so that the source below selects the fork.
+    # Direct dependencies, so that the sources below select the forks.
     "persistent",
+    "zodbpickle",
 ]
 
 [dependency-groups]
@@ -26,6 +27,10 @@ zoedb = { workspace = true }
 # It fixes the instance dict of a deactivated object on Python 3.13 and
 # later, which broke the state of objects on 3.14t.
 persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
+# The fork of zodbpickle, at a commit of the branch zoe-045-free-threading.
+# Its C extension declares that it can run without the GIL, so that
+# importing ZODB keeps the GIL off on 3.14t. The pickle bytes do not change.
+zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
 
 [tool.uv.workspace]
 members = ["zoedb"]
