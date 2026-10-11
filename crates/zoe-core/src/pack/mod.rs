@@ -499,6 +499,9 @@ fn class_name(data: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
     use super::*;
     use crate::format::blob::{blob_name, oid_dir};
@@ -839,6 +842,118 @@ mod tests {
             panic!("{history:?}");
         };
         version.tid
+    }
+
+    /// Return a record of class `m.C` that holds `tag` and a reference to
+    /// each oid of `refs`.
+    fn tagged(refs: &[Oid], tag: u32) -> Vec<u8> {
+        let mut p = b"\x80\x03cm\nC\nq\x00.\x80\x03}(X\x01\x00\x00\x00tJ".to_vec();
+        p.extend_from_slice(&tag.to_le_bytes());
+        for (i, oid) in refs.iter().enumerate() {
+            p.extend_from_slice(&[b'K', u8::try_from(i).unwrap(), b'C', 8]);
+            p.extend_from_slice(&oid.0.to_be_bytes());
+            p.extend_from_slice(b"h\x00\x86Q");
+        }
+        p.extend_from_slice(b"u.");
+        p
+    }
+
+    /// Run a pack in batches of one record while another thread links
+    /// unreachable objects again, from references that it read before T.
+    /// With `targeted`, the thread links the object whose newest record
+    /// the pack removes next. Return the objects that the thread linked
+    /// while their newest record was still there.
+    fn pack_during_stale_links(targeted: bool, first: u64) -> usize {
+        const N: u64 = 40;
+        let store = Arc::new(Store::open_vfs(MemVfs::new()).unwrap());
+        // The holders stay reachable. Each a_i holds b_i, which comes after
+        // a_i in key order.
+        let holders: Vec<Oid> = (1..=4).map(Oid).collect();
+        let a = |i: u64| Oid(100 + 2 * i);
+        let b = |i: u64| Oid(101 + 2 * i);
+        let mut writes = vec![(ROOT, tagged(&holders, 0))];
+        writes.extend(holders.iter().map(|&h| (h, tagged(&[], 0))));
+        for i in 0..N {
+            writes.push((a(i), tagged(&[b(i)], 0)));
+            writes.push((b(i), tagged(&[], 0)));
+        }
+        let t1 = commit(&store, &writes);
+        let mut writes = Vec::new();
+        for i in 0..N {
+            writes.push((a(i), tagged(&[b(i)], 1)));
+            writes.push((b(i), tagged(&[], 1)));
+        }
+        let t2 = commit(&store, &writes);
+        // A holder links every a_i, then drops them at T.
+        let all: Vec<Oid> = (0..N).map(a).collect();
+        commit(&store, &[(holders[0], tagged(&all, 2))]);
+        let t = commit(&store, &[(holders[0], tagged(&[], 3))]);
+
+        let present = |store: &Store, oid: Oid, tid: Tid| match store.load_serial(oid, tid) {
+            Ok(_) => true,
+            Err(ZoeError::NotFound { .. }) => false,
+            Err(e) => panic!("{e}"),
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (store, done) = (Arc::clone(&store), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut linked = Vec::new();
+                let mut i = first;
+                let mut tag = 10;
+                while !done.load(Ordering::Relaxed) && i < N {
+                    if targeted {
+                        // The next object of the pack: its first record is
+                        // gone, and its newest is not.
+                        let next = (0..N)
+                            .find(|&j| present(&store, a(j), t2) && !present(&store, a(j), t1));
+                        let Some(j) = next else {
+                            thread::yield_now();
+                            continue;
+                        };
+                        i = j;
+                    }
+                    tag += 1;
+                    let holder = holders[1 + (i as usize % 3)];
+                    commit(&store, &[(holder, tagged(&[a(i)], tag))]);
+                    if present(&store, a(i), t2) {
+                        linked.push(i);
+                    }
+                    if !targeted {
+                        i += 3;
+                    }
+                }
+                linked
+            })
+        };
+        let report = store.pack_in_batches(t, 1, || {}).unwrap();
+        done.store(true, Ordering::Relaxed);
+        let linked = writer.join().unwrap();
+        assert!(report.records > 0);
+        for &i in &linked {
+            assert!(
+                present(&store, a(i), t2),
+                "a_{i} was linked again and removed"
+            );
+            assert!(
+                present(&store, b(i), t2),
+                "b_{i}, which a_{i} holds, was removed"
+            );
+        }
+        linked.len()
+    }
+
+    #[test]
+    fn a_link_that_lands_while_the_pack_waits_for_the_sequencer_keeps_its_target() {
+        // A finish can end after the first mark of a batch and before the
+        // pack holds the commit sequencer. Only the mark under the
+        // sequencer sees it. The targeted runs hit that window.
+        let mut linked = 0;
+        for first in [0, 2, 4] {
+            linked += pack_during_stale_links(true, first);
+        }
+        linked += pack_during_stale_links(false, 1);
+        assert!(linked > 0);
     }
 
     #[test]
