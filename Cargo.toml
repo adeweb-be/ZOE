@@ -14,6 +14,7 @@ publish = false
 zoe-core = { path = "crates/zoe-core" }
 zoe-pickle = { path = "crates/zoe-pickle" }
 blake3 = "1.8"
+libc = "0.2"
 pyo3 = "0.29"
 redb = "4.3"
 serde = { version = "1", features = ["derive"] }
