@@ -41,7 +41,7 @@ dev = [
 # Rust code changes. maturin builds it in the release profile.
 zoedb = { path = "../../python/zoedb", editable = true }
 # The fork of persistent that the workspace in python/ uses.
-persistent = { git = "https://github.com/adeweb-be/persistent", rev = "caeb9135ab15daf62b9031fcde1bb6965973d0e9" }
+persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
 
 [tool.uv.build-backend]
 module-name = "shootout"

@@ -941,7 +941,7 @@ wheels = [
 [[package]]
 name = "persistent"
 version = "6.8+zoe.1"
-source = { git = "https://github.com/adeweb-be/persistent?rev=caeb9135ab15daf62b9031fcde1bb6965973d0e9#caeb9135ab15daf62b9031fcde1bb6965973d0e9" }
+source = { git = "https://github.com/adeweb-be/persistent?rev=57a8c54959112f49ef563267f0ed2cb96228c21a#57a8c54959112f49ef563267f0ed2cb96228c21a" }
 dependencies = [
     { name = "cffi", marker = "platform_python_implementation == 'CPython'" },
     { name = "zope-deferredimport" },
@@ -3804,7 +3804,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "persistent", git = "https://github.com/adeweb-be/persistent?rev=caeb9135ab15daf62b9031fcde1bb6965973d0e9" },
+    { name = "persistent", git = "https://github.com/adeweb-be/persistent?rev=57a8c54959112f49ef563267f0ed2cb96228c21a" },
     { name = "zoedb", editable = "zoedb" },
 ]
 
