@@ -460,19 +460,25 @@ impl BlobFile {
         self.size
     }
 
-    /// Sync the file and return the blob, ready for a commit in `store`.
+    /// Check that the file belongs to `store`, which is open.
     ///
     /// A file of another store is refused with `Protocol`. Its temporary
     /// name can also exist in `store`, so a rename would move the wrong
     /// file. A file whose store is closed is refused with `Closed`.
-    pub(crate) fn close(mut self, store: &Arc<Opened>) -> Result<PendingBlob> {
+    pub(crate) fn check_owner(&self, store: &Arc<Opened>) -> Result<()> {
         match self.store.upgrade() {
-            None => return Err(ZoeError::Closed),
+            None => Err(ZoeError::Closed),
             Some(own) if !Arc::ptr_eq(&own, store) => {
-                return Err(ZoeError::Protocol("a blob file of another store"));
+                Err(ZoeError::Protocol("a blob file of another store"))
             }
-            Some(_) => {}
+            Some(_) => Ok(()),
         }
+    }
+
+    /// Sync the file and return the blob, ready for a commit in `store`.
+    /// The file must belong to `store`, as `check_owner` checks.
+    pub(crate) fn close(mut self, store: &Arc<Opened>) -> Result<PendingBlob> {
+        self.check_owner(store)?;
         let mut file = self.file.take().expect("a blob file is closed once");
         file.sync()?;
         drop(file);
@@ -735,6 +741,28 @@ mod tests {
         txn.vote().unwrap();
         assert_eq!(txn.finish().unwrap(), tid);
         assert_eq!(read(&store, oid, tid).unwrap(), b"a copy");
+    }
+
+    #[test]
+    fn the_owner_of_a_blob_file_is_checked_before_its_size() {
+        let options = Options {
+            max_blob_size: Some(1),
+            ..Options::default()
+        };
+        let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+        let other = Store::open_vfs(MemVfs::new()).unwrap();
+        let closed = Store::open_vfs(MemVfs::new()).unwrap();
+        let of_other = blob_file(&other, b"too large");
+        let of_closed = blob_file(&closed, b"too large");
+        drop(closed);
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store_blob(Oid(1), Tid::ZERO, PICKLE, of_other);
+        assert!(matches!(error, Err(ZoeError::Protocol(_))), "{error:?}");
+        let error = txn.store_blob(Oid(1), Tid::ZERO, PICKLE, of_closed);
+        assert!(matches!(error, Err(ZoeError::Closed)), "{error:?}");
+        let error = txn.store_blob(Oid(1), Tid::ZERO, PICKLE, blob_file(&store, b"ab"));
+        assert!(matches!(error, Err(ZoeError::TooLarge { .. })), "{error:?}");
     }
 
     #[test]

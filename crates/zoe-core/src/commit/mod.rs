@@ -286,12 +286,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// `file` must come from `new_blob_file` of this store. A file of
     /// another store is refused with `Protocol`, and a file of a closed
-    /// store with `Closed`. A blob longer than `max-blob-size` fails with
-    /// `TooLarge`, before the sync. A restore transaction checks no size
-    /// limit. A refused call stages nothing and drops `file`, which
-    /// removes it.
+    /// store with `Closed`. Then a blob longer than `max-blob-size` fails
+    /// with `TooLarge`, before the sync, as a pickle over a size limit
+    /// does. A restore transaction checks no size limit. A refused call
+    /// stages nothing and drops `file`, which removes it.
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
         self.check_store(oid, data)?;
+        file.check_owner(&self.store.backend)?;
         let stored_bytes = self.check_size(oid, data)?;
         if !self.is_restore() {
             self.store
