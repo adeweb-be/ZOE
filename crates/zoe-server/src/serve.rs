@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Runtime;
 use zoe_core::{Store, ZoeError};
 
-use crate::protocol;
+use crate::protocol::{self, NamedStorage};
 
 /// The settings of a server.
 #[derive(Debug, Clone)]
@@ -92,7 +92,8 @@ impl Server {
         let store = Store::open(&options.path)
             .map(Arc::new)
             .map_err(|error| Error::Store(options.path.clone(), error))?;
-        runtime.spawn(accept(listener, Arc::clone(&store)));
+        let storage = NamedStorage::new(protocol::STORAGE_NAME, &options.path, Arc::clone(&store));
+        runtime.spawn(accept(listener, Arc::new(storage)));
         Ok(Self {
             runtime: Some(runtime),
             store: Some(store),
@@ -174,16 +175,12 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 }
 
 /// Accept clients until the runtime stops.
-async fn accept(listener: TcpListener, store: Arc<Store>) {
+async fn accept(listener: TcpListener, storage: Arc<NamedStorage>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(protocol::serve_connection(
-                    stream,
-                    Arc::clone(&store),
-                    protocol::STORAGE_NAME.to_owned(),
-                ));
+                tokio::spawn(protocol::serve_connection(stream, Arc::clone(&storage)));
             }
             Err(error) => {
                 eprintln!("zoe serve: accept failed: {error}");
@@ -217,6 +214,41 @@ mod tests {
         });
         // The lock of the store is free again.
         Store::open(&dir).unwrap();
+    }
+
+    #[test]
+    fn ruok_gives_the_status_as_json_and_closes() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).unwrap();
+            let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut payload).unwrap();
+            payload
+        }
+
+        let server = Server::start(ServeOptions::new(fresh_dir("ruok"))).unwrap();
+        let mut stream = TcpStream::connect(server.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(read_frame(&mut stream), b"M5");
+        stream.write_all(b"\0\0\0\x04ruok").unwrap();
+        let reply = String::from_utf8(read_frame(&mut stream)).unwrap();
+        assert!(
+            reply.starts_with(r#"{"1": {"connections": 0, "loads": 0, "#),
+            "{reply}"
+        );
+        assert!(
+            reply.ends_with(r#", "last-transaction": "0000000000000000"}}"#),
+            "{reply}"
+        );
+        // The server closes the connection after the status.
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
+        server.stop();
     }
 
     #[test]
