@@ -720,6 +720,7 @@ dependencies = [
     { name = "zeo" },
     { name = "zodb" },
     { name = "zodbshootout" },
+    { name = "zoedb" },
 ]
 
 [package.dev-dependencies]
@@ -737,10 +738,28 @@ requires-dist = [
     { name = "zeo", specifier = ">=6" },
     { name = "zodb", specifier = ">=6" },
     { name = "zodbshootout", specifier = "==0.8.0" },
+    { name = "zoedb", directory = "../../python/zoedb" },
 ]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.1" }]
+
+[[package]]
+name = "zoedb"
+source = { directory = "../../python/zoedb" }
+dependencies = [
+    { name = "zconfig" },
+    { name = "zodb" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
+    { name = "zconfig", specifier = ">=4" },
+    { name = "zodb", specifier = ">=6" },
+    { name = "zodburi", marker = "extra == 'uri'", specifier = ">=3" },
+]
+provides-extras = ["plone", "uri"]
 
 [[package]]
 name = "zope-deferredimport"

@@ -23,12 +23,18 @@ dependencies = [
     # The binary wheel needs no libpq headers to install.
     "psycopg2-binary>=2.9",
     "jsonschema>=4",
+    # ZOE in-process. uv builds the wheel from python/zoedb with maturin.
+    "zoedb",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1",
 ]
+
+[tool.uv.sources]
+# A path source is not editable, so maturin builds a release wheel.
+zoedb = { path = "../../python/zoedb" }
 
 [tool.uv.build-backend]
 module-name = "shootout"
