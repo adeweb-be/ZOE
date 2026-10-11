@@ -40,7 +40,7 @@ pub(crate) trait StagingDir: Send + Sync {
     fn create_dir(&self, name: &str) -> io::Result<()>;
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
     fn remove(&self, name: &str) -> io::Result<()>;
-    fn open(&self, name: &str) -> io::Result<Box<dyn StorageBackend>>;
+    fn create_new(&self, name: &str) -> io::Result<Box<dyn StorageBackend>>;
 }
 
 impl<V: Vfs> StagingDir for V {
@@ -60,8 +60,8 @@ impl<V: Vfs> StagingDir for V {
         Vfs::remove(self, name)
     }
 
-    fn open(&self, name: &str) -> io::Result<Box<dyn StorageBackend>> {
-        Ok(Box::new(Vfs::open(self, name)?))
+    fn create_new(&self, name: &str) -> io::Result<Box<dyn StorageBackend>> {
+        Ok(Box::new(Vfs::create_new(self, name)?))
     }
 }
 
@@ -136,12 +136,12 @@ impl StagingArea {
                 *ready = true;
             }
         }
-        // The number is new in this store, and the open of a writer
-        // removed the files of earlier processes. So the file is new and
-        // empty.
+        // The creation fails when the name exists, as a file or as a
+        // symbolic link. So a spill file is always new and empty, and a
+        // write never goes through a link.
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let name = format!("{STAGING_DIR}/{n}.spill");
-        let file = self.dir.open(&name)?;
+        let file = self.dir.create_new(&name)?;
         Ok(Spill { name, file, len: 0 })
     }
 }
@@ -547,6 +547,44 @@ mod tests {
 
         drop(Store::open(&dir).unwrap());
         assert!(!spill.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symbolic link under the name of a spill file never takes a write.
+    /// The creation of the spill file fails, and the target of the link
+    /// stays as it is. The next spill file takes the next number.
+    #[test]
+    fn a_spill_never_writes_through_a_link() {
+        let dir = temp_dir("link");
+        drop(Store::open(&dir).unwrap());
+        std::fs::create_dir(dir.join(STAGING_DIR)).unwrap();
+        let link = dir.join(STAGING_DIR).join("0.spill");
+        std::os::unix::fs::symlink("../zoe.redb", &link).unwrap();
+        let options = Options {
+            staging_memory: 0,
+            ..Options::default()
+        };
+        let store = Store::open_with(&dir, options).unwrap();
+        // The open removes only regular files, so the link stays.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        let database = std::fs::read(dir.join("zoe.redb")).unwrap();
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store(Oid(1), Tid::ZERO, b"a").unwrap_err();
+        assert!(
+            matches!(&error, ZoeError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{error:?}"
+        );
+        drop(txn);
+        assert_eq!(std::fs::read(dir.join("zoe.redb")).unwrap(), database);
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        assert!(dir.join(STAGING_DIR).join("1.spill").is_file());
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), tid));
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
