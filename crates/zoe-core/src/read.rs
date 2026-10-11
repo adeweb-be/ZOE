@@ -15,7 +15,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 
-use crate::backend::{Backend, Record, RecordMeta, TxnMeta};
+use crate::backend::{Backend, BlobRecord, Record, RecordMeta, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::store::{Opened, Store};
 use crate::types::{Oid, Tid};
@@ -339,6 +339,29 @@ impl Store {
             data: record.data,
             next,
         }))
+    }
+
+    /// Return the keys of the records of the oids from `from` up, in key
+    /// order, deletions too. The list stops after the first oid that
+    /// brings it to `limit` keys or more, so it holds all the keys of each
+    /// oid in it. The call reads no frame. A walk of the frames gives each
+    /// key to `load_serial` and `load_blob`.
+    pub fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
+        self.backend.record_keys(from, limit)
+    }
+
+    /// Return every transaction row, in tid order. Each row comes with its
+    /// own result, so a row that does not read does not hide the others.
+    /// The call reads no record.
+    pub fn txn_rows(&self) -> Vec<Result<TxnMeta>> {
+        self.backend.iter_txns(Tid::ZERO, Tid::MAX).collect()
+    }
+
+    /// Return the blob record that `tid` wrote for `oid`, or `None`. A
+    /// blob record that does not pass its checksum is `CorruptBlob`. The
+    /// call does not read the blob file: `verify_blob` reads it.
+    pub fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
+        self.backend.load_blob(oid, tid)
     }
 
     /// Return the first oid at or after `from` whose current record is not
