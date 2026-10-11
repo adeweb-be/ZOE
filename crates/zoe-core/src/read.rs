@@ -151,14 +151,20 @@ impl Iterator for Transactions {
 
 /// Read the transaction `tid` and its records of `oids` from `backend`, in
 /// one snapshot. The records that are there must match the oid count of
-/// the row. Return `None` when the row is gone.
+/// the row. Return `None` when a pack removed the row. A row that is gone
+/// with no pack to explain it raises `CorruptTxn`.
 ///
 /// `oids` comes from an earlier snapshot. A pack can remove some of these
 /// records since, and then it lowers the oid count of the row in the same
 /// write.
 fn txn_info(backend: &dyn Backend, tid: Tid, oids: Vec<Oid>) -> Result<Option<TxnInfo>> {
     let Some((row, records)) = backend.txn_records(tid, &oids)? else {
-        return Ok(None);
+        // The scan of the rows gave this row. Only a pack can remove it
+        // since. Otherwise the index of the database is damaged.
+        if packed(backend, tid)? {
+            return Ok(None);
+        }
+        return Err(ZoeError::CorruptTxn { tid });
     };
     if records.len() as u64 != row.oid_count {
         return Err(ZoeError::CorruptTxn { tid });
@@ -178,6 +184,13 @@ fn txn_info(backend: &dyn Backend, tid: Tid, oids: Vec<Oid>) -> Result<Option<Tx
         extension: row.extension,
         records,
     }))
+}
+
+/// Tell if a pack can have removed records or the row of the transaction
+/// `tid`. A pack removes only records at or before its tid, and its first
+/// write also writes that tid as the pack watermark.
+fn packed(backend: &dyn Backend, tid: Tid) -> Result<bool> {
+    Ok(tid <= backend.pack_watermark()?)
 }
 
 impl Store {
@@ -227,6 +240,10 @@ impl Store {
 
     /// Return the history entries of the first `size` records of
     /// `versions`, the records of `oid` that an earlier snapshot read.
+    ///
+    /// A record that is gone with its row since that snapshot is left out
+    /// only when a pack can have removed it. Otherwise the call raises
+    /// `CorruptTxn`.
     pub(crate) fn history_entries(
         &self,
         oid: Oid,
@@ -238,7 +255,12 @@ impl Store {
             let tid = version.tid;
             let row = match self.backend.iter_txns(tid, tid).next() {
                 Some(row) => row?,
-                None if self.backend.load_serial(oid, tid)?.is_none() => continue,
+                // A pack removed the record and its row since the snapshot.
+                None if self.backend.load_serial(oid, tid)?.is_none()
+                    && packed(&**self.backend, tid)? =>
+                {
+                    continue;
+                }
                 None => return Err(ZoeError::CorruptTxn { tid }),
             };
             entries.push(HistoryEntry {
@@ -761,5 +783,43 @@ mod tests {
         is_corrupt(store.record_iternext(None), 300);
         let txns: Vec<_> = store.iterator(None, None).unwrap().collect();
         is_corrupt(txns.into_iter().next().unwrap(), 100);
+    }
+
+    /// Remove the row of `tid` and, when `record` is set, the record of
+    /// oid 1 at `tid`, with no pack. A damaged index of the database looks
+    /// the same to a read.
+    fn remove_outside_a_pack(store: &Store, tid: Tid, record: bool) {
+        let mut write = store.backend.begin_write().unwrap();
+        if record {
+            write.remove_record(Oid(1), tid).unwrap();
+        }
+        write.remove_txn(tid).unwrap();
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn a_row_that_is_gone_with_no_pack_is_a_corrupt_transaction() {
+        let store = three_records();
+        let iterator = store.iterator(None, None).unwrap();
+        remove_outside_a_pack(&store, Tid(200), false);
+
+        let txns: Vec<std::result::Result<Tid, String>> = iterator
+            .map(|txn| txn.map(|txn| txn.tid).map_err(|e| format!("{e:?}")))
+            .collect();
+        let corrupt = format!("{:?}", ZoeError::CorruptTxn { tid: Tid(200) });
+        assert_eq!(txns, [Ok(Tid(100)), Err(corrupt), Ok(Tid(300))]);
+    }
+
+    #[test]
+    fn a_history_entry_that_is_gone_with_no_pack_is_a_corrupt_transaction() {
+        let store = three_records();
+        let versions = store.backend.history(Oid(1), 10).unwrap();
+        remove_outside_a_pack(&store, Tid(200), true);
+
+        let history = store.history_entries(Oid(1), versions, 10);
+        assert!(
+            matches!(history, Err(ZoeError::CorruptTxn { tid: Tid(200) })),
+            "{history:?}"
+        );
     }
 }
