@@ -2,12 +2,20 @@
 //! `zoedb` wheel imports it.
 //!
 //! The module does not use the GIL, so that the GIL stays off when
-//! CPython 3.14t loads it.
+//! CPython 3.14t loads it. It imports ZODB only when it raises an
+//! exception of ZODB.
+
+mod errors;
+mod publish;
+mod storage;
 
 /// The extension module.
 #[pyo3::pymodule(gil_used = false)]
 mod _zoe {
     use pyo3::prelude::*;
+
+    #[pymodule_export]
+    use crate::storage::Storage;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

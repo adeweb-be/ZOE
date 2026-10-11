@@ -153,9 +153,15 @@ pub(crate) struct Locks<'m> {
 
 impl Drop for Locks<'_> {
     fn drop(&mut self) {
-        if !self.oids.is_empty() {
-            self.manager.table().release(&self.oids);
-        }
+        self.manager.release(&self.oids);
+    }
+}
+
+impl Locks<'_> {
+    /// Keep the locks after this value is dropped, and return their oids.
+    /// The caller must give the oids to `LockManager::release` later.
+    pub(crate) fn keep(mut self) -> Vec<Oid> {
+        std::mem::take(&mut self.oids)
     }
 }
 
@@ -214,8 +220,15 @@ impl LockManager {
         Ok(locks)
     }
 
+    /// Release one hold on each oid of `oids`. `oids` must come from
+    /// `Locks::keep`.
+    pub(crate) fn release(&self, oids: &[Oid]) {
+        if !oids.is_empty() {
+            self.table().release(oids);
+        }
+    }
+
     /// Tell if no request holds or waits for a lock.
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.table().entries.is_empty()
     }
@@ -262,6 +275,19 @@ mod tests {
             .unwrap();
         assert!(!locks.is_empty());
         drop(held);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn kept_locks_stay_until_their_release() {
+        let locks = LockManager::default();
+        let oids = locks
+            .acquire(&[(Oid(1), Exclusive), (Oid(2), Shared)], Duration::ZERO)
+            .unwrap()
+            .keep();
+        assert_eq!(oids, [Oid(1), Oid(2)]);
+        assert!(!locks.is_empty());
+        locks.release(&oids);
         assert!(locks.is_empty());
     }
 

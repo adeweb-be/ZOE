@@ -33,7 +33,11 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Invalidations go out only after the acknowledgement.
 - Locks that group-commit members hold stay held until the batch is durable. A failed fsync fails every member.
 - Only the commit-batch leader opens a backend write transaction. Readers use snapshots and never block it.
-- One thread drives a transaction from `tpc_begin` to `tpc_finish` or `tpc_abort`. A call from another thread is refused with `WrongThread`.
+- The thread that begins a transaction drives it. `store`, `restore`, `check_current_serial` and `vote` from another thread fail with `WrongThread`, and the refused call changes nothing. `finish` and `abort` may run on any thread, because ZODB lets another thread finish or abort a transaction.
+- `Txn` reaches its store through `S: Deref<Target = Store>`. `Txn<&Store>` borrows the store. `Txn<Arc<Store>>` shares it and borrows nothing, so a skin can keep it across calls and threads.
+- A successful vote hands its locks to the transaction with `Locks::keep`. The transaction then releases them with `LockManager::release` at `finish`, at `abort` or when it is dropped. A failed vote drops its `Locks`, and that releases them.
+- After a vote fails on a stale serial, `conflict_serials` gives the current serial and the serial that the transaction read, the `serials` of a ZODB `ConflictError`. After a lock-wait timeout it gives `None`. `staged` gives the read serial and the pickle that the transaction staged for an oid.
+- `finish_after` commits as `finish` does and also returns `previous`, the last tid of the store when the commit started to write: the commit just before it in commit order. A skin runs its post-commit work in commit order with it, and holds no lock across commits.
 - The lock manager and group commit are the only shared mutable state. The core is `Send + Sync`.
 - Every read verifies the record checksum. A mismatch raises `CorruptRecord` with the oid and the tid, never `POSKeyError`.
 - `load_before(oid, tid)` reads one snapshot: a reverse range scan from `(oid, tid - 1)` gives the record, and a forward scan from `(oid, tid)` gives the serial of the next record. Both records are verified. An oid with records, but none before `tid`, gives `None`. An oid with no record raises `NotFound`.

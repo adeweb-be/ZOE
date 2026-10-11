@@ -824,6 +824,15 @@ wheels = [
 ]
 
 [[package]]
+name = "manuel"
+version = "1.13.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "setuptools" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7b/62/1ae0fc38b62bf720eed970b10c62b608695b34b54436fa223d1c19cc281b/manuel-1.13.0.tar.gz", hash = "sha256:5d63120de8fa6d927780b69ae28aa3e9d1669b10af3d32785f3fba11a5be885a", size = 46185, upload-time = "2024-11-12T12:35:29.916Z" }
+
+[[package]]
 name = "markdown"
 version = "3.11"
 source = { registry = "https://pypi.org/simple" }
@@ -3721,6 +3730,13 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/82/09571aeb3eeb0033ecde410de174250ef56ff47960cc5eed7b2dbb3694a0/zodb-6.3-py3-none-any.whl", hash = "sha256:4f1baad4296fa06d4f0a468c91be05e5bd3f0fbfa0b37794de4f03c97cb8dcf1", size = 419734, upload-time = "2026-04-14T06:15:35.253Z" },
 ]
 
+[package.optional-dependencies]
+test = [
+    { name = "manuel" },
+    { name = "zope-testing" },
+    { name = "zope-testrunner" },
+]
+
 [[package]]
 name = "zodbpickle"
 version = "4.5"
@@ -3767,17 +3783,24 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "zodb", extra = ["test"] },
 ]
 
 [package.metadata]
 requires-dist = [{ name = "zoedb", editable = "zoedb" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1" }]
+dev = [
+    { name = "pytest", specifier = ">=9.1" },
+    { name = "zodb", extras = ["test"] },
+]
 
 [[package]]
 name = "zoedb"
 source = { editable = "zoedb" }
+dependencies = [
+    { name = "zodb" },
+]
 
 [package.optional-dependencies]
 plone = [
@@ -3785,7 +3808,10 @@ plone = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" }]
+requires-dist = [
+    { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
+    { name = "zodb", specifier = ">=6" },
+]
 provides-extras = ["plone"]
 
 [[package]]
@@ -4706,6 +4732,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ee/81/3a610e969c44b47851a69329e5780172a8c94a1105029a7ef17d9be0d358/zope_testing-6.2.tar.gz", hash = "sha256:0de47f3c1a96cbec15ae7a1607d5a142ec39e501728055434358c2f4cf0f21a9", size = 48303, upload-time = "2026-07-03T06:31:41.021Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/21/1b/754e3979c2f4bd6afd9e7f965d161d64053c32936c0e232ba215f1d39606/zope_testing-6.2-py3-none-any.whl", hash = "sha256:3bd449580e7ff033835d6b59833f05f87df6fa5c250baa487d9c68ae6133b873", size = 37414, upload-time = "2026-07-03T06:31:39.67Z" },
+]
+
+[[package]]
+name = "zope-testrunner"
+version = "8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "zope-exceptions" },
+    { name = "zope-interface" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/9b/0cd0153944f4e170adea3099abd06ad633faea93e92c1dad23db8d855b90/zope_testrunner-8.3.tar.gz", hash = "sha256:6fef88117314676650829140c2a9038fb7a0b46fd7c01a29dd7f2842bfc614d7", size = 156258, upload-time = "2026-07-30T06:33:56.556Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/9a/6a88126959e57676e9bc58f27d54a334e25bf3a6e39c598068681df06bb1/zope_testrunner-8.3-py3-none-any.whl", hash = "sha256:33e73eb4dcfe064605ae9b8152ea1456931e1176aa49a2b2b9f51fef20ba71de", size = 231504, upload-time = "2026-07-30T06:33:54.156Z" },
 ]
 
 [[package]]

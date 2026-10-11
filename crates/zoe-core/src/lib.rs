@@ -22,7 +22,7 @@ pub use backend::{
     Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
 };
 pub use clock::{Clock, SystemClock, timestamp};
-pub use commit::Txn;
+pub use commit::{Finished, Txn};
 pub use error::{Result, ZoeError};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use store::{Options, Store};

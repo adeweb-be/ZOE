@@ -280,6 +280,7 @@ name = "zoe-py"
 version = "0.0.0"
 dependencies = [
  "pyo3",
+ "zoe-core",
 ]
 
 [[package]]

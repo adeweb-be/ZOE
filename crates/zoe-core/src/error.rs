@@ -35,6 +35,7 @@ pub enum ZoeError {
 
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
+    /// `Txn::conflict_serials` gives the serials of a stale serial.
     #[error("conflict: oid {oid:?}")]
     Conflict {
         /// The object id in conflict.
@@ -43,7 +44,8 @@ pub enum ZoeError {
 
     /// Another transaction changed an object that this transaction read as
     /// current, since the serial that this transaction read. This is the
-    /// `ReadConflictError` of ZODB.
+    /// `ReadConflictError` of ZODB. `Txn::conflict_serials` gives the
+    /// serials.
     #[error("read conflict: oid {oid:?}")]
     ReadConflict {
         /// The object id that this transaction read as current.
@@ -64,6 +66,12 @@ pub enum ZoeError {
     /// reserved.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
+
+    /// A thread that did not begin the transaction called `store`,
+    /// `restore`, `check_current_serial` or `vote`. The transaction refuses
+    /// the call and does not change.
+    #[error("the call came from a thread that did not begin the transaction")]
+    WrongThread,
 
     /// A finish failed before, so the outcome of its commit is unknown.
     /// The store refuses every finish until it is reopened.

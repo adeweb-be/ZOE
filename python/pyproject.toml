@@ -8,6 +8,7 @@ dependencies = ["zoedb"]
 [dependency-groups]
 dev = [
     "pytest>=9.1",
+    "ZODB[test]",
 ]
 
 [tool.uv]
