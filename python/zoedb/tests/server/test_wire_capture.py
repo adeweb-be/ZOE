@@ -52,7 +52,6 @@ CLIENT_METHODS = {
     "loadSerial",
     "getInvalidations",
     "history",
-    "get_size_info",
     "record_iternext",
     # commit
     "tpc_begin",
@@ -106,11 +105,16 @@ def commit(storage, stores, blobs=()):
 
     txn = TransactionMetaData(b"user", b"description", {"note": "spike"})
     storage.tpc_begin(txn)
-    for oid, serial, data in stores:
-        storage.store(oid, serial, data, "", txn)
-    for oid, serial, data, filename in blobs:
-        storage.storeBlob(oid, serial, data, filename, "", txn)
-    storage.tpc_vote(txn)
+    try:
+        for oid, serial, data in stores:
+            storage.store(oid, serial, data, "", txn)
+        for oid, serial, data, filename in blobs:
+            storage.storeBlob(oid, serial, data, filename, "", txn)
+        storage.tpc_vote(txn)
+    except BaseException:
+        # The client holds its commit lock until the abort.
+        storage.tpc_abort(txn)
+        raise
     return storage.tpc_finish(txn)
 
 
@@ -172,8 +176,9 @@ def test_the_records_cover_every_method_of_the_matrix(tmp_path):
             storage.loadSerial(oid, tid)
             storage.history(oid, 2)
             storage.record_iternext()
-            storage._server.get_size_info()
-            storage._server.getInvalidations(tid)
+            # ClientStorage has no method for these two calls.
+            storage._call("getInvalidations", tid)
+            storage._call("lastTransaction")
 
             # read-current, deleteObject, abort
             from ZODB.Connection import TransactionMetaData
@@ -206,11 +211,24 @@ def test_the_records_cover_every_method_of_the_matrix(tmp_path):
             finally:
                 reader.close()
 
-            # The iterator, and restorea through copyTransactionsFrom.
-            transactions = list(storage.iterator())
+            # The iterator and its records.
+            transactions = 0
+            for transaction in storage.iterator():
+                list(transaction)
+                transactions += 1
             assert transactions
+            # An iterator dropped before its end. The client sends
+            # iterator_gc with its next transaction.
+            dropped = storage.iterator()
+            next(dropped)
+            del dropped
+            txn = TransactionMetaData()
+            storage.tpc_begin(txn)
+            storage.tpc_abort(txn)
 
-            # pack, which sends info to the clients.
+            # pack, which sends info to the clients. Pack needs the root
+            # object.
+            commit(storage, [(ZERO, ZERO, record("root"))])
             storage.pack(TimeStamp(tid2).timeTime() + 1, None)
         finally:
             other.close()
