@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
-use crate::blob::{self, BlobFile, BlobReader, BlobStore};
+use crate::blob::{BlobFile, BlobReader, BlobStore};
 use crate::clock::{Clock, SystemClock};
-use crate::commit::Txn;
+use crate::commit::{StagingArea, Txn};
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::lock::LockManager;
@@ -39,6 +39,11 @@ pub struct Options {
     /// How the store writes new records. The default is zstd at level 3.
     /// The store reads records of every codec, whatever this option.
     pub compression: Compression,
+    /// The most bytes of staged pickles that one transaction keeps in
+    /// memory. The other pickles of the transaction go to a spill file
+    /// under `staging/` in the store directory. This is `staging-memory`
+    /// in the configuration.
+    pub staging_memory: usize,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -50,13 +55,16 @@ impl Default for Options {
         Self {
             lock_timeout: Duration::from_secs(10),
             compression: Compression::default(),
+            staging_memory: 16 << 20,
             _more: (),
         }
     }
 }
 
-/// The open database of a store and its blob store. The blob store owns
-/// the directory, and the directory holds the lock of the store.
+/// The open database of a store, its blob store and its staging area.
+/// The blob store and the staging area share the directory, and the
+/// directory holds the lock of the store. Nothing else holds the
+/// directory.
 ///
 /// The fields drop in the order of their declaration. So the database
 /// closes, and writes its last bytes, before the directory releases the
@@ -64,6 +72,7 @@ impl Default for Options {
 pub(crate) struct Opened {
     backend: Box<dyn Backend>,
     pub(crate) blobs: BlobStore,
+    pub(crate) staging: StagingArea,
 }
 
 impl Deref for Opened {
@@ -126,7 +135,11 @@ impl Store {
     /// A new store is written under a temporary name and renamed into place
     /// after it is durable, so a crash during the creation leaves either
     /// no store or a complete empty one.
-    fn open_full<V: Vfs>(vfs: V, clock: impl Clock + 'static, options: Options) -> Result<Self> {
+    pub(crate) fn open_full<V: Vfs>(
+        vfs: V,
+        clock: impl Clock + 'static,
+        options: Options,
+    ) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
                 vfs.remove(NEW_DATABASE)?;
@@ -146,7 +159,7 @@ impl Store {
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
-        Self::assemble(backend, Box::new(vfs), Box::new(clock), options, false)
+        Self::assemble(backend, vfs, Box::new(clock), options, false)
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -172,27 +185,32 @@ impl Store {
             })?;
         let backend = RedbBackend::open_read_only(db)?;
         let options = Options::default();
-        Self::assemble(backend, Box::new(dir), Box::new(SystemClock), options, true)
+        Self::assemble(backend, dir, Box::new(SystemClock), options, true)
     }
 
     /// Make a store from an open backend and the directory that holds its
-    /// lock.
-    fn assemble(
+    /// lock. The blob store and the staging area share the directory.
+    fn assemble<V: Vfs>(
         backend: RedbBackend,
-        dir: Box<dyn blob::BlobDir>,
+        dir: V,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
     ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
+        let dir = Arc::new(dir);
         let opened = Arc::new(Opened {
             backend: Box::new(backend),
-            blobs: BlobStore::new(dir),
+            blobs: BlobStore::new(Box::new(Arc::clone(&dir))),
+            staging: StagingArea::new(Box::new(dir), options.staging_memory, read_only),
         });
         // `Opened` holds the database and the directory here, so an error
         // drops them in order: the database closes before the lock goes.
         opened.blobs.open(&**opened, read_only)?;
+        // The staging area of a read-only store removes no leftover and
+        // creates no spill file.
+        opened.staging.open()?;
         Ok(Self {
             backend: opened,
             clock,
@@ -473,7 +491,8 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
         // The inner store keeps the directory. The tests of this store use
-        // no blob, so its blob store has an empty directory of its own.
+        // no blob, so its blob store has an empty directory of its own. So
+        // has its staging area, which spills each pickle.
         let faulty = Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
@@ -481,6 +500,7 @@ mod tests {
         let backend = Arc::new(Opened {
             backend: Box::new(faulty),
             blobs: BlobStore::new(Box::new(MemVfs::new())),
+            staging: StagingArea::new(Box::new(MemVfs::new()), 0, false),
         });
         (Store { backend, ..store }, faults)
     }

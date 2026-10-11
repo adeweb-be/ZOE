@@ -877,3 +877,36 @@ def test_an_error_after_the_last_resolved_store_releases_the_locks(tmp_path):
         assert commit(storage, oid, second, counter(5)) > second
     finally:
         storage.close()
+
+
+# The default staging-memory of the core. A transaction keeps this many
+# bytes of pickles in memory and spills the others to `staging/`.
+STAGING_MEMORY = 16 << 20
+
+
+def test_a_damaged_spill_file_fails_the_resolution(tmp_path):
+    path = tmp_path / "store"
+    storage = zoe.Storage(str(path), lock_timeout=0)
+    try:
+        oid, first, second = two_revisions(storage)
+        filler = storage.new_oid()
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        # The filler fills the memory part, so the next pickle spills.
+        storage.store(filler, ZERO, b"x" * STAGING_MEMORY, "", txn)
+        storage.store(oid, first, counter(2), "", txn)
+        (spill,) = (path / "staging").iterdir()
+        with spill.open("r+b") as file:
+            file.write(b"\xff")
+        # The error is not a conflict, so ZODB does not retry it. Its cause
+        # is the error of the read.
+        with pytest.raises(StorageError, match="does not match its hash") as raised:
+            storage.tpc_vote(txn)
+        assert isinstance(raised.value.__cause__, OSError)
+        # The transaction is aborted: its lock is free, and its spill file
+        # is gone.
+        assert commit(storage, oid, second, counter(3)) > second
+        assert list((path / "staging").iterdir()) == []
+        storage.tpc_abort(txn)
+    finally:
+        storage.close()

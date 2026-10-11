@@ -26,7 +26,14 @@
 //! `finish` places the blob files before the backend commit, and the same
 //! backend write transaction holds their blob records. Dropping a
 //! transaction removes the blob files that it did not place.
+//!
+//! The staged records live in a staging buffer: in memory up to the
+//! `staging_memory` option of the store, and in a spill file under
+//! `staging/` beyond it. `staging` describes the buffer.
 
+mod staging;
+
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::thread::{self, ThreadId};
@@ -38,16 +45,8 @@ use crate::error::{Result, ZoeError};
 use crate::lock::Mode;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
-
-/// A record waiting for the commit.
-struct Staged {
-    /// The serial that the client read before it changed the object.
-    serial: Tid,
-    data: Vec<u8>,
-    /// True when `restore` staged the record. A restored record is a copy,
-    /// so a conflict on it cannot be resolved.
-    restored: bool,
-}
+use staging::Staging;
+pub(crate) use staging::StagingArea;
 
 /// A commit that `finish_after` made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +81,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
-    staged: BTreeMap<Oid, Staged>,
+    /// The staged records. `Drop` removes their spill file while `store`
+    /// is still there.
+    staged: Staging,
     /// The oids that the transaction read as current, with the serial that
     /// it read.
     read_current: BTreeMap<Oid, Tid>,
@@ -128,7 +129,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
-            staged: BTreeMap::new(),
+            staged: Staging::default(),
             read_current: BTreeMap::new(),
             locks: None,
             resolving: BTreeSet::new(),
@@ -187,15 +188,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// A blob that `store_blob` staged for `oid` stays, as in ZODB.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         self.check_store(oid, data)?;
-        self.staged.insert(
-            oid,
-            Staged {
-                serial,
-                data: data.to_vec(),
-                restored: false,
-            },
-        );
-        Ok(())
+        let area = &self.store.backend.staging;
+        self.staged.put(area, oid, serial, data, false)
     }
 
     /// Check that `store` or `store_blob` can stage `data` for `oid`. A
@@ -219,10 +213,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// Return the serial that the transaction read for `oid` and the pickle
     /// that it staged. Return `None` when the transaction did not stage
     /// `oid`.
-    pub fn staged(&self, oid: Oid) -> Option<(Tid, &[u8])> {
-        self.staged
-            .get(&oid)
-            .map(|staged| (staged.serial, staged.data.as_slice()))
+    ///
+    /// A pickle in the spill file is read from the file. A read that fails,
+    /// or whose bytes do not match the hash of the pickle, fails the call
+    /// with `Io`.
+    pub fn staged(&self, oid: Oid) -> Result<Option<(Tid, Cow<'_, [u8]>)>> {
+        self.staged.get(oid)
+    }
+
+    /// Return the bytes of the staged pickles that the transaction keeps in
+    /// memory. The other staged pickles are in its spill file.
+    pub fn staged_in_memory(&self) -> usize {
+        self.staged.in_memory()
     }
 
     /// Stage a new version of `oid` with the blob in `file`, as `store`
@@ -236,14 +238,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
         self.check_store(oid, data)?;
         let blob = file.close(&self.store.backend)?;
-        self.staged.insert(
-            oid,
-            Staged {
-                serial,
-                data: data.to_vec(),
-                restored: false,
-            },
-        );
+        let area = &self.store.backend.staging;
+        self.staged.put(area, oid, serial, data, false)?;
         self.blobs.insert(oid, blob);
         Ok(())
     }
@@ -268,17 +264,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         check_oid(oid)?;
         let current = self.current_serial(oid)?;
+        let area = &self.store.backend.staging;
+        self.staged
+            .put(area, oid, current, data.unwrap_or_default(), true)?;
         if data.is_none() {
             self.blobs.remove(&oid);
         }
-        self.staged.insert(
-            oid,
-            Staged {
-                serial: current,
-                data: data.unwrap_or_default().to_vec(),
-                restored: true,
-            },
-        );
         Ok(())
     }
 
@@ -408,7 +399,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .keys()
             .map(|&oid| (oid, Mode::Shared))
             .collect();
-        requests.extend(self.staged.keys().map(|&oid| (oid, Mode::Exclusive)));
+        requests.extend(self.staged.iter().map(|(oid, _)| (oid, Mode::Exclusive)));
         requests.into_iter().collect()
     }
 
@@ -420,7 +411,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// gives each such oid with its committed record.
     fn check_serials(&self, resolve: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
-        for (&oid, staged) in &self.staged {
+        for (oid, staged) in self.staged.iter() {
             let record = self.store.backend.load_before(oid, Tid::MAX)?;
             let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
             if current == staged.serial {
@@ -509,7 +500,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         };
         // The sequencer stays empty if the write below fails.
         *sequencer = None;
-        if let Some(&oid) = self.staged.keys().next_back() {
+        if let Some(oid) = self.staged.last_oid() {
             store.raise_next_oid(oid);
         }
 
@@ -517,8 +508,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // commit, so a blob record never lacks its file.
         let intent = store.blobs().place(tid, &mut self.blobs)?;
         let mut write = store.backend.begin_write()?;
-        for (&oid, staged) in &self.staged {
-            write.put_record(oid, tid, staged.serial, &staged.data)?;
+        // A spilled pickle is read back here, one at a time.
+        for record in self.staged.records() {
+            let (oid, serial, data) = record?;
+            write.put_record(oid, tid, serial, &data)?;
             if let Some(blob) = self.blobs.get(&oid) {
                 write.put_blob(oid, tid, blob.record())?;
             }
@@ -535,7 +528,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         store.blobs().finished(intent);
         // A running pack marks what these records refer to before its next
         // removal.
-        store.packing.note(tid, self.staged.keys().copied());
+        store
+            .packing
+            .note(tid, self.staged.iter().map(|(oid, _)| oid));
 
         *sequencer = Some(tid);
         drop(sequencer);
@@ -546,8 +541,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
         })
     }
 
-    /// Abort the transaction: drop the staged records and release the
-    /// locks.
+    /// Abort the transaction: drop the staged records, remove the spill
+    /// file and release the locks.
     pub fn abort(mut self) {
         self.release();
     }
@@ -562,6 +557,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
 impl<S: Deref<Target = Store>> Drop for Txn<S> {
     fn drop(&mut self) {
         self.release();
+        self.staged.remove_spill(&self.store.backend.staging);
     }
 }
 
@@ -602,11 +598,16 @@ pub(crate) fn check_restore_tid(tid: Tid, last: Tid) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use redb::StorageBackend;
+
     use super::*;
-    use crate::vfs::MemVfs;
+    use crate::clock::SystemClock;
+    use crate::store::Options;
+    use crate::vfs::{MemVfs, Vfs};
 
     fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
@@ -910,8 +911,9 @@ mod tests {
         txn.store(read, first, b"c").unwrap();
         assert!(matches!(txn.vote(), Err(ZoeError::Conflict { oid }) if oid == read));
         assert_eq!(txn.conflict_serials(), Some((second, first)));
-        assert_eq!(txn.staged(read), Some((first, &b"c"[..])));
-        assert_eq!(txn.staged(written), None);
+        let staged = txn.staged(read).unwrap();
+        assert_eq!(staged, Some((first, Cow::Borrowed(&b"c"[..]))));
+        assert_eq!(txn.staged(written).unwrap(), None);
 
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store(read, second, b"c").unwrap();
@@ -997,7 +999,8 @@ mod tests {
             data: b"b".to_vec(),
         };
         assert_eq!(conflicts, [(stale, committed)]);
-        assert_eq!(txn.staged(stale), Some((first, &b"c"[..])));
+        let staged = txn.staged(stale).unwrap();
+        assert_eq!(staged, Some((first, Cow::Borrowed(&b"c"[..]))));
         assert_eq!(txn.conflict_serials(), None);
 
         // The transaction keeps the lock: another vote on the oid cannot
@@ -1235,6 +1238,269 @@ mod tests {
             // commit as a conflict.
             assert_eq!(done.recv().unwrap().unwrap(), 1);
         });
+        assert!(store.lock_table_is_empty());
+    }
+
+    /// Open a store in a new filesystem. Its transactions keep `memory`
+    /// bytes of pickles in memory and spill the rest.
+    fn spilling_store(memory: usize) -> (MemVfs, Store) {
+        let vfs = MemVfs::new();
+        let options = Options {
+            staging_memory: memory,
+            ..Options::default()
+        };
+        let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+        (vfs, store)
+    }
+
+    /// Tell if `vfs` holds a spill file.
+    fn spills(vfs: &MemVfs) -> bool {
+        vfs.names().iter().any(|name| name.starts_with("staging/"))
+    }
+
+    #[test]
+    fn staged_reads_a_pickle_in_memory_or_in_the_spill_file() {
+        let (vfs, store) = spilling_store(1);
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.store(Oid(2), Tid(5), b"bb").unwrap();
+        assert_eq!(txn.staged_in_memory(), 1);
+        assert!(spills(&vfs));
+
+        let (serial, data) = txn.staged(Oid(1)).unwrap().unwrap();
+        assert!(matches!(data, Cow::Borrowed(b"a")));
+        assert_eq!(serial, Tid::ZERO);
+        let (serial, data) = txn.staged(Oid(2)).unwrap().unwrap();
+        assert_eq!((serial, &*data), (Tid(5), &b"bb"[..]));
+        assert!(txn.staged(Oid(3)).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_vote_checks_the_serials_of_spilled_records() {
+        let (vfs, store) = spilling_store(0);
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let mut stale = store.tpc_begin(b"", b"", b"").unwrap();
+        stale.store(oid, Tid::ZERO, b"b").unwrap();
+        assert!(matches!(stale.vote(), Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
+        drop(stale);
+        assert!(!spills(&vfs));
+
+        let tid = commit(&store, oid, first, b"c");
+        assert_eq!(store.load(oid).unwrap(), (b"c".to_vec(), tid));
+    }
+
+    #[test]
+    fn a_restore_transaction_commits_spilled_records() {
+        let (vfs, store) = spilling_store(0);
+        let first = commit(&store, Oid(1), Tid::ZERO, b"a");
+        let tid = Tid(first.0 + 10);
+        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+        txn.restore(Oid(1), None).unwrap();
+        txn.restore(Oid(2), Some(b"b")).unwrap();
+        txn.store(Oid(3), Tid::ZERO, b"c").unwrap();
+        assert_eq!(txn.staged_in_memory(), 0);
+        assert!(spills(&vfs));
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), tid);
+
+        assert!(!spills(&vfs));
+        assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
+        assert_eq!(store.load(Oid(2)).unwrap(), (b"b".to_vec(), tid));
+        assert_eq!(store.load(Oid(3)).unwrap(), (b"c".to_vec(), tid));
+        assert!(store.new_oid().unwrap() > Oid(3));
+    }
+
+    /// A blob stays with its oid when the pickle spills, and when a later
+    /// `store` of the oid spills a new pickle.
+    #[test]
+    fn a_spilled_record_keeps_its_blob() {
+        let (vfs, store) = spilling_store(0);
+        let (twice, once) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        for (oid, bytes) in [(twice, &b"twice"[..]), (once, b"once")] {
+            let mut file = store.new_blob_file().unwrap();
+            file.write_all(bytes).unwrap();
+            txn.store_blob(oid, Tid::ZERO, b"first", file).unwrap();
+        }
+        txn.store(twice, Tid::ZERO, b"second").unwrap();
+        assert!(spills(&vfs));
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        assert!(!spills(&vfs));
+        assert_eq!(store.load(twice).unwrap(), (b"second".to_vec(), tid));
+        assert_eq!(store.load(once).unwrap(), (b"first".to_vec(), tid));
+        for (oid, bytes) in [(twice, &b"twice"[..]), (once, b"once")] {
+            let mut read = Vec::new();
+            store
+                .open_blob(oid, tid)
+                .unwrap()
+                .read_to_end(&mut read)
+                .unwrap();
+            assert_eq!(read, bytes);
+        }
+    }
+
+    /// A conflict on a spilled record resolves as one in memory: `staged`
+    /// reads the pickle from the spill file, and the resolved pickle
+    /// replaces it.
+    #[test]
+    fn a_spilled_record_can_be_resolved() {
+        let (vfs, store) = spilling_store(0);
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let second = commit(&store, oid, first, b"b");
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"c").unwrap();
+        assert!(spills(&vfs));
+        let conflicts = txn.vote_resolving().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        let (serial, data) = txn.staged(oid).unwrap().unwrap();
+        assert!(matches!(data, Cow::Owned(_)));
+        assert_eq!((serial, &*data), (first, &b"c"[..]));
+
+        txn.store(oid, second, b"bc").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(oid).unwrap(), (b"bc".to_vec(), tid));
+        assert!(!spills(&vfs));
+    }
+
+    #[test]
+    fn dropping_a_transaction_removes_its_spill_file() {
+        let (vfs, store) = spilling_store(0);
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        assert!(spills(&vfs));
+        drop(txn);
+        assert!(!spills(&vfs));
+        assert!(store.locks.is_empty());
+    }
+
+    /// A transaction that holds the last share of its store still removes
+    /// its spill file when it drops.
+    #[test]
+    fn the_last_share_of_the_store_removes_the_spill_file() {
+        let (vfs, store) = spilling_store(0);
+        let store = Arc::new(store);
+        let mut txn = Txn::begin(Arc::clone(&store), b"", b"", b"");
+        drop(store);
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        assert!(spills(&vfs));
+        drop(txn);
+        assert!(!spills(&vfs));
+    }
+
+    /// A finish writes only the bytes that the transaction staged. A
+    /// spill file that changed fails the finish before the commit.
+    #[test]
+    fn a_damaged_spill_file_fails_the_finish() {
+        let (vfs, store) = spilling_store(0);
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abc").unwrap();
+        txn.vote().unwrap();
+        let name = &Vfs::list_files(&vfs, "staging").unwrap()[0];
+        vfs.file(&format!("staging/{name}")).write(1, b"x").unwrap();
+
+        let error = txn.finish();
+        assert!(matches!(error, Err(ZoeError::Io(_))), "{error:?}");
+        assert!(!spills(&vfs));
+        assert!(store.locks.is_empty());
+        assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
+        assert_eq!(store.last_transaction(), Tid::ZERO);
+
+        // The error came after the finish took the sequencer, so the store
+        // halts until it is reopened.
+        let mut next = store.tpc_begin(b"", b"", b"").unwrap();
+        next.store(Oid(2), Tid::ZERO, b"b").unwrap();
+        next.vote().unwrap();
+        assert!(matches!(next.finish(), Err(ZoeError::Halted)));
+    }
+
+    /// A spill file that changed while the caller resolves a conflict fails
+    /// `staged` with the error of the read, never with `None`. The
+    /// transaction keeps its locks until the caller aborts it.
+    #[test]
+    fn a_damaged_spill_file_fails_staged_during_resolution() {
+        let (vfs, store) = spilling_store(0);
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        commit(&store, oid, first, b"b");
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"c").unwrap();
+        assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+        let name = &Vfs::list_files(&vfs, "staging").unwrap()[0];
+        vfs.file(&format!("staging/{name}")).write(0, b"x").unwrap();
+
+        let error = txn.staged(oid).unwrap_err();
+        assert!(
+            matches!(&error, ZoeError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{error:?}"
+        );
+        assert!(!store.lock_table_is_empty());
+        txn.abort();
+        assert!(store.lock_table_is_empty());
+        assert!(!spills(&vfs));
+    }
+
+    /// Transactions on many threads spill at once, and some of them drop on
+    /// another thread. Each commit keeps its pickles, and no spill file
+    /// stays. Under ThreadSanitizer, this covers the spill paths.
+    #[test]
+    fn transactions_on_many_threads_spill_at_once() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 6;
+        const OIDS: usize = 3;
+        fn pickle(oid: Oid) -> Vec<u8> {
+            format!("pickle {}", oid.0).into_bytes()
+        }
+
+        // About one pickle of each transaction fits in memory.
+        let (vfs, store) = spilling_store(12);
+        let store = Arc::new(store);
+        let (sender, receiver) = std::sync::mpsc::channel::<Txn<Arc<Store>>>();
+        let dropper = thread::spawn(move || receiver.into_iter().for_each(drop));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (store, sender) = (Arc::clone(&store), sender.clone());
+                thread::spawn(move || {
+                    let mut committed = Vec::new();
+                    for round in 0..ROUNDS {
+                        let mut txn = Txn::begin(Arc::clone(&store), b"", b"", b"");
+                        let oids: Vec<Oid> = (0..OIDS).map(|_| store.new_oid().unwrap()).collect();
+                        for &oid in &oids {
+                            txn.store(oid, Tid::ZERO, &pickle(oid)).unwrap();
+                        }
+                        assert!(txn.staged_in_memory() <= 12);
+                        if round % 2 == 1 {
+                            sender.send(txn).unwrap();
+                            continue;
+                        }
+                        txn.vote().unwrap();
+                        let tid = txn.finish().unwrap();
+                        committed.extend(oids.into_iter().map(|oid| (oid, tid)));
+                    }
+                    committed
+                })
+            })
+            .collect();
+        drop(sender);
+        let committed: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        dropper.join().unwrap();
+
+        assert_eq!(committed.len(), THREADS * ROUNDS / 2 * OIDS);
+        for (oid, tid) in committed {
+            assert_eq!(store.load(oid).unwrap(), (pickle(oid), tid));
+        }
+        assert!(!spills(&vfs));
         assert!(store.lock_table_is_empty());
     }
 }

@@ -22,7 +22,8 @@ use crate::error::{Result, ZoeError};
 
 /// The directory of a store, as the core sees it.
 pub trait Vfs: Send + Sync + 'static {
-    /// An open file. redb stores its database in one.
+    /// An open file that the core reads and writes at any offset. redb
+    /// stores its database in one, and a transaction its spill file.
     type File: redb::StorageBackend;
 
     /// Tell if the file or directory `name` exists.
@@ -30,6 +31,11 @@ pub trait Vfs: Send + Sync + 'static {
 
     /// Open the file `name`. Create it empty when it does not exist.
     fn open(&self, name: &str) -> io::Result<Self::File>;
+
+    /// Create the new, empty file `name` and open it, as `open` does. Fail
+    /// when `name` exists. A symbolic link exists too, so the call never
+    /// opens the target of a link.
+    fn create_new(&self, name: &str) -> io::Result<Self::File>;
 
     /// Rename the file `from` to `to`, and replace `to` if it exists.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
@@ -66,6 +72,64 @@ pub trait Vfs: Send + Sync + 'static {
     /// Return the path of `name`. A simulated filesystem returns `name`
     /// as a relative path.
     fn path(&self, name: &str) -> PathBuf;
+}
+
+/// A shared directory. The clones share the directory and its lock. The
+/// lock goes when the last clone is dropped.
+impl<V: Vfs> Vfs for Arc<V> {
+    type File = V::File;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        (**self).exists(name)
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        (**self).open(name)
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        (**self).create_new(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        (**self).rename(from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        (**self).remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        (**self).sync_dir()
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        (**self).sync_dir_at(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        (**self).create_dir(name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        (**self).list_files(dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        (**self).create_file(name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        (**self).read_file(name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        (**self).set_read_only(name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        (**self).path(name)
+    }
 }
 
 /// A file that the core writes from its start to its end.
@@ -162,6 +226,17 @@ impl Vfs for OsVfs {
             .write(true)
             .create(true)
             .truncate(false)
+            .open(self.dir.join(name))?;
+        redb::backends::FileBackend::new(file).map_err(io::Error::other)
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        // `create_new` sets `O_EXCL`. With it, the creation fails on any
+        // entry of the name, a symbolic link included.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
             .open(self.dir.join(name))?;
         redb::backends::FileBackend::new(file).map_err(io::Error::other)
     }
@@ -632,7 +707,9 @@ impl MemVfs {
         Ok(names)
     }
 
-    fn create_file(&self, name: &str) -> io::Result<MemWriteFile> {
+    /// Create the new, empty file `name`. Fail when `name` exists or its
+    /// directory does not.
+    fn create_new(&self, name: &str) -> io::Result<MemFile> {
         let mut state = self.lock();
         state.alive()?;
         if state.files.contains_key(name) || state.has_dir(name) {
@@ -646,9 +723,17 @@ impl MemVfs {
         state.log.push(Op::Create {
             file: name.to_owned(),
         });
-        Ok(MemWriteFile {
+        Ok(MemFile {
             vfs: self.clone(),
             name: name.to_owned(),
+        })
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<MemWriteFile> {
+        let file = self.create_new(name)?;
+        Ok(MemWriteFile {
+            vfs: file.vfs,
+            name: file.name,
             offset: 0,
         })
     }
@@ -678,6 +763,10 @@ impl Vfs for MemVfs {
     fn open(&self, name: &str) -> io::Result<Self::File> {
         self.lock().alive()?;
         Ok(self.file(name))
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        MemVfs::create_new(self, name)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {

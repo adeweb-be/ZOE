@@ -239,7 +239,7 @@ Begin ──storea*──▶ Staged ──vote──▶ Locked ──tpc_finish�
    └── tpc_abort ────┴── tpc_abort ───┴── tpc_abort (locks released, staging dropped)
 ```
 
-- `Staged`: pickles sit in a per-transaction buffer (memory up to a threshold, spilled to a temp file beyond it, as byteserver does). Nothing is visible.
+- `Staged`: pickles sit in a per-transaction buffer: in memory up to `staging-memory` bytes (default 16 MiB), and beyond it in a spill file of the transaction under `staging/` in the store directory, as byteserver does. A spill file is never durable data: nothing syncs it, the transaction removes it at finish or abort, and a writer open removes the spill files that a crash left. Nothing is visible.
 - `Locked`: per-OID locks held for every written oid and every oid passed to `checkCurrentSerialInTransaction` (shared lock). Conflict detection and resolution happen here, so a failed vote releases locks before any disk write.
 - `Durable`: one backend write transaction holds the records, the txn row with status `committed`, and the meta update; it is fsynced before the client is acknowledged. A crash before the fsync leaves nothing; a crash after it leaves a complete transaction. No repair step exists because there is nothing half-written to find.
 - `Invalidated`: after acknowledgement, the oid list is pushed to every other client (server skin) or applied to the in-process invalidation queue.
@@ -353,6 +353,7 @@ ZODB 5 wraps any storage that does not implement `IMVCCStorage` in `ZODB.mvccada
     blob-dir  var/blobstorage      # optional; defaults to <path>/blobs
     backend  redb                   # redb | log | fdb
     lock-timeout  10s
+    staging-memory  16MB
     early-locks  on
   </zoe>
   mount-point /

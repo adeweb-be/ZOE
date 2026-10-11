@@ -438,29 +438,40 @@ impl Storage {
         let entry = self.entry(py, transaction)?;
         let conflicts = py
             .detach(|| {
-                entry.with(|txn| {
+                let read = entry.with(|txn| {
                     let conflicts = txn
                         .vote_resolving()
                         .map_err(|error| vote_failure(txn, error))?;
+                    // A staged pickle in the spill file of the transaction
+                    // is read from the file, and that read can fail.
                     Ok(conflicts
                         .into_iter()
                         .map(|(oid, committed)| {
                             let (read, data) = txn
-                                .staged(oid)
+                                .staged(oid)?
                                 .map_or((Tid::ZERO, Vec::new()), |(read, data)| {
                                     (read, data.to_vec())
                                 });
-                            (oid, committed, read, data)
+                            Ok((oid, committed, read, data))
                         })
-                        .collect::<Vec<_>>())
-                })
+                        .collect::<Result<Vec<_>, ZoeError>>())
+                })?;
+                if read.is_err() {
+                    // The vote keeps its locks for the resolution. The abort
+                    // releases them before the error leaves `tpc_vote`.
+                    if let Some(txn) = entry.take() {
+                        txn.abort();
+                    }
+                }
+                Ok(read)
             })
-            .map_err(|mut failure| {
+            .map_err(|mut failure: Failure| {
                 failure.data = failure
                     .data
                     .and_then(|data| untransformed(untransform, &data));
                 failure.into_py(py)
-            })?;
+            })?
+            .map_err(|error| unreadable_pickle(py, error))?;
         Ok(conflicts
             .into_iter()
             .map(|(oid, committed, read, data)| {
@@ -629,12 +640,33 @@ type HistoryRow<'py> = (
     u64,
 );
 
+/// Return the `StorageError` for a staged pickle that the core cannot read
+/// back from the spill file. The error of the core is its cause, so its
+/// kind and its message stay.
+fn unreadable_pickle(py: Python<'_>, error: ZoeError) -> PyErr {
+    let message = format!("a staged pickle cannot be read back: {error}");
+    let cause = Failure::from(error).into_py(py);
+    let raised = py
+        .import("ZODB.POSException")
+        .and_then(|module| module.getattr("StorageError"))
+        .and_then(|class| class.call1((message,)))
+        .map_or_else(|e| e, PyErr::from_value);
+    raised.set_cause(py, Some(cause));
+    raised
+}
+
 /// Return the failure of a vote of `txn` that ended with `error`. ZODB
 /// reads the class name of the object in conflict from the pickle that the
 /// transaction stored.
 fn vote_failure(txn: &SharedTxn, error: ZoeError) -> Failure {
     let data = match error {
-        ZoeError::Conflict { oid } => txn.staged(oid).map(|(_, data)| data.to_vec()),
+        // The pickle only gives the class name, so a failed read gives no
+        // data.
+        ZoeError::Conflict { oid } => txn
+            .staged(oid)
+            .ok()
+            .flatten()
+            .map(|(_, data)| data.to_vec()),
         _ => None,
     };
     Failure {
