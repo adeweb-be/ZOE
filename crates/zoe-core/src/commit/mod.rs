@@ -1759,7 +1759,7 @@ mod tests {
         });
         let logged: Vec<_> = events
             .iter()
-            .filter(|e| e.message().contains("lock-warn"))
+            .filter(|e| e.message().contains("lock-warn") && e.number("oid").is_some())
             .map(|e| (e.number("oid"), e.number("duration_ms")))
             .collect();
         // The waiter held `low` while it waited, and `high` only from the

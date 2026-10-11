@@ -15,6 +15,10 @@ use crate::lock::Held;
 use crate::store::Options;
 use crate::types::Oid;
 
+/// The most per-lock lines that one release logs. A summary line follows
+/// them.
+const LOCK_LINES: usize = 10;
+
 /// A size limit of a store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SizeLimit {
@@ -94,22 +98,39 @@ impl Guardrails {
         }
     }
 
-    /// Log each lock of `held` that was held longer than `lock-warn`, when
-    /// the locks are released at `now`. Call it after the release, so that
-    /// the log does not lengthen the hold.
+    /// Log the locks of `held` that were held longer than `lock-warn`,
+    /// when the locks are released at `now`. Call it after the release, so
+    /// that the log does not lengthen the hold.
+    ///
+    /// The first `LOCK_LINES` such locks, in oid order, get a line each.
+    /// Then one summary line gives the number of such locks and the
+    /// longest hold.
     pub(crate) fn locks_released(&self, held: &[Held], now: SystemTime) {
         let Some(warn) = self.lock_warn else {
             return;
         };
+        let (mut locks, mut longest) = (0_u64, Duration::ZERO);
         for lock in held {
             let duration = elapsed(lock.since, now);
-            if duration > warn {
+            if duration <= warn {
+                continue;
+            }
+            if locks < LOCK_LINES as u64 {
                 tracing::warn!(
                     oid = lock.oid.0,
                     duration_ms = millis(duration),
                     "lock held past lock-warn"
                 );
             }
+            locks += 1;
+            longest = longest.max(duration);
+        }
+        if locks > 0 {
+            tracing::warn!(
+                locks,
+                max_duration_ms = millis(longest),
+                "summary of the locks held past lock-warn"
+            );
         }
     }
 
@@ -323,13 +344,39 @@ mod tests {
             .collect();
         assert_eq!(
             logged,
-            [(Some(1), Some(1_500)), (Some(3), Some(1_001))],
+            [(Some(1), Some(1_500)), (Some(3), Some(1_001)), (None, None)],
             "{events:?}"
         );
+        let summary = &events[2];
+        assert_eq!(summary.number("locks"), Some(2));
+        assert_eq!(summary.number("max_duration_ms"), Some(1_500));
         for event in &events {
             assert_eq!(event.level, Level::WARN);
             assert!(event.message().contains("lock-warn"), "{event:?}");
         }
+    }
+
+    #[test]
+    fn one_release_logs_at_most_ten_lock_lines_and_a_summary() {
+        let warn = guardrails(Options {
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        // The locks of higher oids were taken later.
+        let held: Vec<Held> = (0..1_000)
+            .map(|n| Held {
+                oid: Oid(n),
+                since: at(n),
+            })
+            .collect();
+        let ((), events) = events_of(|| warn.locks_released(&held, at(1_995)));
+        let oids: Vec<_> = events.iter().filter_map(|e| e.number("oid")).collect();
+        assert_eq!(oids, (0..10).collect::<Vec<_>>());
+        assert_eq!(events.len(), 11, "{events:?}");
+        let summary = &events[10];
+        // Oids 0 to 994 were held longer than `lock-warn`.
+        assert_eq!(summary.number("locks"), Some(995));
+        assert_eq!(summary.number("max_duration_ms"), Some(1_995));
     }
 
     #[test]
