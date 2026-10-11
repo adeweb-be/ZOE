@@ -24,6 +24,15 @@ from ZODB.tests import StorageTestBase
 import zoe
 
 
+def _default_db(*args, **kw):
+    """Open a database on the default storage.
+
+    `ZODB.MappingStorage.DB` runs this code in its module, where `ZODB` is
+    the package of ZODB.
+    """
+    return ZODB.DB(None, *args, **kw)
+
+
 class StorageLayer:
     """A layer that makes a `zoe.Storage` the default storage of ZODB.
 
@@ -46,14 +55,13 @@ class StorageLayer:
         self._names = itertools.count()
 
     def tearDown(self):
-        # Close the stores that the tests left open. A second close does
-        # nothing.
+        # Abort the current transaction and remove the connections that the
+        # tests left open from the transaction manager. Then close the
+        # stores. A second close does nothing.
+        transaction.abort()
+        transaction.manager.clearSynchs()
         while self._storages:
             self._storages.pop().close()
-        # The connections that the tests left open use the closed stores.
-        # Remove them from the transaction manager, so that a later commit
-        # does not call them.
-        transaction.manager.clearSynchs()
         shutil.rmtree(self._directory, ignore_errors=True)
         self._directory = None
 
@@ -66,12 +74,11 @@ class StorageLayer:
                 storage = layer.open_storage()
             init(db, storage, *args, **kw)
 
-        def DB(*args, **kw):
-            return ZODB.DB(layer.open_storage(), *args, **kw)
-
         self._patch(ZODB.DB, "__init__", __init__)
-        self._patch(ZODB.MappingStorage, "DB", DB)
-        self._patch(ZODB.tests.util, "DB", DB)
+        # A module or a doctest can bind the function of ZODB, as
+        # `from ZODB.tests.util import DB` does. So the function itself
+        # gets the code of `_default_db`.
+        self._patch(ZODB.MappingStorage.DB, "__code__", _default_db.__code__)
 
     def testTearDown(self):
         # A test can leave a connection open, and a later test can commit
