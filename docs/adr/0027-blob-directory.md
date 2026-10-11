@@ -18,11 +18,16 @@ The first build made another `blob_dir` a symbolic link `<path>/blobs` to it, an
 
 **The store does not record its blob directory.** Each open must give the same one, as with FileStorage. A writer open refuses with `MissingBlobDir` a store that has blob records while its blob directory has no layout file. The first blob of a store makes the layout file durable before any blob record, so this blob directory is not the one of the store: the option is missing or wrong, or the directory is not mounted. Without the check, the writer would start a second blob directory, and its recovery would never see the intent files of the first one. `Backend::has_blobs` tells if the store has a blob record. A store without blob records takes any blob directory. zoe-py maps `MissingBlobDir` to `StorageError`.
 
+**The blob directory takes one open store.** A writer takes an exclusive `flock` on a descriptor of the blob directory itself, through `Vfs::lock_dir`: at its open when the directory exists, and in the first blob right after it creates the directory. It takes the lock before it reads or removes anything there, and keeps it until the store closes. Another open store that holds the lock fails the open, or the first blob, with `Locked`, and removes nothing. The lock adds no file to the directory, so the format does not change. A filesystem that cannot lock a directory, as some network filesystems, fails the open with its error: the store never runs without the lock.
+
+**A blob directory without a layout file is new or foreign.** The first blob writes `tmp/layout.tmp`, syncs it and `tmp/`, renames it to `.layout` and syncs the blob directory, before any temporary file or intent file exists. So a writer open runs the recovery only when the layout file exists. A blob directory without it may hold nothing, an empty `tmp/`, or a `tmp/` with only `layout.tmp`, which a stopped first blob leaves. Anything else is a directory of another program: the open and the first blob refuse it with `NotBlobDir`, and never remove its files or add a layout file to it.
+
 ## Alternatives
 
 - **The symbolic link.** It needs no core change, but a copy of the store directory shares the blob directory of the original, which loses data, and tools that walk the store directory see the link.
 - **The blob directory in `meta`.** The store would find its blob directory alone. But it is a data-model change, a red zone, and a copied store would still point at the blob directory of the original.
-- **A lock file in the blob directory.** It would stop two stores from sharing one blob directory. It changes the layout of the blob directory, so it is a format change, and it is not built.
+- **A lock file in the blob directory.** It would stop two open stores from sharing one blob directory, as the lock on the directory does. But it adds a file to the layout of the blob directory, which is a format change.
+- **A store identity in the blob directory.** It would also stop a store from using the blob directory of another store after that store closed. It is a format change, and it is not built.
 - **Only `<path>/blobs`.** The acceptance test and the configuration need another directory.
 
 ## Consequences
@@ -30,5 +35,7 @@ The first build made another `blob_dir` a symbolic link `<path>/blobs` to it, an
 - The blob files, their temporary directory, the intent files and every rename stay in the blob directory, on its device. A commit still renames each blob file.
 - A copy of a store directory with the default blob directory copies its blobs. A store with another blob directory needs a copy of that directory too, and the copy must open with its own copy, as with FileStorage.
 - A forgotten or wrong `blob_dir`, or a blob directory that is not mounted, fails the open of a store with blobs. It never deletes a blob file.
-- Nothing stops two stores that are given the same blob directory. The open of one runs the recovery with its own database, so it can remove the temporary files of the other and the blob files that an intent file of the other names. Each store needs its own blob directory.
+- Two open stores never share a blob directory: the second one gets `Locked`.
+- One sequential case remains. A store that crashed leaves an intent file in its blob directory. If another store opens later with that blob directory by mistake, a copy of the store directory with the same `blob_dir` for example, its recovery reads the intent file against its own database. It can remove a blob file that the crashed store committed. Only a store identity, written in the store and in the blob directory, would tell the two stores apart. That is a format change, left for later. Until then, each store needs its own blob directory, and a copy of a store needs a copy of its blob directory.
+- A directory of another program given as `blob_dir` keeps its files: the store refuses it.
 - ZODB's blob tests can remove their directories again.
