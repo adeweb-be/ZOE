@@ -81,6 +81,11 @@ impl BlobDir {
         })
     }
 
+    /// Return the layout of the directory.
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
     /// Return the path of the blob file of `oid` at `tid`.
     pub(crate) fn path(&self, oid: Oid, tid: Tid) -> PathBuf {
         let mut path = self.root.clone();

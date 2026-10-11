@@ -563,6 +563,14 @@ pub(crate) struct Records<'r> {
     end: u64,
 }
 
+impl Records<'_> {
+    /// Return the offset of the data record that the next call to `next`
+    /// reads.
+    pub(crate) fn offset(&self) -> u64 {
+        self.pos
+    }
+}
+
 impl Iterator for Records<'_> {
     type Item = Result<DataRecord, Error>;
 
