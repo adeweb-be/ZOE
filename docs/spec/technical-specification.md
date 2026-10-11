@@ -356,7 +356,8 @@ ZODB 5 wraps any storage that does not implement `IMVCCStorage` in `ZODB.mvccada
     backend  redb
     lock-timeout  10s
     staging-memory  16MB
-    early-locks  on
+    # on comes with early locks
+    early-locks  off
   </zoe>
   mount-point /
 </zodb_db>
