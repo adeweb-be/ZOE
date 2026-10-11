@@ -361,7 +361,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use redb::{ReadableTable, TableDefinition};
-    use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
     use crate::format;
@@ -692,7 +691,13 @@ mod tests {
     fn add_record(vfs: &MemVfs, oid: Oid, tid: Tid) {
         change_tables(vfs, |records, index| {
             let key = format::record_key(oid, tid);
-            let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, b"x");
+            let frame = format::encode_frame(
+                format::KeySpace::Records,
+                &key,
+                format::MAIN_BRANCH,
+                Tid::ZERO,
+                b"x",
+            );
             records.insert(&key, frame.as_slice()).unwrap();
             index.insert(&format::txn_oid_key(tid, oid), ()).unwrap();
         });
@@ -712,11 +717,7 @@ mod tests {
             let key = format::txn_key(tid);
             let mut frame = table.get(&key).unwrap().unwrap().value().to_vec();
             frame[1] = 1;
-            let mut hasher = Xxh3::new();
-            hasher.update(&key);
-            hasher.update(&frame[..24]);
-            hasher.update(&frame[format::HEADER_LEN..]);
-            frame[24..32].copy_from_slice(&hasher.digest().to_le_bytes());
+            format::seal(format::KeySpace::Txns, &key, &mut frame);
             table.insert(&key, frame.as_slice()).unwrap();
         }
         txn.commit().unwrap();

@@ -3,9 +3,9 @@
 //! `blob` gives the format of the blob store and of the blob records. This
 //! module is a red zone.
 //!
-//! Every record, every blob record, every transaction row and every
-//! sequence row is a frame: a 32-byte header, the typed-field slots, then
-//! the payload. The header fields are little-endian:
+//! Every record, every blob record, every transaction row, every sequence
+//! row and every intent file is a frame: a 32-byte header, the typed-field
+//! slots, then the payload. The header fields are little-endian:
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
@@ -21,12 +21,13 @@
 //! | 24 | 8 | checksum |
 //!
 //! The checksum is the xxh3-64 hash, with the default seed 0, of these
-//! bytes in this order: the key of the row, header bytes 0 to 23, the
-//! slots, then the payload. The key of a record and of a blob record is
-//! the 16 bytes of `record_key`. The key of a transaction row is the 8
-//! bytes of `txn_key`. The key of a sequence row is the UTF-8 bytes of the
-//! name of the sequence. So a frame that is read under another key fails
-//! the check.
+//! bytes in this order: the tag of the key space (1 byte), the key of the
+//! row, header bytes 0 to 23, the slots, then the payload. `KeySpace`
+//! gives the tags. The key of a record and of a blob record is the 16
+//! bytes of `record_key`. The key of a transaction row and of an intent
+//! file is the 8 bytes of `txn_key`. The key of a sequence row is the
+//! UTF-8 bytes of the name of the sequence. So a frame that is read under
+//! another key, or in another key space, fails the check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
 //! checksum covers the payload as stored, so a read verifies the stored
@@ -63,7 +64,37 @@ pub use codec::{Codec, Compression};
 pub(crate) use codec::EMPTY_ZSTD_PAYLOADS;
 
 /// The name and version of the format, in the `format` row of `meta`.
+/// An open refuses a store with another name.
 pub const FORMAT_NAME: &[u8] = b"ZOE format 1";
+
+/// The key space of a frame. Its tag is the first byte of the checksum
+/// input, so a frame verifies only in the key space that wrote it.
+///
+/// A tag never changes, and no key space takes the tag of another, also
+/// after one is removed. 0 is not a tag. The tag 6 is reserved for the
+/// key space `vectors` that the specification plans. A later frame kind
+/// takes the next free tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KeySpace {
+    /// The records, in `records`.
+    Records = 1,
+    /// The blob records, in `blobs`.
+    Blobs = 2,
+    /// The transaction rows, in `txns`.
+    Txns = 3,
+    /// The intent files, in `blobs/tmp/`.
+    Intents = 4,
+    /// The sequence rows, in `sequences`.
+    Sequences = 5,
+}
+
+impl KeySpace {
+    /// Return the tag of the key space.
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+}
 
 /// The version of the frame header that this code writes and reads.
 pub const FRAME_VERSION: u8 = 1;
@@ -123,15 +154,16 @@ pub struct Frame<'a> {
     pub data: Cow<'a, [u8]>,
 }
 
-/// Encode the frame of the row `key`, with the data as it is, no flags and
-/// no typed-field slots.
-pub fn encode_frame(key: &[u8], branch: u32, prev: Tid, data: &[u8]) -> Vec<u8> {
-    encode_frame_with(key, branch, prev, data, Compression::None)
+/// Encode the frame of the row `key` of `space`, with the data as it is,
+/// no flags and no typed-field slots.
+pub fn encode_frame(space: KeySpace, key: &[u8], branch: u32, prev: Tid, data: &[u8]) -> Vec<u8> {
+    encode_frame_with(space, key, branch, prev, data, Compression::None)
 }
 
-/// Encode the frame of the row `key`, with no flags and no typed-field
-/// slots. `compression` selects the codec of the payload.
+/// Encode the frame of the row `key` of `space`, with no flags and no
+/// typed-field slots. `compression` selects the codec of the payload.
 pub fn encode_frame_with(
+    space: KeySpace,
     key: &[u8],
     branch: u32,
     prev: Tid,
@@ -155,31 +187,52 @@ pub fn encode_frame_with(
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
-    let checksum = checksum(key, &frame[..24], &[], &payload);
+    let checksum = checksum(space, key, &frame[..24], &[], &payload);
     frame.extend_from_slice(&checksum.to_le_bytes());
     frame.extend_from_slice(&payload);
     frame
 }
 
-/// Encode the frame of the row `key` with the codec byte `codec` and
-/// `payload` as the stored payload. Tests use it to write frames that the
-/// encoder never writes.
+/// Encode the frame of the row `key` of `space` with the codec byte
+/// `codec` and `payload` as the stored payload. Tests use it to write
+/// frames that the encoder never writes.
 #[cfg(test)]
-pub(crate) fn encode_stored_frame(key: &[u8], codec: u8, payload: &[u8]) -> Vec<u8> {
-    let mut frame = encode_frame(key, MAIN_BRANCH, Tid::ZERO, payload);
+pub(crate) fn encode_stored_frame(
+    space: KeySpace,
+    key: &[u8],
+    codec: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = encode_frame(space, key, MAIN_BRANCH, Tid::ZERO, payload);
     frame[2] = codec;
-    let sum = checksum(key, &frame[..24], &[], payload);
-    frame[24..HEADER_LEN].copy_from_slice(&sum.to_le_bytes());
+    seal(space, key, &mut frame);
     frame
 }
 
-/// Read the frame of the row `key`, verify its checksum and decode its
-/// payload.
+/// Write the checksum of `frame`, the frame of the row `key` of `space`,
+/// into its header. Tests use it to change a header byte and keep the
+/// checksum valid.
+#[cfg(test)]
+pub(crate) fn seal(space: KeySpace, key: &[u8], frame: &mut [u8]) {
+    let slots_len = usize::from(u16::from_le_bytes(frame[20..22].try_into().unwrap()));
+    let (header, body) = frame.split_at(HEADER_LEN);
+    let (slots, payload) = body.split_at(slots_len);
+    let sum = checksum(space, key, &header[..24], slots, payload);
+    frame[24..HEADER_LEN].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// Read the frame of the row `key` of `space`, verify its checksum and
+/// decode its payload. A frame that another key space wrote fails the
+/// checksum.
 ///
 /// A frame with a flag, a codec that this code does not know or a non-zero
 /// reserved byte is refused. The typed-field slots are opaque, so slots
 /// of any length are accepted.
-pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameError> {
+pub fn decode_frame<'a>(
+    space: KeySpace,
+    key: &[u8],
+    bytes: &'a [u8],
+) -> Result<Frame<'a>, FrameError> {
     let header = bytes.get(..HEADER_LEN).ok_or(FrameError::Truncated)?;
     // This check comes before the checksum. A newer version and a damaged
     // version byte look the same here, so both are a corrupt frame.
@@ -194,7 +247,7 @@ pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameE
     }
     let (slots, payload) = body.split_at(slots_len);
     let stored = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    if checksum(key, &header[..24], slots, payload) != stored {
+    if checksum(space, key, &header[..24], slots, payload) != stored {
         return Err(FrameError::Checksum);
     }
     for offset in [1, 3, 22, 23] {
@@ -220,8 +273,11 @@ pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameE
     })
 }
 
-fn checksum(key: &[u8], header: &[u8], slots: &[u8], payload: &[u8]) -> u64 {
+/// Return the checksum of a frame: the xxh3-64 hash of the tag of
+/// `space`, `key`, `header`, `slots` and `payload`, in this order.
+fn checksum(space: KeySpace, key: &[u8], header: &[u8], slots: &[u8], payload: &[u8]) -> u64 {
     let mut hasher = Xxh3::new();
+    hasher.update(&[space.tag()]);
     hasher.update(key);
     hasher.update(header);
     hasher.update(slots);
@@ -358,9 +414,9 @@ mod tests {
 
     #[test]
     fn a_frame_round_trips() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         assert_eq!(frame.len(), HEADER_LEN + 6);
-        let read = decode_frame(&key(), &frame).unwrap();
+        let read = decode_frame(KeySpace::Records, &key(), &frame).unwrap();
         assert_eq!(read.prev, Tid(7));
         assert_eq!(read.branch, MAIN_BRANCH);
         assert_eq!(read.codec, Codec::None);
@@ -371,25 +427,28 @@ mod tests {
 
     #[test]
     fn every_flipped_bit_is_detected() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         for byte in 0..frame.len() {
             for bit in 0..8 {
                 let mut bad = frame.clone();
                 bad[byte] ^= 1 << bit;
-                assert!(decode_frame(&key(), &bad).is_err(), "byte {byte} bit {bit}");
+                assert!(
+                    decode_frame(KeySpace::Records, &key(), &bad).is_err(),
+                    "byte {byte} bit {bit}"
+                );
             }
         }
     }
 
     #[test]
     fn every_flipped_bit_of_the_key_is_detected() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         for byte in 0..key().len() {
             for bit in 0..8 {
                 let mut bad = key();
                 bad[byte] ^= 1 << bit;
                 assert_eq!(
-                    decode_frame(&bad, &frame),
+                    decode_frame(KeySpace::Records, &bad, &frame),
                     Err(FrameError::Checksum),
                     "byte {byte} bit {bit}"
                 );
@@ -399,10 +458,10 @@ mod tests {
 
     #[test]
     fn a_frame_under_another_oid_or_tid_is_refused() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         for (oid, tid) in [(Oid(2), Tid(9)), (Oid(1), Tid(10))] {
             assert_eq!(
-                decode_frame(&record_key(oid, tid), &frame),
+                decode_frame(KeySpace::Records, &record_key(oid, tid), &frame),
                 Err(FrameError::Checksum),
                 "{oid:?} {tid:?}"
             );
@@ -411,19 +470,64 @@ mod tests {
 
     #[test]
     fn a_transaction_row_frame_covers_its_tid() {
-        let frame = encode_frame(&txn_key(Tid(9)), MAIN_BRANCH, Tid::ZERO, b"row");
-        assert!(decode_frame(&txn_key(Tid(9)), &frame).is_ok());
+        let frame = encode_frame(
+            KeySpace::Txns,
+            &txn_key(Tid(9)),
+            MAIN_BRANCH,
+            Tid::ZERO,
+            b"row",
+        );
+        assert!(decode_frame(KeySpace::Txns, &txn_key(Tid(9)), &frame).is_ok());
         assert_eq!(
-            decode_frame(&txn_key(Tid(10)), &frame),
+            decode_frame(KeySpace::Txns, &txn_key(Tid(10)), &frame),
             Err(FrameError::Checksum)
         );
     }
 
+    /// Every key space of this build.
+    const SPACES: [KeySpace; 5] = [
+        KeySpace::Records,
+        KeySpace::Blobs,
+        KeySpace::Txns,
+        KeySpace::Intents,
+        KeySpace::Sequences,
+    ];
+
+    #[test]
+    fn the_tags_of_the_key_spaces_never_change() {
+        let tags = SPACES.map(KeySpace::tag);
+        assert_eq!(tags, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_frame_verifies_only_in_its_own_key_space() {
+        for written in SPACES {
+            for compression in [Compression::None, Compression::default()] {
+                let frame =
+                    encode_frame_with(written, &key(), MAIN_BRANCH, Tid(7), &pickle(), compression);
+                for read in SPACES {
+                    let decoded = decode_frame(read, &key(), &frame);
+                    if read == written {
+                        assert_eq!(&decoded.unwrap().data[..], &pickle()[..]);
+                    } else {
+                        assert_eq!(
+                            decoded,
+                            Err(FrameError::Checksum),
+                            "{written:?} read as {read:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Build a frame from the first 24 header bytes, the slots and the
     /// payload, with a valid checksum.
-    fn seal(header: &[u8], slots: &[u8], payload: &[u8]) -> Vec<u8> {
+    fn sealed(header: &[u8], slots: &[u8], payload: &[u8]) -> Vec<u8> {
         let mut frame = header[..24].to_vec();
-        frame.extend_from_slice(&checksum(&key(), &frame, slots, payload).to_le_bytes());
+        frame.extend_from_slice(
+            &checksum(KeySpace::Records, &key(), &frame, slots, payload).to_le_bytes(),
+        );
         frame.extend_from_slice(slots);
         frame.extend_from_slice(payload);
         frame
@@ -431,12 +535,12 @@ mod tests {
 
     #[test]
     fn a_frame_of_a_newer_format_is_refused() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         for (offset, value) in [(1, 1), (2, 2), (2, 0xff), (3, 1), (22, 1), (23, 1)] {
             let mut header = frame[..24].to_vec();
             header[offset] = value;
             assert_eq!(
-                decode_frame(&key(), &seal(&header, &[], b"pickle")),
+                decode_frame(KeySpace::Records, &key(), &sealed(&header, &[], b"pickle")),
                 Err(FrameError::Unsupported { offset, value }),
                 "offset {offset}"
             );
@@ -452,6 +556,7 @@ mod tests {
     /// The frame of `pickle()` under `key()`, compressed with zstd.
     fn compressed() -> Vec<u8> {
         let frame = encode_frame_with(
+            KeySpace::Records,
             &key(),
             MAIN_BRANCH,
             Tid(7),
@@ -465,7 +570,7 @@ mod tests {
     #[test]
     fn a_compressed_frame_round_trips() {
         let frame = compressed();
-        let read = decode_frame(&key(), &frame).unwrap();
+        let read = decode_frame(KeySpace::Records, &key(), &frame).unwrap();
         assert_eq!(read.codec, Codec::Zstd);
         assert_eq!(read.prev, Tid(7));
         assert_eq!(read.stored_len, frame.len() - HEADER_LEN);
@@ -480,7 +585,10 @@ mod tests {
         let payload_len = u32::from_le_bytes(frame[16..20].try_into().unwrap());
         assert_eq!(payload_len as usize, stored.len());
         let sum = u64::from_le_bytes(frame[24..32].try_into().unwrap());
-        assert_eq!(checksum(&key(), &frame[..24], &[], stored), sum);
+        assert_eq!(
+            checksum(KeySpace::Records, &key(), &frame[..24], &[], stored),
+            sum
+        );
     }
 
     #[test]
@@ -490,18 +598,21 @@ mod tests {
             for bit in 0..8 {
                 let mut bad = frame.clone();
                 bad[byte] ^= 1 << bit;
-                assert!(decode_frame(&key(), &bad).is_err(), "byte {byte} bit {bit}");
+                assert!(
+                    decode_frame(KeySpace::Records, &key(), &bad).is_err(),
+                    "byte {byte} bit {bit}"
+                );
             }
         }
     }
 
     #[test]
     fn a_zstd_payload_that_does_not_decode_is_refused() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         let mut header = frame[..24].to_vec();
         header[2] = CODEC_ZSTD;
         assert_eq!(
-            decode_frame(&key(), &seal(&header, &[], b"pickle")),
+            decode_frame(KeySpace::Records, &key(), &sealed(&header, &[], b"pickle")),
             Err(FrameError::Payload)
         );
     }
@@ -509,9 +620,9 @@ mod tests {
     #[test]
     fn a_zstd_frame_that_states_no_data_is_refused() {
         for payload in EMPTY_ZSTD_PAYLOADS {
-            let frame = encode_stored_frame(&key(), CODEC_ZSTD, payload);
+            let frame = encode_stored_frame(KeySpace::Records, &key(), CODEC_ZSTD, payload);
             assert_eq!(
-                decode_frame(&key(), &frame),
+                decode_frame(KeySpace::Records, &key(), &frame),
                 Err(FrameError::Payload),
                 "{payload:02x?}"
             );
@@ -520,31 +631,37 @@ mod tests {
 
     #[test]
     fn a_transaction_row_is_written_as_it_is() {
-        let frame = encode_frame(&txn_key(Tid(9)), MAIN_BRANCH, Tid::ZERO, &pickle());
+        let frame = encode_frame(
+            KeySpace::Txns,
+            &txn_key(Tid(9)),
+            MAIN_BRANCH,
+            Tid::ZERO,
+            &pickle(),
+        );
         assert_eq!(frame[2], CODEC_NONE);
         assert_eq!(frame.len(), HEADER_LEN + pickle().len());
     }
 
     #[test]
     fn typed_field_slots_of_any_length_are_read() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         let mut header = frame[..24].to_vec();
         header[20..22].copy_from_slice(&3u16.to_le_bytes());
-        let slotted = seal(&header, b"abc", b"pickle");
-        let read = decode_frame(&key(), &slotted).unwrap();
+        let slotted = sealed(&header, b"abc", b"pickle");
+        let read = decode_frame(KeySpace::Records, &key(), &slotted).unwrap();
         assert_eq!(read.slots, b"abc");
         assert_eq!(&read.data[..], b"pickle");
     }
 
     #[test]
     fn a_short_frame_is_truncated() {
-        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let frame = encode_frame(KeySpace::Records, &key(), MAIN_BRANCH, Tid(7), b"pickle");
         assert_eq!(
-            decode_frame(&key(), &frame[..10]),
+            decode_frame(KeySpace::Records, &key(), &frame[..10]),
             Err(FrameError::Truncated)
         );
         assert_eq!(
-            decode_frame(&key(), &frame[..frame.len() - 1]),
+            decode_frame(KeySpace::Records, &key(), &frame[..frame.len() - 1]),
             Err(FrameError::Truncated)
         );
     }
@@ -588,20 +705,35 @@ mod tests {
     #[test]
     fn a_sequence_row_is_a_frame_of_codec_0_with_the_end_in_8_bytes() {
         let key = "intids".as_bytes();
-        let frame = encode_frame(key, MAIN_BRANCH, Tid::ZERO, &encode_sequence(0x0102));
+        let frame = encode_frame(
+            KeySpace::Sequences,
+            key,
+            MAIN_BRANCH,
+            Tid::ZERO,
+            &encode_sequence(0x0102),
+        );
         assert_eq!(frame.len(), HEADER_LEN + SEQUENCE_LEN);
         assert_eq!(frame[2], CODEC_NONE);
         assert_eq!(&frame[16..20], &8u32.to_le_bytes());
         assert_eq!(&frame[HEADER_LEN..], &[0x02, 0x01, 0, 0, 0, 0, 0, 0]);
-        let read = decode_frame(key, &frame).unwrap();
+        let read = decode_frame(KeySpace::Sequences, key, &frame).unwrap();
         assert_eq!(read.prev, Tid::ZERO);
         assert_eq!(decode_sequence(&read.data), Ok(0x0102));
     }
 
     #[test]
     fn a_sequence_row_under_another_name_is_refused() {
-        let frame = encode_frame(b"intids", MAIN_BRANCH, Tid::ZERO, &encode_sequence(101));
-        assert_eq!(decode_frame(b"lexicon", &frame), Err(FrameError::Checksum));
+        let frame = encode_frame(
+            KeySpace::Sequences,
+            b"intids",
+            MAIN_BRANCH,
+            Tid::ZERO,
+            &encode_sequence(101),
+        );
+        assert_eq!(
+            decode_frame(KeySpace::Sequences, b"lexicon", &frame),
+            Err(FrameError::Checksum)
+        );
     }
 
     #[test]

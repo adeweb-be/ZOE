@@ -1124,10 +1124,15 @@ fn flips_in_stored_frames_and_blob_files_are_errors_and_hide_nothing() {
     );
 }
 
-/// Seal `frame` again: write the checksum of its bytes under `key`. The
-/// frame has no typed-field slots.
+/// The tag of the key space `records`, the first byte of the checksum
+/// input of a record.
+const RECORDS_TAG: u8 = 1;
+
+/// Seal `frame` again: write the checksum of its bytes as a record under
+/// `key`. The frame has no typed-field slots.
 fn seal(key: &[u8], frame: &mut [u8]) {
     let mut hasher = Xxh3::new();
+    hasher.update(&[RECORDS_TAG]);
     hasher.update(key);
     hasher.update(&frame[..24]);
     hasher.update(&frame[32..]);

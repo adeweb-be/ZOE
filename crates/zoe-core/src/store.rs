@@ -1049,7 +1049,12 @@ mod tests {
                 .unwrap();
             let txn = db.begin_write().unwrap();
             let key = format::record_key(oid, tid);
-            let frame = format::encode_stored_frame(&key, format::CODEC_ZSTD, payload);
+            let frame = format::encode_stored_frame(
+                format::KeySpace::Records,
+                &key,
+                format::CODEC_ZSTD,
+                payload,
+            );
             txn.open_table(records)
                 .unwrap()
                 .insert(&key, frame.as_slice())
