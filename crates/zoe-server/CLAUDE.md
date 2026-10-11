@@ -34,7 +34,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - stdout carries only the lines `admin <address>` and `listening <address>`. The logs go to stderr.
 - SIGTERM closes the store and exits with 0. `Server::stop` and the drop of a `Server` close it too: they drop the runtime, which waits for the session threads, and then the store.
 - An unmodified `ZEO.ClientStorage` works. A stock client never sees an extension that it did not declare in `register`.
-- Requests on one connection run concurrently. Every reply carries the message id of its request.
+- Every reply carries the message id of its request. Concurrent requests on one connection are not served yet: each connection runs its calls in order.
 - The invalidation queue of a slow client is bounded (default 1,000 messages). On overflow the server closes that connection.
 - `getInvalidations(tid)` returns `None` when the gap is longer than `invalidation-queue-size`.
 - Commits on different named storages never wait for each other.
