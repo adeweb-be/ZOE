@@ -25,11 +25,15 @@
 //!   value that it stands for becomes `{"$cycle": <memo index>}`. A get
 //!   whose value is in an opaque node becomes `{"$memo": <memo index>}`.
 //!
-//! The references are the persistent references of the state, strong
-//! ones only, as ZODB's `referencesf` gives them. Each has a JSON pointer
-//! to its place in the state. A get never adds a reference: the place of
-//! the value that it stands for has it already. The references in an
-//! opaque node are not known.
+//! The references are the persistent references of the record, strong
+//! ones only, as ZODB's `referencesf` gives them. `zoe_pickle::persistent_ids`
+//! gives the list, so it also holds the references inside opaque nodes.
+//! The converter gives the pointers: each reference that the state shows
+//! has a JSON pointer to its place in the state. A get never adds a
+//! reference: the place of the value that it stands for has it already.
+//! A reference inside an opaque node points to that node. When the
+//! converter cannot tell which node holds it, it points to a value that
+//! holds all the nodes that can, at most the root, `""`.
 //!
 //! The JSON has limits, so that a large, deep or crafted record cannot
 //! exhaust the stack, the memory or the time of the call:
@@ -57,7 +61,7 @@
 //!   cycle marker for a value outside it is not reused, because the
 //!   marker is wrong in another place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Map, Number, Value, json};
 use zoe_core::Oid;
@@ -98,18 +102,113 @@ const CACHE_BUDGET: usize = 1 << 18;
 /// The largest int that a JSON number holds without a loss in the window.
 const MAX_SAFE_INT: i128 = (1 << 53) - 1;
 
-/// Return the state of `tree` as JSON, and its outbound references.
-pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
+/// Return the state of `tree` as JSON, and the references that the state
+/// shows.
+pub(crate) fn state(tree: &Tree) -> (Value, Found) {
     convert(&tree.resolver(), tree.state())
 }
 
-/// Return the state `root` of a tree as JSON, and its outbound references.
-/// `resolver` is the resolver of the tree.
-pub(crate) fn convert<'t>(resolver: &Resolver<'t>, root: &'t Node) -> (Value, Vec<Reference>) {
+/// Return the state `root` of a tree as JSON, and the references that the
+/// state shows. `resolver` is the resolver of the tree.
+pub(crate) fn convert<'t>(resolver: &Resolver<'t>, root: &'t Node) -> (Value, Found) {
     let mut converter = Converter::new(resolver);
     let mut at = String::new();
     let state = converter.value(root, &mut at, 0);
-    (state, converter.references)
+    let found = Found {
+        references: converter.references,
+        opaque: converter.opaque,
+    };
+    (state, found)
+}
+
+/// What the converter finds out about the references of a state.
+#[derive(Debug)]
+pub(crate) struct Found {
+    /// The strong references that the state shows, with their pointers,
+    /// in pickle order.
+    pub(crate) references: Vec<Reference>,
+    /// The opaque nodes that can hold a reference, in pickle order.
+    opaque: Vec<Place>,
+}
+
+/// The place of an opaque node that can hold a reference.
+#[derive(Debug)]
+struct Place {
+    /// The pointer of the node, or of a value that holds it.
+    at: String,
+    /// The count of the references that the state shows before the node.
+    after: usize,
+}
+
+impl Found {
+    /// Return one reference for each oid of `oids`, in their order.
+    /// `oids` are the strong references of the record, in pickle order,
+    /// as `zoe_pickle::persistent_ids` gives them.
+    ///
+    /// A reference that the state shows keeps its pointer. Each other
+    /// reference is inside an opaque node. It points to the opaque nodes
+    /// between the reference before it and the reference after it: to the
+    /// node when there is one, else to a value that holds them all, at
+    /// most the root.
+    pub(crate) fn place(self, oids: &[Oid]) -> Vec<Reference> {
+        // The references that the state shows, by oid, in order.
+        let mut shown: HashMap<Oid, VecDeque<usize>> = HashMap::new();
+        for (index, reference) in self.references.iter().enumerate() {
+            shown.entry(reference.oid).or_default().push_back(index);
+        }
+        let mut holders: HashMap<usize, String> = HashMap::new();
+        let mut after = 0;
+        let mut placed = Vec::with_capacity(oids.len());
+        for &oid in oids {
+            if let Some(index) = shown.get_mut(&oid).and_then(VecDeque::pop_front) {
+                after = index + 1;
+                placed.push(self.references[index].clone());
+                continue;
+            }
+            let at = holders.entry(after).or_insert_with(|| {
+                let start = self.opaque.partition_point(|place| place.after < after);
+                let end = self.opaque.partition_point(|place| place.after <= after);
+                holder(
+                    self.opaque[start..end]
+                        .iter()
+                        .map(|place| place.at.as_str()),
+                )
+            });
+            placed.push(Reference {
+                oid,
+                at: at.clone(),
+            });
+        }
+        placed
+    }
+}
+
+/// Return the pointer of the deepest value that holds the values of all
+/// the pointers of `pointers`. Return the root, `""`, when there is none.
+fn holder<'a>(pointers: impl Iterator<Item = &'a str>) -> String {
+    let mut common: Option<Vec<&str>> = None;
+    for pointer in pointers {
+        let segments = pointer.split('/');
+        common = Some(match common {
+            None => segments.collect(),
+            Some(common) => common
+                .into_iter()
+                .zip(segments)
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect(),
+        });
+    }
+    common
+        .map(|segments| segments.join("/"))
+        .unwrap_or_default()
+}
+
+/// Tell if the bytes of an opaque node can hold a persistent id: they hold
+/// the byte of BINPERSID or of PERSID. The byte can also be part of an
+/// argument, so the test can say yes for a node without one.
+fn can_hold_reference(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&byte| byte == b'Q' || byte == b'P')
 }
 
 /// What a persistent id leads to.
@@ -273,6 +372,8 @@ struct Converter<'r, 't> {
     /// start of the innermost expansion. `usize::MAX` for none.
     lowest_cycle: usize,
     references: Vec<Reference>,
+    /// The opaque nodes that can hold a reference.
+    opaque: Vec<Place>,
 }
 
 impl<'r, 't> Converter<'r, 't> {
@@ -288,6 +389,7 @@ impl<'r, 't> Converter<'r, 't> {
             cached: 0,
             lowest_cycle: usize::MAX,
             references: Vec::new(),
+            opaque: Vec::new(),
         }
     }
 
@@ -419,6 +521,7 @@ impl<'r, 't> Converter<'r, 't> {
                 Some(value) => self.expand(value, get.index, at, depth + 1),
             },
             Node::Opaque(opaque) => {
+                self.opaque_place(&opaque.bytes, at);
                 let length = opaque.bytes.len();
                 // Each byte takes two hex digits.
                 let shown = length.min(self.allowance() / 2);
@@ -648,23 +751,38 @@ impl<'r, 't> Converter<'r, 't> {
     }
 
     /// Return the placeholder of a value that the state leaves out. Keep
-    /// the references below it, with the pointer of the placeholder.
+    /// the references below it and the opaque nodes that can hold one,
+    /// with the pointer of the placeholder.
     fn elided(&mut self, node: &'t Node, at: &str, why: &str) -> Value {
         if self.gets == 0 {
-            for pid in node.walk().filter_map(|node| match node {
-                Node::Persistent(pid) => Some(pid),
-                _ => None,
-            }) {
-                if let Some(target) = target(self.resolver, pid).filter(|t| !t.weak) {
-                    let at = self.pointer(at);
-                    self.references.push(Reference {
-                        oid: target.oid,
-                        at,
-                    });
+            for node in node.walk() {
+                match node {
+                    Node::Persistent(pid) => {
+                        if let Some(target) = target(self.resolver, pid).filter(|t| !t.weak) {
+                            let at = self.pointer(at);
+                            self.references.push(Reference {
+                                oid: target.oid,
+                                at,
+                            });
+                        }
+                    }
+                    Node::Opaque(opaque) => self.opaque_place(&opaque.bytes, at),
+                    _ => {}
                 }
             }
         }
         json!({ "$elided": why })
+    }
+
+    /// Keep the place `at` of an opaque node with the bytes `bytes`, when
+    /// the node can hold a reference. A get adds no place: the place of
+    /// the value that it stands for has it already.
+    fn opaque_place(&mut self, bytes: &[u8], at: &str) {
+        if self.gets == 0 && can_hold_reference(bytes) {
+            let at = self.pointer(at);
+            let after = self.references.len();
+            self.opaque.push(Place { at, after });
+        }
     }
 }
 
@@ -675,8 +793,19 @@ mod tests {
     /// Decode a record whose class pickle is GLOBAL m C, BINPUT 0, and
     /// return its state as JSON and its references.
     fn decode(state: &[u8]) -> (Value, Vec<Reference>) {
-        let record = [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat();
-        super::state(&zoe_pickle::decode_record(&record).unwrap())
+        let (state, found) = decode_found(state);
+        (state, found.references)
+    }
+
+    /// Like `decode`, with all that the converter finds out.
+    fn decode_found(state: &[u8]) -> (Value, Found) {
+        super::state(&zoe_pickle::decode_record(&record(state)).unwrap())
+    }
+
+    /// A record whose class pickle is GLOBAL m C, BINPUT 0, with the state
+    /// pickle `state` without its STOP.
+    fn record(state: &[u8]) -> Vec<u8> {
+        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
     }
 
     /// The pickle of a persistent reference to `oid` with class m.C.
@@ -1019,5 +1148,79 @@ mod tests {
         let gets = state[1].as_array().unwrap();
         assert_eq!(gets.len(), 1 << 10);
         assert_eq!(gets.last().unwrap(), &json!({"$elided": "too many values"}));
+    }
+
+    /// The pickle of a plain object of the class m.Plain, as NEWOBJ and
+    /// BUILD write it, whose attribute `x` holds the pickle `value`.
+    fn plain(value: &[u8]) -> Vec<u8> {
+        [&b"cm\nPlain\n)\x81}X\x01\x00\x00\x00x"[..], value, b"sb"].concat()
+    }
+
+    /// The oids of the strong references of a record, as Loupe reads them.
+    fn oids(record: &[u8]) -> Vec<Oid> {
+        crate::strong_references(record).unwrap()
+    }
+
+    #[test]
+    fn a_reference_inside_an_opaque_node_points_to_the_node() {
+        // A plain object holds the persistent object 6. Pickle keeps the
+        // object as an opaque node, so the state does not show 6.
+        let state = [
+            &b"}(X\x01\x00\x00\x00a"[..],
+            &reference(5),
+            b"X\x01\x00\x00\x00b",
+            &plain(&reference(6)),
+            b"X\x01\x00\x00\x00c",
+            &reference(7),
+            b"u",
+        ]
+        .concat();
+        let (json, found) = decode_found(&state);
+        assert_eq!(json["b"]["$opaque"], json!("NEWOBJ"), "{json}");
+        assert_eq!(references(&found.references), [(5, "/a"), (7, "/c")]);
+        let oids = oids(&record(&state));
+        assert_eq!(oids, [Oid(5), Oid(6), Oid(7)]);
+        let placed = found.place(&oids);
+        assert_eq!(references(&placed), [(5, "/a"), (6, "/b"), (7, "/c")]);
+    }
+
+    #[test]
+    fn a_reference_in_one_of_several_opaque_nodes_points_to_a_holder() {
+        // Two plain objects, side by side in a list, each hold a reference.
+        // No reference that the state shows lies between them, so each
+        // reference points to the list that holds both.
+        let state = [
+            &b"}X\x01\x00\x00\x00l](X\x01\x00\x00\x00a"[..],
+            &plain(&reference(6)),
+            &plain(&reference(7)),
+            b"es",
+        ]
+        .concat();
+        let (json, found) = decode_found(&state);
+        assert!(json["l"].is_array(), "{json}");
+        let placed = found.place(&oids(&record(&state)));
+        assert_eq!(references(&placed), [(6, "/l"), (7, "/l")]);
+    }
+
+    #[test]
+    fn the_holder_of_pointers_is_their_common_value() {
+        let holder = |pointers: &[&str]| holder(pointers.iter().copied());
+        assert_eq!(holder(&["/a/b"]), "/a/b");
+        assert_eq!(holder(&["/a/b", "/a/c/0"]), "/a");
+        assert_eq!(holder(&["/ab", "/ac"]), "");
+        assert_eq!(holder(&["/a", ""]), "");
+        assert_eq!(holder(&[]), "");
+    }
+
+    #[test]
+    fn weak_references_and_other_databases_are_not_references() {
+        // A weak reference and a reference to another database, inside
+        // and outside an opaque node.
+        let weak = b"(X\x01\x00\x00\x00w(C\x08\0\0\0\0\0\0\0\x05tlQ".to_vec();
+        let other = b"(X\x01\x00\x00\x00n(X\x02\x00\x00\x00dbC\x08\0\0\0\0\0\0\0\x06tlQ".to_vec();
+        let state = [&b"("[..], &weak, &other, &plain(&weak), &reference(7), b"t"].concat();
+        let (_, found) = decode_found(&state);
+        let placed = found.place(&oids(&record(&state)));
+        assert_eq!(references(&placed), [(7, "/3")]);
     }
 }

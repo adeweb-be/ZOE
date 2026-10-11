@@ -101,9 +101,12 @@ pub struct Object {
     /// The decoded state. The crate documentation of `state` gives the
     /// form of each value. It is null when the record does not decode.
     pub state: serde_json::Value,
-    /// The outbound references, in the order of the state.
+    /// The strong outbound references, in pickle order, as ZODB's
+    /// `referencesf` gives them. The references inside opaque nodes are in
+    /// the list too. It is empty when `error` is set.
     pub references: Vec<Reference>,
-    /// The refusal of the decoder, when the record does not decode.
+    /// The refusal of the decoder, when the record does not decode, or when
+    /// its references do not decode. Then the references are not known.
     pub error: Option<String>,
 }
 
@@ -113,7 +116,9 @@ pub struct Reference {
     /// The oid that the reference leads to.
     #[serde(serialize_with = "serialize_oid")]
     pub oid: Oid,
-    /// A JSON pointer to the reference in the state of the object.
+    /// A JSON pointer to the reference in the state of the object. A
+    /// reference inside an opaque node points to that node, or to a value
+    /// that holds it.
     pub at: String,
 }
 
@@ -271,8 +276,9 @@ impl Snapshot<'_> {
     /// Return the object `oid`.
     ///
     /// A record that zoe-pickle refuses gives an object with the refusal
-    /// in `error`. An oid without a record at or before the tid of the
-    /// view is an error.
+    /// in `error`. So does a record whose references `persistent_ids`
+    /// refuses, with its state. An oid without a record at or before the
+    /// tid of the view is an error.
     pub fn object(&self, oid: Oid) -> Result<Object> {
         let (data, serial) = self.load(oid)?;
         let size = data.len() as u64;
@@ -281,7 +287,13 @@ impl Snapshot<'_> {
                 let class = tree
                     .class_name()
                     .map(|(module, name)| format!("{module}.{name}"));
-                let (state, references) = state::state(&tree);
+                let (state, found) = state::state(&tree);
+                // The tree holds at most the default node budget, so the
+                // decode of `persistent_ids` also stays inside it.
+                let (references, error) = match strong_references(&data) {
+                    Ok(oids) => (found.place(&oids), None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
                 Object {
                     oid,
                     serial,
@@ -289,7 +301,7 @@ impl Snapshot<'_> {
                     size,
                     state,
                     references,
-                    error: None,
+                    error,
                 }
             }
             Err(e) => Object {
@@ -345,6 +357,28 @@ impl Snapshot<'_> {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Return the oids of the strong persistent references of `record`, in
+/// pickle order, as pack reads them. Weak references, references to
+/// another database and the other lists that ZODB's `referencesf` skips
+/// are not in the list. An oid that is not 8 bytes is an error, as it is
+/// for pack.
+fn strong_references(record: &[u8]) -> std::result::Result<Vec<Oid>, String> {
+    let ids = zoe_pickle::persistent_ids(record)
+        .map_err(|e| format!("the references do not decode: {e}"))?;
+    ids.into_iter()
+        .filter_map(|id| match id {
+            zoe_pickle::PersistentId::Oid(bytes) => Some(bytes),
+            _ => None,
+        })
+        .map(|bytes| {
+            let bytes: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| "the references do not decode: an oid is not 8 bytes".to_owned())?;
+            Ok(Oid(u64::from_be_bytes(bytes)))
+        })
+        .collect()
 }
 
 /// Return the user or the description of a transaction as text, with at
@@ -565,6 +599,86 @@ mod tests {
             folder.diff(Oid(2), Tid(0x10), Tid(0x20)),
             Err(Error::Store(ZoeError::NotFound { .. }))
         ));
+    }
+
+    /// A store with one transaction that writes `records`, by oid.
+    fn store_with(name: &str, records: &[(u64, Vec<u8>)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zoe-loupe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin_restore(Tid(0x10), b"", b"", b"").unwrap();
+        for (oid, data) in records {
+            txn.restore(Oid(*oid), Some(data)).unwrap();
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        dir
+    }
+
+    /// A record of the class `m.C` with the state pickle `state`.
+    fn record(state: &[u8]) -> Vec<u8> {
+        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
+    }
+
+    /// A persistent reference to `oid` with the class `m.C`.
+    fn reference(oid: u8) -> Vec<u8> {
+        [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"h\x00\x86Q"].concat()
+    }
+
+    #[test]
+    fn the_references_inside_a_plain_object_are_references() {
+        // The root holds 1, a plain object that holds 2, and 3. ZODB's
+        // `referencesf` gives 1, 2 and 3, and pack keeps 2.
+        let plain = [
+            &b"cm\nPlain\n)\x81}X\x01\x00\x00\x00x"[..],
+            &reference(2),
+            b"sb",
+        ]
+        .concat();
+        let root = record(
+            &[
+                &b"}(X\x01\x00\x00\x00a"[..],
+                &reference(1),
+                b"X\x01\x00\x00\x00b",
+                &plain,
+                b"X\x01\x00\x00\x00c",
+                &reference(3),
+                b"u",
+            ]
+            .concat(),
+        );
+        let empty = record(b"}");
+        let records = [
+            (0, root),
+            (1, empty.clone()),
+            (2, empty.clone()),
+            (3, empty),
+        ];
+        let folder = Folder::open(store_with("plain", &records)).unwrap();
+        let root = folder.root().unwrap();
+        assert_eq!(root.error, None);
+        let found: Vec<(u64, &str)> = root
+            .references
+            .iter()
+            .map(|r| (r.oid.0, r.at.as_str()))
+            .collect();
+        assert_eq!(found, [(1, "/a"), (2, "/b"), (3, "/c")]);
+        assert!(root.state.pointer("/b/$opaque").is_some(), "{root:?}");
+    }
+
+    #[test]
+    fn references_that_do_not_decode_are_an_error_beside_the_state() {
+        // A persistent id that is an int, and an oid of 3 bytes. The state
+        // decodes. `referencesf` and pack refuse both records.
+        let records = [(0, record(b"K\x05Q")), (1, record(b"C\x03abcQ"))];
+        let folder = Folder::open(store_with("bad-references", &records)).unwrap();
+        for oid in [Oid(0), Oid(1)] {
+            let object = folder.object(oid).unwrap();
+            assert!(object.state.is_object(), "{object:?}");
+            assert!(object.references.is_empty(), "{object:?}");
+            let error = object.error.unwrap_or_default();
+            assert!(error.starts_with("the references do not decode"), "{error}");
+        }
     }
 
     #[test]

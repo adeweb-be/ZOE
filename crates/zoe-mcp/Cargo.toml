@@ -14,11 +14,11 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+zoe-core.workspace = true
 zoe-loupe.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "rt"] }
-zoe-core.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt", "time"] }
 
 [lints]
 workspace = true

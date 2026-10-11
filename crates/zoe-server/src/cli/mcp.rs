@@ -4,7 +4,8 @@
 //! The command opens the store for reads only, with the lock of the store.
 //! It runs as the ops principal of the local operator, and offers no tool
 //! that writes. stdout carries only MCP messages, so the command writes no
-//! report. It ends with 0 when the client closes stdin.
+//! report. It ends with 0 when the client closes stdin, also before the
+//! `initialize` request.
 //!
 //! The console script of the wheel has no MCP server: its extension never
 //! links tokio or rmcp. There, the command fails with 1 and names the `zoe`

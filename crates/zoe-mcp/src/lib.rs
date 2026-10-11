@@ -19,7 +19,9 @@ mod ops;
 
 use std::path::{Path, PathBuf};
 
-use rmcp::ServiceExt;
+use rmcp::service::ServerInitializeError;
+use rmcp::transport::IntoTransport;
+use rmcp::{RoleServer, ServiceExt};
 use zoe_loupe::Folder;
 
 /// An error of the server.
@@ -52,7 +54,7 @@ fn open_failure(path: &Path, error: &zoe_loupe::Error) -> String {
 
 /// Open the store in the folder `path` for reads only, and serve the
 /// read-only ops tools over MCP on stdin and stdout. Return when the
-/// client closes stdin.
+/// client closes stdin, also before the `initialize` request.
 ///
 /// The server holds the lock of the store while it runs. So a running
 /// instance and the server never share a store. The server writes only
@@ -62,23 +64,34 @@ pub fn serve_stdio(path: &Path) -> Result<(), Error> {
         path: path.to_owned(),
         source,
     })?;
-    let session = |error: &dyn std::fmt::Display| Error::Session(error.to_string());
     // One thread runs the session. The tools run on the blocking pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| session(&e))?;
-    let result = runtime.block_on(async {
-        let service = ops::Ops::new(folder)
-            .serve(rmcp::transport::stdio())
-            .await
-            .map_err(|e| session(&e))?;
-        service.waiting().await.map_err(|e| session(&e))?;
-        Ok(())
-    });
+        .map_err(|e| Error::Session(e.to_string()))?;
+    let result = runtime.block_on(serve(folder, rmcp::transport::stdio()));
     // The read of stdin cannot stop. Do not wait for it.
     runtime.shutdown_background();
     result
+}
+
+/// Serve the read-only ops tools of `folder` on `transport`. Return when
+/// the client closes the transport, also before the `initialize` request.
+async fn serve<T, E, A>(folder: Folder, transport: T) -> Result<(), Error>
+where
+    T: IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let session = |error: &dyn std::fmt::Display| Error::Session(error.to_string());
+    let service = match ops::Ops::new(folder).serve(transport).await {
+        Ok(service) => service,
+        // The client closed the transport before `initialize`. Nothing
+        // failed.
+        Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+        Err(e) => return Err(session(&e)),
+    };
+    service.waiting().await.map_err(|e| session(&e))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,5 +116,50 @@ mod tests {
         let message = error.unwrap().to_string();
         let folder = missing.display().to_string();
         assert_eq!(message.matches(&folder).count(), 1, "{message}");
+    }
+
+    /// A store with an empty root, in a new folder.
+    fn folder(name: &str) -> Folder {
+        let dir = std::env::temp_dir().join(format!("zoe-mcp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = zoe_core::Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let root = b"\x80\x03cm\nC\n.\x80\x03}.";
+        txn.store(zoe_core::Oid(0), zoe_core::Tid(0), root).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        drop(store);
+        Folder::open(&dir).unwrap()
+    }
+
+    /// Serve `folder` to a client that writes `input` and then closes its
+    /// end. Return the result of the session.
+    fn session(folder: Folder, input: &'static [u8]) -> Result<(), Error> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                use tokio::io::AsyncWriteExt;
+                let (mut client, server) = tokio::io::duplex(1 << 16);
+                let session = tokio::spawn(serve(folder, server));
+                client.write_all(input).await.unwrap();
+                drop(client);
+                session.await.unwrap()
+            })
+    }
+
+    #[test]
+    fn a_client_that_leaves_before_initialize_ends_the_session_cleanly() {
+        assert!(session(folder("eof"), b"").is_ok());
+        // rmcp skips a line that is not JSON.
+        assert!(session(folder("not-json"), b"not json\n").is_ok());
+    }
+
+    #[test]
+    fn a_first_message_that_is_not_initialize_fails_the_session() {
+        let line = b"{\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"}\n";
+        let error = session(folder("no-initialize"), line).err();
+        assert!(matches!(error, Some(Error::Session(_))), "{error:?}");
     }
 }

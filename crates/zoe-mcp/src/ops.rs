@@ -20,6 +20,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zoe_core::ZoeError;
 use zoe_loupe::{Folder, oid_repr, parse_oid, parse_tid, tid_repr};
 
 /// An error of a tool. The client gets it as a result with `isError`.
@@ -27,15 +28,16 @@ use zoe_loupe::{Folder, oid_repr, parse_oid, parse_tid, tid_repr};
 enum ToolError {
     /// Loupe fails: a bad id, an oid without a record, a path that leads
     /// to no object, or an error of the store.
-    #[error(transparent)]
+    #[error("{}", loupe_message(.0))]
     Loupe(#[from] zoe_loupe::Error),
 
     /// `object_get` needs exactly one of `oid` and `path`.
     #[error("give oid or path, and not both")]
     OidOrPath,
 
-    /// The record does not decode, so its references are not known.
-    #[error("oid {oid}: the references are not known, because the record does not decode: {error}")]
+    /// The record or its references do not decode, so the references
+    /// are not known.
+    #[error("oid {oid}: the references are not known: {error}")]
     NotDecoded {
         /// The oid in ZODB form.
         oid: String,
@@ -157,9 +159,10 @@ impl Ops {
 
     /// List the outbound references of an object.
     #[tool(
-        description = "List the outbound persistent references of an object as of the last \
-                       transaction: for each one, the oid that it leads to and a JSON pointer \
-                       into the state of the object.",
+        description = "List the strong outbound persistent references of an object as of the \
+                       last transaction, as ZODB's referencesf gives them: for each one, the oid \
+                       that it leads to and a JSON pointer into the state of the object. A \
+                       reference inside an opaque value points to that value.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn references(&self, Parameters(args): Parameters<OidArgs>) -> CallToolResult {
@@ -174,6 +177,24 @@ impl Ops {
                     example /plone/folder. No tool writes to the store."
 )]
 impl ServerHandler for Ops {}
+
+/// Return the message of an error of Loupe. Oids and tids are in ZODB
+/// form, as the tools take them.
+fn loupe_message(error: &zoe_loupe::Error) -> String {
+    match error {
+        zoe_loupe::Error::Store(ZoeError::NotFound { oid }) => {
+            format!("oid {}: no record", oid_repr(*oid))
+        }
+        zoe_loupe::Error::Store(ZoeError::CorruptRecord { oid, tid }) => {
+            format!(
+                "oid {}: corrupt record, tid {}",
+                oid_repr(*oid),
+                tid_repr(*tid)
+            )
+        }
+        error => error.to_string(),
+    }
+}
 
 /// Return a result with `isError` and the message `message`.
 fn failure(message: &dyn Display) -> CallToolResult {
@@ -215,8 +236,9 @@ fn diff_json(folder: &Folder, args: &DiffArgs) -> Result<Value, ToolError> {
     }))
 }
 
-/// Return the outbound references of the object of `args`. A record that
-/// does not decode is an error, because an empty list would be wrong.
+/// Return the outbound references of the object of `args`. A record whose
+/// state or references do not decode is an error, because an empty list
+/// would be wrong.
 fn references_json(folder: &Folder, args: &OidArgs) -> Result<Value, ToolError> {
     let object = folder.object(parse_oid(&args.oid)?)?;
     if let Some(error) = object.error {
@@ -235,6 +257,7 @@ fn references_json(folder: &Folder, args: &OidArgs) -> Result<Value, ToolError> 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use rmcp::ServiceExt;
     use tokio::io::{
@@ -245,7 +268,7 @@ mod tests {
     use super::*;
 
     /// A text in a pickle: `BINUNICODE`.
-    fn text(value: &str) -> Vec<u8> {
+    fn text_pickle(value: &str) -> Vec<u8> {
         let length = u32::try_from(value.len()).unwrap().to_le_bytes();
         [&b"X"[..], &length, value.as_bytes()].concat()
     }
@@ -266,7 +289,7 @@ mod tests {
         record(
             "m",
             "Doc",
-            &[&b"}"[..], &text("title"), &text(title), b"s"].concat(),
+            &[&b"}"[..], &text_pickle("title"), &text_pickle(title), b"s"].concat(),
         )
     }
 
@@ -282,9 +305,9 @@ mod tests {
             "PersistentMapping",
             &[
                 &b"}"[..],
-                &text("data"),
+                &text_pickle("data"),
                 b"}",
-                &text("Application"),
+                &text_pickle("Application"),
                 &reference(1),
                 b"ss",
             ]
@@ -293,7 +316,7 @@ mod tests {
         let application = record(
             "m",
             "App",
-            &[&b"}"[..], &text("site"), &reference(2), b"s"].concat(),
+            &[&b"}"[..], &text_pickle("site"), &reference(2), b"s"].concat(),
         );
         let store = Store::open(&dir).unwrap();
         let mut txn = store.tpc_begin(b"admin", b"create", b"").unwrap();
@@ -472,6 +495,7 @@ mod tests {
         let missing = block_on(ops.history(Parameters(oid_args("0x99"))));
         assert_eq!(missing.is_error, Some(true));
         assert!(missing.structured_content.is_none());
+        assert_eq!(text(&missing), "oid 0x99: no record");
         let found = block_on(ops.history(Parameters(oid_args("0x02"))));
         assert_eq!(found.is_error, Some(false));
         let content = found.structured_content.unwrap();
@@ -497,6 +521,18 @@ mod tests {
             let id = self.next_id;
             let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
             self.send(request).await;
+            self.reply(id).await
+        }
+
+        async fn request_without_params(&mut self, method: &str) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method}))
+                .await;
+            self.reply(id).await
+        }
+
+        async fn reply(&mut self, id: u64) -> Value {
             loop {
                 let line = self.lines.next_line().await.unwrap().unwrap();
                 let message: Value = serde_json::from_str(&line).unwrap();
@@ -553,7 +589,20 @@ mod tests {
             }
             // A tool that the server does not offer is a protocol error.
             let pack = client.call("pack", json!({})).await;
-            assert!(pack["error"].is_object(), "{pack}");
+            assert_eq!(pack["error"]["code"], -32602, "{pack}");
+            // So is a call without its params.
+            let bare = client.request_without_params("tools/call").await;
+            assert_eq!(bare["error"]["code"], -32601, "{bare}");
+            // A message of the wrong shape gets an error.
+            let wrong = b"{\"jsonrpc\": \"2.0\", \"id\": 77, \"method\": 42}\n";
+            client.write.write_all(wrong).await.unwrap();
+            let next = client.lines.next_line();
+            let line = tokio::time::timeout(Duration::from_secs(10), next).await;
+            let line = line.unwrap().unwrap().unwrap();
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(reply["error"]["code"], -32600, "{reply}");
+            // rmcp skips a line that is not JSON, and sends no reply.
+            client.write.write_all(b"not json\n").await.unwrap();
 
             let reply = client.call("references", json!({"oid": "0x00"})).await;
             assert_eq!(reply["result"]["isError"], false, "{reply}");
@@ -564,5 +613,73 @@ mod tests {
             drop(client);
             server.await.unwrap();
         });
+    }
+
+    /// The text of the first content of a result.
+    fn text(result: &CallToolResult) -> &str {
+        let content = result.content.first().and_then(|content| content.as_text());
+        content.map(|text| text.text.as_str()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_panic_in_a_tool_is_a_result_with_is_error_and_the_session_goes_on() {
+        let (dir, _, _) = store("panic");
+        let ops = Ops::new(Folder::open(&dir).unwrap());
+        let work = |_: &Folder| -> Result<Value, ToolError> { panic!("a bug in a tool") };
+        let panicked = block_on(ops.run(work));
+        assert_eq!(panicked.is_error, Some(true));
+        assert!(
+            text(&panicked).starts_with("the tool stopped"),
+            "{panicked:?}"
+        );
+        // The server still answers.
+        let found = block_on(ops.history(Parameters(oid_args("0x02"))));
+        assert_eq!(found.is_error, Some(false));
+    }
+
+    #[test]
+    fn references_include_those_inside_a_plain_object() {
+        // The root holds 1, a plain object that holds 2, and 3. ZODB's
+        // `referencesf` gives 1, 2 and 3, and pack keeps 2.
+        let dir = std::env::temp_dir().join(format!("zoe-mcp-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plain = [
+            &b"cm\nPlain\n)\x81}"[..],
+            &text_pickle("x"),
+            &reference(2),
+            b"sb",
+        ]
+        .concat();
+        let state = [
+            &b"}("[..],
+            &text_pickle("a"),
+            &reference(1),
+            &text_pickle("b"),
+            &plain,
+            &text_pickle("c"),
+            &reference(3),
+            b"u",
+        ]
+        .concat();
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid(0), &record("m", "Root", &state))
+            .unwrap();
+        for oid in 1..=3 {
+            txn.store(Oid(oid), Tid(0), &document("child")).unwrap();
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        drop(store);
+
+        let folder = Folder::open(&dir).unwrap();
+        let references = references_json(&folder, &oid_args("0x00")).unwrap();
+        let found: Vec<(&str, &str)> = references["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["oid"].as_str().unwrap(), r["at"].as_str().unwrap()))
+            .collect();
+        assert_eq!(found, [("0x01", "/a"), ("0x02", "/b"), ("0x03", "/c")]);
     }
 }
