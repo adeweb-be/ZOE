@@ -1,6 +1,6 @@
 # ZOE — technical specification
 
-Oct 10, 2026 · @Antoine Duchêne
+@Antoine Duchêne
 
 This document is the technical specification: what ZOE is and how it works. The way of working, the units of work, the sessions, the roadmap and the project organisation are in ZOE — working methods and roadmap.
 
@@ -30,7 +30,7 @@ ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use un
 - ZODB 5 and ZEO 5. ZOE targets ZODB ≥ 6.0 and ZEO ≥ 6.0, which means Plone 6.1 and later; older clients are not supported.
 - Requiring a new client. `ZEO.ClientStorage` stays supported for the life of the project; the native Rust client of F28 ships in phase 8 as a drop-in, never a requirement; the server replaces `runzeo`.
 - Multi-tenancy inside one server. Isolation is by process and by named storage (F22); per-storage quotas are the only shared-server feature.
-- The sixteen features triaged as Won't on 2026-10-10 in the roadmap's Feature triage section, among them agent branches with merge-back, actor-tagged transactions, read replicas with session tokens, WASM plugins, server-side subtree clone and blocks as CRDT documents. Everything else from that triage has a requirement above (F29 to F38, N18, N19) or waits after the roadmap.
+- The sixteen features triaged as Won't in the roadmap's Feature triage section, among them agent branches with merge-back, actor-tagged transactions, read replicas with session tokens, WASM plugins, server-side subtree clone and blocks as CRDT documents. Everything else from that triage has a requirement above (F29 to F38, N18, N19) or waits after the roadmap.
 
 **Success criteria**
 
@@ -42,7 +42,7 @@ ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use un
 
 ## Naming
 
-ZOE, the Zope Object Engine, is the project name, chosen on 2026-10-10: an anagram of ZEO, a first name, and an acronym in the ZODB/ZEO/ZRS tradition. The stem for every identifier is `zoe`, written ZOE in prose. The PyPI name `ZOE` is held by an abandoned 2003 OpenGL toy (last activity 2013) and the crates.io name `zoe` by an active CDC genomics crate, so the distribution ships as `zoedb` while a PEP 541 transfer of `ZOE` is requested, and no bare `zoe` crate is published.
+ZOE, the Zope Object Engine, is the project name: an anagram of ZEO, a first name, and an acronym in the ZODB/ZEO/ZRS tradition. The stem for every identifier is `zoe`, written ZOE in prose. The PyPI name `ZOE` is held by an abandoned OpenGL toy and the crates.io name `zoe` by an active CDC genomics crate, so the distribution ships as `zoedb` while a PEP 541 transfer of `ZOE` is requested, and no bare `zoe` crate is published.
 
 **Candidates**
 
@@ -80,9 +80,9 @@ ZOE, the Zope Object Engine, is the project name, chosen on 2026-10-10: an anagr
 
 ## Context
 
-The ZODB stack is mostly Python; the C lives in three client-side packages, and the upstream projects started free-threading work in 2026. Line counts are from fresh clones on 2026-10-10 (tests excluded).
+The ZODB stack is mostly Python; the C lives in three client-side packages, and the upstream projects have started free-threading work. Line counts are from fresh clones made during the analysis (tests excluded).
 
-| Package | Language | Size | Role | Free-threading status (Oct 2026) |
+| Package | Language | Size | Role | Free-threading status |
 | --- | --- | --- | --- | --- |
 | [ZODB](https://github.com/zopefoundation/ZODB) | Python | 17.6k lines | Connection, DB, FileStorage, MVCC adapter, 2PC | pure Python; thread model is one Connection per thread |
 | [ZEO](https://github.com/zopefoundation/ZEO) 6.3.dev0 | Python + 2 optional Cython modules | 10.3k lines | asyncio client and server, msgpack wire protocol | pure Python |
@@ -753,7 +753,7 @@ The largest risks are not in Rust; they are in matching ZEO's exact semantics an
 
 **Open questions**
 
-- [x] Project name: ZOE, chosen on 2026-10-10 (section Naming).
+- [x] Project name: ZOE (section Naming).
 - [ ] Which conflict classes dominate the production logs of a real site? Needed before phase 3; a one-week log sample decides the native-merge list.
 - [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
 - [ ] Does the first release target ZODB 6 and ZEO 6 only, or also the 5.x lines still common in Plone 6.0 deployments?
@@ -761,7 +761,7 @@ The largest risks are not in Rust; they are in matching ZEO's exact semantics an
 
 ## References
 
-Pages opened during the analysis on 2026-10-10; repository figures come from clones made the same day.
+Pages opened during the analysis; repository figures come from clones made at the same time.
 
 - [PEP 779 – Criteria for supported status for free-threaded Python](https://peps.python.org/pep-0779/)
 - [PEP 803 – "abi3t": Stable ABI for free-threaded builds](https://peps.python.org/pep-0803)

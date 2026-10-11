@@ -1,6 +1,6 @@
 # ZOE — working methods and roadmap
 
-Oct 10, 2026 · @Antoine Duchêne
+@Antoine Duchêne
 
 How ZOE gets built: one human, a team of AI agents, cards gated by tests, worked in interactive sessions. The technical design lives in Doc.
 
@@ -129,7 +129,7 @@ First usable release: the server gate; the in-process storage is usable from the
 
 ## Feature triage
 
-58 candidate features were triaged on 2026-10-10 against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the ten phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
+58 candidate features were triaged against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the ten phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
 
 | Feature | Verdict | Lands in | Note |
 | --- | --- | --- | --- |
