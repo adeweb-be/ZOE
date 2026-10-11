@@ -290,7 +290,7 @@ pub trait Backend: Send + Sync {
     fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>; // not used: pack goes through the methods below
     fn pack_watermark(&self) -> Result<Tid>;                                                 // the tid of the last pack, 0 before the first
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;              // the record keys of whole oids from `from`, for the pack scan
-    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>>;           // a transaction row and its records, one snapshot
+    fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;                          // a transaction row, its index keys and their records, one snapshot
     fn sync(&self) -> Result<()>;                         // fsync barrier used by group commit
 }
 
