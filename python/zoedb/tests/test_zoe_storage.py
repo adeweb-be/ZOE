@@ -2,7 +2,8 @@
 
 ZODB's own storage test suites run first, then the tests of the parts that
 ZODB does not test: the order of the `tpc_finish` callbacks, the read-only
-mode, `close`, `pack` and the parallel commits without the GIL.
+mode, `close`, `pack`, the conflict resolution and the parallel commits
+without the GIL.
 """
 
 import subprocess
@@ -16,6 +17,7 @@ import pytest
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import (
     ConflictError,
+    ReadConflictError,
     ReadOnlyError,
     StorageError,
     StorageTransactionError,
@@ -30,6 +32,7 @@ from ZODB.tests import (
     StorageTestBase,
     Synchronization,
 )
+from ZODB.tests.ConflictResolution import PCounter, PCounter2
 from ZODB.TimeStamp import TimeStamp
 
 import zoe
@@ -83,6 +86,18 @@ class ZODBStorageTests(
 def record(value):
     """Return a small pickle that holds value."""
     return StorageTestBase.zodb_pickle(StorageTestBase.MinPO(value))
+
+
+def counter(amount, cls=PCounter):
+    """Return the pickle of a counter of class cls that holds amount."""
+    obj = cls()
+    obj._value = amount
+    return StorageTestBase.zodb_pickle(obj)
+
+
+def amount(data):
+    """Return the amount of the counter in a pickle."""
+    return StorageTestBase.zodb_unpickle(data)._value
 
 
 @pytest.fixture
@@ -520,3 +535,328 @@ def test_no_lock_is_held_while_an_error_is_built(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def two_revisions(storage, data=counter):
+    """Commit two revisions of a new object. Return the oid and the tids."""
+    oid = storage.new_oid()
+    first = commit(storage, oid, ZERO, data(0))
+    second = commit(storage, oid, first, data(1))
+    return oid, first, second
+
+
+def test_a_vote_without_conflict_resolves_nothing(storage):
+    oid = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, ZERO, counter(0), "", txn)
+    assert storage.tpc_vote(txn) == []
+    storage.tpc_finish(txn)
+
+
+def test_a_read_current_conflict_is_never_resolved(storage, monkeypatch):
+    def resolve(self, old, committed, new):
+        raise AssertionError("a read-current object is never resolved")
+
+    monkeypatch.setattr(PCounter, "_p_resolveConflict", resolve)
+    oid, first, second = two_revisions(storage)
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.checkCurrentSerialInTransaction(oid, first, txn)
+    storage.store(storage.new_oid(), ZERO, counter(5), "", txn)
+    with pytest.raises(ReadConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == oid
+    assert error.value.serials == (second, first)
+
+
+def test_a_class_without_a_resolve_method_raises_with_its_name(storage):
+    oid, first, second = two_revisions(storage, record)
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, first, record(2), "", txn)
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == oid
+    assert error.value.class_name == "ZODB.tests.MinPO.MinPO"
+    assert error.value.serials == (second, first)
+
+
+def test_a_new_object_over_a_committed_one_is_not_resolved(storage, monkeypatch):
+    def resolve(self, old, committed, new):
+        raise AssertionError("an object without an old state is never resolved")
+
+    monkeypatch.setattr(PCounter, "_p_resolveConflict", resolve)
+    oid, first, second = two_revisions(storage)
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, ZERO, counter(2), "", txn)
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == oid
+    assert error.value.serials == (second, ZERO)
+    assert error.value.class_name == "ZODB.tests.ConflictResolution.PCounter"
+
+
+def test_a_serial_of_a_missing_record_is_not_resolved(storage, monkeypatch):
+    def resolve(self, old, committed, new):
+        raise AssertionError("an object without a committed state is never resolved")
+
+    monkeypatch.setattr(PCounter, "_p_resolveConflict", resolve)
+    oid, first, second = two_revisions(storage)
+    missing = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(missing, first, counter(2), "", txn)
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == missing
+    assert error.value.serials == (ZERO, first)
+    assert error.value.class_name == "ZODB.tests.ConflictResolution.PCounter"
+
+
+def test_an_unresolved_conflict_releases_the_locks_before_the_abort(tmp_path):
+    # With no wait for a lock, a lock that the failed vote kept fails the
+    # next commit.
+    storage = zoe.Storage(str(tmp_path / "store"), lock_timeout=0)
+    try:
+        oid, first, second = two_revisions(
+            storage, lambda value: counter(value, PCounter2)
+        )
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, first, counter(2, PCounter2), "", txn)
+        with pytest.raises(ConflictError):
+            storage.tpc_vote(txn)
+        assert commit(storage, oid, second, counter(3, PCounter2)) > second
+        storage.tpc_abort(txn)
+    finally:
+        storage.close()
+
+
+class Marked:
+    """A database that marks each record with a prefix."""
+
+    def transform_record_data(self, data):
+        return b"marked:" + data
+
+    def untransform_record_data(self, data):
+        assert data.startswith(b"marked:")
+        return data.removeprefix(b"marked:")
+
+
+def test_a_conflict_names_the_class_through_the_record_transforms(storage):
+    storage.registerDB(Marked())
+    mark = Marked().transform_record_data
+    oid, first, second = two_revisions(storage, lambda value: mark(counter(value)))
+
+    def vote_error(serial, data):
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, serial, data, "", txn)
+        with pytest.raises(ConflictError) as error:
+            storage.tpc_vote(txn)
+        storage.tpc_abort(txn)
+        return error.value
+
+    # The core does not resolve a new object over a committed one. A
+    # PCounter2 does not resolve.
+    for serial in (ZERO, first):
+        error = vote_error(serial, mark(counter(2, PCounter2)))
+        assert error.class_name == "ZODB.tests.ConflictResolution.PCounter2"
+    # A record that the database cannot untransform gives no class name.
+    assert vote_error(ZERO, counter(2, PCounter2)).class_name is None
+
+
+def test_the_resolution_uses_the_record_transforms_of_the_database(storage):
+    storage.registerDB(Marked())
+    mark = Marked().transform_record_data
+    oid, first, second = two_revisions(storage, lambda value: mark(counter(value)))
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, first, mark(counter(2)), "", txn)
+    assert storage.tpc_vote(txn) == [oid]
+    tid = storage.tpc_finish(txn)
+    data, serial = storage.load(oid)
+    assert serial == tid
+    assert amount(Marked().untransform_record_data(data)) == 3
+
+
+@pytest.fixture
+def stopped(monkeypatch):
+    """Stop each resolution of a PCounter until the test lets it go on.
+
+    Return the event that a resolution sets when it starts, and the event
+    that lets it go on.
+    """
+    entered, go_on = threading.Event(), threading.Event()
+    resolve = PCounter._p_resolveConflict
+
+    def stopped_resolve(self, old, committed, new):
+        entered.set()
+        assert go_on.wait(TIMEOUT)
+        return resolve(self, old, committed, new)
+
+    monkeypatch.setattr(PCounter, "_p_resolveConflict", stopped_resolve)
+    yield entered, go_on
+    go_on.set()
+
+
+def resolving(storage, writes, read_current=()):
+    """Commit in a new thread a transaction that stores writes.
+
+    Each write is an oid, the serial that the transaction read and a pickle.
+    Each read-current entry is an oid and its serial. Return the thread, the
+    transaction and a list that gets the tid of the commit, or the error of
+    the vote.
+    """
+    txn = TransactionMetaData()
+    outcome = []
+
+    def run():
+        storage.tpc_begin(txn)
+        for oid, serial in read_current:
+            storage.checkCurrentSerialInTransaction(oid, serial, txn)
+        for oid, serial, data in writes:
+            storage.store(oid, serial, data, "", txn)
+        try:
+            storage.tpc_vote(txn)
+            outcome.append(storage.tpc_finish(txn))
+        except Exception as error:
+            outcome.append(error)
+            storage.tpc_abort(txn)
+
+    return in_thread(run), txn, outcome
+
+
+def test_a_partial_resolution_commits_nothing(tmp_path):
+    # With no wait for a lock, a lock that the failed vote kept fails the
+    # next commit.
+    storage = zoe.Storage(str(tmp_path / "store"), lock_timeout=0)
+    try:
+        low, first_low, second_low = two_revisions(storage)
+        high, first_high, second_high = two_revisions(
+            storage, lambda value: counter(value, PCounter2)
+        )
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(low, first_low, counter(2), "", txn)
+        storage.store(high, first_high, counter(2, PCounter2), "", txn)
+        with pytest.raises(ConflictError) as error:
+            storage.tpc_vote(txn)
+        assert error.value.oid == high
+        assert error.value.class_name == "ZODB.tests.ConflictResolution.PCounter2"
+        # The resolved state of low is not committed, and both locks are
+        # free before the abort.
+        assert storage.load(low) == (counter(1), second_low)
+        assert storage.load(high) == (counter(1, PCounter2), second_high)
+        assert commit(storage, low, second_low, counter(3)) > second_high
+        assert commit(storage, high, second_high, counter(3, PCounter2)) > second_high
+        storage.tpc_abort(txn)
+    finally:
+        storage.close()
+
+
+def test_an_abort_from_another_thread_during_the_resolution(tmp_path, stopped):
+    entered, go_on = stopped
+    storage = zoe.Storage(str(tmp_path / "store"), lock_timeout=0)
+    try:
+        oid, first, second = two_revisions(storage)
+        thread, txn, outcome = resolving(storage, [(oid, first, counter(2))])
+        assert entered.wait(TIMEOUT)
+        storage.tpc_abort(txn)
+        # The abort released the lock while the resolution runs.
+        later = commit(storage, oid, second, counter(5))
+        go_on.set()
+        thread.join(TIMEOUT)
+        assert isinstance(outcome[0], StorageTransactionError)
+        assert storage.load(oid) == (counter(5), later)
+    finally:
+        storage.close()
+
+
+def test_a_close_during_the_resolution(tmp_path, stopped):
+    entered, go_on = stopped
+    path = str(tmp_path / "store")
+    storage = zoe.Storage(path)
+    try:
+        oid, first, second = two_revisions(storage)
+        thread, _, outcome = resolving(storage, [(oid, first, counter(2))])
+        assert entered.wait(TIMEOUT)
+        storage.close()
+        # The close released the store while the resolution runs.
+        reopened = zoe.Storage(path)
+        try:
+            assert reopened.load(oid) == (counter(1), second)
+        finally:
+            reopened.close()
+        go_on.set()
+        thread.join(TIMEOUT)
+        assert isinstance(outcome[0], StorageError)
+    finally:
+        storage.close()
+
+
+def test_a_read_current_lock_stays_held_during_the_resolution(tmp_path, stopped):
+    entered, go_on = stopped
+    storage = zoe.Storage(str(tmp_path / "store"), lock_timeout=0)
+    try:
+        oid, first, second = two_revisions(storage)
+        read = storage.new_oid()
+        seen = commit(storage, read, ZERO, counter(0))
+        thread, _, outcome = resolving(
+            storage, [(oid, first, counter(2))], read_current=[(read, seen)]
+        )
+        assert entered.wait(TIMEOUT)
+        # The resolving vote holds a shared lock on the read-current oid, so
+        # a writer cannot take it.
+        with pytest.raises(ConflictError) as error:
+            commit(storage, read, seen, counter(1))
+        assert error.value.oid == read
+        assert error.value.serials is None
+        go_on.set()
+        thread.join(TIMEOUT)
+        (tid,) = outcome
+        assert amount(storage.load(oid)[0]) == 3
+        assert commit(storage, read, seen, counter(1)) > tid
+    finally:
+        storage.close()
+
+
+class Interrupt(BaseException):
+    """An exception that can come at any time, as KeyboardInterrupt does."""
+
+
+class Interrupted(zoe.storage.Storage):
+    """A storage whose store raises Interrupt after it stores, on request."""
+
+    interrupt = False
+
+    def store(self, *args):
+        super().store(*args)
+        if self.interrupt:
+            raise Interrupt
+
+
+def test_an_error_after_the_last_resolved_store_releases_the_locks(tmp_path):
+    storage = Interrupted(str(tmp_path / "store"), lock_timeout=0)
+    try:
+        oid, first, second = two_revisions(storage)
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, first, counter(2), "", txn)
+        storage.interrupt = True
+        with pytest.raises(Interrupt):
+            storage.tpc_vote(txn)
+        storage.interrupt = False
+        # The transaction is not voted: it cannot finish, and its lock is
+        # free.
+        with pytest.raises(StorageTransactionError):
+            storage.tpc_finish(txn)
+        assert commit(storage, oid, second, counter(5)) > second
+    finally:
+        storage.close()

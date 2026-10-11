@@ -9,15 +9,21 @@
 //! `finish` and `abort` release the locks. Dropping a transaction aborts
 //! it.
 //!
+//! `vote_resolving` lets the caller resolve conflicts with the locks held.
+//! It returns the stale written oids with their committed records, and
+//! keeps the locks. The caller stores a resolved pickle of each oid and
+//! calls `vote` again. That vote takes no lock: it checks the serials
+//! again with the locks that the first vote took.
+//!
 //! The thread that begins a transaction drives it: `store`, `restore`,
-//! `check_current_serial` and `vote` from another thread fail with
-//! `WrongThread`. `finish` and `abort` work from any thread.
+//! `check_current_serial`, `vote` and `vote_resolving` from another thread
+//! fail with `WrongThread`. `finish` and `abort` work from any thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::thread::{self, ThreadId};
 
-use crate::backend::{TxnMeta, TxnStatus};
+use crate::backend::{Record, TxnMeta, TxnStatus};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::lock::Mode;
@@ -29,6 +35,9 @@ struct Staged {
     /// The serial that the client read before it changed the object.
     serial: Tid,
     data: Vec<u8>,
+    /// True when `restore` staged the record. A restored record is a copy,
+    /// so a conflict on it cannot be resolved.
+    restored: bool,
 }
 
 /// A commit that `finish_after` made.
@@ -62,12 +71,24 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The oids that the transaction read as current, with the serial that
     /// it read.
     read_current: BTreeMap<Oid, Tid>,
-    /// The oids that a successful vote locked. The transaction holds the
-    /// locks until `finish` or `abort`.
+    /// The oids that a vote locked. The transaction holds the locks until
+    /// `finish`, `abort` or a failed vote.
     locks: Option<Vec<Oid>>,
+    /// The oids that `vote_resolving` gave as conflicts. The set is empty
+    /// except between that call and the next vote.
+    resolving: BTreeSet<Oid>,
     /// The current serial and the read serial of the stale oid that failed
     /// the last vote.
     conflict: Option<(Tid, Tid)>,
+}
+
+/// What the serial check of a vote found.
+enum Check {
+    /// No serial fails the vote. Each stale written oid can be resolved:
+    /// the check gives it with its committed record.
+    Passed(Vec<(Oid, Record)>),
+    /// A stale serial fails the vote.
+    Failed(Stale),
 }
 
 /// An oid whose current serial is not the serial that the transaction
@@ -94,6 +115,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             staged: BTreeMap::new(),
             read_current: BTreeMap::new(),
             locks: None,
+            resolving: BTreeSet::new(),
             conflict: None,
         }
     }
@@ -117,8 +139,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(txn)
     }
 
-    fn voted(&self) -> bool {
+    /// Tell if a vote holds the locks of the transaction.
+    fn locked(&self) -> bool {
         self.locks.is_some()
+    }
+
+    /// Tell if a vote succeeded. The transaction can then finish.
+    fn voted(&self) -> bool {
+        self.locked() && self.resolving.is_empty()
     }
 
     /// Refuse a call from a thread that did not begin the transaction.
@@ -135,10 +163,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// An empty pickle marks a deletion, so `store` refuses it with
     /// `Protocol`. A restore transaction takes `store` too, with the same
     /// serial check at the vote.
+    ///
+    /// After a vote, `store` takes only an oid that `vote_resolving` gave
+    /// as a conflict. Then `serial` is the serial of the committed record.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         self.check_thread()?;
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
+        }
+        if self.locked() && !self.resolving.contains(&oid) {
+            return Err(ZoeError::Protocol(
+                "store after vote of an oid without conflict",
+            ));
         }
         if data.is_empty() {
             return Err(ZoeError::Protocol("store of an empty pickle"));
@@ -149,6 +185,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             Staged {
                 serial,
                 data: data.to_vec(),
+                restored: false,
             },
         );
         Ok(())
@@ -175,7 +212,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if self.tid.is_none() {
             return Err(ZoeError::Protocol("restore outside a restore transaction"));
         }
-        if self.voted() {
+        if self.locked() {
             return Err(ZoeError::Protocol("restore after vote"));
         }
         check_oid(oid)?;
@@ -185,6 +222,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             Staged {
                 serial: current,
                 data: data.unwrap_or_default().to_vec(),
+                restored: true,
             },
         );
         Ok(())
@@ -199,7 +237,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// can change `oid` before this one finishes.
     pub fn check_current_serial(&mut self, oid: Oid, serial: Tid) -> Result<()> {
         self.check_thread()?;
-        if self.voted() {
+        if self.locked() {
             return Err(ZoeError::Protocol("check_current_serial after vote"));
         }
         self.read_current.insert(oid, serial);
@@ -212,28 +250,86 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// The vote waits for a lock that another transaction holds, at most
     /// the lock timeout of the store. A longer wait fails with `Conflict`.
     /// A failed vote releases every lock that it took.
+    ///
+    /// After `vote_resolving` gave conflicts, `vote` takes no lock. It
+    /// checks every serial again with the locks that `vote_resolving` took.
+    /// An oid that is still stale fails the vote, and the vote releases the
+    /// locks.
     pub fn vote(&mut self) -> Result<()> {
         self.check_thread()?;
         if self.voted() {
             return Err(ZoeError::Protocol("vote twice"));
         }
         self.conflict = None;
+        if !self.locked() {
+            self.lock()?;
+        }
+        self.resolving.clear();
+        self.check(false).map(drop)
+    }
+
+    /// Vote as `vote` does, but keep the locks when the vote finds stale
+    /// written oids that the caller can resolve. Return each such oid with
+    /// its committed record. An empty list means that the vote succeeded.
+    ///
+    /// The caller can resolve a stale written oid when `store` staged it
+    /// with a serial other than `Tid::ZERO`, and its committed record holds
+    /// a pickle. Any other stale written oid fails the vote with
+    /// `Conflict`. Then a stale read-current oid fails the vote with
+    /// `ReadConflict`: a read-current oid is never resolved. A failed vote
+    /// releases every lock that it took.
+    ///
+    /// After a list of conflicts, the transaction keeps its locks and is
+    /// not voted. For each oid of the list, the caller stores the resolved
+    /// pickle with the serial of the committed record. Then it calls
+    /// `vote`. A conflict that the caller does not resolve stays stale, so
+    /// that vote fails and releases the locks.
+    pub fn vote_resolving(&mut self) -> Result<Vec<(Oid, Record)>> {
+        self.check_thread()?;
+        if self.locked() {
+            return Err(ZoeError::Protocol("vote twice"));
+        }
+        self.conflict = None;
+        self.lock()?;
+        let conflicts = self.check(true)?;
+        self.resolving = conflicts.iter().map(|&(oid, _)| oid).collect();
+        Ok(conflicts)
+    }
+
+    /// Take the locks of the vote, and keep them until `finish`, `abort` or
+    /// a failed vote. A lock timeout releases the locks that the call took.
+    fn lock(&mut self) -> Result<()> {
         let store: &Store = &self.store;
         let locks = store
             .locks
             .acquire(&self.lock_requests(), store.lock_timeout)?;
-        // An error drops `locks`, and that releases them.
-        if let Some(stale) = self.stale()? {
-            self.conflict = Some((stale.current, stale.read));
-            let oid = stale.oid;
-            return Err(if stale.read_only {
-                ZoeError::ReadConflict { oid }
-            } else {
-                ZoeError::Conflict { oid }
-            });
-        }
         self.locks = Some(locks.keep());
         Ok(())
+    }
+
+    /// Check the serials with the locks held. Return the stale written oids
+    /// that the caller can resolve, with their committed records. When
+    /// `resolve` is false, the caller can resolve none.
+    ///
+    /// A stale serial that the caller cannot resolve, or an error, fails
+    /// the check and releases the locks.
+    fn check(&mut self, resolve: bool) -> Result<Vec<(Oid, Record)>> {
+        let error = match self.check_serials(resolve) {
+            Ok(Check::Passed(conflicts)) => return Ok(conflicts),
+            Ok(Check::Failed(stale)) => {
+                self.conflict = Some((stale.current, stale.read));
+                let oid = stale.oid;
+                if stale.read_only {
+                    ZoeError::ReadConflict { oid }
+                } else {
+                    ZoeError::Conflict { oid }
+                }
+            }
+            Err(error) => error,
+        };
+        self.release();
+        self.resolving.clear();
+        Err(error)
     }
 
     /// Return the serials of the stale oid that failed the last vote: the
@@ -259,30 +355,51 @@ impl<S: Deref<Target = Store>> Txn<S> {
         requests.into_iter().collect()
     }
 
-    /// Return the first oid whose current serial is not the serial that the
-    /// client read. The written oids come first, then the read-current
-    /// oids.
-    fn stale(&self) -> Result<Option<Stale>> {
-        let written = self
-            .staged
-            .iter()
-            .map(|(&oid, staged)| (oid, staged.serial, false));
-        let read = self
-            .read_current
-            .iter()
-            .map(|(&oid, &serial)| (oid, serial, true));
-        for (oid, read, read_only) in written.chain(read) {
+    /// Compare the serial that the client read of each oid with its current
+    /// serial. The written oids come first, then the read-current oids.
+    ///
+    /// The first stale oid fails the check, unless `resolve` is true and
+    /// the oid is a written oid that the caller can resolve. The check
+    /// gives each such oid with its committed record.
+    fn check_serials(&self, resolve: bool) -> Result<Check> {
+        let mut conflicts = Vec::new();
+        for (&oid, staged) in &self.staged {
+            let record = self.store.backend.load_before(oid, Tid::MAX)?;
+            let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
+            if current == staged.serial {
+                continue;
+            }
+            match record {
+                Some(record)
+                    if resolve
+                        && !staged.restored
+                        && staged.serial != Tid::ZERO
+                        && !record.data.is_empty() =>
+                {
+                    conflicts.push((oid, record));
+                }
+                _ => {
+                    return Ok(Check::Failed(Stale {
+                        oid,
+                        current,
+                        read: staged.serial,
+                        read_only: false,
+                    }));
+                }
+            }
+        }
+        for (&oid, &read) in &self.read_current {
             let current = self.current_serial(oid)?;
             if current != read {
-                return Ok(Some(Stale {
+                return Ok(Check::Failed(Stale {
                     oid,
                     current,
                     read,
-                    read_only,
+                    read_only: true,
                 }));
             }
         }
-        Ok(None)
+        Ok(Check::Passed(conflicts))
     }
 
     /// Return the serial of the current record of `oid`, or `Tid::ZERO`
@@ -668,6 +785,7 @@ mod tests {
                     txn.store(theirs, Tid::ZERO, b"b"),
                     txn.check_current_serial(theirs, Tid(5)),
                     txn.vote(),
+                    txn.vote_resolving().map(drop),
                     restore.restore(theirs, Some(b"c")),
                 ];
                 for result in refused {
@@ -780,5 +898,276 @@ mod tests {
         assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
         assert!(store.lock_table_is_empty());
         assert_eq!(Arc::strong_count(&store), 1);
+    }
+
+    /// Commit the records of `writes` in one transaction: each is an oid,
+    /// the serial that the transaction read and a pickle.
+    fn commit_all(store: &Store, writes: &[(Oid, Tid, &[u8])]) -> Tid {
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        for &(oid, serial, data) in writes {
+            txn.store(oid, serial, data).unwrap();
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap()
+    }
+
+    #[test]
+    fn a_resolving_vote_gives_the_committed_record_and_keeps_the_locks() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        // A zero lock timeout turns every wait into a conflict.
+        store.lock_timeout = Duration::ZERO;
+        let (stale, fresh) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = commit(&store, stale, Tid::ZERO, b"a");
+        let second = commit(&store, stale, first, b"b");
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(stale, first, b"c").unwrap();
+        txn.store(fresh, Tid::ZERO, b"d").unwrap();
+        let conflicts = txn.vote_resolving().unwrap();
+        let committed = Record {
+            tid: second,
+            prev: first,
+            data: b"b".to_vec(),
+        };
+        assert_eq!(conflicts, [(stale, committed)]);
+        assert_eq!(txn.staged(stale), Some((first, &b"c"[..])));
+        assert_eq!(txn.conflict_serials(), None);
+
+        // The transaction keeps the lock: another vote on the oid cannot
+        // take it.
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other.store(stale, second, b"e").unwrap();
+        assert!(matches!(other.vote(), Err(ZoeError::Conflict { .. })));
+        assert_eq!(other.conflict_serials(), None);
+
+        // The transaction stores the resolved pickle over the committed
+        // serial, and votes again.
+        txn.store(stale, second, b"bc").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(stale).unwrap(), (b"bc".to_vec(), tid));
+        assert_eq!(store.load(fresh).unwrap(), (b"d".to_vec(), tid));
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_resolving_vote_without_conflicts_is_a_vote() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"b").unwrap();
+        assert!(txn.vote_resolving().unwrap().is_empty());
+        assert!(matches!(
+            txn.store(oid, first, b"c"),
+            Err(ZoeError::Protocol(_))
+        ));
+        assert!(matches!(txn.vote(), Err(ZoeError::Protocol(_))));
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_conflict_left_unresolved_fails_the_second_vote() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = commit_all(&store, &[(low, Tid::ZERO, b"a"), (high, Tid::ZERO, b"a")]);
+        let second = commit_all(&store, &[(low, first, b"b"), (high, first, b"b")]);
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(low, first, b"c").unwrap();
+        txn.store(high, first, b"c").unwrap();
+        let conflicts = txn.vote_resolving().unwrap();
+        let oids: Vec<_> = conflicts.iter().map(|&(oid, _)| oid).collect();
+        assert_eq!(oids, [low, high]);
+
+        // The transaction resolves only `low`.
+        txn.store(low, second, b"bc").unwrap();
+        let error = txn.vote();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+            "{error:?}"
+        );
+        assert_eq!(txn.conflict_serials(), Some((second, first)));
+        assert!(store.lock_table_is_empty());
+
+        // The failed vote released the locks, so another transaction
+        // commits at once.
+        commit(&store, high, second, b"d");
+        txn.abort();
+    }
+
+    #[test]
+    fn a_read_current_conflict_is_never_resolved() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (written, read) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = commit_all(
+            &store,
+            &[(written, Tid::ZERO, b"a"), (read, Tid::ZERO, b"a")],
+        );
+        let second = commit_all(&store, &[(written, first, b"b"), (read, first, b"b")]);
+
+        // A stale read-current oid fails the vote, even when the stale
+        // written oid can be resolved.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(written, first, b"c").unwrap();
+        txn.check_current_serial(read, first).unwrap();
+        let error = txn.vote_resolving();
+        assert!(
+            matches!(error, Err(ZoeError::ReadConflict { oid }) if oid == read),
+            "{error:?}"
+        );
+        assert_eq!(txn.conflict_serials(), Some((second, first)));
+        assert!(store.lock_table_is_empty());
+
+        // A read-current oid alone fails the same way.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(written, second, b"c").unwrap();
+        txn.check_current_serial(read, first).unwrap();
+        assert!(matches!(
+            txn.vote_resolving(),
+            Err(ZoeError::ReadConflict { .. })
+        ));
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_conflict_without_an_old_and_a_committed_state_cannot_be_resolved() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (created, deleted, restored, missing) = (Oid(1), Oid(2), Oid(3), Oid(4));
+        let first = commit_all(
+            &store,
+            &[
+                (created, Tid::ZERO, b"a"),
+                (deleted, Tid::ZERO, b"a"),
+                (restored, Tid::ZERO, b"a"),
+            ],
+        );
+        let mut delete = store
+            .tpc_begin_restore(Tid(first.0 + 1), b"", b"", b"")
+            .unwrap();
+        delete.restore(deleted, None).unwrap();
+        delete.vote().unwrap();
+        let gone = delete.finish().unwrap();
+
+        // The transaction read no serial of `created`, `deleted` has no
+        // committed pickle and `missing` has no record. A restored record
+        // is a copy.
+        let mut copy = store
+            .tpc_begin_restore(Tid(u64::MAX - 1), b"", b"", b"")
+            .unwrap();
+        copy.restore(restored, Some(b"b")).unwrap();
+        let changed = commit(&store, restored, first, b"c");
+        for (oid, read, current, txn) in [
+            (created, Tid::ZERO, first, None),
+            (deleted, first, gone, None),
+            (missing, first, Tid::ZERO, None),
+            (restored, first, changed, Some(copy)),
+        ] {
+            let mut txn = txn.unwrap_or_else(|| {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.store(oid, read, b"d").unwrap();
+                txn
+            });
+            let error = txn.vote_resolving();
+            assert!(
+                matches!(error, Err(ZoeError::Conflict { oid: failed }) if failed == oid),
+                "{oid:?} {error:?}"
+            );
+            assert_eq!(txn.conflict_serials(), Some((current, read)), "{oid:?}");
+            assert!(store.lock_table_is_empty());
+        }
+    }
+
+    #[test]
+    fn calls_between_the_two_votes() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (stale, other) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = commit(&store, stale, Tid::ZERO, b"a");
+        let second = commit(&store, stale, first, b"b");
+        let resolving = || {
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(stale, first, b"c").unwrap();
+            assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+            txn
+        };
+
+        // Between the votes, the transaction takes only a store of an oid
+        // in conflict.
+        let mut txn = resolving();
+        for refused in [
+            txn.store(other, Tid::ZERO, b"d"),
+            txn.check_current_serial(other, Tid::ZERO),
+            txn.vote_resolving().map(drop),
+        ] {
+            assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+        }
+        txn.store(stale, second, b"bc").unwrap();
+        txn.vote().unwrap();
+        assert!(matches!(
+            txn.store(stale, second, b"bcd"),
+            Err(ZoeError::Protocol(_))
+        ));
+        txn.abort();
+        assert!(store.lock_table_is_empty());
+
+        // The transaction cannot finish before the second vote. The failed
+        // finish releases the locks.
+        let txn = resolving();
+        assert!(matches!(txn.finish(), Err(ZoeError::Protocol(_))));
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_lock_timeout_in_a_resolving_vote_gives_no_serials() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(oid, first, b"b").unwrap();
+        holder.vote().unwrap();
+        let mut waiter = store.tpc_begin(b"", b"", b"").unwrap();
+        waiter.store(oid, Tid::ZERO, b"c").unwrap();
+        assert!(matches!(
+            waiter.vote_resolving(),
+            Err(ZoeError::Conflict { .. })
+        ));
+        assert_eq!(waiter.conflict_serials(), None);
+        holder.abort();
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_waiting_vote_gets_the_lock_after_the_resolved_commit() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let second = commit(&store, oid, first, b"b");
+        let mut resolving = store.tpc_begin(b"", b"", b"").unwrap();
+        resolving.store(oid, first, b"c").unwrap();
+        assert_eq!(resolving.vote_resolving().unwrap().len(), 1);
+
+        let (voted, done) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut later = store.tpc_begin(b"", b"", b"").unwrap();
+                later.store(oid, second, b"d").unwrap();
+                voted
+                    .send(later.vote_resolving().map(|conflicts| conflicts.len()))
+                    .unwrap();
+            });
+            // The later vote waits while the first transaction resolves.
+            assert!(done.recv_timeout(Duration::from_millis(100)).is_err());
+            resolving.store(oid, second, b"bc").unwrap();
+            resolving.vote().unwrap();
+            resolving.finish().unwrap();
+            // Then the later vote gets the lock and sees the resolved
+            // commit as a conflict.
+            assert_eq!(done.recv().unwrap().unwrap(), 1);
+        });
+        assert!(store.lock_table_is_empty());
     }
 }
