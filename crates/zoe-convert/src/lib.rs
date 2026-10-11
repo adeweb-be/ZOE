@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use zoe_core::{Tid, ZoeError};
 
+mod blobs;
 mod filestorage;
 
 /// An error that stops a conversion.
