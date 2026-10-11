@@ -86,7 +86,8 @@ impl Failure {
             | ZoeError::Closed
             | ZoeError::Format(_)
             | ZoeError::ReadOnly
-            | ZoeError::NotClosedCleanly => message(storage_error(py), &self.error),
+            | ZoeError::NotClosedCleanly
+            | ZoeError::TooLarge { .. } => message(storage_error(py), &self.error),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }

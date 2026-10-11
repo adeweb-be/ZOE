@@ -30,6 +30,9 @@
 //! The staged records live in a staging buffer: in memory up to the
 //! `staging_memory` option of the store, and in a spill file under
 //! `staging/` beyond it. `staging` describes the buffer.
+//!
+//! `store` and `store_blob` check the size limits of the store before
+//! they stage anything.
 
 mod staging;
 
@@ -42,6 +45,7 @@ use crate::backend::{Record, TxnMeta, TxnStatus};
 use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
+use crate::guard::SizeLimit;
 use crate::lock::Mode;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -96,6 +100,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The current serial and the read serial of the stale oid that failed
     /// the last vote.
     conflict: Option<(Tid, Tid)>,
+    /// The sum of the lengths of the pickles that `store` and `store_blob`
+    /// staged. `max-transaction-size` limits it.
+    stored_bytes: u64,
 }
 
 /// What the serial check of a vote found.
@@ -134,6 +141,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             locks: None,
             resolving: BTreeSet::new(),
             conflict: None,
+            stored_bytes: 0,
         }
     }
 
@@ -186,15 +194,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// as a conflict. Then `serial` is the serial of the committed record.
     ///
     /// A blob that `store_blob` staged for `oid` stays, as in ZODB.
+    ///
+    /// A pickle longer than `max-record-size`, or a pickle that takes the
+    /// transaction past `max-transaction-size`, fails with `TooLarge`.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
-        self.check_store(oid, data)?;
+        let stored_bytes = self.check_store(oid, data)?;
         let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, data, false)
+        self.staged.put(area, oid, serial, data, false)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
     }
 
-    /// Check that `store` or `store_blob` can stage `data` for `oid`. A
-    /// refused call changes nothing.
-    fn check_store(&self, oid: Oid, data: &[u8]) -> Result<()> {
+    /// Check that `store` or `store_blob` can stage `data` for `oid`.
+    /// Return the new value of `stored_bytes`, with `data` in it. A refused
+    /// call changes nothing.
+    ///
+    /// The size limits come last, so a call out of order is `Protocol`,
+    /// whatever its size.
+    fn check_store(&self, oid: Oid, data: &[u8]) -> Result<u64> {
         self.check_thread()?;
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
@@ -207,7 +224,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if data.is_empty() {
             return Err(ZoeError::Protocol("store of an empty pickle"));
         }
-        check_oid(oid)
+        check_oid(oid)?;
+        let guardrails = &self.store.guardrails;
+        let size = data.len() as u64;
+        guardrails.check(SizeLimit::Record, oid, size)?;
+        // A pickle that replaces a stored pickle of the same oid counts
+        // once.
+        let stored_bytes = (self.stored_bytes - self.stored_len(oid)).saturating_add(size);
+        guardrails.check(SizeLimit::Transaction, oid, stored_bytes)?;
+        Ok(stored_bytes)
+    }
+
+    /// Return the length of the pickle that `store` or `store_blob` staged
+    /// for `oid`, or 0. A restored pickle does not count.
+    fn stored_len(&self, oid: Oid) -> u64 {
+        self.staged
+            .record(oid)
+            .filter(|staged| !staged.restored)
+            .map_or(0, |staged| staged.pickle_len() as u64)
     }
 
     /// Return the serial that the transaction read for `oid` and the pickle
@@ -233,13 +267,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// `file` must come from `new_blob_file` of this store. A file of
     /// another store is refused with `Protocol`, and a file of a closed
-    /// store with `Closed`. A refused call stages nothing and drops
-    /// `file`, which removes it.
+    /// store with `Closed`. A blob longer than `max-blob-size` fails with
+    /// `TooLarge`, before the sync. A refused call stages nothing and
+    /// drops `file`, which removes it.
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
-        self.check_store(oid, data)?;
+        let stored_bytes = self.check_store(oid, data)?;
+        self.store
+            .guardrails
+            .check(SizeLimit::Blob, oid, file.size())?;
         let blob = file.close(&self.store.backend)?;
         let area = &self.store.backend.staging;
         self.staged.put(area, oid, serial, data, false)?;
+        self.stored_bytes = stored_bytes;
         self.blobs.insert(oid, blob);
         Ok(())
     }
@@ -254,6 +293,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// A blob that `store_blob` staged for `oid` stays, unless `data` is a
     /// deletion: a deleted object has no blob.
+    ///
+    /// A restore copies a record as it is: it checks no size limit, and
+    /// its pickle does not count toward `max-transaction-size`.
     pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
         self.check_thread()?;
         if self.tid.is_none() {
@@ -264,9 +306,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         check_oid(oid)?;
         let current = self.current_serial(oid)?;
+        let stored_len = self.stored_len(oid);
         let area = &self.store.backend.staging;
         self.staged
             .put(area, oid, current, data.unwrap_or_default(), true)?;
+        self.stored_bytes -= stored_len;
         if data.is_none() {
             self.blobs.remove(&oid);
         }
@@ -1502,5 +1546,112 @@ mod tests {
         }
         assert!(!spills(&vfs));
         assert!(store.lock_table_is_empty());
+    }
+
+    /// Open a store in memory with `options`.
+    fn open_with(options: Options) -> Store {
+        Store::open_full(MemVfs::new(), SystemClock, options).unwrap()
+    }
+
+    #[test]
+    fn a_refused_store_stages_nothing() {
+        let store = open_with(Options {
+            max_record_size: Some(3),
+            ..Options::default()
+        });
+        let (kept, refused) = (Oid(1), Oid(2));
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(kept, Tid::ZERO, b"abc").unwrap();
+        for oid in [kept, refused] {
+            let error = txn.store(oid, Tid::ZERO, b"abcd").unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ZoeError::TooLarge {
+                        limit: SizeLimit::Record,
+                        size: 4,
+                        max: 3,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let (serial, data) = txn.staged(kept).unwrap().unwrap();
+        assert_eq!((serial, &*data), (Tid::ZERO, &b"abc"[..]));
+        assert!(txn.staged(refused).unwrap().is_none());
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(kept).unwrap(), (b"abc".to_vec(), tid));
+        assert!(matches!(
+            store.load(refused),
+            Err(ZoeError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn a_call_out_of_order_is_protocol_whatever_its_size() {
+        let store = open_with(Options {
+            max_record_size: Some(1),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        let error = txn.store(Oid(1), Tid::ZERO, b"too large");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_replaced_pickle_counts_once_toward_the_transaction_size() {
+        let store = open_with(Options {
+            max_transaction_size: Some(6),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcd").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcdef").unwrap();
+        let error = txn.store(Oid(2), Tid::ZERO, b"g").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ZoeError::TooLarge {
+                    oid: Oid(2),
+                    limit: SizeLimit::Transaction,
+                    size: 7,
+                    max: 6
+                }
+            ),
+            "{error:?}"
+        );
+        // A shorter pickle of the same oid makes room.
+        txn.store(Oid(1), Tid::ZERO, b"abcde").unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"g").unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+    }
+
+    #[test]
+    fn a_restore_checks_no_limit_and_does_not_count() {
+        let store = open_with(Options {
+            max_record_size: Some(3),
+            max_transaction_size: Some(3),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        txn.restore(Oid(1), Some(b"a copy over the limits"))
+            .unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"abc").unwrap();
+        let error = txn.store(Oid(3), Tid::ZERO, b"d");
+        assert!(
+            matches!(error, Err(ZoeError::TooLarge { size: 4, .. })),
+            "{error:?}"
+        );
+        // A restore of a stored oid takes its pickle out of the count.
+        txn.restore(Oid(2), Some(b"abc")).unwrap();
+        txn.store(Oid(3), Tid::ZERO, b"def").unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), Tid(100));
+        assert_eq!(store.load(Oid(1)).unwrap().0, b"a copy over the limits");
     }
 }

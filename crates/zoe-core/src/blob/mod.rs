@@ -455,6 +455,11 @@ pub struct BlobFile {
 }
 
 impl BlobFile {
+    /// Return the number of bytes written to the file.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Sync the file and return the blob, ready for a commit in `store`.
     ///
     /// A file of another store is refused with `Protocol`. Its temporary
@@ -590,7 +595,9 @@ impl Read for BlobReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::clock::SystemClock;
+    use crate::guard::SizeLimit;
+    use crate::store::{Options, Store};
     use crate::vfs::{CrashImage, MemVfs};
 
     const PICKLE: &[u8] = b"pickle";
@@ -675,6 +682,59 @@ mod tests {
         txn.abort();
         assert!(temp_files(&vfs).is_empty());
         assert!(vfs.names().iter().all(|name| !name.ends_with(".blob")));
+    }
+
+    #[test]
+    fn a_blob_over_a_size_limit_is_refused_and_its_file_removed() {
+        let vfs = MemVfs::new();
+        let options = Options {
+            max_record_size: Some(PICKLE.len() as u64),
+            max_blob_size: Some(4),
+            ..Options::default()
+        };
+        let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        // A blob one byte too long, then a pickle one byte too long.
+        for (pickle, bytes, limit, size) in [
+            (PICKLE, &b"abcde"[..], SizeLimit::Blob, 5),
+            (&b"pickles"[..], &b"abcd"[..], SizeLimit::Record, 7),
+        ] {
+            let error = txn
+                .store_blob(oid, Tid::ZERO, pickle, blob_file(&store, bytes))
+                .unwrap_err();
+            assert!(
+                matches!(error, ZoeError::TooLarge { limit: refused, size: s, max, .. }
+                    if refused == limit && s == size && max == size - 1),
+                "{error:?}"
+            );
+            assert!(temp_files(&vfs).is_empty());
+        }
+        assert!(txn.staged(oid).unwrap().is_none());
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"abcd"))
+            .unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn the_pickle_of_a_blob_counts_toward_the_transaction_size() {
+        let options = Options {
+            max_transaction_size: Some(PICKLE.len() as u64),
+            ..Options::default()
+        };
+        let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob(Oid(1), Tid::ZERO, PICKLE, blob_file(&store, &[7; 1000]))
+            .unwrap();
+        let error = txn.store(Oid(2), Tid::ZERO, b"a").unwrap_err();
+        let size = PICKLE.len() as u64 + 1;
+        assert!(
+            matches!(error, ZoeError::TooLarge { limit: SizeLimit::Transaction, size: s, .. }
+                if s == size),
+            "{error:?}"
+        );
     }
 
     #[test]
