@@ -189,15 +189,7 @@ impl Store {
             (at.min(last), last, watermark)
         };
         let _noting = Noting(&self.packing);
-        let mut pack = Pack {
-            store: self,
-            tid,
-            reachable: HashSet::new(),
-            written: HashSet::new(),
-            cursor: Some(Oid(0)),
-            watermark: (tid > watermark).then_some(tid),
-            report: PackReport::default(),
-        };
+        let mut pack = Pack::new(self, tid, (tid > watermark).then_some(tid));
         pack.mark_roots(last)?;
         loop {
             let removals = pack.plan(batch.max(1))?;
@@ -242,14 +234,29 @@ struct Pack<'s> {
     /// The oids that a finish wrote during the pack. Each has a record
     /// after T.
     written: HashSet<Oid>,
-    /// The first oid that the key scan has not finished. `None` at the end.
-    cursor: Option<Oid>,
+    /// The first key that the key scan has not selected or passed. `None`
+    /// at the end.
+    cursor: Option<(Oid, Tid)>,
     /// The watermark that the next batch writes, if it must write one.
     watermark: Option<Tid>,
     report: PackReport,
 }
 
-impl Pack<'_> {
+impl<'s> Pack<'s> {
+    /// Start a pack of `store` at `tid` with nothing marked. `watermark`
+    /// is the watermark that the first batch writes, if any.
+    fn new(store: &'s Store, tid: Tid, watermark: Option<Tid>) -> Self {
+        Pack {
+            store,
+            tid,
+            reachable: HashSet::new(),
+            written: HashSet::new(),
+            cursor: Some((Oid(0), Tid::ZERO)),
+            watermark,
+            report: PackReport::default(),
+        }
+    }
+
     /// Mark the root and each object that a record after T, up to `last`,
     /// refers to, and what they reach.
     fn mark_roots(&mut self, last: Tid) -> Result<()> {
@@ -330,11 +337,16 @@ impl Pack<'_> {
     }
 
     /// Select the next records to remove, at most `batch` of them, in key
-    /// order. Of a marked oid, every record at or before T but the newest
-    /// goes. Of another oid, every record at or before T goes.
+    /// order from the cursor. Of a marked oid, every record at or before T
+    /// but the newest goes. Of another oid, every record at or before T
+    /// goes.
+    ///
+    /// The cursor names the next key to select, so the scan does not
+    /// depend on the removal of the records that it selected before. A
+    /// pack and a dry run select the same records.
     fn plan(&mut self, batch: usize) -> Result<Vec<Removal>> {
         let mut removals = Vec::new();
-        while let Some(from) = self.cursor {
+        while let Some((from, first)) = self.cursor {
             let keys = self.store.backend.record_keys(from, KEY_CHUNK)?;
             if keys.is_empty() {
                 self.cursor = None;
@@ -349,23 +361,35 @@ impl Pack<'_> {
                     .collect();
                 let no_later = keys.iter().all(|&(_, tid)| tid <= self.tid);
                 let kept = self.reachable.contains(&oid);
-                let count = older.len() - usize::from(kept && !older.is_empty());
-                let room = batch - removals.len();
-                for &tid in older.iter().take(count.min(room)) {
+                let selected = &older[..older.len() - usize::from(kept && !older.is_empty())];
+                // Of the oid at the cursor, the records before the cursor
+                // are selected already.
+                let start = if oid == from { first } else { Tid::ZERO };
+                for &tid in selected.iter().filter(|&&tid| tid >= start) {
+                    if removals.len() == batch {
+                        self.cursor = Some((oid, tid));
+                        return Ok(removals);
+                    }
                     let newest = older.last() == Some(&tid);
                     removals.push(self.removal(oid, tid, newest, no_later)?);
                 }
-                if count > room {
-                    self.cursor = Some(oid);
-                    return Ok(removals);
-                }
-                self.cursor = oid.0.checked_add(1).map(Oid);
+                self.cursor = oid.0.checked_add(1).map(|next| (Oid(next), Tid::ZERO));
                 if removals.len() == batch {
                     return Ok(removals);
                 }
             }
         }
         Ok(removals)
+    }
+
+    /// Return the records of `planned` that the pack removes. A finish
+    /// can link an oid again after the plan. The mark then reaches it, and
+    /// its newest record at or before T stays.
+    fn confirm(&self, planned: Vec<Removal>) -> Vec<Removal> {
+        planned
+            .into_iter()
+            .filter(|r| !(r.newest && self.reachable.contains(&r.oid)))
+            .collect()
     }
 
     /// Read what the report needs of the record of `oid` at `tid`.
@@ -411,10 +435,7 @@ impl Pack<'_> {
             }
             // No finish runs from here to the commit below.
             self.mark_written()?;
-            let removed: Vec<Removal> = removals
-                .into_iter()
-                .filter(|r| !(r.newest && self.reachable.contains(&r.oid)))
-                .collect();
+            let removed = self.confirm(removals);
             self.commit(&removed, &mut sequencer)?;
             removed
         };
@@ -675,6 +696,74 @@ mod tests {
             )]
         );
         assert_eq!((report.records, report.objects), (3, 1), "{report:?}");
+    }
+
+    /// Write a store in `vfs` where `x` stays and `g` goes, each with `n`
+    /// records.
+    fn revisions(vfs: MemVfs, n: usize) -> Store {
+        let store = Store::open_vfs(vfs).unwrap();
+        let (x, g) = (Oid(1), Oid(2));
+        commit(&store, &[(ROOT, record(&[x, g]))]);
+        for _ in 0..n {
+            commit(&store, &[(x, record(&[])), (g, record(&[]))]);
+        }
+        commit(&store, &[(ROOT, record(&[x]))]);
+        store
+    }
+
+    /// The key of each record that the plans of a pack at `tid` select in
+    /// batches of `batch`, with nothing removed between them.
+    fn selected(store: &Store, tid: Tid, batch: usize) -> Vec<(Oid, Tid)> {
+        let mut pack = Pack::new(store, tid, None);
+        pack.mark_roots(store.last_transaction()).unwrap();
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let planned = pack.plan(batch).unwrap();
+            if planned.is_empty() {
+                return keys;
+            }
+            assert!(planned.len() <= batch);
+            for removal in planned {
+                let key = (removal.oid, removal.tid);
+                assert!(seen.insert(key), "the plan selects {key:?} twice");
+                keys.push(key);
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_selects_each_record_once_when_nothing_removes_them() {
+        let store = revisions(MemVfs::new(), 5);
+        let last = store.last_transaction();
+        let all = selected(&store, last, usize::MAX);
+        // The old root, four records of x and five of g.
+        assert_eq!(all.len(), 10, "{all:?}");
+        for batch in [1, 2, 3, 4, 9] {
+            assert_eq!(selected(&store, last, batch), all, "batch {batch}");
+        }
+    }
+
+    #[test]
+    fn a_pack_in_small_batches_removes_what_one_batch_removes() {
+        let built = MemVfs::new();
+        let store = revisions(built.clone(), 5);
+        let last = store.last_transaction();
+        drop(store);
+        let packed = |batch| {
+            let store = Store::open_vfs(built.durable_copy()).unwrap();
+            let report = store.pack_in_batches(last, batch, || {}).unwrap();
+            (report, transactions(&store))
+        };
+        let (report, left) = packed(1000);
+        assert_eq!((report.records, report.objects), (10, 1), "{report:?}");
+        for batch in [1, 2, 3, 4] {
+            assert_eq!(
+                packed(batch),
+                (report.clone(), left.clone()),
+                "batch {batch}"
+            );
+        }
     }
 
     #[test]
