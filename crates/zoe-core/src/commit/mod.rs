@@ -67,6 +67,12 @@ pub struct Finished {
 ///
 /// Dropping a transaction aborts it.
 pub struct Txn<S: Deref<Target = Store>> {
+    /// The blob files of the staged oids that have one.
+    ///
+    /// The fields drop in the order of their declaration. The blobs drop
+    /// before `store`, so a transaction that holds the last share of its
+    /// store still removes their temporary files.
+    blobs: BTreeMap<Oid, PendingBlob>,
     store: S,
     /// The thread that began the transaction.
     thread: ThreadId,
@@ -76,8 +82,6 @@ pub struct Txn<S: Deref<Target = Store>> {
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
-    /// The blob files of the staged oids that have one.
-    blobs: BTreeMap<Oid, PendingBlob>,
     staged: BTreeMap<Oid, Staged>,
     /// The oids that the transaction read as current, with the serial that
     /// it read.
@@ -117,13 +121,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// Begin a transaction on `store`, driven by the calling thread.
     pub fn begin(store: S, user: &[u8], description: &[u8], extension: &[u8]) -> Self {
         Self {
+            blobs: BTreeMap::new(),
             store,
             thread: thread::current().id(),
             tid: None,
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
-            blobs: BTreeMap::new(),
             staged: BTreeMap::new(),
             read_current: BTreeMap::new(),
             locks: None,

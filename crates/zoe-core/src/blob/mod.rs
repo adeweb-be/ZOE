@@ -676,6 +676,21 @@ mod tests {
     }
 
     #[test]
+    fn the_last_share_of_a_store_removes_the_staged_blob_files() {
+        let vfs = MemVfs::new();
+        let store = std::sync::Arc::new(Store::open_vfs(vfs.clone()).unwrap());
+        let oid = store.new_oid().unwrap();
+        let mut txn = crate::commit::Txn::begin(std::sync::Arc::clone(&store), b"", b"", b"");
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"blob"))
+            .unwrap();
+        // The transaction holds the last share of the store.
+        drop(store);
+        assert_eq!(temp_files(&vfs).len(), 1);
+        drop(txn);
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
     fn a_transaction_that_shares_its_store_commits_a_blob() {
         let store = std::sync::Arc::new(Store::open_vfs(MemVfs::new()).unwrap());
         let oid = store.new_oid().unwrap();
