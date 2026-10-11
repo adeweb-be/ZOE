@@ -230,6 +230,11 @@ def test_the_uri_takes_only_an_absolute_path(uri):
         zodburi.resolve_uri(uri)
 
 
+def test_the_uri_refuses_a_repeated_key(tmp_path):
+    with pytest.raises(ValueError, match="lock-timeout more than once"):
+        zodburi.resolve_uri(f"zoe://{tmp_path}?lock-timeout=1&lock-timeout=5")
+
+
 def test_the_uri_does_not_take_path_in_the_query(tmp_path):
     with pytest.raises(KeyError):
         zodburi.resolve_uri(f"zoe://{tmp_path}?path={tmp_path}")

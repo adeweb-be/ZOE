@@ -107,8 +107,8 @@ def resolve_uri(uri):
 
     The URI is `zoe:///absolute/path?key=value&...`. The path of the URI is
     the path of the store. The query takes the keys of the section, except
-    path. The other query keys go to zodburi, which takes the keys of the
-    database, such as `database_name`, and refuses the rest.
+    path, each at most once. The other query keys go to zodburi, which takes
+    the keys of the database, such as `database_name`, and refuses the rest.
     """
     parts = urllib.parse.urlsplit(uri)
     path = urllib.parse.unquote(parts.path)
@@ -118,6 +118,8 @@ def resolve_uri(uri):
     rest = {}
     for name, text in urllib.parse.parse_qsl(parts.query):
         if name in KEYS and name != "path":
+            if name in settings:
+                raise ValueError(f"{uri!r} gives {name} more than once")
             settings[name] = convert(name, text, f"{name}={text!r}")
         else:
             rest[name] = text
