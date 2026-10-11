@@ -87,8 +87,8 @@ pub enum FrameError {
         value: u8,
     },
     /// The payload does not decode with its codec. For zstd, the payload is
-    /// not one zstd frame, does not state the data length, states 0 bytes or
-    /// a length over the bound, or decodes to another length.
+    /// not one standard zstd frame, does not state the data length, states
+    /// 0 bytes or a length over the bound, or decodes to another length.
     Payload,
 }
 

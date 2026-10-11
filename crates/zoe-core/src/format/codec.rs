@@ -35,6 +35,9 @@ const MAX_DATA_LEN: u64 = u32::MAX as u64;
 /// smallest zstd block is 4 bytes, and one block gives at most 128 KiB.
 const ZSTD_MAX_EXPANSION: u64 = 32 * 1024;
 
+/// The magic number that starts a standard zstd frame, as stored.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
 /// How the payload of a frame holds the data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -140,6 +143,12 @@ fn unzstd(stored: &[u8]) -> Result<Vec<u8>, FrameError> {
 /// Return the data length that the zstd payload `stored` states, after the
 /// checks.
 fn zstd_data_len(stored: &[u8]) -> Result<usize, FrameError> {
+    // The payload is a standard zstd frame. This check does not depend on
+    // the build of libzstd, so a skippable frame or a frame of a legacy
+    // format is refused with every build.
+    if !stored.starts_with(&ZSTD_MAGIC) {
+        return Err(FrameError::Payload);
+    }
     // The payload is exactly one zstd frame, with no bytes after it.
     if zstd_safe::find_frame_compressed_size(stored) != Ok(stored.len()) {
         return Err(FrameError::Payload);
@@ -206,7 +215,8 @@ mod tests {
     /// magic number, a descriptor for a single segment with an 8-byte
     /// size, then the size.
     fn zstd_header(len: u64) -> Vec<u8> {
-        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
+        let mut frame = ZSTD_MAGIC.to_vec();
+        frame.push(0xe0);
         frame.extend_from_slice(&len.to_le_bytes());
         frame
     }
@@ -360,7 +370,9 @@ mod tests {
         let two = [&frame[..], &frame[..]].concat();
         let trailing = [&frame[..], b"x"].concat();
         let short = &frame[..frame.len() - 1];
-        for bad in [&two[..], &trailing[..], short, b"pickle", b""] {
+        // The magic number of the legacy zstd format 0.7.
+        let legacy = [&[0x27], &frame[1..]].concat();
+        for bad in [&two[..], &trailing[..], short, &legacy[..], b"pickle", b""] {
             assert_eq!(decode(Codec::Zstd, bad), Err(FrameError::Payload));
         }
     }
