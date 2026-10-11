@@ -1,9 +1,11 @@
 //! The redb backend.
 //!
 //! Four tables hold the key spaces of the data model: `records`, `blobs`,
-//! `txns` and `meta`. `format` says how keys and values are written. A
-//! store without the `blobs` table has no blob records. The first write of
-//! a blob record creates the table.
+//! `txns` and `meta`. `format` says how keys and values are written.
+//! `initialise` creates all four, so a new store has an empty `blobs`
+//! table. A store written before the `blobs` table has none until its
+//! first blob commit creates it. Until then it reads as a store without
+//! blob records.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
