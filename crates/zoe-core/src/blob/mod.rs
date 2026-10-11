@@ -50,6 +50,7 @@ pub(crate) trait BlobDir: Send + Sync {
     fn sync_dir_at(&self, dir: &str) -> io::Result<()>;
     fn create_dir(&self, name: &str) -> io::Result<()>;
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>>;
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
     fn sync_file(&self, name: &str) -> io::Result<()>;
@@ -80,6 +81,10 @@ impl<V: Vfs> BlobDir for V {
 
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         Vfs::list_files(self, dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        Vfs::list_entries(self, dir)
     }
 
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
@@ -183,6 +188,11 @@ impl BlobDir for Relocated {
         dir.list_files(&name)
     }
 
+    fn list_entries(&self, name: &str) -> io::Result<Vec<String>> {
+        let (dir, name) = self.locate(name);
+        dir.list_entries(&name)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
         let (dir, name) = self.locate(name);
         dir.create_file(&name)
@@ -235,39 +245,80 @@ impl BlobStore {
     /// Check the blob store when the store opens.
     ///
     /// The layout file must name the bushy layout. A writer refuses a blob
-    /// directory without a layout file when `backend` has blob records,
-    /// with `MissingBlobDir`: it is not the blob directory of the store.
-    /// Then the leftovers of a crash in `blobs/tmp/` are removed: the blob
-    /// files that an intent file names and that `backend` has no blob
-    /// record for, the intent files and the temporary files.
+    /// directory without a layout file in two cases. When `backend` has
+    /// blob records, it is not the blob directory of the store:
+    /// `MissingBlobDir`. When the directory holds files of another
+    /// program, the store must not take it: `NotBlobDir`.
+    ///
+    /// Then a writer removes the leftovers of a crash in `blobs/tmp/`: the
+    /// blob files that an intent file names and that `backend` has no blob
+    /// record for, the intent files and the temporary files. It does this
+    /// only when the layout file exists. The first blob writes the layout
+    /// file before any intent file or temporary file, so a directory
+    /// without it holds none, and its other files are never removed.
     ///
     /// A read-only store only reads the layout file and changes nothing.
     /// It leaves the leftovers of a crash to the next writer. A blob file
     /// that a crash left without its blob record stays invisible, because
     /// every blob read starts from the blob record.
     pub(crate) fn open(&self, backend: &dyn Backend, read_only: bool) -> Result<()> {
-        if self.dir.exists(LAYOUT_FILE)? {
-            let mut layout = String::new();
-            self.dir
-                .read_file(LAYOUT_FILE)?
-                .read_to_string(&mut layout)?;
-            if layout.trim() != LAYOUT {
+        let layout = self.dir.exists(LAYOUT_FILE)?;
+        if layout {
+            let mut text = String::new();
+            self.dir.read_file(LAYOUT_FILE)?.read_to_string(&mut text)?;
+            if text.trim() != LAYOUT {
                 return Err(ZoeError::Format(format!(
                     "blob layout {:?}: only {LAYOUT:?} is supported",
-                    layout.trim()
+                    text.trim()
                 )));
             }
-        } else if !read_only && backend.has_blobs()? {
-            // The first blob of a store makes its layout file durable
-            // before any blob record.
-            return Err(ZoeError::MissingBlobDir {
-                path: self.dir.path(BLOB_DIR),
-            });
         }
-        if !read_only && self.dir.exists(TMP_DIR)? {
+        if read_only {
+            return Ok(());
+        }
+        if !layout {
+            if backend.has_blobs()? {
+                // The first blob of a store makes its layout file durable
+                // before any blob record.
+                return Err(ZoeError::MissingBlobDir {
+                    path: self.dir.path(BLOB_DIR),
+                });
+            }
+            return self.check_new();
+        }
+        if self.dir.exists(TMP_DIR)? {
             self.recover(backend)?;
         }
         Ok(())
+    }
+
+    /// Check that a blob directory without a layout file holds no file of
+    /// another program, and fail with `NotBlobDir` when it does. A missing
+    /// directory passes. A directory passes when it is empty, or when it
+    /// holds only `tmp/`, empty or with only the new layout file: the first
+    /// blob of a store creates these before the layout file.
+    fn check_new(&self) -> Result<()> {
+        if !self.dir.exists(BLOB_DIR)? {
+            return Ok(());
+        }
+        let tmp = &TMP_DIR[BLOB_DIR.len() + 1..];
+        let new_layout = &NEW_LAYOUT_FILE[TMP_DIR.len() + 1..];
+        let fresh = match &self.dir.list_entries(BLOB_DIR)?[..] {
+            [] => true,
+            [name] if name == tmp && !self.dir.list_files(BLOB_DIR)?.contains(name) => {
+                let entries = self.dir.list_entries(TMP_DIR)?;
+                entries.is_empty()
+                    || (entries == [new_layout] && self.dir.list_files(TMP_DIR)? == [new_layout])
+            }
+            _ => false,
+        };
+        if fresh {
+            Ok(())
+        } else {
+            Err(ZoeError::NotBlobDir {
+                path: self.dir.path(BLOB_DIR),
+            })
+        }
     }
 
     /// Remove the leftovers of a crash in `blobs/tmp/`. Only regular
@@ -357,6 +408,11 @@ impl BlobStore {
             self.dir.create_dir(BLOB_DIR)?;
         }
         self.dir.sync_dir_at(parent(BLOB_DIR))?;
+        // The directory can come after the open. A layout file goes only
+        // into a directory that holds no file of another program.
+        if !self.dir.exists(LAYOUT_FILE)? {
+            self.check_new()?;
+        }
         if !self.dir.exists(TMP_DIR)? {
             self.dir.create_dir(TMP_DIR)?;
         }
@@ -370,6 +426,11 @@ impl BlobStore {
             file.write_all(LAYOUT.as_bytes())?;
             file.sync()?;
             drop(file);
+            // The creation is durable before the rename. So the sync of
+            // `blobs/` below makes the layout file durable, before any
+            // temporary file or intent file exists: the open recovers only
+            // a directory with a layout file.
+            self.dir.sync_dir_at(TMP_DIR)?;
             self.dir.rename(NEW_LAYOUT_FILE, LAYOUT_FILE)?;
         }
         self.dir.sync_dir_at(BLOB_DIR)?;
@@ -2004,6 +2065,101 @@ mod tests {
         drop(file);
         let store = Store::open_relocated(vfs, parent, "elsewhere").unwrap();
         assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
+    }
+
+    /// Write the file `name` of `vfs`, with its missing directories.
+    fn put(vfs: &MemVfs, name: &str, bytes: &[u8]) {
+        let mut dir = String::new();
+        for part in name.split('/').collect::<Vec<_>>().split_last().unwrap().1 {
+            dir = if dir.is_empty() {
+                (*part).to_owned()
+            } else {
+                format!("{dir}/{part}")
+            };
+            if !Vfs::exists(vfs, &dir).unwrap() {
+                Vfs::create_dir(vfs, &dir).unwrap();
+            }
+        }
+        let mut file = Vfs::create_file(vfs, name).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn a_writer_refuses_a_blob_directory_with_other_files() {
+        for files in [
+            &["elsewhere/tmp/report.txt"][..],
+            &["elsewhere/notes.txt"],
+            &["elsewhere/sub/notes.txt"],
+            &["elsewhere/tmp"],
+            &["elsewhere/tmp/layout.tmp", "elsewhere/tmp/report.txt"],
+        ] {
+            let parent = MemVfs::new();
+            for name in files {
+                put(&parent, name, b"theirs");
+            }
+            // Each open refuses the directory and removes nothing.
+            for _ in 0..2 {
+                let result = Store::open_relocated(MemVfs::new(), parent.clone(), "elsewhere");
+                assert!(
+                    matches!(result, Err(ZoeError::NotBlobDir { .. })),
+                    "{files:?}: {:?}",
+                    result.err()
+                );
+                for name in files {
+                    assert_eq!(contents(&parent, name), b"theirs", "{name}");
+                }
+            }
+        }
+
+        // The same holds for the blob directory in the store directory.
+        let vfs = MemVfs::new();
+        put(&vfs, "blobs/tmp/report.txt", b"theirs");
+        assert!(matches!(
+            Store::open_vfs(vfs.clone()),
+            Err(ZoeError::NotBlobDir { .. })
+        ));
+        assert_eq!(contents(&vfs, "blobs/tmp/report.txt"), b"theirs");
+    }
+
+    /// A directory that the first blob of a store left without its layout
+    /// file is still a blob directory: empty, with an empty `tmp/`, or with
+    /// only the new layout file in `tmp/`.
+    #[test]
+    fn a_blob_directory_that_a_first_blob_left_opens() {
+        for files in [&[][..], &["elsewhere/tmp/layout.tmp"]] {
+            let parent = MemVfs::new();
+            Vfs::create_dir(&parent, "elsewhere").unwrap();
+            Vfs::create_dir(&parent, "elsewhere/tmp").unwrap();
+            for name in files {
+                put(&parent, name, b"bus");
+            }
+            let store = Store::open_relocated(MemVfs::new(), parent.clone(), "elsewhere").unwrap();
+            let (oid, tid) = commit_new_blob(&store, b"blob");
+            assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
+            assert_eq!(contents(&parent, "elsewhere/.layout"), LAYOUT.as_bytes());
+            assert!(!Vfs::exists(&parent, "elsewhere/tmp/layout.tmp").unwrap());
+        }
+    }
+
+    /// A blob directory that another program fills after the open gets no
+    /// layout file: the first blob fails, and the files stay.
+    #[test]
+    fn a_first_blob_refuses_a_directory_filled_after_the_open() {
+        let parent = MemVfs::new();
+        let store = Store::open_relocated(MemVfs::new(), parent.clone(), "elsewhere").unwrap();
+        put(&parent, "elsewhere/tmp/report.txt", b"theirs");
+        assert!(matches!(
+            store.new_blob_file(),
+            Err(ZoeError::NotBlobDir { .. })
+        ));
+        assert!(
+            !Vfs::exists(
+                &parent,
+                LAYOUT_FILE.replacen(BLOB_DIR, "elsewhere", 1).as_str()
+            )
+            .unwrap()
+        );
+        assert_eq!(contents(&parent, "elsewhere/tmp/report.txt"), b"theirs");
     }
 
     #[test]

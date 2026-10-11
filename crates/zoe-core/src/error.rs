@@ -152,6 +152,20 @@ pub enum ZoeError {
         path: PathBuf,
     },
 
+    /// The blob directory has no layout file, and it holds files of
+    /// another program. A writer open refuses it, so that the recovery of
+    /// the blob store never removes those files. A blob directory without
+    /// a layout file can hold only an empty `tmp/`, or a `tmp/` with only
+    /// the new layout file that a stopped first blob left.
+    #[error(
+        "the blob directory {} has no layout file and holds other files: give an empty or a missing directory",
+        path.display()
+    )]
+    NotBlobDir {
+        /// The blob directory.
+        path: PathBuf,
+    },
+
     /// The store is not in a format that this code reads. Pack also gives
     /// it for a record whose persistent references it cannot read: the
     /// text then names the oid and the tid of the record.
