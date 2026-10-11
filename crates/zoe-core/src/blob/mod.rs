@@ -3,7 +3,10 @@
 //!
 //! A new blob goes into a temporary file in `blobs/tmp/`. The file
 //! computes the BLAKE3 hash of the bytes while they are written.
-//! `store_blob` syncs the file. `finish` places the blobs before the
+//! `store_blob` syncs the file. A client can also write the file itself in
+//! `blobs/tmp/` and give its path: `store_blob_at` syncs the file, renames
+//! it to a temporary name of the core and computes its hash. The core never
+//! copies the file. `finish` places the blobs before the
 //! backend commit: it writes and syncs an intent file that names the tid
 //! and the oids, renames each blob file into its place, and syncs each
 //! directory. The blob record holds the hash and the size, in the same
@@ -24,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -49,6 +52,7 @@ pub(crate) trait BlobDir: Send + Sync {
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
+    fn sync_file(&self, name: &str) -> io::Result<()>;
     fn set_read_only(&self, name: &str) -> io::Result<()>;
     fn path(&self, name: &str) -> PathBuf;
 }
@@ -84,6 +88,10 @@ impl<V: Vfs> BlobDir for V {
 
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
         Vfs::read_file(self, name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        Vfs::sync_file(self, name)
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
@@ -267,11 +275,17 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Return a new name for a temporary file in `blobs/tmp/`. The core
+    /// gives only names of this form to its temporary files.
+    fn new_temp_name(&self) -> String {
+        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
+        format!("{TMP_DIR}/{n}.tmp")
+    }
+
     /// Return a new temporary file for a blob of the store `store`.
     pub(crate) fn new_file(&self, store: Weak<Opened>) -> Result<BlobFile> {
         self.make_ready()?;
-        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{TMP_DIR}/{n}.tmp");
+        let name = self.new_temp_name();
         let file = self.dir.create_file(&name)?;
         Ok(BlobFile {
             store,
@@ -279,6 +293,84 @@ impl BlobStore {
             file: Some(file),
             hasher: blake3::Hasher::new(),
             size: 0,
+        })
+    }
+
+    /// Return the path of `blobs/tmp/`. Create the blob store when it does
+    /// not exist.
+    pub(crate) fn temp_dir(&self) -> Result<PathBuf> {
+        self.make_ready()?;
+        Ok(self.dir.path(TMP_DIR))
+    }
+
+    /// Take the file at `path` for a blob of the store `store`, and return
+    /// the blob.
+    ///
+    /// The file must be a regular file in `blobs/tmp/` or in one of its
+    /// subdirectories. The call syncs the file. It syncs the directory of a
+    /// file in a subdirectory, so that the creation of the file is durable.
+    /// Then it renames the file to a new temporary name in `blobs/tmp/` and
+    /// computes the BLAKE3 hash of the file. So the file is durable before
+    /// the intent file of the finish, as a file from `new_file` is.
+    ///
+    /// A path outside `blobs/tmp/`, or the name of a file that the core
+    /// makes in `blobs/tmp/`, is refused with `Protocol`. An error before
+    /// the rename leaves the file in its place. After the rename, the blob
+    /// owns the file: an error drops the blob, and that removes the file.
+    pub(crate) fn take(&self, store: Weak<Opened>, path: &Path) -> Result<PendingBlob> {
+        self.make_ready()?;
+        let name = self.temp_name(path).ok_or(ZoeError::Protocol(
+            "the blob file is not in the blob temporary directory",
+        ))?;
+        self.dir.sync_file(&name)?;
+        let dir = parent(&name);
+        if dir != TMP_DIR {
+            self.dir.sync_dir_at(dir)?;
+        }
+        let temp = self.new_temp_name();
+        self.dir.rename(&name, &temp)?;
+        let mut blob = PendingBlob {
+            store,
+            temp: Some(temp.clone()),
+            record: BlobRecord {
+                hash: [0; 32],
+                size: 0,
+            },
+        };
+        blob.record = self.hash(&temp)?;
+        Ok(blob)
+    }
+
+    /// Return the name of the file at `path` in `blobs/tmp/`. Return `None`
+    /// when `path` is not in `blobs/tmp/`, or when it names a file that the
+    /// core makes there: a temporary file, an intent file or the new
+    /// layout file. Only a file in a subdirectory can have any name.
+    fn temp_name(&self, path: &Path) -> Option<String> {
+        let rest = path.strip_prefix(self.dir.path(TMP_DIR)).ok()?;
+        let mut parts = Vec::new();
+        for component in rest.components() {
+            match component {
+                Component::Normal(part) => parts.push(part.to_str()?),
+                _ => return None,
+            }
+        }
+        let name = format!("{TMP_DIR}/{}", parts.join("/"));
+        let own = match parts[..] {
+            [] => true,
+            [file] => is_temp_name(file) || intent_tid(file).is_some() || name == NEW_LAYOUT_FILE,
+            _ => false,
+        };
+        (!own).then_some(name)
+    }
+
+    /// Read the file `name` and return its blob record: the BLAKE3 hash and
+    /// the size of its bytes.
+    fn hash(&self, name: &str) -> Result<BlobRecord> {
+        let mut hasher = blake3::Hasher::new();
+        let size = io::copy(&mut self.dir.read_file(name)?, &mut hasher)?;
+        Ok(BlobRecord {
+            hash: *hasher.finalize().as_bytes(),
+            size,
         })
     }
 
@@ -416,6 +508,13 @@ impl BlobStore {
     pub(crate) fn path(&self, oid: Oid, tid: Tid) -> PathBuf {
         self.dir.path(&blob_name(oid, tid))
     }
+}
+
+/// Tell if `file`, a name in `blobs/tmp/`, has the form of a temporary file
+/// of the core: digits, then `.tmp`.
+fn is_temp_name(file: &str) -> bool {
+    file.strip_suffix(".tmp")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Return the 8 levels of the directory of `oid`, from the top down:
@@ -1359,6 +1458,7 @@ mod tests {
         let orphan_blob = store.open_blob(orphan, crashed);
         assert!(matches!(orphan_blob, Err(ZoeError::NotFound { .. })));
         assert!(matches!(store.new_blob_file(), Err(ZoeError::ReadOnly)));
+        assert!(matches!(store.blob_temp_dir(), Err(ZoeError::ReadOnly)));
         drop(store);
         assert_eq!(tree(&dir.join(BLOB_DIR)), before);
 
@@ -1379,5 +1479,171 @@ mod tests {
         drop(file);
         Store::open_vfs(vfs.clone()).unwrap();
         assert!(Vfs::exists(&vfs, &format!("{TMP_DIR}/stray/f")).unwrap());
+    }
+
+    /// Write `bytes` into the new file `name`, without a sync, as a client
+    /// writes a blob in the temporary directory. Return the path.
+    fn client_file(vfs: &MemVfs, name: &str, bytes: &[u8]) -> PathBuf {
+        let mut file = Vfs::create_file(vfs, name).unwrap();
+        file.write_all(bytes).unwrap();
+        PathBuf::from(name)
+    }
+
+    /// Return the bytes of the file `name`.
+    fn contents(vfs: &MemVfs, name: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Vfs::read_file(vfs, name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_file_of_the_temporary_directory_commits_by_its_path() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        assert_eq!(store.blob_temp_dir().unwrap(), PathBuf::from(TMP_DIR));
+        Vfs::create_dir(&vfs, &format!("{TMP_DIR}/sub")).unwrap();
+        let direct = client_file(&vfs, &format!("{TMP_DIR}/direct"), b"direct");
+        let nested = client_file(&vfs, &format!("{TMP_DIR}/sub/nested"), b"nested");
+        let oids = [store.new_oid().unwrap(), store.new_oid().unwrap()];
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob_at(oids[0], Tid::ZERO, PICKLE, &direct)
+            .unwrap();
+        txn.store_blob_at(oids[1], Tid::ZERO, PICKLE, &nested)
+            .unwrap();
+        // The transaction took the files: they have temporary names of the
+        // core now.
+        assert!(!Vfs::exists(&vfs, &format!("{TMP_DIR}/direct")).unwrap());
+        assert_eq!(temp_files(&vfs).len(), 2);
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        assert_eq!(read(&store, oids[0], tid).unwrap(), b"direct");
+        assert_eq!(read(&store, oids[1], tid).unwrap(), b"nested");
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn an_abort_removes_a_taken_file() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        store.blob_temp_dir().unwrap();
+        let path = client_file(&vfs, &format!("{TMP_DIR}/client"), b"client");
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path).unwrap();
+        assert_eq!(temp_files(&vfs).len(), 1);
+        txn.abort();
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_refused_take_leaves_the_file_in_its_place() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        store.blob_temp_dir().unwrap();
+        let name = format!("{TMP_DIR}/client");
+        let path = client_file(&vfs, &name, b"client");
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path))
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(refused, Err(ZoeError::WrongThread)), "{refused:?}");
+        for (oid, data) in [(oid, &b""[..]), (Oid(u64::MAX), PICKLE)] {
+            let refused = txn.store_blob_at(oid, Tid::ZERO, data, &path);
+            assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+        }
+        // A path outside the temporary directory, or a name that the core
+        // makes there, is refused.
+        let intent = intent_name(Tid(9));
+        for outside in [
+            "client",
+            "blobs/client",
+            TMP_DIR,
+            "blobs/tmp/../client",
+            "blobs/tmp/7.tmp",
+            &intent,
+            NEW_LAYOUT_FILE,
+        ] {
+            let refused = txn.store_blob_at(oid, Tid::ZERO, PICKLE, Path::new(outside));
+            assert!(
+                matches!(refused, Err(ZoeError::Protocol(_))),
+                "{outside}: {refused:?}"
+            );
+        }
+        txn.store(oid, Tid::ZERO, PICKLE).unwrap();
+        txn.vote().unwrap();
+        let refused = txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path);
+        assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+        txn.abort();
+
+        assert_eq!(contents(&vfs, &name), b"client");
+        assert!(store.lock_table_is_empty());
+    }
+
+    /// No crash image of the commit of a taken file keeps a blob file
+    /// without its blob record, and each image after the acknowledgement
+    /// keeps the blob. The file can be in a subdirectory of `blobs/tmp/`.
+    #[test]
+    fn every_crash_image_of_a_taken_blob_opens_without_an_orphan() {
+        for name in ["blobs/tmp/client", "blobs/tmp/sub/client"] {
+            let vfs = empty_store();
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let oid = store.new_oid().unwrap();
+            store.blob_temp_dir().unwrap();
+            if parent(name) != TMP_DIR {
+                Vfs::create_dir(&vfs, parent(name)).unwrap();
+            }
+            let path = client_file(&vfs, name, b"taken");
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path).unwrap();
+            txn.vote().unwrap();
+            let tid = txn.finish().unwrap();
+            vfs.mark("acknowledged");
+            drop(store);
+            check_images(&vfs, oid, tid, b"taken");
+        }
+    }
+
+    #[test]
+    fn a_taken_file_keeps_its_inode_and_a_link_is_refused() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let dir = std::env::temp_dir().join(format!("zoe-blob-take-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let tmp = store.blob_temp_dir().unwrap();
+        assert_eq!(tmp, dir.join(TMP_DIR));
+        let path = tmp.join("client");
+        std::fs::write(&path, b"client").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, tmp.join("link")).unwrap();
+
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let refused = txn.store_blob_at(oid, Tid::ZERO, PICKLE, &tmp.join("link"));
+        assert!(matches!(refused, Err(ZoeError::Io(_))), "{refused:?}");
+        txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path).unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        let committed = std::fs::metadata(store.blob_path(oid, tid).unwrap()).unwrap();
+        assert_eq!(committed.ino(), inode);
+        assert!(committed.permissions().readonly());
+        assert!(!path.exists());
+        assert!(tmp.join("link").is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
