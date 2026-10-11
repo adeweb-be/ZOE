@@ -28,3 +28,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0022](0022-narrow-red-zones.md) | Red zones: the on-disk format, pack and the process files |
 | [0023](0023-blob-record.md) | The blob record |
 | [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record |
+| [0027](0027-blob-directory.md) | The blob directory is an option of the core |
