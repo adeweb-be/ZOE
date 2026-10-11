@@ -85,6 +85,11 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - A crash at any point of a pack leaves a store that opens without repair. Each batch is one backend write transaction. A later pack at the same tid removes what the crashed pack left.
 - The mark holds the set of reachable oids in memory, so the memory of a pack grows with the number of objects.
 - `Backend::pack` is not used. Pack goes through `Backend::record_keys`, `Backend::pack_watermark` and the removal methods of `WriteTxn`.
+- An error of the backend write of a pack batch leaves its outcome unknown, so the pack empties the commit sequencer, as a failed `finish` does. Every later finish and pack fails with `Halted` until the store is reopened.
+- A record that fails its checksum stops the pack with `CorruptRecord`, which names its oid and tid, also when nothing reaches the record. A pack never deletes the evidence of a corruption.
+- `replace_txn` keeps the branch id and the previous serial of the row that it rewrites. It refuses a row with typed-field slots with `Format`, because it cannot write them.
+- The report reads the class of a removed record from its class pickle alone (`zoe_pickle::decode_class_name`). Only `persistent_ids` decodes a whole record, one record at a time.
+- ADR 0025 records the decisions of pack.
 - Every writable open syncs the store directory, also when `zoe.redb` exists, so a creation or a rename that an earlier open left unsynced becomes durable before the open acknowledges anything.
 - A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename, and the leftovers of an unfinished commit: the blob files in the tree that an intent file names and that have no blob record, then the files in `blobs/tmp/`.
 - `next_oid` in `meta` is always greater than every committed oid.
