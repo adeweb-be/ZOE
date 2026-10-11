@@ -17,7 +17,9 @@ pub enum ZoeError {
     },
 
     /// The checksum of a stored record does not match its bytes, or its
-    /// payload does not decode.
+    /// payload does not decode, or a scan for the oid gave the key of the
+    /// tid outside the scan or out of order. The last case is a damaged
+    /// index of the database.
     #[error("corrupt record: oid {oid:?}, tid {tid:?}")]
     CorruptRecord {
         /// The object id of the record.
@@ -38,7 +40,9 @@ pub enum ZoeError {
 
     /// The checksum of a transaction row does not match its bytes, or its
     /// payload does not decode, or a record has no transaction row, or the
-    /// records of a transaction do not match the oid count of its row.
+    /// records of a transaction do not match the oid count of its row, or a
+    /// scan of the rows gave the key of the tid outside the scan or out of
+    /// order.
     #[error("corrupt transaction row: tid {tid:?}")]
     CorruptTxn {
         /// The transaction id of the row.
