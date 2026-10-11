@@ -113,7 +113,8 @@ plone scenario="zoe" command="start":
     # these two. It never goes on a command line or into a file of the
     # build: buildout gets only the user name.
     if [ -n "${ZOE_PLONE_ADMIN:-}" ]; then
-        user="${ZOE_PLONE_ADMIN%%:*}"
+        admin="$ZOE_PLONE_ADMIN"
+        source=ZOE_PLONE_ADMIN
     else
         export ZOE_PLONE_ADMIN_FILE="$target/admin"
         if [ ! -s "$ZOE_PLONE_ADMIN_FILE" ]; then
@@ -122,9 +123,19 @@ plone scenario="zoe" command="start":
                 'import secrets, sys; print(sys.argv[1] + ":" + secrets.token_urlsafe(18))' \
                 admin >"$ZOE_PLONE_ADMIN_FILE")
         fi
-        IFS=: read -r user _ <"$ZOE_PLONE_ADMIN_FILE"
-        echo "just plone: the admin user and its password are in $ZOE_PLONE_ADMIN_FILE"
+        IFS= read -r admin <"$ZOE_PLONE_ADMIN_FILE" || true
+        source="$ZOE_PLONE_ADMIN_FILE"
+        echo "just plone: the admin user and its password are in $source"
     fi
+    # Refuse a value without a colon, a user name or a password. Without a
+    # colon, the name could be the password. The message does not show the
+    # value.
+    user="${admin%%:*}"
+    if [ "$user" = "$admin" ] || [ -z "$user" ] || [ -z "${admin#*:}" ]; then
+        echo "just plone: $source must be user:password, with a user name and a password." >&2
+        exit 2
+    fi
+    unset admin
     # zc.buildout runs on CPython 3.13, the newest version that Plone 6.1
     # supports. The recipe makes its environment once.
     venv="$target/venv"
