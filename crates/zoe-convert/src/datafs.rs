@@ -758,6 +758,16 @@ mod tests {
     }
 
     #[test]
+    fn a_path_that_is_not_a_regular_file_stops_the_conversion() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let error = from_datafs(Path::new("/dev/null"), None, &store).unwrap_err();
+        assert!(
+            matches!(&error, Error::Io { source, .. } if source.kind() == ErrorKind::InvalidInput),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn the_report_lists_at_most_a_hundred_problems() {
         let records: Vec<_> = (1..=105).map(|oid| (oid, Data::Bytes(BLOB))).collect();
         let mut file = FileBuilder::new();

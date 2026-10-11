@@ -26,8 +26,8 @@
 //! before a tail that ZODB takes for the junk of a crash. ZODB cuts the
 //! file at the same offset when it opens the file for writing.
 
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::fs::{self, File};
+use std::io::{self, BufReader, ErrorKind, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -127,15 +127,31 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    /// Open the FileStorage file at `path`. A file that does not start
-    /// with the magic `FS30` is refused with `NotDataFs`.
+    /// Open the FileStorage file at `path`. A path that is not a regular
+    /// file is refused with `Io`, before it is opened. A file that does not
+    /// start with the magic `FS30` is refused with `NotDataFs`.
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
         let io = |source| Error::Io {
             path: path.to_owned(),
             source,
         };
+        // The open of a FIFO waits for a writer, so the check comes first.
+        // The second check covers a file that changes between the two.
+        let not_a_file = || {
+            io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "not a regular file",
+            ))
+        };
+        if !fs::metadata(path).map_err(io)?.is_file() {
+            return Err(not_a_file());
+        }
         let file = File::open(path).map_err(io)?;
-        let size = file.metadata().map_err(io)?.len();
+        let meta = file.metadata().map_err(io)?;
+        if !meta.is_file() {
+            return Err(not_a_file());
+        }
+        let size = meta.len();
         let mut magic = Vec::with_capacity(MAGIC.len());
         (&file)
             .take(MAGIC.len() as u64)
@@ -193,7 +209,9 @@ impl Reader {
                 return Ok(None);
             }
             let pos = self.next;
-            let left = self.size - pos;
+            let Some(left) = self.size.checked_sub(pos) else {
+                return Err(self.corrupt(pos, "offset is after the end of the file"));
+            };
             if left == 0 {
                 self.end = Some(End::Clean);
                 return Ok(None);
@@ -930,6 +948,26 @@ pub(crate) mod tests {
         };
         assert_eq!(at, pos);
         assert_eq!(reason, r#"unknown transaction status "\x00""#);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_regular_file_is_refused() {
+        let dir = test_dir("not-regular");
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // The open of a FIFO without a writer waits forever, so a hang
+        // here means that the check is missing.
+        for path in [fifo, dir, PathBuf::from("/dev/null")] {
+            let error = Reader::open(&path).err().unwrap();
+            let Error::Io { source, .. } = &error else {
+                panic!("not an I/O error: {error:?}");
+            };
+            assert_eq!(source.kind(), ErrorKind::InvalidInput, "{error:?}");
+        }
     }
 
     #[test]
