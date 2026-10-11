@@ -25,39 +25,55 @@ test:
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
     done
 
-# Run the zoe-core tests under ThreadSanitizer. Then run the canary test,
-# which holds a deliberate data race, and pass only when ThreadSanitizer
-# reports it. The build goes to target/tsan, apart from the normal build.
+# Run the zoe-core tests and the race canary under ThreadSanitizer.
 tsan:
     #!/usr/bin/env bash
     set -euo pipefail
+    # ThreadSanitizer writes each report to a file in this directory. A test
+    # that captures the output of a child process cannot hide the report.
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    # Set all the options here. Then options of the caller cannot suppress
+    # a report.
+    export TSAN_OPTIONS="log_path=$tmp/report"
     # RUSTC_BOOTSTRAP lets the pinned stable toolchain accept the unstable
     # flags. -Zbuild-std rebuilds the standard library with the sanitizer
-    # from the rust-src component.
+    # from the rust-src component. The build goes to target/tsan, apart
+    # from the normal build.
     export RUSTC_BOOTSTRAP=1
     export RUSTFLAGS="-Zsanitizer=thread"
     export RUSTDOCFLAGS="-Zsanitizer=thread"
     tsan=(cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
         --target-dir target/tsan --locked -p zoe-core)
-    "${tsan[@]}"
+    # A report from a child process that a test kills does not change an
+    # exit code. So also look for a report in the files and in the output.
+    status=0
+    "${tsan[@]}" 2>&1 | tee "$tmp/output" || status=$?
+    if [ "$status" -ne 0 ] || grep -q -s 'SUMMARY: ThreadSanitizer:' "$tmp"/*; then
+        cat "$tmp"/report.* 2>/dev/null || true
+        echo "just tsan: the zoe-core tests failed under ThreadSanitizer." >&2
+        exit 1
+    fi
+    # The canary test holds a deliberate data race. ThreadSanitizer must
+    # report it, else the sanitizer is off.
     echo "== The canary test must make ThreadSanitizer report a data race"
-    log=target/tsan/canary.log
+    rm -f "$tmp"/*
     status=0
     "${tsan[@]}" --test tsan_canary -- --ignored --exact \
-        a_deliberate_data_race_is_reported >"$log" 2>&1 || status=$?
+        a_deliberate_data_race_is_reported >"$tmp/output" 2>&1 || status=$?
     if [ "$status" -eq 0 ]; then
-        cat "$log"
+        cat "$tmp/output"
         echo "just tsan: the canary test exited clean, so ThreadSanitizer is off." >&2
         exit 1
     fi
     # The stack of the report must name the canary test.
-    if ! grep -q 'WARNING: ThreadSanitizer: data race' "$log" \
-        || ! grep -q 'tsan_canary::a_deliberate_data_race_is_reported' "$log"; then
-        cat "$log"
+    if ! grep -q -s 'SUMMARY: ThreadSanitizer: data race' "$tmp"/* \
+        || ! grep -q -s 'tsan_canary::a_deliberate_data_race_is_reported' "$tmp"/*; then
+        cat "$tmp"/*
         echo "just tsan: ThreadSanitizer did not report the race of the canary test." >&2
         exit 1
     fi
-    grep '^SUMMARY: ThreadSanitizer' "$log"
+    grep -h '^SUMMARY: ThreadSanitizer' "$tmp"/*
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
 
 # Run the ZODB and ZEO conformance suites.
