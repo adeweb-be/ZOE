@@ -13,6 +13,11 @@
 //! to a local before an exception is built. The last reference to the
 //! store drops without the GIL, so the database closes without it.
 //!
+//! `storeBlob` and `restoreBlob` take a file of `temporaryDirectory()` by
+//! rename, through the core, and copy a file from elsewhere. `loadBlob`
+//! gives the path of a committed blob file. The core keeps the blob files
+//! in `blob_dir`, `<path>/blobs` by default.
+//!
 //! `_vote_resolving` votes and keeps the locks when it finds conflicts.
 //! `zoe.storage.Storage.tpc_vote` resolves them in Python, stores the
 //! resolved pickles and calls `tpc_vote` of this class. `tpc_abort` and
@@ -21,7 +26,9 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::thread;
@@ -30,7 +37,7 @@ use std::time::Duration;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use zoe_core::{Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Oid, Options, Store, Tid, Txn, ZoeError};
 
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
@@ -167,14 +174,16 @@ impl Storage {
 impl Storage {
     /// Open the store in the directory `path`, and create it if necessary.
     /// `lock_timeout` is the longest wait of a vote for its locks, in
-    /// seconds.
+    /// seconds. `blob_dir` is the directory of the blob files, `None` for
+    /// `<path>/blobs`. The core takes it as `Options::blob_dir`.
     #[new]
-    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None))]
+    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         read_only: bool,
         lock_timeout: Option<f64>,
+        blob_dir: Option<PathBuf>,
     ) -> PyResult<Self> {
         let mut options = Options::default();
         if let Some(seconds) = lock_timeout {
@@ -182,22 +191,36 @@ impl Storage {
                 PyValueError::new_err("lock_timeout is a number of seconds, 0 or more")
             })?;
         }
+        options.blob_dir = blob_dir;
         let (store, last, path) = py
             .detach(|| {
                 // A read-only storage creates no directory. It opens the
                 // store for writes all the same, because the core has no
                 // read-only open yet. When the core gets one, a read-only
                 // storage uses it.
-                if read_only && !path.is_dir() {
-                    let missing = format!("no store directory: {}", path.display());
-                    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, missing).into());
+                if read_only {
+                    let blob_parent = match &options.blob_dir {
+                        Some(blob_dir) => {
+                            std::path::absolute(blob_dir)?.parent().map(Path::to_owned)
+                        }
+                        None => None,
+                    };
+                    for dir in std::iter::once(path.clone()).chain(blob_parent) {
+                        if !dir.is_dir() {
+                            let missing = format!("no directory: {}", dir.display());
+                            return Err(io::Error::new(io::ErrorKind::NotFound, missing).into());
+                        }
+                    }
                 }
+                // The blob paths that the storage gives do not depend on the
+                // current directory.
+                let path = std::path::absolute(&path)?;
                 let store = Store::open_with(&path, options)?;
                 let last = store.last_transaction();
                 let path = fs::canonicalize(&path)?;
                 Ok::<_, ZoeError>((store, last, path))
             })
-            .map_err(|error| Failure::from(error).into_py(py))?;
+            .map_err(|error| core(py, error))?;
         Ok(Self {
             store: RwLock::new(Some(Arc::new(store))),
             path: path.to_string_lossy().into_owned(),
@@ -370,7 +393,23 @@ impl Storage {
 
     /// Begin a two-phase commit of `transaction`. The calling thread
     /// drives it.
-    fn tpc_begin(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// With `tid`, the transaction is a restore transaction: a copy of a
+    /// transaction of another storage, which commits under `tid`. It takes
+    /// `restoreBlob`. `tid` must be after the last tid of the store.
+    ///
+    /// `status` is the status of the copied transaction, as ZODB's copy
+    /// functions give it: `" "` or `"p"`, as text or bytes. The store keeps
+    /// no transaction status, so the status is not kept. Any other status
+    /// raises `StorageTransactionError`.
+    #[pyo3(signature = (transaction, tid = None, status = None))]
+    fn tpc_begin(
+        &self,
+        py: Python<'_>,
+        transaction: &Bound<'_, PyAny>,
+        tid: Option<&Bound<'_, PyAny>>,
+        status: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         if self.read_only {
             return Err(errors::read_only(py));
         }
@@ -379,11 +418,20 @@ impl Storage {
         if begun {
             return Err(errors::duplicate_transaction(py));
         }
+        if let Some(status) = status {
+            check_status(status)?;
+        }
+        let tid = tid.map(u64_of).transpose()?.map(Tid);
         let user = text(&transaction.getattr("user")?)?;
         let description = text(&transaction.getattr("description")?)?;
         let extension = text(&transaction.getattr("extension_bytes")?)?;
         let store = self.opened(py)?;
-        let txn = py.detach(move || Txn::begin(store, &user, &description, &extension));
+        let txn = py
+            .detach(move || match tid {
+                None => Ok(Txn::begin(store, &user, &description, &extension)),
+                Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension),
+            })
+            .map_err(|e| core(py, e))?;
         let entry = Arc::new(Entry {
             _transaction: transaction.clone().unbind(),
             txn: Mutex::new(Some(txn)),
@@ -434,11 +482,7 @@ impl Storage {
             return Err(errors::version(py));
         }
         let oid = Oid(u64_of(oid)?);
-        let serial = if serial.is_none() {
-            Tid::ZERO
-        } else {
-            Tid(u64_of(serial)?)
-        };
+        let serial = serial_of(serial)?;
         py.detach(|| entry.with(|txn| Ok(txn.store(oid, serial, data)?)))
             .map_err(|failure| failure.into_py(py))
     }
@@ -457,6 +501,139 @@ impl Storage {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         py.detach(|| entry.with(|txn| Ok(txn.check_current_serial(oid, serial)?)))
             .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage a new pickle of `oid` with the blob in the file `blobfilename`.
+    /// `serial` is the serial that the transaction read, or `None` for a
+    /// new object.
+    ///
+    /// The storage takes the file. A file of `temporaryDirectory()`, or of
+    /// one of its subdirectories, moves into the store by rename, never by
+    /// copy. Another file of the store directory or of the blob directory
+    /// is refused with `StorageTransactionError`. A file from elsewhere is
+    /// copied, then removed. A refused call leaves the file in its place.
+    /// An abort removes a file that the transaction took.
+    #[pyo3(name = "storeBlob")]
+    #[allow(clippy::too_many_arguments)]
+    fn store_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: &[u8],
+        blobfilename: PathBuf,
+        version: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let store = self.opened(py)?;
+        let entry = self.entry(py, transaction)?;
+        if version.is_truthy()? {
+            return Err(errors::version(py));
+        }
+        let oid = Oid(u64_of(oid)?);
+        let serial = serial_of(serial)?;
+        // The entry holds a Python reference, so it drops while the thread
+        // is attached. The store drops while it is detached.
+        py.detach(|| {
+            let store = store;
+            take_blob(
+                &store,
+                Path::new(&self.path),
+                &entry,
+                &blobfilename,
+                |txn, path| txn.store_blob_at(oid, serial, data, path),
+                |txn, file| txn.store_blob(oid, serial, data, file),
+            )
+        })
+        .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in the file
+    /// `blobfilename`, in a restore transaction: a transaction that
+    /// `tpc_begin` began with a tid. The version gets that tid. The storage
+    /// takes the file as `storeBlob` does.
+    ///
+    /// The previous serial of the version is the current serial of `oid` in
+    /// the store, not `serial`. If another transaction changes `oid` before
+    /// the vote, the vote raises `ConflictError`. The store keeps every
+    /// pickle whole, so `prev_txn` is not used.
+    #[pyo3(name = "restoreBlob")]
+    #[allow(clippy::too_many_arguments)]
+    fn restore_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: Option<&[u8]>,
+        blobfilename: PathBuf,
+        prev_txn: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (serial, prev_txn);
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let store = self.opened(py)?;
+        let entry = self.entry(py, transaction)?;
+        let oid = Oid(u64_of(oid)?);
+        let data = data.unwrap_or_default();
+        // The entry holds a Python reference, so it drops while the thread
+        // is attached. The store drops while it is detached.
+        py.detach(|| {
+            let store = store;
+            take_blob(
+                &store,
+                Path::new(&self.path),
+                &entry,
+                &blobfilename,
+                |txn, path| txn.restore_blob_at(oid, data, path),
+                |txn, file| txn.restore_blob(oid, data, file),
+            )
+        })
+        .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Return the path of the blob file that the transaction `serial` wrote
+    /// for `oid`. The file is read-only. Raise `POSKeyError` when that
+    /// transaction wrote no blob for `oid`, or when its file is missing, as
+    /// ZODB's blob storages do.
+    #[pyo3(name = "loadBlob")]
+    fn load_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+    ) -> PyResult<OsString> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        let store = self.opened(py)?;
+        let path = py
+            .detach(move || {
+                let path = store.blob_path(oid, serial)?;
+                match fs::exists(&path)? {
+                    true => Ok(path),
+                    false => Err(ZoeError::NotFound { oid }),
+                }
+            })
+            .map_err(|e| core(py, e))?;
+        Ok(path.into_os_string())
+    }
+
+    /// Return the directory for the files of uncommitted blobs: `tmp` in
+    /// the blob directory. `storeBlob` takes a file of this directory by
+    /// rename. A read-only storage raises `ReadOnlyError`.
+    #[pyo3(name = "temporaryDirectory")]
+    fn temporary_directory(&self, py: Python<'_>) -> PyResult<OsString> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let store = self.opened(py)?;
+        let path = py
+            .detach(move || store.blob_temp_dir())
+            .map_err(|e| core(py, e))?;
+        Ok(path.into_os_string())
     }
 
     /// Lock the objects of `transaction` and check their serials. The vote
@@ -745,6 +922,39 @@ fn core(py: Python<'_>, error: ZoeError) -> PyErr {
     Failure::from(error).into_py(py)
 }
 
+/// Check the status that ZODB gives to a copied transaction: `" "` for a
+/// normal one, `"p"` for one that a pack changed. Raise
+/// `StorageTransactionError` for any other status.
+fn check_status(status: &Bound<'_, PyAny>) -> PyResult<()> {
+    let value = text(status)?;
+    if value == b" " || value == b"p" {
+        return Ok(());
+    }
+    Err(errors::status(status.py(), status))
+}
+
+/// Return the serial that a transaction read for an object: `None` is
+/// `Tid::ZERO` and 8 bytes are a tid. A `str` of 8 characters below 256
+/// gives its Latin-1 bytes, as FileStorage takes the serial `'\0' * 8` that
+/// ZODB's blob tests pass.
+fn serial_of(serial: &Bound<'_, PyAny>) -> PyResult<Tid> {
+    if serial.is_none() {
+        return Ok(Tid::ZERO);
+    }
+    let Ok(text) = serial.cast::<PyString>() else {
+        return Ok(Tid(u64_of(serial)?));
+    };
+    let bytes: Option<Vec<u8>> = text
+        .to_str()?
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect();
+    let array: [u8; 8] = bytes
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| PyValueError::new_err("a serial has 8 bytes"))?;
+    Ok(Tid(u64::from_be_bytes(array)))
+}
+
 /// Return the bytes of a metadata field of a transaction. A `str` gives
 /// its UTF-8 bytes.
 fn text(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
@@ -754,8 +964,83 @@ fn text(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     }
 }
 
+/// Stage the blob in the file `path` in the transaction of `entry`.
+///
+/// A file in the blob temporary directory of `store`, or in one of its
+/// subdirectories, goes to `at`, which takes it by rename. A file of the
+/// store directory `store_dir` or of the blob directory outside that
+/// temporary directory, the database or a committed blob file for example,
+/// is refused with `Protocol`: the store owns it. Another file is copied
+/// into a new blob file of `store`, which goes to `copied`, and then it is
+/// removed. A refused call leaves the file in its place.
+fn take_blob(
+    store: &Store,
+    store_dir: &Path,
+    entry: &Entry,
+    path: &Path,
+    at: impl FnOnce(&mut SharedTxn, &Path) -> zoe_core::Result<()>,
+    copied: impl FnOnce(&mut SharedTxn, BlobFile) -> zoe_core::Result<()>,
+) -> Result<(), Failure> {
+    match blob_source(store, store_dir, path)? {
+        Source::Temporary(temporary) => entry.with(|txn| Ok(at(txn, &temporary)?)),
+        Source::Store => {
+            Err(ZoeError::Protocol("the blob file is a file of the store, not a new blob").into())
+        }
+        Source::Elsewhere => {
+            let mut file = store.new_blob_file()?;
+            io::copy(&mut File::open(path)?, &mut file)?;
+            entry.with(|txn| Ok(copied(txn, file)?))?;
+            fs::remove_file(path)?;
+            Ok(())
+        }
+    }
+}
+
+/// Where a blob file that a client gives is.
+enum Source {
+    /// In the blob temporary directory or in one of its subdirectories,
+    /// with the path that the core gives to the file.
+    Temporary(PathBuf),
+    /// In the store directory or in the blob directory, outside the blob
+    /// temporary directory.
+    Store,
+    /// Elsewhere.
+    Elsewhere,
+}
+
+/// Tell where the file `path` is. `store_dir` is the real path of the
+/// store directory.
+///
+/// The directories compare by their real paths, so a path through a
+/// symbolic link or a relative path is found too. The name of the file
+/// stays as it is: the core refuses a symbolic link.
+fn blob_source(store: &Store, store_dir: &Path, path: &Path) -> Result<Source, Failure> {
+    let temp = store.blob_temp_dir()?;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(Source::Elsewhere);
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let (Ok(dir), Ok(real_temp)) = (fs::canonicalize(dir), fs::canonicalize(&temp)) else {
+        return Ok(Source::Elsewhere);
+    };
+    if let Ok(rest) = dir.strip_prefix(&real_temp) {
+        return Ok(Source::Temporary(temp.join(rest).join(name)));
+    }
+    let in_blob_dir = real_temp
+        .parent()
+        .is_some_and(|blobs| dir.starts_with(blobs));
+    if in_blob_dir || dir.starts_with(store_dir) {
+        return Ok(Source::Store);
+    }
+    Ok(Source::Elsewhere)
+}
+
 /// Return the total size of the files in the directory `dir`, in bytes.
-fn directory_size(dir: &Path) -> std::io::Result<u64> {
+fn directory_size(dir: &Path) -> io::Result<u64> {
     let mut size = 0;
     for entry in fs::read_dir(dir)? {
         let metadata = entry?.metadata()?;

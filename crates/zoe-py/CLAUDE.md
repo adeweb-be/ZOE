@@ -8,9 +8,10 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
+- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` section of ZConfig and the `zoe://` URI of zodburi.
 - `src/cli.rs`: `zoe._zoe.main`, the `zoe` command of the console script.
 - `python/zoedb/src/zoe/__main__.py`: `zoe.__main__.main`, the entry point of the console script `zoe` and of `python -m zoe`.
-- `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage` and adds `tpc_vote` with the conflict resolution, `history`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
+- `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage` and `IBlobStorage`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
 
 ## Invariants
 
@@ -22,7 +23,15 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `zoe.Storage` is thread-safe and all Connections of a process share it.
 - A table keyed by the address of the ZODB transaction object holds one core transaction (`Txn<Arc<Store>>`) per `tpc_begin`. The entry keeps the object alive, so no other object gets its address while the entry exists.
 - A second `tpc_begin` of a transaction, or a call with a transaction that the storage did not begin, raises `StorageTransactionError`. `tpc_abort` of an unknown transaction does nothing.
-- The thread that calls `tpc_begin` drives the transaction. `store`, `checkCurrentSerialInTransaction` and `tpc_vote` from another thread raise `zoe.WrongThread`, a subclass of `StorageTransactionError`. `restore` and `storeBlob` follow the same rule when they are built. The core checks the thread, so a refused call changes nothing. `tpc_finish` and `tpc_abort` work from any thread.
+- The thread that calls `tpc_begin` drives the transaction. `store`, `storeBlob`, `restoreBlob`, `checkCurrentSerialInTransaction` and `tpc_vote` from another thread raise `zoe.WrongThread`, a subclass of `StorageTransactionError`. `restore` follows the same rule when it is built. The core checks the thread, so a refused call changes nothing. `tpc_finish` and `tpc_abort` work from any thread.
+- `temporaryDirectory()` is `tmp` in the blob directory, the `blobs/tmp/` of the core. The call creates the blob store when it does not exist.
+- `storeBlob` takes a file of `temporaryDirectory()`, or of one of its subdirectories, by rename, never by copy: it calls `store_blob_at` of the core, which keeps the crash rules of the core. A Connection writes its new blobs there, and a savepoint moves them into a subdirectory there. The directory of the file and the temporary directory compare by their real paths. A file from elsewhere is copied into a new blob file of the core, then removed once the copy is staged. A file of the store directory or of the blob directory outside `tmp`, such as `zoe.redb` or a committed blob file, is refused with `StorageTransactionError`, so a wrong path never removes a file of the store.
+- A refused `storeBlob` leaves the file in its place: the core checks the transaction before it takes the file. A file that the transaction took belongs to it: `tpc_abort`, `close` and an error after the take remove it.
+- `loadBlob` returns the path of a read-only file in the blob directory, from the blob record. A serial that wrote no blob for the oid raises `POSKeyError`, and so does a blob record whose file is missing, as in ZODB's blob storages. `openCommittedBlobFile` opens that path, as ZODB's blob storages do: it checks no hash.
+- The store opens with the absolute form of `path`, so the blob paths do not depend on the current directory.
+- `blob_dir` goes to the core as `Options::blob_dir`; `None` is `<path>/blobs`. The core keeps the blob files, their temporary directory and every rename there, and every sync goes through its `Vfs`. The store does not record its blob directory, so each open must give the same one: a store with blob records refuses a blob directory without a layout file with `MissingBlobDir`, which is `StorageError`. Two open storages never share a blob directory: the core locks it, and the second open raises `StorageError`. The core checks `blob_dir` before it creates anything, so a refused `blob_dir` leaves no store directory, no `zoe.redb` and no lock file. A read-only storage refuses a `blob_dir` whose parent directory is missing with `FileNotFoundError`, as it refuses a missing store directory.
+- `tpc_begin(transaction, tid, status)` with a `tid` begins a restore transaction, which commits under `tid`, as ZODB's copy functions call it. `tid` must be after the last tid of the store, else `tpc_begin` raises `StorageTransactionError`. `restoreBlob` stages a copy of a version with its blob there: it calls `restore_blob_at` or `restore_blob` of the core and takes the file as `storeBlob` does. The previous serial is the current serial of the store, so `serial` and `prev_txn` are not used. A change of the oid before the vote raises `ConflictError`, and the vote never resolves it. `status` takes `" "` and `"p"`, as text or bytes, and any other status raises `StorageTransactionError`. The store keeps no transaction status, so the `"p"` of a transaction that a pack changed is not kept: a copy back to another storage gives `" "`.
+- A read-only storage refuses `storeBlob`, `restoreBlob` and `temporaryDirectory` with `ReadOnlyError`. `loadBlob` and `openCommittedBlobFile` work.
 - `zoe.Storage` resolves conflicts in this process, as ZODB's `ConflictResolvingStorage` does. `tpc_vote` calls `_vote_resolving`: the core takes the locks and, when each stale written oid can be resolved, keeps them and returns each oid with its committed serial and pickle. For each oid, `tryToResolveConflict` runs the `_p_resolveConflict` method of the class, and `tpc_vote` stores the result over the committed serial. Then it calls `tpc_vote` of the extension, which checks the serials again with the same locks. `tpc_vote` returns the resolved oids, or an empty list.
 - A conflict that does not resolve raises the `ConflictError` of `tryToResolveConflict`, with `oid`, `class_name` and `serials`. If ZODB cannot read the class name from the pickle, the error comes without it. A read-current conflict is never resolved: it raises `ReadConflictError`.
 - A staged pickle that the core cannot read back from its spill file fails `_vote_resolving` with `StorageError`, whose cause is the error of the core. `_vote_resolving` aborts the transaction first, so the locks are free when the error leaves `tpc_vote`. The error is not a `ConflictError`, so ZODB does not retry the transaction.
@@ -34,7 +43,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - A `ConflictError` on a stored object gets the stored pickle as `data`, so ZODB fills its class name. If ZODB cannot read the pickle, the error comes without `data`. `_vote_resolving` first applies the `_crs_untransform_record_data` of the database to the pickle, so the class name comes from the pickle and not from the transformed record. A record that does not untransform gives no `data`.
 - `lastTransaction` gives only a published tid. It waits until the last tid of the core is published. A callback that calls it does not wait and gets the tid before its own commit.
 - A read-only storage refuses `tpc_begin`, `new_oid`, `store` and `pack` with `ReadOnlyError`. It does not create a missing directory. It still opens the store for writes and takes the exclusive lock, until the core has a read-only open.
-- `close` marks the table closed and aborts the open transactions. A `tpc_begin` that read the store before the close finds the mark when it inserts its entry, aborts its transaction and raises `StorageError`. So no transaction keeps the store open after `close`, and the directory lock is free when no call is in progress. A second `close` does nothing. A call on a closed storage raises `StorageError`.
+- `close` marks the table closed and aborts the open transactions. A `tpc_begin` that read the store before the close finds the mark when it inserts its entry, aborts its transaction and raises `StorageError`. So no transaction keeps the store open after `close`, and the directory lock is free when no call is in progress. A second `close` does nothing. A call on a closed storage raises `StorageError`, the blob calls too.
 - `close` aborts the transactions that no call uses first. Their locks go, so a vote that waits for one of them ends at once, and `close` does not wait for a lock timeout.
 - `Storage.sequence(name)` returns a `zoe._zoe.Sequence` for the sequence `name` of the store. Its `next()` returns an `int`. It is not part of a ZODB transaction: it takes no transaction entry and no per-OID lock, and an abort does not give the value back. The `Sequence` holds the storage, not the store, so `next` reads the store as the other calls do: after `close`, `sequence` and `next` raise `StorageError`. `next` runs inside `py.detach`. A read-only storage refuses `next` with `ReadOnlyError`. `Sequence.__traverse__` reports the storage to the garbage collector, so a cycle such as `storage.x = storage.sequence(name)` is collectable. `Sequence` has no `__clear__`, because it is frozen: the collector breaks the cycle at the attributes of the storage.
 - `__len__` returns 0: IStorage asks only for an approximate length, and the store keeps no object count. `getSize` is the size of the files in the store directory. `getName` and `sortKey` are the canonical path of the directory.
@@ -52,6 +61,19 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - A change to a public Python API is a stop-and-ask.
 - `_lock_table_is_empty()` tells if no transaction of the core holds or waits for a lock. It is a private hook for the tests, not a public API.
 
+## The `<zoe>` stanza and the `zoe://` URI
+
+- `%import zoe` loads `component.xml`. It declares the `<zoe>` section, which implements `ZODB.storage`, so `<zodb>` and `<zodb_db>` take it. `zoe.config.ZoeStorage.open` opens a `zoe.Storage`.
+- The keys are `path`, `blob-dir`, `backend`, `lock-timeout`, `early-locks` and `read-only`, in kebab-case. `zoe.config.KEYS` gives the converter of each key. `component.xml` declares every key as a string, and a unit test checks it. `ZoeStorage.open` converts the text of the section with `KEYS`, as the twins and the URI do. So the three take the same syntax.
+- Every key has an environment twin: `ZOE_` and the key in upper case, with `_` for `-`. The twin gives the value only when the section does not set the key. An empty value of any key counts as not set: the key takes its twin, then its default. No key has a default in `component.xml`, else a twin could never apply; a missing key takes the default of `zoe.Storage`.
+- `open_storage` expands a leading `~` in `path` and `blob-dir`, from the section, a twin or the URI.
+- Only the section reads the twins. The URI and `zoe.Storage` do not.
+- `zoe:///absolute/path?key=value` resolves through the `zoe` entry point of `zodburi.resolvers`, `zoe.config.resolve_uri`. The path of the URI is `path`. The query takes the other keys of the section, with the same names and values, each at most once: a repeated key raises `ValueError`. The other query keys go to zodburi as database keywords, and zodburi refuses an unknown key with `KeyError`. A host, a fragment or a relative path raises `ValueError`.
+- zodburi comes with the `uri` extra, `zoedb[uri]`, because it needs ZEO. A plain install of zoedb keeps the entry point, which only zodburi reads. The dev group of the workspace takes zodburi for the tests.
+- `backend` takes only `redb`. `early-locks` takes only a false boolean: `on` raises `ValueError` until early locks are built. `lock-timeout` is whole seconds, as ZConfig's `time-interval` gives them, and 0 or more. A refused value raises `ValueError`, which names the source, the key and the value. A section without `path` and without `ZOE_PATH` raises `ValueError`.
+- `zoe.config` imports ZODB and ZConfig. `import zoe` does not import `zoe.config`. ZConfig and zodburi import it when they need it.
+- `just plone zoe` builds a Plone instance from `plone/zoe.cfg`, whose `zope.conf` has the `<zoe>` stanza alone, and `just plone zoe check` creates a Plone site on it. No command line and no file of the build holds the admin password: see `plone/README.md`.
+
 ## Errors
 
 | Core error | Python exception |
@@ -62,7 +84,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 | `WrongThread` | `zoe.WrongThread` |
 | `Protocol`, `LockOrder` | `StorageTransactionError` |
 | `Halted`, `CorruptRecord`, `CorruptBlob`, `CorruptTxn`, `CorruptSequence`, `Backend` | `StorageSystemError` |
-| `Locked`, `Closed`, `Format`, `ReadOnly`, `NotClosedCleanly` | `StorageError` |
+| `Locked`, `Closed`, `Format`, `ReadOnly`, `NotClosedCleanly`, `MissingBlobDir`, `NotBlobDir` | `StorageError` |
 | `Io` | `OSError` |
 
 A pack maps two errors in its own way. Each stops the pack and raises `StorageSystemError`, whose text starts with "pack stopped" and gives the text of the core:
@@ -75,9 +97,11 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 
 ## Tests
 
-- `python/zoedb/tests/acceptance/test_storage.py` and `python/zoedb/tests/acceptance/test_conflict_resolution.py` are the acceptance tests of the storage and of conflict resolution.
+- `python/zoedb/tests/acceptance/test_storage.py` and `python/zoedb/tests/acceptance/test_conflict_resolution.py` are the acceptance tests of the storage and of conflict resolution. `python/zoedb/tests/acceptance/test_blobs.py` is the acceptance test of the blobs.
+- `python/zoedb/tests/test_zoe_blobs.py` holds the unit tests of the blobs: the refused calls, the copy, the savepoints, `blob_dir` and `restoreBlob`.
 - `python/zoedb/tests/acceptance/test_pack.py` is the acceptance test of pack. It also runs ZODB's `PackableStorage` suites.
 - `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script `zoe`.
 - `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
+- `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.

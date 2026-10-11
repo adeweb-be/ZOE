@@ -3698,6 +3698,36 @@ wheels = [
 ]
 
 [[package]]
+name = "zdaemon"
+version = "5.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "zconfig" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/81/9f3c8ed3e2b8e90e69753100a3bbdce48d276e74f0df4422c0fe235a59e0/zdaemon-5.2.1.tar.gz", hash = "sha256:f06c2c7caf519c760834f8fe26e5735950d5017f72d5c208dc8b1900140594cd", size = 61428, upload-time = "2025-07-23T14:10:40.117Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/21/e5b1c3b49c2dbb353c72860a7ef625f4b4fd460b857028cceefa58efe423/zdaemon-5.2.1-py3-none-any.whl", hash = "sha256:4932801cf2f530965a2295c06198c7a17e43a1ae9c990c8bd3f4c26bcab76468", size = 57181, upload-time = "2025-07-23T14:10:38.316Z" },
+]
+
+[[package]]
+name = "zeo"
+version = "6.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "persistent" },
+    { name = "transaction" },
+    { name = "zc-lockfile" },
+    { name = "zconfig" },
+    { name = "zdaemon" },
+    { name = "zodb" },
+    { name = "zope-interface" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/18/2a43f856f8ffa0dad376b180fb56fc8f50ebe1702ffd48a34d6c1fd3b340/zeo-6.2.tar.gz", hash = "sha256:e29c52eb9767d94b270bff4c6eca4c863fcbc46d15323686e6fb71bfe43c7899", size = 244123, upload-time = "2026-04-13T17:59:42.757Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/55/23cb30701f9e857216a92693e52726812ac2db9daeffa3ac44da9a58bfc9/zeo-6.2-py3-none-any.whl", hash = "sha256:254853c9e6a2a29dfe7df89977e71c287f1f31a646a3d1941a6df738f5c282f9", size = 247483, upload-time = "2026-04-13T17:59:41.077Z" },
+]
+
+[[package]]
 name = "zexceptions"
 version = "6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3773,6 +3803,20 @@ wheels = [
 ]
 
 [[package]]
+name = "zodburi"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "zconfig" },
+    { name = "zeo" },
+    { name = "zodb" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/be/a5/8921e5732f05fe5595fb5bfcb6f5264dd81258de2f12e763f8b4bd75fbd6/zodburi-3.0.0.tar.gz", hash = "sha256:4359b964dffdae1e56a19124108d89f3730d15417260f828403cf05d6533cc41", size = 24142, upload-time = "2025-02-22T18:12:10.142Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/84/53f0a2e27f4066790654c838f5fc2b779a31edf4bdaebc139de6021d1ec6/zodburi-3.0.0-py3-none-any.whl", hash = "sha256:b43329f3a092507cbd35ba66753dd307b5d08f2e908309848b91465c7d90a931", size = 14352, upload-time = "2025-02-22T18:12:08.286Z" },
+]
+
+[[package]]
 name = "zoe-workspace"
 version = "0.0.0"
 source = { virtual = "." }
@@ -3784,6 +3828,7 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "zodb", extra = ["test"] },
+    { name = "zodburi" },
 ]
 
 [package.metadata]
@@ -3793,12 +3838,14 @@ requires-dist = [{ name = "zoedb", editable = "zoedb" }]
 dev = [
     { name = "pytest", specifier = ">=9.1" },
     { name = "zodb", extras = ["test"] },
+    { name = "zodburi", specifier = ">=3" },
 ]
 
 [[package]]
 name = "zoedb"
 source = { editable = "zoedb" }
 dependencies = [
+    { name = "zconfig" },
     { name = "zodb" },
 ]
 
@@ -3806,13 +3853,18 @@ dependencies = [
 plone = [
     { name = "products-cmfplone" },
 ]
+uri = [
+    { name = "zodburi" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
+    { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },
+    { name = "zodburi", marker = "extra == 'uri'", specifier = ">=3" },
 ]
-provides-extras = ["plone"]
+provides-extras = ["plone", "uri"]
 
 [[package]]
 name = "zope"

@@ -15,17 +15,19 @@
 //! calls `vote` again. That vote takes no lock: it checks the serials
 //! again with the locks that the first vote took.
 //!
-//! The thread that begins a transaction drives it: `store`, `store_blob`,
-//! `restore`, `check_current_serial`, `vote` and `vote_resolving` from
-//! another thread fail with `WrongThread`. `finish` and `abort` work from
-//! any thread.
+//! The thread that begins a transaction drives it: `store`, the blob
+//! stores, `restore`, the blob restores, `check_current_serial`, `vote` and
+//! `vote_resolving` from another thread fail with `WrongThread`. `finish`
+//! and `abort` work from any thread.
 //!
-//! `store_blob` stages a record with a synced blob file. The blob stays
-//! with its oid until finish or abort: a later `store` of the oid, the
-//! store of a resolved conflict too, replaces only the pickle, as in ZODB.
-//! `finish` places the blob files before the backend commit, and the same
-//! backend write transaction holds their blob records. Dropping a
-//! transaction removes the blob files that it did not place.
+//! `store_blob` stages a record with a synced blob file. `store_blob_at`
+//! takes the blob file by its path in the blob temporary directory, by
+//! rename. The blob stays with its oid until finish or abort: a later
+//! `store` of the oid, the store of a resolved conflict too, replaces only
+//! the pickle, as in ZODB. `restore_blob` and `restore_blob_at` are
+//! `restore` with a blob. `finish` places the blob files before the backend
+//! commit, and the same backend write transaction holds their blob records.
+//! Dropping a transaction removes the blob files that it did not place.
 //!
 //! The staged records live in a staging buffer: in memory up to the
 //! `staging_memory` option of the store, and in a spill file under
@@ -40,6 +42,7 @@ mod staging;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
+use std::path::Path;
 use std::thread::{self, ThreadId};
 use std::time::SystemTime;
 
@@ -307,8 +310,53 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 .check(SizeLimit::Blob, oid, file.size())?;
         }
         let blob = file.close(&self.store.backend)?;
+        self.stage_blob(oid, serial, data, false, stored_bytes, blob)
+    }
+
+    /// Stage a new version of `oid` with the blob in the file at `path`, as
+    /// `store_blob` does, with the same checks. The file must be in the
+    /// blob temporary directory of this store, `Store::blob_temp_dir`, or
+    /// in one of its subdirectories.
+    ///
+    /// The call takes the file by rename, never by copy: it syncs the file,
+    /// renames it to a temporary name of the store and computes its BLAKE3
+    /// hash. `finish` renames it into the blob store. A second blob of
+    /// `oid` replaces the first.
+    ///
+    /// A refused call leaves the file in its place: a call from another
+    /// thread, after the vote, with an empty pickle or a reserved oid, or
+    /// with a path outside the blob temporary directory. A file that the
+    /// transaction took belongs to it: an error after the rename, an abort
+    /// or a drop of the transaction removes the file. So a blob longer
+    /// than `max-blob-size`, which the call can measure only after it took
+    /// the file, fails with `TooLarge` and removes the file.
+    pub fn store_blob_at(&mut self, oid: Oid, serial: Tid, data: &[u8], path: &Path) -> Result<()> {
+        self.check_store(oid, data)?;
+        let stored_bytes = self.check_size(oid, data)?;
+        let blob = self.store.take_blob_file(path)?;
+        if !self.is_restore() {
+            self.store
+                .guardrails
+                .check(SizeLimit::Blob, oid, blob.record().size)?;
+        }
+        self.stage_blob(oid, serial, data, false, stored_bytes, blob)
+    }
+
+    /// Stage `data` for `oid` with `serial`, and the blob `blob`.
+    /// `stored_bytes` is the size of the staged pickles with `data`, as
+    /// `check_size` gives it. A stage that fails drops `blob`, which
+    /// removes its file.
+    fn stage_blob(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        restored: bool,
+        stored_bytes: u64,
+        blob: PendingBlob,
+    ) -> Result<()> {
         let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, data, false)?;
+        self.staged.put(area, oid, serial, data, restored)?;
         self.stored_bytes = stored_bytes;
         self.blobs.insert(oid, blob);
         Ok(())
@@ -327,6 +375,52 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// A restore copies a record as it is: it checks no size limit.
     pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
+        let current = self.check_restore(oid)?;
+        let area = &self.store.backend.staging;
+        self.staged
+            .put(area, oid, current, data.unwrap_or_default(), true)?;
+        if data.is_none() {
+            self.blobs.remove(&oid);
+        }
+        Ok(())
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in `file`, in a
+    /// restore transaction. This is `restore` with a blob, the
+    /// `restoreBlob` of ZODB. Then sync the file. `finish` renames it into
+    /// the blob store.
+    ///
+    /// As for `restore`, the version gets the tid of the transaction, and
+    /// its previous serial is the current serial of `oid` in this store. A
+    /// change of `oid` by another transaction before the vote fails the
+    /// vote with `Conflict`, and `vote_resolving` never resolves it. So
+    /// `restore_blob` differs from `store_blob` in a restore transaction:
+    /// `store_blob` takes the serial of the client and checks it at the
+    /// vote.
+    ///
+    /// `data` cannot be empty, because a deletion has no blob: an empty
+    /// pickle is refused with `Protocol`. `file` must come from
+    /// `new_blob_file` of this store, as for `store_blob`. A refused call
+    /// stages nothing and drops `file`, which removes it.
+    pub fn restore_blob(&mut self, oid: Oid, data: &[u8], file: BlobFile) -> Result<()> {
+        let current = self.check_restore_blob(oid, data)?;
+        let blob = file.close(&self.store.backend)?;
+        self.stage_blob(oid, current, data, true, self.stored_bytes, blob)
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in the file at
+    /// `path`, as `restore_blob` does, with the same checks. The call takes
+    /// the file by rename, as `store_blob_at` does, and a refused call
+    /// leaves the file in its place.
+    pub fn restore_blob_at(&mut self, oid: Oid, data: &[u8], path: &Path) -> Result<()> {
+        let current = self.check_restore_blob(oid, data)?;
+        let blob = self.store.take_blob_file(path)?;
+        self.stage_blob(oid, current, data, true, self.stored_bytes, blob)
+    }
+
+    /// Check that `restore` can stage a copy of `oid`, and return the
+    /// current serial of `oid`. A refused call changes nothing.
+    fn check_restore(&self, oid: Oid) -> Result<Tid> {
         self.check_thread()?;
         if self.tid.is_none() {
             return Err(ZoeError::Protocol("restore outside a restore transaction"));
@@ -335,14 +429,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Err(ZoeError::Protocol("restore after vote"));
         }
         check_oid(oid)?;
-        let current = self.current_serial(oid)?;
-        let area = &self.store.backend.staging;
-        self.staged
-            .put(area, oid, current, data.unwrap_or_default(), true)?;
-        if data.is_none() {
-            self.blobs.remove(&oid);
+        self.current_serial(oid)
+    }
+
+    /// Check that `restore_blob` can stage a copy of `oid` with `data`, and
+    /// return the current serial of `oid`.
+    fn check_restore_blob(&self, oid: Oid, data: &[u8]) -> Result<Tid> {
+        let current = self.check_restore(oid)?;
+        if data.is_empty() {
+            return Err(ZoeError::Protocol("restore of a blob with an empty pickle"));
         }
-        Ok(())
+        Ok(current)
     }
 
     /// Declare that the transaction read `oid` at `serial` and depends on

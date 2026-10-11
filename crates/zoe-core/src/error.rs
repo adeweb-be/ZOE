@@ -1,5 +1,7 @@
 //! The error type of the core.
 
+use std::path::PathBuf;
+
 use crate::guard::SizeLimit;
 use crate::types::{Oid, Tid};
 
@@ -122,8 +124,9 @@ pub enum ZoeError {
     #[error("a finish failed: reopen the store to commit again")]
     Halted,
 
-    /// Another process holds the lock of the store.
-    #[error("the store is locked by another process")]
+    /// Another open store holds the lock of the store directory, or of the
+    /// blob directory.
+    #[error("the store or its blob directory is locked by another open store")]
     Locked,
 
     /// The store is open for reads only. It refuses every write.
@@ -142,6 +145,35 @@ pub enum ZoeError {
     /// its store.
     #[error("the store is closed")]
     Closed,
+
+    /// The store has blob records, but its blob directory has no layout
+    /// file. The first blob of a store creates the layout file before any
+    /// blob record, so this is not the blob directory of the store: the
+    /// blob directory option is missing or wrong, or the directory is not
+    /// mounted. A writer open refuses the store, so that it does not start
+    /// a second blob directory.
+    #[error(
+        "the store has blobs, but the blob directory {} has no layout file: open the store with its blob directory",
+        path.display()
+    )]
+    MissingBlobDir {
+        /// The blob directory that the open found without a layout file.
+        path: PathBuf,
+    },
+
+    /// The blob directory has no layout file, and it holds files of
+    /// another program. A writer open refuses it, so that the recovery of
+    /// the blob store never removes those files. A blob directory without
+    /// a layout file can hold only an empty `tmp/`, or a `tmp/` with only
+    /// the new layout file that a stopped first blob left.
+    #[error(
+        "the blob directory {} has no layout file and holds other files: give an empty or a missing directory",
+        path.display()
+    )]
+    NotBlobDir {
+        /// The blob directory.
+        path: PathBuf,
+    },
 
     /// The store is not in a format that this code reads. Pack also gives
     /// it for a record whose persistent references it cannot read: the

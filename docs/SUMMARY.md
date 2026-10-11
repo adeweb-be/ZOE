@@ -36,6 +36,7 @@
   - [0024. Sequences: one row per name, reserved in durable blocks of 100](adr/0024-sequences.md)
   - [0025. Pack: what it removes, batches, and the progress record](adr/0025-pack.md)
   - [0026. The transaction index: a (tid, oid) key space](adr/0026-transaction-index.md)
+  - [0027. The blob directory](adr/0027-blob-directory.md)
   - [0028. The zoe command](adr/0028-the-zoe-command.md)
 
 # Reference

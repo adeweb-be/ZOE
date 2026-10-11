@@ -4693,6 +4693,7 @@ name = "zoe-core"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "libc",
  "redb",
  "thiserror 2.0.21",
  "tracing",

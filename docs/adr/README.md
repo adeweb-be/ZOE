@@ -30,4 +30,5 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0024](0024-sequences.md) | Sequences: one row per name, reserved in durable blocks of 100 |
 | [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record |
 | [0026](0026-transaction-index.md) | The transaction index: a `(tid, oid)` key space |
+| [0027](0027-blob-directory.md) | The blob directory is an option of the core |
 | [0028](0028-the-zoe-command.md) | The zoe command: one binary in zoe-server, one code path for the console script |

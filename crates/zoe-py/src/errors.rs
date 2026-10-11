@@ -62,6 +62,12 @@ impl From<ZoeError> for Failure {
     }
 }
 
+impl From<std::io::Error> for Failure {
+    fn from(error: std::io::Error) -> Self {
+        ZoeError::from(error).into()
+    }
+}
+
 impl Failure {
     /// Return the exception of ZODB for this failure.
     pub(crate) fn into_py(self, py: Python<'_>) -> PyErr {
@@ -87,7 +93,9 @@ impl Failure {
             | ZoeError::Format(_)
             | ZoeError::ReadOnly
             | ZoeError::NotClosedCleanly
-            | ZoeError::TooLarge { .. } => message(storage_error(py), &self.error),
+            | ZoeError::TooLarge { .. }
+            | ZoeError::MissingBlobDir { .. }
+            | ZoeError::NotBlobDir { .. } => message(storage_error(py), &self.error),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }
@@ -117,6 +125,16 @@ pub(crate) fn pack_failure(py: Python<'_>, error: ZoeError) -> PyErr {
 /// Return the exception for a call on a storage that is closed.
 pub(crate) fn closed(py: Python<'_>) -> PyErr {
     raise(storage_error(py), ("the storage is closed",), None)
+}
+
+/// Return the exception for a transaction status that the storage does
+/// not take.
+pub(crate) fn status(py: Python<'_>, status: &Bound<'_, PyAny>) -> PyErr {
+    let message = match status.repr() {
+        Ok(repr) => format!("transaction status {repr} is not supported"),
+        Err(_) => "transaction status is not supported".to_owned(),
+    };
+    raise(storage_transaction_error(py), (message,), None)
 }
 
 /// Return the exception for a transaction that the storage does not

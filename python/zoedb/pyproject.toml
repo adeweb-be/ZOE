@@ -9,7 +9,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dynamic = ["version"]
-dependencies = ["ZODB>=6"]
+dependencies = ["ZConfig>=4", "ZODB>=6"]
 classifiers = [
     "Development Status :: 1 - Planning",
     "Framework :: ZODB",
@@ -23,6 +23,13 @@ classifiers = [
 
 [project.optional-dependencies]
 plone = ["Products.CMFPlone>=6.1"]
+# zoe:// URIs through zodburi, which needs ZEO.
+uri = ["zodburi>=3"]
+
+# zodburi opens a zoe:// URI with this resolver. The uri extra installs
+# zodburi.
+[project.entry-points."zodburi.resolvers"]
+zoe = "zoe.config:resolve_uri"
 
 [project.scripts]
 # The `zoe` command. It runs the code of the `zoe` binary.

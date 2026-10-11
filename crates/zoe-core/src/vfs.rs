@@ -12,10 +12,12 @@
 //! for example `blobs/tmp/1.tmp`. The empty name `""` is the store
 //! directory itself.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -60,6 +62,11 @@ pub trait Vfs: Send + Sync + 'static {
     /// entries are not in the list.
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
 
+    /// Return the names of all the entries in the directory `dir`, without
+    /// the directory part, in order: files, directories and any other
+    /// entry. A name that is not UTF-8 comes back with its bytes replaced.
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>>;
+
     /// Create the new, empty file `name` and open it for writing. Fail
     /// when `name` exists.
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
@@ -67,8 +74,18 @@ pub trait Vfs: Send + Sync + 'static {
     /// Open the file `name` for reading from its start.
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
 
+    /// Make the bytes of the existing file `name` durable. Fail when
+    /// `name` is not a regular file: a symbolic link is refused too.
+    fn sync_file(&self, name: &str) -> io::Result<()>;
+
     /// Remove the write permissions of the file `name`.
     fn set_read_only(&self, name: &str) -> io::Result<()>;
+
+    /// Take an exclusive lock on the directory `name` itself, and keep it
+    /// until the returned lock drops. Another holder of the lock fails the
+    /// call with `WouldBlock`. A filesystem that cannot lock a directory
+    /// fails the call with its error: the call never skips the lock.
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock>;
 
     /// Return the path of `name`. A simulated filesystem returns `name`
     /// as a relative path.
@@ -116,6 +133,10 @@ impl<V: Vfs> Vfs for Arc<V> {
         (**self).list_files(dir)
     }
 
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        (**self).list_entries(dir)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
         (**self).create_file(name)
     }
@@ -124,12 +145,34 @@ impl<V: Vfs> Vfs for Arc<V> {
         (**self).read_file(name)
     }
 
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        (**self).sync_file(name)
+    }
+
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         (**self).set_read_only(name)
     }
 
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        (**self).lock_dir(name)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         (**self).path(name)
+    }
+}
+
+/// A lock that `Vfs::lock_dir` took. Dropping it releases the lock.
+pub struct DirLock {
+    _guard: Box<dyn Any + Send + Sync>,
+}
+
+impl DirLock {
+    /// Return the lock that `guard` holds until it drops.
+    pub fn new(guard: impl Any + Send + Sync) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
     }
 }
 
@@ -152,7 +195,9 @@ pub(crate) fn parent(name: &str) -> &str {
 #[derive(Debug)]
 pub struct OsVfs {
     dir: PathBuf,
-    _lock: File,
+    /// The lock file of the store. A directory that holds the blob
+    /// directory of a store has none.
+    _lock: Option<File>,
 }
 
 impl OsVfs {
@@ -166,6 +211,18 @@ impl OsVfs {
             .truncate(false)
             .open(dir.join(LOCK))?;
         Self::locked(dir, lock)
+    }
+
+    /// Open the directory `dir` without a lock, and create it if necessary.
+    /// It is the directory that holds the blob directory of a store whose
+    /// blob files are outside the store directory. The lock of the store
+    /// stays in the store directory.
+    pub(crate) fn unlocked(dir: &Path) -> Result<Self> {
+        create_dir_durable(dir)?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            _lock: None,
+        })
     }
 
     /// Open the directory `dir` of an existing store to read it, and take
@@ -198,7 +255,7 @@ impl OsVfs {
         match lock.try_lock() {
             Ok(()) => Ok(Self {
                 dir: dir.to_owned(),
-                _lock: lock,
+                _lock: Some(lock),
             }),
             Err(TryLockError::WouldBlock) => Err(ZoeError::Locked),
             Err(TryLockError::Error(e)) => Err(e.into()),
@@ -279,6 +336,15 @@ impl Vfs for OsVfs {
         Ok(names)
     }
 
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.dir.join(dir))? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
         let file = OpenOptions::new()
             .write(true)
@@ -291,11 +357,51 @@ impl Vfs for OsVfs {
         Ok(Box::new(File::open(self.dir.join(name))?))
     }
 
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let path = self.dir.join(name);
+        // O_NOFOLLOW refuses a symbolic link. O_NONBLOCK keeps the open of
+        // a pipe from waiting for a writer. A sync needs no write
+        // permission.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        // The type comes from the open file, so no other file can take its
+        // place between the check and the sync.
+        if !file.metadata()?.is_file() {
+            let message = format!("not a regular file: {}", path.display());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        file.sync_all()
+    }
+
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         let path = self.dir.join(name);
         let mut permissions = fs::metadata(&path)?.permissions();
         permissions.set_readonly(true);
         fs::set_permissions(path, permissions)
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let path = self.dir.join(name);
+        // flock on a descriptor of the directory itself: no file is
+        // created in it.
+        let dir = File::open(&path)?;
+        if !dir.metadata()?.is_dir() {
+            let message = format!("not a directory: {}", path.display());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        match dir.try_lock() {
+            Ok(()) => Ok(DirLock::new(dir)),
+            Err(TryLockError::WouldBlock) => {
+                let message = format!("{} is locked", path.display());
+                Err(io::Error::new(io::ErrorKind::WouldBlock, message))
+            }
+            Err(TryLockError::Error(e)) => {
+                let message = format!("cannot lock the directory {}: {e}", path.display());
+                Err(io::Error::new(e.kind(), message))
+            }
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -424,6 +530,8 @@ struct State {
     process: Process,
     /// The bytes that reads of the files returned.
     bytes_read: u64,
+    /// The directories that a `lock_dir` holds.
+    locked: BTreeSet<String>,
 }
 
 impl State {
@@ -491,6 +599,7 @@ impl MemVfs {
             log: Vec::new(),
             process: Process::Alive,
             bytes_read: 0,
+            locked: BTreeSet::new(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -534,7 +643,10 @@ impl MemVfs {
     /// on, so an operation that the killed process did not sync stays
     /// pending in the crash images.
     pub fn restart(&self) {
-        self.lock().process = Process::Alive;
+        let mut state = self.lock();
+        state.process = Process::Alive;
+        // The system releases the locks of a killed process.
+        state.locked.clear();
     }
 
     /// Return a filesystem with the files and the directories of this one,
@@ -739,6 +851,23 @@ impl MemVfs {
         })
     }
 
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        let state = self.lock();
+        state.alive()?;
+        if !state.has_dir(dir) {
+            return Err(not_found(dir));
+        }
+        let mut names: Vec<String> = state
+            .files
+            .keys()
+            .chain(state.dirs.iter())
+            .filter(|name| parent(name) == dir && !name.is_empty())
+            .map(|name| name.rsplit('/').next().unwrap_or_default().to_owned())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<MemWriteFile> {
         let file = self.create_new(name)?;
         Ok(MemWriteFile {
@@ -803,12 +932,28 @@ impl Vfs for MemVfs {
         MemVfs::list_files(self, dir)
     }
 
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        MemVfs::list_entries(self, dir)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
         Ok(Box::new(MemVfs::create_file(self, name)?))
     }
 
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(MemVfs::read_file(self, name)?))
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.files.contains_key(name) {
+            return Err(not_found(name));
+        }
+        state.log.push(Op::Sync {
+            file: name.to_owned(),
+        });
+        Ok(())
     }
 
     /// The simulation keeps no permissions, so this only checks that the
@@ -821,6 +966,21 @@ impl Vfs for MemVfs {
         } else {
             Err(not_found(name))
         }
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.has_dir(name) {
+            return Err(not_found(name));
+        }
+        if !state.locked.insert(name.to_owned()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, name.to_owned()));
+        }
+        Ok(DirLock::new(MemDirLock {
+            vfs: self.clone(),
+            name: name.to_owned(),
+        }))
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -1053,6 +1213,18 @@ impl WriteFile for MemWriteFile {
             file: self.name.clone(),
         });
         Ok(())
+    }
+}
+
+/// A lock on a directory of a `MemVfs`. Dropping it releases the lock.
+struct MemDirLock {
+    vfs: MemVfs,
+    name: String,
+}
+
+impl Drop for MemDirLock {
+    fn drop(&mut self) {
+        self.vfs.lock().locked.remove(&self.name);
     }
 }
 
@@ -1479,6 +1651,79 @@ mod tests {
         assert!(!vfs.exists("g").unwrap());
         assert!(vfs.exists("d").unwrap());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_sync_makes_the_earlier_writes_durable() {
+        let vfs = MemVfs::new();
+        let mut file = Vfs::create_file(&vfs, "f").unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        vfs.sync_dir();
+        Vfs::sync_file(&vfs, "f").unwrap();
+        vfs.mark("synced");
+        assert!(Vfs::sync_file(&vfs, "g").is_err());
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("synced")) {
+            assert_eq!(contents(image, "f").as_deref(), Some(&b"x"[..]));
+        }
+    }
+
+    #[test]
+    fn an_os_file_sync_takes_only_a_regular_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!("zoe-vfs-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        fs::write(vfs.path("f"), b"x").unwrap();
+        fs::set_permissions(vfs.path("f"), fs::Permissions::from_mode(0o444)).unwrap();
+        vfs.sync_file("f").unwrap();
+
+        vfs.create_dir("d").unwrap();
+        let error = vfs.sync_file("d").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        let _socket = std::os::unix::net::UnixListener::bind(vfs.path("socket")).unwrap();
+        assert!(vfs.sync_file("socket").is_err());
+        symlink(vfs.path("f"), vfs.path("link")).unwrap();
+        let error = vfs.sync_file("link").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
+        assert_eq!(
+            vfs.sync_file("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_directory_lock_has_one_holder() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        vfs.create_dir("d").unwrap();
+        let lock = vfs.lock_dir("d").unwrap();
+        let error = vfs.lock_dir("d").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        drop(lock);
+        drop(vfs.lock_dir("d").unwrap());
+        fs::write(vfs.path("f"), b"x").unwrap();
+        let error = vfs.lock_dir("f").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(vfs.lock_dir("missing").is_err());
+        // The lock adds no file to the directory.
+        assert!(fs::read_dir(vfs.path("d")).unwrap().next().is_none());
+        fs::remove_dir_all(&root).unwrap();
+
+        // A simulated filesystem keeps its locks until they drop, or until
+        // the process is killed.
+        let vfs = MemVfs::new();
+        Vfs::create_dir(&vfs, "d").unwrap();
+        let lock = Vfs::lock_dir(&vfs, "d").unwrap();
+        let error = Vfs::lock_dir(&vfs, "d").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        std::mem::forget(lock);
+        vfs.restart();
+        drop(Vfs::lock_dir(&vfs, "d").unwrap());
     }
 
     #[test]
