@@ -215,6 +215,17 @@ def test_the_blob_directory_comes_from_the_option(tmp_path):
         storage.close()
 
 
+def test_a_blob_dir_with_other_files_is_refused(tmp_path):
+    blob_dir = tmp_path / "reports"
+    (blob_dir / "tmp").mkdir(parents=True)
+    (blob_dir / "tmp" / "report.txt").write_bytes(b"theirs")
+    for _ in range(2):
+        with pytest.raises(StorageError):
+            zoe.Storage(str(tmp_path / "store"), blob_dir=str(blob_dir))
+        assert (blob_dir / "tmp" / "report.txt").read_bytes() == b"theirs"
+    assert not (blob_dir / ".layout").exists()
+
+
 def test_a_copy_of_the_store_directory_keeps_its_own_blobs(tmp_path):
     original = tmp_path / "original"
     storage = zoe.Storage(str(original))

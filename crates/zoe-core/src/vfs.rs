@@ -60,6 +60,11 @@ pub trait Vfs: Send + Sync + 'static {
     /// entries are not in the list.
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
 
+    /// Return the names of all the entries in the directory `dir`, without
+    /// the directory part, in order: files, directories and any other
+    /// entry. A name that is not UTF-8 comes back with its bytes replaced.
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>>;
+
     /// Create the new, empty file `name` and open it for writing. Fail
     /// when `name` exists.
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
@@ -118,6 +123,10 @@ impl<V: Vfs> Vfs for Arc<V> {
 
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         (**self).list_files(dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        (**self).list_entries(dir)
     }
 
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
@@ -296,6 +305,15 @@ impl Vfs for OsVfs {
             if let Ok(name) = entry.file_name().into_string() {
                 names.push(name);
             }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.dir.join(dir))? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
         }
         names.sort();
         Ok(names)
@@ -770,6 +788,23 @@ impl MemVfs {
         })
     }
 
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        let state = self.lock();
+        state.alive()?;
+        if !state.has_dir(dir) {
+            return Err(not_found(dir));
+        }
+        let mut names: Vec<String> = state
+            .files
+            .keys()
+            .chain(state.dirs.iter())
+            .filter(|name| parent(name) == dir && !name.is_empty())
+            .map(|name| name.rsplit('/').next().unwrap_or_default().to_owned())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     fn create_file(&self, name: &str) -> io::Result<MemWriteFile> {
         let file = self.create_new(name)?;
         Ok(MemWriteFile {
@@ -832,6 +867,10 @@ impl Vfs for MemVfs {
 
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         MemVfs::list_files(self, dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        MemVfs::list_entries(self, dir)
     }
 
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
