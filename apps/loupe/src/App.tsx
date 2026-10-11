@@ -78,9 +78,8 @@ export function App() {
     return [found, failure];
   };
 
-  const open = (path: string) => {
-    const move = ++latestMove.current;
-    return run(async (current) => {
+  const open = (path: string) =>
+    run(async (current) => {
       setFolder(null);
       setRootObject(null);
       setRootMissing(false);
@@ -88,7 +87,9 @@ export function App() {
       const opened = await openFolder(path);
       // The Rust side has the folder open, with the switch on the last
       // transaction. The window shows this even when a newer request
-      // started.
+      // started. A move counts only once its call succeeds, so a failed
+      // call drops no root.
+      const move = ++latestMove.current;
       setFolder(opened);
       setOpens((count) => count + 1);
       setViews((count) => count + 1);
@@ -104,7 +105,6 @@ export function App() {
         throw failure;
       }
     });
-  };
 
   const browse = async () => {
     try {
@@ -139,27 +139,35 @@ export function App() {
    * when `text` is empty. Then read the root and the shown object again.
    */
   const travel = (text: string) => {
-    const shown = current?.oid ?? null;
-    const move = ++latestMove.current;
+    const before = current;
+    const shown = before?.oid ?? null;
+    // When a newer request stops the travel, the pane drops the object
+    // from before the move. An object that a newer request put in the
+    // pane stays.
+    const stop = () =>
+      setCurrent((pane) => (pane === before ? null : pane));
     return run(async (current) => {
       const tid = text.trim() === "" ? null : text.trim();
       await setAsOf(tid);
       // The switch of the Rust side has moved. The window shows the move
-      // even when a newer request started, so it never shows two tids.
+      // even when a newer request started, so it never shows two tids. A
+      // move counts only once its call succeeds, so a failed call drops no
+      // root.
+      const move = ++latestMove.current;
       setAsOfTid(tid);
       setAsOfText(tid ?? "");
       setRootObject(null);
       setRootMissing(false);
       setViews((count) => count + 1);
       if (!current()) {
-        // A newer request fills the pane, as of this move or a later one.
-        setCurrent(null);
+        stop();
       }
       // A view before the first transaction has no root. The tree then
       // shows a note.
       const [foundRoot, rootFailure] = await reloadRoot(move);
       let failure = rootFailure;
       if (!current()) {
+        stop();
         return;
       }
       // The pane keeps the object until its new revision comes. An object
@@ -174,6 +182,7 @@ export function App() {
         failure = objectFailure;
       }
       if (!current()) {
+        stop();
         return;
       }
       setCurrent(found);
