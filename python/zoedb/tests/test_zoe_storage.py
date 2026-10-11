@@ -135,11 +135,6 @@ def test_wrong_thread_is_a_storage_transaction_error():
     assert zoe.Storage is zoe.storage.Storage
 
 
-def test_pack_is_not_implemented(storage):
-    with pytest.raises(NotImplementedError):
-        storage.pack(time.time(), None)
-
-
 def test_a_version_is_unsupported(storage):
     txn = TransactionMetaData()
     storage.tpc_begin(txn)

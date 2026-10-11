@@ -5,6 +5,8 @@ parts that need ZODB: the interface declaration, the history records, the
 conflict resolution and the `WrongThread` exception.
 """
 
+import time
+
 import zope.interface
 from ZODB.ConflictResolution import ConflictResolvingStorage
 from ZODB.interfaces import IStorage
@@ -43,6 +45,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     The vote resolves a conflict in this process, through the
     `_p_resolveConflict` method of the class of the object, as ZODB's
     `ConflictResolvingStorage` does.
+
+    `pack` runs the online pack of the store, with garbage collection.
+    Reads and commits go on while it runs.
     """
 
     def tpc_vote(self, transaction):
@@ -107,8 +112,24 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         ]
 
     def pack(self, pack_time, referencesf):
-        """Refuse to pack: the store does not pack yet."""
-        raise NotImplementedError("zoe.Storage does not pack yet")
+        """Pack the store as of `pack_time`, in seconds since the epoch.
+
+        The pack keeps every record after `pack_time`. For each object that
+        a reader at `pack_time` or later can reach, it also keeps the newest
+        record at or before `pack_time`. It removes the other records, with
+        their blob files. The pack time becomes a tid as in ZODB's own
+        storages: the `TimeStamp` of the time in UTC. The store finds the
+        references in the records itself, so the pack ignores `referencesf`
+        and never calls it.
+
+        The whole pack runs without the GIL. Other threads read and commit
+        while it runs. A pack at a time before the last pack does nothing.
+        A record that the pack cannot read stops it with
+        `StorageSystemError`. A read-only storage raises `ReadOnlyError`,
+        and a closed storage raises `StorageError`.
+        """
+        stop = TimeStamp(*time.gmtime(pack_time)[:5] + (pack_time % 60,))
+        self._pack(stop.raw())
 
     def registerDB(self, wrapper):
         """Accept the database. The storage sends it no invalidations.

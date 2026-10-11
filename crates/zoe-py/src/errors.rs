@@ -97,6 +97,22 @@ impl Failure {
     }
 }
 
+/// Return the exception for a pack that failed with `error`.
+///
+/// A record that fails its checksum stops the pack with `CorruptRecord`.
+/// A record or a row that the pack cannot read stops it with `Format`.
+/// Both raise `StorageSystemError`. The text starts with "pack stopped"
+/// and gives the text of the core, which names the record. Other errors
+/// map as for every call.
+pub(crate) fn pack_failure(py: Python<'_>, error: ZoeError) -> PyErr {
+    let text = match &error {
+        ZoeError::CorruptRecord { .. } => format!("pack stopped: {error}"),
+        ZoeError::Format(text) => format!("pack stopped: {text}"),
+        _ => return Failure::from(error).into_py(py),
+    };
+    raise(storage_system_error(py), (text,), None)
+}
+
 /// Return the exception for a call on a storage that is closed.
 pub(crate) fn closed(py: Python<'_>) -> PyErr {
     raise(storage_error(py), ("the storage is closed",), None)
