@@ -3,7 +3,11 @@
 name = "zoe-workspace"
 version = "0.0.0"
 requires-python = ">=3.12"
-dependencies = ["zoedb"]
+dependencies = [
+    "zoedb",
+    # A direct dependency, so that the source below selects the fork.
+    "persistent",
+]
 
 [dependency-groups]
 dev = [
@@ -18,6 +22,10 @@ package = false
 
 [tool.uv.sources]
 zoedb = { workspace = true }
+# The fork of persistent, at a commit of the branch zoe-043-getstate-race.
+# It fixes the instance dict of a deactivated object on Python 3.13 and
+# later, which broke the state of objects on 3.14t.
+persistent = { git = "https://github.com/adeweb-be/persistent", rev = "caeb9135ab15daf62b9031fcde1bb6965973d0e9" }
 
 [tool.uv.workspace]
 members = ["zoedb"]
