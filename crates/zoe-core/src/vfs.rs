@@ -22,7 +22,8 @@ use crate::error::{Result, ZoeError};
 
 /// The directory of a store, as the core sees it.
 pub trait Vfs: Send + Sync + 'static {
-    /// An open file. redb stores its database in one.
+    /// An open file that the core reads and writes at any offset. redb
+    /// stores its database in one, and a transaction its spill file.
     type File: redb::StorageBackend;
 
     /// Tell if the file or directory `name` exists.
@@ -66,6 +67,60 @@ pub trait Vfs: Send + Sync + 'static {
     /// Return the path of `name`. A simulated filesystem returns `name`
     /// as a relative path.
     fn path(&self, name: &str) -> PathBuf;
+}
+
+/// A shared directory. The clones share the directory and its lock. The
+/// lock goes when the last clone is dropped.
+impl<V: Vfs> Vfs for Arc<V> {
+    type File = V::File;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        (**self).exists(name)
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        (**self).open(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        (**self).rename(from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        (**self).remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        (**self).sync_dir()
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        (**self).sync_dir_at(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        (**self).create_dir(name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        (**self).list_files(dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        (**self).create_file(name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        (**self).read_file(name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        (**self).set_read_only(name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        (**self).path(name)
+    }
 }
 
 /// A file that the core writes from its start to its end.
