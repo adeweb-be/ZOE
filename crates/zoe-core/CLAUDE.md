@@ -13,6 +13,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - The backend never allocates tids. The core allocates the tid at `tpc_finish` under the commit sequencer: `max(now, last_tid + 1 tick)`.
 - Tids always increase.
 - A client passes a tid only through `restore`, never through a normal commit.
+- A restore transaction (`tpc_begin_restore`) commits under the tid of the client and allocates no tid. The tid must be after the last tid: `tpc_begin_restore` checks it, and `finish` checks it again under the commit sequencer. A tid that is not after the last tid, or `Tid::MAX`, fails with `Protocol`, and the store does not halt.
 - Locks are acquired in ascending oid order, over the written and the read-current oids together. A request out of order is refused with `LockOrder`, never granted.
 - Written oids take exclusive locks. Oids passed to `checkCurrentSerialInTransaction` take shared locks. An oid that is both takes an exclusive lock. A shared lock is compatible only with shared locks.
 - Each oid has a wait queue in arrival order. A lock request never passes a request that waits for the same oid, so a stream of readers cannot starve a writer.
@@ -31,6 +32,10 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - One thread drives a transaction from `tpc_begin` to `tpc_finish` or `tpc_abort`. A call from another thread is refused with `WrongThread`.
 - The lock manager and group commit are the only shared mutable state. The core is `Send + Sync`.
 - Every read verifies the record checksum. A mismatch raises `CorruptRecord` with the oid and the tid, never `POSKeyError`.
+- `load_before(oid, tid)` reads one snapshot: a reverse range scan from `(oid, tid - 1)` gives the record, and a forward scan from `(oid, tid)` gives the serial of the next record. Both records are verified. An oid with records, but none before `tid`, gives `None`. An oid with no record raises `NotFound`.
+- A record with a 0-length payload is a deletion. `load`, `load_before` and `load_serial` of a deletion raise `NotFound`. `history` lists it with size 0. The iterator gives it with `data: None`. `record_iternext` skips the oid.
+- The transaction iterator stops at the last tid at the time of the call. A later transaction always has a greater tid, so the iterator gives each transaction with all of its records.
+- No key space maps a tid to its oids. `Backend::txn_oids` scans every key of `records`, so each iterator call reads all the keys of the store.
 - An error in `finish` leaves the outcome unknown until the store is reopened. Until then, every later finish is refused with `Halted`.
 - Every record carries a codec byte, a branch id and a typed-field-slot header. Every blob record carries its BLAKE3 hash. This holds from the first store written.
 - `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` before anything is written.
@@ -39,5 +44,6 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Nothing is undoable past the last pack.
 - A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename.
 - `next_oid` in `meta` is always greater than every committed oid.
+- `finish` raises the next oid of the store above every oid that it writes, before the write. So `new_oid` never gives an oid that a restore wrote.
 - The core reads the time only through the `Clock` trait and the filesystem only through the `Vfs` trait, so the crash simulation and the deterministic simulator can replace them. One exception: lock waits use `Instant`, because `Clock` gives wall time and a `Condvar` wait cannot run on a simulated clock.
-- A change to the `Backend` or `WriteTxn` signatures is a stop-and-ask: other crates implement and call them.
+- A change to an existing `Backend` or `WriteTxn` signature is a stop-and-ask: other crates implement and call them. A new method needs no stop while no crate outside `zoe-core` implements the traits.
