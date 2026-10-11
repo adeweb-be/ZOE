@@ -185,11 +185,8 @@ impl Store {
             blobs: BlobStore::new(dir),
         });
         // `Opened` holds the database and the directory here, so an error
-        // drops them in order: the database closes before the lock goes. A
-        // read-only store changes nothing under `blobs/`.
-        if !read_only {
-            opened.blobs.open(&**opened)?;
-        }
+        // drops them in order: the database closes before the lock goes.
+        opened.blobs.open(&**opened, read_only)?;
         Ok(Self {
             backend: opened,
             clock,
@@ -283,8 +280,10 @@ impl Store {
 
     /// Return a new, empty blob file. Write the blob into it, then give it
     /// to `Txn::store_blob`. Dropping a file that no transaction took
-    /// removes it.
+    /// removes it. A read-only store fails with `ReadOnly` and creates
+    /// nothing.
     pub fn new_blob_file(&self) -> Result<BlobFile> {
+        self.writable()?;
         self.blobs().new_file(Arc::downgrade(&self.backend))
     }
 

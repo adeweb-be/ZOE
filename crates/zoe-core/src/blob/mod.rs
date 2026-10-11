@@ -117,7 +117,12 @@ impl BlobStore {
     /// crash in `blobs/tmp/` are removed: the blob files that an intent
     /// file names and that `backend` has no blob record for, the intent
     /// files and the temporary files.
-    pub(crate) fn open(&self, backend: &dyn Backend) -> Result<()> {
+    ///
+    /// A read-only store only reads the layout file and changes nothing.
+    /// It leaves the leftovers of a crash to the next writer. A blob file
+    /// that a crash left without its blob record stays invisible, because
+    /// every blob read starts from the blob record.
+    pub(crate) fn open(&self, backend: &dyn Backend, read_only: bool) -> Result<()> {
         if self.dir.exists(LAYOUT_FILE)? {
             let mut layout = String::new();
             self.dir
@@ -130,7 +135,7 @@ impl BlobStore {
                 )));
             }
         }
-        if self.dir.exists(TMP_DIR)? {
+        if !read_only && self.dir.exists(TMP_DIR)? {
             self.recover(backend)?;
         }
         Ok(())
@@ -963,6 +968,68 @@ mod tests {
         assert!(matches!(refused, Err(ZoeError::Closed)), "{refused:?}");
         drop(txn);
         drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Return every directory and file under `dir`, with the bytes of each
+    /// file.
+    fn tree(dir: &std::path::Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        let mut todo = vec![dir.to_owned()];
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    found.insert(path.clone(), None);
+                    todo.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    found.insert(path, Some(bytes));
+                }
+            }
+        }
+        found
+    }
+
+    /// A read-only open of a store with the leftovers of a crash reads the
+    /// committed blobs and changes no file under `blobs/`.
+    #[test]
+    fn a_read_only_open_changes_nothing_under_blobs() {
+        let dir = std::env::temp_dir().join(format!("zoe-blob-read-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (oid, tid, orphan) = {
+            let store = Store::open(&dir).unwrap();
+            let oid = store.new_oid().unwrap();
+            let orphan = store.new_oid().unwrap();
+            let tid = commit_blobs(&store, &[oid], b"kept");
+            (oid, tid, orphan)
+        };
+
+        // A finish that placed its blob file and stopped before its backend
+        // commit, with its intent file, and a temporary file.
+        let crashed = Tid(tid.0 + 1);
+        std::fs::create_dir_all(dir.join(oid_dir(orphan))).unwrap();
+        for (name, bytes) in [
+            (blob_name(orphan, crashed), b"orphan".to_vec()),
+            (intent_name(crashed), encode_intent(crashed, &[orphan])),
+            (format!("{TMP_DIR}/7.tmp"), b"temporary".to_vec()),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let before = tree(&dir.join(BLOB_DIR));
+
+        let store = Store::open_read_only(&dir).unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"kept");
+        let orphan_blob = store.open_blob(orphan, crashed);
+        assert!(matches!(orphan_blob, Err(ZoeError::NotFound { .. })));
+        assert!(matches!(store.new_blob_file(), Err(ZoeError::ReadOnly)));
+        drop(store);
+        assert_eq!(tree(&dir.join(BLOB_DIR)), before);
+
+        // The next writer removes the leftovers.
+        drop(Store::open(&dir).unwrap());
+        assert!(!dir.join(blob_name(orphan, crashed)).exists());
+        assert!(!dir.join(intent_name(crashed)).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
