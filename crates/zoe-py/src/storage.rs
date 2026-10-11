@@ -15,8 +15,8 @@
 //!
 //! `storeBlob` and `restoreBlob` take a file of `temporaryDirectory()` by
 //! rename, through the core, and copy a file from elsewhere. `loadBlob`
-//! gives the path of a committed blob file. A `blob_dir` other than
-//! `<path>/blobs` becomes the symbolic link `<path>/blobs` to it.
+//! gives the path of a committed blob file. The core keeps the blob files
+//! in `blob_dir`, `<path>/blobs` by default.
 //!
 //! `_vote_resolving` votes and keeps the locks when it finds conflicts.
 //! `zoe.storage.Storage.tpc_vote` resolves them in Python, stores the
@@ -145,9 +145,8 @@ impl Storage {
 impl Storage {
     /// Open the store in the directory `path`, and create it if necessary.
     /// `lock_timeout` is the longest wait of a vote for its locks, in
-    /// seconds. `blob_dir` is the directory of the blob files: `None` keeps
-    /// the blob directory of the store, `<path>/blobs` for a new store.
-    /// `link_blob_dir` tells what another directory means.
+    /// seconds. `blob_dir` is the directory of the blob files, `None` for
+    /// `<path>/blobs`. The core takes it as `Options::blob_dir`.
     #[new]
     #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None))]
     fn new(
@@ -163,28 +162,36 @@ impl Storage {
                 PyValueError::new_err("lock_timeout is a number of seconds, 0 or more")
             })?;
         }
+        options.blob_dir = blob_dir;
         let (store, last, path) = py
             .detach(|| {
                 // A read-only storage creates no directory. It opens the
                 // store for writes all the same, because the core has no
                 // read-only open yet. When the core gets one, a read-only
                 // storage uses it.
-                if read_only && !path.is_dir() {
-                    let missing = format!("no store directory: {}", path.display());
-                    return Err(io::Error::new(io::ErrorKind::NotFound, missing).into());
+                if read_only {
+                    let blob_parent = match &options.blob_dir {
+                        Some(blob_dir) => std::path::absolute(blob_dir)?
+                            .parent()
+                            .map(Path::to_owned),
+                        None => None,
+                    };
+                    for dir in std::iter::once(path.clone()).chain(blob_parent) {
+                        if !dir.is_dir() {
+                            let missing = format!("no directory: {}", dir.display());
+                            return Err(io::Error::new(io::ErrorKind::NotFound, missing).into());
+                        }
+                    }
                 }
                 // The blob paths that the storage gives do not depend on the
                 // current directory.
                 let path = std::path::absolute(&path)?;
                 let store = Store::open_with(&path, options)?;
-                if let Some(blob_dir) = &blob_dir {
-                    link_blob_dir(&path, blob_dir, read_only)?;
-                }
                 let last = store.last_transaction();
                 let path = fs::canonicalize(&path)?;
-                Ok::<_, Opening>((store, last, path))
+                Ok::<_, ZoeError>((store, last, path))
             })
-            .map_err(|error| error.into_py(py))?;
+            .map_err(|error| core(py, error))?;
         Ok(Self {
             store: RwLock::new(Some(Arc::new(store))),
             path: path.to_string_lossy().into_owned(),
@@ -941,130 +948,6 @@ fn blob_source(store: &Store, path: &Path) -> Result<Source, Failure> {
     match real_temp.parent() {
         Some(blobs) if dir.starts_with(blobs) => Ok(Source::BlobDir),
         _ => Ok(Source::Elsewhere),
-    }
-}
-
-/// An error of `Storage.__new__`.
-enum Opening {
-    /// The core failed.
-    Core(ZoeError),
-    /// The store refuses `blob_dir`.
-    BlobDir(String),
-}
-
-impl From<ZoeError> for Opening {
-    fn from(error: ZoeError) -> Self {
-        Self::Core(error)
-    }
-}
-
-impl From<io::Error> for Opening {
-    fn from(error: io::Error) -> Self {
-        Self::Core(error.into())
-    }
-}
-
-impl Opening {
-    fn into_py(self, py: Python<'_>) -> PyErr {
-        match self {
-            Self::Core(error) => core(py, error),
-            Self::BlobDir(message) => errors::blob_dir(py, message),
-        }
-    }
-}
-
-/// The blob directory in the store directory. The core keeps the blob
-/// files there.
-const BLOBS: &str = "blobs";
-
-/// Make `blob_dir` the blob directory of the store in `dir`.
-///
-/// The core keeps the blob files in `<dir>/blobs`. Another `blob_dir`
-/// becomes the symbolic link `<dir>/blobs` to it. So the blob files and
-/// their temporary directory live in `blob_dir`, on its device, and a
-/// commit renames each file there. The link stays: a later open without
-/// `blob_dir` finds the blobs.
-///
-/// A store that has a blob directory refuses another `blob_dir`. A new link
-/// needs a missing or empty `blob_dir`, so two stores never share a blob
-/// directory. `blob_dir` is created and synced before the link, and the
-/// store directory is synced after it. A read-only storage creates nothing.
-fn link_blob_dir(dir: &Path, blob_dir: &Path, read_only: bool) -> Result<(), Opening> {
-    let link = dir.join(BLOBS);
-    let blob_dir = resolved(blob_dir)?;
-    if blob_dir == resolved(&link)? {
-        return Ok(());
-    }
-    match fs::symlink_metadata(&link) {
-        Ok(_) => {
-            let current = fs::canonicalize(&link).unwrap_or(link);
-            if fs::canonicalize(&blob_dir).is_ok_and(|wanted| wanted == current) {
-                return Ok(());
-            }
-            Err(Opening::BlobDir(format!(
-                "blob_dir {}: the store keeps its blobs in {}",
-                blob_dir.display(),
-                current.display()
-            )))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if read_only {
-                return Ok(());
-            }
-            create_dir_durable(&blob_dir)?;
-            if fs::read_dir(&blob_dir)?.next().is_some() {
-                return Err(Opening::BlobDir(format!(
-                    "blob_dir {} is not empty, and the store has no blob directory yet",
-                    blob_dir.display()
-                )));
-            }
-            std::os::unix::fs::symlink(&blob_dir, &link)?;
-            File::open(dir)?.sync_all()?;
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Return the absolute form of `path`, with the symbolic links of its
-/// parent resolved. The last part stays as it is, so the path of a missing
-/// directory or of a link resolves too.
-fn resolved(path: &Path) -> io::Result<PathBuf> {
-    let path = std::path::absolute(path)?;
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(parent) = fs::canonicalize(parent)
-    {
-        return Ok(parent.join(name));
-    }
-    Ok(path)
-}
-
-/// Create the directory `dir` and its missing parents, one level at a
-/// time. Sync the parent of each new directory, and the parent of `dir`
-/// also when `dir` exists: a process that stopped before its sync can
-/// leave a directory that is not durable.
-fn create_dir_durable(dir: &Path) -> io::Result<()> {
-    let missing: Vec<&Path> = dir
-        .ancestors()
-        .take_while(|path| !path.as_os_str().is_empty() && !path.is_dir())
-        .collect();
-    for path in missing.into_iter().rev() {
-        match fs::create_dir(path) {
-            Ok(()) => {}
-            // Another process can create the directory first.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
-            Err(e) => return Err(e),
-        }
-        sync_parent(path)?;
-    }
-    sync_parent(dir)
-}
-
-/// Sync the directory that holds `path`.
-fn sync_parent(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
-        _ => Ok(()),
     }
 }
 

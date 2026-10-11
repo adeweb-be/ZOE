@@ -125,11 +125,6 @@ pub(crate) fn closed(py: Python<'_>) -> PyErr {
     raise(storage_error(py), ("the storage is closed",), None)
 }
 
-/// Return the exception for a `blob_dir` that the store refuses.
-pub(crate) fn blob_dir(py: Python<'_>, message: String) -> PyErr {
-    raise(storage_error(py), (message,), None)
-}
-
 /// Return the exception for a transaction that the storage does not
 /// know.
 pub(crate) fn unknown_transaction(py: Python<'_>) -> PyErr {

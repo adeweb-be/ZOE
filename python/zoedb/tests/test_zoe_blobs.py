@@ -9,6 +9,7 @@ closed storage.
 
 import os
 import pickle
+import shutil
 import tempfile
 import threading
 
@@ -163,62 +164,70 @@ def test_a_blob_of_a_savepoint_commits_by_rename(tmp_path):
         db.close()
 
 
-def test_the_blob_directory_stays_with_the_store(tmp_path):
-    path, blob_dir = str(tmp_path / "store"), tmp_path / "elsewhere"
+def test_the_blob_directory_comes_from_the_option(tmp_path):
+    path, blob_dir = str(tmp_path / "store"), tmp_path / "a" / "elsewhere"
     storage = zoe.Storage(path, blob_dir=str(blob_dir))
     try:
         oid = storage.new_oid()
         tid = store_blob(storage, oid, ZERO, write_temporary(storage, DATA))
+        committed = storage.loadBlob(oid, tid)
+        assert committed.startswith(str(blob_dir) + os.sep)
+        assert storage.temporaryDirectory() == str(blob_dir / "tmp")
     finally:
         storage.close()
+    assert (blob_dir / ".layout").read_text().strip() == "bushy"
+    assert not (tmp_path / "store" / "blobs").exists()
 
-    # A later open without blob_dir, or with the same one, finds the blobs.
-    for options in ({}, {"blob_dir": str(blob_dir)}):
-        storage = zoe.Storage(path, **options)
-        try:
-            committed = os.path.realpath(storage.loadBlob(oid, tid))
-            assert committed.startswith(os.path.realpath(blob_dir) + os.sep)
-            assert read(committed) == DATA
-        finally:
-            storage.close()
+    # The store does not record its blob directory. Without it, or with
+    # another one, the store refuses to open.
+    for options in ({}, {"blob_dir": str(tmp_path / "other")}):
+        with pytest.raises(StorageError):
+            zoe.Storage(path, **options)
+    assert not (tmp_path / "store" / "blobs").exists()
 
-    # The store refuses another blob directory.
-    with pytest.raises(StorageError):
-        zoe.Storage(path, blob_dir=str(tmp_path / "other"))
-    zoe.Storage(path, blob_dir=os.path.join(path, "blobs")).close()
-
-
-def test_a_store_with_blobs_refuses_another_blob_directory(tmp_path):
-    path = str(tmp_path / "store")
-    storage = zoe.Storage(path)
+    storage = zoe.Storage(path, blob_dir=str(blob_dir))
     try:
-        store_blob(storage, storage.new_oid(), ZERO, write_temporary(storage, DATA))
+        assert read(storage.loadBlob(oid, tid)) == DATA
     finally:
         storage.close()
-    with pytest.raises(StorageError):
-        zoe.Storage(path, blob_dir=str(tmp_path / "elsewhere"))
-    assert not (tmp_path / "elsewhere").exists()
 
 
-def test_a_new_link_needs_an_empty_blob_directory(tmp_path):
-    used = tmp_path / "used"
-    used.mkdir()
-    (used / "file").write_bytes(b"x")
-    with pytest.raises(StorageError):
-        zoe.Storage(str(tmp_path / "store"), blob_dir=str(used))
-
-    # An empty directory is taken.
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    storage = zoe.Storage(str(tmp_path / "other"), blob_dir=str(empty))
+def test_a_copy_of_the_store_directory_keeps_its_own_blobs(tmp_path):
+    original = tmp_path / "original"
+    storage = zoe.Storage(str(original))
     try:
-        tid = store_blob(
-            storage, storage.new_oid(), ZERO, write_temporary(storage, DATA)
-        )
-        assert tid > ZERO
-        assert (empty / ".layout").read_text().strip() == "bushy"
+        oid = storage.new_oid()
+        first = store_blob(storage, oid, ZERO, write_temporary(storage, b"first"))
+        shutil.copytree(original, tmp_path / "copy", symlinks=True)
+        second = store_blob(storage, oid, first, write_temporary(storage, b"second"))
     finally:
         storage.close()
+
+    # The copy opens with its own blob directory, so its open does not touch
+    # the blobs of the original.
+    copy = zoe.Storage(str(tmp_path / "copy"))
+    try:
+        assert read(copy.loadBlob(oid, first)) == b"first"
+        with pytest.raises(POSKeyError):
+            copy.loadBlob(oid, second)
+    finally:
+        copy.close()
+    storage = zoe.Storage(str(original))
+    try:
+        assert read(storage.loadBlob(oid, second)) == b"second"
+    finally:
+        storage.close()
+
+
+def test_a_refused_blob_dir_creates_no_store(tmp_path):
+    a_file = tmp_path / "file"
+    a_file.write_bytes(b"x")
+    (tmp_path / "empty").mkdir()
+    for path in (tmp_path / "missing", tmp_path / "empty"):
+        with pytest.raises(OSError):
+            zoe.Storage(str(path), blob_dir=str(a_file))
+    assert not (tmp_path / "missing").exists()
+    assert list((tmp_path / "empty").iterdir()) == []
 
 
 def test_a_read_only_storage_refuses_the_blob_writes(tmp_path):
@@ -251,13 +260,10 @@ def test_a_read_only_storage_refuses_the_blob_writes(tmp_path):
         storage.close()
     assert outside.exists()
 
-    # A read-only storage links no blob directory.
-    zoe.Storage(str(tmp_path / "plain")).close()
-    zoe.Storage(
-        str(tmp_path / "plain"), read_only=True, blob_dir=str(tmp_path / "other")
-    ).close()
-    assert not (tmp_path / "other").exists()
-    assert not (tmp_path / "plain" / "blobs").exists()
+    # A read-only storage creates no parent of its blob directory.
+    with pytest.raises(FileNotFoundError):
+        zoe.Storage(path, read_only=True, blob_dir=str(tmp_path / "a" / "b"))
+    assert not (tmp_path / "a").exists()
 
 
 def test_the_blob_calls_of_a_closed_storage_raise_storage_error(tmp_path):

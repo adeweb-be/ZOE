@@ -40,12 +40,12 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `store`, `pack`, `storeBlob` and `temporaryDirectory` with
     `ReadOnlyError`, and it does not create a missing directory.
 
-    `blob_dir` is the directory of the blob files, in ZODB's BushyLayout.
-    The store keeps them in `path/blobs`. Another `blob_dir` becomes the
-    symbolic link `path/blobs` to it, and the link stays, so a later open
-    without `blob_dir` finds the blobs. A store that already has a blob
-    directory refuses another one with `StorageError`, and so does a new
-    link to a `blob_dir` that is not empty.
+    `blob_dir` is the directory of the blob files, in ZODB's BushyLayout;
+    `None` is `path/blobs`. The store does not record it, so each open must
+    give the same one. A store with blobs refuses a `blob_dir` without the
+    layout file of its blobs with `StorageError`: the option is missing or
+    wrong, or the directory is not mounted. A `blob_dir` that is not a
+    directory raises `OSError`, and the storage creates nothing.
 
     `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
     copy, and copies a file from elsewhere. `loadBlob` returns the path of a
