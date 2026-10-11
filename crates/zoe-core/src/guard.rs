@@ -1,11 +1,17 @@
-//! The guardrails of a store: the size limits of a store call.
+//! The guardrails of a store: the size limits of a store call, and the
+//! log lines of slow locks and slow transactions.
 //!
 //! A size limit refuses a `store` or a `store_blob` before the transaction
-//! stages it, so a refused call writes nothing.
+//! stages it, so a refused call writes nothing. A lock held longer than
+//! `lock-warn` and a transaction open longer than `transaction-warn` give a
+//! `tracing` event at WARN level. Each duration comes from the store clock.
+//! An event holds only oids, counts and durations, never pickle bytes.
 
 use std::fmt;
+use std::time::{Duration, SystemTime};
 
 use crate::error::{Result, ZoeError};
+use crate::lock::Held;
 use crate::store::Options;
 use crate::types::Oid;
 
@@ -54,6 +60,8 @@ pub(crate) struct Guardrails {
     max_record_size: Option<u64>,
     max_transaction_size: Option<u64>,
     max_blob_size: Option<u64>,
+    lock_warn: Option<Duration>,
+    transaction_warn: Option<Duration>,
 }
 
 impl Guardrails {
@@ -62,6 +70,8 @@ impl Guardrails {
             max_record_size: options.max_record_size,
             max_transaction_size: options.max_transaction_size,
             max_blob_size: options.max_blob_size,
+            lock_warn: options.lock_warn,
+            transaction_warn: options.transaction_warn,
         }
     }
 
@@ -83,16 +93,164 @@ impl Guardrails {
             _ => Ok(()),
         }
     }
+
+    /// Log each lock of `held` that was held longer than `lock-warn`, when
+    /// the locks are released at `now`. Call it after the release, so that
+    /// the log does not lengthen the hold.
+    pub(crate) fn locks_released(&self, held: &[Held], now: SystemTime) {
+        let Some(warn) = self.lock_warn else {
+            return;
+        };
+        for lock in held {
+            let duration = elapsed(lock.since, now);
+            if duration > warn {
+                tracing::warn!(
+                    oid = lock.oid.0,
+                    duration_ms = millis(duration),
+                    "lock held past lock-warn"
+                );
+            }
+        }
+    }
+
+    /// Log a transaction that began at `began` and ends at `now`, when it
+    /// was open longer than `transaction-warn`. `oids` is the number of
+    /// oids that it writes.
+    pub(crate) fn transaction_ended(&self, began: SystemTime, now: SystemTime, oids: usize) {
+        let Some(warn) = self.transaction_warn else {
+            return;
+        };
+        let duration = elapsed(began, now);
+        if duration > warn {
+            tracing::warn!(
+                duration_ms = millis(duration),
+                oids = oids as u64,
+                "transaction open past transaction-warn"
+            );
+        }
+    }
+}
+
+/// Return the time from `since` to `now`. A clock that went back gives
+/// zero.
+fn elapsed(since: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(since).unwrap_or_default()
+}
+
+/// Return `duration` in whole milliseconds.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A `tracing` subscriber that captures the events of one thread, for the
+/// tests of the crate.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    /// One captured event: its level, and each field as text. The message
+    /// is the field `message`.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Captured {
+        pub(crate) level: Level,
+        pub(crate) fields: BTreeMap<String, String>,
+    }
+
+    impl Captured {
+        pub(crate) fn message(&self) -> &str {
+            self.fields.get("message").map_or("", String::as_str)
+        }
+
+        pub(crate) fn number(&self, field: &str) -> Option<u64> {
+            self.fields.get(field)?.parse().ok()
+        }
+    }
+
+    #[derive(Default)]
+    struct Fields(BTreeMap<String, String>);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            let captured = Captured {
+                level: *event.metadata().level(),
+                fields: fields.0,
+            };
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(captured);
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// Run `f` with the capturing subscriber on this thread. Return the
+    /// result of `f` and the events of this thread.
+    pub(crate) fn events_of<R>(f: impl FnOnce() -> R) -> (R, Vec<Captured>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let result = tracing::subscriber::with_default(Capture(Arc::clone(&events)), f);
+        let events = events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        (result, events)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use tracing::Level;
+
+    use super::capture::events_of;
     use super::*;
 
     const LIMITS: [SizeLimit; 3] = [SizeLimit::Record, SizeLimit::Transaction, SizeLimit::Blob];
 
     fn guardrails(options: Options) -> Guardrails {
         Guardrails::new(&options)
+    }
+
+    fn at(millis: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_000_000_000) + Duration::from_millis(millis)
     }
 
     #[test]
@@ -135,5 +293,81 @@ mod tests {
             keys,
             ["max-record-size", "max-transaction-size", "max-blob-size"]
         );
+    }
+
+    #[test]
+    fn a_lock_is_logged_only_past_lock_warn() {
+        let warn = guardrails(Options {
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let held = [
+            Held {
+                oid: Oid(1),
+                since: at(0),
+            },
+            Held {
+                oid: Oid(2),
+                since: at(500),
+            },
+            Held {
+                oid: Oid(3),
+                since: at(499),
+            },
+        ];
+        // At the release, `Oid(2)` was held exactly `lock-warn`.
+        let ((), events) = events_of(|| warn.locks_released(&held, at(1_500)));
+        let logged: Vec<_> = events
+            .iter()
+            .map(|e| (e.number("oid"), e.number("duration_ms")))
+            .collect();
+        assert_eq!(
+            logged,
+            [(Some(1), Some(1_500)), (Some(3), Some(1_001))],
+            "{events:?}"
+        );
+        for event in &events {
+            assert_eq!(event.level, Level::WARN);
+            assert!(event.message().contains("lock-warn"), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn a_lock_is_not_logged_without_lock_warn_or_when_the_clock_goes_back() {
+        let held = [Held {
+            oid: Oid(1),
+            since: at(10_000),
+        }];
+        let off = guardrails(Options::default());
+        let on = guardrails(Options {
+            lock_warn: Some(Duration::ZERO),
+            ..Options::default()
+        });
+        let ((), events) = events_of(|| {
+            off.locks_released(&held, at(60_000));
+            on.locks_released(&held, at(0));
+        });
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_transaction_is_logged_only_past_transaction_warn() {
+        let warn = guardrails(Options {
+            transaction_warn: Some(Duration::from_secs(2)),
+            ..Options::default()
+        });
+        let off = guardrails(Options::default());
+        let ((), events) = events_of(|| {
+            warn.transaction_ended(at(0), at(2_000), 3);
+            warn.transaction_ended(at(0), at(2_001), 4);
+            warn.transaction_ended(at(5_000), at(0), 5);
+            off.transaction_ended(at(0), at(60_000), 6);
+        });
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, Level::WARN);
+        assert!(event.message().contains("transaction-warn"), "{event:?}");
+        assert_eq!(event.number("duration_ms"), Some(2_001));
+        assert_eq!(event.number("oids"), Some(4));
     }
 }

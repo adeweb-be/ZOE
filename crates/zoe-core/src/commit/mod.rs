@@ -32,7 +32,8 @@
 //! `staging/` beyond it. `staging` describes the buffer.
 //!
 //! `store` and `store_blob` check the size limits of the store before
-//! they stage anything.
+//! they stage anything. A transaction logs its slow locks when it releases
+//! them, and logs itself when it ends, if it was slow.
 
 mod staging;
 
@@ -40,13 +41,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::thread::{self, ThreadId};
+use std::time::SystemTime;
 
 use crate::backend::{Record, TxnMeta, TxnStatus};
 use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::guard::SizeLimit;
-use crate::lock::Mode;
+use crate::lock::{Held, Mode};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 use staging::Staging;
@@ -91,9 +93,10 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The oids that the transaction read as current, with the serial that
     /// it read.
     read_current: BTreeMap<Oid, Tid>,
-    /// The oids that a vote locked. The transaction holds the locks until
-    /// `finish`, `abort` or a failed vote.
-    locks: Option<Vec<Oid>>,
+    /// The locks that a vote took, with the time when it took each one.
+    /// The transaction holds the locks until `finish`, `abort` or a failed
+    /// vote.
+    locks: Option<Vec<Held>>,
     /// The oids that `vote_resolving` gave as conflicts. The set is empty
     /// except between that call and the next vote.
     resolving: BTreeSet<Oid>,
@@ -103,6 +106,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The sum of the lengths of the pickles that `store` and `store_blob`
     /// staged. `max-transaction-size` limits it.
     stored_bytes: u64,
+    /// The time on the store clock when the transaction began.
+    began: SystemTime,
 }
 
 /// What the serial check of a vote found.
@@ -128,6 +133,7 @@ struct Stale {
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Begin a transaction on `store`, driven by the calling thread.
     pub fn begin(store: S, user: &[u8], description: &[u8], extension: &[u8]) -> Self {
+        let began = store.clock.now();
         Self {
             blobs: BTreeMap::new(),
             store,
@@ -142,6 +148,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             resolving: BTreeSet::new(),
             conflict: None,
             stored_bytes: 0,
+            began,
         }
     }
 
@@ -392,9 +399,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
     fn lock(&mut self) -> Result<()> {
         self.store.writable()?;
         let store: &Store = &self.store;
+        let requests = self.lock_requests();
         let locks = store
             .locks
-            .acquire(&self.lock_requests(), store.lock_timeout)?;
+            .acquire(&requests, store.lock_timeout, &*store.clock)?;
         self.locks = Some(locks.keep());
         Ok(())
     }
@@ -591,9 +599,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.release();
     }
 
+    /// Release the locks, then log each lock held past `lock-warn`.
     fn release(&mut self) {
-        if let Some(oids) = self.locks.take() {
-            self.store.locks.release(&oids);
+        if let Some(held) = self.locks.take() {
+            let now = self.store.clock.now();
+            self.store.locks.release(&held);
+            self.store.guardrails.locks_released(&held, now);
         }
     }
 }
@@ -602,6 +613,12 @@ impl<S: Deref<Target = Store>> Drop for Txn<S> {
     fn drop(&mut self) {
         self.release();
         self.staged.remove_spill(&self.store.backend.staging);
+        // `finish` and `abort` also end here. So each transaction is
+        // checked against `transaction-warn` once, when it ends.
+        let now = self.store.clock.now();
+        self.store
+            .guardrails
+            .transaction_ended(self.began, now, self.staged.len());
     }
 }
 
@@ -649,7 +666,8 @@ mod tests {
     use redb::StorageBackend;
 
     use super::*;
-    use crate::clock::SystemClock;
+    use crate::clock::{ManualClock, SystemClock};
+    use crate::guard::capture::{Captured, events_of};
     use crate::store::Options;
     use crate::vfs::{MemVfs, Vfs};
 
@@ -1653,5 +1671,104 @@ mod tests {
         txn.vote().unwrap();
         assert_eq!(txn.finish().unwrap(), Tid(100));
         assert_eq!(store.load(Oid(1)).unwrap().0, b"a copy over the limits");
+    }
+
+    /// Return the `transaction-warn` events of `events`.
+    fn slow_transactions(events: &[Captured]) -> Vec<Option<u64>> {
+        events
+            .iter()
+            .filter(|e| e.message().contains("transaction-warn"))
+            .map(|e| e.number("duration_ms"))
+            .collect()
+    }
+
+    /// Open a store in memory with `options` and a clock that the test
+    /// moves.
+    fn open_with_clock(options: Options) -> (Store, ManualClock) {
+        let clock = ManualClock::new();
+        let store = Store::open_full(MemVfs::new(), clock.clone(), options).unwrap();
+        (store, clock)
+    }
+
+    #[test]
+    fn each_end_of_a_transaction_is_logged_once() {
+        let (store, clock) = open_with_clock(Options {
+            transaction_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let ((), events) = events_of(|| {
+            let mut finished = store.tpc_begin(b"", b"", b"").unwrap();
+            finished.store(Oid(1), Tid::ZERO, b"a").unwrap();
+            finished.vote().unwrap();
+            clock.advance(Duration::from_millis(1_100));
+            finished.finish().unwrap();
+
+            let mut aborted = store.tpc_begin(b"", b"", b"").unwrap();
+            aborted.store(Oid(2), Tid::ZERO, b"b").unwrap();
+            aborted.vote().unwrap();
+            clock.advance(Duration::from_millis(1_200));
+            aborted.abort();
+
+            let dropped = store.tpc_begin(b"", b"", b"").unwrap();
+            clock.advance(Duration::from_millis(1_300));
+            drop(dropped);
+
+            // A finish that fails ends the transaction too.
+            let mut failed = store.tpc_begin(b"", b"", b"").unwrap();
+            failed.store(Oid(3), Tid::ZERO, b"c").unwrap();
+            clock.advance(Duration::from_millis(1_400));
+            assert!(failed.finish().is_err());
+        });
+        assert_eq!(
+            slow_transactions(&events),
+            [Some(1_100), Some(1_200), Some(1_300), Some(1_400)],
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_lock_taken_after_a_wait_is_held_from_its_grant() {
+        let (store, clock) = open_with_clock(Options {
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let (low, high) = (Oid(1), Oid(2));
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        let ((), events) = events_of(|| {
+            let waiter = thread::scope(|scope| {
+                // The waiter takes `low`, then waits for `high`.
+                let waiter = scope.spawn(|| {
+                    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                    txn.check_current_serial(low, Tid::ZERO).unwrap();
+                    txn.store(high, Tid::ZERO, b"b").unwrap();
+                    txn.vote().unwrap();
+                    txn
+                });
+                while store.locks.waiting(high) == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                clock.advance(Duration::from_millis(3_000));
+                holder.abort();
+                waiter.join().unwrap()
+            });
+            clock.advance(Duration::from_millis(500));
+            waiter.finish().unwrap();
+        });
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|e| e.message().contains("lock-warn"))
+            .map(|e| (e.number("oid"), e.number("duration_ms")))
+            .collect();
+        // The waiter held `low` while it waited, and `high` only from the
+        // abort of the holder.
+        assert_eq!(
+            logged,
+            [(Some(high.0), Some(3_000)), (Some(low.0), Some(3_500))],
+            "{events:?}"
+        );
+        assert!(store.lock_table_is_empty());
     }
 }

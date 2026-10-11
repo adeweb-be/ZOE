@@ -16,11 +16,17 @@
 //! it to the waiters at the head of the queue, under the mutex, and then
 //! wakes them. So a waiter holds its lock before it wakes up, and no new
 //! request can take the lock first.
+//!
+//! Each lock that a call takes keeps the time when the call took it, on
+//! the store clock. `lock-warn` measures the hold time from it. The
+//! timeout uses the monotonic clock instead, because a `Condvar` wait
+//! cannot run on a simulated clock.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use crate::clock::Clock;
 use crate::error::{Result, ZoeError};
 use crate::types::Oid;
 
@@ -123,15 +129,15 @@ impl Table {
         }
     }
 
-    /// Release one hold on each oid of `oids`, and grant each lock to the
-    /// waiters that it admits.
-    fn release(&mut self, oids: &[Oid]) {
-        for oid in oids {
-            if let Some(entry) = self.entries.get_mut(oid) {
+    /// Release one hold on each lock of `held`, and grant each lock to
+    /// the waiters that it admits.
+    fn release(&mut self, held: &[Held]) {
+        for &Held { oid, .. } in held {
+            if let Some(entry) = self.entries.get_mut(&oid) {
                 entry.holders -= 1;
                 entry.grant();
                 if entry.is_unused() {
-                    self.entries.remove(oid);
+                    self.entries.remove(&oid);
                 }
             }
         }
@@ -144,24 +150,32 @@ pub(crate) struct LockManager {
     table: Mutex<Table>,
 }
 
+/// A lock that a call took: its oid, and the time on the store clock when
+/// the call took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) oid: Oid,
+    pub(crate) since: SystemTime,
+}
+
 /// The locks that one `acquire` call took. Dropping it releases them.
 #[derive(Debug)]
 pub(crate) struct Locks<'m> {
     manager: &'m LockManager,
-    oids: Vec<Oid>,
+    held: Vec<Held>,
 }
 
 impl Drop for Locks<'_> {
     fn drop(&mut self) {
-        self.manager.release(&self.oids);
+        self.manager.release(&self.held);
     }
 }
 
 impl Locks<'_> {
-    /// Keep the locks after this value is dropped, and return their oids.
-    /// The caller must give the oids to `LockManager::release` later.
-    pub(crate) fn keep(mut self) -> Vec<Oid> {
-        std::mem::take(&mut self.oids)
+    /// Keep the locks after this value is dropped, and return them. The
+    /// caller must give them to `LockManager::release` later.
+    pub(crate) fn keep(mut self) -> Vec<Held> {
+        std::mem::take(&mut self.held)
     }
 }
 
@@ -178,14 +192,23 @@ impl LockManager {
     /// from its start on the monotonic clock. If it still waits at that
     /// time, it leaves the queue, releases the locks that it took and
     /// returns `Conflict` on the oid that it waits for.
-    pub(crate) fn acquire(&self, requests: &[(Oid, Mode)], timeout: Duration) -> Result<Locks<'_>> {
+    ///
+    /// Each lock keeps the time of `clock` when the call took it. The call
+    /// reads `clock` at its start and after each wait.
+    pub(crate) fn acquire(
+        &self,
+        requests: &[(Oid, Mode)],
+        timeout: Duration,
+        clock: &dyn Clock,
+    ) -> Result<Locks<'_>> {
         if let Some(pair) = requests.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
             return Err(ZoeError::LockOrder { oid: pair[1].0 });
         }
         let start = Instant::now();
+        let mut since = clock.now();
         let mut locks = Locks {
             manager: self,
-            oids: Vec::with_capacity(requests.len()),
+            held: Vec::with_capacity(requests.len()),
         };
         let mut table = self.table();
         // The call waits for one oid at a time, so one condition variable
@@ -210,21 +233,22 @@ impl LockManager {
                 // that is still in the queue has used all its time.
                 if table.waits(oid, wake) {
                     table.withdraw(oid, wake);
-                    table.release(&locks.oids);
-                    locks.oids.clear();
+                    table.release(&locks.held);
+                    locks.held.clear();
                     return Err(ZoeError::Conflict { oid });
                 }
+                since = clock.now();
             }
-            locks.oids.push(oid);
+            locks.held.push(Held { oid, since });
         }
         Ok(locks)
     }
 
-    /// Release one hold on each oid of `oids`. `oids` must come from
+    /// Release one hold on each lock of `held`. `held` must come from
     /// `Locks::keep`.
-    pub(crate) fn release(&self, oids: &[Oid]) {
-        if !oids.is_empty() {
-            self.table().release(oids);
+    pub(crate) fn release(&self, held: &[Held]) {
+        if !held.is_empty() {
+            self.table().release(held);
         }
     }
 
@@ -235,7 +259,7 @@ impl LockManager {
 
     /// Return the number of requests that wait for `oid`.
     #[cfg(test)]
-    fn waiting(&self, oid: Oid) -> usize {
+    pub(crate) fn waiting(&self, oid: Oid) -> usize {
         self.table()
             .entries
             .get(&oid)
@@ -251,6 +275,7 @@ mod tests {
 
     use super::Mode::{Exclusive, Shared};
     use super::*;
+    use crate::clock::{ManualClock, SystemClock};
 
     /// A timeout that no test reaches when the code is correct.
     const LONG: Duration = Duration::from_secs(10);
@@ -271,7 +296,11 @@ mod tests {
     fn a_free_lock_is_taken_and_released() {
         let locks = LockManager::default();
         let held = locks
-            .acquire(&[(Oid(1), Exclusive), (Oid(2), Shared)], Duration::ZERO)
+            .acquire(
+                &[(Oid(1), Exclusive), (Oid(2), Shared)],
+                Duration::ZERO,
+                &SystemClock,
+            )
             .unwrap();
         assert!(!locks.is_empty());
         drop(held);
@@ -281,13 +310,52 @@ mod tests {
     #[test]
     fn kept_locks_stay_until_their_release() {
         let locks = LockManager::default();
-        let oids = locks
-            .acquire(&[(Oid(1), Exclusive), (Oid(2), Shared)], Duration::ZERO)
+        let held = locks
+            .acquire(
+                &[(Oid(1), Exclusive), (Oid(2), Shared)],
+                Duration::ZERO,
+                &SystemClock,
+            )
             .unwrap()
             .keep();
+        let oids: Vec<_> = held.iter().map(|lock| lock.oid).collect();
         assert_eq!(oids, [Oid(1), Oid(2)]);
         assert!(!locks.is_empty());
-        locks.release(&oids);
+        locks.release(&held);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn each_lock_keeps_the_clock_time_when_the_call_took_it() {
+        let locks = LockManager::default();
+        let clock = ManualClock::new();
+        let start = clock.now();
+        let holder = locks
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &clock)
+            .unwrap();
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                locks
+                    .acquire(&[(Oid(1), Shared), (Oid(2), Exclusive)], LONG, &clock)
+                    .map(Locks::keep)
+            });
+            until_waiting(&locks, Oid(2), 1);
+            clock.advance(Duration::from_secs(5));
+            drop(holder);
+            let held = waiter.join().unwrap().unwrap();
+            let since = start + Duration::from_secs(5);
+            assert_eq!(
+                held,
+                [
+                    Held {
+                        oid: Oid(1),
+                        since: start
+                    },
+                    Held { oid: Oid(2), since }
+                ]
+            );
+            locks.release(&held);
+        });
         assert!(locks.is_empty());
     }
 
@@ -298,7 +366,7 @@ mod tests {
             [(Oid(2), Exclusive), (Oid(1), Exclusive)],
             [(Oid(1), Shared), (Oid(1), Exclusive)],
         ] {
-            let error = locks.acquire(&requests, Duration::ZERO);
+            let error = locks.acquire(&requests, Duration::ZERO, &SystemClock);
             assert!(
                 matches!(error, Err(ZoeError::LockOrder { oid: Oid(1) })),
                 "{requests:?}"
@@ -312,8 +380,10 @@ mod tests {
         let locks = LockManager::default();
         let oid = Oid(1);
         let compatible = |held: Mode, asked: Mode| {
-            let _held = locks.acquire(&[(oid, held)], Duration::ZERO).unwrap();
-            let result = locks.acquire(&[(oid, asked)], Duration::ZERO);
+            let _held = locks
+                .acquire(&[(oid, held)], Duration::ZERO, &SystemClock)
+                .unwrap();
+            let result = locks.acquire(&[(oid, asked)], Duration::ZERO, &SystemClock);
             match result {
                 Ok(_) => true,
                 Err(ZoeError::Conflict { oid: Oid(1) }) => false,
@@ -331,14 +401,18 @@ mod tests {
     fn waiters_get_the_lock_in_arrival_order() {
         let locks = LockManager::default();
         let oid = Oid(1);
-        let holder = locks.acquire(&[(oid, Exclusive)], Duration::ZERO).unwrap();
+        let holder = locks
+            .acquire(&[(oid, Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
         let (granted, order) = mpsc::channel();
         thread::scope(|scope| {
             for name in 0..5 {
                 let granted = granted.clone();
                 let locks = &locks;
                 scope.spawn(move || {
-                    let held = locks.acquire(&[(oid, Exclusive)], LONG).unwrap();
+                    let held = locks
+                        .acquire(&[(oid, Exclusive)], LONG, &SystemClock)
+                        .unwrap();
                     granted.send(name).unwrap();
                     drop(held);
                 });
@@ -355,24 +429,28 @@ mod tests {
     fn a_shared_request_does_not_pass_a_waiting_exclusive_request() {
         let locks = LockManager::default();
         let oid = Oid(1);
-        let reader = locks.acquire(&[(oid, Shared)], Duration::ZERO).unwrap();
+        let reader = locks
+            .acquire(&[(oid, Shared)], Duration::ZERO, &SystemClock)
+            .unwrap();
         let (granted, order) = mpsc::channel();
         thread::scope(|scope| {
             let writer = granted.clone();
             let locks = &locks;
             scope.spawn(move || {
-                let held = locks.acquire(&[(oid, Exclusive)], LONG).unwrap();
+                let held = locks
+                    .acquire(&[(oid, Exclusive)], LONG, &SystemClock)
+                    .unwrap();
                 writer.send("writer").unwrap();
                 drop(held);
             });
             until_waiting(locks, oid, 1);
 
             // The shared lock is free for a reader, but a writer waits.
-            let refused = locks.acquire(&[(oid, Shared)], Duration::ZERO);
+            let refused = locks.acquire(&[(oid, Shared)], Duration::ZERO, &SystemClock);
             assert!(matches!(refused, Err(ZoeError::Conflict { .. })));
 
             scope.spawn(move || {
-                let held = locks.acquire(&[(oid, Shared)], LONG).unwrap();
+                let held = locks.acquire(&[(oid, Shared)], LONG, &SystemClock).unwrap();
                 granted.send("second reader").unwrap();
                 drop(held);
             });
@@ -388,7 +466,9 @@ mod tests {
     fn a_release_grants_every_shared_waiter_at_the_head() {
         let locks = LockManager::default();
         let oid = Oid(1);
-        let writer = locks.acquire(&[(oid, Exclusive)], Duration::ZERO).unwrap();
+        let writer = locks
+            .acquire(&[(oid, Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
         let readers = Barrier::new(3);
         let (granted, order) = mpsc::channel();
         thread::scope(|scope| {
@@ -396,7 +476,7 @@ mod tests {
                 let granted = granted.clone();
                 let (locks, readers) = (&locks, &readers);
                 scope.spawn(move || {
-                    let held = locks.acquire(&[(oid, Shared)], LONG).unwrap();
+                    let held = locks.acquire(&[(oid, Shared)], LONG, &SystemClock).unwrap();
                     granted.send(name).unwrap();
                     // Both readers hold the lock at the same time.
                     readers.wait();
@@ -406,7 +486,9 @@ mod tests {
             }
             let locks = &locks;
             scope.spawn(move || {
-                let held = locks.acquire(&[(oid, Exclusive)], LONG).unwrap();
+                let held = locks
+                    .acquire(&[(oid, Exclusive)], LONG, &SystemClock)
+                    .unwrap();
                 granted.send("second writer").unwrap();
                 drop(held);
             });
@@ -424,16 +506,20 @@ mod tests {
     fn a_wait_past_the_timeout_releases_what_the_call_took() {
         let locks = LockManager::default();
         let holder = locks
-            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO)
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
         let timeout = Duration::from_millis(50);
         let start = Instant::now();
-        let error = locks.acquire(&[(Oid(1), Exclusive), (Oid(2), Shared)], timeout);
+        let error = locks.acquire(
+            &[(Oid(1), Exclusive), (Oid(2), Shared)],
+            timeout,
+            &SystemClock,
+        );
         assert!(start.elapsed() >= timeout);
         assert!(matches!(error, Err(ZoeError::Conflict { oid: Oid(2) })));
         assert_eq!(locks.waiting(Oid(2)), 0);
         locks
-            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO)
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
         drop(holder);
         assert!(locks.is_empty());
@@ -443,10 +529,10 @@ mod tests {
     fn the_timeout_covers_all_the_waits_of_a_call() {
         let locks = LockManager::default();
         let first = locks
-            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO)
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
         let second = locks
-            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO)
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
         // The margins of about half the timeout absorb slow scheduling, for
         // example under ThreadSanitizer.
@@ -454,7 +540,11 @@ mod tests {
         thread::scope(|scope| {
             let waiter = scope.spawn(|| {
                 let start = Instant::now();
-                let result = locks.acquire(&[(Oid(1), Exclusive), (Oid(2), Exclusive)], timeout);
+                let result = locks.acquire(
+                    &[(Oid(1), Exclusive), (Oid(2), Exclusive)],
+                    timeout,
+                    &SystemClock,
+                );
                 (result.map(drop), start, Instant::now())
             });
             until_waiting(&locks, Oid(1), 1);
@@ -475,17 +565,23 @@ mod tests {
     fn a_waiter_that_times_out_lets_the_waiters_behind_it_in() {
         let locks = LockManager::default();
         let oid = Oid(1);
-        let reader = locks.acquire(&[(oid, Shared)], Duration::ZERO).unwrap();
+        let reader = locks
+            .acquire(&[(oid, Shared)], Duration::ZERO, &SystemClock)
+            .unwrap();
         thread::scope(|scope| {
             // The second reader must queue before the writer times out. The
             // timeout is long so that slow scheduling cannot break the test.
             let writer = scope.spawn(|| {
                 locks
-                    .acquire(&[(oid, Exclusive)], Duration::from_secs(1))
+                    .acquire(&[(oid, Exclusive)], Duration::from_secs(1), &SystemClock)
                     .map(drop)
             });
             until_waiting(&locks, oid, 1);
-            let second = scope.spawn(|| locks.acquire(&[(oid, Shared)], LONG).map(drop));
+            let second = scope.spawn(|| {
+                locks
+                    .acquire(&[(oid, Shared)], LONG, &SystemClock)
+                    .map(drop)
+            });
             until_waiting(&locks, oid, 2);
             assert!(matches!(
                 writer.join().unwrap(),
@@ -502,9 +598,9 @@ mod tests {
     fn a_zero_timeout_never_waits() {
         let locks = LockManager::default();
         let holder = locks
-            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO)
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
-        let error = locks.acquire(&[(Oid(1), Exclusive)], Duration::ZERO);
+        let error = locks.acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock);
         assert!(matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })));
         assert_eq!(locks.waiting(Oid(1)), 0);
         drop(holder);
@@ -541,7 +637,7 @@ mod tests {
                                 (Oid(oid), mode)
                             })
                             .collect();
-                        let held = locks.acquire(&requests, LONG).unwrap();
+                        let held = locks.acquire(&requests, LONG, &SystemClock).unwrap();
                         for &(oid, mode) in &requests {
                             let count = &counts[oid.0 as usize];
                             if mode == Exclusive {

@@ -58,6 +58,14 @@ pub struct Options {
     /// fails with `TooLarge`. `None`, the default, sets no limit. This is
     /// `max-blob-size` in the configuration.
     pub max_blob_size: Option<u64>,
+    /// A lock held longer than this is logged when it is released, with
+    /// its oid and the time that it was held. `None`, the default, logs no
+    /// lock. This is `lock-warn` in the configuration.
+    pub lock_warn: Option<Duration>,
+    /// A transaction open longer than this is logged when it ends, with
+    /// the time that it was open. `None`, the default, logs no
+    /// transaction. This is `transaction-warn` in the configuration.
+    pub transaction_warn: Option<Duration>,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -73,6 +81,8 @@ impl Default for Options {
             max_record_size: None,
             max_transaction_size: None,
             max_blob_size: None,
+            lock_warn: None,
+            transaction_warn: None,
             _more: (),
         }
     }
@@ -148,7 +158,8 @@ impl Store {
     }
 
     /// Open the store in `vfs` with the clock `clock` and `options`, and
-    /// create it if necessary.
+    /// create it if necessary. The store reads the time only from `clock`:
+    /// the tids, and the durations of `lock-warn` and `transaction-warn`.
     ///
     /// A new store is written under a temporary name and renamed into place
     /// after it is durable, so a crash during the creation leaves either
