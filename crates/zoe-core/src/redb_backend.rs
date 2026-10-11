@@ -532,9 +532,14 @@ impl Backend for RedbBackend {
         let index = txn.open_table(TXN_OIDS).map_err(backend)?;
         let start = format::txn_oid_key(tid, Oid(0));
         let end = format::txn_oid_key(tid, Oid(u64::MAX));
+        // Each key has the tid `tid` and comes after the key before it, so
+        // no oid of another transaction comes in, and no oid comes twice.
         let mut oids = Vec::new();
+        let mut after = Included(start);
         for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
+            inside_index(key.value(), (after, Included(end)))?;
+            after = Excluded(*key.value());
             oids.push(format::split_txn_oid_key(key.value()).1);
         }
         let txns = txn.open_table(TXNS).map_err(backend)?;
@@ -1489,6 +1494,110 @@ mod tests {
         // Without the check of the scan, these reads give the rows outside
         // it.
         assert!(scans.early > 0, "no forward scan started before its start");
+    }
+
+    /// The number of transactions that `many_index_keys` writes.
+    const INDEXED: u64 = 1000;
+
+    /// Write a transaction of one record at each tid `row_tid(n)`, for `n`
+    /// from 1 to `INDEXED`, in the database file `db` of `vfs`. The record
+    /// of `row_tid(n)` is of oid `n`. The index then has branch pages.
+    fn many_index_keys(vfs: &MemVfs) {
+        let backend = backend_in(vfs);
+        let mut write = backend.begin_write().unwrap();
+        for n in 1..=INDEXED {
+            let tid = row_tid(n);
+            write.put_record(Oid(n), tid, Tid::ZERO, b"x").unwrap();
+            write
+                .put_txn(&TxnMeta {
+                    tid,
+                    user: Vec::new(),
+                    description: Vec::new(),
+                    extension: Vec::new(),
+                    oid_count: 1,
+                    status: TxnStatus::Committed,
+                })
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    /// Tell if `oids` is not in strictly ascending order.
+    fn unordered(oids: &[Oid]) -> bool {
+        oids.windows(2).any(|pair| pair[0] >= pair[1])
+    }
+
+    /// Run the scans of the transaction index for each transaction of
+    /// `many_index_keys`. Record each key outside its scan, or out of
+    /// order, that a read gave, and count the ones that a check caught. A
+    /// damaged key in a leaf page changes the stored oid. That is not
+    /// outside the scan, and the read of its record catches it.
+    fn check_index(backend: &RedbBackend, scans: &mut Scans) {
+        fn caught(at: Tid, tid: Tid, scans: &mut Scans) {
+            match at.cmp(&tid) {
+                std::cmp::Ordering::Less => scans.early += 1,
+                std::cmp::Ordering::Greater => scans.late += 1,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        for n in 1..=INDEXED {
+            let tid = row_tid(n);
+            match backend.txn_oids(tid, tid) {
+                Ok(oids) => {
+                    if oids.keys().any(|&at| at != tid) || oids.values().any(|o| unordered(o)) {
+                        scans.wrong.push(format!("txn_oids {tid:?}: {oids:?}"));
+                    }
+                }
+                Err(ZoeError::CorruptTxn { tid: at }) => caught(at, tid, scans),
+                Err(_) => {}
+            }
+            match backend.txn_records(tid) {
+                Ok(Some((row, records))) => {
+                    let oids: Vec<Oid> = records.iter().map(|&(oid, _)| oid).collect();
+                    if row.tid != tid || unordered(&oids) {
+                        scans.wrong.push(format!("txn_records {tid:?}: {oids:?}"));
+                    }
+                }
+                Err(ZoeError::CorruptTxn { tid: at }) => caught(at, tid, scans),
+                _ => {}
+            }
+        }
+        if let Ok(oids) = backend.txn_oids(Tid::ZERO, Tid::MAX)
+            && oids.values().any(|oids| unordered(oids))
+        {
+            scans.wrong.push(format!("txn_oids: {oids:?}"));
+        }
+    }
+
+    /// A damaged key of a branch page of the transaction index never
+    /// makes a scan give a key outside it, or a key twice. The scan gives
+    /// the keys inside it, or fails.
+    #[test]
+    fn a_damaged_branch_key_never_gives_an_index_key_outside_the_scan() {
+        let vfs = MemVfs::new();
+        many_index_keys(&vfs);
+        let file = file_of(&vfs);
+        let keys: Vec<Vec<u8>> = (1..=INDEXED)
+            .map(|n| format::txn_oid_key(row_tid(n), Oid(n)).to_vec())
+            .collect();
+        let mut scans = Scans::default();
+        for at in copies(&file, &keys) {
+            // The tid half and the oid half of the key.
+            for range in [at..at + 8, at + 8..at + 16] {
+                for fill in [0, 0xff] {
+                    with_damage(&file, range.clone(), fill, |backend| {
+                        check_index(backend, &mut scans);
+                    });
+                }
+            }
+        }
+        assert!(scans.wrong.is_empty(), "{:?}", scans.wrong);
+        // Without the checks of the scans, these reads give the keys
+        // outside them.
+        assert!(
+            scans.early + scans.late > 0,
+            "no scan of the index went outside its range"
+        );
     }
 
     #[test]

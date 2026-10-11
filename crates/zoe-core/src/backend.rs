@@ -139,7 +139,10 @@ pub trait Backend: Send + Sync {
     ///
     /// The map comes from the transaction index. The call reads only the
     /// index keys of the range and no record, so its cost is the size of
-    /// the result. The caller checks each oid against its record.
+    /// the result. A key outside the range, or a key that does not come
+    /// after the key before it, is `CorruptTxn`. The iterator takes only
+    /// the tids of the map: `txn_records` reads the oids of each
+    /// transaction with their records.
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;
 
     /// Return the first oid at or after `from` that has a version, with
@@ -168,8 +171,9 @@ pub trait Backend: Send + Sync {
     /// is left.
     ///
     /// An index key without its record is `CorruptTxn`. Index keys of a
-    /// `tid` that has no row are `CorruptTxn` too. The caller compares the
-    /// records with the oid count of the row.
+    /// `tid` that has no row are `CorruptTxn` too, and so is a key of
+    /// another tid or a key that does not come after the key before it.
+    /// The caller compares the records with the oid count of the row.
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;
 
     /// Make all committed writes durable. Group commit uses this barrier.
