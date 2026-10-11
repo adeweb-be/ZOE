@@ -721,6 +721,33 @@ mod tests {
         assert_eq!(backend.next_oid().unwrap(), Oid(2));
     }
 
+    /// A blob record stays uncompressed when the records of the store are
+    /// compressed. Its payload of zeros would shrink with zstd.
+    #[test]
+    fn a_blob_record_is_never_compressed() {
+        let backend = empty();
+        let zeros = BlobRecord {
+            hash: [0; 32],
+            size: 0,
+        };
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_record(Oid(1), Tid(5), Tid::ZERO, &[0; 4096])
+            .unwrap();
+        write.put_blob(Oid(1), Tid(5), &zeros).unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.db.begin_read().unwrap();
+        let key = format::record_key(Oid(1), Tid(5));
+        let record = txn.open_table(RECORDS).unwrap();
+        let record = record.get(&key).unwrap().unwrap();
+        assert_eq!(record.value()[2], format::CODEC_ZSTD);
+        let blobs = txn.open_table(BLOBS).unwrap();
+        let blob = blobs.get(&key).unwrap().unwrap();
+        assert_eq!(blob.value()[2], format::CODEC_NONE);
+        assert_eq!(backend.load_blob(Oid(1), Tid(5)).unwrap(), Some(zeros));
+    }
+
     #[test]
     fn a_store_without_the_blobs_table_has_no_blob_record() {
         let db = redb::Builder::new()

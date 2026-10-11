@@ -14,10 +14,12 @@
 //! The payload of a blob record is 40 bytes: the BLAKE3 hash of the blob
 //! file (32 bytes), then the size of the file in bytes (8 bytes,
 //! little-endian). The blob record is a frame under the 16-byte record key
-//! of `(oid, tid)`, with the previous serial 0.
+//! of `(oid, tid)`, with the previous serial 0 and the codec `CODEC_NONE`:
+//! the compression of the store never applies to it.
 //!
 //! An intent file is `blobs/tmp/0x<16 hex digits of the tid>.intent`. It
-//! holds a frame under the 8-byte transaction key of the tid. Its payload
+//! holds a frame with the codec `CODEC_NONE` under the 8-byte transaction
+//! key of the tid. Its payload
 //! is the oids of the blobs of the finish, 8 big-endian bytes each.
 
 use super::{FrameError, MAIN_BRANCH, decode_frame, encode_frame, txn_key};
@@ -182,6 +184,7 @@ mod tests {
 
         let oids = [Oid(1), Oid(u64::MAX)];
         let bytes = encode_intent(tid, &oids);
+        assert_eq!(bytes[2], crate::format::CODEC_NONE);
         assert_eq!(decode_intent(tid, &bytes), Ok(oids.to_vec()));
     }
 
