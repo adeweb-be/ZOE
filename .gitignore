@@ -13,13 +13,5 @@ __pycache__/
 /python/zoedb/src/zoe/*.so
 /python/.venv*/
 
-# Plone instances built by buildout
-/plone/.installed.cfg
-/plone/bin/
-/plone/develop-eggs/
-/plone/eggs/
-/plone/parts/
-/plone/var/
-
 # IDE files
 /.idea/
