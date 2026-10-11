@@ -2,10 +2,10 @@
 //!
 //! The diff walks the JSON states of the two records, as `state` writes
 //! them, and the decoded trees under them at the same time. It goes into a
-//! dict with text keys key by key, and into a tuple or a list item by item.
-//! It compares each other pair of values in the trees, and gives one change
-//! for each pair that is not equal. A key or an item that only one state
-//! has is also a change.
+//! dict with text keys one key at a time, and into a tuple or a list one
+//! item at a time. It compares each other pair of values in the trees, and
+//! gives one change for each pair that is not equal. A key or an item that
+//! only one state has is also a change.
 //!
 //! Two values are equal when Python finds them equal, with the type of each
 //! value counted:
