@@ -4,7 +4,8 @@
 //! after the last transaction of its target, verifies the target and
 //! writes a report. A report that lists a problem fails the command.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Args};
@@ -12,6 +13,9 @@ use zoe_convert::Report;
 use zoe_core::Store;
 
 use super::{Failure, store_failure};
+
+/// The first bytes of a FileStorage file.
+const MAGIC: &[u8] = b"FS30";
 
 /// The options of `zoe convert`. The command takes one direction:
 /// `--from-data-fs` or `--to-data-fs`.
@@ -74,14 +78,36 @@ fn from_data_fs(
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     // The open of the store creates it. Check the file first, so that a
-    // wrong file name creates no store.
-    std::fs::metadata(data_fs).map_err(|e| Failure(format!("{}: {e}", data_fs.display())))?;
+    // wrong file creates no store.
+    check_data_fs(data_fs)?;
     let store = Store::open(path).map_err(|e| store_failure(path, e))?;
     let report = zoe_convert::from_datafs(data_fs, blob_dir, &store)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("{} into the store {}", data_fs.display(), path.display());
     write_report(out, &title, &report)?;
     verified(&report)
+}
+
+/// Check that `data_fs` is a regular file that starts with the magic of a
+/// FileStorage file. The reader of `zoe-convert` checks this too, but
+/// only after the open of the store.
+fn check_data_fs(data_fs: &Path) -> Result<(), Failure> {
+    let failure = |what: &dyn std::fmt::Display| Failure(format!("{}: {what}", data_fs.display()));
+    // A FIFO is not a regular file. Its open would wait for a writer.
+    let metadata = std::fs::metadata(data_fs).map_err(|e| failure(&e))?;
+    if !metadata.is_file() {
+        return Err(failure(&"not a regular file"));
+    }
+    let mut magic = Vec::with_capacity(MAGIC.len());
+    File::open(data_fs)
+        .and_then(|file| file.take(MAGIC.len() as u64).read_to_end(&mut magic))
+        .map_err(|e| failure(&e))?;
+    if magic != MAGIC {
+        return Err(failure(
+            &"not a FileStorage file: the magic is not \"FS30\"",
+        ));
+    }
+    Ok(())
 }
 
 /// Convert the store in `path` into the `Data.fs` `data_fs` and the blob

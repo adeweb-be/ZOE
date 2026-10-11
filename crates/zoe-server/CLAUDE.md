@@ -19,7 +19,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - The report goes to stdout. A message goes to stderr, and starts with `zoe <subcommand>:`. The help and the version go to stdout with the code 0.
 - The command parses all its arguments before it opens a file. A usage error changes nothing on disk.
 - `cli::main` flushes stdout before it returns, because the Python process does not flush the stdout of Rust when it ends.
-- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs` and `zoe pack --dry-run`. A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store, and it checks that the `Data.fs` exists first.
+- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs` and `zoe pack --dry-run`. A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store. Before it opens the store, it checks that the `Data.fs` is a regular file that starts with `FS30`, so a wrong source creates no store.
 - `--days N` gives the tid of the time of the clock minus N days of 86,400 seconds, by `zoe_core::timestamp`. The command reads the time only through the `Clock` trait, so a test gives its own time. `cli::main` uses the system clock.
 
 ## Invariants of the server

@@ -1,5 +1,4 @@
-//! Tests of the `zoe` binary beside its acceptance test: an option that
-//! turns off its twin.
+//! Tests of the `zoe` binary beside its acceptance test.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -66,5 +65,29 @@ fn dry_run_on_the_command_line_wins_over_its_twin() {
     assert!(pack("--dry-run=false", "true").starts_with("Packed"));
     assert!(pack("--dry-run", "false").starts_with("A pack"));
     assert!(pack("--dry-run=true", "false").starts_with("A pack"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_source_that_is_not_a_data_fs_creates_no_store() {
+    let dir = fresh_dir("not-data-fs");
+    let not_data_fs = dir.join("not-a-data-fs");
+    std::fs::write(&not_data_fs, b"this is not a FileStorage file").unwrap();
+    let short = dir.join("short");
+    std::fs::write(&short, b"FS").unwrap();
+    for source in [&dir, &not_data_fs, &short, &dir.join("missing")] {
+        let store = dir.join("zoe");
+        let args = [
+            "convert",
+            "--from-data-fs",
+            source.to_str().unwrap(),
+            "--path",
+            store.to_str().unwrap(),
+        ];
+        let output = run(&args, &[]);
+        assert_exit(&output, 1, &format!("convert {}", source.display()));
+        assert!(!output.stderr.is_empty(), "the failure has no message");
+        assert!(!store.exists(), "{} created a store", source.display());
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
