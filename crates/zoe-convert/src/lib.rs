@@ -1,12 +1,41 @@
 //! Converters: `Data.fs` to ZOE, RelStorage to ZOE, ZOE to `Data.fs` and
 //! ZOE to ZOE. Each conversion verifies its result and writes a report.
+//!
+//! [`from_datafs`] converts a `Data.fs` and its blob directory into a ZOE
+//! store. It reads the file as a stream, restores each transaction under
+//! its own tid, and resumes after the last tid of the store.
 
 use std::path::PathBuf;
 
 use zoe_core::{Tid, ZoeError};
 
 mod blobs;
+mod datafs;
 mod filestorage;
+
+pub use datafs::from_datafs;
+
+/// The report of a conversion.
+///
+/// The counts describe the source, up to where the conversion stopped. A
+/// conversion that verifies has no problems.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    /// The transactions of the source.
+    pub transactions: u64,
+    /// The transactions that this run copied.
+    pub copied: u64,
+    /// The data records of the source. A record without data counts.
+    pub records: u64,
+    /// The blob files of the source.
+    pub blobs: u64,
+    /// The tid of the last transaction of the source. It is `Tid::ZERO`
+    /// when the source has no transaction.
+    pub last_tid: Tid,
+    /// What the verification found, one problem per line. The list stops
+    /// at 100 problems, and a last line counts the others.
+    pub problems: Vec<String>,
+}
 
 /// An error that stops a conversion.
 #[derive(Debug, thiserror::Error)]
