@@ -2,7 +2,7 @@
 
 Card ZOE-043. Found by ZOE-027.
 
-**Verdict.** The bug is in the C code of `persistent` and not in ZOE. On CPython 3.13 and later, the instance dict of a `Persistent` subclass can share the inline values of the object. `ghostify()` and `_p_deactivate()` release that dict but leave the values in it. On the free-threaded build, the garbage collector can then clear the released dict, and this clears the state of the object that a later load put in the same values. Borrowed references and a race between two threads on one object are not the cause. The fix moves the values into the dict before the release, with `PyObject_ClearManagedDict()`. It is in our fork `adeweb-be/persistent`, branch `zoe-043-getstate-race`, commit `caeb913`, version `6.8+zoe.1`.
+**Verdict.** The bug is in the C code of `persistent` and not in ZOE. On CPython 3.13 and later, the instance dict of a `Persistent` subclass can share the inline values of the object. `ghostify()` and `_p_deactivate()` release that dict but leave the values in it. On the free-threaded build, the garbage collector can then clear the released dict, and this clears the state of the object that a later load put in the same values. Borrowed references and a race between two threads on one object are not the cause. The fix moves the values into the dict before the release, with `PyObject_ClearManagedDict()`. It is in our fork `adeweb-be/persistent`, branch `zoe-043-getstate-race`, commit `57a8c54`, version `6.8+zoe.1`.
 
 ## Symptom
 
@@ -43,13 +43,13 @@ The interleaving, with connection C used by thread A and then by thread B:
 4. A collection runs. It merges the queue of A and clears D1 with `tp_clear()`. This sets the inline values of `obj1` to NULL.
 5. D2 still counts one item, but its value is NULL. `pickle_copy_dict()` (line 423) gets that NULL from `PyDict_Next()`, and `PyObject_SetItem()` raises the `SystemError`. An attribute read raises `AttributeError`, and `dir()` reads the NULL and crashes.
 
-Steps 2 to 4 need no access to one object from two threads at the same time. They need a collection while the old dict waits for its owner thread. The second regression test of the fork runs these steps in this order, with no concurrent access, and fails every time without the fix.
+Steps 2 to 4 need no access to one object from two threads at the same time. They need a collection while the old dict waits for its owner thread. The second regression test of the fork runs these steps in this order, with no concurrent access, and fails in most runs without the fix.
 
 ## Fix
 
-`detach_dict()` in `cPersistence.c` now serves `ghostify()` and `_p_deactivate()` on all builds. For a type with inline values, it takes a reference to the dict and calls `PyObject_ClearManagedDict()`, which moves the values into the dict and releases the dict of the object. The released dict then owns its values, so a clear of it does not touch the object. On the free-threaded build, a critical section on the object keeps two threads that deactivate it from both getting the dict.
+`detach_dict()` in `cPersistence.c` now serves `ghostify()` and `_p_deactivate()` on all builds. For a type with inline values, it takes a reference to the dict and calls `PyObject_ClearManagedDict()`, which moves the values into the dict and releases the dict of the object. The released dict then owns its values, so a clear of it does not touch the object. On the free-threaded build, a critical section on the object serializes most calls from two threads that deactivate it. The section pauses when the dict lock in `PyObject_ClearManagedDict()` blocks, and then both threads can get the dict. Concurrent use of one object is not supported. `PyObject_ClearManagedDict()` is documented only for clear and dealloc, so the fix depends on the internals of CPython 3.13 and 3.14 and needs a check again on 3.15.
 
-The fork adds two tests to `persistent/tests/test_threading.py`. One keeps the old `__dict__`, invalidates and loads the object, then clears the old dict. The other loads the object in a second thread, then invalidates and loads it in the main thread and runs `gc.collect()`. Both fail without the fix on 3.14t, with the same `SystemError`. The first also fails on 3.14. The suite of the fork passes on 3.12, 3.13, 3.14 and 3.14t: 785 tests, 0 failures, 6 skipped.
+The fork adds two tests to `persistent/tests/test_threading.py`. One keeps the old `__dict__`, invalidates and loads the object, then clears the old dict. The other loads the object in a second thread, then invalidates and loads it in the main thread and runs `gc.collect()`. Without the fix on 3.14t, both fail with the same `SystemError`: the first in each run, the second in most runs. The first also fails on 3.14. The suite of the fork passes on 3.12, 3.13, 3.14 and 3.14t: 785 tests, 0 failures, 6 skipped.
 
 ## The GIL at import
 

@@ -47,3 +47,4 @@
   - [Free-threading in persistent, BTrees and zodbpickle](spikes/free-threading-upstream.md)
   - [Byte-identical pickle round trip in zoe-pickle](spikes/pickle-round-trip.md)
   - [redb versus an append-only log for the record store](spikes/record-store.md)
+- [Finding: persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
