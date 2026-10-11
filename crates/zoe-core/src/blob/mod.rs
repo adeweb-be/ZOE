@@ -1579,6 +1579,8 @@ mod tests {
                 "{outside}: {refused:?}"
             );
         }
+        let refused = txn.restore_blob_at(oid, PICKLE, &path);
+        assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
         txn.store(oid, Tid::ZERO, PICKLE).unwrap();
         txn.vote().unwrap();
         let refused = txn.store_blob_at(oid, Tid::ZERO, PICKLE, &path);
@@ -1645,5 +1647,99 @@ mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_blob_copies_a_version_with_its_blob() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let (oid, taken) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = commit_blobs(&store, &[oid], b"first");
+        let path = client_file(&vfs, &format!("{TMP_DIR}/client"), b"taken");
+
+        let tid = Tid(first.0 + 10);
+        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+        txn.restore_blob(oid, b"restored", blob_file(&store, b"restored"))
+            .unwrap();
+        txn.restore_blob_at(taken, b"taken", &path).unwrap();
+        // The previous serial is the current serial of the store, not a
+        // serial of the client.
+        let (serial, data) = txn.staged(oid).unwrap().unwrap();
+        assert_eq!((serial, &*data), (first, &b"restored"[..]));
+        let (serial, data) = txn.staged(taken).unwrap().unwrap();
+        assert_eq!((serial, &*data), (Tid::ZERO, &b"taken"[..]));
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), tid);
+
+        assert_eq!(store.load(oid).unwrap(), (b"restored".to_vec(), tid));
+        assert_eq!(read(&store, oid, tid).unwrap(), b"restored");
+        assert_eq!(read(&store, oid, first).unwrap(), b"first");
+        assert_eq!(read(&store, taken, tid).unwrap(), b"taken");
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_change_before_the_vote_fails_a_restored_blob() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit_blobs(&store, &[oid], b"first");
+        let mut txn = store
+            .tpc_begin_restore(Tid(u64::MAX - 1), b"", b"", b"")
+            .unwrap();
+        txn.restore_blob(oid, b"restored", blob_file(&store, b"restored"))
+            .unwrap();
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other.store(oid, first, b"other").unwrap();
+        other.vote().unwrap();
+        let second = other.finish().unwrap();
+
+        // A restored blob is a copy, so the vote never resolves it.
+        let refused = txn.vote_resolving();
+        assert!(
+            matches!(refused, Err(ZoeError::Conflict { oid: o }) if o == oid),
+            "{refused:?}"
+        );
+        assert_eq!(txn.conflict_serials(), Some((second, first)));
+        assert!(store.lock_table_is_empty());
+        drop(txn);
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn restore_blob_needs_a_restore_transaction_and_a_pickle() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut normal = store.tpc_begin(b"", b"", b"").unwrap();
+        let mut restore = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        for (txn, data) in [(&mut normal, PICKLE), (&mut restore, &b""[..])] {
+            let refused = txn.restore_blob(oid, data, blob_file(&store, b"blob"));
+            assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+            assert!(txn.staged(oid).unwrap().is_none());
+        }
+        let file = blob_file(&store, b"blob");
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| restore.restore_blob(oid, PICKLE, file))
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(refused, Err(ZoeError::WrongThread)), "{refused:?}");
+        // A refused call drops its blob file, and that removes the file.
+        assert!(temp_files(&vfs).is_empty());
+
+        // A restored deletion drops the blob of its oid.
+        restore
+            .restore_blob(oid, PICKLE, blob_file(&store, b"blob"))
+            .unwrap();
+        restore.restore(oid, None).unwrap();
+        assert!(temp_files(&vfs).is_empty());
+        restore.vote().unwrap();
+        let tid = restore.finish().unwrap();
+        assert!(matches!(
+            store.open_blob(oid, tid),
+            Err(ZoeError::NotFound { .. })
+        ));
     }
 }

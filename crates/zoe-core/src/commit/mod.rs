@@ -16,18 +16,18 @@
 //! again with the locks that the first vote took.
 //!
 //! The thread that begins a transaction drives it: `store`, the blob
-//! stores, `restore`, `check_current_serial`, `vote` and `vote_resolving`
-//! from another thread fail with `WrongThread`. `finish` and `abort` work
-//! from any thread.
+//! stores, `restore`, the blob restores, `check_current_serial`, `vote` and
+//! `vote_resolving` from another thread fail with `WrongThread`. `finish`
+//! and `abort` work from any thread.
 //!
 //! `store_blob` stages a record with a synced blob file. `store_blob_at`
 //! takes the blob file by its path in the blob temporary directory, by
 //! rename. The blob stays with its oid until finish or abort: a later
 //! `store` of the oid, the store of a resolved conflict too, replaces only
-//! the pickle, as in ZODB. `finish` places the blob files before the
-//! backend commit, and the same backend write transaction holds their blob
-//! records. Dropping a transaction removes the blob files that it did not
-//! place.
+//! the pickle, as in ZODB. `restore_blob` and `restore_blob_at` are
+//! `restore` with a blob. `finish` places the blob files before the backend
+//! commit, and the same backend write transaction holds their blob records.
+//! Dropping a transaction removes the blob files that it did not place.
 //!
 //! The staged records live in a staging buffer: in memory up to the
 //! `staging_memory` option of the store, and in a spill file under
@@ -375,6 +375,52 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// A restore copies a record as it is: it checks no size limit.
     pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
+        let current = self.check_restore(oid)?;
+        let area = &self.store.backend.staging;
+        self.staged
+            .put(area, oid, current, data.unwrap_or_default(), true)?;
+        if data.is_none() {
+            self.blobs.remove(&oid);
+        }
+        Ok(())
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in `file`, in a
+    /// restore transaction. This is `restore` with a blob, the
+    /// `restoreBlob` of ZODB. Then sync the file. `finish` renames it into
+    /// the blob store.
+    ///
+    /// As for `restore`, the version gets the tid of the transaction, and
+    /// its previous serial is the current serial of `oid` in this store. A
+    /// change of `oid` by another transaction before the vote fails the
+    /// vote with `Conflict`, and `vote_resolving` never resolves it. So
+    /// `restore_blob` differs from `store_blob` in a restore transaction:
+    /// `store_blob` takes the serial of the client and checks it at the
+    /// vote.
+    ///
+    /// `data` cannot be empty, because a deletion has no blob: an empty
+    /// pickle is refused with `Protocol`. `file` must come from
+    /// `new_blob_file` of this store, as for `store_blob`. A refused call
+    /// stages nothing and drops `file`, which removes it.
+    pub fn restore_blob(&mut self, oid: Oid, data: &[u8], file: BlobFile) -> Result<()> {
+        let current = self.check_restore_blob(oid, data)?;
+        let blob = file.close(&self.store.backend)?;
+        self.stage_blob(oid, current, data, true, blob)
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in the file at
+    /// `path`, as `restore_blob` does, with the same checks. The call takes
+    /// the file by rename, as `store_blob_at` does, and a refused call
+    /// leaves the file in its place.
+    pub fn restore_blob_at(&mut self, oid: Oid, data: &[u8], path: &Path) -> Result<()> {
+        let current = self.check_restore_blob(oid, data)?;
+        let blob = self.store.take_blob_file(path)?;
+        self.stage_blob(oid, current, data, true, blob)
+    }
+
+    /// Check that `restore` can stage a copy of `oid`, and return the
+    /// current serial of `oid`. A refused call changes nothing.
+    fn check_restore(&self, oid: Oid) -> Result<Tid> {
         self.check_thread()?;
         if self.tid.is_none() {
             return Err(ZoeError::Protocol("restore outside a restore transaction"));
@@ -383,14 +429,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Err(ZoeError::Protocol("restore after vote"));
         }
         check_oid(oid)?;
-        let current = self.current_serial(oid)?;
-        let area = &self.store.backend.staging;
-        self.staged
-            .put(area, oid, current, data.unwrap_or_default(), true)?;
-        if data.is_none() {
-            self.blobs.remove(&oid);
+        self.current_serial(oid)
+    }
+
+    /// Check that `restore_blob` can stage a copy of `oid` with `data`, and
+    /// return the current serial of `oid`.
+    fn check_restore_blob(&self, oid: Oid, data: &[u8]) -> Result<Tid> {
+        let current = self.check_restore(oid)?;
+        if data.is_empty() {
+            return Err(ZoeError::Protocol("restore of a blob with an empty pickle"));
         }
-        Ok(())
+        Ok(current)
     }
 
     /// Declare that the transaction read `oid` at `serial` and depends on

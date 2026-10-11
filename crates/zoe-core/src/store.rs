@@ -345,7 +345,8 @@ impl Store {
     /// Return the path of the blob temporary directory, `blobs/tmp/`.
     ///
     /// A client can write a new blob into a file there and give its path to
-    /// `Txn::store_blob_at`, which takes the file by rename. The call creates the blob store when it does not exist. A
+    /// `Txn::store_blob_at` or `Txn::restore_blob_at`, which take the file
+    /// by rename. The call creates the blob store when it does not exist. A
     /// read-only store fails with `ReadOnly` and creates nothing.
     pub fn blob_temp_dir(&self) -> Result<PathBuf> {
         self.writable()?;
