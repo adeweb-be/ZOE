@@ -85,10 +85,10 @@ const TEXT_BUDGET: usize = 1 << 24;
 const MAX_KEY: usize = 256;
 
 /// The longest pointer of a reference.
-const MAX_POINTER: usize = 1 << 10;
+pub(crate) const MAX_POINTER: usize = 1 << 10;
 
 /// The most bytes that the pointers of the references of one state take.
-const POINTER_BUDGET: usize = 1 << 24;
+pub(crate) const POINTER_BUDGET: usize = 1 << 24;
 
 /// The most JSON values that the reused JSON of the gets holds in all.
 /// A chain of gets would else keep a copy of its values at each link.
@@ -99,9 +99,15 @@ const MAX_SAFE_INT: i128 = (1 << 53) - 1;
 
 /// Return the state of `tree` as JSON, and its outbound references.
 pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
-    let mut converter = Converter::new(tree);
+    convert(&tree.resolver(), tree.state())
+}
+
+/// Return the state `root` of a tree as JSON, and its outbound references.
+/// `resolver` is the resolver of the tree.
+pub(crate) fn convert<'t>(resolver: &Resolver<'t>, root: &'t Node) -> (Value, Vec<Reference>) {
+    let mut converter = Converter::new(resolver);
     let mut at = String::new();
-    let state = converter.value(tree.state(), &mut at, 0);
+    let state = converter.value(root, &mut at, 0);
     (state, converter.references)
 }
 
@@ -189,7 +195,7 @@ pub(crate) fn dict_entries(node: &Node) -> Vec<&(Node, Node)> {
 }
 
 /// Add the segment `segment` to the JSON pointer `at`.
-fn push_segment(at: &mut String, segment: &str) {
+pub(crate) fn push_segment(at: &mut String, segment: &str) {
     at.push('/');
     for c in segment.chars() {
         match c {
@@ -244,8 +250,8 @@ struct Expanded {
     text: usize,
 }
 
-struct Converter<'t> {
-    resolver: Resolver<'t>,
+struct Converter<'r, 't> {
+    resolver: &'r Resolver<'t>,
     /// The JSON values that the state can still get.
     budget: usize,
     /// The JSON bytes of text that the state can still take.
@@ -268,10 +274,10 @@ struct Converter<'t> {
     references: Vec<Reference>,
 }
 
-impl<'t> Converter<'t> {
-    fn new(tree: &'t Tree) -> Self {
+impl<'r, 't> Converter<'r, 't> {
+    fn new(resolver: &'r Resolver<'t>) -> Self {
         Converter {
-            resolver: tree.resolver(),
+            resolver,
             budget: VALUE_BUDGET,
             text_budget: TEXT_BUDGET,
             pointer_budget: POINTER_BUDGET,
@@ -543,7 +549,7 @@ impl<'t> Converter<'t> {
         // decoded.
         let mut size = 0;
         for (key, _) in entries {
-            let len = text::text_len(&self.resolver, key)?;
+            let len = text::text_len(self.resolver, key)?;
             if len > MAX_KEY {
                 return None;
             }
@@ -554,7 +560,7 @@ impl<'t> Converter<'t> {
         }
         let keys: Vec<String> = entries
             .iter()
-            .map(|(key, _)| text::text(&self.resolver, key))
+            .map(|(key, _)| text::text(self.resolver, key))
             .collect::<Option<_>>()?;
         if keys
             .iter()
@@ -606,7 +612,7 @@ impl<'t> Converter<'t> {
     }
 
     fn reference(&mut self, pid: &'t Node, at: &mut String, depth: usize) -> Value {
-        let Some(target) = target(&self.resolver, pid) else {
+        let Some(target) = target(self.resolver, pid) else {
             let len = at.len();
             push_segment(at, "$persistent");
             let pid = self.value(pid, at, depth + 1);
@@ -640,7 +646,7 @@ impl<'t> Converter<'t> {
                 Node::Persistent(pid) => Some(pid),
                 _ => None,
             }) {
-                if let Some(target) = target(&self.resolver, pid).filter(|t| !t.weak) {
+                if let Some(target) = target(self.resolver, pid).filter(|t| !t.weak) {
                     let at = self.pointer(at);
                     self.references.push(Reference {
                         oid: target.oid,
@@ -851,7 +857,8 @@ mod tests {
         state.push(b't');
         let record = [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], &state, b"."].concat();
         let tree = zoe_pickle::decode_record(&record).unwrap();
-        let mut converter = Converter::new(&tree);
+        let resolver = tree.resolver();
+        let mut converter = Converter::new(&resolver);
         converter.value(tree.state(), &mut String::new(), 0);
         let held: usize = converter.expanded.values().map(|e| e.values).sum();
         assert_eq!(held, converter.cached);

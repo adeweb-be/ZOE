@@ -9,8 +9,10 @@
 //!
 //! Loupe also travels in time. [`Folder::as_of`] gives a [`Snapshot`]: the
 //! store as it was after a transaction. [`Folder::history`] lists the
-//! revisions of an object.
+//! revisions of an object, and [`Folder::diff`] compares the decoded
+//! states of two revisions.
 
+mod diff;
 mod path;
 mod state;
 mod text;
@@ -19,6 +21,8 @@ use std::path::Path;
 
 use serde::{Serialize, Serializer};
 use zoe_core::{Oid, Store, Tid, ZoeError};
+
+pub use diff::Change;
 
 /// The most revisions that [`Folder::history`] gives, newest first.
 pub const HISTORY_LIMIT: usize = 1 << 12;
@@ -208,6 +212,19 @@ impl Folder {
                 size: entry.size,
             })
             .collect())
+    }
+
+    /// Return the changes from the state of `oid` as of `before` to its
+    /// state as of `after`.
+    ///
+    /// The diff compares the decoded trees, not the bytes. The module
+    /// documentation of `diff` gives the rules and the limits. The call
+    /// fails when the object has no record as of one of the tids, or when
+    /// zoe-pickle refuses one of the two records.
+    pub fn diff(&self, oid: Oid, before: Tid, after: Tid) -> Result<Vec<Change>> {
+        let before = self.as_of(before).tree(oid)?;
+        let after = self.as_of(after).tree(oid)?;
+        Ok(diff::diff(&before, &after))
     }
 
     /// Return the view as of the last transaction.
