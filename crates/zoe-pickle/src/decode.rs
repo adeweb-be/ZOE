@@ -537,9 +537,10 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Adds a batch to the list or the dict on top of the stack. If the top
-    /// is another value, for example an object that REDUCE makes, or if
-    /// junk is in the span, the top and the batch become one opaque node.
+    /// Adds a batch to the list or the dict on top of the stack. The top and
+    /// the batch become one opaque node in two cases: the top is another
+    /// value, for example an object that REDUCE makes, or junk is in the
+    /// span.
     fn fill(
         &mut self,
         m: &mut Machine,
@@ -613,9 +614,9 @@ impl<'a> Decoder<'a> {
     }
 
     /// Returns a placeholder opaque node for a span, and records the span.
-    /// The span replaces the older spans inside it. A span never starts
-    /// inside an older span and ends after it, because each span is the
-    /// span of a stack entry, or of the entries that an opcode takes off.
+    /// The span replaces the older spans inside it. Each span is the span of
+    /// a stack entry, or of the entries that an opcode takes off. So a span
+    /// never starts inside an older span and ends after it.
     fn opaque_span(&mut self, span: Range<usize>, opcode: u8) -> Node {
         while self
             .spans

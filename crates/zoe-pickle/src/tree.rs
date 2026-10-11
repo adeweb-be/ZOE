@@ -4,8 +4,8 @@
 //! needs both to write the same bytes again.
 //!
 //! No function here calls itself once per nesting level. The drop, the
-//! clone, the comparison and the debug output of a node use explicit
-//! stacks too (see `iterative.rs`), so a deep tree cannot overflow the call
+//! clone, the comparison and the debug output of a node also use explicit
+//! stacks (see `iterative.rs`). So a deep tree cannot overflow the call
 //! stack.
 
 use std::collections::HashMap;
@@ -51,10 +51,12 @@ impl Tree {
     /// 3. `((module, name), None)`;
     /// 7. `((module, name), newargs)`.
     ///
-    /// ZODB still reads three older formats. Their shapes are the same as
-    /// those of the current formats, so this method reads them in the same
-    /// way: format 4, `((module, name), initargs)`, as format 7; format 5,
-    /// `(class, None)`, and format 6, `(class, initargs)`, as format 2.
+    /// ZODB still reads three older formats. They have the shapes of the
+    /// current formats, so this method reads them in the same way:
+    ///
+    /// - format 4, `((module, name), initargs)`, reads as format 7;
+    /// - format 5, `(class, None)`, reads as format 2;
+    /// - format 6, `(class, initargs)`, reads as format 2.
     ///
     /// The class is a GLOBAL. A persistent class is a persistent reference,
     /// and the record does not hold its name, so this method returns `None`
@@ -453,9 +455,10 @@ pub struct Get {
 pub struct Opaque {
     /// The original bytes.
     pub bytes: Vec<u8>,
-    /// The opcode that made the decoder keep the bytes: for example REDUCE
-    /// of an unknown callable, NEWOBJ, EXT1 or POP. When an opaque node
-    /// grows over another one, it keeps the opcode of the first.
+    /// A label for people: the opcode that consumed the span. Examples are
+    /// REDUCE of an unknown callable, NEWOBJ, EXT1 and POP. When the span
+    /// grows over an older opaque node, the label of that node can stay.
+    /// The encoder does not read this field.
     pub opcode: u8,
 }
 
@@ -470,7 +473,7 @@ impl Node {
     }
 
     /// Returns an iterator over this node and all nodes below it, depth
-    /// first: a node comes before its children, and the children come in
+    /// first. A node comes before its children. The children come in
     /// pickle order.
     pub fn walk(&self) -> Walk<'_> {
         Walk {

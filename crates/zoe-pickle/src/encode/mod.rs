@@ -130,9 +130,9 @@ fn int(out: &mut Vec<u8>, value: &Int) -> Result<(), Error> {
     Ok(())
 }
 
-/// Writes an opcode, a length and the bytes: a length of one byte for the
-/// short opcode, four bytes for the long one, at most `max`. A zero short
-/// opcode means that the opcode has no short form.
+/// Writes an opcode, a length and the bytes. The short opcode has a length
+/// of one byte. The long opcode has a length of four bytes, at most `max`.
+/// A zero short opcode means that the opcode has no short form.
 fn sized(
     out: &mut Vec<u8>,
     [short, long]: [u8; 2],
