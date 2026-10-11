@@ -82,9 +82,11 @@ impl Failure {
                 message(storage_transaction_error(py), &self.error)
             }
             ZoeError::Io(error) => error.into(),
-            ZoeError::Locked | ZoeError::Closed | ZoeError::Format(_) => {
-                message(storage_error(py), &self.error)
-            }
+            ZoeError::Locked
+            | ZoeError::Closed
+            | ZoeError::Format(_)
+            | ZoeError::ReadOnly
+            | ZoeError::NotClosedCleanly => message(storage_error(py), &self.error),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptTxn { .. }
