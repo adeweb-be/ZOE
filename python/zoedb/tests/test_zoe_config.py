@@ -43,6 +43,11 @@ def open_stanza(*lines):
     return ZODB.config.storageFromString(stanza(*lines))
 
 
+def blob_directory(storage):
+    """Return the real path of the blob directory of storage."""
+    return os.path.dirname(os.path.realpath(storage.temporaryDirectory()))
+
+
 def test_the_section_and_the_uri_convert_each_key_the_same_way():
     schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
     datatypes = {key: info.datatype for key, info in schema.gettype("zoe")}
@@ -95,7 +100,7 @@ def test_an_empty_twin_counts_as_not_set(tmp_path, monkeypatch):
     storage = open_stanza(f"path {tmp_path / 'store'}")
     try:
         assert storage.isReadOnly() is False
-        assert not os.path.islink(tmp_path / "store" / "blobs")
+        assert blob_directory(storage) == os.path.realpath(tmp_path / "store" / "blobs")
     finally:
         storage.close()
 
@@ -139,7 +144,7 @@ def test_the_uri_decodes_the_path_and_the_query(tmp_path):
     storage = factory()
     try:
         assert storage.getName() == os.path.realpath(path)
-        assert os.path.realpath(path / "blobs") == os.path.realpath(blobs)
+        assert blob_directory(storage) == os.path.realpath(blobs)
     finally:
         storage.close()
 
