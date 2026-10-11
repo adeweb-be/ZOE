@@ -16,8 +16,8 @@ pub type Bytes = Vec<u8>;
 /// An iterator over the transaction log, in tid order.
 pub type TxnIter<'a> = Box<dyn Iterator<Item = Result<TxnMeta>> + 'a>;
 
-/// The row of a transaction, and the records of it that one read found,
-/// as `(oid, pickle)`.
+/// The row of a transaction and its records, as `(oid, pickle)`, from one
+/// snapshot.
 pub type TxnRecords = (TxnMeta, Vec<(Oid, Bytes)>);
 
 /// One version of one object: a row of the `records` key space.
@@ -162,10 +162,15 @@ pub trait Backend: Send + Sync {
     /// snapshot gives the list.
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;
 
-    /// Return the transaction row of `tid` and the records of `oids` that
-    /// `tid` wrote and that exist, in one snapshot. Return `None` when the
-    /// row does not exist.
-    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>>;
+    /// Return the transaction row of `tid` and the records that the
+    /// transaction index gives for `tid`, in oid order, in one snapshot.
+    /// Return `None` when the row does not exist and no index key of `tid`
+    /// is left.
+    ///
+    /// An index key without its record is `CorruptTxn`. Index keys of a
+    /// `tid` that has no row are `CorruptTxn` too. The caller compares the
+    /// records with the oid count of the row.
+    fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;
 
     /// Make all committed writes durable. Group commit uses this barrier.
     fn sync(&self) -> Result<()>;
@@ -354,7 +359,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn txn_records(&self, _: Tid, _: &[Oid]) -> Result<Option<TxnRecords>> {
+        fn txn_records(&self, _: Tid) -> Result<Option<TxnRecords>> {
             Ok(None)
         }
 

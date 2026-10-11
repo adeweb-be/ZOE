@@ -547,8 +547,8 @@ mod tests {
             self.inner.record_keys(from, limit)
         }
 
-        fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>> {
-            self.inner.txn_records(tid, oids)
+        fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>> {
+            self.inner.txn_records(tid)
         }
 
         fn sync(&self) -> Result<()> {

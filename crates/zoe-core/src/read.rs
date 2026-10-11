@@ -9,10 +9,10 @@
 //! removes a record and the row of its transaction in one write, and it
 //! removes a row only when no record of the transaction is left. So
 //! `history` drops a record that it finds without a row only when the
-//! record is gone too, and the iterator reads each transaction and its
-//! records in one snapshot.
+//! record is gone too, and the iterator reads each transaction, its index
+//! keys and its records in one snapshot.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use crate::backend::{Backend, Record, RecordMeta, TxnMeta};
@@ -93,7 +93,9 @@ pub struct CurrentRecord {
 pub struct Transactions {
     store: Weak<Opened>,
     rows: VecDeque<Result<TxnMeta>>,
-    oids: BTreeMap<Tid, Vec<Oid>>,
+    /// The tids that the transaction index gave for the range. The
+    /// iterator uses them to find index keys of a tid that has no row.
+    indexed: BTreeSet<Tid>,
 }
 
 impl Iterator for Transactions {
@@ -101,25 +103,25 @@ impl Iterator for Transactions {
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
         loop {
-            if self.rows.is_empty() && self.oids.is_empty() {
+            if self.rows.is_empty() && self.indexed.is_empty() {
                 return None;
             }
             // The store stays open until this call returns.
             let Some(store) = self.store.upgrade() else {
                 self.rows.clear();
-                self.oids.clear();
+                self.indexed.clear();
                 return Some(Err(ZoeError::Closed));
             };
             // Index keys of a tid before the next row, or after the last
             // row, have no row. They come in tid order, as an error.
-            if let Some(&tid) = self.oids.keys().next() {
+            if let Some(&tid) = self.indexed.first() {
                 let no_row = match self.rows.front() {
                     Some(Ok(row)) => tid < row.tid,
                     Some(Err(_)) => false,
                     None => true,
                 };
                 if no_row {
-                    self.oids.remove(&tid);
+                    self.indexed.remove(&tid);
                     return Some(Err(ZoeError::CorruptTxn { tid }));
                 }
             }
@@ -131,14 +133,14 @@ impl Iterator for Transactions {
                     // no second error.
                     let next = self.rows.iter().find_map(|row| row.as_ref().ok());
                     match next {
-                        Some(row) => self.oids = self.oids.split_off(&row.tid),
-                        None => self.oids.clear(),
+                        Some(row) => self.indexed = self.indexed.split_off(&row.tid),
+                        None => self.indexed.clear(),
                     }
                     return Some(Err(error));
                 }
             };
-            let oids = self.oids.remove(&row.tid).unwrap_or_default();
-            match txn_info(&**store, row.tid, oids) {
+            self.indexed.remove(&row.tid);
+            match txn_info(&**store, row.tid) {
                 Ok(Some(txn)) => return Some(Ok(txn)),
                 // A pack removed the transaction after the iterator read
                 // its row.
@@ -149,20 +151,18 @@ impl Iterator for Transactions {
     }
 }
 
-/// Read the transaction `tid` and its records of `oids` from `backend`, in
-/// one snapshot. The records that are there must match the oid count of
-/// the row. Return `None` when a pack removed the row. A row that is gone
-/// with no pack to explain it raises `CorruptTxn`.
+/// Read the transaction `tid`, its index keys and their records from
+/// `backend`, in one snapshot. The records must match the oid count of the
+/// row. Return `None` when a pack removed the transaction after the
+/// iterator read its row. A transaction that is gone with no pack to
+/// explain it raises `CorruptTxn`.
 ///
-/// `oids` are the oids that the transaction index gave for `tid` in an
-/// earlier snapshot. A pack can remove some of these records since, and
-/// then it lowers the oid count of the row in the same write. A record
-/// without its index key, or an index key without its record, leaves the
-/// records short of the count.
-fn txn_info(backend: &dyn Backend, tid: Tid, oids: Vec<Oid>) -> Result<Option<TxnInfo>> {
-    let Some((row, records)) = backend.txn_records(tid, &oids)? else {
+/// A record without its index key leaves the records short of the count.
+/// The backend gives `CorruptTxn` for an index key without its record.
+fn txn_info(backend: &dyn Backend, tid: Tid) -> Result<Option<TxnInfo>> {
+    let Some((row, records)) = backend.txn_records(tid)? else {
         // The scan of the rows gave this row. Only a pack can remove it
-        // since. Otherwise the index of the database is damaged.
+        // since. Otherwise the database is damaged.
         if packed(backend, tid)? {
             return Ok(None);
         }
@@ -286,8 +286,11 @@ impl Store {
     /// iterator leaves out a transaction that commits after this call.
     ///
     /// The oids of each transaction come from the transaction index. The
-    /// call reads only the index keys of the range, never every record
-    /// key, so a read of one transaction costs the size of its result.
+    /// call reads the rows and the index keys of the range, then each
+    /// transaction with its index keys and its records in one snapshot. It
+    /// never reads every record key, so a read of one transaction costs
+    /// the size of its result. A transaction that a pack removes after
+    /// this call is left out.
     ///
     /// A transaction whose index keys do not match the oid count of its row
     /// gives `CorruptTxn`: a record without its index key does this. An
@@ -304,15 +307,15 @@ impl Store {
             self.backend.iter_txns(start, stop).collect()
         };
         // A range with no row needs no read of the index.
-        let oids = if rows.is_empty() {
-            BTreeMap::new()
+        let indexed = if rows.is_empty() {
+            BTreeSet::new()
         } else {
-            self.backend.txn_oids(start, stop)?
+            self.backend.txn_oids(start, stop)?.into_keys().collect()
         };
         Ok(Transactions {
             store: Arc::downgrade(&self.backend),
             rows: rows.into(),
-            oids,
+            indexed,
         })
     }
 
@@ -355,6 +358,8 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use redb::{ReadableTable, TableDefinition};
     use xxhash_rust::xxh3::Xxh3;
 
@@ -820,6 +825,34 @@ mod tests {
             matches!(one[..], [Err(ZoeError::CorruptTxn { tid: Tid(200) })]),
             "{one:?}"
         );
+    }
+
+    #[test]
+    fn an_index_key_that_a_removal_left_behind_is_corrupt() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let both = [(Oid(1), Some(pickle(1))), (Oid(2), Some(pickle(1)))];
+        restore(&store, 100, &both);
+        restore(&store, 200, &[(Oid(1), Some(pickle(2)))]);
+        // A removal of the record of oid 2 at 100 that lowers the oid count
+        // of its row, as a pack does, but keeps the index key.
+        store.remove_record_for_test(Oid(2), Tid(100)).unwrap();
+        let row = store
+            .backend
+            .iter_txns(Tid(100), Tid(100))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut write = store.backend.begin_write().unwrap();
+        write
+            .replace_txn(&TxnMeta {
+                oid_count: 1,
+                ..row
+            })
+            .unwrap();
+        write.commit().unwrap();
+
+        let (ok, err) = (Ok::<Tid, Tid>, Err::<Tid, Tid>);
+        assert_eq!(checked(&store, None), [err(Tid(100)), ok(Tid(200))]);
     }
 
     #[test]
