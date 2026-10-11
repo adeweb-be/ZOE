@@ -903,12 +903,78 @@ fn run_child(fixture: &Fixture, flips: &[(usize, usize)], from: usize) {
     }
 }
 
+/// What the parent reads from the lines of its children, one child after
+/// the other.
+struct Reader {
+    outcomes: Vec<Option<Outcome>>,
+    /// The flip that the current child started and did not finish.
+    started: Option<usize>,
+    /// The notes of the flip that the current child runs.
+    notes: Vec<String>,
+}
+
+impl Reader {
+    fn new(count: usize) -> Self {
+        Self {
+            outcomes: vec![None; count],
+            started: None,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Read one line of the current child. Text can come before the tag:
+    /// libtest writes `test … ` before the first line of a child.
+    fn line(&mut self, line: &str) {
+        let Some(at) = line.find(TAG) else {
+            return;
+        };
+        let mut words = line[at + TAG.len()..].split_whitespace();
+        let (word, n) = (
+            words.next(),
+            words.next().and_then(|n| n.parse::<usize>().ok()),
+        );
+        match (word, n) {
+            (Some("start"), Some(n)) => self.started = Some(n),
+            (Some("note"), Some(_)) => self.notes.push(words.collect::<Vec<_>>().join(" ")),
+            (Some("done"), Some(n)) => {
+                self.outcomes[n] = Some(decode(words, std::mem::take(&mut self.notes)));
+                self.started = None;
+            }
+            _ => panic!("a child wrote {line:?}"),
+        }
+    }
+
+    /// End the current child. `success` tells if it exited with success,
+    /// and `failure` describes its exit. Return the flip after the one
+    /// where the child aborted, or `None` when the child did all its flips.
+    fn end(&mut self, success: bool, failure: impl FnOnce() -> String) -> Option<usize> {
+        self.notes.clear();
+        match self.started.take() {
+            Some(n) => {
+                self.outcomes[n] = Some(Outcome::Abort);
+                Some(n + 1)
+            }
+            None => {
+                assert!(success, "a child failed out of a flip: {}", failure());
+                None
+            }
+        }
+    }
+
+    fn outcomes(self) -> Vec<Outcome> {
+        let outcomes = self.outcomes.into_iter().enumerate();
+        outcomes
+            .map(|(n, outcome)| outcome.unwrap_or_else(|| panic!("no outcome for flip {n}")))
+            .collect()
+    }
+}
+
 /// Run the flips of the test `test` in child processes of this test, and
 /// return the outcome of each flip. A child that stops during a flip
 /// aborted in it, and the next child starts at the flip after it.
 fn run_children(test: &str, fixture: &Fixture, count: usize) -> Vec<Outcome> {
     let hash = xxh3_64(fixture.database());
-    let mut outcomes: Vec<Option<Outcome>> = vec![None; count];
+    let mut reader = Reader::new(count);
     let mut from = 0;
     while from < count {
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -924,47 +990,71 @@ fn run_children(test: &str, fixture: &Fixture, count: usize) -> Vec<Outcome> {
             let _ = BufReader::new(stderr).read_to_string(&mut text);
             text
         });
-        let (mut started, mut notes): (Option<usize>, Vec<String>) = (None, Vec::new());
         for line in BufReader::new(child.stdout.take().unwrap()).lines() {
-            let line = line.unwrap();
-            let Some(rest) = line.strip_prefix(TAG) else {
-                continue;
-            };
-            let mut words = rest.split_whitespace();
-            let (word, n) = (
-                words.next(),
-                words.next().and_then(|n| n.parse::<usize>().ok()),
-            );
-            match (word, n) {
-                (Some("start"), Some(n)) => started = Some(n),
-                (Some("note"), Some(_)) => notes.push(words.collect::<Vec<_>>().join(" ")),
-                (Some("done"), Some(n)) => {
-                    outcomes[n] = Some(decode(words, std::mem::take(&mut notes)));
-                    started = None;
-                }
-                _ => panic!("a child wrote {line:?}"),
-            }
+            reader.line(&line.unwrap());
         }
         let status = child.wait().unwrap();
         let errors = errors.join().unwrap();
-        match started {
-            Some(n) => {
-                outcomes[n] = Some(Outcome::Abort);
-                from = n + 1;
-            }
-            None => {
-                assert!(
-                    status.success(),
-                    "a child failed out of a flip: {status}\n{errors}"
-                );
-                break;
-            }
+        match reader.end(status.success(), || format!("{status}\n{errors}")) {
+            Some(next) => from = next,
+            None => break,
         }
     }
-    let outcomes = outcomes.into_iter().enumerate();
-    outcomes
-        .map(|(n, outcome)| outcome.unwrap_or_else(|| panic!("no outcome for flip {n}")))
-        .collect()
+    reader.outcomes()
+}
+
+#[test]
+fn the_reader_takes_a_late_tag_and_two_aborts_in_a_row() {
+    let test = "test flips_anywhere_in_the_database_file_never_return_wrong_data ...";
+    let mut reader = Reader::new(4);
+    // The first child aborts in flip 1, and the second child aborts in its
+    // first flip, flip 2. Each first line has the text of libtest before
+    // the tag.
+    let children: [(&[String], bool, Option<usize>); 3] = [
+        (
+            &[
+                "running 1 test".to_owned(),
+                format!("{test} {TAG} start 0"),
+                format!("{TAG} done 0 refused"),
+                format!("{TAG} start 1"),
+            ],
+            false,
+            Some(2),
+        ),
+        (
+            &["running 1 test".to_owned(), format!("{test} {TAG} start 2")],
+            false,
+            Some(3),
+        ),
+        (
+            &[
+                "running 1 test".to_owned(),
+                format!("{test} {TAG} start 3"),
+                format!("{TAG} note 3 Hidden: a read"),
+                format!("{TAG} done 3 read 1 0 1 0 0"),
+                "ok".to_owned(),
+            ],
+            true,
+            None,
+        ),
+    ];
+    for (lines, success, next) in children {
+        lines.iter().for_each(|line| reader.line(line));
+        assert_eq!(reader.end(success, String::new), next);
+    }
+    let reads = Reads {
+        counts: [1, 0, 1, 0, 0],
+        notes: vec!["Hidden: a read".to_owned()],
+    };
+    assert_eq!(
+        reader.outcomes(),
+        [
+            Outcome::Refused,
+            Outcome::Abort,
+            Outcome::Abort,
+            Outcome::Read(reads),
+        ]
+    );
 }
 
 /// Flip seeded bits of the database file of the fixture at the offsets
