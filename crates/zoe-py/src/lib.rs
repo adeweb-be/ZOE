@@ -7,6 +7,7 @@
 
 mod errors;
 mod publish;
+mod sequence;
 mod storage;
 
 /// The extension module.
@@ -14,6 +15,8 @@ mod storage;
 mod _zoe {
     use pyo3::prelude::*;
 
+    #[pymodule_export]
+    use crate::sequence::Sequence;
     #[pymodule_export]
     use crate::storage::Storage;
 

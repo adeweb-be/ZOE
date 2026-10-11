@@ -49,6 +49,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
 
     `pack` runs the online pack of the store, with garbage collection.
     Reads and commits go on while it runs.
+
+    `sequence(name).next()` returns the next value of the sequence `name` of
+    the store: an `int`, unique and strictly increasing per store and per
+    name. It is not part of a transaction, so an abort does not give the
+    value back. A reopen of the store can skip values, at most 100.
     """
 
     def tpc_vote(self, transaction):

@@ -2,8 +2,8 @@
 
 ZODB's own storage test suites run first, then the tests of the parts that
 ZODB does not test: the order of the `tpc_finish` callbacks, the read-only
-mode, `close`, `pack`, the conflict resolution and the parallel commits
-without the GIL.
+mode, `close`, `pack`, the conflict resolution, the parallel commits
+without the GIL and the sequences.
 """
 
 import io
@@ -177,6 +177,7 @@ def test_read_only(tmp_path):
             storage.new_oid,
             lambda: storage.tpc_begin(txn),
             lambda: storage.store(ZERO, ZERO, record(1), "", txn),
+            lambda: storage.sequence("intids").next(),
         ):
             with pytest.raises(ReadOnlyError):
                 call()
@@ -202,6 +203,37 @@ def test_close_aborts_the_open_transactions_and_releases_the_store(tmp_path):
         assert commit(reopened, oid, ZERO, record(2)) > ZERO
     finally:
         reopened.close()
+
+
+def test_a_sequence_of_a_closed_storage_raises_storage_error(tmp_path):
+    storage = zoe.Storage(str(tmp_path / "store"))
+    sequence = storage.sequence("intids")
+    assert sequence.next() == 1
+    storage.close()
+    for call in (sequence.next, lambda: storage.sequence("intids")):
+        with pytest.raises(StorageError):
+            call()
+
+
+def test_a_sequence_name_is_a_str(storage):
+    with pytest.raises(TypeError):
+        storage.sequence(b"intids")
+    assert storage.sequence("").next() == 1
+    assert storage.sequence("\u00e9").next() == 1
+
+
+def test_a_sequence_does_not_wait_for_a_voted_transaction(storage):
+    oid = storage.new_oid()
+    txn = voted(storage, oid, ZERO, record(1))
+    values = []
+    # 150 values cross a block boundary, so one reservation runs.
+    thread = in_thread(
+        lambda: values.extend(storage.sequence("intids").next() for _ in range(150))
+    )
+    thread.join(TIMEOUT)
+    assert not thread.is_alive(), "the sequence waited for the transaction"
+    assert values == list(range(1, 151))
+    storage.tpc_finish(txn)
 
 
 def test_the_lock_table_is_empty_after_finish_and_abort(storage):
