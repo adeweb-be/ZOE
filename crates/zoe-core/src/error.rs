@@ -105,7 +105,8 @@ pub enum ZoeError {
     )]
     NotClosedCleanly,
 
-    /// The store is closed. A transaction iterator outlived its store.
+    /// The store is closed. A transaction iterator or a blob file outlived
+    /// its store.
     #[error("the store is closed")]
     Closed,
 

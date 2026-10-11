@@ -213,8 +213,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Stage a new version of `oid` with the blob in `file`, as `store`
     /// does. This syncs the file. `finish` renames it into the blob store.
+    ///
+    /// `file` must come from `new_blob_file` of this store. A file of
+    /// another store is refused with `Protocol`, and a file of a closed
+    /// store with `Closed`.
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
-        let blob = file.close()?;
+        let blob = file.close(&self.store.backend)?;
         self.store(oid, serial, data)?;
         self.blobs.insert(oid, blob);
         Ok(())
@@ -482,7 +486,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
         // The blob files are durable in their place before the backend
         // commit, so a blob record never lacks its file.
-        let intent = store.blobs.place(tid, &mut self.blobs)?;
+        let intent = store.blobs().place(tid, &mut self.blobs)?;
         let mut write = store.backend.begin_write()?;
         for (&oid, staged) in &self.staged {
             write.put_record(oid, tid, staged.serial, &staged.data)?;
@@ -499,7 +503,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             status: TxnStatus::Committed,
         })?;
         write.commit()?;
-        store.blobs.finished(intent);
+        store.blobs().finished(intent);
 
         *sequencer = Some(tid);
         drop(sequencer);

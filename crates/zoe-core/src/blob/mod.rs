@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::backend::{Backend, BlobRecord};
 use crate::error::{Result, ZoeError};
@@ -28,6 +28,7 @@ use crate::format::blob::{
     BLOB_DIR, LAYOUT, LAYOUT_FILE, NEW_LAYOUT_FILE, TMP_DIR, blob_name, decode_intent,
     encode_intent, intent_name, intent_tid, oid_dir,
 };
+use crate::store::Opened;
 use crate::types::{Oid, Tid};
 use crate::vfs::{Vfs, WriteFile, parent};
 
@@ -91,8 +92,8 @@ impl<V: Vfs> BlobDir for V {
 /// The blob files of a store.
 pub(crate) struct BlobStore {
     /// The store directory. It holds the single-writer lock while the
-    /// store is open.
-    dir: Arc<dyn BlobDir>,
+    /// store is open. Nothing else owns it.
+    dir: Box<dyn BlobDir>,
     /// Tells if `blobs/`, `blobs/tmp/` and the layout file are durable.
     ready: Mutex<bool>,
     /// The number of the next temporary file.
@@ -100,16 +101,28 @@ pub(crate) struct BlobStore {
 }
 
 impl BlobStore {
-    /// Open the blob store of the store directory `dir`.
+    /// Return the blob store of the store directory `dir`. This reads
+    /// nothing: `open` checks the store directory.
+    pub(crate) fn new(dir: Box<dyn BlobDir>) -> Self {
+        Self {
+            dir,
+            ready: Mutex::new(false),
+            next_temp: AtomicU64::new(0),
+        }
+    }
+
+    /// Check the blob store when the store opens.
     ///
     /// The layout file must name the bushy layout. Then the leftovers of a
     /// crash in `blobs/tmp/` are removed: the blob files that an intent
     /// file names and that `backend` has no blob record for, the intent
     /// files and the temporary files.
-    pub(crate) fn open(dir: Arc<dyn BlobDir>, backend: &dyn Backend) -> Result<Self> {
-        if dir.exists(LAYOUT_FILE)? {
+    pub(crate) fn open(&self, backend: &dyn Backend) -> Result<()> {
+        if self.dir.exists(LAYOUT_FILE)? {
             let mut layout = String::new();
-            dir.read_file(LAYOUT_FILE)?.read_to_string(&mut layout)?;
+            self.dir
+                .read_file(LAYOUT_FILE)?
+                .read_to_string(&mut layout)?;
             if layout.trim() != LAYOUT {
                 return Err(ZoeError::Format(format!(
                     "blob layout {:?}: only {LAYOUT:?} is supported",
@@ -117,15 +130,10 @@ impl BlobStore {
                 )));
             }
         }
-        let store = Self {
-            dir,
-            ready: Mutex::new(false),
-            next_temp: AtomicU64::new(0),
-        };
-        if store.dir.exists(TMP_DIR)? {
-            store.recover(backend)?;
+        if self.dir.exists(TMP_DIR)? {
+            self.recover(backend)?;
         }
-        Ok(store)
+        Ok(())
     }
 
     /// Remove the leftovers of a crash in `blobs/tmp/`. Only regular
@@ -237,14 +245,14 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Return a new temporary file for a blob.
-    pub(crate) fn new_file(&self) -> Result<BlobFile> {
+    /// Return a new temporary file for a blob of the store `store`.
+    pub(crate) fn new_file(&self, store: Weak<Opened>) -> Result<BlobFile> {
         self.make_ready()?;
         let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
         let name = format!("{TMP_DIR}/{n}.tmp");
         let file = self.dir.create_file(&name)?;
         Ok(BlobFile {
-            dir: Arc::clone(&self.dir),
+            store,
             name,
             file: Some(file),
             hasher: blake3::Hasher::new(),
@@ -347,9 +355,14 @@ fn has_blob_record(backend: &dyn Backend, oid: Oid, tid: Tid) -> Result<bool> {
 }
 
 /// A new blob, in a temporary file. Write the bytes of the blob, then give
-/// the file to `Txn::store_blob`. Dropping the file removes it.
+/// the file to `Txn::store_blob` of the same store. Dropping the file
+/// removes it.
+///
+/// The file holds only a weak reference to its store, so it does not keep
+/// the store open. After the store is dropped, a write fails with
+/// `Closed`, and the next open of the store removes the file.
 pub struct BlobFile {
-    dir: Arc<dyn BlobDir>,
+    store: Weak<Opened>,
     name: String,
     /// The open file. It is `None` after `close`.
     file: Option<Box<dyn WriteFile>>,
@@ -358,13 +371,24 @@ pub struct BlobFile {
 }
 
 impl BlobFile {
-    /// Sync the file and return the blob, ready for a commit.
-    pub(crate) fn close(mut self) -> Result<PendingBlob> {
+    /// Sync the file and return the blob, ready for a commit in `store`.
+    ///
+    /// A file of another store is refused with `Protocol`. Its temporary
+    /// name can also exist in `store`, so a rename would move the wrong
+    /// file. A file whose store is closed is refused with `Closed`.
+    pub(crate) fn close(mut self, store: &Arc<Opened>) -> Result<PendingBlob> {
+        match self.store.upgrade() {
+            None => return Err(ZoeError::Closed),
+            Some(own) if !Arc::ptr_eq(&own, store) => {
+                return Err(ZoeError::Protocol("a blob file of another store"));
+            }
+            Some(_) => {}
+        }
         let mut file = self.file.take().expect("a blob file is closed once");
         file.sync()?;
         drop(file);
         Ok(PendingBlob {
-            dir: Arc::clone(&self.dir),
+            store: Weak::clone(&self.store),
             temp: Some(std::mem::take(&mut self.name)),
             record: BlobRecord {
                 hash: *self.hasher.finalize().as_bytes(),
@@ -376,6 +400,9 @@ impl BlobFile {
 
 impl Write for BlobFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.store.strong_count() == 0 {
+            return Err(io::Error::other(ZoeError::Closed));
+        }
         let file = self.file.as_mut().expect("a blob file is open until close");
         let n = file.write(buf)?;
         self.hasher.update(&buf[..n]);
@@ -396,15 +423,21 @@ impl Drop for BlobFile {
         // `close` empties the name. The file then belongs to the blob.
         if !self.name.is_empty() {
             drop(self.file.take());
-            let _ = self.dir.remove(&self.name);
+            if let Some(store) = self.store.upgrade() {
+                let _ = store.blobs.dir.remove(&self.name);
+            }
         }
     }
 }
 
 /// A synced blob that a transaction holds until its finish or its abort.
 /// Dropping a blob that `place` did not rename removes its file.
+///
+/// The blob holds only a weak reference to its store, as a blob file does,
+/// so a transaction that shares its store or borrows it holds the same
+/// blob.
 pub(crate) struct PendingBlob {
-    dir: Arc<dyn BlobDir>,
+    store: Weak<Opened>,
     /// The temporary file. It is `None` after `place` renamed it.
     temp: Option<String>,
     record: BlobRecord,
@@ -419,8 +452,10 @@ impl PendingBlob {
 
 impl Drop for PendingBlob {
     fn drop(&mut self) {
-        if let Some(temp) = self.temp.take() {
-            let _ = self.dir.remove(&temp);
+        if let Some(temp) = self.temp.take()
+            && let Some(store) = self.store.upgrade()
+        {
+            let _ = store.blobs.dir.remove(&temp);
         }
     }
 }
@@ -824,6 +859,50 @@ mod tests {
                 "{image:?} kept an orphan"
             );
         }
+    }
+
+    #[test]
+    fn a_blob_file_of_another_store_is_refused() {
+        let (vfs_a, vfs_b) = (MemVfs::new(), MemVfs::new());
+        let a = Store::open_vfs(vfs_a.clone()).unwrap();
+        let b = Store::open_vfs(vfs_b.clone()).unwrap();
+        // Both temporary files have the same name, each in its own store.
+        let own = blob_file(&b, b"own");
+        let other = blob_file(&a, b"other");
+        assert_eq!(temp_files(&vfs_a), temp_files(&vfs_b));
+
+        let oid = b.new_oid().unwrap();
+        let mut txn = b.tpc_begin(b"", b"", b"").unwrap();
+        let refused = txn.store_blob(oid, Tid::ZERO, PICKLE, other);
+        assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+        assert!(temp_files(&vfs_a).is_empty());
+        assert_eq!(temp_files(&vfs_b).len(), 1);
+        drop(own);
+        assert!(temp_files(&vfs_b).is_empty());
+    }
+
+    #[test]
+    fn a_blob_file_does_not_keep_its_store_open() {
+        let dir = std::env::temp_dir().join(format!("zoe-blob-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let mut file = store.new_blob_file().unwrap();
+        file.write_all(b"before").unwrap();
+        drop(store);
+
+        // The lock of the store is free, so the store opens again.
+        let store = Store::open(&dir).unwrap();
+        let error = file.write_all(b"after").unwrap_err();
+        let inner = error.into_inner().unwrap().downcast::<ZoeError>().unwrap();
+        assert!(matches!(*inner, ZoeError::Closed), "{inner:?}");
+
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let refused = txn.store_blob(oid, Tid::ZERO, PICKLE, file);
+        assert!(matches!(refused, Err(ZoeError::Closed)), "{refused:?}");
+        drop(txn);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

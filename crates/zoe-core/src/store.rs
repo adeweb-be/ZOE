@@ -1,6 +1,5 @@
 //! A ZOE store: the entry point of the core.
 
-use std::any::Any;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -55,14 +54,15 @@ impl Default for Options {
     }
 }
 
-/// The open database of a store and the directory that holds its lock.
+/// The open database of a store and its blob store. The blob store owns
+/// the directory, and the directory holds the lock of the store.
 ///
 /// The fields drop in the order of their declaration. So the database
 /// closes, and writes its last bytes, before the directory releases the
 /// lock.
 pub(crate) struct Opened {
     backend: Box<dyn Backend>,
-    _dir: Box<dyn Any + Send + Sync>,
+    pub(crate) blobs: BlobStore,
 }
 
 impl Deref for Opened {
@@ -75,8 +75,9 @@ impl Deref for Opened {
 
 /// An open store.
 pub struct Store {
-    /// The database and the directory. A transaction iterator holds only a
-    /// weak reference, so dropping the `Store` closes the store.
+    /// The database, the blob store and the directory. A transaction
+    /// iterator and a blob file hold only a weak reference, so dropping
+    /// the `Store` closes the store.
     pub(crate) backend: Arc<Opened>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
@@ -88,10 +89,6 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
-    /// The blob files. The blob store and `Opened` share the directory,
-    /// so the lock stays until both are dropped. This field drops after
-    /// `backend`, so the database closes first.
-    pub(crate) blobs: BlobStore,
 }
 
 impl Store {
@@ -143,7 +140,7 @@ impl Store {
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
-        Self::assemble(backend, Arc::new(vfs), Box::new(clock), options, false)
+        Self::assemble(backend, Box::new(vfs), Box::new(clock), options, false)
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -169,33 +166,38 @@ impl Store {
             })?;
         let backend = RedbBackend::open_read_only(db)?;
         let options = Options::default();
-        Self::assemble(backend, Arc::new(dir), Box::new(SystemClock), options, true)
+        Self::assemble(backend, Box::new(dir), Box::new(SystemClock), options, true)
     }
 
     /// Make a store from an open backend and the directory that holds its
     /// lock.
     fn assemble(
         backend: RedbBackend,
-        dir: Arc<dyn blob::BlobDir>,
+        dir: Box<dyn blob::BlobDir>,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
     ) -> Result<Self> {
-        let blobs = BlobStore::open(Arc::clone(&dir), &backend)?;
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
+        let opened = Arc::new(Opened {
+            backend: Box::new(backend),
+            blobs: BlobStore::new(dir),
+        });
+        // `Opened` holds the database and the directory here, so an error
+        // drops them in order: the database closes before the lock goes. A
+        // read-only store changes nothing under `blobs/`.
+        if !read_only {
+            opened.blobs.open(&**opened)?;
+        }
         Ok(Self {
-            backend: Arc::new(Opened {
-                backend: Box::new(backend),
-                _dir: Box::new(dir),
-            }),
+            backend: opened,
             clock,
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
-            blobs,
         })
     }
 
@@ -283,7 +285,7 @@ impl Store {
     /// to `Txn::store_blob`. Dropping a file that no transaction took
     /// removes it.
     pub fn new_blob_file(&self) -> Result<BlobFile> {
-        self.blobs.new_file()
+        self.blobs().new_file(Arc::downgrade(&self.backend))
     }
 
     /// Open the blob that `tid` wrote for `oid`.
@@ -293,7 +295,7 @@ impl Store {
     /// `InvalidData`. A missing file is `CorruptBlob`.
     pub fn open_blob(&self, oid: Oid, tid: Tid) -> Result<BlobReader> {
         let record = self.blob_record(oid, tid)?;
-        self.blobs.reader(oid, tid, record)
+        self.blobs().reader(oid, tid, record)
     }
 
     /// Read the whole blob that `tid` wrote for `oid`, and check its size
@@ -313,7 +315,12 @@ impl Store {
     /// file is read-only. A read through the path checks no hash.
     pub fn blob_path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
         self.blob_record(oid, tid)?;
-        Ok(self.blobs.path(oid, tid))
+        Ok(self.blobs().path(oid, tid))
+    }
+
+    /// Return the blob store.
+    pub(crate) fn blobs(&self) -> &BlobStore {
+        &self.backend.blobs
     }
 
     /// Return the blob record that `tid` wrote for `oid`, or `NotFound`.
@@ -445,14 +452,15 @@ mod tests {
     fn faulty_store() -> (Store, Arc<Faults>) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
-        // The inner store keeps the directory.
+        // The inner store keeps the directory. The tests of this store use
+        // no blob, so its blob store has an empty directory of its own.
         let faulty = Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
         };
         let backend = Arc::new(Opened {
             backend: Box::new(faulty),
-            _dir: Box::new(()),
+            blobs: BlobStore::new(Box::new(MemVfs::new())),
         });
         (Store { backend, ..store }, faults)
     }
