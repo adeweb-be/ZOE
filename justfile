@@ -20,6 +20,10 @@ check:
 # Run the Rust tests, then the Python tests on every interpreter.
 test:
     cargo test --workspace --locked
+    # The bit-flip harness runs in release too. The debug assertions of redb
+    # change what a damaged database file does. The harness prints its
+    # counts.
+    cargo test --release --locked -p zoe-core --test bit_flip_harness -- --show-output
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \

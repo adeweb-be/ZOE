@@ -8,6 +8,8 @@
 //! blob records.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{
@@ -47,6 +49,33 @@ fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError 
         )),
         _ => corrupt,
     }
+}
+
+/// Check that `key`, which a scan of `records` gave to a read of `oid`, is
+/// inside `range`. A key outside it raises `CorruptRecord` with `oid` and
+/// the tid of the key.
+///
+/// redb seeks each end of a scan through the branch pages, and it checks
+/// only the bound of the other end. So a damaged branch page can move the
+/// seek and give a key outside the range. The frame of that key is intact
+/// and passes its checksum, so only this check stops it.
+fn inside(oid: Oid, key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()> {
+    if range.contains(key) {
+        return Ok(());
+    }
+    let (_, tid) = format::split_record_key(key);
+    Err(ZoeError::CorruptRecord { oid, tid })
+}
+
+/// Check that `key`, which a scan of `txns` gave, is inside `range`, as
+/// `inside` does for `records`. A key outside it raises `CorruptTxn` with
+/// the tid of the key.
+fn inside_txns(key: &[u8; 8], range: impl RangeBounds<[u8; 8]>) -> Result<()> {
+    if range.contains(key) {
+        return Ok(());
+    }
+    let tid = Tid(u64::from_be_bytes(*key));
+    Err(ZoeError::CorruptTxn { tid })
 }
 
 /// The redb database of a store.
@@ -108,7 +137,8 @@ impl RedbBackend {
     ///
     /// The last tid is the greater of `last_tid` in `meta` and the tid of
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
-    /// a second time.
+    /// a second time. The row counts only when its frame passes the
+    /// checksum under its key. So a damaged key cannot raise the last tid.
     fn open_db(db: Db) -> Result<Self> {
         let last_tid = {
             let txn = db.begin_read().map_err(backend)?;
@@ -127,7 +157,13 @@ impl RedbBackend {
                 .and_then(format::decode_u64)
                 .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?;
             let txns = txn.open_table(TXNS).map_err(backend)?;
-            let last_row = txns.last().map_err(backend)?;
+            let last_row = txns.last().map_err(backend)?.filter(|(key, value)| {
+                // A frame of a newer format passed the checksum too.
+                matches!(
+                    format::decode_frame(key.value(), value.value()),
+                    Ok(_) | Err(format::FrameError::Unsupported { .. })
+                )
+            });
             stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())))
         };
         Ok(Self {
@@ -198,6 +234,7 @@ impl Backend for RedbBackend {
         match range.next_back() {
             Some(entry) => {
                 let (key, value) = entry.map_err(backend)?;
+                inside(oid, key.value(), start..end)?;
                 Self::record(oid, key.value(), value.value()).map(Some)
             }
             None => Ok(None),
@@ -273,8 +310,12 @@ impl Backend for RedbBackend {
             let txns = txn.open_table(TXNS).map_err(backend)?;
             let (start, end) = (format::txn_key(from), format::txn_key(to));
             let mut rows = Vec::new();
+            // Each key is after the key before it.
+            let mut after = Included(start);
             for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
                 let (key, value) = entry.map_err(backend)?;
+                inside_txns(key.value(), (after, Included(end)))?;
+                after = Excluded(*key.value());
                 rows.push(Self::txn_row(key.value(), value.value()));
             }
             Ok(rows)
@@ -291,6 +332,8 @@ impl Backend for RedbBackend {
         let start = format::record_key(oid, Tid::ZERO);
         let end = format::record_key(oid, Tid::MAX);
         let mut history = Vec::new();
+        // Each key is before the key before it.
+        let mut before = Included(end);
         for entry in records
             .range::<&[u8; 16]>(&start..=&end)
             .map_err(backend)?
@@ -298,6 +341,8 @@ impl Backend for RedbBackend {
             .take(limit)
         {
             let (key, value) = entry.map_err(backend)?;
+            inside(oid, key.value(), (Included(start), before))?;
+            before = Excluded(*key.value());
             let record = Self::record(oid, key.value(), value.value())?;
             history.push(RecordMeta {
                 tid: record.tid,
@@ -321,6 +366,7 @@ impl Backend for RedbBackend {
         {
             Some(entry) => {
                 let (key, value) = entry.map_err(backend)?;
+                inside(oid, key.value(), start..split)?;
                 Some(Self::record(oid, key.value(), value.value())?)
             }
             None => None,
@@ -332,6 +378,7 @@ impl Backend for RedbBackend {
         {
             Some(entry) => {
                 let (key, value) = entry.map_err(backend)?;
+                inside(oid, key.value(), split..=end)?;
                 Some(Self::frame(oid, key.value(), value.value())?.0)
             }
             None => None,
@@ -345,10 +392,14 @@ impl Backend for RedbBackend {
         let mut oids: BTreeMap<Tid, Vec<Oid>> = BTreeMap::new();
         // No key space maps a tid to its oids, so this scan reads every
         // key. It does not decode the frames: each later read of a record
-        // verifies it.
+        // verifies it. Each key is after the key before it, so no oid comes
+        // twice.
+        let mut after = Unbounded;
         for entry in records.iter().map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
             let (oid, tid) = format::split_record_key(key.value());
+            inside(oid, key.value(), (after, Unbounded))?;
+            after = Excluded(*key.value());
             if (from..=to).contains(&tid) {
                 oids.entry(tid).or_default().push(oid);
             }
@@ -365,7 +416,11 @@ impl Backend for RedbBackend {
             .map_err(backend)?
             .next()
         {
-            Some(entry) => format::split_record_key(entry.map_err(backend)?.0.value()).0,
+            Some(entry) => {
+                let key = *entry.map_err(backend)?.0.value();
+                inside(from, &key, start..)?;
+                format::split_record_key(&key).0
+            }
             None => return Ok(None),
         };
         let first = format::record_key(oid, Tid::ZERO);
@@ -376,6 +431,7 @@ impl Backend for RedbBackend {
         match versions.next_back() {
             Some(entry) => {
                 let (key, value) = entry.map_err(backend)?;
+                inside(oid, key.value(), first..=last)?;
                 Ok(Some((oid, Self::record(oid, key.value(), value.value())?)))
             }
             None => Ok(None),
@@ -404,9 +460,13 @@ impl Backend for RedbBackend {
         let records = txn.open_table(RECORDS).map_err(backend)?;
         let start = format::record_key(from, Tid::ZERO);
         let mut keys: Vec<(Oid, Tid)> = Vec::new();
+        // Each key is at or after the start, and after the key before it.
+        let mut after = Included(start);
         for entry in records.range::<&[u8; 16]>(&start..).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
             let (oid, tid) = format::split_record_key(key.value());
+            inside(oid, key.value(), (after, Unbounded))?;
+            after = Excluded(*key.value());
             if keys.len() >= limit && keys.last().is_some_and(|&(last, _)| last != oid) {
                 break;
             }
@@ -438,6 +498,59 @@ impl Backend for RedbBackend {
         // Every commit is durable when it returns, so there is nothing to
         // flush.
         Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    fn read_stored(&self, key: crate::testing::Key) -> Result<Option<Bytes>> {
+        use crate::testing::Key;
+        let txn = self.db.begin_read().map_err(backend)?;
+        let value = match key {
+            Key::Record(oid, tid) | Key::Blob(oid, tid) => {
+                let table = if matches!(key, Key::Record(..)) {
+                    RECORDS
+                } else {
+                    BLOBS
+                };
+                let table = txn.open_table(table).map_err(backend)?;
+                let value = table.get(&format::record_key(oid, tid)).map_err(backend)?;
+                value.map(|v| v.value().to_vec())
+            }
+            Key::Txn(tid) => {
+                let table = txn.open_table(TXNS).map_err(backend)?;
+                let value = table.get(&format::txn_key(tid)).map_err(backend)?;
+                value.map(|v| v.value().to_vec())
+            }
+        };
+        Ok(value)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_stored(&self, key: crate::testing::Key, bytes: &[u8]) -> Result<()> {
+        use crate::testing::Key;
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        match key {
+            Key::Record(oid, tid) | Key::Blob(oid, tid) => {
+                let table = if matches!(key, Key::Record(..)) {
+                    RECORDS
+                } else {
+                    BLOBS
+                };
+                let mut table = txn.open_table(table).map_err(backend)?;
+                table
+                    .insert(&format::record_key(oid, tid), bytes)
+                    .map_err(backend)?;
+            }
+            Key::Txn(tid) => {
+                let mut table = txn.open_table(TXNS).map_err(backend)?;
+                table
+                    .insert(&format::txn_key(tid), bytes)
+                    .map_err(backend)?;
+            }
+        }
+        txn.commit().map_err(backend)
     }
 }
 
@@ -574,10 +687,12 @@ impl WriteTxn for RedbWrite<'_> {
 
 #[cfg(test)]
 mod tests {
+    use redb::StorageBackend;
     use redb::backends::InMemoryBackend;
     use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
+    use crate::vfs::MemVfs;
 
     impl RedbBackend {
         /// Return the database of a store that is open for writes.
@@ -771,6 +886,32 @@ mod tests {
             .unwrap()
             .insert(META_LAST_TID, &format::encode_u64(7)[..])
             .unwrap();
+        txn.commit().unwrap();
+
+        let reopened = RedbBackend::open_db(backend.db).unwrap();
+        assert_eq!(reopened.last_tid(), Tid(500));
+    }
+
+    /// A flipped bit in the key of the last row gives a tid that the store
+    /// never gave. The frame of the row fails the checksum under that key,
+    /// so the tid does not raise the last tid.
+    #[test]
+    fn a_last_row_under_a_damaged_key_does_not_raise_the_last_tid() {
+        let backend = empty();
+        commit_txn(&backend, Tid(500));
+        let txn = backend.database().begin_write().unwrap();
+        {
+            let mut txns = txn.open_table(TXNS).unwrap();
+            let frame = txns
+                .get(&format::txn_key(Tid(500)))
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let damaged = Tid(500 | 1 << 62);
+            txns.insert(&format::txn_key(damaged), frame.as_slice())
+                .unwrap();
+        }
         txn.commit().unwrap();
 
         let reopened = RedbBackend::open_db(backend.db).unwrap();
@@ -989,5 +1130,279 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// The number of records of oid 1 that `many_records` writes, and of
+    /// rows that `many_rows` writes.
+    const LAST: u64 = 120;
+
+    /// Return the bytes of the database file `db` of `vfs`.
+    fn file_of(vfs: &MemVfs) -> Vec<u8> {
+        let file = vfs.file("db");
+        let mut bytes = vec![0; file.len().unwrap() as usize];
+        file.read(0, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// Return an empty backend in the database file `db` of `vfs`. It
+    /// writes the data as it is.
+    fn backend_in(vfs: &MemVfs) -> RedbBackend {
+        let db = redb::Builder::new()
+            .create_with_backend(vfs.file("db"))
+            .unwrap();
+        RedbBackend::initialise(&db).unwrap();
+        RedbBackend::open(db)
+            .unwrap()
+            .with_compression(Compression::None)
+    }
+
+    /// Return the offsets of the copies of each key of `keys` that is in
+    /// `file` more than once. Such a key is in a leaf page and in a branch
+    /// page, or in an old copy of a page. The keys have the same length and
+    /// the same first 6 bytes.
+    fn copies(file: &[u8], keys: &[Vec<u8>]) -> Vec<usize> {
+        let (len, prefix) = (keys[0].len(), &keys[0][..6]);
+        let mut places: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+        for at in 0..file.len() - len {
+            let bytes = &file[at..at + len];
+            if bytes.starts_with(prefix) && keys.iter().any(|key| key[..] == *bytes) {
+                places.entry(bytes).or_default().push(at);
+            }
+        }
+        places
+            .into_values()
+            .filter(|places| places.len() > 1)
+            .flatten()
+            .collect()
+    }
+
+    /// Open a copy of `file` with `fill` written over `range`, and give the
+    /// backend to `check`. redb can panic on a damaged page. A panic gives
+    /// no data.
+    fn with_damage(
+        file: &[u8],
+        range: std::ops::Range<usize>,
+        fill: u8,
+        check: impl FnOnce(&RedbBackend),
+    ) {
+        let mut damaged = file.to_vec();
+        damaged[range].fill(fill);
+        let copy = MemVfs::new();
+        let target = copy.file("db");
+        target.set_len(damaged.len() as u64).unwrap();
+        target.write(0, &damaged).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let db = redb::Builder::new().create_with_backend(target).ok()?;
+            check(&RedbBackend::open(db).ok()?);
+            Some(())
+        }));
+    }
+
+    /// What the reads of damaged databases gave.
+    #[derive(Default)]
+    struct Scans {
+        /// The keys outside a scan that a read gave.
+        wrong: Vec<String>,
+        /// The keys at or after the end of a backward scan that a check
+        /// caught.
+        late: usize,
+        /// The keys before the start of a forward scan that a check caught.
+        early: usize,
+    }
+
+    /// Write the records of oid 1 at the tids 1 to `LAST`, and one record of
+    /// oid 2, in the database file `db` of `vfs`. The records are large
+    /// enough that `records` has branch pages.
+    fn many_records(vfs: &MemVfs) {
+        let backend = backend_in(vfs);
+        let mut write = backend.begin_write().unwrap();
+        for tid in 1..=LAST {
+            let pickle = [tid as u8; 200];
+            write
+                .put_record(Oid(1), Tid(tid), Tid(tid - 1), &pickle)
+                .unwrap();
+        }
+        write
+            .put_record(Oid(2), Tid(1), Tid::ZERO, b"pickle")
+            .unwrap();
+        write.commit().unwrap();
+    }
+
+    /// Run the scans of `records` for oid 1 at each tid. Record each key
+    /// outside its scan that a read gave, and count the ones that a check
+    /// caught.
+    fn check_records(backend: &RedbBackend, scans: &mut Scans) {
+        for t in 1..=LAST + 1 {
+            let tid = Tid(t);
+            match backend.load_before(Oid(1), tid) {
+                Ok(Some(record)) if record.tid >= tid => {
+                    scans
+                        .wrong
+                        .push(format!("load_before {tid:?}: {:?}", record.tid));
+                }
+                Err(ZoeError::CorruptRecord {
+                    oid: Oid(1),
+                    tid: at,
+                }) if at >= tid => {
+                    scans.late += 1;
+                }
+                _ => {}
+            }
+            match backend.load_before_next(Oid(1), tid) {
+                Ok((before, next)) => {
+                    if before.as_ref().is_some_and(|r| r.tid >= tid)
+                        || next.is_some_and(|next| next < tid)
+                    {
+                        let before = before.map(|r| r.tid);
+                        scans
+                            .wrong
+                            .push(format!("load_before_next {tid:?}: {before:?}, {next:?}"));
+                    }
+                }
+                Err(ZoeError::CorruptRecord {
+                    oid: Oid(1),
+                    tid: at,
+                }) if at < tid => {
+                    scans.early += 1;
+                }
+                Err(_) => {}
+            }
+        }
+        if let Ok(history) = backend.history(Oid(1), usize::MAX) {
+            let tids: Vec<u64> = history.iter().map(|meta| meta.tid.0).collect();
+            let newest_first = tids.windows(2).all(|pair| pair[0] > pair[1]);
+            if !newest_first || tids.iter().any(|&tid| !(1..=LAST).contains(&tid)) {
+                scans.wrong.push(format!("history: {tids:?}"));
+            }
+        }
+        if let Ok(Some((oid, record))) = backend.current_from(Oid(1)) {
+            let last = if oid == Oid(1) { LAST } else { 1 };
+            if !(1..=last).contains(&record.tid.0) {
+                scans
+                    .wrong
+                    .push(format!("current_from: {oid:?} {:?}", record.tid));
+            }
+        }
+        if let Ok(oids) = backend.txn_oids(Tid::ZERO, Tid::MAX)
+            && oids
+                .values()
+                .any(|oids| oids.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            scans.wrong.push(format!("txn_oids: {oids:?}"));
+        }
+        for from in [Oid(1), Oid(2)] {
+            if let Ok(keys) = backend.record_keys(from, usize::MAX)
+                && (keys.windows(2).any(|pair| pair[0] >= pair[1])
+                    || keys.iter().any(|&(oid, _)| oid < from))
+            {
+                scans.wrong.push(format!("record_keys {from:?}: {keys:?}"));
+            }
+        }
+    }
+
+    /// A key of a branch page bounds the keys of a child page. A damaged
+    /// one moves the seek of a scan into the wrong child, and redb can then
+    /// give a key outside the scan. Every read of a record gives a key
+    /// inside its scan, or fails.
+    #[test]
+    fn a_damaged_branch_key_never_gives_a_record_outside_the_scan() {
+        let vfs = MemVfs::new();
+        many_records(&vfs);
+        let file = file_of(&vfs);
+        let keys: Vec<Vec<u8>> = (1..=LAST)
+            .map(|tid| format::record_key(Oid(1), Tid(tid)).to_vec())
+            .collect();
+        let mut scans = Scans::default();
+        for at in copies(&file, &keys) {
+            // The lowest and the highest tid make the key bound too few or
+            // too many keys.
+            for fill in [0, 0xff] {
+                with_damage(&file, at + 8..at + 16, fill, |backend| {
+                    check_records(backend, &mut scans);
+                });
+            }
+        }
+        assert!(scans.wrong.is_empty(), "{:?}", scans.wrong);
+        // Without the checks of the scans, these reads give the keys
+        // outside them.
+        assert!(scans.late > 0, "no backward scan went past its end");
+        assert!(scans.early > 0, "no forward scan started before its start");
+    }
+
+    /// The tid of the row `n` of `many_rows`. The high bytes make its key
+    /// easy to find in the file.
+    fn row_tid(n: u64) -> Tid {
+        Tid(0x5a5a_0000_0000_0000 | n)
+    }
+
+    /// Write the rows `row_tid(1)` to `row_tid(LAST)` in the database file
+    /// `db` of `vfs`. The rows are large enough that `txns` has branch
+    /// pages.
+    fn many_rows(vfs: &MemVfs) {
+        let backend = backend_in(vfs);
+        let mut write = backend.begin_write().unwrap();
+        for n in 1..=LAST {
+            write
+                .put_txn(&TxnMeta {
+                    tid: row_tid(n),
+                    user: b"user".to_vec(),
+                    description: vec![n as u8; 200],
+                    extension: Vec::new(),
+                    oid_count: 0,
+                    status: TxnStatus::Committed,
+                })
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    /// Run a scan of `txns` for each row. Record each row outside its scan
+    /// that a read gave, and count the ones that a check caught.
+    fn check_rows(backend: &RedbBackend, scans: &mut Scans) {
+        for n in 1..=LAST {
+            let tid = row_tid(n);
+            for row in backend.iter_txns(tid, tid) {
+                match row {
+                    Ok(row) if row.tid != tid => {
+                        scans
+                            .wrong
+                            .push(format!("iter_txns {tid:?}: {:?}", row.tid));
+                    }
+                    Err(ZoeError::CorruptTxn { tid: at }) if at < tid => scans.early += 1,
+                    _ => {}
+                }
+            }
+        }
+        let tids: Vec<Tid> = backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .filter_map(|row| row.ok().map(|row| row.tid))
+            .collect();
+        if tids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            scans.wrong.push(format!("iter_txns: {tids:?}"));
+        }
+    }
+
+    /// A damaged key of a branch page of `txns` never makes a scan give a
+    /// row outside it. The scan gives the rows inside it, or fails.
+    #[test]
+    fn a_damaged_branch_key_never_gives_a_row_outside_the_scan() {
+        let vfs = MemVfs::new();
+        many_rows(&vfs);
+        let file = file_of(&vfs);
+        let keys: Vec<Vec<u8>> = (1..=LAST)
+            .map(|n| format::txn_key(row_tid(n)).to_vec())
+            .collect();
+        let mut scans = Scans::default();
+        for at in copies(&file, &keys) {
+            for fill in [0, 0xff] {
+                with_damage(&file, at..at + 8, fill, |backend| {
+                    check_rows(backend, &mut scans);
+                });
+            }
+        }
+        assert!(scans.wrong.is_empty(), "{:?}", scans.wrong);
+        // Without the check of the scan, these reads give the rows outside
+        // it.
+        assert!(scans.early > 0, "no forward scan started before its start");
     }
 }

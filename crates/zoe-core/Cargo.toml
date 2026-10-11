@@ -17,5 +17,15 @@ xxhash-rust.workspace = true
 zoe-pickle = { path = "../zoe-pickle" }
 zstd.workspace = true
 
+[features]
+# The test hook `zoe_core::testing`, which rewrites stored bytes. Only the
+# dev-dependency below turns it on, so only test builds have it.
+testing = []
+
+[dev-dependencies]
+# This crate with the test hook. Cargo builds dev-dependencies only for
+# tests, examples and benchmarks.
+zoe-core = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

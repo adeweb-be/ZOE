@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 
 use crate::error::Result;
+#[cfg(feature = "testing")]
+use crate::error::ZoeError;
 use crate::format::Codec;
 use crate::types::{Oid, Tid};
 
@@ -165,6 +167,27 @@ pub trait Backend: Send + Sync {
 
     /// Make all committed writes durable. Group commit uses this barrier.
     fn sync(&self) -> Result<()>;
+
+    /// Return the bytes stored under `key`, as stored. Only the test hook
+    /// `testing` calls it. A backend without the hook gives a `Backend`
+    /// error.
+    #[cfg(feature = "testing")]
+    fn read_stored(&self, key: crate::testing::Key) -> Result<Option<Bytes>> {
+        Err(ZoeError::Backend(
+            format!("no test hook to read {key:?}").into(),
+        ))
+    }
+
+    /// Store `bytes` under `key`, with no check, in a write transaction of
+    /// its own. Only the test hook `testing` calls it. A backend without
+    /// the hook gives a `Backend` error.
+    #[cfg(feature = "testing")]
+    fn write_stored(&self, key: crate::testing::Key, bytes: &[u8]) -> Result<()> {
+        let _ = bytes;
+        Err(ZoeError::Backend(
+            format!("no test hook to write {key:?}").into(),
+        ))
+    }
 }
 
 /// One backend write transaction. It holds the records, the blob records,
