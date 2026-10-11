@@ -69,9 +69,6 @@ class ZODBStorageTests(
     def open(self, read_only=False):
         self._storage = zoe.Storage("store", read_only=read_only)
 
-    def testLoadBeforeConsecutiveTids(self):
-        pytest.skip("tpc_begin with a tid is a restore, not built yet")
-
     def testLoadBeforeUndo(self):
         pytest.skip("the storage does not undo")
 
