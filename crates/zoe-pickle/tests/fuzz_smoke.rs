@@ -1,16 +1,18 @@
 //! A fuzz smoke test that runs on stable inside `cargo test`.
 //!
-//! A mutator with a fixed seed changes the records of the corpus and some
-//! hand-written records of protocols 0 to 3. The decoder must not panic on
-//! any input. Each input that it accepts must encode to the same bytes,
-//! clone into an equal tree, and print, walk and resolve without a panic.
+//! A mutator with a fixed seed changes the records of the corpus, some
+//! hand-written records of protocols 0 to 3, and inputs at the limits of
+//! the decoder. The decoder must not panic on any input. Each input that it
+//! accepts must encode to the same bytes, clone into an equal tree, and
+//! print, walk and resolve without a panic.
 
 use std::panic;
 use std::path::PathBuf;
 
 use zoe_pickle::{Node, decode_record, encode_record};
 
-/// The mutated inputs per seed record.
+/// The mutated inputs per seed of 4 KiB or less. A larger seed gets fewer
+/// in proportion, and 20 at least.
 const ROUNDS: usize = 300;
 
 /// The bytes that the mutator writes as opcodes: each opcode that the
@@ -56,8 +58,81 @@ impl Rng {
     }
 }
 
+/// The class pickle of the hand-written records: GLOBAL m C, BINPUT 0.
+const CLASS: &[u8] = b"\x80\x03cm\nC\nq\x00.";
+
+/// Returns a record of `CLASS` and a protocol-3 state pickle with `body`.
+fn record(body: &[u8]) -> Vec<u8> {
+    [CLASS, b"\x80\x03", body, b"."].concat()
+}
+
+/// Returns each seed and whether the decoder accepts it: the records of the
+/// corpus, the hand-written records and the inputs at the limits.
+fn seeds() -> Vec<(Vec<u8>, bool)> {
+    let mut seeds: Vec<_> = records().into_iter().map(|seed| (seed, true)).collect();
+    seeds.extend(limits());
+    seeds
+}
+
+/// Returns inputs at the limits of the decoder, and whether it accepts
+/// them: lengths and memo indices near 2**31 and 2**32, and deep and wide
+/// values.
+fn limits() -> Vec<(Vec<u8>, bool)> {
+    const DEPTH: usize = 5_000;
+    const WIDTH: usize = 20_000;
+    let repeat = |bytes: &[u8], times| bytes.repeat(times);
+    vec![
+        // Lengths of 2**32 - 1 and 2**31 - 1: the record ends too early.
+        (record(b"B\xff\xff\xff\xffabc"), false),
+        (record(b"X\xff\xff\xff\xffabc"), false),
+        (record(b"T\xff\xff\xff\x7fabc"), false),
+        (record(b"\x8b\xff\xff\xff\x7f\x01"), false),
+        // Lengths of 2**31: Python reads them as negative.
+        (record(b"T\x00\x00\x00\x80abc"), false),
+        (record(b"\x8b\x00\x00\x00\x80\x01"), false),
+        // The memo index 2**32 - 1.
+        (record(b"(Nr\xff\xff\xff\xffj\xff\xff\xff\xfft"), true),
+        (record(b"j\xff\xff\xff\xff"), false),
+        // Deep values: tuples, marked tuples, lists, dicts, persistent
+        // references and chains of puts.
+        (record(&[&b")"[..], &[0x85; DEPTH]].concat()), true),
+        (
+            record(&[repeat(b"(", DEPTH), repeat(b"t", DEPTH)].concat()),
+            true,
+        ),
+        (
+            record(&[repeat(b"]", DEPTH), repeat(b"a", DEPTH - 1)].concat()),
+            true,
+        ),
+        (
+            record(&[&b"}"[..], &repeat(b"N}", DEPTH), &repeat(b"s", DEPTH)].concat()),
+            true,
+        ),
+        (record(&[&b"N"[..], &repeat(b"Q", DEPTH)].concat()), true),
+        (
+            record(&[&b"N"[..], &repeat(b"q\x01", DEPTH)].concat()),
+            true,
+        ),
+        // Wide values: one batch of many items, many batches of one item,
+        // a marked tuple and a dict.
+        (
+            record(&[&b"]("[..], &repeat(b"K\x01", WIDTH), b"e"].concat()),
+            true,
+        ),
+        (record(&[&b"]"[..], &repeat(b"Na", WIDTH)].concat()), true),
+        (
+            record(&[&b"("[..], &repeat(b"h\x00", WIDTH), b"t"].concat()),
+            true,
+        ),
+        (
+            record(&[&b"}("[..], &repeat(b"NN", WIDTH / 2), b"u"].concat()),
+            true,
+        ),
+    ]
+}
+
 /// Returns the records of the corpus and the hand-written records.
-fn seeds() -> Vec<Vec<u8>> {
+fn records() -> Vec<Vec<u8>> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
@@ -69,7 +144,7 @@ fn seeds() -> Vec<Vec<u8>> {
         .iter()
         .map(|path| std::fs::read(path).unwrap())
         .collect();
-    let class: &[u8] = b"\x80\x03cm\nC\nq\x00.";
+    let class = CLASS;
     let class0: &[u8] = b"cpersistent.mapping\nPersistentMapping\n.";
     let nested = [&b"\x80\x03)"[..], &[0x85; 50], b"."].concat();
     for record in [
@@ -146,12 +221,18 @@ fn check(input: &[u8]) -> bool {
 #[test]
 fn mutated_records_never_panic_and_round_trip_when_accepted() {
     let seeds = seeds();
+    let inputs: Vec<Vec<u8>> = seeds.iter().map(|(seed, _)| seed.clone()).collect();
     let mut rng = Rng(0x5eed);
     let (mut accepted, mut refused) = (0, 0);
-    for seed in &seeds {
-        assert!(check(seed), "a seed record is refused: {seed:02x?}");
-        for _ in 0..ROUNDS {
-            let input = mutate(&mut rng, seed, &seeds);
+    for (seed, valid) in &seeds {
+        assert_eq!(check(seed), *valid, "a seed: {seed:02x?}");
+        let rounds = if seed.len() <= 4096 {
+            ROUNDS
+        } else {
+            (ROUNDS * 4096 / seed.len()).max(20)
+        };
+        for _ in 0..rounds {
+            let input = mutate(&mut rng, seed, &inputs);
             if check(&input) {
                 accepted += 1;
             } else {
