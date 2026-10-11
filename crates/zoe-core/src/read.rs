@@ -443,7 +443,7 @@ impl Store {
 
     /// Iterate as `iterator` does, with slices of at most `slice` rows and
     /// `slice` tids of the index.
-    fn iterator_in_slices(
+    pub(crate) fn iterator_in_slices(
         &self,
         start: Option<Tid>,
         stop: Option<Tid>,
@@ -1037,6 +1037,12 @@ mod tests {
         assert_eq!(BTreeMap::from_iter(txns), expected);
     }
 
+    /// The tid of a transaction that the iterator gives, or the text of
+    /// its error.
+    fn tid_or_error(txn: Result<TxnInfo>) -> std::result::Result<Tid, String> {
+        txn.map(|txn| txn.tid).map_err(|e| format!("{e:?}"))
+    }
+
     /// The tid of each transaction that the iterator gives with slices of
     /// `slice`, or the text of each error.
     fn sliced(
@@ -1047,7 +1053,7 @@ mod tests {
     ) -> Vec<std::result::Result<Tid, String>> {
         store
             .iterator_in_slices(start.map(Tid), stop.map(Tid), slice)
-            .map(|txn| txn.map(|txn| txn.tid).map_err(|e| format!("{e:?}")))
+            .map(tid_or_error)
             .collect()
     }
 
@@ -1129,6 +1135,59 @@ mod tests {
             (Some(140), Some(160)),
         ] {
             same_in_every_slice(&store, start, stop);
+        }
+    }
+
+    /// A pickle of class `m.C` with an empty state. It refers to no
+    /// object.
+    const LEAF: &[u8] = b"\x80\x03cm\nC\nq\x00.\x80\x03}.";
+
+    #[test]
+    fn a_pack_between_two_slices_gives_no_error() {
+        // The root at 100. Then, in turn, a transaction with no record and
+        // a transaction of an object that nothing refers to. The pack
+        // removes each such object with its row, one in each batch. A row
+        // with no record has no index key, so an index read past it can
+        // name the tid of a row that the next batch removes.
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        restore(&store, 100, &[(Oid(0), Some(LEAF.to_vec()))]);
+        let mut written = vec![Tid(100)];
+        for n in 1..=8u8 {
+            let tid = 200 * u64::from(n);
+            restore(&store, tid, &[]);
+            restore(&store, tid + 100, &[(Oid(n.into()), Some(pickle(n)))]);
+            written.extend([Tid(tid), Tid(tid + 100)]);
+        }
+        let last = store.last_transaction();
+
+        // Each call reads a new slice of one row. Each batch of the pack
+        // runs between two calls.
+        let mut iterator = store.iterator_in_slices(None, None, 1);
+        let mut given = Vec::new();
+        let report = store
+            .pack_in_batches(last, 1, || {
+                if let Some(txn) = iterator.next() {
+                    given.push(tid_or_error(txn));
+                }
+            })
+            .unwrap();
+        let during = given.len();
+        given.extend(iterator.map(tid_or_error));
+
+        assert_eq!(report.records, 8, "{report:?}");
+        assert!(during >= 2, "{during} calls during the pack");
+        assert!(given.len() > during, "no call after the pack: {given:?}");
+        let given: Vec<Tid> = given
+            .iter()
+            .map(|txn| txn.clone().unwrap_or_else(|e| panic!("{e} in {given:?}")))
+            .collect();
+        assert!(given.windows(2).all(|pair| pair[0] < pair[1]), "{given:?}");
+        assert!(given.iter().all(|tid| written.contains(tid)), "{given:?}");
+        // The root and the transactions with no record survive the pack.
+        let survivors: Vec<Tid> = (0..=8).map(|n| Tid(100u64.max(200 * n))).collect();
+        assert_eq!(tids(&store, None, None), survivors);
+        for tid in &survivors {
+            assert!(given.contains(tid), "{tid:?} is missing from {given:?}");
         }
     }
 
