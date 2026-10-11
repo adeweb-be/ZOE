@@ -126,9 +126,15 @@ impl Store {
     }
 
     /// Return a new oid. An oid that no commit uses can come back after
-    /// the store reopens.
+    /// the store reopens. When no oid below `u64::MAX` is left, fail with
+    /// `Protocol`.
     pub fn new_oid(&self) -> Result<Oid> {
-        Ok(Oid(self.next_oid.fetch_add(1, Ordering::Relaxed)))
+        self.next_oid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next < u64::MAX).then(|| next + 1)
+            })
+            .map(Oid)
+            .map_err(|_| ZoeError::Protocol("no oid is left"))
     }
 
     /// Begin a transaction.
@@ -486,6 +492,16 @@ mod tests {
         assert_eq!((row.tid, row.oid_count), (tid, 1));
         assert_eq!(row.user, b"user");
         assert_eq!(store.backend.history(oid, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_oid_fails_when_no_oid_is_left() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.next_oid.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(store.new_oid().unwrap(), Oid(u64::MAX - 1));
+        for _ in 0..2 {
+            assert!(matches!(store.new_oid(), Err(ZoeError::Protocol(_))));
+        }
     }
 
     #[test]

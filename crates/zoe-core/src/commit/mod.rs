@@ -76,6 +76,7 @@ impl<'s> Txn<'s> {
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
         }
+        check_oid(oid)?;
         self.staged.insert(
             oid,
             Staged {
@@ -100,6 +101,7 @@ impl<'s> Txn<'s> {
         if self.voted() {
             return Err(ZoeError::Protocol("restore after vote"));
         }
+        check_oid(oid)?;
         let current = self.current_serial(oid)?;
         self.staged.insert(
             oid,
@@ -249,6 +251,16 @@ impl<'s> Txn<'s> {
     }
 }
 
+/// Check that a transaction can write `oid`. `Oid(u64::MAX)` is refused
+/// with `Protocol`, because the next oid must stay greater than every
+/// written oid.
+fn check_oid(oid: Oid) -> Result<()> {
+    if oid == Oid(u64::MAX) {
+        return Err(ZoeError::Protocol("oid u64::MAX is reserved"));
+    }
+    Ok(())
+}
+
 /// Return the tid of a normal commit after the tid `last`: `now`, or the
 /// tid after `last` if `now` is not after it. `Tid::MAX` is never given,
 /// because `load` reads the versions before it. When no tid is left, fail
@@ -382,6 +394,23 @@ mod tests {
                 Err(ZoeError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn the_maximum_oid_is_refused() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store(Oid(u64::MAX), Tid::ZERO, b"a");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        let error = txn.restore(Oid(u64::MAX), Some(b"a"));
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+
+        // The highest oid that a commit can write uses up the oids.
+        voted_restore(&store, Tid(100), Oid(u64::MAX - 1), b"a")
+            .finish()
+            .unwrap();
+        assert!(matches!(store.new_oid(), Err(ZoeError::Protocol(_))));
     }
 
     #[test]
