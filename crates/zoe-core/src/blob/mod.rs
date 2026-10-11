@@ -854,7 +854,7 @@ mod tests {
     fn empty_store() -> MemVfs {
         let vfs = MemVfs::new();
         drop(Store::open_vfs(vfs.clone()).unwrap());
-        vfs.settled()
+        vfs.durable_copy()
     }
 
     /// Open each crash image of `vfs`. A blob record must have its file,
@@ -940,7 +940,7 @@ mod tests {
             commit_blobs(&store, &[oid], b"one");
             oid
         };
-        let vfs = built.settled();
+        let vfs = built.durable_copy();
         let dir = oid_dir(oid);
 
         let store = Store::open_vfs(vfs.clone()).unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
     fn a_crash_during_recovery_leaves_no_orphan_behind() {
         let (vfs, leftovers) = leftovers_of_a_crash();
         // The leftovers are on disk when the recovery starts.
-        let vfs = vfs.settled();
+        let vfs = vfs.durable_copy();
         drop(Store::open_vfs(vfs.clone()).unwrap());
 
         let images = vfs.crash_images();
