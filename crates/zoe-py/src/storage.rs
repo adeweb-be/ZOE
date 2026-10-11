@@ -561,7 +561,8 @@ impl Storage {
 
     /// Return the path of the blob file that the transaction `serial` wrote
     /// for `oid`. The file is read-only. Raise `POSKeyError` when that
-    /// transaction wrote no blob for `oid`.
+    /// transaction wrote no blob for `oid`, or when its file is missing, as
+    /// ZODB's blob storages do.
     #[pyo3(name = "loadBlob")]
     fn load_blob(
         &self,
@@ -572,7 +573,13 @@ impl Storage {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let store = self.opened(py)?;
         let path = py
-            .detach(move || store.blob_path(oid, serial))
+            .detach(move || {
+                let path = store.blob_path(oid, serial)?;
+                match fs::exists(&path)? {
+                    true => Ok(path),
+                    false => Err(ZoeError::NotFound { oid }),
+                }
+            })
             .map_err(|e| core(py, e))?;
         Ok(path.into_os_string())
     }
