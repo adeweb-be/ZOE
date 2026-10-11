@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
-use crate::blob::{BlobFile, BlobReader, BlobStore};
+use crate::blob::{self, BlobFile, BlobReader, BlobStore};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
@@ -17,7 +17,7 @@ use crate::format::Compression;
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
 use crate::types::{Oid, Tid};
-use crate::vfs::{Dir, MemVfs, OsVfs, Vfs};
+use crate::vfs::{MemVfs, OsVfs, Vfs};
 
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
@@ -176,7 +176,7 @@ impl Store {
     /// lock.
     fn assemble(
         backend: RedbBackend,
-        dir: Arc<dyn Dir>,
+        dir: Arc<dyn blob::BlobDir>,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,

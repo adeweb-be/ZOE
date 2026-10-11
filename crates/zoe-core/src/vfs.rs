@@ -21,19 +21,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::error::{Result, ZoeError};
 
 /// The directory of a store, as the core sees it.
-pub trait Vfs: Dir {
+pub trait Vfs: Send + Sync + 'static {
     /// An open file. redb stores its database in one.
     type File: redb::StorageBackend;
 
-    /// Open the file `name`. Create it empty when it does not exist.
-    fn open(&self, name: &str) -> io::Result<Self::File>;
-}
-
-/// The file and directory operations of a `Vfs`, other than the database
-/// file. The blob store uses them through a trait object.
-pub trait Dir: Send + Sync + 'static {
     /// Tell if the file or directory `name` exists.
     fn exists(&self, name: &str) -> io::Result<bool>;
+
+    /// Open the file `name`. Create it empty when it does not exist.
+    fn open(&self, name: &str) -> io::Result<Self::File>;
 
     /// Rename the file `from` to `to`, and replace `to` if it exists.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
@@ -41,8 +37,7 @@ pub trait Dir: Send + Sync + 'static {
     /// Remove the file `name`.
     fn remove(&self, name: &str) -> io::Result<()>;
 
-    /// Make the creations, renames and removals in the store directory
-    /// durable.
+    /// Make the creations, renames and removals in the directory durable.
     fn sync_dir(&self) -> io::Result<()>;
 
     /// Make the creations, renames and removals in the directory `dir`
@@ -53,9 +48,10 @@ pub trait Dir: Send + Sync + 'static {
     /// directory is durable after a sync of its parent.
     fn create_dir(&self, name: &str) -> io::Result<()>;
 
-    /// Return the names of the entries of the directory `dir`, without
-    /// the directory part, in order.
-    fn list_dir(&self, dir: &str) -> io::Result<Vec<String>>;
+    /// Return the names of the regular files in the directory `dir`,
+    /// without the directory part, in order. Directories and other
+    /// entries are not in the list.
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
 
     /// Create the new, empty file `name` and open it for writing. Fail
     /// when `name` exists.
@@ -156,6 +152,10 @@ pub(crate) const LOCK: &str = "lock";
 impl Vfs for OsVfs {
     type File = redb::backends::FileBackend;
 
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        fs::exists(self.dir.join(name))
+    }
+
     fn open(&self, name: &str) -> io::Result<Self::File> {
         let file = OpenOptions::new()
             .read(true)
@@ -164,12 +164,6 @@ impl Vfs for OsVfs {
             .truncate(false)
             .open(self.dir.join(name))?;
         redb::backends::FileBackend::new(file).map_err(io::Error::other)
-    }
-}
-
-impl Dir for OsVfs {
-    fn exists(&self, name: &str) -> io::Result<bool> {
-        fs::exists(self.dir.join(name))
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -192,11 +186,16 @@ impl Dir for OsVfs {
         fs::create_dir(self.dir.join(name))
     }
 
-    fn list_dir(&self, dir: &str) -> io::Result<Vec<String>> {
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in fs::read_dir(self.dir.join(dir))? {
+            let entry = entry?;
+            // The file type of an entry does not follow a symbolic link.
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             // A name that is not UTF-8 is not a name of the core.
-            if let Ok(name) = entry?.file_name().into_string() {
+            if let Ok(name) = entry.file_name().into_string() {
                 names.push(name);
             }
         }
@@ -555,7 +554,7 @@ impl MemVfs {
         Ok(())
     }
 
-    fn list_dir(&self, dir: &str) -> io::Result<Vec<String>> {
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         let state = self.lock();
         if !state.has_dir(dir) {
             return Err(not_found(dir));
@@ -563,7 +562,6 @@ impl MemVfs {
         let mut names: Vec<String> = state
             .files
             .keys()
-            .chain(&state.dirs)
             .filter(|name| parent(name) == dir)
             .map(|name| name.rsplit('/').next().unwrap_or_default().to_owned())
             .collect();
@@ -606,14 +604,12 @@ impl MemVfs {
 impl Vfs for MemVfs {
     type File = MemFile;
 
-    fn open(&self, name: &str) -> io::Result<Self::File> {
-        Ok(self.file(name))
-    }
-}
-
-impl Dir for MemVfs {
     fn exists(&self, name: &str) -> io::Result<bool> {
         Ok(MemVfs::exists(self, name))
+    }
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        Ok(self.file(name))
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -637,8 +633,8 @@ impl Dir for MemVfs {
         MemVfs::create_dir(self, name)
     }
 
-    fn list_dir(&self, dir: &str) -> io::Result<Vec<String>> {
-        MemVfs::list_dir(self, dir)
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        MemVfs::list_files(self, dir)
     }
 
     fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
@@ -1149,7 +1145,7 @@ mod tests {
 
     /// Write `bytes` into the new file `name` and sync the file.
     fn write_synced(vfs: &MemVfs, name: &str, bytes: &[u8]) {
-        let mut file = Dir::create_file(vfs, name).unwrap();
+        let mut file = Vfs::create_file(vfs, name).unwrap();
         file.write_all(bytes).unwrap();
         file.sync().unwrap();
     }
@@ -1157,7 +1153,7 @@ mod tests {
     #[test]
     fn a_file_whose_directory_is_not_durable_can_vanish() {
         let vfs = MemVfs::new();
-        Dir::create_dir(&vfs, "d").unwrap();
+        Vfs::create_dir(&vfs, "d").unwrap();
         write_synced(&vfs, "d/f", b"x");
         vfs.sync_dir_at("d").unwrap();
 
@@ -1172,12 +1168,12 @@ mod tests {
     fn a_rename_is_durable_after_a_sync_of_its_new_directory() {
         let vfs = MemVfs::new();
         for dir in ["a", "b"] {
-            Dir::create_dir(&vfs, dir).unwrap();
+            Vfs::create_dir(&vfs, dir).unwrap();
         }
         vfs.sync_dir();
         write_synced(&vfs, "a/f", b"x");
         vfs.sync_dir_at("a").unwrap();
-        Dir::rename(&vfs, "a/f", "b/f").unwrap();
+        Vfs::rename(&vfs, "a/f", "b/f").unwrap();
         vfs.sync_dir_at("b").unwrap();
         vfs.mark("renamed");
 
@@ -1191,12 +1187,12 @@ mod tests {
     fn a_sync_of_another_directory_leaves_a_rename_pending() {
         let vfs = MemVfs::new();
         for dir in ["a", "b"] {
-            Dir::create_dir(&vfs, dir).unwrap();
+            Vfs::create_dir(&vfs, dir).unwrap();
         }
         vfs.sync_dir();
         write_synced(&vfs, "a/f", b"x");
         vfs.sync_dir_at("a").unwrap();
-        Dir::rename(&vfs, "a/f", "b/f").unwrap();
+        Vfs::rename(&vfs, "a/f", "b/f").unwrap();
         vfs.sync_dir_at("a").unwrap();
         vfs.mark("synced");
 
@@ -1207,20 +1203,20 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_lists_only_its_own_entries() {
+    fn a_directory_lists_only_its_own_files() {
         let vfs = MemVfs::new();
-        Dir::create_dir(&vfs, "d").unwrap();
-        Dir::create_dir(&vfs, "d/e").unwrap();
+        Vfs::create_dir(&vfs, "d").unwrap();
+        Vfs::create_dir(&vfs, "d/e").unwrap();
         write_synced(&vfs, "d/f", b"");
         write_synced(&vfs, "d/e/g", b"");
         write_synced(&vfs, "h", b"");
-        assert_eq!(Dir::list_dir(&vfs, "d").unwrap(), ["e", "f"]);
-        assert_eq!(Dir::list_dir(&vfs, "").unwrap(), ["d", "h"]);
+        assert_eq!(Vfs::list_files(&vfs, "d").unwrap(), ["f"]);
+        assert_eq!(Vfs::list_files(&vfs, "").unwrap(), ["h"]);
         assert_eq!(vfs.names(), ["d/e/g", "d/f", "h"]);
-        assert!(Dir::list_dir(&vfs, "x").is_err());
-        assert!(Dir::create_file(&vfs, "x/f").is_err());
-        assert!(Dir::create_file(&vfs, "h").is_err());
-        assert!(Dir::create_dir(&vfs, "d").is_err());
+        assert!(Vfs::list_files(&vfs, "x").is_err());
+        assert!(Vfs::create_file(&vfs, "x/f").is_err());
+        assert!(Vfs::create_file(&vfs, "h").is_err());
+        assert!(Vfs::create_dir(&vfs, "d").is_err());
     }
 
     #[test]
@@ -1228,12 +1224,12 @@ mod tests {
         let vfs = MemVfs::new();
         write_synced(&vfs, "f", b"abc");
         let mut bytes = Vec::new();
-        Dir::read_file(&vfs, "f")
+        Vfs::read_file(&vfs, "f")
             .unwrap()
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"abc");
-        assert_eq!(Dir::path(&vfs, "d/f"), PathBuf::from("d/f"));
+        assert_eq!(Vfs::path(&vfs, "d/f"), PathBuf::from("d/f"));
     }
 
     #[test]
@@ -1251,7 +1247,8 @@ mod tests {
         drop(file);
         assert!(vfs.create_file("d/f").is_err());
         vfs.sync_dir_at("d").unwrap();
-        assert_eq!(vfs.list_dir("d").unwrap(), ["f"]);
+        vfs.create_dir("d/e").unwrap();
+        assert_eq!(vfs.list_files("d").unwrap(), ["f"]);
 
         vfs.set_read_only("d/f").unwrap();
         let mode = fs::metadata(vfs.path("d/f")).unwrap().permissions().mode();

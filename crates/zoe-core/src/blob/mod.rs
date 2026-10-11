@@ -29,13 +29,70 @@ use crate::format::blob::{
     encode_intent, intent_name, intent_tid, oid_dir,
 };
 use crate::types::{Oid, Tid};
-use crate::vfs::{Dir, WriteFile, parent};
+use crate::vfs::{Vfs, WriteFile, parent};
+
+/// The operations of a `Vfs` that the blob store uses, in a form that a
+/// trait object can hold. Every `Vfs` has them.
+pub(crate) trait BlobDir: Send + Sync {
+    fn exists(&self, name: &str) -> io::Result<bool>;
+    fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+    fn remove(&self, name: &str) -> io::Result<()>;
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()>;
+    fn create_dir(&self, name: &str) -> io::Result<()>;
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>>;
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>>;
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
+    fn set_read_only(&self, name: &str) -> io::Result<()>;
+    fn path(&self, name: &str) -> PathBuf;
+}
+
+impl<V: Vfs> BlobDir for V {
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        Vfs::exists(self, name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        Vfs::rename(self, from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        Vfs::remove(self, name)
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        Vfs::sync_dir_at(self, dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        Vfs::create_dir(self, name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        Vfs::list_files(self, dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        Vfs::create_file(self, name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        Vfs::read_file(self, name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        Vfs::set_read_only(self, name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        Vfs::path(self, name)
+    }
+}
 
 /// The blob files of a store.
 pub(crate) struct BlobStore {
     /// The store directory. It holds the single-writer lock while the
     /// store is open.
-    dir: Arc<dyn Dir>,
+    dir: Arc<dyn BlobDir>,
     /// Tells if `blobs/`, `blobs/tmp/` and the layout file are durable.
     ready: Mutex<bool>,
     /// The number of the next temporary file.
@@ -49,7 +106,7 @@ impl BlobStore {
     /// crash in `blobs/tmp/` are removed: the blob files that an intent
     /// file names and that `backend` has no blob record for, the intent
     /// files and the temporary files.
-    pub(crate) fn open(dir: Arc<dyn Dir>, backend: &dyn Backend) -> Result<Self> {
+    pub(crate) fn open(dir: Arc<dyn BlobDir>, backend: &dyn Backend) -> Result<Self> {
         if dir.exists(LAYOUT_FILE)? {
             let mut layout = String::new();
             dir.read_file(LAYOUT_FILE)?.read_to_string(&mut layout)?;
@@ -71,11 +128,12 @@ impl BlobStore {
         Ok(store)
     }
 
-    /// Remove the leftovers of a crash in `blobs/tmp/`.
+    /// Remove the leftovers of a crash in `blobs/tmp/`. Only regular
+    /// files are removed there.
     fn recover(&self, backend: &dyn Backend) -> Result<()> {
         let mut leftovers = Vec::new();
         let mut orphan_dirs = BTreeSet::new();
-        for file in self.dir.list_dir(TMP_DIR)? {
+        for file in self.dir.list_files(TMP_DIR)? {
             let name = format!("{TMP_DIR}/{file}");
             if let Some(tid) = intent_tid(&file) {
                 let mut bytes = Vec::new();
@@ -246,7 +304,7 @@ fn has_blob_record(backend: &dyn Backend, oid: Oid, tid: Tid) -> Result<bool> {
 /// A new blob, in a temporary file. Write the bytes of the blob, then give
 /// the file to `Txn::store_blob`. Dropping the file removes it.
 pub struct BlobFile {
-    dir: Arc<dyn Dir>,
+    dir: Arc<dyn BlobDir>,
     name: String,
     /// The open file. It is `None` after `close`.
     file: Option<Box<dyn WriteFile>>,
@@ -301,7 +359,7 @@ impl Drop for BlobFile {
 /// A synced blob that a transaction holds until its finish or its abort.
 /// Dropping a blob that `place` did not rename removes its file.
 pub(crate) struct PendingBlob {
-    dir: Arc<dyn Dir>,
+    dir: Arc<dyn BlobDir>,
     /// The temporary file. It is `None` after `place` renamed it.
     temp: Option<String>,
     record: BlobRecord,
@@ -426,7 +484,7 @@ mod tests {
         txn.store(oid, Tid::ZERO, PICKLE).unwrap();
         txn.vote().unwrap();
         let tid = txn.finish().unwrap();
-        assert!(!vfs.exists(BLOB_DIR).unwrap());
+        assert!(!Vfs::exists(&vfs, BLOB_DIR).unwrap());
         assert!(matches!(
             store.open_blob(oid, tid),
             Err(ZoeError::NotFound { .. })
@@ -482,8 +540,8 @@ mod tests {
         let name = blob_name(oid, tid);
 
         for bytes in [&b"blob+"[..], b"blo", b""] {
-            vfs.remove(&name).unwrap();
-            let mut file = vfs.create_file(&name).unwrap();
+            Vfs::remove(&vfs, &name).unwrap();
+            let mut file = Vfs::create_file(&vfs, &name).unwrap();
             file.write_all(bytes).unwrap();
             drop(file);
             let error = read(&store, oid, tid).unwrap_err();
@@ -499,7 +557,7 @@ mod tests {
         let store = Store::open_vfs(vfs.clone()).unwrap();
         let oid = store.new_oid().unwrap();
         let tid = commit_blobs(&store, &[oid], b"blob");
-        vfs.remove(&blob_name(oid, tid)).unwrap();
+        Vfs::remove(&vfs, &blob_name(oid, tid)).unwrap();
         for result in [
             store.open_blob(oid, tid).map(drop),
             store.verify_blob(oid, tid),
@@ -529,8 +587,8 @@ mod tests {
         let dir = oid_dir(orphan);
         let ends = dir.match_indices('/').map(|(end, _)| end);
         for end in ends.chain([dir.len()]) {
-            if !vfs.exists(&dir[..end]).unwrap() {
-                vfs.create_dir(&dir[..end]).unwrap();
+            if !Vfs::exists(&vfs, &dir[..end]).unwrap() {
+                Vfs::create_dir(&vfs, &dir[..end]).unwrap();
             }
         }
         for (name, bytes) in [
@@ -539,12 +597,12 @@ mod tests {
             (intent_name(tid), encode_intent(tid, &[committed])),
             (format!("{TMP_DIR}/7.tmp"), b"temporary".to_vec()),
         ] {
-            let mut file = vfs.create_file(&name).unwrap();
+            let mut file = Vfs::create_file(&vfs, &name).unwrap();
             file.write_all(&bytes).unwrap();
         }
 
         let store = Store::open_vfs(vfs.clone()).unwrap();
-        assert!(!vfs.exists(&blob_name(orphan, crashed)).unwrap());
+        assert!(!Vfs::exists(&vfs, &blob_name(orphan, crashed)).unwrap());
         assert_eq!(read(&store, committed, tid).unwrap(), b"kept");
         assert!(temp_files(&vfs).is_empty());
     }
@@ -559,7 +617,7 @@ mod tests {
         };
         let crashed = Tid(tid.0 + 1);
         let bytes = encode_intent(crashed, &[Oid(9)]);
-        let mut file = vfs.create_file(&intent_name(crashed)).unwrap();
+        let mut file = Vfs::create_file(&vfs, &intent_name(crashed)).unwrap();
         file.write_all(&bytes[..bytes.len() / 2]).unwrap();
         drop(file);
 
@@ -571,8 +629,8 @@ mod tests {
     fn a_layout_other_than_bushy_is_refused() {
         let vfs = MemVfs::new();
         drop(Store::open_vfs(vfs.clone()).unwrap());
-        vfs.create_dir(BLOB_DIR).unwrap();
-        let mut file = vfs.create_file(LAYOUT_FILE).unwrap();
+        Vfs::create_dir(&vfs, BLOB_DIR).unwrap();
+        let mut file = Vfs::create_file(&vfs, LAYOUT_FILE).unwrap();
         file.write_all(b"lawn").unwrap();
         drop(file);
         assert!(matches!(Store::open_vfs(vfs), Err(ZoeError::Format(_))));
@@ -594,17 +652,29 @@ mod tests {
             .iter()
             .filter(|image| {
                 let image_vfs = image.vfs();
-                if !image_vfs.exists(&name).unwrap() {
+                if !Vfs::exists(&image_vfs, &name).unwrap() {
                     return false;
                 }
                 let store = Store::open_vfs(image_vfs.clone()).unwrap();
                 let orphan = store.load(oid).is_err();
                 if orphan {
-                    assert!(!image_vfs.exists(&name).unwrap(), "{image:?}");
+                    assert!(!Vfs::exists(&image_vfs, &name).unwrap(), "{image:?}");
                 }
                 orphan
             })
             .count();
         assert!(orphans > 0);
+    }
+
+    #[test]
+    fn a_directory_in_tmp_does_not_stop_an_open() {
+        let vfs = MemVfs::new();
+        drop(blob_file(&Store::open_vfs(vfs.clone()).unwrap(), b"x"));
+        Vfs::create_dir(&vfs, &format!("{TMP_DIR}/stray")).unwrap();
+        let mut file = Vfs::create_file(&vfs, &format!("{TMP_DIR}/stray/f")).unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        Store::open_vfs(vfs.clone()).unwrap();
+        assert!(Vfs::exists(&vfs, &format!("{TMP_DIR}/stray/f")).unwrap());
     }
 }
