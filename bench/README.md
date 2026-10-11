@@ -1,6 +1,6 @@
 # Benchmarks
 
-This directory holds the reference baseline: a harness that runs [zodbshootout](https://pypi.org/project/zodbshootout/) against FileStorage, ZEO 6 and RelStorage on PostgreSQL, and the JSON schema of its results. The ZOE storages join the same harness when they exist. `zoe-bench` (contention and server saturation) and the criterion microbenchmarks live in `crates/`.
+This directory holds the reference baseline: a harness that runs [zodbshootout](https://pypi.org/project/zodbshootout/) against FileStorage, ZEO 6 and RelStorage on PostgreSQL, and the JSON schema of its results. The same harness measures ZOE in-process, the storage `zoe`, through the `<zoe>` stanza. `zoe-bench` (contention and server saturation) and the criterion microbenchmarks live in `crates/`.
 
 ## Run it
 
@@ -13,6 +13,8 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench run --storage zeo --quick` | one storage only |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
+
+The bench project takes `python/zoedb` as a path source. uv builds the zoedb wheel from the source tree with maturin, as it does for the Python tests. A path source is not editable, so maturin builds the release profile into `target/release`. The cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
 RelStorage runs when `ZOE_BENCH_PG_DSN` (or `--dsn`) names a PostgreSQL database that the harness may empty. Without it, the harness skips RelStorage and says so. The Dagger function `bench` starts PostgreSQL 17 as a service and runs the harness tests, then the baseline, and returns the results tree:
 
@@ -37,9 +39,9 @@ zodbshootout runs five scenarios: `add`, `update`, `read_cold`, `read_warm` (zod
 | full | threads at concurrency 1, 4, 16 and 64; processes at 4, 16 and 64; objects of 1 KB and 100 KB | 20 (2 processes × 10) |
 
 - In the threads mode, one process runs the workers as threads that share one `DB`, as in one Zope process. In the processes mode, each worker is a process with its own `DB`, as in several Zope processes.
-- FileStorage runs only in the threads mode: only one process can open its file.
+- FileStorage and `zoe` run only in the threads mode: only one process can open a FileStorage file or a ZOE store.
 - A sample is the time for the slowest worker to do one transaction. A result reports the mean, the median and the 99th percentile of these times. `ops_per_second` is objects per second for all workers together: concurrency × 100 ÷ mean.
-- Every storage runs with its default settings. RelStorage keeps history, like FileStorage and ZEO. The ZEO server is a separate process on the same machine.
+- Every storage runs with its default settings. The `<zoe>` stanza sets only `path`. RelStorage keeps history, like FileStorage and ZEO. The ZEO server is a separate process on the same machine.
 
 The corpus is synthetic: zodbshootout generates its own objects. Results are numbers, never data.
 

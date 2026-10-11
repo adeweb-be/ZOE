@@ -12,7 +12,7 @@
       "const": 1
     },
     "storage": {
-      "description": "The storage under test: filestorage, zeo or relstorage (PostgreSQL), and the ZOE storages when they exist.",
+      "description": "The storage under test: filestorage, zeo, relstorage (PostgreSQL) or zoe (ZOE in-process).",
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$"
     },
