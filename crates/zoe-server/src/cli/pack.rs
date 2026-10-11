@@ -10,8 +10,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::Args;
 use clap::builder::BoolishValueParser;
+use clap::{ArgAction, Args};
 use zoe_core::{Clock, PackReport, Store, Tid, timestamp};
 
 use super::{Failure, store_failure};
@@ -38,7 +38,20 @@ pub(super) struct PackArgs {
     days: u64,
 
     /// Report what the pack would remove, by class, and change nothing.
-    #[arg(long, env = "ZOE_DRY_RUN", value_parser = BoolishValueParser::new())]
+    ///
+    /// With --dry-run=false the command packs, also when the twin asks for a
+    /// dry run.
+    #[arg(
+        long,
+        env = "ZOE_DRY_RUN",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = BoolishValueParser::new(),
+        action = ArgAction::Set
+    )]
     dry_run: bool,
 }
 
