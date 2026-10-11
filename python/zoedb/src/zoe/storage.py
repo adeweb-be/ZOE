@@ -89,7 +89,26 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `restore` and `restoreBlob` copy a record into it unchanged.
     `copyTransactionsFrom` copies every transaction of another storage with
     them, as `zodbconvert` asks.
+
+    `cleanup` closes the storage and removes the store directory and the
+    blob directory, as `cleanup` of FileStorage removes its files.
     """
+
+    def __init__(self, path, *, blob_dir=None, **options):
+        # The extension opens the store. Keep the blob directory for cleanup.
+        self._blob_dir = None if blob_dir is None else os.path.abspath(blob_dir)
+
+    def cleanup(self):
+        """Close the storage and remove the files of the store.
+
+        The storage removes the store directory and the blob directory. A
+        missing directory is not an error. The storage stays closed.
+        """
+        self.close()
+        for directory in (self.getName(), self._blob_dir):
+            if directory is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(directory)
 
     def tpc_vote(self, transaction):
         """Vote on `transaction`, and resolve its conflicts.
