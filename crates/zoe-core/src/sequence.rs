@@ -7,9 +7,9 @@
 //! The store reserves the values in blocks of `BLOCK`. A reservation is a
 //! backend write transaction of its own. It writes the end of the block to
 //! the row of the name, and the write is durable before the sequence gives
-//! a value of the block. An open store starts each name at the stored end.
-//! So a crash or a reopen never gives a value twice, and it skips at most
-//! `BLOCK` values.
+//! a value of the block. An open store reads the stored end at the first
+//! use of a name and starts there. So a crash or a reopen never gives a
+//! value twice, and it skips at most `BLOCK` values.
 //!
 //! An allocation is not part of a transaction: an abort does not give its
 //! values back. It takes no per-OID lock and not the commit sequencer. It
@@ -27,6 +27,7 @@ const BLOCK: u64 = 100;
 
 /// The values of one name that the store can give without a reservation:
 /// `next` up to `end`, `end` excluded.
+#[derive(Clone, Copy)]
 struct Block {
     next: u64,
     end: u64,
@@ -35,9 +36,10 @@ struct Block {
 /// The state of one name in an open store.
 struct Counter {
     name: String,
-    /// The reserved values that are not given yet. The mutex orders the
+    /// The reserved values that are not given yet. It is `None` until the
+    /// first use of the name reads the stored end. The mutex orders the
     /// allocations of the name, and a reservation holds it.
-    block: Mutex<Block>,
+    block: Mutex<Option<Block>>,
 }
 
 /// The sequences of an open store.
@@ -53,11 +55,9 @@ impl Sequences {
         if let Some(counter) = counters.get(name) {
             return Arc::clone(counter);
         }
-        // An empty block makes the first `next` reserve. The reservation
-        // reads the stored end.
         let counter = Arc::new(Counter {
             name: name.to_owned(),
-            block: Mutex::new(Block { next: 1, end: 1 }),
+            block: Mutex::new(None),
         });
         counters.insert(name.to_owned(), Arc::clone(&counter));
         counter
@@ -85,21 +85,29 @@ impl<'a> Sequence<'a> {
     ///
     /// When the reserved values are all given, the call reserves the next
     /// block and waits for its write. When no value below `u64::MAX` is
-    /// left, it fails with `Protocol`. A failed call gives no value. If its
-    /// reservation reached the disk all the same, the next call skips that
-    /// block.
+    /// left, it fails with `Protocol`. A failed call gives no value and
+    /// loses none: the next call gives the same value.
     pub fn next(&self) -> Result<u64> {
-        let mut block = self.lock();
+        let mut slot = self.lock();
+        let mut block = match *slot {
+            Some(block) => block,
+            None => {
+                let block = self.load()?;
+                *slot = Some(block);
+                block
+            }
+        };
         if block.next >= block.end {
-            *block = self.reserve(block.next)?;
+            block.end = self.reserve(block.next)?;
         }
         let value = block.next;
         block.next += 1;
+        *slot = Some(block);
         Ok(value)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Block> {
-        // A panic cannot leave a block half changed: `next` changes it
+    fn lock(&self) -> MutexGuard<'_, Option<Block>> {
+        // A panic cannot leave a block half changed: `next` writes it back
         // only after the reservation succeeds.
         self.counter
             .block
@@ -107,25 +115,30 @@ impl<'a> Sequence<'a> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reserve the block that starts at the stored end, or at `next` if
-    /// that is greater. Return the block after its end is durable.
+    /// Return the empty block at the stored end of the name. A name with no
+    /// row starts at 1.
+    fn load(&self) -> Result<Block> {
+        let stored = self.store.backend.sequence_end(&self.counter.name)?;
+        let end = stored.unwrap_or(1).max(1);
+        Ok(Block { next: end, end })
+    }
+
+    /// Reserve the block that starts at `start`. Return its end after the
+    /// end is durable.
     ///
-    /// The mutex of the name is held, so no other reservation of the name
-    /// changes the row between the read and the write. The stored end
-    /// never decreases.
-    fn reserve(&self, next: u64) -> Result<Block> {
-        let backend = &self.store.backend;
-        let name = &self.counter.name;
-        let stored = backend.sequence_end(name)?.unwrap_or(1);
-        let start = stored.max(next);
+    /// `start` is the next value of the name, so every value given is
+    /// below it. A reservation that failed after its write reached the
+    /// disk wrote the same end, so a retry does not raise the stored end
+    /// further.
+    fn reserve(&self, start: u64) -> Result<u64> {
         if start == u64::MAX {
             return Err(ZoeError::Protocol("no value is left in the sequence"));
         }
         let end = start.saturating_add(BLOCK);
-        let mut write = backend.begin_write()?;
-        write.put_sequence_end(name, end)?;
+        let mut write = self.store.backend.begin_write()?;
+        write.put_sequence_end(&self.counter.name, end)?;
         write.commit()?;
-        Ok(Block { next: start, end })
+        Ok(end)
     }
 }
 

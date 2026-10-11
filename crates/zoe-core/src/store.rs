@@ -483,6 +483,8 @@ mod tests {
         write: AtomicBool,
         /// `iter_txns` fails as a whole.
         rows: AtomicBool,
+        /// The commit of a write transaction writes, then fails.
+        landed: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
@@ -493,6 +495,52 @@ mod tests {
 
     fn injected() -> ZoeError {
         ZoeError::Backend("injected fault".into())
+    }
+
+    /// A write transaction whose commit writes, then fails.
+    struct Landed<'a>(Box<dyn WriteTxn + 'a>);
+
+    impl WriteTxn for Landed<'_> {
+        fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
+            self.0.put_record(oid, tid, prev, data)
+        }
+
+        fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()> {
+            self.0.put_blob(oid, tid, blob)
+        }
+
+        fn put_txn(&mut self, meta: &crate::backend::TxnMeta) -> Result<()> {
+            self.0.put_txn(meta)
+        }
+
+        fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()> {
+            self.0.remove_record(oid, tid)
+        }
+
+        fn remove_blob(&mut self, oid: Oid, tid: Tid) -> Result<()> {
+            self.0.remove_blob(oid, tid)
+        }
+
+        fn replace_txn(&mut self, meta: &crate::backend::TxnMeta) -> Result<()> {
+            self.0.replace_txn(meta)
+        }
+
+        fn remove_txn(&mut self, tid: Tid) -> Result<()> {
+            self.0.remove_txn(tid)
+        }
+
+        fn put_pack_watermark(&mut self, tid: Tid) -> Result<()> {
+            self.0.put_pack_watermark(tid)
+        }
+
+        fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()> {
+            self.0.put_sequence_end(name, end)
+        }
+
+        fn commit(self: Box<Self>) -> Result<()> {
+            self.0.commit()?;
+            Err(injected())
+        }
     }
 
     impl Backend for Faulty {
@@ -523,7 +571,11 @@ mod tests {
             if self.faults.write.load(Ordering::Relaxed) {
                 return Err(injected());
             }
-            self.inner.begin_write()
+            let write = self.inner.begin_write()?;
+            if self.faults.landed.load(Ordering::Relaxed) {
+                return Ok(Box::new(Landed(write)));
+            }
+            Ok(write)
         }
 
         fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
@@ -913,7 +965,8 @@ mod tests {
     fn a_reservation_that_fails_before_its_write_loses_no_value() {
         let (store, faults) = faulty_store();
         let sequence = store.sequence("intids");
-        for fault in [&faults.write, &faults.load] {
+        // The first use reads the stored end, then the reservation writes.
+        for fault in [&faults.load, &faults.write] {
             fault.store(true, Ordering::Relaxed);
             let error = sequence.next();
             assert!(matches!(error, Err(ZoeError::Backend(_))), "{error:?}");
@@ -930,6 +983,22 @@ mod tests {
         assert!(sequence.next().is_err());
         faults.write.store(false, Ordering::Relaxed);
         assert_eq!(sequence.next().unwrap(), 201);
+    }
+
+    #[test]
+    fn a_reservation_that_fails_after_its_write_loses_no_value() {
+        let (store, faults) = faulty_store();
+        let sequence = store.sequence("intids");
+        faults.landed.store(true, Ordering::Relaxed);
+        for _ in 0..2 {
+            assert!(matches!(sequence.next(), Err(ZoeError::Backend(_))));
+        }
+        faults.landed.store(false, Ordering::Relaxed);
+        // The retries wrote the same end, so a crash now skips at most one
+        // block.
+        assert_eq!(store.backend.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(sequence.next().unwrap(), 1);
+        assert_eq!(store.backend.sequence_end("intids").unwrap(), Some(101));
     }
 
     #[test]
