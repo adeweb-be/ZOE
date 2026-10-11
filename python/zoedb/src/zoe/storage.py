@@ -1,15 +1,17 @@
 """The in-process storage: `zoe.Storage` implements the ZODB storage interfaces.
 
 The extension class `zoe._zoe.Storage` calls the core. This module adds the
-parts that need ZODB: the interface declaration, the history records, the
-conflict resolution and the `WrongThread` exception.
+parts that need ZODB: the interface declarations, the history records, the
+conflict resolution, the committed blob files and the `WrongThread`
+exception.
 """
 
 import time
 
 import zope.interface
+from ZODB.blob import BlobFile
 from ZODB.ConflictResolution import ConflictResolvingStorage
-from ZODB.interfaces import IStorage
+from ZODB.interfaces import IBlobStorage, IStorage
 from ZODB.POSException import ConflictError, StorageTransactionError
 from ZODB.TimeStamp import TimeStamp
 
@@ -26,17 +28,28 @@ class WrongThread(StorageTransactionError):
     """
 
 
-@zope.interface.implementer(IStorage)
+@zope.interface.implementer(IStorage, IBlobStorage)
 class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
-    `Storage(path, *, read_only=False, lock_timeout=None)` opens the store in
-    `path` and creates the directory when it is missing. `lock_timeout` is
-    the longest time, in seconds, that a vote waits for the lock of an
-    object. A longer wait raises `ConflictError`. `None` keeps the default of
-    the store. A read-only storage refuses `tpc_begin`, `new_oid`, `store`
-    and `pack` with `ReadOnlyError`, and it does not create a missing
-    directory.
+    `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None)`
+    opens the store in `path` and creates the directory when it is missing.
+    `lock_timeout` is the longest time, in seconds, that a vote waits for the
+    lock of an object. A longer wait raises `ConflictError`. `None` keeps the
+    default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
+    `store`, `pack`, `storeBlob` and `temporaryDirectory` with
+    `ReadOnlyError`, and it does not create a missing directory.
+
+    `blob_dir` is the directory of the blob files, in ZODB's BushyLayout.
+    The store keeps them in `path/blobs`. Another `blob_dir` becomes the
+    symbolic link `path/blobs` to it, and the link stays, so a later open
+    without `blob_dir` finds the blobs. A store that already has a blob
+    directory refuses another one with `StorageError`, and so does a new
+    link to a `blob_dir` that is not empty.
+
+    `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
+    copy, and copies a file from elsewhere. `loadBlob` returns the path of a
+    read-only file.
 
     All the connections of a process share one storage. The thread that
     begins a transaction stores and votes in it; another thread gets
@@ -97,6 +110,18 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
             raise
         except Exception:
             raise ConflictError(oid=oid, serials=(committed, read)) from None
+
+    def openCommittedBlobFile(self, oid, serial, blob=None):
+        """Open the blob file of `oid` at `serial` for reading.
+
+        Return a `BlobFile` of `blob` when `blob` is given, otherwise a
+        binary file. Raise `POSKeyError` when `serial` wrote no blob for
+        `oid`.
+        """
+        path = self.loadBlob(oid, serial)
+        if blob is None:
+            return open(path, "rb")
+        return BlobFile(path, "r", blob)
 
     def history(self, oid, size=1):
         """Return at most `size` records of `oid`, newest first."""
