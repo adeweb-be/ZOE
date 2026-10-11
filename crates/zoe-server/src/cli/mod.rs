@@ -13,6 +13,8 @@
 //! changes nothing on disk.
 
 mod convert;
+#[cfg(feature = "serve")]
+mod mcp;
 mod pack;
 
 use std::ffi::OsString;
@@ -56,6 +58,10 @@ enum Command {
     /// Pack a store as of a number of days ago, or report what that pack
     /// would remove.
     Pack(pack::PackArgs),
+    /// Serve the read-only ops tools of a store to an agent, over MCP on
+    /// stdin and stdout.
+    #[cfg(feature = "serve")]
+    Mcp(mcp::McpArgs),
 }
 
 /// Why a subcommand failed. The command writes it to stderr and exits with
@@ -101,7 +107,9 @@ fn closed_by_reader(error: &io::Error) -> bool {
 /// function. `zoe pack --days` reads the time of the system clock.
 pub fn main(args: Vec<OsString>) -> i32 {
     match Cli::try_parse_from(args) {
-        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout().lock()),
+        // Each write takes the lock of stdout. `zoe mcp` writes to stdout
+        // from other threads, so the command does not hold the lock.
+        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout()),
         Err(error) => usage(&error),
     }
 }
@@ -128,6 +136,8 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
     let (name, result) = match &cli.command {
         Command::Convert(args) => ("convert", convert::run(args, out)),
         Command::Pack(args) => ("pack", pack::run(args, clock, out)),
+        #[cfg(feature = "serve")]
+        Command::Mcp(args) => ("mcp", mcp::run(args)),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.

@@ -5,7 +5,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 ## Layout
 
 - `src/main.rs`: the binary `zoe`. It only calls `cli::main` and exits with its code.
-- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`.
+- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `mcp.rs` holds `zoe mcp`. `zoe mcp` compiles only with the feature `serve`.
 - `src/protocol/`: the server code. It compiles only with the feature `serve`.
 
 ## Invariants of the command
@@ -19,12 +19,13 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - The report goes to stdout. A message goes to stderr, and starts with `zoe <subcommand>:`. The help and the version go to stdout with the code 0. A reader that closes stdout before the end of the report, as `head` does, does not fail the command, because the work is done. A conversion that does not verify still fails.
 - The command parses all its arguments before it opens a file. A usage error changes nothing on disk.
 - `cli::main` flushes stdout before it returns, because the Python process does not flush the stdout of Rust when it ends.
-- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs` and `zoe pack --dry-run`. A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store. Before it opens the store, it checks that the `Data.fs` is a regular file that starts with `FS30`, so a wrong source creates no store.
+- `cli::main` does not hold the lock of stdout. `zoe mcp` writes MCP messages to stdout from another thread, and writes no report.
+- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs`, `zoe pack --dry-run`, and `zoe mcp` through Loupe's `Folder`. A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store. Before it opens the store, it checks that the `Data.fs` is a regular file that starts with `FS30`, so a wrong source creates no store.
 - `--days N` gives the tid of the time of the clock minus N days of 86,400 seconds, by `zoe_core::timestamp`. The command reads the time only through the `Clock` trait, so a test gives its own time. `cli::main` uses the system clock.
 
 ## Invariants of the server
 
-- This is the only crate that uses tokio, and only under the feature `serve`. The feature is on by default. `zoe-py` depends on this crate without it, so the extension never links tokio: `cargo tree -p zoe-py -e normal` must not list tokio.
+- This crate uses tokio only under the feature `serve`: the server code, and `zoe-mcp` for `zoe mcp`. The feature is on by default. `zoe-py` depends on this crate without it, so the extension never links tokio or rmcp: `cargo tree -p zoe-py -e normal` must list neither.
 - The server has no Python inside and needs no Plone eggs. It ships as one static binary.
 - Core calls run on the blocking pool, never on the async runtime threads.
 - An unmodified `ZEO.ClientStorage` works. A stock client never sees an extension that it did not declare in `register`.
@@ -40,3 +41,4 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 ## Tests
 
 - `tests/cli.rs` is the acceptance test of the binary and of `cli::main`. `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script.
+- `tests/mcp.rs` is the acceptance test of `zoe mcp`. It compiles only with the feature `serve`.

@@ -212,7 +212,7 @@ The two grey containers are deployment choices; only the tinted core is new code
 
 **One read.** `loadBefore(oid, tid)` → protocol layer → core → backend range lookup on `(oid, < tid)` → the pickle and its serial, written to the socket without an intermediate copy. In simple mode the same call is a Python method into the core with no wire.
 
-**Where async lives.** Only in the server skin. The core is synchronous and the client is synchronous; `prefetch` is how a client overlaps I/O, and the server answers prefetched loads out of order on the same connection.
+**Where async lives.** In the server skin, and in the crates that talk to a network or to an agent: `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe. The core is synchronous, and the extension module `zoe._zoe` never links tokio. The ZODB side of a client is synchronous; `prefetch` is how a client overlaps I/O, and the server answers prefetched loads out of order on the same connection.
 
 ## Storage core
 

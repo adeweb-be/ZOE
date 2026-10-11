@@ -10,18 +10,26 @@ publish.workspace = true
 
 [features]
 default = ["serve"]
-# The server code. Only this feature may bring in tokio. The extension
-# module turns it off, so it never links tokio.
-serve = []
+# The server code and `zoe mcp`. Only this feature may bring in tokio. The
+# extension module turns it off, so it never links tokio.
+serve = ["dep:zoe-mcp"]
 
 [[bin]]
 name = "zoe"
 path = "src/main.rs"
 
+[[test]]
+name = "mcp"
+required-features = ["serve"]
+
 [dependencies]
 clap.workspace = true
 zoe-convert.workspace = true
 zoe-core.workspace = true
+zoe-mcp = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
