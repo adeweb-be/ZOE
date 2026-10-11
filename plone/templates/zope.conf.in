@@ -1,8 +1,6 @@
 %import zoe
 %define INSTANCEHOME ${buildout:parts-directory}/instance
 instancehome $INSTANCEHOME
-%define CLIENTHOME ${buildout:directory}/var/instance
-clienthome $CLIENTHOME
 debug-mode off
 security-policy-implementation C
 verbose-security off
@@ -11,8 +9,8 @@ default-zpublisher-encoding utf-8
 <zodb_db main>
     cache-size 30000
     <zoe>
-      path ${buildout:directory}/var/zoe
-      blob-dir ${buildout:directory}/var/blobstorage
+      path ${buildout:var-directory}/zoe
+      blob-dir ${buildout:var-directory}/blobstorage
       backend redb
     </zoe>
     mount-point /
