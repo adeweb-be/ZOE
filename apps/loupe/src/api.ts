@@ -28,6 +28,28 @@ export interface FolderInfo {
   lastTid: string;
 }
 
+/** One revision of an object: the transaction that wrote a record. */
+export interface Revision {
+  tid: string;
+  user: string;
+  description: string;
+  /** The size of the record in bytes. A deletion has size 0. */
+  size: number;
+}
+
+/**
+ * One change of a diff: a JSON pointer into the two states, and the value
+ * before and after. A side that does not have the value has no field.
+ */
+export interface Change {
+  path: string;
+  before?: unknown;
+  after?: unknown;
+}
+
+/** The most revisions that `history` gives: `HISTORY_LIMIT` of zoe-loupe. */
+export const HISTORY_LIMIT = 4096;
+
 export const openFolder = (path: string) =>
   invoke<FolderInfo>("open_folder", { path });
 
@@ -39,6 +61,16 @@ export const object = (oid: string) => invoke<LoupeObject>("object", { oid });
 
 export const resolve = (path: string) =>
   invoke<LoupeObject>("resolve", { path });
+
+export const history = (oid: string) =>
+  invoke<Revision[]>("history", { oid });
+
+/** Set the "as of" switch to a tid, or to null for the last transaction. */
+export const setAsOf = (tid: string | null) =>
+  invoke<null>("set_as_of", { tid });
+
+export const diff = (oid: string, tidA: string, tidB: string) =>
+  invoke<Change[]>("diff", { oid, tidA, tidB });
 
 /** Return the value at the JSON pointer `at` in `value`. */
 export function pointer(value: unknown, at: string): unknown {

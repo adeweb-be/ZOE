@@ -58,6 +58,7 @@ body {
 
 .folder form,
 .folder label,
+.as-of,
 .path {
   display: flex;
   align-items: center;
@@ -67,6 +68,11 @@ body {
 .folder input {
   width: 36em;
   max-width: 60vw;
+}
+
+.as-of input {
+  width: 26em;
+  font-family: ui-monospace, monospace;
 }
 
 input,
@@ -196,4 +202,63 @@ main {
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+.tree.empty {
+  margin: 0;
+}
+
+.muted,
+.note {
+  color: var(--muted);
+}
+
+.note {
+  margin: 4px 0;
+}
+
+.history,
+.changes {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.history th,
+.history td,
+.changes th,
+.changes td {
+  padding: 2px 8px 2px 0;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.history th,
+.changes th {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.history .tid {
+  font-family: ui-monospace, monospace;
+}
+
+.history tr.shown {
+  background: var(--selected);
+}
+
+.diff h3 {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+
+.changes .at {
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.changes .value {
+  margin: 0;
+  max-height: 20em;
+  overflow: auto;
 }
