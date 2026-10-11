@@ -446,11 +446,7 @@ impl Storage {
             return Err(errors::version(py));
         }
         let oid = Oid(u64_of(oid)?);
-        let serial = if serial.is_none() {
-            Tid::ZERO
-        } else {
-            Tid(u64_of(serial)?)
-        };
+        let serial = serial_of(serial)?;
         py.detach(|| entry.with(|txn| Ok(txn.store(oid, serial, data)?)))
             .map_err(|failure| failure.into_py(py))
     }
@@ -502,11 +498,7 @@ impl Storage {
             return Err(errors::version(py));
         }
         let oid = Oid(u64_of(oid)?);
-        let serial = if serial.is_none() {
-            Tid::ZERO
-        } else {
-            Tid(u64_of(serial)?)
-        };
+        let serial = serial_of(serial)?;
         // The entry holds a Python reference, so it drops while the thread
         // is attached. The store drops while it is detached.
         py.detach(|| {
@@ -903,6 +895,28 @@ fn check_status(status: &Bound<'_, PyAny>) -> PyResult<()> {
         return Ok(());
     }
     Err(errors::status(status.py(), status))
+}
+
+/// Return the serial that a transaction read for an object: `None` is
+/// `Tid::ZERO` and 8 bytes are a tid. A `str` of 8 characters below 256
+/// gives its Latin-1 bytes, as FileStorage takes the serial `'\0' * 8` that
+/// ZODB's blob tests pass.
+fn serial_of(serial: &Bound<'_, PyAny>) -> PyResult<Tid> {
+    if serial.is_none() {
+        return Ok(Tid::ZERO);
+    }
+    let Ok(text) = serial.cast::<PyString>() else {
+        return Ok(Tid(u64_of(serial)?));
+    };
+    let bytes: Option<Vec<u8>> = text
+        .to_str()?
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect();
+    let array: [u8; 8] = bytes
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| PyValueError::new_err("a serial has 8 bytes"))?;
+    Ok(Tid(u64::from_be_bytes(array)))
 }
 
 /// Return the bytes of a metadata field of a transaction. A `str` gives
