@@ -18,6 +18,9 @@ mod pack;
 mod read;
 mod redb_backend;
 mod store;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub mod testing;
 mod types;
 pub mod vfs;
 

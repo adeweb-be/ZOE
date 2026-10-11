@@ -386,6 +386,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "xxhash-rust",
+ "zoe-core",
  "zoe-pickle",
  "zstd",
 ]

@@ -439,6 +439,59 @@ impl Backend for RedbBackend {
         // flush.
         Ok(())
     }
+
+    #[cfg(feature = "testing")]
+    fn read_stored(&self, key: crate::testing::Key) -> Result<Option<Bytes>> {
+        use crate::testing::Key;
+        let txn = self.db.begin_read().map_err(backend)?;
+        let value = match key {
+            Key::Record(oid, tid) | Key::Blob(oid, tid) => {
+                let table = if matches!(key, Key::Record(..)) {
+                    RECORDS
+                } else {
+                    BLOBS
+                };
+                let table = txn.open_table(table).map_err(backend)?;
+                let value = table.get(&format::record_key(oid, tid)).map_err(backend)?;
+                value.map(|v| v.value().to_vec())
+            }
+            Key::Txn(tid) => {
+                let table = txn.open_table(TXNS).map_err(backend)?;
+                let value = table.get(&format::txn_key(tid)).map_err(backend)?;
+                value.map(|v| v.value().to_vec())
+            }
+        };
+        Ok(value)
+    }
+
+    #[cfg(feature = "testing")]
+    fn write_stored(&self, key: crate::testing::Key, bytes: &[u8]) -> Result<()> {
+        use crate::testing::Key;
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        match key {
+            Key::Record(oid, tid) | Key::Blob(oid, tid) => {
+                let table = if matches!(key, Key::Record(..)) {
+                    RECORDS
+                } else {
+                    BLOBS
+                };
+                let mut table = txn.open_table(table).map_err(backend)?;
+                table
+                    .insert(&format::record_key(oid, tid), bytes)
+                    .map_err(backend)?;
+            }
+            Key::Txn(tid) => {
+                let mut table = txn.open_table(TXNS).map_err(backend)?;
+                table
+                    .insert(&format::txn_key(tid), bytes)
+                    .map_err(backend)?;
+            }
+        }
+        txn.commit().map_err(backend)
+    }
 }
 
 /// One redb write transaction.
