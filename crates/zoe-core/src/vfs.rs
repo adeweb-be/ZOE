@@ -66,6 +66,10 @@ pub trait Vfs: Send + Sync + 'static {
     /// Open the file `name` for reading from its start.
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
 
+    /// Make the bytes of the existing file `name` durable. Fail when
+    /// `name` is not a regular file: a symbolic link is refused too.
+    fn sync_file(&self, name: &str) -> io::Result<()>;
+
     /// Remove the write permissions of the file `name`.
     fn set_read_only(&self, name: &str) -> io::Result<()>;
 
@@ -121,6 +125,10 @@ impl<V: Vfs> Vfs for Arc<V> {
 
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
         (**self).read_file(name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        (**self).sync_file(name)
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
@@ -288,6 +296,17 @@ impl Vfs for OsVfs {
 
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(File::open(self.dir.join(name))?))
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let path = self.dir.join(name);
+        // The metadata of a symbolic link is the metadata of the link.
+        if !fs::symlink_metadata(&path)?.is_file() {
+            let message = format!("not a regular file: {}", path.display());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        // A sync needs no write permission.
+        File::open(path)?.sync_all()
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
@@ -799,6 +818,18 @@ impl Vfs for MemVfs {
 
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(MemVfs::read_file(self, name)?))
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.files.contains_key(name) {
+            return Err(not_found(name));
+        }
+        state.log.push(Op::Sync {
+            file: name.to_owned(),
+        });
+        Ok(())
     }
 
     /// The simulation keeps no permissions, so this only checks that the
@@ -1451,6 +1482,46 @@ mod tests {
         vfs.remove("g").unwrap();
         assert!(!vfs.exists("g").unwrap());
         assert!(vfs.exists("d").unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_sync_makes_the_earlier_writes_durable() {
+        let vfs = MemVfs::new();
+        let mut file = Vfs::create_file(&vfs, "f").unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        vfs.sync_dir();
+        Vfs::sync_file(&vfs, "f").unwrap();
+        vfs.mark("synced");
+        assert!(Vfs::sync_file(&vfs, "g").is_err());
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("synced")) {
+            assert_eq!(contents(image, "f").as_deref(), Some(&b"x"[..]));
+        }
+    }
+
+    #[test]
+    fn an_os_file_sync_takes_only_a_regular_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!("zoe-vfs-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        fs::write(vfs.path("f"), b"x").unwrap();
+        fs::set_permissions(vfs.path("f"), fs::Permissions::from_mode(0o444)).unwrap();
+        vfs.sync_file("f").unwrap();
+
+        vfs.create_dir("d").unwrap();
+        symlink(vfs.path("f"), vfs.path("link")).unwrap();
+        for name in ["d", "link"] {
+            let error = vfs.sync_file(name).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}");
+        }
+        assert_eq!(
+            vfs.sync_file("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
