@@ -151,13 +151,14 @@ impl Store {
     ///
     /// redb opens a database read-only only from a path. So this call
     /// reaches the files directly, not through a `Vfs`. A store that a
-    /// crash left open fails with `NeedsRepair`: `open` repairs it.
+    /// crash left open fails with `NotClosedCleanly`: a writer open
+    /// rebuilds the free-space map of its database.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
         let db = redb::Builder::new()
             .open_read_only(dir.path(DATABASE))
             .map_err(|e| match e {
-                redb::DatabaseError::RepairAborted => ZoeError::NeedsRepair,
+                redb::DatabaseError::RepairAborted => ZoeError::NotClosedCleanly,
                 e => ZoeError::Backend(Box::new(e)),
             })?;
         let backend = RedbBackend::open_read_only(db)?;
@@ -785,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_left_open_needs_a_repair_before_a_read_only_open() {
+    fn a_store_left_open_opens_read_only_only_after_a_writer() {
         let open = fresh_dir("read-only-open");
         let copy = fresh_dir("read-only-copy");
         let (oid, _) = write_store(&open);
@@ -796,7 +797,7 @@ mod tests {
 
         let result = Store::open_read_only(&copy);
         assert!(
-            matches!(result, Err(ZoeError::NeedsRepair)),
+            matches!(result, Err(ZoeError::NotClosedCleanly)),
             "{:?}",
             result.err()
         );

@@ -28,7 +28,7 @@
   "error.noFolder": "No folder is open.",
   "error.noStore": "{path} holds no ZOE store.",
   "error.locked": "Another process holds the lock of this store. Stop the instance that uses it, then open the folder again.",
-  "error.needsRepair": "This store was not closed cleanly. Open it once with a writer, such as a ZOE instance, to repair it. Then open it in Loupe.",
+  "error.notClosedCleanly": "This store was not closed cleanly. Open it once with a writer, such as a ZOE instance; the writer rebuilds the database's free-space map. Then open it in Loupe.",
   "error.noRecord": "Oid {oid} has no record.",
   "error.noObject": "{path}: {segment} leads to no object.",
   "error.refused": "zoe-pickle refuses the record of oid {oid}: {message}",

@@ -17,7 +17,7 @@ pub(crate) enum Failure {
     /// Another process holds the lock of the store.
     Locked,
     /// The store was not closed cleanly. A writer must open it once.
-    NeedsRepair,
+    NotClosedCleanly,
     /// The oid has no record.
     NoRecord { oid: String },
     /// A path leads to no object.
@@ -44,7 +44,7 @@ impl From<Error> for Failure {
         match error {
             Error::NoStore { path } => Failure::NoStore { path },
             Error::Store(ZoeError::Locked) => Failure::Locked,
-            Error::Store(ZoeError::NeedsRepair) => Failure::NeedsRepair,
+            Error::Store(ZoeError::NotClosedCleanly) => Failure::NotClosedCleanly,
             Error::Store(ZoeError::NotFound { oid }) => Failure::NoRecord { oid: oid_repr(oid) },
             Error::NoObject { path, segment } => Failure::NoObject { path, segment },
             Error::Refused { oid, source } => Failure::Refused {
@@ -70,10 +70,10 @@ mod tests {
             serde_json::to_value(failure).unwrap(),
             serde_json::json!({"kind": "noRecord", "oid": "0x01"})
         );
-        let failure = Failure::from(Error::Store(ZoeError::NeedsRepair));
+        let failure = Failure::from(Error::Store(ZoeError::NotClosedCleanly));
         assert_eq!(
             serde_json::to_value(failure).unwrap(),
-            serde_json::json!({"kind": "needsRepair"})
+            serde_json::json!({"kind": "notClosedCleanly"})
         );
     }
 }

@@ -49,7 +49,7 @@ Oids and tids are strings in ZODB form, as `ZODB.utils.oid_repr` writes them: `0
 
 An object is `{ oid, serial, class, size, state, references, error }`. `state` is the decoded state as JSON; the module documentation of `crates/zoe-loupe/src/state.rs` gives the form of each value and the limits on its size. Each reference is `{ oid, at }`, where `at` is a JSON pointer into `state`. `error` holds the refusal of zoe-pickle when the record does not decode.
 
-A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `needsRepair`, `noRecord`, `noObject`, `refused`, `badId` and `other`. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
+A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notClosedCleanly`, `noRecord`, `noObject`, `refused`, `badId` and `other`. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
 
 The pane shows the start of a large state, and a button shows all of it.
 

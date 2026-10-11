@@ -27,7 +27,7 @@ pub enum Error {
     },
 
     /// The store failed. For example, another process holds the lock, the
-    /// store needs a repair, or the oid has no record.
+    /// store was not closed cleanly, or the oid has no record.
     #[error(transparent)]
     Store(#[from] ZoeError),
 
@@ -106,7 +106,7 @@ impl Folder {
     ///
     /// The call fails with `NoStore` when `path` holds no store, and with
     /// `Locked` when another process holds the lock of the store. A store
-    /// that was not closed cleanly fails with `NeedsRepair`. The call
+    /// that was not closed cleanly fails with `NotClosedCleanly`. The call
     /// writes nothing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
