@@ -186,6 +186,16 @@ pub(crate) struct Staged {
     pickle: Pickle,
 }
 
+impl Staged {
+    /// Return the length of the pickle. This reads no pickle.
+    pub(crate) fn pickle_len(&self) -> usize {
+        match &self.pickle {
+            Pickle::Memory(bytes) => bytes.len(),
+            Pickle::Spilled { len, .. } => *len,
+        }
+    }
+}
+
 /// The staged records of one transaction.
 ///
 /// The buffer does not hold its staging area: each call that needs it
@@ -275,6 +285,12 @@ impl Staging {
     /// reads no pickle.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Oid, &Staged)> + '_ {
         self.records.iter().map(|(&oid, staged)| (oid, staged))
+    }
+
+    /// Return the record of `oid`, or `None` when `oid` is not staged.
+    /// This reads no pickle.
+    pub(crate) fn record(&self, oid: Oid) -> Option<&Staged> {
+        self.records.get(&oid)
     }
 
     /// Return the serial and the pickle of `oid`, or `None` when `oid` is

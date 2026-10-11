@@ -4695,6 +4695,7 @@ dependencies = [
  "blake3",
  "redb",
  "thiserror 2.0.21",
+ "tracing",
  "xxhash-rust",
  "zoe-pickle",
  "zstd",

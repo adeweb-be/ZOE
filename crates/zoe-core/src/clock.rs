@@ -1,4 +1,5 @@
-//! The clock that tids come from.
+//! The clock that tids come from, and the durations of `lock-warn` and
+//! `transaction-warn`.
 //!
 //! The core reads the time only through `Clock`, so a test or a simulator
 //! can give its own time.
@@ -20,6 +21,31 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> SystemTime {
         SystemTime::now()
+    }
+}
+
+/// A clock that moves only when a test moves it. Its clones share the
+/// time.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ManualClock(std::sync::Arc<std::sync::Mutex<SystemTime>>);
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new() -> Self {
+        let start = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        Self(std::sync::Arc::new(std::sync::Mutex::new(start)))
+    }
+
+    pub(crate) fn advance(&self, by: std::time::Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now(&self) -> SystemTime {
+        *self.0.lock().unwrap()
     }
 }
 

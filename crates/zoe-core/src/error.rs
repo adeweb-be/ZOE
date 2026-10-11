@@ -1,5 +1,6 @@
 //! The error type of the core.
 
+use crate::guard::SizeLimit;
 use crate::types::{Oid, Tid};
 
 /// The result type of the core.
@@ -77,6 +78,25 @@ pub enum ZoeError {
     /// reserved.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
+
+    /// A `store` or a `store_blob` is over a size limit of the store. The
+    /// transaction refuses the call and stages nothing. The message names
+    /// the configuration key of the limit, and holds no pickle bytes.
+    #[error(
+        "store of oid {oid:?} refused: {} of {size} bytes, over {limit} ({max} bytes)",
+        .limit.subject()
+    )]
+    TooLarge {
+        /// The oid of the refused call.
+        oid: Oid,
+        /// The limit that refused the call.
+        limit: SizeLimit,
+        /// The size that the call gives, in bytes: the pickle, the sum of
+        /// the pickles of the transaction, or the blob.
+        size: u64,
+        /// The limit, in bytes.
+        max: u64,
+    },
 
     /// A thread that did not begin the transaction called `store`,
     /// `store_blob`, `restore`, `check_current_serial` or `vote`. The

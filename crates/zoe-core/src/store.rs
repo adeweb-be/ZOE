@@ -13,6 +13,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::commit::{StagingArea, Txn};
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
+use crate::guard::Guardrails;
 use crate::lock::LockManager;
 use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
@@ -44,6 +45,27 @@ pub struct Options {
     /// under `staging/` in the store directory. This is `staging-memory`
     /// in the configuration.
     pub staging_memory: usize,
+    /// The longest pickle that `store` and `store_blob` take, in bytes. A
+    /// longer pickle fails with `TooLarge`. `None`, the default, sets no
+    /// limit. This is `max-record-size` in the configuration.
+    pub max_record_size: Option<u64>,
+    /// The largest sum of the pickles that `store` and `store_blob` stage
+    /// in one transaction, in bytes. Blob bytes do not count. The call
+    /// that goes past it fails with `TooLarge`. `None`, the default, sets
+    /// no limit. This is `max-transaction-size` in the configuration.
+    pub max_transaction_size: Option<u64>,
+    /// The longest blob that `store_blob` takes, in bytes. A longer blob
+    /// fails with `TooLarge`. `None`, the default, sets no limit. This is
+    /// `max-blob-size` in the configuration.
+    pub max_blob_size: Option<u64>,
+    /// A lock held longer than this is logged when it is released, with
+    /// its oid and the time that it was held. `None`, the default, logs no
+    /// lock. This is `lock-warn` in the configuration.
+    pub lock_warn: Option<Duration>,
+    /// A transaction open longer than this is logged when it ends, with
+    /// the time that it was open. `None`, the default, logs no
+    /// transaction. This is `transaction-warn` in the configuration.
+    pub transaction_warn: Option<Duration>,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -56,6 +78,11 @@ impl Default for Options {
             lock_timeout: Duration::from_secs(10),
             compression: Compression::default(),
             staging_memory: 16 << 20,
+            max_record_size: None,
+            max_transaction_size: None,
+            max_blob_size: None,
+            lock_warn: None,
+            transaction_warn: None,
             _more: (),
         }
     }
@@ -92,6 +119,7 @@ pub struct Store {
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
+    pub(crate) guardrails: Guardrails,
     /// The tid of the last commit. Its lock is the commit sequencer. It is
     /// `None` after a failed finish, because the outcome of that commit is
     /// unknown.
@@ -130,12 +158,13 @@ impl Store {
     }
 
     /// Open the store in `vfs` with the clock `clock` and `options`, and
-    /// create it if necessary.
+    /// create it if necessary. The store reads the time only from `clock`:
+    /// the tids, and the durations of `lock-warn` and `transaction-warn`.
     ///
     /// A new store is written under a temporary name and renamed into place
     /// after it is durable, so a crash during the creation leaves either
     /// no store or a complete empty one.
-    pub(crate) fn open_full<V: Vfs>(
+    pub fn open_full<V: Vfs>(
         vfs: V,
         clock: impl Clock + 'static,
         options: Options,
@@ -216,6 +245,7 @@ impl Store {
             clock,
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
+            guardrails: Guardrails::new(&options),
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,

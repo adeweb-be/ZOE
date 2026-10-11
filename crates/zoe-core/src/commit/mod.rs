@@ -30,6 +30,10 @@
 //! The staged records live in a staging buffer: in memory up to the
 //! `staging_memory` option of the store, and in a spill file under
 //! `staging/` beyond it. `staging` describes the buffer.
+//!
+//! `store` and `store_blob` check the size limits of the store before
+//! they stage anything. A transaction logs its slow locks when it releases
+//! them, and logs itself when it ends, if it was slow.
 
 mod staging;
 
@@ -37,12 +41,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::thread::{self, ThreadId};
+use std::time::SystemTime;
 
 use crate::backend::{Record, TxnMeta, TxnStatus};
 use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
-use crate::lock::Mode;
+use crate::guard::{Ended, SizeLimit};
+use crate::lock::{Held, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 use staging::Staging;
@@ -87,15 +93,23 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The oids that the transaction read as current, with the serial that
     /// it read.
     read_current: BTreeMap<Oid, Tid>,
-    /// The oids that a vote locked. The transaction holds the locks until
-    /// `finish`, `abort` or a failed vote.
-    locks: Option<Vec<Oid>>,
+    /// The locks that a vote took, with the time when it took each one.
+    /// The transaction holds the locks until `finish`, `abort` or a failed
+    /// vote.
+    locks: Option<Vec<Held>>,
     /// The oids that `vote_resolving` gave as conflicts. The set is empty
     /// except between that call and the next vote.
     resolving: BTreeSet<Oid>,
     /// The current serial and the read serial of the stale oid that failed
     /// the last vote.
     conflict: Option<(Tid, Tid)>,
+    /// The sum of the lengths of the pickles that `store` and `store_blob`
+    /// staged. `max-transaction-size` limits it.
+    stored_bytes: u64,
+    /// The time on the store clock when the transaction began.
+    began: SystemTime,
+    /// The tid of the commit, after a `finish` that succeeded.
+    committed: Option<Tid>,
 }
 
 /// What the serial check of a vote found.
@@ -121,6 +135,7 @@ struct Stale {
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Begin a transaction on `store`, driven by the calling thread.
     pub fn begin(store: S, user: &[u8], description: &[u8], extension: &[u8]) -> Self {
+        let began = store.clock.now();
         Self {
             blobs: BTreeMap::new(),
             store,
@@ -134,6 +149,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
             locks: None,
             resolving: BTreeSet::new(),
             conflict: None,
+            stored_bytes: 0,
+            began,
+            committed: None,
         }
     }
 
@@ -186,10 +204,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// as a conflict. Then `serial` is the serial of the committed record.
     ///
     /// A blob that `store_blob` staged for `oid` stays, as in ZODB.
+    ///
+    /// A pickle longer than `max-record-size`, or a pickle that takes the
+    /// transaction past `max-transaction-size`, fails with `TooLarge`. A
+    /// restore transaction checks no size limit.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         self.check_store(oid, data)?;
+        let stored_bytes = self.check_size(oid, data)?;
         let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, data, false)
+        self.staged.put(area, oid, serial, data, false)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
     }
 
     /// Check that `store` or `store_blob` can stage `data` for `oid`. A
@@ -208,6 +233,41 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Err(ZoeError::Protocol("store of an empty pickle"));
         }
         check_oid(oid)
+    }
+
+    /// Check `data` for `oid` against `max-record-size` and
+    /// `max-transaction-size`. Return the new value of `stored_bytes`,
+    /// with `data` in it. A refused call changes nothing.
+    ///
+    /// The callers check the order of the call first, so a call out of
+    /// order is `Protocol`, whatever its size.
+    fn check_size(&self, oid: Oid, data: &[u8]) -> Result<u64> {
+        if self.is_restore() {
+            return Ok(self.stored_bytes);
+        }
+        let guardrails = &self.store.guardrails;
+        let size = data.len() as u64;
+        guardrails.check(SizeLimit::Record, oid, size)?;
+        // A pickle that replaces a staged pickle of the same oid counts
+        // once. The check reads the length of the staged pickle, never its
+        // bytes, so a spilled pickle costs no read.
+        let staged = self
+            .staged
+            .record(oid)
+            .map_or(0, |staged| staged.pickle_len() as u64);
+        let stored_bytes = self
+            .stored_bytes
+            .saturating_sub(staged)
+            .saturating_add(size);
+        guardrails.check(SizeLimit::Transaction, oid, stored_bytes)?;
+        Ok(stored_bytes)
+    }
+
+    /// Tell if this is a restore transaction. A restore transaction copies
+    /// records as they are, so it checks no size limit: a copy never
+    /// refuses what its source took.
+    fn is_restore(&self) -> bool {
+        self.tid.is_some()
     }
 
     /// Return the serial that the transaction read for `oid` and the pickle
@@ -233,13 +293,23 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// `file` must come from `new_blob_file` of this store. A file of
     /// another store is refused with `Protocol`, and a file of a closed
-    /// store with `Closed`. A refused call stages nothing and drops
-    /// `file`, which removes it.
+    /// store with `Closed`. Then a blob longer than `max-blob-size` fails
+    /// with `TooLarge`, before the sync, as a pickle over a size limit
+    /// does. A restore transaction checks no size limit. A refused call
+    /// stages nothing and drops `file`, which removes it.
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
         self.check_store(oid, data)?;
+        file.check_owner(&self.store.backend)?;
+        let stored_bytes = self.check_size(oid, data)?;
+        if !self.is_restore() {
+            self.store
+                .guardrails
+                .check(SizeLimit::Blob, oid, file.size())?;
+        }
         let blob = file.close(&self.store.backend)?;
         let area = &self.store.backend.staging;
         self.staged.put(area, oid, serial, data, false)?;
+        self.stored_bytes = stored_bytes;
         self.blobs.insert(oid, blob);
         Ok(())
     }
@@ -254,6 +324,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// A blob that `store_blob` staged for `oid` stays, unless `data` is a
     /// deletion: a deleted object has no blob.
+    ///
+    /// A restore copies a record as it is: it checks no size limit.
     pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
         self.check_thread()?;
         if self.tid.is_none() {
@@ -343,16 +415,27 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 
     /// Take the locks of the vote, and keep them until `finish`, `abort` or
-    /// a failed vote. A lock timeout releases the locks that the call took.
-    /// A read-only store fails with `ReadOnly` and gives no lock.
+    /// a failed vote. A lock timeout releases the locks that the call took,
+    /// and logs each one held past `lock-warn`. A read-only store fails
+    /// with `ReadOnly` and gives no lock.
     fn lock(&mut self) -> Result<()> {
         self.store.writable()?;
         let store: &Store = &self.store;
-        let locks = store
+        let requests = self.lock_requests();
+        match store
             .locks
-            .acquire(&self.lock_requests(), store.lock_timeout)?;
-        self.locks = Some(locks.keep());
-        Ok(())
+            .acquire(&requests, store.lock_timeout, &*store.clock)
+        {
+            Ok(locks) => {
+                self.locks = Some(locks.keep());
+                Ok(())
+            }
+            Err(Refused { error, released }) => {
+                let now = store.clock.now();
+                store.guardrails.locks_released(&released, now);
+                Err(error)
+            }
+        }
     }
 
     /// Check the serials with the locks held. Return the stale written oids
@@ -531,6 +614,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         store
             .packing
             .note(tid, self.staged.iter().map(|(oid, _)| oid));
+        self.committed = Some(tid);
 
         *sequencer = Some(tid);
         drop(sequencer);
@@ -547,9 +631,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.release();
     }
 
+    /// Release the locks, then log each lock held past `lock-warn`.
     fn release(&mut self) {
-        if let Some(oids) = self.locks.take() {
-            self.store.locks.release(&oids);
+        if let Some(held) = self.locks.take() {
+            let now = self.store.clock.now();
+            self.store.locks.release(&held);
+            self.store.guardrails.locks_released(&held, now);
         }
     }
 }
@@ -558,6 +645,17 @@ impl<S: Deref<Target = Store>> Drop for Txn<S> {
     fn drop(&mut self) {
         self.release();
         self.staged.remove_spill(&self.store.backend.staging);
+        // `finish` and `abort` also end here. So each transaction is
+        // checked against `transaction-warn` once, when it ends.
+        let now = self.store.clock.now();
+        let ended = Ended {
+            oids: self.staged.len() as u64,
+            oid: self.staged.iter().next().map(|(oid, _)| oid),
+            tid: self.committed,
+        };
+        self.store
+            .guardrails
+            .transaction_ended(self.began, now, ended);
     }
 }
 
@@ -605,7 +703,8 @@ mod tests {
     use redb::StorageBackend;
 
     use super::*;
-    use crate::clock::SystemClock;
+    use crate::clock::{ManualClock, SystemClock};
+    use crate::guard::capture::{Captured, events_of};
     use crate::store::Options;
     use crate::vfs::{MemVfs, Vfs};
 
@@ -1502,5 +1601,316 @@ mod tests {
         }
         assert!(!spills(&vfs));
         assert!(store.lock_table_is_empty());
+    }
+
+    /// Open a store in memory with `options`.
+    fn open_with(options: Options) -> Store {
+        Store::open_full(MemVfs::new(), SystemClock, options).unwrap()
+    }
+
+    #[test]
+    fn a_refused_store_stages_nothing() {
+        let store = open_with(Options {
+            max_record_size: Some(3),
+            ..Options::default()
+        });
+        let (kept, refused) = (Oid(1), Oid(2));
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(kept, Tid::ZERO, b"abc").unwrap();
+        for oid in [kept, refused] {
+            let error = txn.store(oid, Tid::ZERO, b"abcd").unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ZoeError::TooLarge {
+                        limit: SizeLimit::Record,
+                        size: 4,
+                        max: 3,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let (serial, data) = txn.staged(kept).unwrap().unwrap();
+        assert_eq!((serial, &*data), (Tid::ZERO, &b"abc"[..]));
+        assert!(txn.staged(refused).unwrap().is_none());
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(kept).unwrap(), (b"abc".to_vec(), tid));
+        assert!(matches!(
+            store.load(refused),
+            Err(ZoeError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn a_call_out_of_order_is_protocol_whatever_its_size() {
+        let store = open_with(Options {
+            max_record_size: Some(1),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        let error = txn.store(Oid(1), Tid::ZERO, b"too large");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_replaced_pickle_counts_once_toward_the_transaction_size() {
+        let store = open_with(Options {
+            max_transaction_size: Some(6),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcd").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcdef").unwrap();
+        let error = txn.store(Oid(2), Tid::ZERO, b"g").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ZoeError::TooLarge {
+                    oid: Oid(2),
+                    limit: SizeLimit::Transaction,
+                    size: 7,
+                    max: 6
+                }
+            ),
+            "{error:?}"
+        );
+        // A shorter pickle of the same oid makes room.
+        txn.store(Oid(1), Tid::ZERO, b"abcde").unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"g").unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+    }
+
+    #[test]
+    fn a_restore_transaction_checks_no_size_limit() {
+        let store = open_with(Options {
+            max_record_size: Some(3),
+            max_transaction_size: Some(3),
+            ..Options::default()
+        });
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        txn.restore(Oid(1), Some(b"a copy over the limits"))
+            .unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"a store over the limits")
+            .unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), Tid(100));
+        assert_eq!(store.load(Oid(1)).unwrap().0, b"a copy over the limits");
+        assert_eq!(store.load(Oid(2)).unwrap().0, b"a store over the limits");
+
+        // A normal transaction keeps the limits.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store(Oid(3), Tid::ZERO, b"abcd");
+        assert!(matches!(error, Err(ZoeError::TooLarge { .. })), "{error:?}");
+    }
+
+    /// Return the duration, the lowest oid and the tid of each
+    /// `transaction-warn` event of `events`.
+    fn slow_transactions(events: &[Captured]) -> Vec<[Option<u64>; 3]> {
+        events
+            .iter()
+            .filter(|e| e.message().contains("transaction-warn"))
+            .map(|e| [e.number("duration_ms"), e.number("oid"), e.number("tid")])
+            .collect()
+    }
+
+    /// Open a store in memory with `options` and a clock that the test
+    /// moves.
+    fn open_with_clock(options: Options) -> (Store, ManualClock) {
+        let clock = ManualClock::new();
+        let store = Store::open_full(MemVfs::new(), clock.clone(), options).unwrap();
+        (store, clock)
+    }
+
+    #[test]
+    fn each_end_of_a_transaction_is_logged_once() {
+        let (store, clock) = open_with_clock(Options {
+            transaction_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let (tid, events) = events_of(|| {
+            let mut finished = store.tpc_begin(b"", b"", b"").unwrap();
+            finished.store(Oid(9), Tid::ZERO, b"a").unwrap();
+            finished.store(Oid(1), Tid::ZERO, b"a").unwrap();
+            finished.vote().unwrap();
+            clock.advance(Duration::from_millis(1_100));
+            let tid = finished.finish().unwrap();
+
+            let mut aborted = store.tpc_begin(b"", b"", b"").unwrap();
+            aborted.store(Oid(2), Tid::ZERO, b"b").unwrap();
+            aborted.vote().unwrap();
+            clock.advance(Duration::from_millis(1_200));
+            aborted.abort();
+
+            let dropped = store.tpc_begin(b"", b"", b"").unwrap();
+            clock.advance(Duration::from_millis(1_300));
+            drop(dropped);
+
+            // A finish that fails ends the transaction too.
+            let mut failed = store.tpc_begin(b"", b"", b"").unwrap();
+            failed.store(Oid(3), Tid::ZERO, b"c").unwrap();
+            clock.advance(Duration::from_millis(1_400));
+            assert!(failed.finish().is_err());
+            tid
+        });
+        // Only a commit has a tid, and only a transaction that writes has
+        // an oid: the lowest one.
+        assert_eq!(
+            slow_transactions(&events),
+            [
+                [Some(1_100), Some(1), Some(tid.0)],
+                [Some(1_200), Some(2), None],
+                [Some(1_300), None, None],
+                [Some(1_400), Some(3), None],
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// A clock that moves on by `step` at each read.
+    struct StepClock {
+        now: std::sync::Mutex<std::time::SystemTime>,
+        step: Duration,
+    }
+
+    impl crate::clock::Clock for StepClock {
+        fn now(&self) -> std::time::SystemTime {
+            let mut now = self.now.lock().unwrap();
+            *now += self.step;
+            *now
+        }
+    }
+
+    #[test]
+    fn the_locks_that_a_lock_wait_timeout_releases_are_logged() {
+        let step = Duration::from_secs(2);
+        let clock = StepClock {
+            now: std::sync::Mutex::new(std::time::UNIX_EPOCH),
+            step,
+        };
+        // A zero lock timeout turns every wait into a timeout.
+        let options = Options {
+            lock_timeout: Duration::ZERO,
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        };
+        let store = Store::open_full(MemVfs::new(), clock, options).unwrap();
+        let (low, high) = (Oid(1), Oid(2));
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        // The vote takes `low`, then times out on `high`. It reads the
+        // clock when it takes `low` and after it releases `low`, so the
+        // hold lasts one step.
+        let ((), events) = events_of(|| {
+            let mut waiter = store.tpc_begin(b"", b"", b"").unwrap();
+            waiter.check_current_serial(low, Tid::ZERO).unwrap();
+            waiter.store(high, Tid::ZERO, b"b").unwrap();
+            let error = waiter.vote();
+            assert!(
+                matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+                "{error:?}"
+            );
+        });
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|e| e.message().contains("lock-warn"))
+            .map(|e| (e.number("oid"), e.number("duration_ms")))
+            .collect();
+        let step = Some(step.as_millis() as u64);
+        assert_eq!(logged, [(Some(low.0), step), (None, None)], "{events:?}");
+        holder.abort();
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_lock_taken_after_a_wait_is_held_from_its_grant() {
+        let (store, clock) = open_with_clock(Options {
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let (low, high) = (Oid(1), Oid(2));
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        let ((), events) = events_of(|| {
+            let waiter = thread::scope(|scope| {
+                // The waiter takes `low`, then waits for `high`.
+                let waiter = scope.spawn(|| {
+                    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                    txn.check_current_serial(low, Tid::ZERO).unwrap();
+                    txn.store(high, Tid::ZERO, b"b").unwrap();
+                    txn.vote().unwrap();
+                    txn
+                });
+                while store.locks.waiting(high) == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                clock.advance(Duration::from_millis(3_000));
+                holder.abort();
+                waiter.join().unwrap()
+            });
+            clock.advance(Duration::from_millis(500));
+            waiter.finish().unwrap();
+        });
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|e| e.message().contains("lock-warn") && e.number("oid").is_some())
+            .map(|e| (e.number("oid"), e.number("duration_ms")))
+            .collect();
+        // The waiter held `low` while it waited, and `high` only from the
+        // abort of the holder.
+        assert_eq!(
+            logged,
+            [(Some(high.0), Some(3_000)), (Some(low.0), Some(3_500))],
+            "{events:?}"
+        );
+        assert!(store.lock_table_is_empty());
+    }
+
+    /// The size checks read the length of a spilled pickle, never its
+    /// bytes. So a damaged spill file does not change them.
+    #[test]
+    fn the_size_checks_read_no_spilled_pickle() {
+        let vfs = MemVfs::new();
+        let options = Options {
+            staging_memory: 0,
+            max_transaction_size: Some(6),
+            ..Options::default()
+        };
+        let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcd").unwrap();
+        assert!(spills(&vfs));
+        let name = &Vfs::list_files(&vfs, "staging").unwrap()[0];
+        vfs.file(&format!("staging/{name}"))
+            .write(0, b"xxxx")
+            .unwrap();
+
+        // The spilled pickles of `Oid(1)` count once, with their length.
+        txn.store(Oid(1), Tid::ZERO, b"abcdef").unwrap();
+        let error = txn.store(Oid(2), Tid::ZERO, b"g");
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::TooLarge {
+                    size: 7,
+                    max: 6,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        txn.store(Oid(1), Tid::ZERO, b"abcde").unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"g").unwrap();
+        txn.abort();
+        assert!(!spills(&vfs));
     }
 }
