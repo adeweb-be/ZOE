@@ -42,6 +42,8 @@ use crate::backend::{TxnMeta, TxnStatus};
 use crate::types::{Oid, Tid};
 
 mod codec;
+#[cfg(test)]
+mod synthetic;
 
 pub use codec::{Codec, Compression};
 
