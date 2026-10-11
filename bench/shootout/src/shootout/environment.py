@@ -24,6 +24,7 @@ SOFTWARE = (
     "transaction",
 )
 RELSTORAGE_SOFTWARE = ("RelStorage", "psycopg2-binary")
+ZOE_SOFTWARE = ("zoedb",)
 
 
 def machine(workdir: Path, name: str | None = None) -> dict:

@@ -18,7 +18,7 @@ class Storage:
     """One storage that the harness can measure."""
 
     name: str
-    # FileStorage locks its file, so only one process can open it.
+    # FileStorage and zoe lock their files, so only one process can open them.
     multi_process: bool
     needs_dsn: bool
 
@@ -29,6 +29,7 @@ STORAGES = {
         Storage("filestorage", multi_process=False, needs_dsn=False),
         Storage("zeo", multi_process=True, needs_dsn=False),
         Storage("relstorage", multi_process=True, needs_dsn=True),
+        Storage("zoe", multi_process=False, needs_dsn=False),
     )
 }
 
@@ -60,6 +61,10 @@ def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
             f"dsn {dsn}",
             "</postgresql>",
             "</relstorage>",
+        )
+    elif storage.name == "zoe":
+        yield "%import zoe\n" + _section(
+            storage.name, "<zoe>", f"path {workdir / 'store'}", "</zoe>"
         )
     else:
         raise ValueError(f"unknown storage {storage.name!r}")

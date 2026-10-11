@@ -187,6 +187,27 @@ def test_a_blob_of_a_savepoint_commits_by_rename(tmp_path):
         db.close()
 
 
+def test_cleanup_removes_the_store_and_the_blobs_and_closes_the_storage(tmp_path):
+    path, blob_dir = tmp_path / "store", tmp_path / "elsewhere"
+    storage = zoe.Storage(str(path), blob_dir=str(blob_dir))
+    oid = storage.new_oid()
+    store_blob(storage, oid, ZERO, write_temporary(storage, DATA))
+    storage.cleanup()
+
+    assert not path.exists()
+    assert not blob_dir.exists()
+    with pytest.raises(StorageError):
+        storage.lastTransaction()
+    # A second cleanup finds nothing to remove.
+    storage.cleanup()
+    # The path is free at once, and the new store is empty.
+    reopened = zoe.Storage(str(path), blob_dir=str(blob_dir))
+    try:
+        assert reopened.lastTransaction() == ZERO
+    finally:
+        reopened.close()
+
+
 def test_the_blob_directory_comes_from_the_option(tmp_path):
     path, blob_dir = str(tmp_path / "store"), tmp_path / "a" / "elsewhere"
     storage = zoe.Storage(path, blob_dir=str(blob_dir))

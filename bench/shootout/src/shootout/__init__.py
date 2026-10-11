@@ -1,4 +1,4 @@
-"""Run zodbshootout against the reference storages.
+"""Run zodbshootout against the reference storages and ZOE.
 
 `run` measures one storage and returns one result document. The document
 validates against `bench/schema/results.schema.json`.
@@ -92,6 +92,8 @@ def run(
     software = environment.SOFTWARE
     if storage == "relstorage":
         software += environment.RELSTORAGE_SOFTWARE
+    elif storage == "zoe":
+        software += environment.ZOE_SOFTWARE
 
     root = Path(tempfile.mkdtemp(prefix=f"{storage}-", dir=workdir))
     scenarios = []
