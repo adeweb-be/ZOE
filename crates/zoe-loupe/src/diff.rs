@@ -19,6 +19,9 @@
 //! - The type of a value counts: `1`, `1.0` and `True` are three values, and
 //!   a tuple is not a list. An int beyond 128 bits that two opcodes write in
 //!   two forms is a change.
+//! - A NaN equals a NaN, so a NaN that stays is no change. The sign of a
+//!   zero counts, in a value and in a key: `0.0` and `-0.0` differ, as the
+//!   pane shows them differently.
 //! - An opaque node compares by its bytes, because the tree does not model
 //!   it.
 //!
@@ -420,7 +423,6 @@ impl<'t> Differ<'_, 't> {
         self.spend(count_a + batches_a + count_b + batches_b)?;
         let (entries_a, entries_b) = (dict_entries(a), dict_entries(b));
         let (resolver_a, resolver_b) = (self.a, self.b);
-
         let keyed_a = self.by_key(resolver_a, &entries_a)?;
         let keyed_b = self.by_key(resolver_b, &entries_b)?;
         if let (Some(keyed_a), Some(keyed_b)) = (keyed_a, keyed_b) {
@@ -568,9 +570,9 @@ impl<'t> Differ<'_, 't> {
                     }
                 }
                 Node::Float(float) => match float_value(float) {
+                    // The bits keep the sign of a zero, so 0.0 and -0.0 are
+                    // two keys.
                     Some(value) => {
-                        // 0.0 and -0.0 are one key, as in Python.
-                        let value = if value == 0.0 { 0.0 } else { value };
                         form.push(b'F');
                         form.extend(value.to_bits().to_le_bytes());
                     }
@@ -703,11 +705,14 @@ fn extent(node: &Node) -> (usize, usize) {
     }
 }
 
-/// Compare two floats by value. A NaN equals a NaN here, so that a value
-/// that stays the same is no change.
+/// Compare two floats by value. Two rules differ from Python, so that the
+/// diff shows each difference that the pane shows, and no other: a NaN
+/// equals a NaN, and 0.0 does not equal -0.0.
 fn floats(x: &Float, y: &Float) -> bool {
     match (float_value(x), float_value(y)) {
-        (Some(x), Some(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Some(x), Some(y)) => {
+            (x == y && x.is_sign_negative() == y.is_sign_negative()) || (x.is_nan() && y.is_nan())
+        }
         _ => x == y,
     }
 }
@@ -932,6 +937,19 @@ mod tests {
         let (deep_a, deep_b) = (record(&deep(b"K\x01")), record(&deep(b"K\x01")));
         assert_eq!(diff_within(&deep_a, &deep_b, 0).len(), 1);
         assert!(diff_within(&deep_a, &deep_b, WORK_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn the_sign_of_a_zero_counts_and_a_nan_equals_a_nan() {
+        let zero = b"G\x00\x00\x00\x00\x00\x00\x00\x00";
+        let negative = b"G\x80\x00\x00\x00\x00\x00\x00\x00";
+        assert_eq!(changes(zero, negative).len(), 1);
+        assert!(changes(zero, b"F0.0\n").is_empty());
+        let nan = b"G\x7f\xf8\x00\x00\x00\x00\x00\x00";
+        assert!(changes(nan, b"Fnan\n").is_empty());
+        // In a key too.
+        let keyed = |key: &[u8]| [&b"}("[..], key, b"K\x01K\x02K\x03u"].concat();
+        assert_eq!(changes(&keyed(zero), &keyed(negative)).len(), 1);
     }
 
     #[test]
