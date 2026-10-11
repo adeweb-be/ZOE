@@ -52,6 +52,14 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// The checksum of a sequence row does not match the name and the
+    /// bytes, or its payload does not decode.
+    #[error("corrupt sequence row: {name:?}")]
+    CorruptSequence {
+        /// The name of the sequence.
+        name: String,
+    },
+
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
     /// `Txn::conflict_serials` gives the serials of a stale serial.
@@ -81,8 +89,8 @@ pub enum ZoeError {
 
     /// The store refuses a call. A two-phase commit call came out of order,
     /// for example `finish` before `vote`, or a restore gave a tid that is
-    /// not after the last tid, or no tid or oid is left, or an oid is
-    /// reserved.
+    /// not after the last tid, or no tid, oid or sequence value is left, or
+    /// an oid is reserved.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
 

@@ -1,11 +1,11 @@
 //! The on-disk format: the frame and its checksum, the keys, and the
-//! values of the transaction rows and the `meta` rows. `blob` gives the
-//! format of the blob store and of the blob records. This module is a red
-//! zone.
+//! values of the transaction rows, the sequence rows and the `meta` rows.
+//! `blob` gives the format of the blob store and of the blob records. This
+//! module is a red zone.
 //!
-//! Every record, every blob record and every transaction row is a frame: a
-//! 32-byte header, the typed-field slots, then the payload. The header
-//! fields are little-endian:
+//! Every record, every blob record, every transaction row and every
+//! sequence row is a frame: a 32-byte header, the typed-field slots, then
+//! the payload. The header fields are little-endian:
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
@@ -24,8 +24,9 @@
 //! bytes in this order: the key of the row, header bytes 0 to 23, the
 //! slots, then the payload. The key of a record and of a blob record is
 //! the 16 bytes of `record_key`. The key of a transaction row is the 8
-//! bytes of `txn_key`. So a frame that is read under another key fails the
-//! check.
+//! bytes of `txn_key`. The key of a sequence row is the UTF-8 bytes of the
+//! name of the sequence. So a frame that is read under another key fails
+//! the check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
 //! checksum covers the payload as stored, so a read verifies the stored
@@ -320,6 +321,23 @@ pub fn decode_txn(tid: Tid, payload: &[u8]) -> Result<TxnMeta, FrameError> {
     })
 }
 
+/// The length of the payload of a sequence row.
+pub const SEQUENCE_LEN: usize = 8;
+
+/// Encode the payload of a sequence row: the end of the reserved values,
+/// little-endian. The end is the first value that the store has not
+/// reserved.
+pub fn encode_sequence(end: u64) -> [u8; SEQUENCE_LEN] {
+    end.to_le_bytes()
+}
+
+/// Decode the payload of a sequence row. Return the end of the reserved
+/// values.
+pub fn decode_sequence(payload: &[u8]) -> Result<u64, FrameError> {
+    let bytes: [u8; SEQUENCE_LEN] = payload.try_into().map_err(|_| FrameError::Truncated)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], FrameError> {
     if rest.len() < n {
         return Err(FrameError::Truncated);
@@ -565,5 +583,32 @@ mod tests {
             status: TxnStatus::Committed,
         };
         assert_eq!(decode_txn(Tid(9), &encode_txn(&meta)), Ok(meta));
+    }
+
+    #[test]
+    fn a_sequence_row_is_a_frame_of_codec_0_with_the_end_in_8_bytes() {
+        let key = "intids".as_bytes();
+        let frame = encode_frame(key, MAIN_BRANCH, Tid::ZERO, &encode_sequence(0x0102));
+        assert_eq!(frame.len(), HEADER_LEN + SEQUENCE_LEN);
+        assert_eq!(frame[2], CODEC_NONE);
+        assert_eq!(&frame[16..20], &8u32.to_le_bytes());
+        assert_eq!(&frame[HEADER_LEN..], &[0x02, 0x01, 0, 0, 0, 0, 0, 0]);
+        let read = decode_frame(key, &frame).unwrap();
+        assert_eq!(read.prev, Tid::ZERO);
+        assert_eq!(decode_sequence(&read.data), Ok(0x0102));
+    }
+
+    #[test]
+    fn a_sequence_row_under_another_name_is_refused() {
+        let frame = encode_frame(b"intids", MAIN_BRANCH, Tid::ZERO, &encode_sequence(101));
+        assert_eq!(decode_frame(b"lexicon", &frame), Err(FrameError::Checksum));
+    }
+
+    #[test]
+    fn a_sequence_payload_of_another_length_is_refused() {
+        for payload in [&[][..], &[1; 7], &[1; 9]] {
+            assert_eq!(decode_sequence(payload), Err(FrameError::Truncated));
+        }
+        assert_eq!(decode_sequence(&encode_sequence(u64::MAX)), Ok(u64::MAX));
     }
 }

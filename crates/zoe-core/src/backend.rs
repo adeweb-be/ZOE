@@ -218,11 +218,16 @@ pub trait Backend: Send + Sync {
     fn remove_record_for_test(&self, _oid: Oid, _tid: Tid) -> Result<()> {
         Err(ZoeError::Backend("this backend has no test hooks".into()))
     }
+
+    /// Return the end of the reserved values of the sequence `name`: the
+    /// first value that the store has not reserved. Return `None` when the
+    /// sequence has no row.
+    fn sequence_end(&self, name: &str) -> Result<Option<u64>>;
 }
 
 /// One backend write transaction. It holds the records, their keys in
 /// the transaction index, the blob records, the transaction row and the
-/// meta update of one commit.
+/// meta update of one commit, or the sequence row of one reservation.
 pub trait WriteTxn {
     /// Stage the version of `oid` that `tid` writes, and its key
     /// `(tid, oid)` in the transaction index. `prev` is the serial of the
@@ -258,6 +263,10 @@ pub trait WriteTxn {
 
     /// Stage `pack_watermark` in `meta`: the tid of the last pack.
     fn put_pack_watermark(&mut self, tid: Tid) -> Result<()>;
+
+    /// Stage the row of the sequence `name` with `end`, the first value
+    /// that the store has not reserved.
+    fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()>;
 
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;
@@ -303,6 +312,10 @@ mod tests {
         }
 
         fn put_pack_watermark(&mut self, _: Tid) -> Result<()> {
+            Ok(())
+        }
+
+        fn put_sequence_end(&mut self, _: &str, _: u64) -> Result<()> {
             Ok(())
         }
 
@@ -378,6 +391,10 @@ mod tests {
 
         fn sync(&self) -> Result<()> {
             Ok(())
+        }
+
+        fn sequence_end(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
         }
     }
 
