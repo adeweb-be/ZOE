@@ -18,7 +18,7 @@ Three places can hold the binary: a `[[bin]]` in `zoe-server`, a thin binary cra
 
 **The console script goes through the extension.** The extension exposes `zoe._zoe.main(argv) -> int`, which runs `zoe_server::cli::main` with the GIL released. `zoe/__main__.py` calls it with `sys.argv`, and the wheel declares the console script `zoe = "zoe.__main__:main"`. So the binary, the console script and `python -m zoe` run the same code. The entry point restores the default handler of SIGINT before the call, because Python handles a signal only when it runs Python code: Ctrl-C then stops the process, as it stops the binary.
 
-**`serve` sits behind a feature.** `zoe-server` has the cargo feature `serve`, on by default. The server code and `zoe mcp` compile only with it, and only it may bring in tokio. `zoe mcp` brings in tokio and rmcp through `zoe-mcp`. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, and never links tokio or rmcp. `cargo tree -p zoe-py -e normal` shows it.
+**`serve` sits behind a feature.** `zoe-server` has the cargo feature `serve`, on by default. The server code and the MCP server of `zoe mcp` compile only with it, and only it may bring in tokio. `zoe mcp` brings in tokio and rmcp through `zoe-mcp`. Without the feature, `zoe serve` and `zoe mcp` still parse, and fail with 1 and a message that names the `zoe` binary. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, and never links tokio or rmcp. `cargo tree -p zoe-py -e normal` shows it.
 
 **`--path` everywhere.** The store is `--path` in every subcommand, with the twin `ZOE_PATH`, as in `zoe serve --path`.
 
@@ -47,7 +47,7 @@ The twins are `ZOE_PATH`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLO
 
 - The wheel carries clap, `zoe-convert` and the CLI module inside the extension. The extension grows by that code.
 - `zoe-py` depends on `zoe-server`. A server dependency that is not optional behind `serve` would reach the extension. The feature split and the `cargo tree` check guard this.
-- The console script has no `zoe mcp`, because the extension compiles without `serve`. An agent runs the binary `zoe`.
+- In the console script, `zoe mcp` fails with 1 and names the `zoe` binary, because the extension compiles without `serve`. An agent runs the binary `zoe`.
 - A workspace build, such as `cargo test --workspace`, unifies the features, so there `zoe-py` compiles with `serve`. maturin builds `zoe-py` alone, without it.
 - The console script writes to the file descriptors of the process, not to `sys.stdout` and `sys.stderr`. A Python caller that replaces `sys.stdout` does not capture the report.
 - Ctrl-C stops a conversion or a pack at once. The converters resume after the last copied transaction, and a pack that stops leaves a store that opens without repair (ADR 0025).

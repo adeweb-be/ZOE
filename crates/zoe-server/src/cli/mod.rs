@@ -13,9 +13,9 @@
 //! changes nothing on disk.
 
 mod convert;
-#[cfg(feature = "serve")]
 mod mcp;
 mod pack;
+mod serve;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -58,9 +58,10 @@ enum Command {
     /// Pack a store as of a number of days ago, or report what that pack
     /// would remove.
     Pack(pack::PackArgs),
+    /// Serve a store with the ZEO 6 msgpack protocol until SIGTERM.
+    Serve(serve::ServeArgs),
     /// Serve the read-only ops tools of a store to an agent, over MCP on
     /// stdin and stdout.
-    #[cfg(feature = "serve")]
     Mcp(mcp::McpArgs),
 }
 
@@ -136,7 +137,7 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
     let (name, result) = match &cli.command {
         Command::Convert(args) => ("convert", convert::run(args, out)),
         Command::Pack(args) => ("pack", pack::run(args, clock, out)),
-        #[cfg(feature = "serve")]
+        Command::Serve(args) => ("serve", serve::run(args, out)),
         Command::Mcp(args) => ("mcp", mcp::run(args)),
     };
     // The console script runs this code in the Python process. Nothing

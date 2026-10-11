@@ -5,8 +5,11 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 ## Layout
 
 - `src/main.rs`: the binary `zoe`. It only calls `cli::main` and exits with its code.
-- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `mcp.rs` holds `zoe mcp`. `zoe mcp` compiles only with the feature `serve`.
-- `src/protocol/`: the server code. It compiles only with the feature `serve`.
+- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`.
+- `src/cli/serve.rs`: `zoe serve`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
+- `src/cli/mcp.rs`: `zoe mcp`. It calls `zoe-mcp`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
+- `src/serve.rs`: `zoe_server::serve::{Server, ServeOptions}`, the server as a library. The binary and the Rust tests run it.
+- `src/protocol/`: the frames, the messages, the extension pickle and the session of a connection. It compiles only with the feature `serve`.
 
 ## Invariants of the command
 
@@ -27,9 +30,15 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 
 - This crate uses tokio only under the feature `serve`: the server code, and `zoe-mcp` for `zoe mcp`. The feature is on by default. `zoe-py` depends on this crate without it, so the extension never links tokio or rmcp: `cargo tree -p zoe-py -e normal` must list neither.
 - The server has no Python inside and needs no Plone eggs. It ships as one static binary.
-- Core calls run on the blocking pool, never on the async runtime threads.
+- Core calls run on the blocking pool, never on the async runtime threads. Each connection runs its calls in order on one thread of the pool, so one thread drives each core transaction and the core never answers `WrongThread`.
+- The server announces `M5` and takes only `M5`. A frame is a 4-byte big-endian length, then the bytes. A reply carries the message id of its call, whatever its msgpack type. The id -1 is a heartbeat and gets no reply. An error goes out with the flags 2 and `[class, args]`, with the class names of ZODB's exceptions. An error of a call without a reply closes the connection, as in ZEO.
+- A frame with the id -1 is a heartbeat whatever its other parts: it gets no reply and changes nothing.
+- The decode of a frame has a depth bound of 128 steps of rmpv, about 60 levels of arrays or maps. A deeper frame closes its connection, and the server stays up. A stock server takes deeper frames, but a ZEO message nests at most about 3 levels, and a transaction extension nests as deep as its dict.
+- `tpc_finish` replies only after the core made the commit durable.
+- stdout carries only the lines `admin <address>` and `listening <address>`. The logs go to stderr.
+- SIGTERM closes the store and exits with 0. `Server::stop` and the drop of a `Server` close it too: they drop the runtime, which waits for the session threads, and then the store.
 - An unmodified `ZEO.ClientStorage` works. A stock client never sees an extension that it did not declare in `register`.
-- Requests on one connection run concurrently. Every reply carries the message id of its request.
+- Every reply carries the message id of its request. Concurrent requests on one connection are not served yet: each connection runs its calls in order.
 - The invalidation queue of a slow client is bounded (default 1,000 messages). On overflow the server closes that connection.
 - `getInvalidations(tid)` returns `None` when the gap is longer than `invalidation-queue-size`.
 - Commits on different named storages never wait for each other.
@@ -40,5 +49,6 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 
 ## Tests
 
-- `tests/cli.rs` is the acceptance test of the binary and of `cli::main`. `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script.
+- `tests/cli.rs` is the acceptance test of the binary and of `cli::main`.
+- `tests/serve.rs` and `python/zoedb/tests/server/test_walking_skeleton.py` are the acceptance tests of `zoe serve`. `tests/wire/mod.rs` is a raw ZEO 6 client and a `zoe serve` process for the Rust tests of the server; it is part of the acceptance tests. The Python tests find the binary through `ZOE_BINARY`, which `just test` sets. `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script.
 - `tests/mcp.rs` is the acceptance test of `zoe mcp`. It compiles only with the feature `serve`.

@@ -17,6 +17,8 @@ dev = [
     "ZODB[test]",
     # The tests of the zoe:// URI. zoedb takes it through its uri extra.
     "zodburi>=3",
+    # The ZEO client speaks the msgpack protocol M5 of zoe serve.
+    "msgpack",
 ]
 
 [tool.uv]

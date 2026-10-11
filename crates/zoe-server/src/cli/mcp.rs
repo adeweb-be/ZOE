@@ -4,8 +4,11 @@
 //! The command opens the store for reads only, with the lock of the store.
 //! It runs as the ops principal of the local operator, and offers no tool
 //! that writes. stdout carries only MCP messages, so the command writes no
-//! report. It ends with 0 when the client closes stdin. It compiles only
-//! with the feature `serve`, because `zoe-mcp` uses tokio.
+//! report. It ends with 0 when the client closes stdin.
+//!
+//! The console script of the wheel has no MCP server: its extension never
+//! links tokio or rmcp. There, the command fails with 1 and names the `zoe`
+//! binary.
 
 use std::path::PathBuf;
 
@@ -22,8 +25,17 @@ pub(super) struct McpArgs {
 }
 
 /// Run `zoe mcp` until the client closes stdin.
+#[cfg(feature = "serve")]
 pub(super) fn run(args: &McpArgs) -> Result<(), Failure> {
     zoe_mcp::serve_stdio(&args.path).map_err(|error| Failure::Message(error.to_string()))
+}
+
+/// Fail: this build has no MCP server.
+#[cfg(not(feature = "serve"))]
+pub(super) fn run(_args: &McpArgs) -> Result<(), Failure> {
+    Err(Failure::Message(
+        "this build has no MCP server; run the `zoe` binary".to_owned(),
+    ))
 }
 
 #[cfg(test)]
