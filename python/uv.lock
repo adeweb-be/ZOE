@@ -3828,6 +3828,7 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "zodb", extra = ["test"] },
+    { name = "zodburi" },
 ]
 
 [package.metadata]
@@ -3837,6 +3838,7 @@ requires-dist = [{ name = "zoedb", editable = "zoedb" }]
 dev = [
     { name = "pytest", specifier = ">=9.1" },
     { name = "zodb", extras = ["test"] },
+    { name = "zodburi", specifier = ">=3" },
 ]
 
 [[package]]
@@ -3845,12 +3847,14 @@ source = { editable = "zoedb" }
 dependencies = [
     { name = "zconfig" },
     { name = "zodb" },
-    { name = "zodburi" },
 ]
 
 [package.optional-dependencies]
 plone = [
     { name = "products-cmfplone" },
+]
+uri = [
+    { name = "zodburi" },
 ]
 
 [package.metadata]
@@ -3858,9 +3862,9 @@ requires-dist = [
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
     { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },
-    { name = "zodburi", specifier = ">=3" },
+    { name = "zodburi", marker = "extra == 'uri'", specifier = ">=3" },
 ]
-provides-extras = ["plone"]
+provides-extras = ["plone", "uri"]
 
 [[package]]
 name = "zope"
