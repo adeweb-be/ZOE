@@ -21,8 +21,31 @@ const DATABASE: &str = "zoe.redb";
 /// The name under which a new database is written before it is renamed.
 const NEW_DATABASE: &str = "zoe.redb.new";
 
-/// The default lock timeout.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// The options of a store.
+///
+/// Build it from the defaults, for example
+/// `Options { lock_timeout, ..Options::default() }`. Then a new option does
+/// not break the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// The longest time that a vote waits for its locks. A longer wait
+    /// fails the vote with `Conflict`. This is `lock-timeout` in the
+    /// configuration.
+    pub lock_timeout: Duration,
+    /// Not an option. This field makes `..Options::default()` necessary
+    /// when a caller sets every option.
+    #[doc(hidden)]
+    pub _more: (),
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            lock_timeout: Duration::from_secs(10),
+            _more: (),
+        }
+    }
+}
 
 /// An open store.
 pub struct Store {
@@ -41,9 +64,16 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open the store in the directory `dir`, and create it if necessary.
+    /// Open the store in the directory `dir` with the default options, and
+    /// create it if necessary.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_in(OsVfs::new(dir.as_ref())?, SystemClock)
+        Self::open_with(dir, Options::default())
+    }
+
+    /// Open the store in the directory `dir` with `options`, and create it
+    /// if necessary.
+    pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        Self::open_full(OsVfs::new(dir.as_ref())?, SystemClock, options)
     }
 
     /// Open the store in the simulated filesystem `vfs`, and create it if
@@ -52,13 +82,19 @@ impl Store {
         Self::open_in(vfs, SystemClock)
     }
 
-    /// Open the store in `vfs` with the clock `clock`, and create it if
-    /// necessary.
+    /// Open the store in `vfs` with the clock `clock` and the default
+    /// options, and create it if necessary.
+    pub fn open_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Self> {
+        Self::open_full(vfs, clock, Options::default())
+    }
+
+    /// Open the store in `vfs` with the clock `clock` and `options`, and
+    /// create it if necessary.
     ///
     /// A new store is written under a temporary name and renamed into place
     /// after it is durable, so a crash during the creation leaves either
     /// no store or a complete empty one.
-    pub fn open_in<V: Vfs>(vfs: V, clock: impl Clock + 'static) -> Result<Self> {
+    fn open_full<V: Vfs>(vfs: V, clock: impl Clock + 'static, options: Options) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
                 vfs.remove(NEW_DATABASE)?;
@@ -82,7 +118,7 @@ impl Store {
             backend: Box::new(backend),
             clock: Box::new(clock),
             locks: LockManager::default(),
-            lock_timeout: LOCK_TIMEOUT,
+            lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             _vfs: Box::new(vfs),
@@ -285,6 +321,104 @@ mod tests {
         assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
         assert!(store.locks.is_empty());
         assert_eq!(store.last_transaction(), Tid::ZERO);
+    }
+
+    #[test]
+    fn a_dropped_transaction_releases_its_locks() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.check_current_serial(Oid(oid.0 + 1), Tid::ZERO).unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        assert!(!store.locks.is_empty());
+        drop(txn);
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_lock_timeout_in_vote_releases_every_lock() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        // The vote takes the lock on `low`, then waits for `high`.
+        let mut waiter = store.tpc_begin(b"", b"", b"").unwrap();
+        waiter.check_current_serial(low, Tid::ZERO).unwrap();
+        waiter.store(high, Tid::ZERO, b"b").unwrap();
+        let error = waiter.vote();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+            "{error:?}"
+        );
+
+        // The lock on `low` is free.
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other.store(low, Tid::ZERO, b"c").unwrap();
+        other.vote().unwrap();
+        other.abort();
+        holder.abort();
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn an_oid_read_and_written_takes_an_exclusive_lock() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.lock_timeout = Duration::ZERO;
+        let oid = store.new_oid().unwrap();
+        let mut writer = store.tpc_begin(b"", b"", b"").unwrap();
+        writer.check_current_serial(oid, Tid::ZERO).unwrap();
+        writer.store(oid, Tid::ZERO, b"a").unwrap();
+        writer.vote().unwrap();
+
+        let mut reader = store.tpc_begin(b"", b"", b"").unwrap();
+        reader.check_current_serial(oid, Tid::ZERO).unwrap();
+        assert!(matches!(reader.vote(), Err(ZoeError::Conflict { .. })));
+        writer.finish().unwrap();
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_stale_written_serial_wins_over_a_stale_read_serial() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let mut create = store.tpc_begin(b"", b"", b"").unwrap();
+        create.store(low, Tid::ZERO, b"a").unwrap();
+        create.store(high, Tid::ZERO, b"a").unwrap();
+        create.vote().unwrap();
+        create.finish().unwrap();
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.check_current_serial(low, Tid::ZERO).unwrap();
+        txn.store(high, Tid::ZERO, b"b").unwrap();
+        let error = txn.vote();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+            "{error:?}"
+        );
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn calls_after_the_vote_are_refused() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        assert!(matches!(txn.vote(), Err(ZoeError::Protocol(_))));
+        assert!(matches!(
+            txn.store(oid, Tid::ZERO, b"b"),
+            Err(ZoeError::Protocol(_))
+        ));
+        assert!(matches!(
+            txn.check_current_serial(oid, Tid::ZERO),
+            Err(ZoeError::Protocol(_))
+        ));
+        txn.finish().unwrap();
     }
 
     #[test]
