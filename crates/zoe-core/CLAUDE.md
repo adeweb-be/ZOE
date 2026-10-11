@@ -13,8 +13,8 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - The backend never allocates tids. The core allocates the tid at `tpc_finish` under the commit sequencer: `max(now, last_tid + 1 tick)`.
 - Tids always increase.
 - A normal commit never gets `Tid::MAX`, the tid that `load` reads before. When no tid below `Tid::MAX` is left after the last tid, `finish` fails with `Protocol`, and the store does not halt.
-- A client passes a tid only through `restore`, never through a normal commit.
-- A restore transaction (`tpc_begin_restore`) commits under the tid of the client and allocates no tid. The tid must be after the last tid: `tpc_begin_restore` checks it, and `finish` checks it again under the commit sequencer. A tid that is not after the last tid, or `Tid::MAX`, fails with `Protocol`, and the store does not halt. A restore transaction holds only restored records: `store` is refused in it.
+- A client passes a tid only through a restore transaction (`tpc_begin_restore`), never through a normal commit. A restore transaction takes both `store` and `restore`. `store` keeps its serial check there.
+- A restore transaction (`tpc_begin_restore`) commits under the tid of the client and allocates no tid. The tid must be after the last tid: `tpc_begin_restore` checks it, and `finish` checks it again under the commit sequencer. A tid that is not after the last tid, or `Tid::MAX`, fails with `Protocol`, and the store does not halt.
 - `store` refuses an empty pickle with `Protocol`. Only `restore` writes a deletion.
 - `Oid(u64::MAX)` is reserved: `store` and `restore` refuse it with `Protocol`. `new_oid` fails with `Protocol` when no oid below `u64::MAX` is left. It never wraps.
 - Locks are acquired in ascending oid order, over the written and the read-current oids together. A request out of order is refused with `LockOrder`, never granted.

@@ -74,14 +74,11 @@ impl<'s> Txn<'s> {
     /// read; it is `Tid::ZERO` for a new object.
     ///
     /// An empty pickle marks a deletion, so `store` refuses it with
-    /// `Protocol`. A restore transaction takes only `restore`, so `store`
-    /// refuses it there too.
+    /// `Protocol`. A restore transaction takes `store` too, with the same
+    /// serial check at the vote.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
-        }
-        if self.tid.is_some() {
-            return Err(ZoeError::Protocol("store in a restore transaction"));
         }
         if data.is_empty() {
             return Err(ZoeError::Protocol("store of an empty pickle"));
@@ -407,15 +404,31 @@ mod tests {
     }
 
     #[test]
-    fn store_refuses_an_empty_pickle_and_a_restore_transaction() {
+    fn store_refuses_an_empty_pickle() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        let error = txn.store(Oid(1), Tid::ZERO, b"");
-        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        for mut txn in [
+            store.tpc_begin(b"", b"", b"").unwrap(),
+            store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap(),
+        ] {
+            let error = txn.store(Oid(1), Tid::ZERO, b"");
+            assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        }
+    }
 
+    #[test]
+    fn store_in_a_restore_transaction_checks_the_serial() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
         let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
-        let error = txn.store(Oid(1), Tid::ZERO, b"a");
-        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.restore(Oid(2), Some(b"b")).unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), Tid(100));
+        assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), Tid(100)));
+
+        let mut stale = store.tpc_begin_restore(Tid(200), b"", b"", b"").unwrap();
+        stale.store(Oid(1), Tid::ZERO, b"c").unwrap();
+        assert!(matches!(stale.vote(), Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
     }
 
     #[test]
