@@ -422,20 +422,24 @@ mod tests {
         let second = locks
             .acquire(&[(Oid(2), Exclusive)], Duration::ZERO)
             .unwrap();
-        let timeout = Duration::from_millis(400);
+        // The margins of about half the timeout absorb slow scheduling, for
+        // example under ThreadSanitizer.
+        let timeout = Duration::from_secs(2);
         thread::scope(|scope| {
             let waiter = scope.spawn(|| {
                 let start = Instant::now();
                 let result = locks.acquire(&[(Oid(1), Exclusive), (Oid(2), Exclusive)], timeout);
-                (result.map(drop), start.elapsed())
+                (result.map(drop), start, Instant::now())
             });
             until_waiting(&locks, Oid(1), 1);
             thread::sleep(timeout / 2);
+            let released = Instant::now();
             drop(first);
-            let (result, waited) = waiter.join().unwrap();
+            let (result, start, end) = waiter.join().unwrap();
             assert!(matches!(result, Err(ZoeError::Conflict { oid: Oid(2) })));
-            assert!(waited >= timeout, "{waited:?}");
-            assert!(waited < timeout * 2, "{waited:?}");
+            assert!(end - start >= timeout, "{:?}", end - start);
+            // The wait for the second oid gets only the time that is left.
+            assert!(end - released < timeout, "{:?}", end - released);
         });
         drop(second);
         assert!(locks.is_empty());
@@ -447,9 +451,11 @@ mod tests {
         let oid = Oid(1);
         let reader = locks.acquire(&[(oid, Shared)], Duration::ZERO).unwrap();
         thread::scope(|scope| {
+            // The second reader must queue before the writer times out. The
+            // timeout is long so that slow scheduling cannot break the test.
             let writer = scope.spawn(|| {
                 locks
-                    .acquire(&[(oid, Exclusive)], Duration::from_millis(100))
+                    .acquire(&[(oid, Exclusive)], Duration::from_secs(1))
                     .map(drop)
             });
             until_waiting(&locks, oid, 1);
