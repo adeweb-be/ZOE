@@ -40,13 +40,13 @@ use crate::Error;
 pub(crate) const MAGIC: &[u8; 4] = b"FS30";
 
 /// The length of a transaction header.
-const TXN_HEADER_LEN: u64 = 23;
+pub(crate) const TXN_HEADER_LEN: u64 = 23;
 
 /// The length of a data record header.
-const DATA_HEADER_LEN: u64 = 42;
+pub(crate) const DATA_HEADER_LEN: u64 = 42;
 
 /// The length of a number: a length, an offset or a back pointer.
-const NUMBER_LEN: u64 = 8;
+pub(crate) const NUMBER_LEN: u64 = 8;
 
 /// The most chain ends that the reader keeps. When the cache is full, the
 /// reader empties it.
@@ -561,6 +561,14 @@ pub(crate) struct Records<'r> {
     pos: u64,
     /// The offset after the last data record.
     end: u64,
+}
+
+impl Records<'_> {
+    /// Return the offset of the data record that the next call to `next`
+    /// reads.
+    pub(crate) fn offset(&self) -> u64 {
+        self.pos
+    }
 }
 
 impl Iterator for Records<'_> {
