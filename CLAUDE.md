@@ -20,7 +20,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t |
 | `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan` |
 | `just conformance` | ZODB and ZEO conformance suites (not built yet) |
-| `just plone` | builds the Plone instances under `plone/` (not built yet) |
+| `just plone` | builds the Plone instance of a scenario under `plone/` into `target/plone` and starts it; `just plone zoe check` creates a Plone site on the zoe scenario by script and reads it over HTTP |
 | `just bench` | benchmarks (not built yet) |
 | `just loupe` | builds and runs Loupe (not built yet) |
 | `just docs` | builds the documentation site into `target/book` |
