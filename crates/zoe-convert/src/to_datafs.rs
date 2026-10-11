@@ -68,8 +68,10 @@ const CHUNK: usize = 1 << 16;
 /// of the store: the tids, the metadata and every pickle, byte for byte. It
 /// checks that the blob directory has every blob of the store with its
 /// size, and compares the first blob and then one blob in 16 byte for
-/// byte. The report lists each difference in `problems`. A blob that the
-/// store does not read is not written, and the report names it.
+/// byte. A difference fails the call with `Mismatch`, which lists the
+/// differences. Then the conversion keeps the old file and removes the file
+/// that it wrote. A blob that the store does not read is not written. This
+/// is not a difference: `Report.problems` names each such blob.
 pub fn to_datafs(source: &Store, data_fs: &Path, blob_dir: &Path) -> Result<Report, Error> {
     let _lock = lock(&sibling(data_fs, LOCK_SUFFIX)?)?;
     let temp = sibling(data_fs, TEMP_SUFFIX)?;
@@ -109,7 +111,6 @@ fn convert(source: &Store, data_fs: &Path, temp: &Path, blob_dir: &Path) -> Resu
     }
     let blobs = OutBlobs::prepare(blob_dir)?;
 
-    let mut problems = Problems::default();
     let mut copied = 0;
     let written = if existing.is_some() && txns.peek().is_none() {
         false
@@ -124,9 +125,7 @@ fn convert(source: &Store, data_fs: &Path, temp: &Path, blob_dir: &Path) -> Resu
         for txn in txns.by_ref() {
             let txn = txn?;
             for record in txn.records.iter().filter(|record| record.data.is_some()) {
-                if let Some(problem) = blobs.write(source, record.oid, txn.tid)? {
-                    problems.push(problem);
-                }
+                blobs.write(source, record.oid, txn.tid)?;
             }
             writer.write_txn(&txn)?;
             copied += 1;
@@ -137,7 +136,14 @@ fn convert(source: &Store, data_fs: &Path, temp: &Path, blob_dir: &Path) -> Resu
     drop(txns);
 
     let file = if written { temp } else { data_fs };
-    let mut report = verify(file, &blobs.dir, source, last, problems)?;
+    let (mut report, differences) = verify(file, &blobs.dir, source, last)?;
+    if !differences.is_empty() {
+        // The caller removes the temporary file.
+        return Err(Error::Mismatch {
+            path: data_fs.to_owned(),
+            problems: differences,
+        });
+    }
     report.copied = copied;
     if written {
         fs::rename(temp, data_fs).map_err(|source| io_error(data_fs, source))?;
@@ -216,32 +222,23 @@ impl OutBlobs {
     ///
     /// The blob goes into a temporary file, which is made read-only and
     /// synced. Then the file is renamed into place, and its directory is
-    /// synced. A record without a blob writes nothing. Return a problem
-    /// when the store does not read the blob: a missing file, or a size or
-    /// a hash that does not match. Then nothing is written.
-    fn write(&self, store: &Store, oid: Oid, tid: Tid) -> Result<Option<String>, Error> {
-        let problem = |error: &dyn std::fmt::Display| {
-            let at = format!("oid {} at {}", hex(oid.0), hex(tid.0));
-            Some(format!("{at}: the store does not read the blob: {error}"))
-        };
+    /// synced. A record without a blob writes nothing. A blob that the
+    /// store does not read writes nothing too: a missing file, or a size or
+    /// a hash that does not match. The verification reports it.
+    fn write(&self, store: &Store, oid: Oid, tid: Tid) -> Result<(), Error> {
         let mut blob = match store.open_blob(oid, tid) {
             Ok(blob) => blob,
-            Err(ZoeError::NotFound { .. }) => return Ok(None),
-            Err(error @ ZoeError::CorruptBlob { .. }) => return Ok(problem(&error)),
+            Err(ZoeError::NotFound { .. } | ZoeError::CorruptBlob { .. }) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         let temp = self
             .temp
             .join(format!("{:016x}-{:016x}.blob", oid.0, tid.0));
         match write_blob_file(&mut blob, &temp) {
-            Ok(None) => {}
-            Ok(Some(error)) => {
+            Ok(true) => {}
+            result => {
                 let _ = fs::remove_file(&temp);
-                return Ok(problem(&error));
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temp);
-                return Err(error);
+                return result.map(|_| ());
             }
         }
         let path = self.dir.path(oid, tid);
@@ -249,7 +246,7 @@ impl OutBlobs {
         create_dirs(dir).map_err(|source| io_error(dir, source))?;
         fs::rename(&temp, &path).map_err(|source| io_error(&path, source))?;
         sync_dir(dir)?;
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -257,9 +254,9 @@ impl OutBlobs {
 /// makes a committed blob file, and sync it.
 ///
 /// A crash can leave a read-only file at `path`, so the call removes it
-/// first. Return the error of `blob` when it fails its check of the size
-/// and the hash. Any other error of `blob` is a `Store` error.
-fn write_blob_file(blob: &mut impl Read, path: &Path) -> Result<Option<io::Error>, Error> {
+/// first. Return false when `blob` fails its check of the size and the
+/// hash. Any other error of `blob` is a `Store` error.
+fn write_blob_file(blob: &mut impl Read, path: &Path) -> Result<bool, Error> {
     let io = |source| io_error(path, source);
     remove_if_exists(path)?;
     let mut file = OpenOptions::new()
@@ -273,7 +270,7 @@ fn write_blob_file(blob: &mut impl Read, path: &Path) -> Result<Option<io::Error
             Ok(0) => break,
             Ok(n) => n,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::InvalidData => return Ok(Some(error)),
+            Err(error) if error.kind() == ErrorKind::InvalidData => return Ok(false),
             Err(error) => return Err(Error::Store(error.into())),
         };
         file.write_all(&buf[..n]).map_err(io)?;
@@ -282,22 +279,25 @@ fn write_blob_file(blob: &mut impl Read, path: &Path) -> Result<Option<io::Error
     permissions.set_mode(permissions.mode() & !0o222);
     file.set_permissions(permissions).map_err(io)?;
     file.sync_all().map_err(io)?;
-    Ok(None)
+    Ok(true)
 }
 
 /// Compare the FileStorage file at `path` with every transaction of
-/// `store` up to `last`, and return the report. `problems` holds the
-/// problems that the copy found.
+/// `store` up to `last`. Return the report and the differences.
 ///
-/// The counts of the report describe the store. A transaction of the store
-/// that the file does not have, and the reverse, is a problem.
+/// The counts of the report describe the store. `Report.problems` lists
+/// each blob that the store does not read and that the blob directory does
+/// not have: the copy skips such a blob, so it is not a difference. Each
+/// other finding is a difference: a transaction of the store that the file
+/// does not have and the reverse, a record or a metadata field that
+/// differs, a blob file that is missing or differs, and a transaction that
+/// the store does not read.
 fn verify(
     path: &Path,
     blobs: &BlobDir,
     store: &Store,
     last: Tid,
-    mut problems: Problems,
-) -> Result<Report, Error> {
+) -> Result<(Report, Vec<String>), Error> {
     let mut report = Report {
         transactions: 0,
         copied: 0,
@@ -306,13 +306,15 @@ fn verify(
         last_tid: Tid::ZERO,
         problems: Vec::new(),
     };
+    let mut unread = Problems::default();
+    let mut differences = Problems::default();
     let mut reader = Reader::open(path)?;
     let mut next = read_txn(&mut reader)?;
     for txn in store.iterator(None, Some(last))? {
         let txn = match txn {
             Ok(txn) => txn,
             Err(error) => {
-                problems.push(format!("the store does not read: {error}"));
+                differences.push(format!("the store does not read: {error}"));
                 continue;
             }
         };
@@ -323,15 +325,15 @@ fn verify(
         while let Some((header, _)) = &next
             && header.tid < txn.tid
         {
-            problems.push(not_in_store(header.tid));
+            differences.push(not_in_store(header.tid));
             next = read_txn(&mut reader)?;
         }
         match &next {
             Some((header, records)) if header.tid == txn.tid => {
-                compare_txn(header, records, &txn, &mut problems);
+                compare_txn(header, records, &txn, &mut differences);
                 next = read_txn(&mut reader)?;
             }
-            _ => problems.push(format!("the Data.fs lacks transaction {}", hex(txn.tid.0))),
+            _ => differences.push(format!("the Data.fs lacks transaction {}", hex(txn.tid.0))),
         }
 
         for record in txn.records.iter().filter(|record| record.data.is_some()) {
@@ -341,7 +343,7 @@ fn verify(
                 Ok(_) => {}
                 Err(ZoeError::NotFound { .. }) => continue,
                 Err(error) => {
-                    problems.push(format!("{at}: the store does not read the blob: {error}"));
+                    unread.push(format!("{at}: the store does not read the blob: {error}"));
                     continue;
                 }
             }
@@ -351,28 +353,33 @@ fn verify(
             let size = match fs::metadata(&copy) {
                 Ok(meta) => meta.len(),
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    problems.push(format!(
-                        "{at}: the blob directory has no blob file {}",
-                        copy.display()
-                    ));
+                    match store.verify_blob(oid, tid) {
+                        Err(error) => {
+                            unread.push(format!("{at}: the store does not read the blob: {error}"))
+                        }
+                        Ok(()) => differences.push(format!(
+                            "{at}: the blob directory has no blob file {}",
+                            copy.display()
+                        )),
+                    }
                     continue;
                 }
                 Err(error) => return Err(io_error(&copy, error)),
             };
             if let Some(problem) = check_blob(store, oid, tid, &copy, size, sample)? {
-                problems.push(format!("{at}: {problem}"));
+                differences.push(format!("{at}: {problem}"));
             }
         }
     }
     while let Some((header, _)) = next {
-        problems.push(not_in_store(header.tid));
+        differences.push(not_in_store(header.tid));
         next = read_txn(&mut reader)?;
     }
     if let Some(problem) = reader.end().and_then(stop_problem) {
-        problems.summary(problem);
+        differences.summary(problem);
     }
-    report.problems = problems.finish();
-    Ok(report)
+    report.problems = unread.finish();
+    Ok((report, differences.finish()))
 }
 
 /// Read the next transaction of `reader` with its records.
@@ -738,25 +745,25 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&path, b"evil").unwrap();
 
-        let report = convert(&store, &dir).unwrap();
         let at = format!("oid 0x0000000000000002 at {}", hex(tid.0));
-        assert_eq!(report.problems.len(), 2, "{report:?}");
-        assert!(
-            report.problems[0].starts_with(&format!("{at}: the store does not read the blob")),
-            "{report:?}"
-        );
-        assert!(
-            report.problems[1].starts_with(&format!("{at}: the blob directory has no blob file")),
-            "{report:?}"
-        );
+        // A first run and a run with nothing to add give the same report.
+        for copied in [1, 0] {
+            let report = convert(&store, &dir).unwrap();
+            assert_eq!(report.copied, copied);
+            assert_eq!(report.problems.len(), 1, "{report:?}");
+            assert!(
+                report.problems[0].starts_with(&format!("{at}: the store does not read the blob")),
+                "{report:?}"
+            );
+            assert_eq!(report.blobs, 2);
+        }
         let blobs = BlobDir::open(&dir.join("blobs")).unwrap();
         assert_eq!(fs::read(blobs.path(Oid(1), tid)).unwrap(), b"good");
         assert!(!blobs.path(Oid(2), tid).exists());
-        assert_eq!(report.blobs, 2);
     }
 
     #[test]
-    fn the_verification_reports_a_file_that_differs_from_the_store() {
+    fn a_file_that_differs_from_the_store_fails_the_verification() {
         let (dir, store) = setup("exit-differs");
         let tid = commit(&store, b"", &[(1, b"a"), (2, b"b")], &[]);
         // A file with the tid of the store and other records.
@@ -777,12 +784,16 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
 
-        let report = convert(&store, &dir).unwrap();
-        assert_eq!((report.transactions, report.copied), (1, 0));
+        let before = fs::read(&data_fs).unwrap();
+        let error = convert(&store, &dir).unwrap_err();
+        let Error::Mismatch { path, problems } = &error else {
+            panic!("not a mismatch: {error:?}");
+        };
+        assert_eq!(path, &data_fs);
         let txn = format!("transaction {}", hex(tid.0));
         assert_eq!(
-            report.problems,
-            [
+            problems,
+            &[
                 format!("{txn}: the user differs"),
                 format!("{txn}: the record of oid 0x0000000000000001 differs"),
                 format!(
@@ -791,5 +802,89 @@ mod tests {
                 ),
             ]
         );
+        assert!(error.to_string().ends_with(&problems[0]), "{error}");
+        assert_eq!(fs::read(&data_fs).unwrap(), before);
+    }
+
+    /// One transaction to restore: its tid and its records.
+    type Restore<'a> = (Tid, &'a [(u64, &'a [u8])]);
+
+    /// Restore the transactions `txns` in `store`.
+    fn restore(store: &Store, txns: &[Restore<'_>]) {
+        for &(tid, records) in txns {
+            let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+            for &(oid, data) in records {
+                txn.restore(Oid(oid), Some(data)).unwrap();
+            }
+            txn.vote().unwrap();
+            txn.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_store_that_differs_before_the_last_tid_of_the_file_is_refused() {
+        let dir = test_dir("exit-differs-before");
+        let (t1, t2, t3) = (Tid(0x10), Tid(0x20), Tid(0x30));
+        let s1 = Store::open(dir.join("s1")).unwrap();
+        restore(&s1, &[(t1, &[(1, b"a")]), (t2, &[(2, b"b")])]);
+        let report = convert(&s1, &dir).unwrap();
+        assert!(report.problems.is_empty(), "{report:?}");
+        let data_fs = dir.join("Data.fs");
+        let before = fs::read(&data_fs).unwrap();
+
+        // S2 has the last tid of the file, another record at an earlier tid
+        // and one more transaction.
+        let s2 = Store::open(dir.join("s2")).unwrap();
+        restore(
+            &s2,
+            &[(t1, &[(1, b"x")]), (t2, &[(2, b"b")]), (t3, &[(1, b"c")])],
+        );
+        let difference = format!(
+            "transaction {}: the record of oid 0x0000000000000001 differs",
+            hex(t1.0)
+        );
+        let error = convert(&s2, &dir).unwrap_err();
+        assert!(
+            matches!(&error, Error::Mismatch { problems, .. } if problems == std::slice::from_ref(&difference)),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&data_fs).unwrap(), before);
+        assert!(!dir.join("Data.fs.new").exists());
+
+        // Without the transaction to add, the file stays and the call fails
+        // the same way.
+        let s3 = Store::open(dir.join("s3")).unwrap();
+        restore(&s3, &[(t1, &[(1, b"x")]), (t2, &[(2, b"b")])]);
+        let error = convert(&s3, &dir).unwrap_err();
+        assert!(
+            matches!(&error, Error::Mismatch { problems, .. } if problems == &[difference]),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&data_fs).unwrap(), before);
+    }
+
+    #[test]
+    fn a_missing_blob_file_of_the_output_blocks_the_rename() {
+        let (dir, store) = setup("exit-missing-blob");
+        let tid = commit(&store, b"", &[], &[(1, b"blob")]);
+        convert(&store, &dir).unwrap();
+        let data_fs = dir.join("Data.fs");
+        let before = fs::read(&data_fs).unwrap();
+        let blob = BlobDir::open(&dir.join("blobs")).unwrap().path(Oid(1), tid);
+        fs::remove_file(&blob).unwrap();
+
+        commit(&store, b"", &[(2, b"a")], &[]);
+        let error = convert(&store, &dir).unwrap_err();
+        let Error::Mismatch { problems, .. } = &error else {
+            panic!("not a mismatch: {error:?}");
+        };
+        let at = format!("oid 0x0000000000000001 at {}", hex(tid.0));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with(&format!("{at}: the blob directory has no blob file")),
+            "{problems:?}"
+        );
+        assert_eq!(fs::read(&data_fs).unwrap(), before);
+        assert!(!dir.join("Data.fs.new").exists());
     }
 }

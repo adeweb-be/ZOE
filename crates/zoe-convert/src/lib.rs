@@ -110,6 +110,22 @@ pub enum Error {
         last: Tid,
     },
 
+    /// The verification found that the `Data.fs` does not match the store.
+    /// The conversion keeps the old file and removes the file that it
+    /// wrote.
+    #[error(
+        "{}: the Data.fs does not match the store: {}",
+        path.display(),
+        .problems.first().map_or("", String::as_str)
+    )]
+    Mismatch {
+        /// The path of the file.
+        path: PathBuf,
+        /// The differences, one per line, with the cap of
+        /// `Report.problems`.
+        problems: Vec<String>,
+    },
+
     /// A field of a transaction is longer than a `Data.fs` holds. The
     /// header of a transaction record holds the length of the user, the
     /// description and the extension in 2 bytes each.
