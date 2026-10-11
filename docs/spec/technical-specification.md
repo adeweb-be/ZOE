@@ -82,7 +82,7 @@ ZOE, the Zope Object Engine, is the project name: an anagram of ZEO, a first nam
 
 The ZODB stack is mostly Python; the C lives in three client-side packages, and the upstream projects have started free-threading work. Line counts are from fresh clones made during the analysis (tests excluded).
 
-| Package | Language | Size | Role | Free-threading status at the analysis |
+| Package | Language | Size | Role | Free-threading status |
 | --- | --- | --- | --- | --- |
 | [ZODB](https://github.com/zopefoundation/ZODB) | Python | 17.6k lines | Connection, DB, FileStorage, MVCC adapter, 2PC | pure Python; thread model is one Connection per thread |
 | [ZEO](https://github.com/zopefoundation/ZEO) 6.3.dev0 | Python + 2 optional Cython modules | 10.3k lines | asyncio client and server, msgpack wire protocol | pure Python |
