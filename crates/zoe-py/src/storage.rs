@@ -522,6 +522,14 @@ impl Storage {
         }
     }
 
+    /// Tell if no transaction holds or waits for a lock. This is a private
+    /// hook for the tests.
+    #[pyo3(name = "_lock_table_is_empty")]
+    fn lock_table_is_empty(&self, py: Python<'_>) -> PyResult<bool> {
+        let store = self.opened(py)?;
+        Ok(py.detach(|| store.lock_table_is_empty()))
+    }
+
     /// Close the storage: abort its open transactions and close the store.
     /// The storage refuses every later call. A call that runs when `close`
     /// starts keeps the store open until it returns.
