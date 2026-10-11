@@ -253,6 +253,16 @@ def test_a_refused_blob_dir_creates_no_store(tmp_path):
     assert list((tmp_path / "empty").iterdir()) == []
 
 
+def test_a_missing_blob_file_raises_poskeyerror(storage):
+    oid = storage.new_oid()
+    tid = store_blob(storage, oid, ZERO, write_temporary(storage, DATA))
+    os.remove(storage.loadBlob(oid, tid))
+    with pytest.raises(POSKeyError):
+        storage.loadBlob(oid, tid)
+    with pytest.raises(POSKeyError):
+        storage.openCommittedBlobFile(oid, tid)
+
+
 def test_a_read_only_storage_refuses_the_blob_writes(tmp_path):
     path = str(tmp_path / "store")
     storage = zoe.Storage(path)
