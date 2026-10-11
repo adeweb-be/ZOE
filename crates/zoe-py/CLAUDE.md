@@ -54,6 +54,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 
 ## Tests
 
-- `python/zoedb/tests/acceptance/test_storage.py` and `python/zoedb/tests/acceptance/test_conflict_resolution.py` are the acceptance tests.
+- `python/zoedb/tests/acceptance/test_storage.py` and `python/zoedb/tests/acceptance/test_conflict_resolution.py` are the acceptance tests of the storage and of conflict resolution.
+- `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.
