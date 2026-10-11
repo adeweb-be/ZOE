@@ -34,10 +34,12 @@
 //!   with a longer pointer below it compares as one value.
 //! - The pointers of the changes take at most `POINTER_BUDGET` bytes in all.
 //!   Past that, the diff is one change of the whole state.
-//! - The comparisons of one diff take at most `WORK_BUDGET` steps. Past that,
-//!   two values compare by their JSON. Equal JSON is no change only when it
-//!   shows both values whole. A value with a cut or a marker is then a
-//!   change, because the diff cannot tell.
+//! - The comparisons of one diff take at most `WORK_BUDGET` steps. A step
+//!   is one pair of nodes, one item or entry that a comparison collects, or
+//!   one byte that it reads. Past the budget, two values compare by their
+//!   JSON. Equal JSON is no change only when it shows both values whole.
+//!   A value with a cut or a marker is then a change, because the diff
+//!   cannot tell.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,7 +53,8 @@ use crate::state::{
 use crate::text::{self, IntValue};
 
 /// The most steps that the comparisons of one diff take. A step is one
-/// pair of nodes, or one byte of a value that a comparison reads.
+/// pair of nodes, one item or entry that a comparison collects, or one
+/// byte of a value that a comparison reads.
 const WORK_BUDGET: usize = 1 << 26;
 
 /// One change between two states of an object.
@@ -356,12 +359,25 @@ impl<'t> Differ<'_, 't> {
                 self.spend(x.bytes.len())?;
                 x.bytes == y.bytes
             }
-            (Node::Tuple(x), Node::Tuple(y)) => pair(x.items.iter(), y.items.iter(), pending),
-            (Node::List(_), Node::List(_)) => pair(
-                list_items(a).into_iter(),
-                list_items(b).into_iter(),
-                pending,
-            ),
+            (Node::Tuple(x), Node::Tuple(y)) => {
+                let equal = x.items.len() == y.items.len();
+                if equal {
+                    self.spend(x.items.len())?;
+                    pending.extend(x.items.iter().zip(&y.items));
+                }
+                equal
+            }
+            (Node::List(_), Node::List(_)) => {
+                let (items_a, batches_a) = extent(a);
+                let (items_b, batches_b) = extent(b);
+                self.spend(batches_a + batches_b)?;
+                let equal = items_a == items_b;
+                if equal {
+                    self.spend(items_a)?;
+                    pending.extend(list_items(a).into_iter().zip(list_items(b)));
+                }
+                equal
+            }
             (Node::Dict(_), Node::Dict(_)) => self.dicts(a, b, pending)?,
             (Node::Persistent(x), Node::Persistent(y)) => {
                 match (target(self.a, x), target(self.b, y)) {
@@ -399,8 +415,12 @@ impl<'t> Differ<'_, 't> {
         b: &'t Node,
         pending: &mut Vec<(&'t Node, &'t Node)>,
     ) -> Option<bool> {
+        let (count_a, batches_a) = extent(a);
+        let (count_b, batches_b) = extent(b);
+        self.spend(count_a + batches_a + count_b + batches_b)?;
         let (entries_a, entries_b) = (dict_entries(a), dict_entries(b));
         let (resolver_a, resolver_b) = (self.a, self.b);
+
         let keyed_a = self.by_key(resolver_a, &entries_a)?;
         let keyed_b = self.by_key(resolver_b, &entries_b)?;
         if let (Some(keyed_a), Some(keyed_b)) = (keyed_a, keyed_b) {
@@ -464,8 +484,8 @@ impl<'t> Differ<'_, 't> {
             _ => return Some(false),
         }
         if let (Some(items_a), Some(items_b)) = (
-            set_items(resolver_a, &x.args),
-            set_items(resolver_b, &y.args),
+            self.set_items(resolver_a, &x.args)?,
+            self.set_items(resolver_b, &y.args)?,
         ) && let (Some(forms_a), Some(forms_b)) = (
             self.set_forms(resolver_a, items_a)?,
             self.set_forms(resolver_b, items_b)?,
@@ -474,6 +494,31 @@ impl<'t> Differ<'_, 't> {
         }
         pending.push((x.args.as_ref(), y.args.as_ref()));
         Some(true)
+    }
+
+    /// Return the items of a set from the arguments of its REDUCE: `()`, or
+    /// `(items,)` with a list or a tuple of items. Return `Some(None)` for
+    /// arguments of another shape, and `None` when the work budget runs
+    /// out.
+    fn set_items(
+        &mut self,
+        resolver: &Resolver<'t>,
+        args: &'t Node,
+    ) -> Option<Option<Vec<&'t Node>>> {
+        let Some(Node::Tuple(args)) = resolver.resolve(args) else {
+            return Some(None);
+        };
+        let items = match &args.items[..] {
+            [] => return Some(Some(Vec::new())),
+            [items] => resolver.resolve(items),
+            _ => None,
+        };
+        let Some(items @ (Node::Tuple(_) | Node::List(_))) = items else {
+            return Some(None);
+        };
+        let (count, batches) = extent(items);
+        self.spend(count + batches)?;
+        Some(Some(sequence_items(items)))
     }
 
     /// Return the canonical forms of the items of a set, sorted, without
@@ -560,6 +605,7 @@ impl<'t> Differ<'_, 't> {
                     None => return Some(None),
                 },
                 Node::Tuple(tuple) => {
+                    self.spend(tuple.items.len())?;
                     form.push(b'T');
                     form.extend((tuple.items.len() as u64).to_le_bytes());
                     pending.extend(tuple.items.iter().rev());
@@ -629,34 +675,31 @@ fn sequence_items(node: &Node) -> Vec<&Node> {
     }
 }
 
-/// Push the pairs of items of two sequences. Tell if the sequences have
-/// the same length.
-fn pair<'t>(
-    x: impl ExactSizeIterator<Item = &'t Node>,
-    y: impl ExactSizeIterator<Item = &'t Node>,
-    pending: &mut Vec<(&'t Node, &'t Node)>,
-) -> bool {
-    if x.len() != y.len() {
-        return false;
-    }
-    pending.extend(x.zip(y));
-    true
-}
-
-/// Return the items of a set from the arguments of its REDUCE: `()`, or
-/// `(items,)` with a list or a tuple of items.
-fn set_items<'t>(resolver: &Resolver<'t>, args: &'t Node) -> Option<Vec<&'t Node>> {
-    let Node::Tuple(args) = resolver.resolve(args)? else {
-        return None;
-    };
-    match &args.items[..] {
-        [] => Some(Vec::new()),
-        [items] => match resolver.resolve(items)? {
-            Node::Tuple(tuple) => Some(tuple.items.iter().collect()),
-            list @ Node::List(_) => Some(list_items(list)),
-            _ => None,
-        },
-        _ => None,
+/// Return the count of the items of a tuple or a list, or of the entries
+/// of a dict, and the count of the batches that hold them. The call reads
+/// each batch once and collects nothing.
+fn extent(node: &Node) -> (usize, usize) {
+    match node {
+        Node::Tuple(tuple) => (tuple.items.len(), 0),
+        Node::List(list) => (
+            list.initial.as_ref().map_or(0, Vec::len)
+                + list
+                    .batches
+                    .iter()
+                    .map(|batch| batch.items.len())
+                    .sum::<usize>(),
+            list.batches.len(),
+        ),
+        Node::Dict(dict) => (
+            dict.initial.as_ref().map_or(0, Vec::len)
+                + dict
+                    .batches
+                    .iter()
+                    .map(|batch| batch.items.len())
+                    .sum::<usize>(),
+            dict.batches.len(),
+        ),
+        _ => (0, 0),
     }
 }
 
@@ -889,6 +932,31 @@ mod tests {
         let (deep_a, deep_b) = (record(&deep(b"K\x01")), record(&deep(b"K\x01")));
         assert_eq!(diff_within(&deep_a, &deep_b, 0).len(), 1);
         assert!(diff_within(&deep_a, &deep_b, WORK_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn a_list_of_another_length_costs_no_collection() {
+        // Two long lists of other lengths: the comparison stops at the
+        // lengths, within a small budget.
+        let list = |count: usize| [&b"]("[..], &b"K\x01".repeat(count), b"e"].concat();
+        let (long, longer) = (record(&list(100_000)), record(&list(100_001)));
+        let (resolver_a, resolver_b) = (long.resolver(), longer.resolver());
+        let mut differ = Differ {
+            a: &resolver_a,
+            b: &resolver_b,
+            work: 10,
+            pointers: POINTER_BUDGET,
+            overflow: false,
+            compared: HashMap::new(),
+            changes: Vec::new(),
+        };
+        assert_eq!(differ.equal(long.state(), longer.state()), Some(false));
+        // Equal lengths pay for the collection.
+        let same = record(&list(100_000));
+        let resolver_c = same.resolver();
+        differ.b = &resolver_c;
+        differ.work = 10;
+        assert_eq!(differ.equal(long.state(), same.state()), None);
     }
 
     #[test]
