@@ -1913,6 +1913,39 @@ mod tests {
     /// The blob file and its directories are durable in the filesystem of
     /// the blob directory when `finish` returns: the parent of the blob
     /// directory is synced, not the store directory.
+    /// The staging area of a store with its blob directory elsewhere stays
+    /// in the store directory: a spilled pickle goes to `staging/` there,
+    /// and the blob files go to the blob directory.
+    #[test]
+    fn a_relocated_store_keeps_its_staging_area_in_the_store_directory() {
+        use crate::clock::SystemClock;
+        use crate::store::Options;
+
+        let (vfs, parent) = (MemVfs::new(), MemVfs::new());
+        let options = Options {
+            staging_memory: 0,
+            ..Options::default()
+        };
+        let blob_parent: Box<dyn BlobDir> = Box::new(parent.clone());
+        let relocated = Some((blob_parent, "elsewhere".to_owned()));
+        let store = Store::open_full(vfs.clone(), SystemClock, options, relocated).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"blob"))
+            .unwrap();
+        assert_eq!(txn.staged_in_memory(), 0);
+        let starts = |vfs: &MemVfs, prefix: &str| vfs.names().iter().any(|n| n.starts_with(prefix));
+        assert!(starts(&vfs, "staging/"));
+        assert!(starts(&parent, "elsewhere/tmp/"));
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
+        assert!(!starts(&parent, "staging"));
+        assert!(!starts(&vfs, BLOB_DIR));
+        assert!(starts(&parent, "elsewhere/0x00/"));
+    }
+
     #[test]
     fn a_relocated_blob_is_durable_in_its_own_filesystem() {
         let parent = MemVfs::new();
