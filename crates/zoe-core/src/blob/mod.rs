@@ -365,14 +365,23 @@ impl BlobStore {
     /// Remove the blob files of `blobs` after a pack made the removal of
     /// their blob records durable, and sync their directories. A file that
     /// is not there is not an error.
+    ///
+    /// The directory of a file that is not there is synced too, when it
+    /// exists. A killed process can remove a file and stop before the
+    /// sync, and then the removal is not durable.
     pub(crate) fn remove_files(&self, blobs: &[(Oid, Tid)]) -> Result<()> {
         let mut dirs = BTreeSet::new();
         for &(oid, tid) in blobs {
+            let dir = oid_dir(oid);
             match self.dir.remove(&blob_name(oid, tid)) {
                 Ok(()) => {
-                    dirs.insert(oid_dir(oid));
+                    dirs.insert(dir);
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if self.dir.exists(&dir)? {
+                        dirs.insert(dir);
+                    }
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -848,6 +857,28 @@ mod tests {
         }
         let orphan = blob_name(orphan, crashed);
         (vfs, Leftovers { oid, tid, orphan })
+    }
+
+    #[test]
+    fn a_pack_syncs_the_directory_of_a_blob_file_that_is_gone() {
+        let vfs = MemVfs::new();
+        let (oid, tid) = {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let oid = store.new_oid().unwrap();
+            (oid, commit_blobs(&store, &[oid], b"blob"))
+        };
+        let vfs = vfs.durable_copy();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        // A killed process removed the file and did not sync its
+        // directory.
+        Vfs::remove(&vfs, &blob_name(oid, tid)).unwrap();
+        store.blobs().remove_files(&[(oid, tid)]).unwrap();
+        vfs.mark("synced");
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("synced")) {
+            let names = image.vfs().names();
+            assert!(!names.contains(&blob_name(oid, tid)), "{image:?}");
+        }
     }
 
     #[test]
