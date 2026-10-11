@@ -25,9 +25,11 @@ interface Props {
 
 export function History({ oid, serial, onAsOf, onError }: Props) {
   const [revisions, setRevisions] = useState<Revision[] | null>(null);
+  const [historyFailed, setHistoryFailed] = useState(false);
   const [from, setFrom] = useState<string | null>(null);
   const [to, setTo] = useState<string | null>(null);
   const [changes, setChanges] = useState<Change[] | null>(null);
+  const [diffFailed, setDiffFailed] = useState(false);
 
   // Each effect drops a reply that comes after the oid changes. The
   // parent gives a new `onError` at each render, so no effect depends on
@@ -35,9 +37,15 @@ export function History({ oid, serial, onAsOf, onError }: Props) {
   useEffect(() => {
     let live = true;
     setRevisions(null);
+    setHistoryFailed(false);
     history(oid).then(
       (found) => live && setRevisions(found),
-      (failure) => live && onError(failure),
+      (failure) => {
+        if (live) {
+          setHistoryFailed(true);
+          onError(failure);
+        }
+      },
     );
     return () => {
       live = false;
@@ -46,13 +54,19 @@ export function History({ oid, serial, onAsOf, onError }: Props) {
 
   useEffect(() => {
     setChanges(null);
+    setDiffFailed(false);
     if (from === null || to === null) {
       return;
     }
     let live = true;
     diff(oid, from, to).then(
       (found) => live && setChanges(found),
-      (failure) => live && onError(failure),
+      (failure) => {
+        if (live) {
+          setDiffFailed(true);
+          onError(failure);
+        }
+      },
     );
     return () => {
       live = false;
@@ -62,7 +76,9 @@ export function History({ oid, serial, onAsOf, onError }: Props) {
   return (
     <>
       <h2>{t("history.title")}</h2>
-      {revisions === null ? (
+      {historyFailed ? (
+        <p className="error">{t("history.failed")}</p>
+      ) : revisions === null ? (
         <p>{t("history.loading")}</p>
       ) : (
         <>
@@ -142,7 +158,7 @@ export function History({ oid, serial, onAsOf, onError }: Props) {
         </>
       )}
       {from !== null && to !== null && (
-        <DiffView from={from} to={to} changes={changes} />
+        <DiffView from={from} to={to} changes={changes} failed={diffFailed} />
       )}
     </>
   );
@@ -152,14 +168,18 @@ interface DiffProps {
   from: string;
   to: string;
   changes: Change[] | null;
+  /** True when the diff call failed. */
+  failed: boolean;
 }
 
 /** The changes from the revision `from` to the revision `to`. */
-function DiffView({ from, to, changes }: DiffProps) {
+function DiffView({ from, to, changes, failed }: DiffProps) {
   return (
     <section className="diff" data-testid="diff">
       <h3>{t("diff.title", { from, to })}</h3>
-      {changes === null ? (
+      {failed ? (
+        <p className="error">{t("diff.failed")}</p>
+      ) : changes === null ? (
         <p>{t("diff.loading")}</p>
       ) : changes.length === 0 ? (
         <p>{t("diff.none")}</p>
