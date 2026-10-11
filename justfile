@@ -92,6 +92,7 @@ conformance:
 # instances of zeo and zeoclient need their server. The build goes to
 # target/plone. ZOE_PLONE_ADMIN gives the admin user as user:password.
 # Without it, the recipe makes a random password once, in target/plone/admin.
+# The instance listens on 127.0.0.1, on the port ZOE_PLONE_PORT or 8080.
 plone scenario="zoe" command="start":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -101,6 +102,7 @@ plone scenario="zoe" command="start":
     fi
     target="{{ justfile_directory() }}/target/plone"
     instance="$target/{{ scenario }}/bin/instance"
+    port="${ZOE_PLONE_PORT:-8080}"
     # The interpreters of the shell know only the C locales. Zope sets the
     # locale of the environment when it starts.
     export LC_ALL=C.UTF-8
@@ -151,7 +153,8 @@ plone scenario="zoe" command="start":
     # in the instance. Only this user reads the record of buildout.
     "$venv/bin/buildout" -N -c "plone/{{ scenario }}.cfg" \
         "buildout:extends-cache=$target/extends" \
-        "instance:user=$user:"
+        "instance:user=$user:" \
+        "instance:http-address=127.0.0.1:$port"
     chmod 600 "$target/{{ scenario }}/.installed.cfg"
     case "{{ command }}" in
         build)
@@ -164,16 +167,20 @@ plone scenario="zoe" command="start":
             # The scripts run in the instance with the storage of the
             # scenario. The instance must not run, because the storage
             # opens in one process only.
+            # A new mark in the title of the site tells that read_site.py
+            # reads this instance, and not another process on the port.
+            mark="mark-$RANDOM$RANDOM"
             "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py
+            "$instance" run plone/create_site.py "$mark"
             "$instance" console &
             pid=$!
             trap 'kill "$pid" 2>/dev/null || true; wait "$pid" || true' EXIT
-            # Wait for the instance, then read the page of the site. The
-            # page holds the title that create_site.py gives the site. Only
-            # the admin user can read the management page of the site.
-            python3.13 plone/read_site.py http://127.0.0.1:8080/Plone "Check site"
-            python3.13 plone/read_site.py http://127.0.0.1:8080/Plone/manage_main portal_catalog
+            # Wait for the instance, then read the page of the site, which
+            # holds the title with the mark. Only the admin user can read
+            # the management page of the site.
+            site="http://127.0.0.1:$port/Plone"
+            python3.13 plone/read_site.py "$site" "Check site $mark"
+            python3.13 plone/read_site.py "$site/manage_main" portal_catalog
             ;;
         *)
             echo "just plone: unknown command {{ command }}. Use start, build or check." >&2

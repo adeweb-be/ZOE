@@ -1,23 +1,26 @@
 """Create a Plone site in the instance, as the admin user.
 
-`bin/instance run create_site.py` runs this script in the instance, with
-the storage of the scenario, after set_admin.py. The instance gives the
+`bin/instance run create_site.py MARK` runs this script in the instance,
+with the storage of the scenario, after set_admin.py. The instance gives the
 Zope application as `app`. ZOE_PLONE_ADMIN gives the admin user as
 user:password. Without it, the file that ZOE_PLONE_ADMIN_FILE names holds
 that text.
 
 As the admin user, the script removes the site of an earlier run, adds a
-new site, commits and closes the database.
+new site, commits and closes the database. The title of the site holds
+MARK, so a reader can tell this site from another one.
 """
 
 import os
+import sys
 
 import transaction
 from AccessControl.SecurityManagement import newSecurityManager
 from Products.CMFPlone.factory import addPloneSite
 
 SITE_ID = "Plone"
-TITLE = "Check site"
+# The instance puts the arguments of the script after its path.
+TITLE = f"Check site {sys.argv[-1]}"
 
 
 def admin():
