@@ -98,7 +98,8 @@ impl<V: Vfs> BlobDir for V {
 /// The blob files of a store.
 pub(crate) struct BlobStore {
     /// The store directory. It holds the single-writer lock while the
-    /// store is open. Nothing else owns it.
+    /// store is open. The staging area shares it through an `Arc`, and
+    /// nothing outside `Opened` holds it.
     dir: Box<dyn BlobDir>,
     /// Tells if `blobs/`, `blobs/tmp/` and the layout file are durable.
     ready: Mutex<bool>,

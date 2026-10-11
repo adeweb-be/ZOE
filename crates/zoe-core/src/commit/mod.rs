@@ -1410,6 +1410,13 @@ mod tests {
         assert!(store.locks.is_empty());
         assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
         assert_eq!(store.last_transaction(), Tid::ZERO);
+
+        // The error came after the finish took the sequencer, so the store
+        // halts until it is reopened.
+        let mut next = store.tpc_begin(b"", b"", b"").unwrap();
+        next.store(Oid(2), Tid::ZERO, b"b").unwrap();
+        next.vote().unwrap();
+        assert!(matches!(next.finish(), Err(ZoeError::Halted)));
     }
 
     /// A spill file that changed while the caller resolves a conflict fails
@@ -1437,5 +1444,61 @@ mod tests {
         txn.abort();
         assert!(store.lock_table_is_empty());
         assert!(!spills(&vfs));
+    }
+
+    /// Transactions on many threads spill at once, and some of them drop on
+    /// another thread. Each commit keeps its pickles, and no spill file
+    /// stays. Under ThreadSanitizer, this covers the spill paths.
+    #[test]
+    fn transactions_on_many_threads_spill_at_once() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 6;
+        const OIDS: usize = 3;
+        fn pickle(oid: Oid) -> Vec<u8> {
+            format!("pickle {}", oid.0).into_bytes()
+        }
+
+        // About one pickle of each transaction fits in memory.
+        let (vfs, store) = spilling_store(12);
+        let store = Arc::new(store);
+        let (sender, receiver) = std::sync::mpsc::channel::<Txn<Arc<Store>>>();
+        let dropper = thread::spawn(move || receiver.into_iter().for_each(drop));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (store, sender) = (Arc::clone(&store), sender.clone());
+                thread::spawn(move || {
+                    let mut committed = Vec::new();
+                    for round in 0..ROUNDS {
+                        let mut txn = Txn::begin(Arc::clone(&store), b"", b"", b"");
+                        let oids: Vec<Oid> = (0..OIDS).map(|_| store.new_oid().unwrap()).collect();
+                        for &oid in &oids {
+                            txn.store(oid, Tid::ZERO, &pickle(oid)).unwrap();
+                        }
+                        assert!(txn.staged_in_memory() <= 12);
+                        if round % 2 == 1 {
+                            sender.send(txn).unwrap();
+                            continue;
+                        }
+                        txn.vote().unwrap();
+                        let tid = txn.finish().unwrap();
+                        committed.extend(oids.into_iter().map(|oid| (oid, tid)));
+                    }
+                    committed
+                })
+            })
+            .collect();
+        drop(sender);
+        let committed: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        dropper.join().unwrap();
+
+        assert_eq!(committed.len(), THREADS * ROUNDS / 2 * OIDS);
+        for (oid, tid) in committed {
+            assert_eq!(store.load(oid).unwrap(), (pickle(oid), tid));
+        }
+        assert!(!spills(&vfs));
+        assert!(store.lock_table_is_empty());
     }
 }
