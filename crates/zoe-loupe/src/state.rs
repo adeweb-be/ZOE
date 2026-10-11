@@ -10,10 +10,11 @@
 //!   holds UTF-8, else `{"$bytes": "<escaped>"}`, as bytes do.
 //! - A tuple and a list become an array.
 //! - A dict with text keys becomes an object. Another dict becomes
-//!   `{"$dict": [[key, value], ...]}`.
+//!   `{"$dict": [[key, value], ...]}`. So does a dict with a key that
+//!   starts with `$`, so that no key of the store looks like a tag.
 //! - A persistent reference becomes `{"$ref": "<oid>", "class": ...}`. A
-//!   weak reference also has `"weak": true`. Another persistent id
-//!   becomes `{"$persistent": <id>}`.
+//!   weak reference also has `"weak": true`. Another persistent id, such
+//!   as a reference to another database, becomes `{"$persistent": <id>}`.
 //! - A GLOBAL becomes `{"$global": "module.name"}`. A REDUCE of `set` or
 //!   `frozenset` becomes `{"$call": "builtins.set", "args": [...]}`.
 //! - An opaque node becomes `{"$opaque": "<opcode>", "pickle": "<hex>"}`.
@@ -30,7 +31,12 @@
 //! The JSON has limits, so that a large or deep record cannot exhaust
 //! the stack or the memory. A value past `MAX_DEPTH` levels, or past
 //! `VALUE_BUDGET` values, becomes `{"$elided": "..."}`. The references
-//! below it then point to the elided value.
+//! below it then point to the elided value. A str, bytes, opaque bytes or
+//! the text of a large int show at most `MAX_TEXT` bytes, and all of
+//! them together at most `TEXT_BUDGET` bytes. A value that is cut shows
+//! its start and its size in the record: `{"$str": "<start>", "length":
+//! n}`, `{"$bytes": "<start>", "length": n}`, `{"$opaque": ..., "pickle":
+//! "<start>", "length": n}` or `{"$int": "<start>", "length": n}`.
 
 use serde_json::{Map, Number, Value, json};
 use zoe_core::Oid;
@@ -48,6 +54,13 @@ const VALUE_BUDGET: usize = zoe_pickle::NODE_BUDGET;
 /// value with recursion, so the depth stays small.
 const MAX_DEPTH: usize = 100;
 
+/// The most bytes that one str, bytes or opaque value shows.
+const MAX_TEXT: usize = 1 << 16;
+
+/// The most bytes that the str, bytes and opaque values of one state show
+/// together. The keys of the dicts count too.
+const TEXT_BUDGET: usize = 1 << 24;
+
 /// The largest int that a JSON number holds without a loss in the window.
 const MAX_SAFE_INT: i128 = (1 << 53) - 1;
 
@@ -56,6 +69,7 @@ pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
     let mut converter = Converter {
         resolver: tree.resolver(),
         budget: VALUE_BUDGET,
+        text_budget: TEXT_BUDGET,
         ancestors: Vec::new(),
         gets: 0,
         references: Vec::new(),
@@ -76,7 +90,7 @@ pub(crate) struct Target<'t> {
 }
 
 /// Read a persistent id of ZODB: `oid`, `(oid, class)`, `[oid]`, or
-/// `['w', (oid, ...)]`. Other forms, such as the references to another
+/// `['w', (oid,)]`. Other forms, such as the references to another
 /// database, give `None`.
 pub(crate) fn target<'t>(resolver: &Resolver<'t>, pid: &'t Node) -> Option<Target<'t>> {
     let pid = resolver.resolve(pid)?;
@@ -98,11 +112,15 @@ pub(crate) fn target<'t>(resolver: &Resolver<'t>, pid: &'t Node) -> Option<Targe
                     weak: true,
                 }),
                 [kind, args] if text::text(resolver, kind).as_deref() == Some("w") => {
+                    // `(oid, database)` is a reference to another database.
                     let Node::Tuple(args) = resolver.resolve(args)? else {
                         return None;
                     };
+                    let [oid] = &args.items[..] else {
+                        return None;
+                    };
                     Some(Target {
-                        oid: Oid(text::oid_bytes(resolver, args.items.first()?)?),
+                        oid: Oid(text::oid_bytes(resolver, oid)?),
                         class: None,
                         weak: true,
                     })
@@ -181,10 +199,22 @@ fn opcode_name(opcode: u8) -> String {
     name.to_owned()
 }
 
+/// Return bytes as `{"$bytes": "<escaped>"}`. `len` is the size of the
+/// value in the record. When `shown` is only its start, add `length`.
+fn bytes_value(shown: &[u8], len: usize) -> Value {
+    let mut value = json!({ "$bytes": text::escape_bytes(shown) });
+    if shown.len() < len {
+        value["length"] = json!(len);
+    }
+    value
+}
+
 struct Converter<'t> {
     resolver: Resolver<'t>,
     /// The JSON values that the state can still get.
     budget: usize,
+    /// The bytes of text that the state can still show.
+    text_budget: usize,
     /// The addresses of the nodes that the converter is in, innermost
     /// last. A get of one of them is a cycle.
     ancestors: Vec<usize>,
@@ -216,9 +246,18 @@ impl<'t> Converter<'t> {
             Node::None => Value::Null,
             Node::Bool(value) => Value::Bool(value.value()),
             Node::Int(int) => match text::int(int) {
-                IntValue::Small(value) if value.abs() <= MAX_SAFE_INT => json!(value as i64),
+                IntValue::Small(value) if (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&value) => {
+                    json!(value as i64)
+                }
                 IntValue::Small(value) => json!({ "$int": value.to_string() }),
-                IntValue::Large(text) => json!({ "$int": text }),
+                IntValue::Large(text) => {
+                    let shown = self.cut(text.len());
+                    if shown < text.len() {
+                        json!({ "$int": &text[..shown], "length": text.len() })
+                    } else {
+                        json!({ "$int": text })
+                    }
+                }
             },
             Node::Float(float) => {
                 let value = match float {
@@ -239,12 +278,33 @@ impl<'t> Converter<'t> {
                     }
                 }
             }
-            Node::Bytes(bytes) => json!({ "$bytes": text::escape_bytes(&bytes.data) }),
-            Node::ByteString(string) => match String::from_utf8(text::byte_string(string)) {
-                Ok(text) => Value::String(text),
-                Err(e) => json!({ "$bytes": text::escape_bytes(e.as_bytes()) }),
-            },
-            Node::Unicode(value) => Value::String(text::unicode(value)),
+            Node::Bytes(bytes) => {
+                let len = bytes.data.len();
+                let shown = self.cut(len);
+                bytes_value(&bytes.data[..shown], len)
+            }
+            Node::ByteString(string) => {
+                let len = text::byte_string_len(string);
+                let shown = self.cut(len);
+                let start = text::byte_string_start(string, shown);
+                if shown < len {
+                    return bytes_value(&start, len);
+                }
+                match String::from_utf8(start) {
+                    Ok(text) => Value::String(text),
+                    Err(e) => bytes_value(e.as_bytes(), e.as_bytes().len()),
+                }
+            }
+            Node::Unicode(value) => {
+                let len = text::unicode_len(value);
+                let shown = self.cut(len);
+                let start = text::unicode_start(value, shown);
+                if shown < len {
+                    json!({ "$str": start, "length": len })
+                } else {
+                    Value::String(start)
+                }
+            }
             Node::Tuple(tuple) => self.array(tuple.items.iter(), at, depth),
             Node::List(_) => self.array(list_items(node).into_iter(), at, depth),
             Node::Dict(_) => self.dict(node, at, depth),
@@ -276,13 +336,29 @@ impl<'t> Converter<'t> {
                     value
                 }
             },
-            Node::Opaque(opaque) => json!({
-                "$opaque": opcode_name(opaque.opcode),
-                "pickle": text::hex(&opaque.bytes),
-            }),
+            Node::Opaque(opaque) => {
+                let len = opaque.bytes.len();
+                let shown = self.cut(len);
+                let mut value = json!({
+                    "$opaque": opcode_name(opaque.opcode),
+                    "pickle": text::hex(&opaque.bytes[..shown]),
+                });
+                if shown < len {
+                    value["length"] = json!(len);
+                }
+                value
+            }
             // `Node::value` looks through puts.
             Node::Put(_) => Value::Null,
         }
+    }
+
+    /// Take up to `len` bytes from the text budget, and at most
+    /// `MAX_TEXT`. Return the count of bytes to show.
+    fn cut(&mut self, len: usize) -> usize {
+        let shown = len.min(MAX_TEXT).min(self.text_budget);
+        self.text_budget -= shown;
+        shown
     }
 
     fn array(
@@ -303,13 +379,26 @@ impl<'t> Converter<'t> {
 
     fn dict(&mut self, node: &'t Node, at: &mut String, depth: usize) -> Value {
         let entries = dict_entries(node);
-        let keys: Option<Vec<String>> = entries
+        // Text keys whose size fits the text budget become the keys of an
+        // object, unless one of them looks like a tag.
+        let size: Option<usize> = entries
             .iter()
-            .map(|(key, _)| text::text(&self.resolver, key))
-            .collect();
+            .map(|(key, _)| text::text_len(&self.resolver, key))
+            .sum();
+        let keys: Option<Vec<String>> = match size {
+            Some(size) if size <= self.text_budget => {
+                self.text_budget -= size;
+                entries
+                    .iter()
+                    .map(|(key, _)| text::text(&self.resolver, key))
+                    .collect()
+            }
+            _ => None,
+        };
+        let keys = keys.filter(|keys| !keys.iter().any(|key| key.starts_with('$')));
         let len = at.len();
         let Some(keys) = keys else {
-            // Keys that are not text: a list of pairs.
+            // A list of pairs.
             push_segment(at, "$dict");
             let pairs = entries
                 .iter()
@@ -425,6 +514,75 @@ mod tests {
                 {"$int": "18446744073709551616"},
             ])
         );
+    }
+
+    #[test]
+    fn the_smallest_long_of_16_bytes_is_a_tagged_int() {
+        let (state, _) = decode(&[&b"\x8a\x10"[..], &[0; 15], b"\x80"].concat());
+        assert_eq!(state, json!({"$int": i128::MIN.to_string()}));
+        let (state, _) = decode(b"\x8a\x07\x01\x00\x00\x00\x00\x00\xe0");
+        assert_eq!(state, json!(1 - (1_i64 << 53)));
+        let (state, _) = decode(b"\x8a\x07\x00\x00\x00\x00\x00\x00\xe0");
+        assert_eq!(state, json!({"$int": (-(1_i64 << 53)).to_string()}));
+    }
+
+    #[test]
+    fn a_dict_with_a_key_like_a_tag_is_a_list_of_pairs() {
+        let state = [
+            &b"}(X\x04\x00\x00\x00$refX\x04\x00\x00\x000x01X\x01\x00\x00\x00a"[..],
+            &reference(5),
+            b"u",
+        ]
+        .concat();
+        let (state, found) = decode(&state);
+        assert_eq!(state["$dict"][0], json!(["$ref", "0x01"]));
+        assert!(state.get("$ref").is_none());
+        assert_eq!(references(&found), [(5, "/$dict/1/1")]);
+        let (state, _) = decode(b"}X\x04\x00\x00\x00$intK\x01s");
+        assert_eq!(state, json!({"$dict": [["$int", 1]]}));
+    }
+
+    #[test]
+    fn a_long_value_shows_its_start_and_its_length() {
+        let len = MAX_TEXT + 10;
+        let text = [&b"X"[..], &(len as u32).to_le_bytes(), &b"a".repeat(len)].concat();
+        let (state, _) = decode(&text);
+        assert_eq!(state["length"], json!(len));
+        assert_eq!(state["$str"].as_str().unwrap().len(), MAX_TEXT);
+
+        let bytes = [&b"B"[..], &(len as u32).to_le_bytes(), &vec![0xff; len]].concat();
+        let (state, _) = decode(&bytes);
+        assert_eq!(state["length"], json!(len));
+        assert_eq!(state["$bytes"].as_str().unwrap().len(), 4 * MAX_TEXT);
+
+        let (state, _) = decode(b"X\x02\x00\x00\x00ab");
+        assert_eq!(state, json!("ab"));
+    }
+
+    #[test]
+    fn many_gets_of_a_long_value_stop_at_the_text_budget() {
+        // One str of MAX_TEXT bytes, then gets of it: past the budget, the
+        // gets show an empty start.
+        let gets = TEXT_BUDGET / MAX_TEXT + 2;
+        let mut state = [&b"(X"[..], &(MAX_TEXT as u32).to_le_bytes()].concat();
+        state.extend(b"a".repeat(MAX_TEXT));
+        state.extend(b"q\x01");
+        state.extend(b"h\x01".repeat(gets));
+        state.push(b't');
+        let (state, _) = decode(&state);
+        let items = state.as_array().unwrap();
+        assert_eq!(items.len(), gets + 1);
+        let full = items.iter().filter(|item| item.is_string()).count();
+        assert_eq!(full, TEXT_BUDGET / MAX_TEXT);
+        assert_eq!(items[gets], json!({"$str": "", "length": MAX_TEXT}));
+    }
+
+    #[test]
+    fn a_weak_reference_to_another_database_is_no_reference() {
+        let (state, found) =
+            decode(b"]q\x01(X\x01\x00\x00\x00wC\x08\0\0\0\0\0\0\0\x05X\x02\x00\x00\x00db\x86eQ");
+        assert!(state.get("$persistent").is_some(), "{state}");
+        assert!(found.is_empty());
     }
 
     #[test]

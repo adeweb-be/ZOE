@@ -4,17 +4,55 @@ use zoe_pickle::{ByteString, Int, Node, Resolver, Unicode};
 
 /// Return the bytes of a Python 2 `str`.
 pub(crate) fn byte_string(string: &ByteString) -> Vec<u8> {
+    byte_string_start(string, usize::MAX)
+}
+
+/// Return the first `limit` bytes of a Python 2 `str`. Decode no more of
+/// it than that.
+pub(crate) fn byte_string_start(string: &ByteString, limit: usize) -> Vec<u8> {
     match string {
-        ByteString::Binary(bytes) => bytes.data.clone(),
-        ByteString::Text(quoted) => unquote(quoted),
+        ByteString::Binary(bytes) => bytes.data[..limit.min(bytes.data.len())].to_vec(),
+        ByteString::Text(quoted) => unquote(quoted, limit),
+    }
+}
+
+/// Return the size of a Python 2 `str` in the record.
+pub(crate) fn byte_string_len(string: &ByteString) -> usize {
+    match string {
+        ByteString::Binary(bytes) => bytes.data.len(),
+        ByteString::Text(quoted) => quoted.len(),
     }
 }
 
 /// Return the text of a `str`.
 pub(crate) fn unicode(text: &Unicode) -> String {
+    unicode_start(text, usize::MAX)
+}
+
+/// Return the start of a `str`: at most `limit` bytes of UTF-8, cut at a
+/// character boundary. Decode no more of it than that.
+pub(crate) fn unicode_start(text: &Unicode, limit: usize) -> String {
     match text {
-        Unicode::Binary(text) => text.clone(),
-        Unicode::Text(raw) => raw_unicode(raw),
+        Unicode::Binary(text) => text[..text.floor_char_boundary(limit)].to_owned(),
+        Unicode::Text(raw) => raw_unicode(raw, limit),
+    }
+}
+
+/// Return the size of a `str` in the record.
+pub(crate) fn unicode_len(text: &Unicode) -> usize {
+    match text {
+        Unicode::Binary(text) => text.len(),
+        Unicode::Text(raw) => raw.len(),
+    }
+}
+
+/// Return the size in the record of a str node or a Python 2 `str` node.
+/// Look through memo puts and gets. Other nodes give `None`.
+pub(crate) fn text_len<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<usize> {
+    match resolver.resolve(node)? {
+        Node::Unicode(text) => Some(unicode_len(text)),
+        Node::ByteString(string) => Some(byte_string_len(string)),
+        _ => None,
     }
 }
 
@@ -40,12 +78,13 @@ pub(crate) fn oid_bytes<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<u
 }
 
 /// Decode the text of STRING without its quotes: the escapes of
-/// `codecs.escape_decode`. An unknown escape stays as it is.
-fn unquote(quoted: &[u8]) -> Vec<u8> {
+/// `codecs.escape_decode`. An unknown escape stays as it is. Stop after
+/// `limit` bytes.
+fn unquote(quoted: &[u8], limit: usize) -> Vec<u8> {
     let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or(&[]);
-    let mut out = Vec::with_capacity(inner.len());
+    let mut out = Vec::with_capacity(inner.len().min(limit));
     let mut i = 0;
-    while i < inner.len() {
+    while i < inner.len() && out.len() < limit {
         let byte = inner[i];
         i += 1;
         if byte != b'\\' || i == inner.len() {
@@ -87,6 +126,7 @@ fn unquote(quoted: &[u8]) -> Vec<u8> {
             other => out.extend([b'\\', other]),
         }
     }
+    out.truncate(limit);
     out
 }
 
@@ -97,11 +137,12 @@ fn hex_byte(digits: &[u8]) -> Option<u8> {
 
 /// Decode raw-unicode-escape: each byte is a Latin-1 character, except
 /// `\uXXXX` and `\UXXXXXXXX` after an odd count of backslashes. A
-/// surrogate or a code point out of range gives U+FFFD.
-fn raw_unicode(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len());
+/// surrogate or a code point out of range gives U+FFFD. Stop after
+/// `limit` bytes of UTF-8, at a character boundary.
+fn raw_unicode(raw: &[u8], limit: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(limit));
     let mut i = 0;
-    while i < raw.len() {
+    while i < raw.len() && out.len() < limit {
         if raw[i] != b'\\' {
             out.push(char::from(raw[i]));
             i += 1;
@@ -128,6 +169,7 @@ fn raw_unicode(raw: &[u8]) -> String {
             _ => out.extend(std::iter::repeat_n('\\', run)),
         }
     }
+    out.truncate(out.floor_char_boundary(limit));
     out
 }
 
@@ -221,22 +263,32 @@ mod tests {
 
     #[test]
     fn string_escapes_decode() {
-        assert_eq!(unquote(br"'a\'b'"), b"a'b");
-        assert_eq!(unquote(br#""a\nb\x00\\""#), b"a\nb\x00\\");
-        assert_eq!(unquote(br"'\101\7\q'"), b"A\x07\\q");
-        assert_eq!(unquote(br"'\xg0'"), b"\\xg0");
+        assert_eq!(unquote(br"'a\'b'", usize::MAX), b"a'b");
+        assert_eq!(unquote(br#""a\nb\x00\\""#, usize::MAX), b"a\nb\x00\\");
+        assert_eq!(unquote(br"'\101\7\q'", usize::MAX), b"A\x07\\q");
+        assert_eq!(unquote(br"'\xg0'", usize::MAX), b"\\xg0");
     }
 
     #[test]
     fn raw_unicode_escapes_decode() {
-        assert_eq!(raw_unicode(b"caf\\u00e9"), "caf\u{e9}");
-        assert_eq!(raw_unicode(br"\U0001f600"), "\u{1f600}");
-        assert_eq!(raw_unicode(b"\xe9"), "\u{e9}");
+        assert_eq!(raw_unicode(b"caf\\u00e9", usize::MAX), "caf\u{e9}");
+        assert_eq!(raw_unicode(br"\U0001f600", usize::MAX), "\u{1f600}");
+        assert_eq!(raw_unicode(b"\xe9", usize::MAX), "\u{e9}");
         // An even count of backslashes is no escape.
-        assert_eq!(raw_unicode(br"\\u0041"), r"\\u0041");
-        assert_eq!(raw_unicode(br"\\\u0041"), r"\\A");
-        assert_eq!(raw_unicode(br"\ud800"), "\u{fffd}");
-        assert_eq!(raw_unicode(br"\u12"), r"\u12");
+        assert_eq!(raw_unicode(br"\\u0041", usize::MAX), r"\\u0041");
+        assert_eq!(raw_unicode(br"\\\u0041", usize::MAX), r"\\A");
+        assert_eq!(raw_unicode(br"\ud800", usize::MAX), "\u{fffd}");
+        assert_eq!(raw_unicode(br"\u12", usize::MAX), r"\u12");
+    }
+
+    #[test]
+    fn a_start_stops_at_the_limit() {
+        assert_eq!(unquote(br"'a\x00bc'", 2), b"a\x00");
+        assert_eq!(raw_unicode(b"ab\\u00e9c", 3), "ab");
+        assert_eq!(raw_unicode(b"ab\\u00e9c", 4), "ab\u{e9}");
+        let text = Unicode::Binary("a\u{e9}b".to_owned());
+        assert_eq!(unicode_start(&text, 2), "a");
+        assert_eq!(unicode_len(&text), 4);
     }
 
     #[test]
