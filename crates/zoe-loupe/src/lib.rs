@@ -218,13 +218,26 @@ impl Folder {
     /// state as of `after`.
     ///
     /// The diff compares the decoded trees, not the bytes. The module
-    /// documentation of `diff` gives the rules and the limits. The call
-    /// fails when the object has no record as of one of the tids, or when
-    /// zoe-pickle refuses one of the two records.
+    /// documentation of `diff` gives the rules and the limits.
+    ///
+    /// A deletion has no state. Against a deletion, the diff is one change
+    /// of the whole state, `""`, without a value on the side of the
+    /// deletion. Two deletions give no change. The call fails when the
+    /// object has no record as of one of the tids, or when zoe-pickle
+    /// refuses one of the two records.
     pub fn diff(&self, oid: Oid, before: Tid, after: Tid) -> Result<Vec<Change>> {
-        let before = self.as_of(before).tree(oid)?;
-        let after = self.as_of(after).tree(oid)?;
-        Ok(diff::diff(&before, &after))
+        let before = self.as_of(before).tree_or_deletion(oid)?;
+        let after = self.as_of(after).tree_or_deletion(oid)?;
+        let whole = |tree: &zoe_pickle::Tree| state::state(tree).0;
+        Ok(match (before, after) {
+            (Some(before), Some(after)) => diff::diff(&before, &after),
+            (None, None) => Vec::new(),
+            (before, after) => vec![Change {
+                path: String::new(),
+                before: before.as_ref().map(whole),
+                after: after.as_ref().map(whole),
+            }],
+        })
     }
 
     /// Return the view as of the last transaction.
@@ -315,6 +328,22 @@ impl Snapshot<'_> {
     pub(crate) fn tree(&self, oid: Oid) -> Result<zoe_pickle::Tree> {
         let (data, _) = self.load(oid)?;
         zoe_pickle::decode_record(&data).map_err(|source| Error::Refused { oid, source })
+    }
+
+    /// Return the record of `oid`, decoded, or `None` when the record of
+    /// `oid` at or before the tid of the view is a deletion.
+    fn tree_or_deletion(&self, oid: Oid) -> Result<Option<zoe_pickle::Tree>> {
+        match self.tree(oid) {
+            Ok(tree) => Ok(Some(tree)),
+            // `load_before` gives `NotFound` for a deletion and for an oid
+            // without a record. Only the oid of a deletion has a history.
+            Err(Error::Store(ZoeError::NotFound { .. }))
+                if self.folder.store.history(oid, 1).is_ok() =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -487,6 +516,55 @@ mod tests {
         let history = folder.history(Oid(1)).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].tid, Tid(0x20));
+    }
+
+    #[test]
+    fn a_diff_against_a_deletion_is_one_change_of_the_whole_state() {
+        let dir = std::env::temp_dir().join(format!("zoe-loupe-deletion-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let record = b"\x80\x03cm\nC\nq\x00.\x80\x03K\x07.";
+        {
+            let store = Store::open(&dir).unwrap();
+            for (tid, data) in [(Tid(0x10), Some(&record[..])), (Tid(0x20), None)] {
+                let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+                txn.restore(Oid(1), data).unwrap();
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+            }
+        }
+        let folder = Folder::open(&dir).unwrap();
+        let history = folder.history(Oid(1)).unwrap();
+        assert_eq!(
+            history.iter().map(|r| (r.tid, r.size)).collect::<Vec<_>>(),
+            [(Tid(0x20), 0), (Tid(0x10), record.len() as u64)]
+        );
+        let whole = |before: Option<serde_json::Value>, after: Option<serde_json::Value>| {
+            vec![Change {
+                path: String::new(),
+                before,
+                after,
+            }]
+        };
+        let seven = Some(serde_json::json!(7));
+        assert_eq!(
+            folder.diff(Oid(1), Tid(0x10), Tid(0x20)).unwrap(),
+            whole(seven.clone(), None)
+        );
+        assert_eq!(
+            folder.diff(Oid(1), Tid(0x20), Tid(0x10)).unwrap(),
+            whole(None, seven)
+        );
+        assert!(
+            folder
+                .diff(Oid(1), Tid(0x20), Tid(0x30))
+                .unwrap()
+                .is_empty()
+        );
+        // An oid without a record is still an error.
+        assert!(matches!(
+            folder.diff(Oid(2), Tid(0x10), Tid(0x20)),
+            Err(Error::Store(ZoeError::NotFound { .. }))
+        ));
     }
 
     #[test]
