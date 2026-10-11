@@ -22,17 +22,36 @@ use crate::tree::{
     Pickle, Put, Reduce, Tree, Tuple, Unicode, Width,
 };
 
-/// The most nodes that the decoder makes for one record: 1,048,576.
+/// The node budget of [`decode_record`]: 1,048,576 nodes.
 ///
 /// An opcode of one byte can make a node of 56 bytes. So without a limit,
-/// the tree of a record can take some 56 times the size of the record. The
-/// decoder counts each value, mark and memo put that it makes, and refuses
-/// a record that needs more than this budget. At the budget, the tree takes
-/// about 60 MB, and the stack of the decoder takes about 90 MB more while
-/// it runs. ZODB splits a big BTree into buckets of some hundreds of items,
-/// so the budget is far above what most records need. A list of about a
-/// million items, or a dict of some hundreds of thousands, comes near it.
+/// the tree of a record can take some 56 times the size of the record. At
+/// this budget, the tree takes about 60 MB. The stack of the decoder takes
+/// about 90 MB more while it runs. ZODB splits a big BTree into buckets of
+/// some hundreds of items, so most records need far fewer nodes. But ZODB
+/// also writes and loads a list of a million items, or a dict of some
+/// hundreds of thousands. This budget refuses them. A tool that must read
+/// every record gives a larger budget to [`decode_record_with`].
 pub const NODE_BUDGET: usize = 1 << 20;
+
+/// The limits of one call of [`decode_record_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The most nodes that the decoder makes for the record. The decoder
+    /// counts each value, mark and memo put that it makes. Each opcode
+    /// makes one node at most, so the count never gets above the length of
+    /// the record. A budget equal to that length never refuses a record.
+    pub node_budget: usize,
+}
+
+impl Default for Limits {
+    /// The limits of [`decode_record`]: a budget of [`NODE_BUDGET`] nodes.
+    fn default() -> Self {
+        Limits {
+            node_budget: NODE_BUDGET,
+        }
+    }
+}
 
 /// The callables that a modeled REDUCE can call.
 const KNOWN_CONSTRUCTORS: [(&str, &str); 2] = [("builtins", "set"), ("builtins", "frozenset")];
@@ -41,10 +60,20 @@ const KNOWN_CONSTRUCTORS: [(&str, &str); 2] = [("builtins", "set"), ("builtins",
 ///
 /// Both pickles share one memo, as ZODB writes them with one pickler. A
 /// construct that the tree does not model becomes a [`Node::Opaque`]. The
-/// decoder refuses bytes that Python's unpickler refuses, and a record that
-/// needs more than [`NODE_BUDGET`] nodes.
+/// decoder refuses bytes that Python's unpickler refuses. It also refuses a
+/// record that needs more than [`NODE_BUDGET`] nodes, with
+/// [`Error::Budget`].
 pub fn decode_record(bytes: &[u8]) -> Result<Tree, Error> {
-    Decoder::new(bytes, NODE_BUDGET).record()
+    decode_record_with(bytes, Limits::default())
+}
+
+/// Decodes a record as [`decode_record`] does, with the given limits.
+///
+/// A tool that must read every record, such as pack or a converter, gives
+/// a node budget equal to the length of the record. Then only malformed
+/// bytes give an error.
+pub fn decode_record_with(bytes: &[u8], limits: Limits) -> Result<Tree, Error> {
+    Decoder::new(bytes, limits.node_budget).record()
 }
 
 /// One stack entry.
@@ -115,6 +144,8 @@ struct Decoder<'a> {
     memo: HashMap<u32, Slot>,
     /// The spans of the opaque nodes, sorted and disjoint.
     spans: Vec<Range<usize>>,
+    /// The node budget of the record.
+    limit: usize,
     /// The nodes that the record can still make.
     budget: usize,
     /// The bytes that the decoder copies into opaque nodes.
@@ -129,6 +160,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             memo: HashMap::new(),
             spans: Vec::new(),
+            limit: budget,
             budget,
             #[cfg(test)]
             copied: 0,
@@ -623,10 +655,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn spend(&mut self) -> Result<(), Error> {
-        self.budget = self
-            .budget
-            .checked_sub(1)
-            .ok_or_else(|| self.error(format!("the record needs more than {NODE_BUDGET} nodes")))?;
+        self.budget = self.budget.checked_sub(1).ok_or(Error::Budget {
+            offset: self.pos,
+            budget: self.limit,
+        })?;
         Ok(())
     }
 
@@ -1241,9 +1273,40 @@ mod tests {
         // The class pickle makes 2 nodes (GLOBAL, BINPUT) and the state
         // makes 13: MARK, ten NONE, TUPLE.
         let bytes = record(&[&b"("[..], &[b'N'; 10], b"t"].concat());
-        assert!(Decoder::new(&bytes, 14).record().is_ok());
-        let error = Decoder::new(&bytes, 13).record().unwrap_err();
-        assert!(error.to_string().contains("nodes"), "{error}");
+        let limits = |node_budget| Limits { node_budget };
+        assert!(decode_record_with(&bytes, limits(14)).is_ok());
+        let error = decode_record_with(&bytes, limits(13)).unwrap_err();
+        assert_eq!(
+            error,
+            Error::Budget {
+                offset: bytes.len() - 1,
+                budget: 13
+            }
+        );
+        assert!(error.to_string().contains("more than 13 nodes"), "{error}");
+    }
+
+    #[test]
+    fn a_budget_equal_to_the_length_never_refuses_a_record() {
+        // One opcode of one byte per node: the most nodes for the length.
+        let body = [&b"("[..], &[b'N'; NODE_BUDGET], b"t"].concat();
+        let bytes = record(&body);
+        let error = decode_record(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Budget {
+                    budget: NODE_BUDGET,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let limits = Limits {
+            node_budget: bytes.len(),
+        };
+        let tree = decode_record_with(&bytes, limits).unwrap();
+        assert_eq!(encode_record(&tree).unwrap(), bytes);
     }
 
     #[test]

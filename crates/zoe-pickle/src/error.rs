@@ -12,6 +12,15 @@ pub enum Error {
         /// What is wrong.
         message: String,
     },
+    /// The record needs more nodes than the node budget allows. The bytes
+    /// can be valid: a larger budget can decode them.
+    #[error("cannot decode at offset {offset}: the record needs more than {budget} nodes")]
+    Budget {
+        /// The offset where the decoder stops.
+        offset: usize,
+        /// The node budget.
+        budget: usize,
+    },
     /// The tree holds a value that its opcode cannot write.
     #[error("cannot encode: {0}")]
     Encode(String),
