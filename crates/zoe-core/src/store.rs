@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, RecordEncoding};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
+use crate::format::Compression;
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
 use crate::types::{Oid, Tid};
@@ -33,6 +34,9 @@ pub struct Options {
     /// fails the vote with `Conflict`. This is `lock-timeout` in the
     /// configuration.
     pub lock_timeout: Duration,
+    /// How the store writes new records. The default is zstd at level 3.
+    /// The store reads records of every codec, whatever this option.
+    pub compression: Compression,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -43,6 +47,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             lock_timeout: Duration::from_secs(10),
+            compression: Compression::default(),
             _more: (),
         }
     }
@@ -129,7 +134,7 @@ impl Store {
         let db = redb::Builder::new()
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
-        let backend = RedbBackend::open(db)?;
+        let backend = RedbBackend::open(db)?.with_compression(options.compression);
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
@@ -194,6 +199,14 @@ impl Store {
         }
     }
 
+    /// Return how the record that `tid` wrote for `oid` is stored: its
+    /// codec, its stored length and the length of its pickle.
+    pub fn record_info(&self, oid: Oid, tid: Tid) -> Result<RecordEncoding> {
+        self.backend
+            .record_info(oid, tid)?
+            .ok_or(ZoeError::NotFound { oid })
+    }
+
     /// Return the tid of the last committed transaction.
     pub fn last_transaction(&self) -> Tid {
         self.backend.last_tid()
@@ -226,6 +239,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::format::Codec;
 
     /// A clock that never moves.
     struct FrozenClock;
@@ -267,6 +281,10 @@ mod tests {
 
         fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
             self.inner.load_serial(oid, tid)
+        }
+
+        fn record_info(&self, oid: Oid, tid: Tid) -> Result<Option<RecordEncoding>> {
+            self.inner.record_info(oid, tid)
         }
 
         fn last_tid(&self) -> Tid {
@@ -556,6 +574,18 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(store.new_oid(), Err(ZoeError::Protocol(_))));
         }
+    }
+
+    #[test]
+    fn record_info_of_a_missing_record_is_not_found() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let tid = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let info = store.record_info(oid, tid).unwrap();
+        assert_eq!(info.codec, Codec::None);
+        assert_eq!((info.stored_len, info.data_len), (1, 1));
+        let error = store.record_info(oid, Tid(tid.0 + 1));
+        assert!(matches!(error, Err(ZoeError::NotFound { .. })), "{error:?}");
     }
 
     #[test]
