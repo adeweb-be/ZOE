@@ -97,9 +97,11 @@ impl Key {
     /// Read a key node. Look through memo puts and gets.
     fn read<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<Key> {
         match resolver.resolve(node)? {
-            Node::Int(int) => match text::int(int) {
+            // A key beyond an i128 matches no segment, so its text is not
+            // needed.
+            Node::Int(int) => match text::int(int, 0) {
                 IntValue::Small(value) => Some(Key::Int(value)),
-                IntValue::Large(_) => None,
+                IntValue::Large { .. } => None,
             },
             _ => text(resolver, node).map(Key::Text),
         }

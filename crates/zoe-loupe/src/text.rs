@@ -4,14 +4,17 @@ use zoe_pickle::{ByteString, Int, Node, Resolver, Unicode};
 
 /// Return the bytes of a Python 2 `str`.
 pub(crate) fn byte_string(string: &ByteString) -> Vec<u8> {
-    byte_string_start(string, usize::MAX)
+    byte_string_start(string, usize::MAX).0
 }
 
-/// Return the first `limit` bytes of a Python 2 `str`. Decode no more of
-/// it than that.
-pub(crate) fn byte_string_start(string: &ByteString, limit: usize) -> Vec<u8> {
+/// Return the first `limit` bytes of a Python 2 `str`, and tell if they
+/// are all of it. Decode no more of it than that.
+pub(crate) fn byte_string_start(string: &ByteString, limit: usize) -> (Vec<u8>, bool) {
     match string {
-        ByteString::Binary(bytes) => bytes.data[..limit.min(bytes.data.len())].to_vec(),
+        ByteString::Binary(bytes) => {
+            let end = limit.min(bytes.data.len());
+            (bytes.data[..end].to_vec(), end == bytes.data.len())
+        }
         ByteString::Text(quoted) => unquote(quoted, limit),
     }
 }
@@ -26,14 +29,18 @@ pub(crate) fn byte_string_len(string: &ByteString) -> usize {
 
 /// Return the text of a `str`.
 pub(crate) fn unicode(text: &Unicode) -> String {
-    unicode_start(text, usize::MAX)
+    unicode_start(text, usize::MAX).0
 }
 
 /// Return the start of a `str`: at most `limit` bytes of UTF-8, cut at a
-/// character boundary. Decode no more of it than that.
-pub(crate) fn unicode_start(text: &Unicode, limit: usize) -> String {
+/// character boundary. Also tell if it is all of the text. Decode no more
+/// of it than that.
+pub(crate) fn unicode_start(text: &Unicode, limit: usize) -> (String, bool) {
     match text {
-        Unicode::Binary(text) => text[..text.floor_char_boundary(limit)].to_owned(),
+        Unicode::Binary(text) => {
+            let end = text.floor_char_boundary(limit);
+            (text[..end].to_owned(), end == text.len())
+        }
         Unicode::Text(raw) => raw_unicode(raw, limit),
     }
 }
@@ -79,8 +86,8 @@ pub(crate) fn oid_bytes<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<u
 
 /// Decode the text of STRING without its quotes: the escapes of
 /// `codecs.escape_decode`. An unknown escape stays as it is. Stop after
-/// `limit` bytes.
-fn unquote(quoted: &[u8], limit: usize) -> Vec<u8> {
+/// `limit` bytes, and tell if the bytes are all of the text.
+fn unquote(quoted: &[u8], limit: usize) -> (Vec<u8>, bool) {
     let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or(&[]);
     let mut out = Vec::with_capacity(inner.len().min(limit));
     let mut i = 0;
@@ -126,8 +133,9 @@ fn unquote(quoted: &[u8], limit: usize) -> Vec<u8> {
             other => out.extend([b'\\', other]),
         }
     }
+    let whole = i >= inner.len() && out.len() <= limit;
     out.truncate(limit);
-    out
+    (out, whole)
 }
 
 /// Return the value of two hex digits.
@@ -138,8 +146,9 @@ fn hex_byte(digits: &[u8]) -> Option<u8> {
 /// Decode raw-unicode-escape: each byte is a Latin-1 character, except
 /// `\uXXXX` and `\UXXXXXXXX` after an odd count of backslashes. A
 /// surrogate or a code point out of range gives U+FFFD. Stop after
-/// `limit` bytes of UTF-8, at a character boundary.
-fn raw_unicode(raw: &[u8], limit: usize) -> String {
+/// `limit` bytes of UTF-8, at a character boundary, and tell if the text
+/// is whole.
+fn raw_unicode(raw: &[u8], limit: usize) -> (String, bool) {
     let mut out = String::with_capacity(raw.len().min(limit));
     let mut i = 0;
     while i < raw.len() && out.len() < limit {
@@ -169,15 +178,45 @@ fn raw_unicode(raw: &[u8], limit: usize) -> String {
             _ => out.extend(std::iter::repeat_n('\\', run)),
         }
     }
+    let whole = i >= raw.len() && out.len() <= limit;
     out.truncate(out.floor_char_boundary(limit));
-    out
+    (out, whole)
 }
 
-/// Return bytes as Python writes them in a bytes literal, without the
-/// quotes: printable ASCII as it is, other bytes as escapes.
-pub(crate) fn escape_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for &byte in bytes {
+/// Return the size of a character in a JSON string, as serde_json writes
+/// it: a quote and a backslash take two bytes, a control character two or
+/// six.
+pub(crate) fn json_cost(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Return the longest start of `text` whose JSON size is at most
+/// `allowance` bytes: the end of the start and its JSON size.
+pub(crate) fn fit(text: &str, allowance: usize) -> (usize, usize) {
+    let mut cost = 0;
+    for (index, c) in text.char_indices() {
+        let next = cost + json_cost(c);
+        if next > allowance {
+            return (index, cost);
+        }
+        cost = next;
+    }
+    (text.len(), cost)
+}
+
+/// Write the start of `bytes` as Python writes a bytes literal, without
+/// the quotes: printable ASCII as it is, other bytes as escapes. Stop
+/// before the JSON size of the text gets above `allowance`. Return the
+/// text, the count of bytes that it shows and its JSON size.
+pub(crate) fn escape_within(bytes: &[u8], allowance: usize) -> (String, usize, usize) {
+    let mut out = String::new();
+    let mut cost = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let start = out.len();
         match byte {
             b'\\' => out.push_str("\\\\"),
             b'\n' => out.push_str("\\n"),
@@ -186,8 +225,14 @@ pub(crate) fn escape_bytes(bytes: &[u8]) -> String {
             0x20..=0x7e => out.push(char::from(byte)),
             _ => out.push_str(&format!("\\x{byte:02x}")),
         }
+        let piece: usize = out[start..].chars().map(json_cost).sum();
+        if cost + piece > allowance {
+            out.truncate(start);
+            return (out, index, cost);
+        }
+        cost += piece;
     }
-    out
+    (out, bytes.len(), cost)
 }
 
 /// Return bytes as lowercase hex digits.
@@ -199,33 +244,49 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 pub(crate) enum IntValue {
     /// An int that fits an `i128`.
     Small(i128),
-    /// The decimal text or the hex text of a larger int.
-    Large(String),
+    /// A larger int: the start of its decimal text or hex text, the size
+    /// of the int in the record, and if the start is the whole text.
+    Large {
+        start: String,
+        length: usize,
+        whole: bool,
+    },
 }
 
-/// Return the value of an int node.
-pub(crate) fn int(int: &Int) -> IntValue {
+/// Return the value of an int node. The text of a large int has at most
+/// `limit` bytes, and the call reads no more of the int than that needs.
+pub(crate) fn int(int: &Int, limit: usize) -> IntValue {
     match int {
         Int::U8(value) => IntValue::Small(i128::from(*value)),
         Int::U16(value) => IntValue::Small(i128::from(*value)),
         Int::I32(value) => IntValue::Small(i128::from(*value)),
-        Int::Long { bytes, .. } => long(bytes),
-        Int::Text(text) => decimal(text),
-        Int::LongText(text) => decimal(text.strip_suffix('L').unwrap_or(text)),
+        Int::Long { bytes, .. } => long(bytes, limit),
+        Int::Text(text) => decimal(text, limit),
+        Int::LongText(text) => decimal(text.strip_suffix('L').unwrap_or(text), limit),
     }
 }
 
-/// Read decimal text. Text that does not fit an `i128` stays text.
-fn decimal(text: &str) -> IntValue {
-    match text.parse::<i128>() {
-        Ok(value) => IntValue::Small(value),
-        Err(_) => IntValue::Large(text.to_owned()),
+/// Read decimal text. Text that does not fit an `i128` stays text. The
+/// decoder gives only digits and a sign, so the text is ASCII.
+fn decimal(text: &str, limit: usize) -> IntValue {
+    // An i128 has at most 39 digits and a sign.
+    if text.len() <= 40
+        && let Ok(value) = text.parse::<i128>()
+    {
+        return IntValue::Small(value);
+    }
+    let end = limit.min(text.len());
+    IntValue::Large {
+        start: text[..end].to_owned(),
+        length: text.len(),
+        whole: end == text.len(),
     }
 }
 
 /// Read the little-endian two's complement bytes of LONG1 or LONG4. More
-/// than 16 bytes give the hex text of the value.
-fn long(bytes: &[u8]) -> IntValue {
+/// than 16 bytes give the hex text of the value, from its most
+/// significant digits.
+fn long(bytes: &[u8], limit: usize) -> IntValue {
     let negative = bytes.last().is_some_and(|byte| byte & 0x80 != 0);
     if bytes.len() <= 16 {
         let fill = if negative { 0xff } else { 0 };
@@ -233,28 +294,49 @@ fn long(bytes: &[u8]) -> IntValue {
         wide[..bytes.len()].copy_from_slice(bytes);
         return IntValue::Small(i128::from_le_bytes(wide));
     }
-    // Negate the two's complement to get the magnitude.
-    let mut magnitude = bytes.to_vec();
-    if negative {
-        let mut carry = true;
-        for byte in &mut magnitude {
-            *byte = !*byte;
-            if carry {
-                (*byte, carry) = byte.overflowing_add(1);
-            }
-        }
+    let cut = |start: String| IntValue::Large {
+        start,
+        length: bytes.len(),
+        whole: false,
+    };
+    if limit == 0 {
+        return cut(String::new());
     }
-    let mut digits: String = magnitude
-        .iter()
+    // The magnitude of a negative int is its two's complement negated:
+    // below the lowest byte that is not zero, the bytes are zero; that byte
+    // is negated; the bytes above it are inverted.
+    let lowest = bytes.iter().position(|&byte| byte != 0).unwrap_or(0);
+    let magnitude = |index: usize| match (negative, index.cmp(&lowest)) {
+        (false, _) => bytes[index],
+        (true, std::cmp::Ordering::Less) => 0,
+        (true, std::cmp::Ordering::Equal) => bytes[index].wrapping_neg(),
+        (true, std::cmp::Ordering::Greater) => !bytes[index],
+    };
+    let mut text = String::from(if negative { "-0x" } else { "0x" });
+    let mut digits = (0..bytes.len())
         .rev()
-        .skip_while(|&&byte| byte == 0)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    if digits.is_empty() {
-        digits.push('0');
+        .map(magnitude)
+        .skip_while(|&byte| byte == 0)
+        .peekable();
+    if digits.peek().is_none() {
+        text.push('0');
     }
-    let sign = if negative { "-" } else { "" };
-    IntValue::Large(format!("{sign}0x{digits}"))
+    for byte in digits {
+        if text.len() + 2 > limit {
+            text.truncate(limit);
+            return cut(text);
+        }
+        text.push_str(&format!("{byte:02x}"));
+    }
+    if text.len() > limit {
+        text.truncate(limit);
+        return cut(text);
+    }
+    IntValue::Large {
+        start: text,
+        length: bytes.len(),
+        whole: true,
+    }
 }
 
 #[cfg(test)]
@@ -263,64 +345,105 @@ mod tests {
 
     #[test]
     fn string_escapes_decode() {
-        assert_eq!(unquote(br"'a\'b'", usize::MAX), b"a'b");
-        assert_eq!(unquote(br#""a\nb\x00\\""#, usize::MAX), b"a\nb\x00\\");
-        assert_eq!(unquote(br"'\101\7\q'", usize::MAX), b"A\x07\\q");
-        assert_eq!(unquote(br"'\xg0'", usize::MAX), b"\\xg0");
+        assert_eq!(unquote(br"'a\'b'", usize::MAX).0, b"a'b");
+        assert_eq!(unquote(br#""a\nb\x00\\""#, usize::MAX).0, b"a\nb\x00\\");
+        assert_eq!(unquote(br"'\101\7\q'", usize::MAX).0, b"A\x07\\q");
+        assert_eq!(unquote(br"'\xg0'", usize::MAX).0, b"\\xg0");
     }
 
     #[test]
     fn raw_unicode_escapes_decode() {
-        assert_eq!(raw_unicode(b"caf\\u00e9", usize::MAX), "caf\u{e9}");
-        assert_eq!(raw_unicode(br"\U0001f600", usize::MAX), "\u{1f600}");
-        assert_eq!(raw_unicode(b"\xe9", usize::MAX), "\u{e9}");
+        assert_eq!(raw_unicode(b"caf\\u00e9", usize::MAX).0, "caf\u{e9}");
+        assert_eq!(raw_unicode(br"\U0001f600", usize::MAX).0, "\u{1f600}");
+        assert_eq!(raw_unicode(b"\xe9", usize::MAX).0, "\u{e9}");
         // An even count of backslashes is no escape.
-        assert_eq!(raw_unicode(br"\\u0041", usize::MAX), r"\\u0041");
-        assert_eq!(raw_unicode(br"\\\u0041", usize::MAX), r"\\A");
-        assert_eq!(raw_unicode(br"\ud800", usize::MAX), "\u{fffd}");
-        assert_eq!(raw_unicode(br"\u12", usize::MAX), r"\u12");
+        assert_eq!(raw_unicode(br"\\u0041", usize::MAX).0, r"\\u0041");
+        assert_eq!(raw_unicode(br"\\\u0041", usize::MAX).0, r"\\A");
+        assert_eq!(raw_unicode(br"\ud800", usize::MAX).0, "\u{fffd}");
+        assert_eq!(raw_unicode(br"\u12", usize::MAX).0, r"\u12");
     }
 
     #[test]
     fn a_start_stops_at_the_limit() {
-        assert_eq!(unquote(br"'a\x00bc'", 2), b"a\x00");
-        assert_eq!(raw_unicode(b"ab\\u00e9c", 3), "ab");
-        assert_eq!(raw_unicode(b"ab\\u00e9c", 4), "ab\u{e9}");
+        assert_eq!(unquote(br"'a\x00bc'", 2).0, b"a\x00");
+        assert_eq!(raw_unicode(b"ab\\u00e9c", 3).0, "ab");
+        assert_eq!(raw_unicode(b"ab\\u00e9c", 4).0, "ab\u{e9}");
         let text = Unicode::Binary("a\u{e9}b".to_owned());
-        assert_eq!(unicode_start(&text, 2), "a");
+        assert_eq!(unicode_start(&text, 2), ("a".to_owned(), false));
+        assert_eq!(unicode_start(&text, 4), ("a\u{e9}b".to_owned(), true));
         assert_eq!(unicode_len(&text), 4);
     }
 
     #[test]
     fn bytes_escape_as_in_python() {
-        assert_eq!(escape_bytes(b"a\x00\n\\\xff"), r"a\x00\n\\\xff");
+        let (text, shown, cost) = escape_within(b"a\x00\n\\\xff\"", usize::MAX);
+        assert_eq!(text, r#"a\x00\n\\\xff""#);
+        assert_eq!(shown, 6);
+        // The JSON string doubles each backslash and the quote.
+        assert_eq!(cost, serde_json::to_string(&text).unwrap().len() - 2);
+        let (text, shown, cost) = escape_within(b"ab\x00c", 6);
+        assert_eq!((text.as_str(), shown, cost), ("ab", 2, 2));
+    }
+
+    #[test]
+    fn a_start_fits_its_json_size() {
+        assert_eq!(fit("ab\"c", 3), (2, 2));
+        assert_eq!(fit("ab\"c", 4), (3, 4));
+        assert_eq!(fit("a\u{1}", 6), (1, 1));
+        assert_eq!(fit("a\u{e9}", 3), (3, 3));
+    }
+
+    /// Return the start and the wholeness of a large int.
+    fn large(value: IntValue) -> (String, bool) {
+        match value {
+            IntValue::Small(value) => panic!("{value}"),
+            IntValue::Large { start, whole, .. } => (start, whole),
+        }
     }
 
     #[test]
     fn longs_read_as_twos_complement() {
-        let small = |bytes: &[u8]| match long(bytes) {
+        let small = |bytes: &[u8]| match long(bytes, usize::MAX) {
             IntValue::Small(value) => value,
-            IntValue::Large(text) => panic!("{text}"),
+            IntValue::Large { start, .. } => panic!("{start}"),
         };
         assert_eq!(small(b""), 0);
         assert_eq!(small(b"\xff"), -1);
         assert_eq!(small(b"\x00\x80\x00"), 0x8000);
         assert_eq!(small(b"\x00\x80"), -0x8000);
         assert_eq!(small(&[0xff; 16]), -1);
-        let large = |bytes: &[u8]| match long(bytes) {
-            IntValue::Small(value) => panic!("{value}"),
-            IntValue::Large(text) => text,
-        };
         let mut bytes = vec![0; 16];
         bytes.push(1);
-        assert_eq!(large(&bytes), format!("0x01{}", "00".repeat(16)));
-        assert_eq!(large(&[0xff; 17]), "-0x01");
+        let whole = format!("0x01{}", "00".repeat(16));
+        assert_eq!(large(long(&bytes, usize::MAX)), (whole.clone(), true));
+        assert_eq!(large(long(&bytes, 6)), (whole[..6].to_owned(), false));
+        assert_eq!(large(long(&bytes, 0)), (String::new(), false));
+        assert_eq!(
+            large(long(&[0xff; 17], usize::MAX)),
+            ("-0x01".to_owned(), true)
+        );
+        assert_eq!(large(long(&[0; 17], usize::MAX)), ("0x0".to_owned(), true));
+    }
+
+    #[test]
+    fn a_negative_long_with_zero_low_bytes_has_its_magnitude() {
+        // -2^(8*20): twenty zero bytes, then 0x00 0xff with the sign bit.
+        let mut bytes = vec![0; 20];
+        bytes.push(0xff);
+        let (text, whole) = large(long(&bytes, usize::MAX));
+        assert!(whole);
+        assert_eq!(text, format!("-0x01{}", "00".repeat(20)));
+        // -0x0102: the low byte 0xfe is negated, the next is inverted.
+        let mut bytes = vec![0xfe, 0xfe];
+        bytes.extend([0xff; 15]);
+        assert_eq!(large(long(&bytes, usize::MAX)).0, "-0x0102");
     }
 
     #[test]
     fn decimal_text_reads_as_an_int() {
-        assert!(matches!(decimal("-12"), IntValue::Small(-12)));
+        assert!(matches!(decimal("-12", usize::MAX), IntValue::Small(-12)));
         let huge = "1".repeat(50);
-        assert!(matches!(decimal(&huge), IntValue::Large(text) if text == huge));
+        assert_eq!(large(decimal(&huge, usize::MAX)), (huge.clone(), true));
+        assert_eq!(large(decimal(&huge, 3)), ("111".to_owned(), false));
     }
 }

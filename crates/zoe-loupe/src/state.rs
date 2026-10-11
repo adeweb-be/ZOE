@@ -4,14 +4,17 @@
 //!
 //! - None, a bool, an int and a float become null, a bool and a number.
 //!   An int beyond 2^53 becomes `{"$int": "<decimal or hex>"}`, so the
-//!   window does not round it. A NaN or an infinity becomes
-//!   `{"$float": "nan"}`.
-//! - A str becomes a string. A Python 2 `str` becomes a string when it
-//!   holds UTF-8, else `{"$bytes": "<escaped>"}`, as bytes do.
+//!   window does not round it. A float with no fraction becomes
+//!   `{"$float": "1.0"}`, so it does not read as an int. A NaN or an
+//!   infinity becomes `{"$float": "nan"}`.
+//! - A str becomes a string. A Python 2 `str` becomes
+//!   `{"$str2": "<text>"}` when it holds UTF-8, else
+//!   `{"$bytes": "<escaped>"}`, as bytes do.
 //! - A tuple and a list become an array.
 //! - A dict with text keys becomes an object. Another dict becomes
 //!   `{"$dict": [[key, value], ...]}`. So does a dict with a key that
-//!   starts with `$`, so that no key of the store looks like a tag.
+//!   starts with `$`, so that no key of the store looks like a tag, and a
+//!   dict with a key longer than `MAX_KEY` bytes.
 //! - A persistent reference becomes `{"$ref": "<oid>", "class": ...}`. A
 //!   weak reference also has `"weak": true`. Another persistent id, such
 //!   as a reference to another database, becomes `{"$persistent": <id>}`.
@@ -28,19 +31,33 @@
 //! the value that it stands for has it already. The references in an
 //! opaque node are not known.
 //!
-//! The JSON has limits, so that a large or deep record cannot exhaust
-//! the stack or the memory. A value past `MAX_DEPTH` levels, or past
-//! `VALUE_BUDGET` values, becomes `{"$elided": "..."}`. The references
-//! below it then point to the elided value. A str, bytes, opaque bytes or
-//! the text of a large int show at most `MAX_TEXT` bytes, and all of
-//! them together at most `TEXT_BUDGET` bytes. A value that is cut shows
-//! its start and its size in the record: `{"$str": "<start>", "length":
-//! n}`, `{"$bytes": "<start>", "length": n}`, `{"$opaque": ..., "pickle":
-//! "<start>", "length": n}` or `{"$int": "<start>", "length": n}`.
+//! The JSON has limits, so that a large, deep or crafted record cannot
+//! exhaust the stack, the memory or the time of the call:
+//!
+//! - A value past `MAX_DEPTH` levels, or past `VALUE_BUDGET` values,
+//!   becomes `{"$elided": "..."}`. The references below it then point to
+//!   the elided value.
+//! - The text of a str, a bytes value, an opaque value, a large int, a
+//!   GLOBAL or a class name takes at most `MAX_TEXT` bytes in the JSON,
+//!   escapes and hex digits included. All the text of the state, dict
+//!   keys included, takes at most `TEXT_BUDGET` bytes. A value that is
+//!   cut shows its start and its size in the record: `{"$str": "<start>",
+//!   "length": n}`, `{"$str2": ..., "length": n}`, `{"$bytes": ...,
+//!   "length": n}`, `{"$opaque": ..., "pickle": ..., "length": n}`,
+//!   `{"$int": ..., "length": n}` or `{"$global": ..., "length": n}`. A
+//!   class name that is cut shows its start only.
+//! - A pointer of a reference has at most `MAX_POINTER` bytes, and the
+//!   pointers of one state at most `POINTER_BUDGET` bytes together. A
+//!   longer pointer gives way to the pointer of a value that holds the
+//!   reference, at most the root, `""`.
+//! - Each get of one value at one depth converts that value once. The
+//!   other gets reuse the JSON, and pay for it from the budgets.
+
+use std::collections::HashMap;
 
 use serde_json::{Map, Number, Value, json};
 use zoe_core::Oid;
-use zoe_pickle::{Float, Node, Resolver, Tree};
+use zoe_pickle::{Float, Global, Node, Resolver, Tree};
 
 use crate::text::{self, IntValue};
 use crate::{Reference, oid_repr};
@@ -54,12 +71,21 @@ const VALUE_BUDGET: usize = zoe_pickle::NODE_BUDGET;
 /// value with recursion, so the depth stays small.
 const MAX_DEPTH: usize = 100;
 
-/// The most bytes that one str, bytes or opaque value shows.
+/// The most JSON bytes that the text of one value takes.
 const MAX_TEXT: usize = 1 << 16;
 
-/// The most bytes that the str, bytes and opaque values of one state show
-/// together. The keys of the dicts count too.
+/// The most JSON bytes that all the text of one state takes.
 const TEXT_BUDGET: usize = 1 << 24;
+
+/// The longest key of a dict that becomes the key of a JSON object. Each
+/// key is a segment of the pointers below it, so the keys stay short.
+const MAX_KEY: usize = 256;
+
+/// The longest pointer of a reference.
+const MAX_POINTER: usize = 1 << 10;
+
+/// The most bytes that the pointers of the references of one state take.
+const POINTER_BUDGET: usize = 1 << 24;
 
 /// The largest int that a JSON number holds without a loss in the window.
 const MAX_SAFE_INT: i128 = (1 << 53) - 1;
@@ -70,8 +96,10 @@ pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
         resolver: tree.resolver(),
         budget: VALUE_BUDGET,
         text_budget: TEXT_BUDGET,
+        pointer_budget: POINTER_BUDGET,
         ancestors: Vec::new(),
         gets: 0,
+        expanded: HashMap::new(),
         references: Vec::new(),
     };
     let mut at = String::new();
@@ -199,27 +227,41 @@ fn opcode_name(opcode: u8) -> String {
     name.to_owned()
 }
 
-/// Return bytes as `{"$bytes": "<escaped>"}`. `len` is the size of the
-/// value in the record. When `shown` is only its start, add `length`.
-fn bytes_value(shown: &[u8], len: usize) -> Value {
-    let mut value = json!({ "$bytes": text::escape_bytes(shown) });
-    if shown.len() < len {
-        value["length"] = json!(len);
+/// Return `{tag: text}`, and add `length` when `text` is only the start
+/// of a value of `length` bytes in the record.
+fn tagged(tag: &str, text: impl Into<Value>, whole: bool, length: usize) -> Value {
+    let mut value = Map::new();
+    value.insert(tag.to_owned(), text.into());
+    if !whole {
+        value.insert("length".to_owned(), json!(length));
     }
-    value
+    Value::Object(value)
+}
+
+/// The JSON of a get, kept for the other gets of the same value at the
+/// same depth, with what it took from the budgets.
+struct Expanded {
+    value: Value,
+    values: usize,
+    text: usize,
 }
 
 struct Converter<'t> {
     resolver: Resolver<'t>,
     /// The JSON values that the state can still get.
     budget: usize,
-    /// The bytes of text that the state can still show.
+    /// The JSON bytes of text that the state can still take.
     text_budget: usize,
+    /// The bytes of reference pointers that the state can still take.
+    pointer_budget: usize,
     /// The addresses of the nodes that the converter is in, innermost
     /// last. A get of one of them is a cycle.
     ancestors: Vec<usize>,
     /// The count of the memo gets that the converter is in.
     gets: usize,
+    /// The JSON of each value that a get expanded, by the address of the
+    /// value and the depth.
+    expanded: HashMap<(usize, usize), Expanded>,
     references: Vec<Reference>,
 }
 
@@ -245,18 +287,19 @@ impl<'t> Converter<'t> {
         match node {
             Node::None => Value::Null,
             Node::Bool(value) => Value::Bool(value.value()),
-            Node::Int(int) => match text::int(int) {
+            Node::Int(int) => match text::int(int, self.allowance()) {
                 IntValue::Small(value) if (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&value) => {
                     json!(value as i64)
                 }
                 IntValue::Small(value) => json!({ "$int": value.to_string() }),
-                IntValue::Large(text) => {
-                    let shown = self.cut(text.len());
-                    if shown < text.len() {
-                        json!({ "$int": &text[..shown], "length": text.len() })
-                    } else {
-                        json!({ "$int": text })
-                    }
+                IntValue::Large {
+                    start,
+                    length,
+                    whole,
+                } => {
+                    // The start is ASCII and fits the allowance.
+                    self.text_budget -= start.len();
+                    tagged("$int", start, whole, length)
                 }
             },
             Node::Float(float) => {
@@ -264,57 +307,72 @@ impl<'t> Converter<'t> {
                     Float::Binary(value) => Some(*value),
                     Float::Text(text) => text.parse().ok(),
                 };
-                match value.and_then(Number::from_f64) {
-                    Some(number) => Value::Number(number),
+                match value {
+                    Some(value) if value.is_finite() && value.fract() != 0.0 => {
+                        Number::from_f64(value).map_or(Value::Null, Value::Number)
+                    }
+                    Some(value) if value.is_finite() => json!({ "$float": format!("{value:?}") }),
+                    Some(value) if value.is_nan() => json!({ "$float": "nan" }),
+                    Some(value) if value > 0.0 => json!({ "$float": "inf" }),
+                    Some(_) => json!({ "$float": "-inf" }),
                     None => {
-                        let text = match (value, float) {
-                            (Some(value), _) if value.is_nan() => "nan".to_owned(),
-                            (Some(value), _) if value > 0.0 => "inf".to_owned(),
-                            (Some(_), _) => "-inf".to_owned(),
-                            (None, Float::Text(text)) => text.clone(),
-                            (None, Float::Binary(_)) => "nan".to_owned(),
-                        };
+                        let (text, _) = self.take_text(match float {
+                            Float::Text(text) => text,
+                            Float::Binary(_) => "nan",
+                        });
                         json!({ "$float": text })
                     }
                 }
             }
-            Node::Bytes(bytes) => {
-                let len = bytes.data.len();
-                let shown = self.cut(len);
-                bytes_value(&bytes.data[..shown], len)
-            }
+            Node::Bytes(bytes) => self.bytes(&bytes.data, true, bytes.data.len()),
             Node::ByteString(string) => {
-                let len = text::byte_string_len(string);
-                let shown = self.cut(len);
-                let start = text::byte_string_start(string, shown);
-                if shown < len {
-                    return bytes_value(&start, len);
-                }
-                match String::from_utf8(start) {
-                    Ok(text) => Value::String(text),
-                    Err(e) => bytes_value(e.as_bytes(), e.as_bytes().len()),
+                let length = text::byte_string_len(string);
+                let (start, whole) = text::byte_string_start(string, self.allowance());
+                let text = match String::from_utf8(start) {
+                    Ok(text) => Ok(text),
+                    // A start that ends inside a character is text up to it.
+                    Err(e) if !whole && e.utf8_error().error_len().is_none() => {
+                        let valid = e.utf8_error().valid_up_to();
+                        let mut bytes = e.into_bytes();
+                        bytes.truncate(valid);
+                        Ok(String::from_utf8(bytes).unwrap_or_default())
+                    }
+                    Err(e) => Err(e.into_bytes()),
+                };
+                match text {
+                    Ok(text) => {
+                        let (shown, fits) = self.take_text(&text);
+                        tagged("$str2", shown, whole && fits, length)
+                    }
+                    Err(bytes) => self.bytes(&bytes, whole, length),
                 }
             }
             Node::Unicode(value) => {
-                let len = text::unicode_len(value);
-                let shown = self.cut(len);
-                let start = text::unicode_start(value, shown);
-                if shown < len {
-                    json!({ "$str": start, "length": len })
+                let length = text::unicode_len(value);
+                let (start, whole) = text::unicode_start(value, self.allowance());
+                let (shown, fits) = self.take_text(&start);
+                if whole && fits {
+                    Value::String(shown.to_owned())
                 } else {
-                    Value::String(start)
+                    tagged("$str", shown, false, length)
                 }
             }
             Node::Tuple(tuple) => self.array(tuple.items.iter(), at, depth),
             Node::List(_) => self.array(list_items(node).into_iter(), at, depth),
             Node::Dict(_) => self.dict(node, at, depth),
             Node::Global(global) => {
-                json!({ "$global": format!("{}.{}", global.module, global.name) })
+                let (name, whole) = self.qualified(global);
+                tagged(
+                    "$global",
+                    name,
+                    whole,
+                    global.module.len() + 1 + global.name.len(),
+                )
             }
             Node::Persistent(pid) => self.reference(pid, at, depth),
             Node::Reduce(reduce) => {
                 let callable = match self.resolver.resolve(&reduce.callable) {
-                    Some(Node::Global(global)) => format!("{}.{}", global.module, global.name),
+                    Some(Node::Global(global)) => self.qualified(global).0,
                     _ => String::new(),
                 };
                 let len = at.len();
@@ -325,26 +383,17 @@ impl<'t> Converter<'t> {
             }
             Node::Get(get) => match self.resolver.resolve(node) {
                 None => json!({ "$memo": get.index }),
-                Some(value) => {
-                    let address = std::ptr::from_ref(value.value()).addr();
-                    if self.ancestors.contains(&address) {
-                        return json!({ "$cycle": get.index });
-                    }
-                    self.gets += 1;
-                    let value = self.value(value, at, depth + 1);
-                    self.gets -= 1;
-                    value
-                }
+                Some(value) => self.expand(value, get.index, at, depth + 1),
             },
             Node::Opaque(opaque) => {
-                let len = opaque.bytes.len();
-                let shown = self.cut(len);
-                let mut value = json!({
-                    "$opaque": opcode_name(opaque.opcode),
-                    "pickle": text::hex(&opaque.bytes[..shown]),
-                });
-                if shown < len {
-                    value["length"] = json!(len);
+                let length = opaque.bytes.len();
+                // Each byte takes two hex digits.
+                let shown = length.min(self.allowance() / 2);
+                self.text_budget -= 2 * shown;
+                let mut value = tagged("$opaque", opcode_name(opaque.opcode), true, length);
+                value["pickle"] = json!(text::hex(&opaque.bytes[..shown]));
+                if shown < length {
+                    value["length"] = json!(length);
                 }
                 value
             }
@@ -353,12 +402,92 @@ impl<'t> Converter<'t> {
         }
     }
 
-    /// Take up to `len` bytes from the text budget, and at most
-    /// `MAX_TEXT`. Return the count of bytes to show.
-    fn cut(&mut self, len: usize) -> usize {
-        let shown = len.min(MAX_TEXT).min(self.text_budget);
-        self.text_budget -= shown;
-        shown
+    /// Return the JSON of `value`, which a get with the memo index `index`
+    /// stands for, at the depth `depth`. Reuse the JSON of an earlier get
+    /// of the same value at the same depth, when the budgets can pay for
+    /// it.
+    fn expand(&mut self, value: &'t Node, index: u32, at: &mut String, depth: usize) -> Value {
+        let address = std::ptr::from_ref(value.value()).addr();
+        if self.ancestors.contains(&address) {
+            return json!({ "$cycle": index });
+        }
+        if let Some(earlier) = self.expanded.get(&(address, depth))
+            && earlier.values <= self.budget
+            && earlier.text <= self.text_budget
+        {
+            self.budget -= earlier.values;
+            self.text_budget -= earlier.text;
+            return earlier.value.clone();
+        }
+        let (budget, text_budget) = (self.budget, self.text_budget);
+        self.gets += 1;
+        let json = self.value(value, at, depth);
+        self.gets -= 1;
+        self.expanded.insert(
+            (address, depth),
+            Expanded {
+                value: json.clone(),
+                values: budget - self.budget,
+                text: text_budget - self.text_budget,
+            },
+        );
+        json
+    }
+
+    /// Return the JSON bytes of text that one value can still take.
+    fn allowance(&self) -> usize {
+        MAX_TEXT.min(self.text_budget)
+    }
+
+    /// Take the longest start of `text` that the allowance pays for. Return
+    /// it, and tell if it is the whole text.
+    fn take_text<'a>(&mut self, text: &'a str) -> (&'a str, bool) {
+        let (end, cost) = text::fit(text, self.allowance());
+        self.text_budget -= cost;
+        (&text[..end], end == text.len())
+    }
+
+    /// Return bytes as `{"$bytes": "<escaped>"}`, as far as the allowance
+    /// pays for. `whole` tells if `bytes` is the whole value, and `length`
+    /// is the size of the value in the record.
+    fn bytes(&mut self, bytes: &[u8], whole: bool, length: usize) -> Value {
+        let allowance = self.allowance();
+        // Each byte takes one JSON byte at least.
+        let start = &bytes[..bytes.len().min(allowance)];
+        let (escaped, shown, cost) = text::escape_within(start, allowance);
+        self.text_budget -= cost;
+        tagged("$bytes", escaped, whole && shown == bytes.len(), length)
+    }
+
+    /// Return the name of a GLOBAL, `module.name`, as far as the allowance
+    /// pays for, and tell if it is whole.
+    fn qualified(&mut self, global: &Global) -> (String, bool) {
+        let mut name = String::new();
+        for part in [global.module.as_str(), ".", global.name.as_str()] {
+            let (shown, whole) = self.take_text(part);
+            name.push_str(shown);
+            if !whole {
+                return (name, false);
+            }
+        }
+        (name, true)
+    }
+
+    /// Return the pointer of a reference at `at`, within `MAX_POINTER` and
+    /// the pointer budget. A longer pointer gives way to the pointer of the
+    /// innermost value that holds the reference and fits.
+    fn pointer(&mut self, at: &str) -> String {
+        let limit = MAX_POINTER.min(self.pointer_budget);
+        let end = if at.len() <= limit {
+            at.len()
+        } else {
+            at.as_bytes()[..=limit]
+                .iter()
+                .rposition(|&byte| byte == b'/')
+                .unwrap_or(0)
+        };
+        self.pointer_budget -= end;
+        at[..end].to_owned()
     }
 
     fn array(
@@ -377,27 +506,49 @@ impl<'t> Converter<'t> {
         Value::Array(array)
     }
 
+    /// Return the keys of a dict as the keys of a JSON object, or `None`
+    /// when the dict must be a list of pairs. Take their JSON size from
+    /// the text budget.
+    fn keys(&mut self, entries: &[&'t (Node, Node)]) -> Option<Vec<String>> {
+        // Check the sizes in the record first, so that no long key is
+        // decoded.
+        let mut size = 0;
+        for (key, _) in entries {
+            let len = text::text_len(&self.resolver, key)?;
+            if len > MAX_KEY {
+                return None;
+            }
+            size += len;
+        }
+        if size > self.text_budget {
+            return None;
+        }
+        let keys: Vec<String> = entries
+            .iter()
+            .map(|(key, _)| text::text(&self.resolver, key))
+            .collect::<Option<_>>()?;
+        if keys
+            .iter()
+            .any(|key| key.len() > MAX_KEY || key.starts_with('$'))
+        {
+            return None;
+        }
+        let cost: usize = keys
+            .iter()
+            .flat_map(|key| key.chars())
+            .map(text::json_cost)
+            .sum();
+        if cost > self.text_budget {
+            return None;
+        }
+        self.text_budget -= cost;
+        Some(keys)
+    }
+
     fn dict(&mut self, node: &'t Node, at: &mut String, depth: usize) -> Value {
         let entries = dict_entries(node);
-        // Text keys whose size fits the text budget become the keys of an
-        // object, unless one of them looks like a tag.
-        let size: Option<usize> = entries
-            .iter()
-            .map(|(key, _)| text::text_len(&self.resolver, key))
-            .sum();
-        let keys: Option<Vec<String>> = match size {
-            Some(size) if size <= self.text_budget => {
-                self.text_budget -= size;
-                entries
-                    .iter()
-                    .map(|(key, _)| text::text(&self.resolver, key))
-                    .collect()
-            }
-            _ => None,
-        };
-        let keys = keys.filter(|keys| !keys.iter().any(|key| key.starts_with('$')));
         let len = at.len();
-        let Some(keys) = keys else {
+        let Some(keys) = self.keys(&entries) else {
             // A list of pairs.
             push_segment(at, "$dict");
             let pairs = entries
@@ -433,17 +584,16 @@ impl<'t> Converter<'t> {
             at.truncate(len);
             return json!({ "$persistent": pid });
         };
-        let class = target
-            .class
-            .and_then(|class| self.resolver.resolve(class))
-            .and_then(|class| match class {
-                Node::Global(global) => Some(format!("{}.{}", global.module, global.name)),
-                _ => None,
-            });
+        let class = match target.class.and_then(|class| self.resolver.resolve(class)) {
+            Some(Node::Global(global)) => Some(self.qualified(global).0),
+            _ => None,
+        }
+        .filter(|class| !class.is_empty());
         if !target.weak && self.gets == 0 {
+            let at = self.pointer(at);
             self.references.push(Reference {
                 oid: target.oid,
-                at: at.clone(),
+                at,
             });
         }
         let mut value = json!({ "$ref": oid_repr(target.oid), "class": class });
@@ -462,9 +612,10 @@ impl<'t> Converter<'t> {
                 _ => None,
             }) {
                 if let Some(target) = target(&self.resolver, pid).filter(|t| !t.weak) {
+                    let at = self.pointer(at);
                     self.references.push(Reference {
                         oid: target.oid,
-                        at: at.to_owned(),
+                        at,
                     });
                 }
             }
@@ -509,7 +660,7 @@ mod tests {
                 1.5,
                 "a",
                 {"$bytes": "\\x00\\xff"},
-                "b",
+                {"$str2": "b"},
                 [1],
                 {"$int": "18446744073709551616"},
             ])
@@ -553,10 +704,114 @@ mod tests {
         let bytes = [&b"B"[..], &(len as u32).to_le_bytes(), &vec![0xff; len]].concat();
         let (state, _) = decode(&bytes);
         assert_eq!(state["length"], json!(len));
-        assert_eq!(state["$bytes"].as_str().unwrap().len(), 4 * MAX_TEXT);
+        // Each byte is an escape of four characters, five in JSON.
+        let escaped = state["$bytes"].as_str().unwrap();
+        assert_eq!(escaped.len(), 4 * (MAX_TEXT / 5));
+        assert!(json!(escaped).to_string().len() - 2 <= MAX_TEXT);
+
+        // A quote takes two bytes in JSON.
+        let quotes = [
+            &b"X"[..],
+            &(MAX_TEXT as u32).to_le_bytes(),
+            &b"\"".repeat(MAX_TEXT),
+        ]
+        .concat();
+        let (state, _) = decode(&quotes);
+        assert_eq!(state["$str"].as_str().unwrap().len(), MAX_TEXT / 2);
+
+        let python2 = [&b"T"[..], &(len as u32).to_le_bytes(), &b"a".repeat(len)].concat();
+        let (state, _) = decode(&python2);
+        assert_eq!(state["length"], json!(len));
+        assert_eq!(state["$str2"].as_str().unwrap().len(), MAX_TEXT);
 
         let (state, _) = decode(b"X\x02\x00\x00\x00ab");
         assert_eq!(state, json!("ab"));
+    }
+
+    #[test]
+    fn a_float_without_a_fraction_keeps_its_type() {
+        let (state, _) = decode(b"(G?\xf0\x00\x00\x00\x00\x00\x00G?\xf8\x00\x00\x00\x00\x00\x00t");
+        assert_eq!(state, json!([{"$float": "1.0"}, 1.5]));
+    }
+
+    /// The pickle of a dict that holds `inner` under a key of `size`
+    /// bytes.
+    fn under_key(size: usize, inner: &[u8]) -> Vec<u8> {
+        let key = [&b"X"[..], &(size as u32).to_le_bytes(), &b"k".repeat(size)].concat();
+        [&b"}"[..], &key, inner, b"s"].concat()
+    }
+
+    #[test]
+    fn a_dict_with_a_long_key_is_a_list_of_pairs() {
+        let (state, _) = decode(&under_key(MAX_KEY, b"K\x01"));
+        assert_eq!(state["k".repeat(MAX_KEY)], json!(1));
+        let (state, found) = decode(&under_key(MAX_KEY + 1, &reference(5)));
+        assert_eq!(state["$dict"][0][0], json!("k".repeat(MAX_KEY + 1)));
+        assert_eq!(references(&found), [(5, "/$dict/0/1")]);
+    }
+
+    #[test]
+    fn a_long_pointer_gives_way_to_the_pointer_of_a_holder() {
+        let mut state = reference(5);
+        for _ in 0..10 {
+            state = under_key(200, &state);
+        }
+        let full = format!("/{}", "k".repeat(200)).repeat(10);
+        let (state, found) = decode(&state);
+        let [(5, at)] = references(&found)[..] else {
+            panic!("{found:?}");
+        };
+        assert!(at.len() <= MAX_POINTER && !at.is_empty(), "{}", at.len());
+        assert!(full.starts_with(at) && full.as_bytes()[at.len()] == b'/');
+        assert!(state.pointer(at).is_some_and(Value::is_object));
+        assert_eq!(state.pointer(&full).unwrap()["$ref"], json!("0x05"));
+    }
+
+    #[test]
+    fn the_pointers_of_a_state_stop_at_the_pointer_budget() {
+        // References in a list under four keys of 250 bytes: each pointer
+        // takes about 1,010 bytes.
+        let count = POINTER_BUDGET / 1000 + 100;
+        let mut list = b"](".to_vec();
+        for _ in 0..count {
+            list.extend(reference(5));
+        }
+        list.push(b'e');
+        let mut state = list;
+        for _ in 0..4 {
+            state = under_key(250, &state);
+        }
+        let (state, found) = decode(&state);
+        assert_eq!(found.len(), count);
+        let total: usize = found.iter().map(|r| r.at.len()).sum();
+        assert!(total <= POINTER_BUDGET, "{total}");
+        assert!(found.last().unwrap().at.len() < found[0].at.len());
+        for reference in &found {
+            assert!(state.pointer(&reference.at).is_some(), "{}", reference.at);
+        }
+    }
+
+    #[test]
+    fn many_gets_of_a_large_int_take_little_time() {
+        // A LONG4 of 1 MiB whose low bytes are all zero, the slowest case,
+        // then 100,000 gets of it.
+        const LEN: usize = 1 << 20;
+        let gets = 100_000;
+        let mut long = vec![0; LEN];
+        long[LEN - 1] = 0x80;
+        let mut state = [&b"(\x8b"[..], &(LEN as u32).to_le_bytes(), &long, b"q\x01"].concat();
+        state.extend(b"h\x01".repeat(gets));
+        state.push(b't');
+        let started = std::time::Instant::now();
+        let (state, _) = decode(&state);
+        let elapsed = started.elapsed();
+        let items = state.as_array().unwrap();
+        assert_eq!(items.len(), gets + 1);
+        assert_eq!(items[1], items[0]);
+        assert_eq!(items[gets], json!({"$int": "", "length": LEN}));
+        // Each get reuses the JSON of the first one, or takes nothing when
+        // the text budget is spent. A full conversion per get takes hours.
+        assert!(elapsed.as_secs() < 20, "{elapsed:?}");
     }
 
     #[test]
