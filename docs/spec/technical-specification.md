@@ -224,7 +224,7 @@ The core is a synchronous Rust library, `zoe-core`, with no Python and no tokio 
 | --- | --- | --- | --- |
 | `records` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a record frame; its header carries the serial of the previous record, its payload the pickle bytes or their zstd frame, as the codec byte says | one row per object version; a 0-length payload marks deletion by pack or `deleteObject` |
 | `txns` | `tid: u64` big-endian, 8 bytes | a frame whose payload is the status byte, the oid count as a `u64`, then user, description and extension, each with a `u32` length; the oid count and the three lengths are little-endian | the transaction log; status is `committing` until the finish record lands |
-| `blobs` | `(oid, tid)` | blob file name + size + checksum | the file itself lives in the blob store |
+| `blobs` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a frame with previous serial 0 whose payload is the BLAKE3 hash of the blob file (32 bytes), then the size of the file in bytes as a little-endian `u64` | one row per blob revision, written in the same backend transaction as its record; the file lives in the blob store, at the BushyLayout path of `(oid, tid)`; a store without the table has no blobs |
 | `meta` | fixed text keys | `format` (`ZOE format 1`), `last_tid`, `next_oid`, `pack_watermark`; numbers are 8-byte big-endian | one row each |
 
 `loadBefore(oid, tid)` is a reverse range scan from `(oid, tid - 1)`; `load(oid)` is `loadBefore(oid, MAX)`; `loadSerial` is a point read. This is the RelStorage history-preserving layout, which is what makes MVCC and `history()` free.
@@ -260,7 +260,7 @@ The merge policy is a versioned object in the store, so it is transactional and 
 
 **Pack.** Pack at tid T walks `records` and `txns` in reverse, marks reachable versions from the root as of T, deletes unreachable versions and every version older than the newest at or before T. It runs in batches inside MVCC read snapshots, so it never blocks readers; writers are only paused for the final meta update. Blob files are deleted after their record. `pack` is exposed on both skins and as a CLI (`zoe pack --days 7`).
 
-**Blobs.** The blob store is a trait with two implementations: a directory tree `blobs/<oid hex>/<tid hex>.blob` (same layout as ZODB's `BushyLayout`, so existing tools understand it), and an S3-compatible store with a local LRU cache. `storeBlob` streams into a temp file and renames it into place inside `tpc_finish`; `loadBlob` returns a path (simple mode) or streams chunks (server mode).
+**Blobs.** The blob store is a trait with two implementations: a directory tree beside the store, and an S3-compatible store with a local LRU cache. The directory tree is `blobs/` in ZODB's `BushyLayout`, so existing tools understand it: `blobs/.layout` holds `bushy`, and the file of `(oid, tid)` is one directory per big-endian byte of the oid, then the tid as ZODB's `tid_repr` writes it, for example `blobs/0x00/0x00/0x00/0x00/0x00/0x00/0x12/0x34/0x03f6db4f24444444.blob`. A committed blob file is read-only and immutable per `(oid, tid)`. `storeBlob` writes into a temp file in `blobs/tmp/`, computes its BLAKE3 hash on the way, and syncs it. `tpc_finish` places the files before the backend commit: it writes and syncs an intent file in `blobs/tmp/` that names the tid and the oids, renames each file into place and syncs its directory. The backend write transaction then holds each blob record (hash and size) next to its record, and the intent file is removed. So a crash never leaves a blob record without its file. A crash can leave a file without its record: the next open reads only `blobs/tmp/`, never the whole tree, and removes the files that an intent file names and that have no blob record. Every read through the core checks the size and the hash at the end of the file; a mismatch is a distinct `CorruptBlob` error with the oid and tid. `loadBlob` returns a path (simple mode) or streams chunks (server mode). ADR 0023 records the blob record and the crash order.
 
 **Undo.** Every `(oid, tid)` record stays until pack, so undoing a transaction T is a read and a write: for each oid in T, the undo transaction stores the state the oid had before T (`loadBefore(oid, T)`), or a delete record when T created it. When the oid's current record is T's, that is the whole job; when later transactions changed it, the write goes through the resolution tiers as a three-way merge, with T's state as the base, the current state as ours and the pre-T state as theirs, and fails with `UndoError` when no tier resolves it. A blob record points at the earlier blob file, immutable per `(oid, tid)`. `undoLog` and `undoInfo` read the transaction index; nothing is undoable past the last pack. In server mode `undoa` queues the undo into the running transaction and `vote` does the work, as ZEO's own server does.
 
@@ -278,6 +278,7 @@ The merge policy is a versioned object in the store, so it is transactional and 
 pub trait Backend: Send + Sync {
     fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>>;
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
+    fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>>;
     fn last_tid(&self) -> Tid;
     fn begin_write(&self) -> Result<WriteTxn<'_>>;      // one per tpc_finish
     fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_>;
@@ -291,6 +292,7 @@ pub trait Backend: Send + Sync {
 
 pub trait WriteTxn {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
+    fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
     fn commit(self) -> Result<()>;                        // durable on return
 }
