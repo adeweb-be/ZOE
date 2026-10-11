@@ -214,11 +214,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// that it staged. Return `None` when the transaction did not stage
     /// `oid`.
     ///
-    /// A pickle in the spill file is read from the file. A pickle that the
-    /// file cannot give back, after an I/O error or a hash mismatch, also
-    /// gives `None`.
-    pub fn staged(&self, oid: Oid) -> Option<(Tid, Cow<'_, [u8]>)> {
-        self.staged.get(oid).ok().flatten()
+    /// A pickle in the spill file is read from the file. A read that fails,
+    /// or whose bytes do not match the hash of the pickle, fails the call
+    /// with `Io`.
+    pub fn staged(&self, oid: Oid) -> Result<Option<(Tid, Cow<'_, [u8]>)>> {
+        self.staged.get(oid)
     }
 
     /// Return the bytes of the staged pickles that the transaction keeps in
@@ -909,8 +909,9 @@ mod tests {
         txn.store(read, first, b"c").unwrap();
         assert!(matches!(txn.vote(), Err(ZoeError::Conflict { oid }) if oid == read));
         assert_eq!(txn.conflict_serials(), Some((second, first)));
-        assert_eq!(txn.staged(read), Some((first, Cow::Borrowed(&b"c"[..]))));
-        assert_eq!(txn.staged(written), None);
+        let staged = txn.staged(read).unwrap();
+        assert_eq!(staged, Some((first, Cow::Borrowed(&b"c"[..]))));
+        assert_eq!(txn.staged(written).unwrap(), None);
 
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store(read, second, b"c").unwrap();
@@ -996,7 +997,8 @@ mod tests {
             data: b"b".to_vec(),
         };
         assert_eq!(conflicts, [(stale, committed)]);
-        assert_eq!(txn.staged(stale), Some((first, Cow::Borrowed(&b"c"[..]))));
+        let staged = txn.staged(stale).unwrap();
+        assert_eq!(staged, Some((first, Cow::Borrowed(&b"c"[..]))));
         assert_eq!(txn.conflict_serials(), None);
 
         // The transaction keeps the lock: another vote on the oid cannot
@@ -1263,12 +1265,12 @@ mod tests {
         assert_eq!(txn.staged_in_memory(), 1);
         assert!(spills(&vfs));
 
-        let (serial, data) = txn.staged(Oid(1)).unwrap();
+        let (serial, data) = txn.staged(Oid(1)).unwrap().unwrap();
         assert!(matches!(data, Cow::Borrowed(b"a")));
         assert_eq!(serial, Tid::ZERO);
-        let (serial, data) = txn.staged(Oid(2)).unwrap();
+        let (serial, data) = txn.staged(Oid(2)).unwrap().unwrap();
         assert_eq!((serial, &*data), (Tid(5), &b"bb"[..]));
-        assert!(txn.staged(Oid(3)).is_none());
+        assert!(txn.staged(Oid(3)).unwrap().is_none());
     }
 
     #[test]
@@ -1354,7 +1356,7 @@ mod tests {
         assert!(spills(&vfs));
         let conflicts = txn.vote_resolving().unwrap();
         assert_eq!(conflicts.len(), 1);
-        let (serial, data) = txn.staged(oid).unwrap();
+        let (serial, data) = txn.staged(oid).unwrap().unwrap();
         assert!(matches!(data, Cow::Owned(_)));
         assert_eq!((serial, &*data), (first, &b"c"[..]));
 
@@ -1408,5 +1410,32 @@ mod tests {
         assert!(store.locks.is_empty());
         assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
         assert_eq!(store.last_transaction(), Tid::ZERO);
+    }
+
+    /// A spill file that changed while the caller resolves a conflict fails
+    /// `staged` with the error of the read, never with `None`. The
+    /// transaction keeps its locks until the caller aborts it.
+    #[test]
+    fn a_damaged_spill_file_fails_staged_during_resolution() {
+        let (vfs, store) = spilling_store(0);
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        commit(&store, oid, first, b"b");
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"c").unwrap();
+        assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+        let name = &Vfs::list_files(&vfs, "staging").unwrap()[0];
+        vfs.file(&format!("staging/{name}")).write(0, b"x").unwrap();
+
+        let error = txn.staged(oid).unwrap_err();
+        assert!(
+            matches!(&error, ZoeError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{error:?}"
+        );
+        assert!(!store.lock_table_is_empty());
+        txn.abort();
+        assert!(store.lock_table_is_empty());
+        assert!(!spills(&vfs));
     }
 }

@@ -739,7 +739,7 @@ mod tests {
                 .unwrap()
         });
         assert!(matches!(refused, Err(ZoeError::WrongThread)), "{refused:?}");
-        assert!(txn.staged(oid).is_none());
+        assert!(txn.staged(oid).unwrap().is_none());
         assert!(temp_files(&vfs).is_empty());
     }
 
