@@ -7,6 +7,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/storage.rs`: `zoe._zoe.Storage`, a frozen pyclass that Python can subclass. It implements the `IStorage` methods that ZODB's `MVCCAdapter` calls.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
+- `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
 - `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage` and adds `tpc_vote` with the conflict resolution, `history`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
 
 ## Invariants
@@ -33,6 +34,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - A read-only storage refuses `tpc_begin`, `new_oid`, `store` and `pack` with `ReadOnlyError`. It does not create a missing directory. It still opens the store for writes and takes the exclusive lock, until the core has a read-only open.
 - `close` marks the table closed and aborts the open transactions. A `tpc_begin` that read the store before the close finds the mark when it inserts its entry, aborts its transaction and raises `StorageError`. So no transaction keeps the store open after `close`, and the directory lock is free when no call is in progress. A second `close` does nothing. A call on a closed storage raises `StorageError`.
 - `close` aborts the transactions that no call uses first. Their locks go, so a vote that waits for one of them ends at once, and `close` does not wait for a lock timeout.
+- `Storage.sequence(name)` returns a `zoe._zoe.Sequence` for the sequence `name` of the store. Its `next()` returns an `int`. It is not part of a ZODB transaction: it takes no transaction entry and no per-OID lock, and an abort does not give the value back. The `Sequence` holds the storage, not the store, so `next` reads the store as the other calls do: after `close`, `sequence` and `next` raise `StorageError`. `next` runs inside `py.detach`. A read-only storage refuses `next` with `ReadOnlyError`. `Sequence.__traverse__` reports the storage to the garbage collector, so a cycle such as `storage.x = storage.sequence(name)` is collectable. `Sequence` has no `__clear__`, because it is frozen: the collector breaks the cycle at the attributes of the storage.
 - `__len__` returns 0: IStorage asks only for an approximate length, and the store keeps no object count. `getSize` is the size of the files in the store directory. `getName` and `sortKey` are the canonical path of the directory.
 - `pack(t, referencesf)` turns `t` into a tid as ZODB's own storages do: `TimeStamp(*time.gmtime(t)[:5] + (t % 60,))`. Then `_pack` runs `Store::pack` at that tid. The pack keeps every record after the tid and, for each object that a reader at the tid or later can reach, the newest record at or before it. `pack` never calls `referencesf`: the core reads the references in the pickles.
 - `_pack` runs the whole pack inside one `py.detach`, so the GIL is free from start to end. The pack takes no per-OID lock and does not wait for a publication. Other threads read and commit while it runs: a commit waits for at most one batch of the pack. A second pack waits for the first. A pack can run from any thread, also while a transaction of that thread is open.
@@ -53,7 +55,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 | `ReadConflict` | `ReadConflictError` with `oid` and `serials == (current, read)` |
 | `WrongThread` | `zoe.WrongThread` |
 | `Protocol`, `LockOrder` | `StorageTransactionError` |
-| `Halted`, `CorruptRecord`, `CorruptBlob`, `CorruptTxn`, `Backend` | `StorageSystemError` |
+| `Halted`, `CorruptRecord`, `CorruptBlob`, `CorruptTxn`, `CorruptSequence`, `Backend` | `StorageSystemError` |
 | `Locked`, `Closed`, `Format`, `ReadOnly`, `NotClosedCleanly` | `StorageError` |
 | `Io` | `OSError` |
 

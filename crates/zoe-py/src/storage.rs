@@ -34,6 +34,7 @@ use zoe_core::{Oid, Options, Store, Tid, Txn, ZoeError};
 
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
+use crate::sequence::Sequence;
 
 /// A transaction of the core that shares its store.
 type SharedTxn = Txn<Arc<Store>>;
@@ -113,6 +114,23 @@ impl Storage {
         store.ok_or_else(|| errors::closed(py))
     }
 
+    /// Fail when the storage is closed. Take no reference to the store, so
+    /// that the store never drops while the thread is attached.
+    fn check_open(&self, py: Python<'_>) -> PyResult<()> {
+        // The guard drops at the end of this statement. Building the
+        // exception runs Python code, so it must come after.
+        let open = self
+            .store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if open {
+            Ok(())
+        } else {
+            Err(errors::closed(py))
+        }
+    }
+
     fn table(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -131,6 +149,17 @@ impl Storage {
     fn remove(&self, transaction: &Bound<'_, PyAny>) -> Option<Arc<Entry>> {
         let key = transaction.as_ptr() as usize;
         self.table().entries.remove(&key)
+    }
+
+    /// Return the next value of the sequence `name`. A read-only storage
+    /// refuses the call.
+    pub(crate) fn next_value(&self, py: Python<'_>, name: &str) -> PyResult<u64> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let store = self.opened(py)?;
+        py.detach(move || store.sequence(name).next())
+            .map_err(|e| core(py, e))
     }
 }
 
@@ -330,6 +359,13 @@ impl Storage {
         py.detach(move || store.pack(tid))
             .map(|_report| ())
             .map_err(|error| errors::pack_failure(py, error))
+    }
+
+    /// Return the sequence `name` of the store. Its `next()` gives values
+    /// that are unique and strictly increasing per store and per name.
+    fn sequence(slf: &Bound<'_, Self>, name: String) -> PyResult<Sequence> {
+        slf.get().check_open(slf.py())?;
+        Ok(Sequence::new(slf.clone().unbind(), name))
     }
 
     /// Begin a two-phase commit of `transaction`. The calling thread

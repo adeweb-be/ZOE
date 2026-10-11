@@ -92,6 +92,7 @@ impl Failure {
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }
             | ZoeError::CorruptTxn { .. }
+            | ZoeError::CorruptSequence { .. }
             | ZoeError::Backend(_) => message(storage_system_error(py), &self.error),
         }
     }

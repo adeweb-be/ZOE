@@ -1,14 +1,15 @@
 //! The redb backend.
 //!
-//! Five tables hold the key spaces of the data model: `records`,
-//! `txn_oids`, `blobs`, `txns` and `meta`. `format` says how keys and
+//! Six tables hold the key spaces of the data model: `records`,
+//! `txn_oids`, `blobs`, `txns`, `sequences` and `meta`. `format` says how keys and
 //! values are written. `txn_oids` is the transaction index: `put_record`
 //! writes the index key of each record in the write transaction of the
 //! record, and `remove_record` removes the key with the record.
-//! `initialise` creates all five, so a new store has an empty
-//! `blobs` table. A store written before the `blobs` table has none until
-//! its first blob commit creates it. Until then it reads as a store
-//! without blob records.
+//! `initialise` creates all six, so a new store has an empty `blobs`
+//! table and an empty `sequences` table. A store written before one of
+//! these tables has none until its first blob commit or its first
+//! reservation creates it. Until then it reads as a store without blob
+//! records or without sequences.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -31,6 +32,7 @@ const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records
 const TXN_OIDS: TableDefinition<&[u8; 16], ()> = TableDefinition::new("txn_oids");
 const BLOBS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("blobs");
 const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
+const SEQUENCES: TableDefinition<&str, &[u8]> = TableDefinition::new("sequences");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_FORMAT: &str = "format";
@@ -127,6 +129,7 @@ impl RedbBackend {
             txn.open_table(TXN_OIDS).map_err(backend)?;
             txn.open_table(BLOBS).map_err(backend)?;
             txn.open_table(TXNS).map_err(backend)?;
+            txn.open_table(SEQUENCES).map_err(backend)?;
             let mut meta = txn.open_table(META).map_err(backend)?;
             meta.insert(META_FORMAT, format::FORMAT_NAME)
                 .map_err(backend)?;
@@ -630,6 +633,27 @@ impl Backend for RedbBackend {
     fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
         self.remove_for_test(RECORDS, &format::record_key(oid, tid), oid)
     }
+
+    fn sequence_end(&self, name: &str) -> Result<Option<u64>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let sequences = match txn.open_table(SEQUENCES) {
+            Ok(sequences) => sequences,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let Some(value) = sequences.get(name).map_err(backend)? else {
+            return Ok(None);
+        };
+        let end = format::decode_frame(name.as_bytes(), value.value())
+            .and_then(|frame| format::decode_sequence(&frame.data))
+            .map_err(|e| {
+                let corrupt = ZoeError::CorruptSequence {
+                    name: name.to_owned(),
+                };
+                refused(e, &format!("sequence row {name:?}"), corrupt)
+            })?;
+        Ok(Some(end))
+    }
 }
 
 /// One redb write transaction.
@@ -744,6 +768,14 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn put_pack_watermark(&mut self, tid: Tid) -> Result<()> {
         self.pack_watermark = Some(tid);
+        Ok(())
+    }
+
+    fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()> {
+        let payload = format::encode_sequence(end);
+        let frame = format::encode_frame(name.as_bytes(), format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let mut sequences = self.txn.open_table(SEQUENCES).map_err(backend)?;
+        sequences.insert(name, frame.as_slice()).map_err(backend)?;
         Ok(())
     }
 
@@ -1904,5 +1936,105 @@ mod tests {
             };
             assert!(allowed.contains(&&tids[..]), "{image:?}: {tids:?}");
         }
+    }
+
+    /// Commit the row of the sequence `name` with `end`.
+    fn commit_sequence(backend: &RedbBackend, name: &str, end: u64) {
+        let mut write = backend.begin_write().unwrap();
+        write.put_sequence_end(name, end).unwrap();
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn a_sequence_row_round_trips_and_changes_no_meta_row() {
+        let backend = empty();
+        assert_eq!(backend.sequence_end("intids").unwrap(), None);
+        commit_sequence(&backend, "intids", 101);
+        commit_sequence(&backend, "a name / with é", 7);
+        assert_eq!(backend.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(backend.sequence_end("a name / with é").unwrap(), Some(7));
+        assert_eq!(backend.sequence_end("lexicon").unwrap(), None);
+        assert_eq!(backend.last_tid(), Tid::ZERO);
+        assert_eq!(backend.next_oid().unwrap(), Oid(1));
+
+        let reopened = RedbBackend::open_db(backend.db).unwrap();
+        assert_eq!(reopened.last_tid(), Tid::ZERO);
+        assert_eq!(reopened.sequence_end("intids").unwrap(), Some(101));
+    }
+
+    #[test]
+    fn a_store_without_the_sequences_table_has_no_sequence_row() {
+        let db = redb::Builder::new()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(RECORDS).unwrap();
+        txn.open_table(TXN_OIDS).unwrap();
+        txn.open_table(TXNS).unwrap();
+        {
+            let mut meta = txn.open_table(META).unwrap();
+            meta.insert(META_FORMAT, format::FORMAT_NAME).unwrap();
+            meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
+                .unwrap();
+            meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let backend = RedbBackend::open(db).unwrap();
+        assert_eq!(backend.sequence_end("intids").unwrap(), None);
+        commit_sequence(&backend, "intids", 101);
+        assert_eq!(backend.sequence_end("intids").unwrap(), Some(101));
+    }
+
+    /// Replace the stored row of the sequence `name` with `frame`.
+    fn insert_sequence_frame(backend: &RedbBackend, name: &str, frame: &[u8]) {
+        let txn = backend.database().begin_write().unwrap();
+        txn.open_table(SEQUENCES)
+            .unwrap()
+            .insert(name, frame)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_damaged_sequence_row_is_a_corrupt_sequence() {
+        let backend = empty();
+        let good = format::encode_frame(
+            b"intids",
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &format::encode_sequence(101),
+        );
+        let mut flipped = good.clone();
+        *flipped.last_mut().unwrap() ^= 1;
+        let short = format::encode_frame(b"intids", format::MAIN_BRANCH, Tid::ZERO, &[1; 7]);
+        for frame in [flipped, short, good[..20].to_vec()] {
+            insert_sequence_frame(&backend, "intids", &frame);
+            let error = backend.sequence_end("intids");
+            assert!(
+                matches!(&error, Err(ZoeError::CorruptSequence { name }) if name == "intids"),
+                "{error:?}"
+            );
+        }
+        // A row stored under another name fails the checksum.
+        insert_sequence_frame(&backend, "lexicon", &good);
+        let error = backend.sequence_end("lexicon");
+        assert!(
+            matches!(&error, Err(ZoeError::CorruptSequence { name }) if name == "lexicon"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_sequence_row_of_a_newer_format_is_a_format_error() {
+        let backend = empty();
+        let frame = frame_with_codec(b"intids", 2, &format::encode_sequence(101));
+        insert_sequence_frame(&backend, "intids", &frame);
+        let error = backend.sequence_end("intids");
+        assert!(
+            matches!(&error, Err(ZoeError::Format(message)) if message.contains("header byte 2")),
+            "{error:?}"
+        );
     }
 }
