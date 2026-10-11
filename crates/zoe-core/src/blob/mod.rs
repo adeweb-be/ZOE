@@ -182,10 +182,20 @@ impl BlobStore {
         let mut orphan_dirs = BTreeSet::new();
         for (tid, oids) in &intents {
             for &oid in oids {
+                if has_blob_record(backend, oid, *tid)? {
+                    continue;
+                }
                 let blob = blob_name(oid, *tid);
-                if !has_blob_record(backend, oid, *tid)? && self.dir.exists(&blob)? {
+                if self.dir.exists(&blob)? {
                     self.dir.remove(&blob)?;
-                    orphan_dirs.insert(oid_dir(oid));
+                }
+                // An open that a crash stopped can have removed the file
+                // without a sync of its directory. A power loss then brings
+                // the file back. So the directory is synced also when the
+                // file is gone.
+                let dir = oid_dir(oid);
+                if self.dir.exists(&dir)? {
+                    orphan_dirs.insert(dir);
                 }
             }
         }
@@ -512,7 +522,7 @@ impl Read for BlobReader {
 mod tests {
     use super::*;
     use crate::store::Store;
-    use crate::vfs::MemVfs;
+    use crate::vfs::{CrashImage, MemVfs};
 
     const PICKLE: &[u8] = b"pickle";
 
@@ -837,8 +847,10 @@ mod tests {
     /// `bytes` of `oid` at `tid`.
     fn check_images(vfs: &MemVfs, oid: Oid, tid: Tid, bytes: &[u8]) {
         for image in vfs.crash_images() {
-            let store = Store::open_vfs(image.vfs())
+            let image_vfs = image.vfs();
+            let store = Store::open_vfs(image_vfs.clone())
                 .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            assert_no_orphan(&store, &image_vfs, &image);
             match store.load(oid) {
                 Ok((_, found)) => {
                     assert_eq!(found, tid, "{image:?}");
@@ -854,6 +866,92 @@ mod tests {
                 }
                 Err(e) => panic!("{image:?}: {e}"),
             }
+        }
+    }
+
+    /// Return the oid and the tid of the blob file `name`, or `None` when
+    /// `name` is not the name of a blob file.
+    fn blob_of(name: &str) -> Option<(Oid, Tid)> {
+        let parts: Vec<&str> = name.strip_prefix("blobs/")?.split('/').collect();
+        let [bytes @ .., file] = &parts[..] else {
+            return None;
+        };
+        if bytes.len() != 8 {
+            return None;
+        }
+        let mut oid = 0;
+        for byte in bytes {
+            oid = oid << 8 | u64::from(u8::from_str_radix(byte.strip_prefix("0x")?, 16).ok()?);
+        }
+        let tid = file.strip_prefix("0x")?.strip_suffix(".blob")?;
+        Some((Oid(oid), Tid(u64::from_str_radix(tid, 16).ok()?)))
+    }
+
+    /// Check that every blob file of `vfs` has its blob record in `store`.
+    fn assert_no_orphan(store: &Store, vfs: &MemVfs, image: &CrashImage) {
+        for name in vfs.names().iter().filter(|name| name.ends_with(".blob")) {
+            let (oid, tid) =
+                blob_of(name).unwrap_or_else(|| panic!("{image:?}: {name} is no blob file"));
+            assert!(
+                store.blob_path(oid, tid).is_ok(),
+                "{image:?} kept {name}, which has no blob record"
+            );
+        }
+    }
+
+    /// No crash image of a blob commit keeps a blob file without its blob
+    /// record after an open.
+    #[test]
+    fn every_crash_image_of_a_blob_commit_opens_without_an_orphan() {
+        let vfs = empty_store();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let tid = commit_blobs(&store, &[oid], b"blob");
+        vfs.mark("acknowledged");
+        drop(store);
+        check_images(&vfs, oid, tid, b"blob");
+    }
+
+    /// A finish dies after it places its blob file. The first open
+    /// removes the file and dies at the sync of its directory. A second
+    /// open finds the intent file but no blob file. A power loss after it
+    /// must not bring back a blob file that no record names.
+    #[test]
+    fn a_killed_recovery_then_an_open_then_a_power_loss() {
+        let built = MemVfs::new();
+        let oid = {
+            let store = Store::open_vfs(built.clone()).unwrap();
+            let oid = store.new_oid().unwrap();
+            commit_blobs(&store, &[oid], b"one");
+            oid
+        };
+        let vfs = built.settled();
+        let dir = oid_dir(oid);
+
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let serial = store.load(oid).unwrap().1;
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob(oid, serial, PICKLE, blob_file(&store, b"two"))
+            .unwrap();
+        txn.vote().unwrap();
+        vfs.kill_at_dir_sync(&dir);
+        assert!(txn.finish().is_err());
+        std::mem::forget(store);
+        vfs.restart();
+
+        vfs.kill_at_dir_sync(&dir);
+        assert!(Store::open_vfs(vfs.clone()).is_err());
+        vfs.restart();
+        drop(Store::open_vfs(vfs.clone()).unwrap());
+        vfs.mark("opened");
+
+        for image in vfs.crash_images() {
+            if !image.is_after("opened") {
+                continue;
+            }
+            let image_vfs = image.vfs();
+            let store = Store::open_vfs(image_vfs.clone()).unwrap();
+            assert_no_orphan(&store, &image_vfs, &image);
         }
     }
 
@@ -920,6 +1018,7 @@ mod tests {
             let store = Store::open_vfs(image_vfs.clone()).unwrap();
             let kept = read(&store, leftovers.oid, leftovers.tid);
             assert_eq!(kept.ok().as_deref(), Some(&b"kept"[..]), "{image:?}");
+            assert_no_orphan(&store, &image_vfs, &image);
             assert!(
                 !Vfs::exists(&image_vfs, &leftovers.orphan).unwrap(),
                 "{image:?} kept an orphan"
