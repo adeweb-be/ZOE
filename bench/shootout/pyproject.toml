@@ -26,6 +26,8 @@ dependencies = [
     # The zoe storage runs in this process. uv builds its extension from
     # python/zoedb with maturin.
     "zoedb",
+    # A direct dependency, so that the source below selects the fork.
+    "persistent",
 ]
 
 [dependency-groups]
@@ -38,6 +40,8 @@ dev = [
 # The cache keys of python/zoedb make uv build the extension again when the
 # Rust code changes. maturin builds it in the release profile.
 zoedb = { path = "../../python/zoedb", editable = true }
+# The fork of persistent that the workspace in python/ uses.
+persistent = { git = "https://github.com/adeweb-be/persistent", rev = "caeb9135ab15daf62b9031fcde1bb6965973d0e9" }
 
 [tool.uv.build-backend]
 module-name = "shootout"
