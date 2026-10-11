@@ -72,9 +72,19 @@ impl<'s> Txn<'s> {
 
     /// Stage a new version of `oid`. `serial` is the serial that the client
     /// read; it is `Tid::ZERO` for a new object.
+    ///
+    /// An empty pickle marks a deletion, so `store` refuses it with
+    /// `Protocol`. A restore transaction takes only `restore`, so `store`
+    /// refuses it there too.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
+        }
+        if self.tid.is_some() {
+            return Err(ZoeError::Protocol("store in a restore transaction"));
+        }
+        if data.is_empty() {
+            return Err(ZoeError::Protocol("store of an empty pickle"));
         }
         check_oid(oid)?;
         self.staged.insert(
@@ -394,6 +404,18 @@ mod tests {
                 Err(ZoeError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn store_refuses_an_empty_pickle_and_a_restore_transaction() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store(Oid(1), Tid::ZERO, b"");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        let error = txn.store(Oid(1), Tid::ZERO, b"a");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
     }
 
     #[test]
