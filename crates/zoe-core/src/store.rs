@@ -1070,6 +1070,10 @@ mod tests {
             store.backend.begin_write(),
             Err(ZoeError::ReadOnly)
         ));
+        assert!(matches!(
+            store.sequence("intids").next(),
+            Err(ZoeError::ReadOnly)
+        ));
         // A transaction that a skin begins on the store itself votes no.
         let mut txn = Txn::begin(&store, b"", b"", b"");
         txn.store(Oid(1), tid, b"b").unwrap();

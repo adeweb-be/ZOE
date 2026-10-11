@@ -85,9 +85,11 @@ impl<'a> Sequence<'a> {
     ///
     /// When the reserved values are all given, the call reserves the next
     /// block and waits for its write. When no value below `u64::MAX` is
-    /// left, it fails with `Protocol`. A failed call gives no value and
-    /// loses none: the next call gives the same value.
+    /// left, it fails with `Protocol`. A read-only store fails with
+    /// `ReadOnly`. A failed call gives no value and loses none: the next
+    /// call gives the same value.
     pub fn next(&self) -> Result<u64> {
+        self.store.writable()?;
         let mut slot = self.lock();
         let mut block = match *slot {
             Some(block) => block,
