@@ -389,25 +389,36 @@ impl Backend for RedbBackend {
     }
 
     fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
-        let read = || -> Result<Vec<Result<TxnMeta>>> {
-            let txn = self.db.begin_read().map_err(backend)?;
-            let txns = txn.open_table(TXNS).map_err(backend)?;
-            let (start, end) = (format::txn_key(from), format::txn_key(to));
-            let mut rows = Vec::new();
-            // Each key is after the key before it.
-            let mut after = Included(start);
-            for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
-                let (key, value) = entry.map_err(backend)?;
+        let (start, end) = (format::txn_key(from), format::txn_key(to));
+        let range = self
+            .db
+            .begin_read()
+            .map_err(backend)
+            .and_then(|txn| txn.open_table(TXNS).map_err(backend))
+            .and_then(|txns| txns.range::<&[u8; 8]>(&start..=&end).map_err(backend));
+        let mut range = match range {
+            Ok(range) => range,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        // The range keeps its snapshot. It reads one row at a time, so the
+        // memory does not grow with the range. Each key is after the key
+        // before it. A failed scan gives its error and ends the iterator.
+        let mut after = Included(start);
+        let mut failed = false;
+        Box::new(std::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            let row = range.next()?.map_err(backend).and_then(|(key, value)| {
                 inside_txns(key.value(), (after, Included(end)))?;
                 after = Excluded(*key.value());
-                rows.push(Self::txn_row(key.value(), value.value()));
-            }
-            Ok(rows)
-        };
-        match read() {
-            Ok(rows) => Box::new(rows.into_iter()),
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        }
+                Ok(Self::txn_row(key.value(), value.value()))
+            });
+            Some(row.unwrap_or_else(|e| {
+                failed = true;
+                Err(e)
+            }))
+        }))
     }
 
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
@@ -491,6 +502,33 @@ impl Backend for RedbBackend {
             oids.entry(tid).or_default().push(oid);
         }
         Ok(oids)
+    }
+
+    fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>> {
+        let mut tids: Vec<Tid> = Vec::new();
+        if from > to || limit == 0 {
+            return Ok(tids);
+        }
+        let txn = self.db.begin_read().map_err(backend)?;
+        let index = txn.open_table(TXN_OIDS).map_err(backend)?;
+        // The scan keeps only the tids. Each key is inside the range and
+        // after the key before it, as in `txn_oids`.
+        let start = format::txn_oid_key(from, Oid(0));
+        let end = format::txn_oid_key(to, Oid(u64::MAX));
+        let mut after = Included(start);
+        for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
+            let (key, _) = entry.map_err(backend)?;
+            inside_index(key.value(), (after, Included(end)))?;
+            after = Excluded(*key.value());
+            let (tid, _) = format::split_txn_oid_key(key.value());
+            if tids.last() != Some(&tid) {
+                if tids.len() == limit {
+                    break;
+                }
+                tids.push(tid);
+            }
+        }
+        Ok(tids)
     }
 
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
@@ -1687,6 +1725,15 @@ mod tests {
                 Err(ZoeError::CorruptTxn { tid: at }) => caught(at, tid, scans),
                 Err(_) => {}
             }
+            match backend.indexed_tids(tid, tid, 2) {
+                Ok(tids) => {
+                    if tids.iter().any(|&at| at != tid) {
+                        scans.wrong.push(format!("indexed_tids {tid:?}: {tids:?}"));
+                    }
+                }
+                Err(ZoeError::CorruptTxn { tid: at }) => caught(at, tid, scans),
+                Err(_) => {}
+            }
             match backend.txn_records(tid) {
                 Ok(Some((row, records))) => {
                     let oids: Vec<Oid> = records.iter().map(|&(oid, _)| oid).collect();
@@ -1702,6 +1749,11 @@ mod tests {
             && oids.values().any(|oids| unordered(oids))
         {
             scans.wrong.push(format!("txn_oids: {oids:?}"));
+        }
+        if let Ok(tids) = backend.indexed_tids(Tid::ZERO, Tid::MAX, usize::MAX)
+            && tids.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            scans.wrong.push(format!("indexed_tids: {tids:?}"));
         }
     }
 
@@ -1754,6 +1806,39 @@ mod tests {
             backend.load_serial(Oid(1), Tid(5)).unwrap(),
             Some(b"pickle".to_vec())
         );
+    }
+
+    #[test]
+    fn indexed_tids_gives_each_tid_once_up_to_the_limit() {
+        let backend = empty();
+        commit_txn_of(&backend, Tid(5), &[1, 2]);
+        commit_txn_of(&backend, Tid(6), &[3]);
+        commit_txn_of(&backend, Tid(8), &[1, 2, 3]);
+        let tids = |from, to, limit| backend.indexed_tids(Tid(from), Tid(to), limit).unwrap();
+        assert_eq!(tids(0, u64::MAX, 10), [Tid(5), Tid(6), Tid(8)]);
+        assert_eq!(tids(0, u64::MAX, 2), [Tid(5), Tid(6)]);
+        assert_eq!(tids(6, 8, 1), [Tid(6)]);
+        assert_eq!(tids(7, 9, 10), [Tid(8)]);
+        assert!(tids(7, 7, 10).is_empty());
+        assert!(tids(9, 5, 10).is_empty());
+        assert!(tids(0, u64::MAX, 0).is_empty());
+        // The trait default gives the same tids.
+        let oids = backend.txn_oids(Tid::ZERO, Tid::MAX).unwrap();
+        let default: Vec<Tid> = oids.into_keys().take(2).collect();
+        assert_eq!(default, tids(0, u64::MAX, 2));
+    }
+
+    #[test]
+    fn iter_txns_reads_its_rows_from_one_snapshot() {
+        let backend = empty();
+        commit_txn_of(&backend, Tid(5), &[1]);
+        commit_txn_of(&backend, Tid(6), &[2]);
+        let mut rows = backend.iter_txns(Tid::ZERO, Tid::MAX);
+        assert_eq!(rows.next().unwrap().unwrap().tid, Tid(5));
+        // A later commit is not in the snapshot of the iterator.
+        commit_txn_of(&backend, Tid(7), &[3]);
+        let rest: Vec<Tid> = rows.map(|row| row.unwrap().tid).collect();
+        assert_eq!(rest, [Tid(6)]);
     }
 
     #[test]
