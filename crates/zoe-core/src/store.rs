@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
-use crate::commit::{Txn, check_restore_tid};
+use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
@@ -157,13 +157,21 @@ impl Store {
             .map_err(|_| ZoeError::Protocol("no oid is left"))
     }
 
-    /// Begin a transaction.
-    pub fn tpc_begin(&self, user: &[u8], description: &[u8], extension: &[u8]) -> Result<Txn<'_>> {
-        Ok(Txn::new(self, user, description, extension))
+    /// Begin a transaction that borrows the store, driven by the calling
+    /// thread. `Txn::begin` with an `Arc<Store>` gives a transaction that
+    /// borrows nothing.
+    pub fn tpc_begin(
+        &self,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<&Self>> {
+        Ok(Txn::begin(self, user, description, extension))
     }
 
-    /// Begin a restore transaction: a copy of a transaction with its own
-    /// tid. `finish` commits it under `tid` and allocates no tid.
+    /// Begin a restore transaction that borrows the store: a copy of a
+    /// transaction with its own tid. `finish` commits it under `tid` and
+    /// allocates no tid.
     ///
     /// `tid` must be after the last tid of the store. Otherwise the call
     /// fails with `Protocol`. `finish` checks this again under the commit
@@ -174,9 +182,8 @@ impl Store {
         user: &[u8],
         description: &[u8],
         extension: &[u8],
-    ) -> Result<Txn<'_>> {
-        check_restore_tid(tid, self.last_transaction())?;
-        Ok(Txn::new(self, user, description, extension).with_tid(tid))
+    ) -> Result<Txn<&Self>> {
+        Txn::begin_restore(self, tid, user, description, extension)
     }
 
     /// Return the current pickle of `oid` and its serial.
@@ -190,6 +197,13 @@ impl Store {
     /// Return the tid of the last committed transaction.
     pub fn last_transaction(&self) -> Tid {
         self.backend.last_tid()
+    }
+
+    /// Tell if no transaction holds or waits for a lock. A test of a skin
+    /// uses it to show that every lock is released.
+    #[doc(hidden)]
+    pub fn lock_table_is_empty(&self) -> bool {
+        self.locks.is_empty()
     }
 
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
