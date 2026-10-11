@@ -33,6 +33,7 @@
   - [0021. Interactive sessions instead of automated loops](adr/0021-interactive-sessions.md)
   - [0022. Red zones: the on-disk format, pack and the process files](adr/0022-narrow-red-zones.md)
   - [0023. The blob record](adr/0023-blob-record.md)
+  - [0025. Pack: what it removes, batches, and the progress record](adr/0025-pack.md)
 
 # Reference
 
