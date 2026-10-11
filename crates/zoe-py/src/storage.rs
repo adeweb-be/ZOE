@@ -7,11 +7,17 @@
 //! The storage keeps a table of the open transactions, keyed by the
 //! address of the ZODB transaction object. Each entry keeps the object
 //! alive, so no other object gets its address while the entry exists.
+//!
+//! A lock guard never lives into Python code: a lookup binds its result
+//! to a local before an exception is built. The last reference to the
+//! store drops without the GIL, so the database closes without it.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
+use std::thread;
 use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
@@ -53,6 +59,26 @@ impl Entry {
     fn take(&self) -> Option<SharedTxn> {
         self.lock().take()
     }
+
+    /// Take the transaction of the core out of the entry, if no call uses
+    /// it now. Fail when a call uses it.
+    fn try_take(&self) -> Result<Option<SharedTxn>, ()> {
+        match self.txn.try_lock() {
+            Ok(mut txn) => Ok(txn.take()),
+            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner().take()),
+            Err(TryLockError::WouldBlock) => Err(()),
+        }
+    }
+}
+
+/// The open transactions of a storage.
+#[derive(Default)]
+struct Table {
+    /// True after `close`. The table then refuses a new transaction.
+    closed: bool,
+    /// The open transactions, keyed by the address of the ZODB
+    /// transaction object.
+    entries: HashMap<usize, Arc<Entry>>,
 }
 
 /// The in-process storage. It implements ZODB's `IStorage`.
@@ -63,40 +89,41 @@ pub(crate) struct Storage {
     /// The absolute path of the store directory.
     path: String,
     read_only: bool,
-    /// The open transactions, keyed by the address of the ZODB
-    /// transaction object.
-    txns: Mutex<HashMap<usize, Arc<Entry>>>,
+    table: Mutex<Table>,
     published: Published,
 }
 
 impl Storage {
     /// Return the store, or fail when the storage is closed.
     fn opened(&self, py: Python<'_>) -> PyResult<Arc<Store>> {
-        self.store
+        // The guard drops at the end of this statement. Building the
+        // exception runs Python code, so it must come after.
+        let store = self
+            .store
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| errors::closed(py))
+            .clone();
+        store.ok_or_else(|| errors::closed(py))
     }
 
-    fn txns(&self) -> MutexGuard<'_, HashMap<usize, Arc<Entry>>> {
-        self.txns.lock().unwrap_or_else(PoisonError::into_inner)
+    fn table(&self) -> MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Return the entry of `transaction`. Fail when the storage did not
     /// begin it.
     fn entry(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<Arc<Entry>> {
         let key = transaction.as_ptr() as usize;
-        self.txns()
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| errors::unknown_transaction(py))
+        // The guard drops at the end of this statement, before the
+        // exception runs Python code.
+        let found = self.table().entries.get(&key).cloned();
+        found.ok_or_else(|| errors::unknown_transaction(py))
     }
 
     /// Remove the entry of `transaction` from the table and return it.
     fn remove(&self, transaction: &Bound<'_, PyAny>) -> Option<Arc<Entry>> {
         let key = transaction.as_ptr() as usize;
-        self.txns().remove(&key)
+        self.table().entries.remove(&key)
     }
 }
 
@@ -119,20 +146,28 @@ impl Storage {
                 PyValueError::new_err("lock_timeout is a number of seconds, 0 or more")
             })?;
         }
-        let (store, path) = py
+        let (store, last, path) = py
             .detach(|| {
+                // A read-only storage creates no directory. It opens the
+                // store for writes all the same, because the core has no
+                // read-only open yet. When the core gets one, a read-only
+                // storage uses it.
+                if read_only && !path.is_dir() {
+                    let missing = format!("no store directory: {}", path.display());
+                    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, missing).into());
+                }
                 let store = Store::open_with(&path, options)?;
+                let last = store.last_transaction();
                 let path = fs::canonicalize(&path)?;
-                Ok::<_, ZoeError>((store, path))
+                Ok::<_, ZoeError>((store, last, path))
             })
             .map_err(|error| Failure::from(error).into_py(py))?;
-        let published = Published::new(store.last_transaction());
         Ok(Self {
             store: RwLock::new(Some(Arc::new(store))),
             path: path.to_string_lossy().into_owned(),
             read_only,
-            txns: Mutex::new(HashMap::new()),
-            published,
+            table: Mutex::new(Table::default()),
+            published: Published::new(last),
         })
     }
 
@@ -155,8 +190,8 @@ impl Storage {
         Ok(py.detach(|| directory_size(Path::new(&self.path)))?)
     }
 
-    /// Return 0. The store does not count its objects, and IStorage lets a
-    /// storage give 0.
+    /// Return 0. IStorage asks only for an approximate length, and the
+    /// store keeps no object count.
     fn __len__(&self) -> usize {
         0
     }
@@ -171,7 +206,7 @@ impl Storage {
     #[pyo3(name = "lastTransaction")]
     fn last_transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let store = self.opened(py)?;
-        let tid = py.detach(|| self.published.wait_for(store.last_transaction()));
+        let tid = py.detach(move || self.published.wait_for(store.last_transaction()));
         Ok(p64(py, tid.0))
     }
 
@@ -181,7 +216,9 @@ impl Storage {
             return Err(errors::read_only(py));
         }
         let store = self.opened(py)?;
-        let oid = py.detach(|| store.new_oid()).map_err(|e| core(py, e))?;
+        let oid = py
+            .detach(move || store.new_oid())
+            .map_err(|e| core(py, e))?;
         Ok(p64(py, oid.0))
     }
 
@@ -196,7 +233,9 @@ impl Storage {
         let _ = version;
         let oid = Oid(u64_of(oid)?);
         let store = self.opened(py)?;
-        let (data, serial) = py.detach(|| store.load(oid)).map_err(|e| core(py, e))?;
+        let (data, serial) = py
+            .detach(move || store.load(oid))
+            .map_err(|e| core(py, e))?;
         Ok((PyBytes::new(py, &data), p64(py, serial.0)))
     }
 
@@ -213,7 +252,7 @@ impl Storage {
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
         let store = self.opened(py)?;
         let record = py
-            .detach(|| store.load_before(oid, tid))
+            .detach(move || store.load_before(oid, tid))
             .map_err(|e| core(py, e))?;
         Ok(record.map(|record| {
             (
@@ -235,7 +274,7 @@ impl Storage {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let store = self.opened(py)?;
         let data = py
-            .detach(|| store.load_serial(oid, serial))
+            .detach(move || store.load_serial(oid, serial))
             .map_err(|e| core(py, e))?;
         Ok(PyBytes::new(py, &data))
     }
@@ -253,7 +292,7 @@ impl Storage {
         let oid = Oid(u64_of(oid)?);
         let store = self.opened(py)?;
         let entries = py
-            .detach(|| store.history(oid, size))
+            .detach(move || store.history(oid, size))
             .map_err(|e| core(py, e))?;
         Ok(entries
             .into_iter()
@@ -274,29 +313,44 @@ impl Storage {
         if self.read_only {
             return Err(errors::read_only(py));
         }
-        let store = self.opened(py)?;
         let key = transaction.as_ptr() as usize;
-        if self.txns().contains_key(&key) {
+        let begun = self.table().entries.contains_key(&key);
+        if begun {
             return Err(errors::duplicate_transaction(py));
         }
         let user = text(&transaction.getattr("user")?)?;
         let description = text(&transaction.getattr("description")?)?;
         let extension = text(&transaction.getattr("extension_bytes")?)?;
-        let txn = py.detach(|| Txn::begin(store, &user, &description, &extension));
+        let store = self.opened(py)?;
+        let txn = py.detach(move || Txn::begin(store, &user, &description, &extension));
         let entry = Arc::new(Entry {
             _transaction: transaction.clone().unbind(),
             txn: Mutex::new(Some(txn)),
         });
-        let mut txns = self.txns();
-        if txns.contains_key(&key) {
-            drop(txns);
-            // Another thread began the same transaction meanwhile. Abort
-            // the new transaction.
-            py.detach(|| drop(entry.take()));
-            return Err(errors::duplicate_transaction(py));
+        // `close` can run since the store was read. The table refuses the
+        // transaction then, so that no transaction keeps the store open
+        // after `close`.
+        let refused: Option<fn(Python<'_>) -> PyErr> = {
+            let mut table = self.table();
+            if table.closed {
+                Some(errors::closed)
+            } else {
+                match table.entries.entry(key) {
+                    Occupied(_) => Some(errors::duplicate_transaction),
+                    Vacant(vacant) => {
+                        vacant.insert(Arc::clone(&entry));
+                        None
+                    }
+                }
+            }
+        };
+        match refused {
+            None => Ok(()),
+            Some(error) => {
+                py.detach(|| drop(entry.take()));
+                Err(error(py))
+            }
         }
-        txns.insert(key, entry);
-        Ok(())
     }
 
     /// Stage a new pickle of `oid` in `transaction`. `serial` is the serial
@@ -350,9 +404,20 @@ impl Storage {
         let entry = self.entry(py, transaction)?;
         py.detach(|| {
             entry.with(|txn| {
-                txn.vote().map_err(|error| Failure {
-                    error,
-                    serials: txn.conflict_serials(),
+                txn.vote().map_err(|error| {
+                    // ZODB reads the class name of the object in conflict
+                    // from the pickle that the transaction stored.
+                    let data = match error {
+                        ZoeError::Conflict { oid } => {
+                            txn.staged(oid).map(|(_, data)| data.to_vec())
+                        }
+                        _ => None,
+                    };
+                    Failure {
+                        error,
+                        serials: txn.conflict_serials(),
+                        data,
+                    }
                 })
             })
         })
@@ -368,6 +433,11 @@ impl Storage {
         transaction: &Bound<'py, PyAny>,
         func: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        // The commit could not be published in commit order: it would wait
+        // for the commit of the callback that runs it.
+        if self.published.in_callback() {
+            return Err(errors::commit_in_callback(py));
+        }
         let entry = self
             .remove(transaction)
             .ok_or_else(|| errors::unknown_transaction(py))?;
@@ -402,19 +472,73 @@ impl Storage {
     }
 
     /// Close the storage: abort its open transactions and close the store.
+    /// The storage refuses every later call. A call that runs when `close`
+    /// starts keeps the store open until it returns.
     fn close(&self, py: Python<'_>) {
+        let entries: Vec<Arc<Entry>> = {
+            let mut table = self.table();
+            table.closed = true;
+            table.entries.drain().map(|(_, entry)| entry).collect()
+        };
         let store = self
             .store
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let entries: Vec<Arc<Entry>> = self.txns().drain().map(|(_, entry)| entry).collect();
-        py.detach(|| {
-            for entry in &entries {
-                drop(entry.take());
-            }
+        let entries = py.detach(move || {
+            abort_all(&entries);
             drop(store);
+            entries
         });
+        // The entries hold Python references, so they drop while the thread
+        // is attached.
+        drop(entries);
+    }
+}
+
+impl Drop for Storage {
+    /// Close the store without the GIL when Python frees a storage that
+    /// was not closed. During the shutdown of the interpreter, the store
+    /// closes with the GIL.
+    fn drop(&mut self) {
+        let store = self
+            .store
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let txns: Vec<SharedTxn> = self
+            .table
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .values()
+            .filter_map(|entry| entry.take())
+            .collect();
+        let close = move || drop((txns, store));
+        Python::try_attach(|py| py.detach(close));
+    }
+}
+
+/// Abort the transactions of `entries`.
+///
+/// A vote that waits for a lock uses its entry until the wait ends. So the
+/// transactions that no call uses go first: their abort releases their
+/// locks, and a vote that waits for one of them ends. Then the others go,
+/// as soon as their calls end.
+fn abort_all(entries: &[Arc<Entry>]) {
+    let mut busy: Vec<&Arc<Entry>> = entries.iter().collect();
+    loop {
+        busy.retain(|entry| match entry.try_take() {
+            Ok(txn) => {
+                drop(txn);
+                false
+            }
+            Err(()) => true,
+        });
+        if busy.is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 

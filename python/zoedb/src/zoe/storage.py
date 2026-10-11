@@ -31,8 +31,8 @@ class Storage(_zoe.Storage):
     `path` and creates the directory when it is missing. `lock_timeout` is
     the longest time, in seconds, that a vote waits for the lock of an
     object. A longer wait raises `ConflictError`. `None` keeps the default of
-    the store. A read-only storage refuses `tpc_begin` and `new_oid` with
-    `ReadOnlyError`.
+    the store. A read-only storage refuses `tpc_begin`, `new_oid` and `store`
+    with `ReadOnlyError`, and it does not create a missing directory.
 
     All the connections of a process share one storage. The thread that
     begins a transaction stores and votes in it; another thread gets

@@ -43,11 +43,13 @@ exception!(read_only_error, "ZODB.POSException", "ReadOnlyError");
 exception!(unsupported, "ZODB.POSException", "Unsupported");
 exception!(wrong_thread, "zoe.storage", "WrongThread");
 
-/// A core error, with the serials of a vote that failed on a stale serial.
+/// A core error, with the details of a vote that failed on a conflict.
 pub(crate) struct Failure {
     pub(crate) error: ZoeError,
     /// The current serial, then the serial that the transaction read.
     pub(crate) serials: Option<(Tid, Tid)>,
+    /// The pickle that the transaction stored for the oid in conflict.
+    pub(crate) data: Option<Vec<u8>>,
 }
 
 impl From<ZoeError> for Failure {
@@ -55,6 +57,7 @@ impl From<ZoeError> for Failure {
         Self {
             error,
             serials: None,
+            data: None,
         }
     }
 }
@@ -64,9 +67,15 @@ impl Failure {
     pub(crate) fn into_py(self, py: Python<'_>) -> PyErr {
         match self.error {
             ZoeError::NotFound { oid } => raise(pos_key_error(py), (p64(py, oid.0),), None),
-            ZoeError::Conflict { oid } => conflict(py, conflict_error(py), oid, self.serials),
+            ZoeError::Conflict { oid } => conflict(
+                py,
+                conflict_error(py),
+                oid,
+                self.serials,
+                self.data.as_deref(),
+            ),
             ZoeError::ReadConflict { oid } => {
-                conflict(py, read_conflict_error(py), oid, self.serials)
+                conflict(py, read_conflict_error(py), oid, self.serials, None)
             }
             ZoeError::WrongThread => message(wrong_thread(py), &self.error),
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } => {
@@ -108,6 +117,16 @@ pub(crate) fn duplicate_transaction(py: Python<'_>) -> PyErr {
     )
 }
 
+/// Return the exception for a `tpc_finish` in a `tpc_finish` callback of
+/// the same storage.
+pub(crate) fn commit_in_callback(py: Python<'_>) -> PyErr {
+    raise(
+        storage_transaction_error(py),
+        ("a tpc_finish callback cannot commit in the same storage",),
+        None,
+    )
+}
+
 /// Return the exception for a write to a read-only storage.
 pub(crate) fn read_only(py: Python<'_>) -> PyErr {
     raise(read_only_error(py), (), None)
@@ -134,26 +153,36 @@ pub(crate) fn u64_of(value: &Bound<'_, PyAny>) -> PyResult<u64> {
 }
 
 /// Return a `ConflictError` of the class `class` on `oid`, with the
-/// serials when the vote gave them.
+/// serials when the vote gave them. ZODB reads the class name of the
+/// object from `data`, the pickle that the transaction stored. If it cannot
+/// read it, the exception has no `data`.
 fn conflict(
     py: Python<'_>,
     class: PyResult<&Bound<'_, PyType>>,
     oid: Oid,
     serials: Option<(Tid, Tid)>,
+    data: Option<&[u8]>,
 ) -> PyErr {
-    let kwargs = PyDict::new(py);
-    let filled = kwargs
-        .set_item("oid", p64(py, oid.0))
-        .and_then(|()| match serials {
-            Some((current, read)) => {
-                kwargs.set_item("serials", (p64(py, current.0), p64(py, read.0)))
-            }
-            None => Ok(()),
-        });
-    match filled {
-        Ok(()) => raise(class, (), Some(&kwargs)),
-        Err(error) => error,
-    }
+    let class = match class {
+        Ok(class) => class,
+        Err(error) => return error,
+    };
+    let make = |data: Option<&[u8]>| -> PyResult<PyErr> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("oid", p64(py, oid.0))?;
+        if let Some((current, read)) = serials {
+            kwargs.set_item("serials", (p64(py, current.0), p64(py, read.0)))?;
+        }
+        if let Some(data) = data {
+            kwargs.set_item("data", PyBytes::new(py, data))?;
+        }
+        Ok(PyErr::from_value(class.call((), Some(&kwargs))?))
+    };
+    let made = match make(data) {
+        Err(_) if data.is_some() => make(None),
+        made => made,
+    };
+    made.unwrap_or_else(|error| error)
 }
 
 /// Return an exception of the class `class` with the text of `error`.

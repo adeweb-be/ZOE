@@ -8,9 +8,11 @@
 //! did not get.
 //!
 //! The callbacks run in commit order: a commit waits until the commit
-//! before it is published. No lock is held while a callback runs.
+//! before it is published. No lock is held while a callback runs. A
+//! callback cannot commit in its own storage: that commit would wait for
+//! the callback that runs it.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use zoe_core::Tid;
@@ -22,8 +24,9 @@ pub(crate) struct Published {
 }
 
 thread_local! {
-    /// The number of callbacks that run on this thread.
-    static CALLBACKS: Cell<usize> = const { Cell::new(0) };
+    /// The addresses of the `Published` values whose callbacks run on this
+    /// thread.
+    static CALLBACKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 impl Published {
@@ -40,16 +43,25 @@ impl Published {
         self.last.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Tell if a callback of this store runs on this thread.
+    pub(crate) fn in_callback(&self) -> bool {
+        CALLBACKS.with_borrow(|running| running.contains(&self.key()))
+    }
+
     /// Wait until `tid` is published, and return the last published tid.
     ///
     /// A callback that asks for the last tid does not wait, because the
     /// commit of its own callback is not published yet. It gets the last
     /// published tid.
     pub(crate) fn wait_for(&self, tid: Tid) -> Tid {
-        let last = self.lock();
-        if CALLBACKS.get() > 0 {
-            return *last;
+        if self.in_callback() {
+            return *self.lock();
         }
+        let last = self.lock();
         *self
             .changed
             .wait_while(last, |last| *last < tid)
@@ -86,16 +98,21 @@ impl<'p> Publication<'p> {
     }
 
     /// Run `callback`, the callback of the commit. A call to `wait_for` in
-    /// the callback does not wait.
+    /// the callback does not wait, and `in_callback` is true in it.
     pub(crate) fn run<T>(&self, callback: impl FnOnce() -> T) -> T {
-        struct Running;
+        struct Running(usize);
         impl Drop for Running {
             fn drop(&mut self) {
-                CALLBACKS.set(CALLBACKS.get() - 1);
+                CALLBACKS.with_borrow_mut(|running| {
+                    if let Some(at) = running.iter().rposition(|&key| key == self.0) {
+                        running.remove(at);
+                    }
+                });
             }
         }
-        CALLBACKS.set(CALLBACKS.get() + 1);
-        let _running = Running;
+        let key = self.published.key();
+        CALLBACKS.with_borrow_mut(|running| running.push(key));
+        let _running = Running(key);
         callback()
     }
 }
@@ -154,5 +171,17 @@ mod tests {
         assert_eq!(publication.run(|| published.wait_for(Tid(2))), Tid(1));
         drop(publication);
         assert_eq!(published.wait_for(Tid(2)), Tid(2));
+    }
+
+    #[test]
+    fn a_callback_is_known_only_to_its_store_and_thread() {
+        let (mine, other) = (Published::new(Tid(1)), Published::new(Tid(1)));
+        let publication = Publication::after(&mine, Tid(1), Tid(2));
+        let seen = publication.run(|| {
+            let elsewhere = thread::scope(|scope| scope.spawn(|| mine.in_callback()).join());
+            (mine.in_callback(), other.in_callback(), elsewhere.unwrap())
+        });
+        assert_eq!(seen, (true, false, false));
+        assert!(!mine.in_callback());
     }
 }
