@@ -4,6 +4,8 @@
 //! so each call reads the store as the calls of the storage do: after
 //! `close`, a call raises `StorageError`.
 
+use pyo3::PyTraverseError;
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 
 use crate::storage::Storage;
@@ -31,5 +33,12 @@ impl Sequence {
     /// read-only storage raises `ReadOnlyError`.
     fn next(&self, py: Python<'_>) -> PyResult<u64> {
         self.storage.get().next_value(py, &self.name)
+    }
+
+    /// Give the storage to the garbage collector. A cycle such as
+    /// `storage.x = storage.sequence(name)` is then collectable: the
+    /// collector clears the attributes of the storage.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.storage)
     }
 }

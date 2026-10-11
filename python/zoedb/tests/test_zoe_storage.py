@@ -6,6 +6,7 @@ mode, `close`, `pack`, the conflict resolution, the parallel commits
 without the GIL and the sequences.
 """
 
+import gc
 import io
 import pickle
 import subprocess
@@ -14,6 +15,7 @@ import sysconfig
 import textwrap
 import threading
 import time
+import weakref
 
 import pytest
 from persistent.mapping import PersistentMapping
@@ -220,6 +222,19 @@ def test_a_sequence_name_is_a_str(storage):
         storage.sequence(b"intids")
     assert storage.sequence("").next() == 1
     assert storage.sequence("\u00e9").next() == 1
+
+
+def test_a_cycle_through_a_sequence_is_collected(tmp_path):
+    path = str(tmp_path / "store")
+    storage = zoe.Storage(path)
+    storage.intids = storage.sequence("intids")
+    assert storage.intids.next() == 1
+    collected = weakref.ref(storage)
+    del storage
+    gc.collect()
+    assert collected() is None
+    # The collector closed the store, so the directory is free.
+    zoe.Storage(path).close()
 
 
 def test_a_sequence_does_not_wait_for_a_voted_transaction(storage):
