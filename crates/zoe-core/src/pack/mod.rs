@@ -965,6 +965,50 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_record_stops_the_pack_and_stays() {
+        let vfs = MemVfs::new();
+        let g = Oid(1);
+        let (t1, t2) = {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let t1 = commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+            let t2 = commit(&store, &[(ROOT, record(&[]))]);
+            (t1, t2)
+        };
+        // Flip the last bit of the unreachable record of g.
+        {
+            let records: redb::TableDefinition<&[u8; 16], &[u8]> =
+                redb::TableDefinition::new("records");
+            let db = redb::Builder::new()
+                .create_with_backend(vfs.file("zoe.redb"))
+                .unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(records).unwrap();
+                let key = crate::format::record_key(g, t1);
+                let mut frame = redb::ReadableTable::get(&table, &key)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_vec();
+                *frame.last_mut().unwrap() ^= 1;
+                table.insert(&key, frame.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open_vfs(vfs).unwrap();
+
+        // A pack must not delete the evidence of a corruption. The error
+        // names the record.
+        let error = store.pack(t2);
+        assert!(
+            matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
+            "{error:?}"
+        );
+        assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
+        assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
+    }
+
+    #[test]
     fn a_pack_of_an_empty_store_removes_nothing() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         assert_eq!(store.pack(Tid::MAX).unwrap(), PackReport::default());
