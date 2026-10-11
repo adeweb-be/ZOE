@@ -46,19 +46,27 @@ pub(super) struct PackArgs {
 pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Result<(), Failure> {
     let path = &args.path;
     let at = days_ago(clock.now(), args.days);
-    if args.dry_run {
-        return Err(Failure(format!(
-            "{}: the dry run of a pack is not built yet",
-            path.display()
-        )));
-    }
-    let store = open_existing(path)?;
-    let report = store.pack(at).map_err(|e| store_failure(path, e))?;
-    let title = format!(
-        "Packed the store {} as of tid {:#018x}. It removed:",
-        path.display(),
-        at.0
-    );
+    let (report, title) = if args.dry_run {
+        // A dry run only reads. A read-only open changes no byte of the
+        // store.
+        let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
+        let report = store.pack_dry_run(at).map_err(|e| store_failure(path, e))?;
+        let title = format!(
+            "A pack of the store {} as of tid {:#018x} would remove:",
+            path.display(),
+            at.0
+        );
+        (report, title)
+    } else {
+        let store = open_existing(path)?;
+        let report = store.pack(at).map_err(|e| store_failure(path, e))?;
+        let title = format!(
+            "Packed the store {} as of tid {:#018x}. It removed:",
+            path.display(),
+            at.0
+        );
+        (report, title)
+    };
     write_report(out, &title, &report)?;
     Ok(())
 }
@@ -105,7 +113,6 @@ fn write_report(out: &mut dyn Write, title: &str, report: &PackReport) -> io::Re
         "records", "bytes"
     )?;
     for (class, totals) in &report.by_class {
-        let class = class.as_deref().unwrap_or("<unknown>");
         let (n, size) = (totals.records, totals.bytes);
         writeln!(out, "    {n:>records$}  {size:>bytes$}  {class}")?;
     }
@@ -145,8 +152,12 @@ mod tests {
             objects: 1,
             ..PackReport::default()
         };
-        for (class, records, bytes) in [(Some("app.content.Document"), 2, 1_400), (None, 1, 100)] {
-            let totals = report.by_class.entry(class.map(str::to_owned)).or_default();
+        let classes = [
+            ("app.content.Document", 2, 1_400),
+            (PackReport::UNKNOWN_CLASS, 1, 100),
+        ];
+        for (class, records, bytes) in classes {
+            let totals = report.by_class.entry(class.to_owned()).or_default();
             totals.records = records;
             totals.bytes = bytes;
         }
