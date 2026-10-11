@@ -47,7 +47,7 @@ use crate::backend::{Record, TxnMeta, TxnStatus};
 use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
-use crate::guard::SizeLimit;
+use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -108,6 +108,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     stored_bytes: u64,
     /// The time on the store clock when the transaction began.
     began: SystemTime,
+    /// The tid of the commit, after a `finish` that succeeded.
+    committed: Option<Tid>,
 }
 
 /// What the serial check of a vote found.
@@ -149,6 +151,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             conflict: None,
             stored_bytes: 0,
             began,
+            committed: None,
         }
     }
 
@@ -607,6 +610,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         store
             .packing
             .note(tid, self.staged.iter().map(|(oid, _)| oid));
+        self.committed = Some(tid);
 
         *sequencer = Some(tid);
         drop(sequencer);
@@ -640,9 +644,14 @@ impl<S: Deref<Target = Store>> Drop for Txn<S> {
         // `finish` and `abort` also end here. So each transaction is
         // checked against `transaction-warn` once, when it ends.
         let now = self.store.clock.now();
+        let ended = Ended {
+            oids: self.staged.len() as u64,
+            oid: self.staged.iter().next().map(|(oid, _)| oid),
+            tid: self.committed,
+        };
         self.store
             .guardrails
-            .transaction_ended(self.began, now, self.staged.len());
+            .transaction_ended(self.began, now, ended);
     }
 }
 
@@ -1696,12 +1705,13 @@ mod tests {
         assert!(matches!(error, Err(ZoeError::TooLarge { .. })), "{error:?}");
     }
 
-    /// Return the `transaction-warn` events of `events`.
-    fn slow_transactions(events: &[Captured]) -> Vec<Option<u64>> {
+    /// Return the duration, the lowest oid and the tid of each
+    /// `transaction-warn` event of `events`.
+    fn slow_transactions(events: &[Captured]) -> Vec<[Option<u64>; 3]> {
         events
             .iter()
             .filter(|e| e.message().contains("transaction-warn"))
-            .map(|e| e.number("duration_ms"))
+            .map(|e| [e.number("duration_ms"), e.number("oid"), e.number("tid")])
             .collect()
     }
 
@@ -1719,12 +1729,13 @@ mod tests {
             transaction_warn: Some(Duration::from_secs(1)),
             ..Options::default()
         });
-        let ((), events) = events_of(|| {
+        let (tid, events) = events_of(|| {
             let mut finished = store.tpc_begin(b"", b"", b"").unwrap();
+            finished.store(Oid(9), Tid::ZERO, b"a").unwrap();
             finished.store(Oid(1), Tid::ZERO, b"a").unwrap();
             finished.vote().unwrap();
             clock.advance(Duration::from_millis(1_100));
-            finished.finish().unwrap();
+            let tid = finished.finish().unwrap();
 
             let mut aborted = store.tpc_begin(b"", b"", b"").unwrap();
             aborted.store(Oid(2), Tid::ZERO, b"b").unwrap();
@@ -1741,10 +1752,18 @@ mod tests {
             failed.store(Oid(3), Tid::ZERO, b"c").unwrap();
             clock.advance(Duration::from_millis(1_400));
             assert!(failed.finish().is_err());
+            tid
         });
+        // Only a commit has a tid, and only a transaction that writes has
+        // an oid: the lowest one.
         assert_eq!(
             slow_transactions(&events),
-            [Some(1_100), Some(1_200), Some(1_300), Some(1_400)],
+            [
+                [Some(1_100), Some(1), Some(tid.0)],
+                [Some(1_200), Some(2), None],
+                [Some(1_300), None, None],
+                [Some(1_400), Some(3), None],
+            ],
             "{events:?}"
         );
     }

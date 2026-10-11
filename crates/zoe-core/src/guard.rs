@@ -5,7 +5,8 @@
 //! stages it, so a refused call writes nothing. A lock held longer than
 //! `lock-warn` and a transaction open longer than `transaction-warn` give a
 //! `tracing` event at WARN level. Each duration comes from the store clock.
-//! An event holds only oids, counts and durations, never pickle bytes.
+//! An event holds only oids, tids, counts and durations, never pickle
+//! bytes.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -13,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use crate::error::{Result, ZoeError};
 use crate::lock::Held;
 use crate::store::Options;
-use crate::types::Oid;
+use crate::types::{Oid, Tid};
 
 /// The most per-lock lines that one release logs. A summary line follows
 /// them.
@@ -135,9 +136,9 @@ impl Guardrails {
     }
 
     /// Log a transaction that began at `began` and ends at `now`, when it
-    /// was open longer than `transaction-warn`. `oids` is the number of
-    /// oids that it writes.
-    pub(crate) fn transaction_ended(&self, began: SystemTime, now: SystemTime, oids: usize) {
+    /// was open longer than `transaction-warn`. `ended` describes the
+    /// transaction.
+    pub(crate) fn transaction_ended(&self, began: SystemTime, now: SystemTime, ended: Ended) {
         let Some(warn) = self.transaction_warn else {
             return;
         };
@@ -145,11 +146,25 @@ impl Guardrails {
         if duration > warn {
             tracing::warn!(
                 duration_ms = millis(duration),
-                oids = oids as u64,
+                oids = ended.oids,
+                oid = ended.oid.map(|oid| oid.0),
+                tid = ended.tid.map(|tid| tid.0),
                 "transaction open past transaction-warn"
             );
         }
     }
+}
+
+/// What the line of a slow transaction tells about it. An absent field is
+/// not logged.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Ended {
+    /// The number of oids that the transaction writes.
+    pub(crate) oids: u64,
+    /// The lowest oid that the transaction writes.
+    pub(crate) oid: Option<Oid>,
+    /// The tid of the commit, when the transaction committed.
+    pub(crate) tid: Option<Tid>,
 }
 
 /// Return the time from `since` to `now`. A clock that went back gives
@@ -404,17 +419,30 @@ mod tests {
             ..Options::default()
         });
         let off = guardrails(Options::default());
+        let committed = Ended {
+            oids: 4,
+            oid: Some(Oid(7)),
+            tid: Some(Tid(99)),
+        };
         let ((), events) = events_of(|| {
-            warn.transaction_ended(at(0), at(2_000), 3);
-            warn.transaction_ended(at(0), at(2_001), 4);
-            warn.transaction_ended(at(5_000), at(0), 5);
-            off.transaction_ended(at(0), at(60_000), 6);
+            warn.transaction_ended(at(0), at(2_000), committed);
+            warn.transaction_ended(at(0), at(2_001), committed);
+            warn.transaction_ended(at(5_000), at(0), committed);
+            off.transaction_ended(at(0), at(60_000), committed);
+            warn.transaction_ended(at(0), at(3_000), Ended::default());
         });
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 2, "{events:?}");
         let event = &events[0];
         assert_eq!(event.level, Level::WARN);
         assert!(event.message().contains("transaction-warn"), "{event:?}");
         assert_eq!(event.number("duration_ms"), Some(2_001));
         assert_eq!(event.number("oids"), Some(4));
+        assert_eq!(event.number("oid"), Some(7));
+        assert_eq!(event.number("tid"), Some(99));
+        // An empty transaction that did not commit has no oid and no tid.
+        let empty = &events[1];
+        assert_eq!(empty.number("oids"), Some(0));
+        assert!(!empty.fields.contains_key("oid"), "{empty:?}");
+        assert!(!empty.fields.contains_key("tid"), "{empty:?}");
     }
 }
