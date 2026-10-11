@@ -3,7 +3,7 @@
 // `just loupe e2e` builds the app and runs these tests under xvfb-run.
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { connect } from "node:net";
+import { connect, createServer, type AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,8 +14,21 @@ const APPLICATION =
   process.env.LOUPE_APP ??
   path.resolve(HERE, "../../target/loupe/debug/loupe");
 
-/** The port of tauri-driver. */
-const PORT = 4444;
+/** Return a TCP port that no server uses now. */
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((done) => server.close(done));
+  return port;
+}
+
+// The launcher picks the ports. The workers inherit its environment, so
+// they use the same ports.
+process.env.LOUPE_DRIVER_PORT ??= String(await freePort());
+process.env.LOUPE_NATIVE_PORT ??= String(await freePort());
+const PORT = Number(process.env.LOUPE_DRIVER_PORT);
+const NATIVE_PORT = Number(process.env.LOUPE_NATIVE_PORT);
 
 let driver: ChildProcess | undefined;
 
@@ -38,6 +51,21 @@ async function listening(port: number): Promise<void> {
   throw new Error(`nothing listens on port ${port}`);
 }
 
+/**
+ * Stop tauri-driver, WebKitWebDriver and the app. tauri-driver leads a
+ * process group of its own, and the other two are in it.
+ */
+function stopDriver(): void {
+  if (driver?.pid !== undefined && driver.exitCode === null) {
+    try {
+      process.kill(-driver.pid, "SIGTERM");
+    } catch {
+      // The group has stopped already.
+    }
+  }
+  driver = undefined;
+}
+
 export const config: WebdriverIO.Config = {
   runner: "local",
   hostname: "127.0.0.1",
@@ -56,13 +84,16 @@ export const config: WebdriverIO.Config = {
   waitforTimeout: 10_000,
 
   beforeSession: async () => {
-    driver = spawn("tauri-driver", ["--port", String(PORT)], {
-      stdio: ["ignore", "inherit", "inherit"],
-    });
+    driver = spawn(
+      "tauri-driver",
+      ["--port", String(PORT), "--native-port", String(NATIVE_PORT)],
+      { detached: true, stdio: ["ignore", "inherit", "inherit"] },
+    );
     await listening(PORT);
   },
 
-  afterSession: () => {
-    driver?.kill();
-  },
+  afterSession: () => stopDriver(),
 };
+
+// A worker that stops early still stops the app.
+process.once("exit", stopDriver);
