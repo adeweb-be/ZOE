@@ -19,8 +19,15 @@ use zoe_core::{Oid, Store, Tid, ZoeError};
 /// An error of Loupe.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The store failed. For example, the folder holds no store, another
-    /// process holds the lock, or the oid has no record.
+    /// The folder holds no store.
+    #[error("{path} holds no store")]
+    NoStore {
+        /// The path of the folder.
+        path: String,
+    },
+
+    /// The store failed. For example, another process holds the lock, the
+    /// store needs a repair, or the oid has no record.
     #[error(transparent)]
     Store(#[from] ZoeError),
 
@@ -97,10 +104,18 @@ pub struct Folder {
 impl Folder {
     /// Open the store in the folder `path` for reads only.
     ///
-    /// The call fails when `path` holds no store, or when another process
-    /// holds the lock of the store. It writes nothing.
+    /// The call fails with `NoStore` when `path` holds no store, and with
+    /// `Locked` when another process holds the lock of the store. A store
+    /// that was not closed cleanly fails with `NeedsRepair`. The call
+    /// writes nothing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let store = Store::open_read_only(path)?;
+        let path = path.as_ref();
+        let store = Store::open_read_only(path).map_err(|e| match e {
+            ZoeError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => Error::NoStore {
+                path: path.display().to_string(),
+            },
+            e => Error::Store(e),
+        })?;
         Ok(Self { store })
     }
 
@@ -237,6 +252,13 @@ mod tests {
         ] {
             assert!(parse_oid(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_folder_without_a_store_is_no_store() {
+        let missing = std::env::temp_dir().join(format!("zoe-loupe-none-{}", std::process::id()));
+        let error = Folder::open(&missing).err();
+        assert!(matches!(error, Some(Error::NoStore { .. })), "{error:?}");
     }
 
     #[test]
