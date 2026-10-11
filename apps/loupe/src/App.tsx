@@ -22,6 +22,8 @@ export function App() {
   const [folderPath, setFolderPath] = useState("");
   const [folder, setFolder] = useState<FolderInfo | null>(null);
   const [rootObject, setRootObject] = useState<LoupeObject | null>(null);
+  // True when the view of the switch has no root.
+  const [rootMissing, setRootMissing] = useState(false);
   const [current, setCurrent] = useState<LoupeObject | null>(null);
   const [objectPath, setObjectPath] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -37,6 +39,9 @@ export function App() {
   // The number of the last request. A reply to an older request comes
   // too late, and the window drops it.
   const latest = useRef(0);
+  // The number of the last move of the switch. A root that comes after a
+  // newer move is too late, and the window drops it.
+  const latestMove = useRef(0);
 
   /** Run an IPC call. Show its error, unless a newer request started. */
   const run = async (call: (current: () => boolean) => Promise<void>) => {
@@ -52,25 +57,54 @@ export function App() {
     }
   };
 
-  const open = (path: string) =>
-    run(async (current) => {
+  /**
+   * Read the root again after a move of the switch. Keep it only when no
+   * newer move came. Return the root, or null with the failure.
+   */
+  const reloadRoot = async (
+    move: number,
+  ): Promise<[LoupeObject | null, unknown]> => {
+    let found: LoupeObject | null = null;
+    let failure: unknown = null;
+    try {
+      found = await root();
+    } catch (rootFailure) {
+      failure = rootFailure;
+    }
+    if (move === latestMove.current) {
+      setRootObject(found);
+      setRootMissing(found === null);
+    }
+    return [found, failure];
+  };
+
+  const open = (path: string) => {
+    const move = ++latestMove.current;
+    return run(async (current) => {
       setFolder(null);
       setRootObject(null);
+      setRootMissing(false);
       setCurrent(null);
       const opened = await openFolder(path);
-      const found = await root();
-      if (!current()) {
-        return;
-      }
+      // The Rust side has the folder open, with the switch on the last
+      // transaction. The window shows this even when a newer request
+      // started.
       setFolder(opened);
       setOpens((count) => count + 1);
       setViews((count) => count + 1);
       setAsOfTid(null);
       setAsOfText("");
-      setRootObject(found);
+      const [found, failure] = await reloadRoot(move);
+      if (!current()) {
+        return;
+      }
       setCurrent(found);
       setObjectPath("");
+      if (failure !== null) {
+        throw failure;
+      }
     });
+  };
 
   const browse = async () => {
     try {
@@ -106,28 +140,28 @@ export function App() {
    */
   const travel = (text: string) => {
     const shown = current?.oid ?? null;
+    const move = ++latestMove.current;
     return run(async (current) => {
       const tid = text.trim() === "" ? null : text.trim();
       await setAsOf(tid);
-      if (!current()) {
-        return;
-      }
+      // The switch of the Rust side has moved. The window shows the move
+      // even when a newer request started, so it never shows two tids.
       setAsOfTid(tid);
       setAsOfText(tid ?? "");
+      setRootObject(null);
+      setRootMissing(false);
+      setViews((count) => count + 1);
+      if (!current()) {
+        // A newer request fills the pane, as of this move or a later one.
+        setCurrent(null);
+      }
       // A view before the first transaction has no root. The tree then
       // shows a note.
-      let foundRoot: LoupeObject | null = null;
-      let failure: unknown = null;
-      try {
-        foundRoot = await root();
-      } catch (rootFailure) {
-        failure = rootFailure;
-      }
+      const [foundRoot, rootFailure] = await reloadRoot(move);
+      let failure = rootFailure;
       if (!current()) {
         return;
       }
-      setRootObject(foundRoot);
-      setViews((count) => count + 1);
       // The pane keeps the object until its new revision comes. An object
       // with no record as of the tid leaves the pane empty.
       let found: LoupeObject | null = foundRoot;
@@ -230,10 +264,12 @@ export function App() {
               onSelect={(oid) => void show(oid)}
               onError={(failure) => setError(describe(failure))}
             />
-          ) : (
+          ) : rootMissing ? (
             <p className="tree empty">
               {t("asOf.noRoot", { tid: asOf ?? folder.lastTid })}
             </p>
+          ) : (
+            <div className="tree" />
           )}
           <ObjectPane
             object={current}
