@@ -439,33 +439,35 @@ impl MemVfs {
     /// The operations of an image land in their recorded order. A write to
     /// a file whose creation is not on disk is lost. A file or a directory
     /// whose directory is not on disk is lost.
+    ///
+    /// An image holds only the list of the operations that land. It builds
+    /// its files when `CrashImage::vfs` is called, so a test that opens
+    /// one image at a time holds the files of one image at a time.
     pub fn crash_images(&self) -> Vec<CrashImage> {
-        let state = self.lock();
+        let recording = {
+            let state = self.lock();
+            Arc::new(Recording {
+                files: state.initial.clone(),
+                dirs: state.initial_dirs.clone(),
+                log: state.log.clone(),
+            })
+        };
         let mut images = Vec::new();
-        for point in 0..=state.log.len() {
-            let ops = &state.log[..point];
+        for point in 0..=recording.log.len() {
+            let ops = &recording.log[..point];
             let (synced, pending) = split_at_syncs(ops);
-            let marks: Vec<String> = ops
-                .iter()
-                .filter_map(|op| match op {
-                    Op::Mark { name } => Some(name.clone()),
-                    _ => None,
-                })
-                .collect();
             let mut push = |variant: Variant| {
-                let (chosen, torn) = match &variant {
-                    Variant::Pending(chosen) => (&chosen[..], None),
-                    Variant::Torn(i, half) => (&pending[..], Some((*i, *half))),
+                let chosen = match &variant {
+                    Variant::Pending(chosen) => &chosen[..],
+                    Variant::Torn(..) => &pending[..],
                 };
                 let mut which: Vec<usize> = synced.iter().chain(chosen).copied().collect();
                 which.sort_unstable();
-                let (files, dirs) = apply(&state.initial, &state.initial_dirs, ops, &which, torn);
                 images.push(CrashImage {
+                    recording: Arc::clone(&recording),
                     point,
-                    files,
-                    dirs,
+                    which,
                     variant,
-                    marks: marks.clone(),
                 });
             };
 
@@ -931,25 +933,48 @@ impl fmt::Display for Variant {
     }
 }
 
-/// A state that a crash can leave on disk.
-pub struct CrashImage {
-    point: usize,
-    variant: Variant,
-    marks: Vec<String>,
+/// The files and directories when a record starts, and the record. The
+/// crash images of one call share it.
+struct Recording {
     files: BTreeMap<String, Vec<u8>>,
     dirs: BTreeSet<String>,
+    log: Vec<Op>,
+}
+
+/// A state that a crash can leave on disk.
+pub struct CrashImage {
+    recording: Arc<Recording>,
+    /// The number of operations before the crash.
+    point: usize,
+    /// The indexes of the operations that land, in order.
+    which: Vec<usize>,
+    variant: Variant,
 }
 
 impl CrashImage {
     /// Return a filesystem with the files and directories of this image
     /// and an empty record.
     pub fn vfs(&self) -> MemVfs {
-        MemVfs::with_tree(self.files.clone(), self.dirs.clone())
+        let (files, dirs) = self.tree();
+        MemVfs::with_tree(files, dirs)
     }
 
     /// Tell if the crash came after the mark `name`.
     pub fn is_after(&self, name: &str) -> bool {
-        self.marks.iter().any(|m| m == name)
+        self.recording.log[..self.point]
+            .iter()
+            .any(|op| matches!(op, Op::Mark { name: mark } if mark == name))
+    }
+
+    /// Build the files and the directories of this image.
+    fn tree(&self) -> (BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
+        let torn = match self.variant {
+            Variant::Torn(i, half) => Some((i, half)),
+            Variant::Pending(_) => None,
+        };
+        let recording = &self.recording;
+        let ops = &recording.log[..self.point];
+        apply(&recording.files, &recording.dirs, ops, &self.which, torn)
     }
 }
 
@@ -970,7 +995,7 @@ mod tests {
     use super::*;
 
     fn contents(image: &CrashImage, name: &str) -> Option<Vec<u8>> {
-        image.files.get(name).cloned()
+        image.tree().0.get(name).cloned()
     }
 
     /// Return a filesystem with a durable, empty file `f`.
