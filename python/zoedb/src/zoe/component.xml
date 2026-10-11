@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+
+<!-- The <zoe> section. "%import zoe" loads this file. -->
+
+<component prefix="zoe.config">
+
+  <import package="ZODB"/>
+
+  <sectiontype name="zoe" implements="ZODB.storage" datatype=".ZoeStorage">
+    <description>
+      A ZOE storage in this process: zoe.Storage. Each key has an
+      environment variable, its twin. The twin is "ZOE_" and the key in
+      upper case, with "_" for "-". The twin gives the value only when the
+      section does not set the key. An empty value counts as not set. The
+      twin takes the same values as the key.
+    </description>
+    <key name="path" datatype="string">
+      <description>
+        The directory of the store. The storage creates it when it is
+        missing. The section or ZOE_PATH must give it.
+      </description>
+    </key>
+    <key name="blob-dir" datatype="string">
+      <description>
+        The directory of the blob files. The default is the blobs
+        directory in path.
+      </description>
+    </key>
+    <key name="backend" datatype=".backend">
+      <description>
+        The backend of the store. The only backend is redb, the default.
+      </description>
+    </key>
+    <key name="lock-timeout" datatype="time-interval">
+      <description>
+        The longest time that a vote waits for the lock of an object, in
+        whole seconds, such as 10s or 2m. A longer wait raises
+        ConflictError. The default is the default of the store.
+      </description>
+    </key>
+    <key name="early-locks" datatype=".early_locks">
+      <description>
+        Early write-intent locks. The storage has none yet: off is the
+        only value, and the default.
+      </description>
+    </key>
+    <key name="read-only" datatype="boolean">
+      <description>
+        If true, the storage refuses writes and does not create a missing
+        directory. The default is false.
+      </description>
+    </key>
+  </sectiontype>
+
+</component>
