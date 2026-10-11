@@ -874,6 +874,25 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_store_refuses_a_pack() {
+        let dir = fresh_dir("read-only-pack");
+        // The root does not decode, so a pack that reads it fails with
+        // another error.
+        let tid = {
+            let store = Store::open(&dir).unwrap();
+            commit(&store, Oid(0), Tid::ZERO, b"a").unwrap()
+        };
+        let before = files(&dir);
+
+        let store = Store::open_read_only(&dir).unwrap();
+        let error = store.pack(Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::ReadOnly)), "{error:?}");
+        assert_eq!(store.load(Oid(0)).unwrap(), (b"a".to_vec(), tid));
+        drop(store);
+        assert!(files(&dir) == before, "the refused pack changed a file");
+    }
+
+    #[test]
     fn a_read_only_store_and_a_writer_exclude_each_other() {
         let dir = fresh_dir("read-only-lock");
         write_store(&dir);

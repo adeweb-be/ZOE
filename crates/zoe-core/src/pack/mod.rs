@@ -158,13 +158,15 @@ impl Store {
     /// A record that the mark reads and that does not decode fails the
     /// pack with `References` before the pack removes anything. Such a
     /// record committed during the pack stops the pack before its next
-    /// batch. A halted store refuses the pack with `Halted`.
+    /// batch. A halted store refuses the pack with `Halted`, and a
+    /// read-only store with `ReadOnly`.
     pub fn pack_in_batches(
         &self,
         at: Tid,
         batch: usize,
         mut between: impl FnMut(),
     ) -> Result<PackReport> {
+        self.writable()?;
         let _running = lock(&self.packing.running);
         let (tid, last, watermark) = {
             let sequencer = self.lock_sequencer();
