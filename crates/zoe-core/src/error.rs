@@ -44,19 +44,6 @@ pub enum ZoeError {
         tid: Tid,
     },
 
-    /// Pack cannot read the persistent references of a record: its pickle
-    /// does not decode, or a persistent id has a form that ZODB does not
-    /// write. Pack stops before it removes more.
-    #[error("cannot read the references of oid {oid:?}, tid {tid:?}: {message}")]
-    References {
-        /// The object id of the record.
-        oid: Oid,
-        /// The transaction id of the record.
-        tid: Tid,
-        /// What is wrong.
-        message: String,
-    },
-
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
     /// `Txn::conflict_serials` gives the serials of a stale serial.
@@ -123,7 +110,9 @@ pub enum ZoeError {
     #[error("the store is closed")]
     Closed,
 
-    /// The store is not in a format that this code reads.
+    /// The store is not in a format that this code reads. Pack also gives
+    /// it for a record whose persistent references it cannot read: the
+    /// text then names the oid and the tid of the record.
     #[error("unknown store format: {0}")]
     Format(String),
 

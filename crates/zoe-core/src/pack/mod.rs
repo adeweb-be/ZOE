@@ -156,7 +156,7 @@ impl Store {
     /// 1.
     ///
     /// A record that the mark reads and that does not decode fails the
-    /// pack with `References` before the pack removes anything. Such a
+    /// pack with `Format` before the pack removes anything. Such a
     /// record committed during the pack stops the pack before its next
     /// batch. A halted store refuses the pack with `Halted`, and a
     /// read-only store with `ReadOnly`.
@@ -299,7 +299,11 @@ impl Pack<'_> {
         if data.is_empty() {
             return Ok(());
         }
-        let refused = |message: String| ZoeError::References { oid, tid, message };
+        let refused = |message: String| {
+            ZoeError::Format(format!(
+                "pack cannot read the references of the record of oid {oid:?}, tid {tid:?}: {message}"
+            ))
+        };
         for id in persistent_ids(data).map_err(|e| refused(e.to_string()))? {
             let PersistentId::Oid(bytes) = id else {
                 continue;
@@ -765,8 +769,9 @@ mod tests {
         });
 
         let written = written.unwrap();
+        let named = format!("oid {a:?}, tid {written:?}");
         assert!(
-            matches!(result, Err(ZoeError::References { oid, tid, .. }) if oid == a && tid == written),
+            matches!(&result, Err(ZoeError::Format(text)) if text.contains(&named)),
             "{result:?}"
         );
         // The first batch removed the old root, and nothing after it.
