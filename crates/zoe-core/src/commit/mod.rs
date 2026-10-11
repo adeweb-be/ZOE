@@ -18,12 +18,18 @@
 //! The thread that begins a transaction drives it: `store`, `restore`,
 //! `check_current_serial`, `vote` and `vote_resolving` from another thread
 //! fail with `WrongThread`. `finish` and `abort` work from any thread.
+//!
+//! `store_blob` stages a record with a synced blob file. `finish` places
+//! the blob files before the backend commit, and the same backend write
+//! transaction holds their blob records. Dropping a transaction removes
+//! the blob files that it did not place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::thread::{self, ThreadId};
 
 use crate::backend::{Record, TxnMeta, TxnStatus};
+use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::lock::Mode;
@@ -67,6 +73,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
+    /// The blob files of the staged oids that have one.
+    blobs: BTreeMap<Oid, PendingBlob>,
     staged: BTreeMap<Oid, Staged>,
     /// The oids that the transaction read as current, with the serial that
     /// it read.
@@ -112,6 +120,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
+            blobs: BTreeMap::new(),
             staged: BTreeMap::new(),
             read_current: BTreeMap::new(),
             locks: None,
@@ -181,6 +190,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Err(ZoeError::Protocol("store of an empty pickle"));
         }
         check_oid(oid)?;
+        self.blobs.remove(&oid);
         self.staged.insert(
             oid,
             Staged {
@@ -201,6 +211,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .map(|staged| (staged.serial, staged.data.as_slice()))
     }
 
+    /// Stage a new version of `oid` with the blob in `file`, as `store`
+    /// does. This syncs the file. `finish` renames it into the blob store.
+    pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
+        let blob = file.close()?;
+        self.store(oid, serial, data)?;
+        self.blobs.insert(oid, blob);
+        Ok(())
+    }
+
     /// Stage a copy of a version of `oid` in a restore transaction. `None`
     /// copies a deletion. The version gets the tid of the transaction.
     ///
@@ -218,6 +237,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         check_oid(oid)?;
         let current = self.current_serial(oid)?;
+        self.blobs.remove(&oid);
         self.staged.insert(
             oid,
             Staged {
@@ -460,9 +480,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
             store.raise_next_oid(oid);
         }
 
+        // The blob files are durable in their place before the backend
+        // commit, so a blob record never lacks its file.
+        let intent = store.blobs.place(tid, &mut self.blobs)?;
         let mut write = store.backend.begin_write()?;
         for (&oid, staged) in &self.staged {
             write.put_record(oid, tid, staged.serial, &staged.data)?;
+            if let Some(blob) = self.blobs.get(&oid) {
+                write.put_blob(oid, tid, blob.record())?;
+            }
         }
         write.put_txn(&TxnMeta {
             tid,
@@ -473,6 +499,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             status: TxnStatus::Committed,
         })?;
         write.commit()?;
+        store.blobs.finished(intent);
 
         *sequencer = Some(tid);
         drop(sequencer);

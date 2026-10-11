@@ -1,13 +1,15 @@
 //! A ZOE store: the entry point of the core.
 
 use std::any::Any;
+use std::io;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::backend::{Backend, RecordEncoding};
+use crate::backend::{Backend, BlobRecord, RecordEncoding};
+use crate::blob::{BlobFile, BlobReader, BlobStore};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
@@ -15,7 +17,7 @@ use crate::format::Compression;
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
 use crate::types::{Oid, Tid};
-use crate::vfs::{MemVfs, OsVfs, Vfs};
+use crate::vfs::{Dir, MemVfs, OsVfs, Vfs};
 
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
@@ -86,6 +88,10 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
+    /// The blob files. The blob store and `Opened` share the directory,
+    /// so the lock stays until both are dropped. This field drops after
+    /// `backend`, so the database closes first.
+    pub(crate) blobs: BlobStore,
 }
 
 impl Store {
@@ -137,7 +143,7 @@ impl Store {
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
-        Self::assemble(backend, Box::new(vfs), Box::new(clock), options, false)
+        Self::assemble(backend, Arc::new(vfs), Box::new(clock), options, false)
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -163,24 +169,25 @@ impl Store {
             })?;
         let backend = RedbBackend::open_read_only(db)?;
         let options = Options::default();
-        Self::assemble(backend, Box::new(dir), Box::new(SystemClock), options, true)
+        Self::assemble(backend, Arc::new(dir), Box::new(SystemClock), options, true)
     }
 
     /// Make a store from an open backend and the directory that holds its
     /// lock.
     fn assemble(
         backend: RedbBackend,
-        dir: Box<dyn Any + Send + Sync>,
+        dir: Arc<dyn Dir>,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
     ) -> Result<Self> {
+        let blobs = BlobStore::open(Arc::clone(&dir), &backend)?;
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
             backend: Arc::new(Opened {
                 backend: Box::new(backend),
-                _dir: dir,
+                _dir: Box::new(dir),
             }),
             clock,
             locks: LockManager::default(),
@@ -188,6 +195,7 @@ impl Store {
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
+            blobs,
         })
     }
 
@@ -269,6 +277,50 @@ impl Store {
     #[doc(hidden)]
     pub fn lock_table_is_empty(&self) -> bool {
         self.locks.is_empty()
+    }
+
+    /// Return a new, empty blob file. Write the blob into it, then give it
+    /// to `Txn::store_blob`. Dropping a file that no transaction took
+    /// removes it.
+    pub fn new_blob_file(&self) -> Result<BlobFile> {
+        self.blobs.new_file()
+    }
+
+    /// Open the blob that `tid` wrote for `oid`.
+    ///
+    /// The reader checks the size and the BLAKE3 hash of the blob when it
+    /// reaches the end of the file. A mismatch fails that read with
+    /// `InvalidData`. A missing file is `CorruptBlob`.
+    pub fn open_blob(&self, oid: Oid, tid: Tid) -> Result<BlobReader> {
+        let record = self.blob_record(oid, tid)?;
+        self.blobs.reader(oid, tid, record)
+    }
+
+    /// Read the whole blob that `tid` wrote for `oid`, and check its size
+    /// and its BLAKE3 hash. A mismatch is `CorruptBlob`.
+    pub fn verify_blob(&self, oid: Oid, tid: Tid) -> Result<()> {
+        let mut reader = self.open_blob(oid, tid)?;
+        match io::copy(&mut reader, &mut io::sink()) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                Err(ZoeError::CorruptBlob { oid, tid })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Return the path of the blob file that `tid` wrote for `oid`. The
+    /// file is read-only. A read through the path checks no hash.
+    pub fn blob_path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
+        self.blob_record(oid, tid)?;
+        Ok(self.blobs.path(oid, tid))
+    }
+
+    /// Return the blob record that `tid` wrote for `oid`, or `NotFound`.
+    fn blob_record(&self, oid: Oid, tid: Tid) -> Result<BlobRecord> {
+        self.backend
+            .load_blob(oid, tid)?
+            .ok_or(ZoeError::NotFound { oid })
     }
 
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
