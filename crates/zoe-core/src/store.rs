@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
-use crate::blob::{BlobFile, BlobReader, BlobStore};
+use crate::blob::{BlobFile, BlobReader, BlobStore, PendingBlob};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::{StagingArea, Txn};
 use crate::error::{Result, ZoeError};
@@ -340,6 +340,24 @@ impl Store {
     pub fn new_blob_file(&self) -> Result<BlobFile> {
         self.writable()?;
         self.blobs().new_file(Arc::downgrade(&self.backend))
+    }
+
+    /// Return the path of the blob temporary directory, `blobs/tmp/`.
+    ///
+    /// A client can write a new blob into a file there and give its path to
+    /// `Txn::store_blob_at`, which takes the file by rename. The call creates the blob store when it does not exist. A
+    /// read-only store fails with `ReadOnly` and creates nothing.
+    pub fn blob_temp_dir(&self) -> Result<PathBuf> {
+        self.writable()?;
+        self.blobs().temp_dir()
+    }
+
+    /// Take the file at `path` in the blob temporary directory by rename,
+    /// and return the blob, ready for a commit. A read-only store fails with
+    /// `ReadOnly`. `BlobStore::take` tells which files it takes.
+    pub(crate) fn take_blob_file(&self, path: &Path) -> Result<PendingBlob> {
+        self.writable()?;
+        self.blobs().take(Arc::downgrade(&self.backend), path)
     }
 
     /// Open the blob that `tid` wrote for `oid`.
