@@ -7,6 +7,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/storage.rs`: `zoe._zoe.Storage`, a frozen pyclass that Python can subclass. It implements the `IStorage` methods that ZODB's `MVCCAdapter` calls.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
+- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` section of ZConfig and the `zoe://` URI of zodburi.
 - `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage` and `IBlobStorage`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
 
 ## Invariants
@@ -52,6 +53,19 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - A change to a public Python API is a stop-and-ask.
 - `_lock_table_is_empty()` tells if no transaction of the core holds or waits for a lock. It is a private hook for the tests, not a public API.
 
+## The `<zoe>` stanza and the `zoe://` URI
+
+- `%import zoe` loads `component.xml`. It declares the `<zoe>` section, which implements `ZODB.storage`, so `<zodb>` and `<zodb_db>` take it. `zoe.config.ZoeStorage.open` opens a `zoe.Storage`.
+- The keys are `path`, `blob-dir`, `backend`, `lock-timeout`, `early-locks` and `read-only`, in kebab-case. `zoe.config.KEYS` gives the converter of each key. `component.xml` declares every key as a string, and a unit test checks it. `ZoeStorage.open` converts the text of the section with `KEYS`, as the twins and the URI do. So the three take the same syntax.
+- Every key has an environment twin: `ZOE_` and the key in upper case, with `_` for `-`. The twin gives the value only when the section does not set the key. An empty value of any key counts as not set: the key takes its twin, then its default. No key has a default in `component.xml`, else a twin could never apply; a missing key takes the default of `zoe.Storage`.
+- `open_storage` expands a leading `~` in `path` and `blob-dir`, from the section, a twin or the URI.
+- Only the section reads the twins. The URI and `zoe.Storage` do not.
+- `zoe:///absolute/path?key=value` resolves through the `zoe` entry point of `zodburi.resolvers`, `zoe.config.resolve_uri`. The path of the URI is `path`. The query takes the other keys of the section, with the same names and values, each at most once: a repeated key raises `ValueError`. The other query keys go to zodburi as database keywords, and zodburi refuses an unknown key with `KeyError`. A host, a fragment or a relative path raises `ValueError`.
+- zodburi comes with the `uri` extra, `zoedb[uri]`, because it needs ZEO. A plain install of zoedb keeps the entry point, which only zodburi reads. The dev group of the workspace takes zodburi for the tests.
+- `backend` takes only `redb`. `early-locks` takes only a false boolean: `on` raises `ValueError` until early locks are built. `lock-timeout` is whole seconds, as ZConfig's `time-interval` gives them, and 0 or more. A refused value raises `ValueError`, which names the source, the key and the value. A section without `path` and without `ZOE_PATH` raises `ValueError`.
+- `zoe.config` imports ZODB and ZConfig. `import zoe` does not import `zoe.config`. ZConfig and zodburi import it when they need it.
+- `just plone zoe` builds a Plone instance from `plone/zoe.cfg`, whose `zope.conf` has the `<zoe>` stanza alone, and `just plone zoe check` creates a Plone site on it. No command line and no file of the build holds the admin password: see `plone/README.md`.
+
 ## Errors
 
 | Core error | Python exception |
@@ -79,5 +93,6 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 - `python/zoedb/tests/test_zoe_blobs.py` holds the unit tests of the blobs: the refused calls, the copy, the savepoints, `blob_dir` and `restoreBlob`.
 - `python/zoedb/tests/acceptance/test_pack.py` is the acceptance test of pack. It also runs ZODB's `PackableStorage` suites.
 - `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
+- `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.

@@ -351,17 +351,33 @@ ZODB 5 wraps any storage that does not implement `IMVCCStorage` in `ZODB.mvccada
 <zodb_db main>
   <zoe>
     path  var/zoe
-    blob-dir  var/blobstorage      # optional; defaults to <path>/blobs
-    backend  redb                   # redb | log | fdb
+    # optional; defaults to <path>/blobs
+    blob-dir  var/blobstorage
+    # redb | log | fdb
+    backend  redb
     lock-timeout  10s
     staging-memory  16MB
-    early-locks  on
+    # on comes with early locks
+    early-locks  off
   </zoe>
   mount-point /
 </zodb_db>
 ```
 
-The same storage is reachable through `zodburi` as `zoe:///var/zoe?backend=redb` for scripts, `zodbverify` and `zodbconvert`.
+ZConfig keeps a `#` after a value as part of the value, so a comment takes a line of its own.
+
+| Key | Environment twin | Value | Default |
+| --- | --- | --- | --- |
+| `path` | `ZOE_PATH` | the directory of the store, created when missing; a leading `~` is the home directory | none: the stanza or `ZOE_PATH` gives it |
+| `blob-dir` | `ZOE_BLOB_DIR` | the directory of the blob files; a leading `~` is the home directory | `<path>/blobs` |
+| `backend` | `ZOE_BACKEND` | `redb`; `log` and `fdb` when they are built; another value raises `ValueError` | `redb` |
+| `lock-timeout` | `ZOE_LOCK_TIMEOUT` | whole seconds, as ZConfig's `time-interval`: `10`, `10s`, `2m` | the default of the store |
+| `early-locks` | `ZOE_EARLY_LOCKS` | a boolean; `on` raises `ValueError` until early locks are built | `off` |
+| `read-only` | `ZOE_READ_ONLY` | a boolean, as in `<filestorage>` | `false` |
+
+A key of the stanza wins over its twin: the twin gives the value only when the stanza does not set the key, with the same syntax. An empty value of any key counts as not set, so the key takes its twin, then its default.
+
+With the `uri` extra, `zoedb[uri]`, the same storage is reachable through `zodburi` as `zoe:///var/zoe?backend=redb` for scripts, `zodbverify` and `zodbconvert`. The path of the URI is `path`, and it is absolute. The query takes the other keys of the table, with the same names and values, each at most once, and the URI does not read the twins. The query also takes the database keys of zodburi, such as `database_name` and `connection_cache_size`; zodburi refuses any other key.
 
 In a buildout, `plone.recipe.zope2instance` knows only filestorage, ZEO client and RelStorage, so an instance part points `zope-conf-template` at a template carrying the stanza above; the Plone extra ships that template, and a `zoe` option for the recipe is a later contribution upstream.
 

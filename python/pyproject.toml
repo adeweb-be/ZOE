@@ -9,6 +9,8 @@ dependencies = ["zoedb"]
 dev = [
     "pytest>=9.1",
     "ZODB[test]",
+    # The tests of the zoe:// URI. zoedb takes it through its uri extra.
+    "zodburi>=3",
 ]
 
 [tool.uv]
