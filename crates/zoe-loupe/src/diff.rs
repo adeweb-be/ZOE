@@ -39,10 +39,11 @@
 //!   Past that, the diff is one change of the whole state.
 //! - The comparisons of one diff take at most `WORK_BUDGET` steps. A step
 //!   is one pair of nodes, one item or entry that a comparison collects, or
-//!   one byte that it reads. Past the budget, two values compare by their
-//!   JSON. Equal JSON is no change only when it shows both values whole.
-//!   A value with a cut or a marker is then a change, because the diff
-//!   cannot tell.
+//!   one byte that it reads. Past the budget, each pair that the diff did
+//!   not compare is a change. The JSON cannot replace the comparison: it
+//!   gives a tuple and a list the same form, and so it does for bytes and
+//!   a Python 2 `str`. So past the budget the diff can show a change that
+//!   is not one, but it never misses a change.
 
 use std::collections::{HashMap, HashSet};
 
@@ -271,9 +272,7 @@ impl<'t> Differ<'_, 't> {
     }
 
     /// Tell if two values are equal. Compare the trees. When the work
-    /// budget is spent, compare the JSON: equal JSON proves equal values
-    /// only when it shows both values whole. So a value with a cut or a
-    /// marker in its JSON is then a change.
+    /// budget is spent, the values are not equal: the diff cannot tell.
     fn same(&mut self, a: Side<'_, 't>, b: Side<'_, 't>) -> bool {
         let node_a = self.a.resolve(a.node).unwrap_or(a.node.value());
         let node_b = self.b.resolve(b.node).unwrap_or(b.node.value());
@@ -281,10 +280,7 @@ impl<'t> Differ<'_, 't> {
         if let Some(&known) = self.compared.get(&key) {
             return known;
         }
-        let equal = match self.equal(a.node, b.node) {
-            Some(equal) => equal,
-            None => a.json == b.json && whole(a.json) && whole(b.json),
-        };
+        let equal = self.equal(a.node, b.node).unwrap_or(false);
         self.compared.insert(key, equal);
         equal
     }
@@ -619,31 +615,6 @@ impl<'t> Differ<'_, 't> {
     }
 }
 
-/// Tell if a JSON value shows its value whole: it holds no value that the
-/// state cuts, and no marker in place of a value.
-fn whole(json: &Value) -> bool {
-    let mut pending = vec![json];
-    while let Some(json) = pending.pop() {
-        match json {
-            Value::Array(items) => pending.extend(items),
-            Value::Object(object) => {
-                let tagged = !plain(object);
-                if tagged
-                    && (object.contains_key("length")
-                        || ["$elided", "$cycle", "$memo"]
-                            .iter()
-                            .any(|marker| object.contains_key(*marker)))
-                {
-                    return false;
-                }
-                pending.extend(object.values());
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
 /// Tell if a JSON object is a dict with text keys, not a tagged value.
 /// Each tag starts with `$`, and no key of such a dict does.
 fn plain(object: &Map<String, Value>) -> bool {
@@ -916,8 +887,8 @@ mod tests {
         // The JSON shows the same start on both sides.
         assert_eq!(changed[0].before, changed[0].after);
 
-        // Past the work budget, equal JSON of a cut value is a change,
-        // because the diff cannot tell.
+        // Past the work budget, a pair is a change, because the diff
+        // cannot tell.
         let tree_a = record(&text(&long));
         let tree_b = record(&text(&other));
         assert_eq!(diff_within(&tree_a, &tree_b, 0).len(), 1);
@@ -926,17 +897,28 @@ mod tests {
     }
 
     #[test]
-    fn past_the_work_budget_whole_json_compares() {
-        let (one, two) = (record(b"(K\x01K\x02t"), record(b"(K\x01K\x03t"));
-        assert!(diff_within(&one, &record(b"(K\x01K\x02t"), 0).is_empty());
-        let changed = diff_within(&one, &two, 0);
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].path, "/1");
-        // A marker in the JSON is a change past the budget.
-        let deep = |leaf: &[u8]| [b"(".repeat(110), leaf.to_vec(), b"t".repeat(110)].concat();
-        let (deep_a, deep_b) = (record(&deep(b"K\x01")), record(&deep(b"K\x01")));
-        assert_eq!(diff_within(&deep_a, &deep_b, 0).len(), 1);
-        assert!(diff_within(&deep_a, &deep_b, WORK_BUDGET).is_empty());
+    fn past_the_work_budget_each_pair_left_is_a_change() {
+        // Values that the JSON writes in one form: a tuple and a list, and
+        // bytes and a Python 2 `str`.
+        for (before, after) in [
+            (&b"K\x01\x85"[..], &b"]K\x01a"[..]),
+            (b"C\x01\xff", b"U\x01\xff"),
+        ] {
+            let (tree_a, tree_b) = (record(before), record(after));
+            let (json_a, json_b) = (state::state(&tree_a).0, state::state(&tree_b).0);
+            assert_eq!(json_a, json_b);
+            assert_eq!(diff_within(&tree_a, &tree_b, WORK_BUDGET).len(), 1);
+            assert_eq!(diff_within(&tree_a, &tree_b, 0).len(), 1);
+        }
+        // Equal values are a change too past the budget, at each pair that
+        // the diff did not compare.
+        let (one, other) = (record(b"(K\x01K\x02t"), record(b"(K\x01K\x02t"));
+        assert!(diff_within(&one, &other, WORK_BUDGET).is_empty());
+        let paths: Vec<String> = diff_within(&one, &other, 0)
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        assert_eq!(paths, ["/0", "/1"]);
     }
 
     #[test]
