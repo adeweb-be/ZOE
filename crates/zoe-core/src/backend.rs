@@ -4,6 +4,8 @@
 //! conflict resolution, invalidations and blobs. A backend stores and
 //! reads bytes under the keys of the data model.
 
+use std::collections::BTreeMap;
+
 use crate::error::Result;
 use crate::types::{Oid, Tid};
 
@@ -94,6 +96,20 @@ pub trait Backend: Send + Sync {
     /// Return at most `limit` versions of `oid`, newest first.
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>>;
 
+    /// Return the newest version of `oid` with a tid lower than `tid`, and
+    /// the serial of the oldest version of `oid` with a tid at or after
+    /// `tid`. One snapshot gives both.
+    fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)>;
+
+    /// Return the oids that each transaction from `from` to `to` wrote,
+    /// both bounds included. The oids of a transaction are in ascending
+    /// order. One snapshot gives the whole map.
+    fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;
+
+    /// Return the first oid at or after `from` that has a version, with
+    /// its newest version.
+    fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;
+
     /// Remove the versions older than `before` that `reachable` rejects.
     fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>;
 
@@ -162,6 +178,18 @@ mod tests {
 
         fn history(&self, _: Oid, _: usize) -> Result<Vec<RecordMeta>> {
             Ok(Vec::new())
+        }
+
+        fn load_before_next(&self, _: Oid, _: Tid) -> Result<(Option<Record>, Option<Tid>)> {
+            Ok((None, None))
+        }
+
+        fn txn_oids(&self, _: Tid, _: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
+            Ok(BTreeMap::new())
+        }
+
+        fn current_from(&self, _: Oid) -> Result<Option<(Oid, Record)>> {
+            Ok(None)
         }
 
         fn pack(&self, _: Tid, _: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {

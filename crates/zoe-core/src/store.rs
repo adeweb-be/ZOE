@@ -156,6 +156,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -220,6 +221,18 @@ mod tests {
 
         fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
             self.inner.history(oid, limit)
+        }
+
+        fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)> {
+            self.inner.load_before_next(oid, tid)
+        }
+
+        fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
+            self.inner.txn_oids(from, to)
+        }
+
+        fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
+            self.inner.current_from(from)
         }
 
         fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
