@@ -702,8 +702,8 @@ fn the_synthetic_set_round_trips_and_shrinks() {
         sizes.data += data.len() as u64;
         sizes.stored += payload.len() as u64;
     }
-    // At the default level, the set shrinks by 1.88. The bound below
-    // catches a fault in the codec or in the generator.
+    // At the default level, these 1,000 records shrink by 1.87. The bound
+    // below catches a fault in the codec or in the generator.
     assert!(sizes.ratio() > 1.7, "{sizes:?}");
 }
 

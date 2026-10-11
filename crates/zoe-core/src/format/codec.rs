@@ -31,8 +31,10 @@ const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// payload length field, for every codec.
 const MAX_DATA_LEN: u64 = u32::MAX as u64;
 
-/// The most data bytes that one byte of a zstd frame can give. The
-/// smallest zstd block is 4 bytes, and one block gives at most 128 KiB.
+/// The largest ratio of the stated data length to the stored length that
+/// the reader accepts. A zstd writer puts at most 128 KiB in a block of at
+/// least 4 bytes, so its frames stay inside this ratio. libzstd accepts
+/// larger blocks on read, so the reader enforces the ratio itself.
 const ZSTD_MAX_EXPANSION: u64 = 32 * 1024;
 
 /// The magic number that starts a standard zstd frame, as stored.
@@ -109,7 +111,9 @@ pub(crate) fn encode(data: &[u8], compression: Compression) -> (Codec, Cow<'_, [
 /// is, and that is always correct.
 fn zstd_smaller(data: &[u8], level: i32) -> Option<Vec<u8>> {
     // The buffer is shorter than the data, so zstd fails when its result
-    // is not smaller.
+    // is not smaller. zstd can also fail when its result is only a little
+    // smaller, because it needs some free space in the buffer. Then the
+    // data is stored as it is. That costs a few bytes and is correct.
     let mut packed = Vec::with_capacity(data.len().checked_sub(1)?);
     let mut compressor = Compressor::new(level).ok()?;
     // The reader needs the data length in the zstd frame header.

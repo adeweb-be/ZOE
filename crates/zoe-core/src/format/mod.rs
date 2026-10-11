@@ -9,7 +9,7 @@
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
 //! | 0 | 1 | frame version |
-//! | 1 | 1 | flags, 0: no flag is defined |
+//! | 1 | 1 | flags: 0; the encrypted flag is reserved for a later phase; no flag is defined yet |
 //! | 2 | 1 | codec: 0 none, 1 zstd (see `codec`) |
 //! | 3 | 1 | reserved, 0 |
 //! | 4 | 4 | branch id |
@@ -92,7 +92,7 @@ pub enum FrameError {
     Payload,
 }
 
-/// A frame that was read, checked and decoded.
+/// A frame that `decode_frame` read, checked and decoded.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
     /// The flags byte.
@@ -105,7 +105,7 @@ pub struct Frame<'a> {
     pub prev: Tid,
     /// The typed-field slots.
     pub slots: &'a [u8],
-    /// The length of the payload as stored, before it is decoded.
+    /// The length of the payload as stored, before the codec decodes it.
     pub stored_len: usize,
     /// The data: the payload, decoded with its codec.
     pub data: Cow<'a, [u8]>,
