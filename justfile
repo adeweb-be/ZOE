@@ -138,7 +138,8 @@ loupe command="run":
             rustfmt --check --edition 2024 src-tauri/build.rs src-tauri/src/main.rs
             # The Tauri context embeds dist/, so clippy needs a build of it.
             npm run build
-            cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings
+            cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+            cargo test --manifest-path src-tauri/Cargo.toml --locked
             ;;
         e2e)
             cargo tauri build --debug --no-bundle -- --locked

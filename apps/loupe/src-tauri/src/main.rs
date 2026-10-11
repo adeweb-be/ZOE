@@ -1,8 +1,10 @@
 //! Loupe, the desktop inspector of ZOE stores.
 //!
 //! The window calls the IPC commands of this file. Each command returns an
-//! object of `zoe-loupe`, with oids and tids as ZODB-form strings, or an
-//! error message.
+//! object of `zoe-loupe`, with oids and tids as ZODB-form strings, or a
+//! `Failure`.
+
+mod failure;
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -10,6 +12,8 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use zoe_loupe::{Folder, Object};
+
+use crate::failure::Failure;
 
 /// The state of the app: the open folder, if any.
 #[derive(Default)]
@@ -26,10 +30,10 @@ impl Loupe {
     fn with_folder<T>(
         &self,
         read: impl FnOnce(&Folder) -> zoe_loupe::Result<T>,
-    ) -> Result<T, String> {
+    ) -> Result<T, Failure> {
         match &*self.folder() {
-            Some(folder) => read(folder).map_err(|e| e.to_string()),
-            None => Err("no folder is open".to_owned()),
+            Some(folder) => Ok(read(folder)?),
+            None => Err(Failure::NoFolder),
         }
     }
 }
@@ -47,10 +51,10 @@ struct FolderInfo {
 /// Open the store folder `path` for reads only. Close the folder that is
 /// open first, so that its lock goes.
 #[tauri::command]
-async fn open_folder(loupe: State<'_, Loupe>, path: String) -> Result<FolderInfo, String> {
+async fn open_folder(loupe: State<'_, Loupe>, path: String) -> Result<FolderInfo, Failure> {
     let mut folder = loupe.folder();
     *folder = None;
-    let opened = Folder::open(&path).map_err(|e| e.to_string())?;
+    let opened = Folder::open(&path)?;
     let info = FolderInfo {
         path,
         last_tid: zoe_loupe::tid_repr(opened.last_tid()),
@@ -62,30 +66,30 @@ async fn open_folder(loupe: State<'_, Loupe>, path: String) -> Result<FolderInfo
 /// Ask for a folder in the native dialog. Return `None` when the user
 /// cancels.
 #[tauri::command]
-async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+async fn pick_folder(app: AppHandle) -> Result<Option<String>, Failure> {
     let picked =
         tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Failure::other)?;
     Ok(picked.map(|path| path.to_string()))
 }
 
 /// Return the root object.
 #[tauri::command]
-async fn root(loupe: State<'_, Loupe>) -> Result<Object, String> {
+async fn root(loupe: State<'_, Loupe>) -> Result<Object, Failure> {
     loupe.with_folder(Folder::root)
 }
 
 /// Return the object `oid`, an oid in ZODB form.
 #[tauri::command]
-async fn object(loupe: State<'_, Loupe>, oid: String) -> Result<Object, String> {
-    let oid = zoe_loupe::parse_oid(&oid).map_err(|e| e.to_string())?;
+async fn object(loupe: State<'_, Loupe>, oid: String) -> Result<Object, Failure> {
+    let oid = zoe_loupe::parse_oid(&oid)?;
     loupe.with_folder(|folder| folder.object(oid))
 }
 
 /// Return the object that the Plone path `path` leads to.
 #[tauri::command]
-async fn resolve(loupe: State<'_, Loupe>, path: String) -> Result<Object, String> {
+async fn resolve(loupe: State<'_, Loupe>, path: String) -> Result<Object, Failure> {
     loupe.with_folder(|folder| folder.resolve(&path))
 }
 
