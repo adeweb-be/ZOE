@@ -112,12 +112,13 @@ fn repr(n: u64) -> String {
 /// `ZODB.blob.Blob` itself.
 ///
 /// This is the test of ZODB's `is_blob_record`. It reads only the class
-/// pickle: an optional PROTO, the GLOBAL `ZODB.blob Blob`, an optional
-/// memo put, then STOP. A record that only refers to a blob, or a subclass
-/// of `Blob`, is not a blob record.
+/// pickle: an optional PROTO of protocol 0 to 3, the GLOBAL
+/// `ZODB.blob Blob`, an optional memo put, then STOP. A record that only
+/// refers to a blob, or a subclass of `Blob`, is not a blob record.
 pub(crate) fn is_blob_record(data: &[u8]) -> bool {
     let rest = match data {
-        [0x80, _, rest @ ..] => rest,
+        [0x80, 0..=3, rest @ ..] => rest,
+        [0x80, ..] => return false,
         rest => rest,
     };
     let Some(rest) = rest.strip_prefix(b"cZODB.blob\nBlob\n") else {
@@ -224,6 +225,8 @@ mod tests {
             b"\x80\x03cZODB.blob\nBlobFile\nq\x00.N.",
             // A PUT without digits.
             b"cZODB.blob\nBlob\np\n.N.",
+            // A protocol after 3.
+            b"\x80\x04cZODB.blob\nBlob\nq\x00.\x80\x04N.",
             b"",
             b"cZODB.blob\nBlob\n",
         ] {
