@@ -719,6 +719,25 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_transaction_takes_a_blob_over_the_limits() {
+        let options = Options {
+            max_record_size: Some(1),
+            max_transaction_size: Some(1),
+            max_blob_size: Some(1),
+            ..Options::default()
+        };
+        let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+        let oid = store.new_oid().unwrap();
+        let tid = Tid(100);
+        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"a copy"))
+            .unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), tid);
+        assert_eq!(read(&store, oid, tid).unwrap(), b"a copy");
+    }
+
+    #[test]
     fn the_pickle_of_a_blob_counts_toward_the_transaction_size() {
         let options = Options {
             max_transaction_size: Some(PICKLE.len() as u64),
