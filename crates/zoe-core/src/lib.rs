@@ -34,7 +34,7 @@ pub use commit::{Finished, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
-pub use pack::{ClassReport, PackReport};
+pub use pack::{ClassTotals, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};

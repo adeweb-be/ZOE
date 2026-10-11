@@ -59,7 +59,8 @@ const BATCH: usize = 1000;
 /// The number of record keys that one read of the key scan asks for.
 const KEY_CHUNK: usize = 4096;
 
-/// What a pack removed.
+/// What a pack removed. A dry run gives the same report for what a pack
+/// would remove.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackReport {
     /// The number of records that the pack removed.
@@ -73,14 +74,23 @@ pub struct PackReport {
     /// The size of these blob files, in bytes.
     pub blob_bytes: u64,
     /// The removed records by class. The key is `module.name` from the
-    /// class pickle. It is `None` for a deletion, for a persistent class
-    /// and for a class pickle that does not decode.
-    pub by_class: BTreeMap<Option<String>, ClassReport>,
+    /// class pickle, or [`PackReport::UNKNOWN_CLASS`]. The map has one
+    /// entry for each class, so it grows with the number of classes, not
+    /// with the number of records.
+    pub by_class: BTreeMap<String, ClassTotals>,
+}
+
+impl PackReport {
+    /// The `by_class` key of a record that gives no class name: a
+    /// deletion, a record of a persistent class, and a record whose class
+    /// pickle does not decode. The key holds no dot, so no `module.name`
+    /// key is equal to it.
+    pub const UNKNOWN_CLASS: &str = "<unknown>";
 }
 
 /// What a pack removed of one class.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClassReport {
+pub struct ClassTotals {
     /// The number of records.
     pub records: u64,
     /// The size of their pickles, in bytes.
@@ -217,7 +227,7 @@ struct Removal {
     /// The size of the pickle.
     size: u64,
     /// The class of the record, for the report.
-    class: Option<String>,
+    class: String,
     /// The size of the blob file, if the record has a blob.
     blob: Option<u64>,
 }
@@ -502,12 +512,15 @@ impl Pack<'_> {
     }
 }
 
-/// Return `module.name` of the class of the record `data`, or `None` when
-/// the class pickle names no class or does not decode. Only the class
-/// pickle is decoded, so a large state takes no memory here.
-fn class_name(data: &[u8]) -> Option<String> {
-    let (module, name) = decode_class_name(data).ok()??;
-    Some(format!("{module}.{name}"))
+/// Return `module.name` of the class of the record `data`. Return
+/// `PackReport::UNKNOWN_CLASS` when the class pickle names no class or
+/// does not decode, and for a deletion. Only the class pickle is decoded,
+/// so a large state takes no memory here.
+fn class_name(data: &[u8]) -> String {
+    match decode_class_name(data) {
+        Ok(Some((module, name))) => format!("{module}.{name}"),
+        Ok(None) | Err(_) => PackReport::UNKNOWN_CLASS.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -654,14 +667,54 @@ mod tests {
         assert_eq!(
             classes,
             [(
-                &Some("m.C".to_owned()),
-                &ClassReport {
+                &"m.C".to_owned(),
+                &ClassTotals {
                     records: 3,
                     bytes: report.bytes
                 }
             )]
         );
         assert_eq!((report.records, report.objects), (3, 1), "{report:?}");
+    }
+
+    #[test]
+    fn a_record_without_a_class_name_goes_under_the_unknown_key() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let [x, garbage, persistent, deleted] = [1, 2, 3, 4].map(Oid);
+        // The class pickle of a persistent class is a persistent reference.
+        let persistent_class = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x09Q.\x80\x03}.";
+        let t1 = commit(
+            &store,
+            &[
+                (ROOT, record(&[x])),
+                (x, record(&[])),
+                (garbage, b"not a pickle".to_vec()),
+                (persistent, persistent_class.to_vec()),
+                (deleted, record(&[])),
+            ],
+        );
+        let t2 = Tid(t1.0 + 1);
+        let mut txn = store.tpc_begin_restore(t2, b"", b"", b"").unwrap();
+        txn.restore(deleted, None).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+
+        let report = store.pack(t2).unwrap();
+
+        let unknown = (b"not a pickle".len() + persistent_class.len()) as u64;
+        let classes: Vec<(&str, u64, u64)> = report
+            .by_class
+            .iter()
+            .map(|(class, totals)| (class.as_str(), totals.records, totals.bytes))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                (PackReport::UNKNOWN_CLASS, 3, unknown),
+                ("m.C", 1, record(&[]).len() as u64),
+            ]
+        );
+        assert_eq!((report.records, report.objects), (4, 3), "{report:?}");
     }
 
     #[test]
