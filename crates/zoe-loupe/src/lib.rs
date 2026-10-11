@@ -6,6 +6,10 @@
 //! the serial, the size, the decoded state as JSON and the outbound
 //! references. It resolves the paths of a Plone site. It never writes to
 //! the folder.
+//!
+//! Loupe also travels in time. [`Folder::as_of`] gives a [`Snapshot`]: the
+//! store as it was after a transaction. [`Folder::history`] lists the
+//! revisions of an object.
 
 mod path;
 mod state;
@@ -15,6 +19,12 @@ use std::path::Path;
 
 use serde::{Serialize, Serializer};
 use zoe_core::{Oid, Store, Tid, ZoeError};
+
+/// The most revisions that [`Folder::history`] gives, newest first.
+pub const HISTORY_LIMIT: usize = 1 << 12;
+
+/// The most bytes of the user or the description of a revision.
+const MAX_NOTE: usize = 1 << 12;
 
 /// An error of Loupe.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +62,16 @@ pub enum Error {
     /// A text is not an oid or a tid in ZODB form.
     #[error("{0}: not a ZODB id")]
     BadId(String),
+
+    /// The object has no record at or before the tid of a view. A later
+    /// transaction creates it.
+    #[error("oid {}: no record as of tid {}", id_repr(.oid.0), id_repr(.tid.0))]
+    NoRecordAsOf {
+        /// The oid of the object.
+        oid: Oid,
+        /// The tid of the view.
+        tid: Tid,
+    },
 }
 
 /// The result type of Loupe.
@@ -93,6 +113,23 @@ pub struct Reference {
     pub at: String,
 }
 
+/// One revision of an object: a record and the transaction that wrote
+/// it.
+///
+/// In JSON, `tid` is a ZODB-form string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Revision {
+    /// The tid of the transaction that wrote the record.
+    #[serde(serialize_with = "serialize_tid")]
+    pub tid: Tid,
+    /// The user name of the transaction.
+    pub user: String,
+    /// The description of the transaction.
+    pub description: String,
+    /// The size of the record in bytes. A deletion has size 0.
+    pub size: u64,
+}
+
 /// A store folder, open for reads only.
 ///
 /// The folder holds the lock of the store while it is open. So a running
@@ -124,9 +161,15 @@ impl Folder {
         self.store.last_transaction()
     }
 
-    /// Return the root object, oid 0.
+    /// Return a view of the store as of `tid`: each object as it was after
+    /// the last transaction at or before `tid`.
+    pub fn as_of(&self, tid: Tid) -> Snapshot<'_> {
+        Snapshot { folder: self, tid }
+    }
+
+    /// Return the root object, oid 0, as of the last transaction.
     pub fn root(&self) -> Result<Object> {
-        self.object(Oid(0))
+        self.latest().root()
     }
 
     /// Return the object `oid` as of the last transaction.
@@ -134,7 +177,74 @@ impl Folder {
     /// A record that zoe-pickle refuses gives an object with the refusal
     /// in `error`. An oid without a record is an error.
     pub fn object(&self, oid: Oid) -> Result<Object> {
-        let (data, serial) = self.store.load(oid)?;
+        self.latest().object(oid)
+    }
+
+    /// Return the object that the Plone path `path` leads to, as of the
+    /// last transaction.
+    ///
+    /// A path starts at the Zope application, `root["Application"]`. Each
+    /// segment is an item of the `_tree` of a folder, a key of a BTree or a
+    /// mapping, or an attribute that holds a reference. So `/plone/folder`
+    /// and `/plone/folder/doc/__annotations__/key` resolve.
+    pub fn resolve(&self, path: &str) -> Result<Object> {
+        self.latest().resolve(path)
+    }
+
+    /// Return the revisions of `oid`, newest first. Give at most
+    /// [`HISTORY_LIMIT`] of them.
+    ///
+    /// The user and the description are text. Bytes that are not UTF-8
+    /// become U+FFFD. A text longer than 4 KiB shows its start and ends
+    /// with `…`. An oid without a record is an error.
+    pub fn history(&self, oid: Oid) -> Result<Vec<Revision>> {
+        let entries = self.store.history(oid, HISTORY_LIMIT)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| Revision {
+                tid: entry.tid,
+                user: note(&entry.user),
+                description: note(&entry.description),
+                size: entry.size,
+            })
+            .collect())
+    }
+
+    /// Return the view as of the last transaction.
+    fn latest(&self) -> Snapshot<'_> {
+        self.as_of(self.last_tid())
+    }
+}
+
+/// A view of a store folder as of a tid. It shows each object as it was
+/// after the last transaction at or before that tid.
+///
+/// Every read of a view loads with `load_before` at the same tid. So a
+/// view never mixes the revisions of two tids.
+#[derive(Clone, Copy)]
+pub struct Snapshot<'a> {
+    folder: &'a Folder,
+    tid: Tid,
+}
+
+impl Snapshot<'_> {
+    /// Return the tid of the view.
+    pub fn tid(&self) -> Tid {
+        self.tid
+    }
+
+    /// Return the root object, oid 0.
+    pub fn root(&self) -> Result<Object> {
+        self.object(Oid(0))
+    }
+
+    /// Return the object `oid`.
+    ///
+    /// A record that zoe-pickle refuses gives an object with the refusal
+    /// in `error`. An oid without a record at or before the tid of the
+    /// view is an error.
+    pub fn object(&self, oid: Oid) -> Result<Object> {
+        let (data, serial) = self.load(oid)?;
         let size = data.len() as u64;
         let object = match zoe_pickle::decode_record(&data) {
             Ok(tree) => {
@@ -165,21 +275,41 @@ impl Folder {
         Ok(object)
     }
 
-    /// Return the object that the Plone path `path` leads to.
-    ///
-    /// A path starts at the Zope application, `root["Application"]`. Each
-    /// segment is an item of the `_tree` of a folder, a key of a BTree or a
-    /// mapping, or an attribute that holds a reference. So `/plone/folder`
-    /// and `/plone/folder/doc/__annotations__/key` resolve.
+    /// Return the object that the Plone path `path` leads to. Each step of
+    /// the path reads as of the tid of the view. [`Folder::resolve`] gives
+    /// the form of a path.
     pub fn resolve(&self, path: &str) -> Result<Object> {
         self.object(path::resolve(self, path)?)
     }
 
-    /// Return the current record of `oid`, decoded.
+    /// Return the record of `oid` and its serial.
+    fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid)> {
+        // `load_before` gives the newest record before its tid, and the
+        // view includes its own tid. `Tid::MAX` is after every
+        // transaction, so the saturated add loses no record.
+        let before = Tid(self.tid.0.saturating_add(1));
+        match self.folder.store.load_before(oid, before)? {
+            Some(record) => Ok((record.data, record.serial)),
+            None => Err(Error::NoRecordAsOf { oid, tid: self.tid }),
+        }
+    }
+
+    /// Return the record of `oid`, decoded.
     pub(crate) fn tree(&self, oid: Oid) -> Result<zoe_pickle::Tree> {
-        let (data, _) = self.store.load(oid)?;
+        let (data, _) = self.load(oid)?;
         zoe_pickle::decode_record(&data).map_err(|source| Error::Refused { oid, source })
     }
+}
+
+/// Return the user or the description of a transaction as text, with at
+/// most `MAX_NOTE` bytes of the record.
+fn note(bytes: &[u8]) -> String {
+    let start = &bytes[..bytes.len().min(MAX_NOTE)];
+    let mut text = String::from_utf8_lossy(start).into_owned();
+    if start.len() < bytes.len() {
+        text.push('…');
+    }
+    text
 }
 
 /// Return an 8-byte id in ZODB form, as `ZODB.utils.oid_repr` writes it:
@@ -203,14 +333,22 @@ pub fn tid_repr(tid: Tid) -> String {
 
 /// Read an oid in ZODB form: `0x` and 1 to 16 hex digits.
 pub fn parse_oid(text: &str) -> Result<Oid> {
+    parse_id(text).map(Oid)
+}
+
+/// Read a tid in ZODB form: `0x` and 1 to 16 hex digits.
+pub fn parse_tid(text: &str) -> Result<Tid> {
+    parse_id(text).map(Tid)
+}
+
+/// Read an 8-byte id in ZODB form: `0x` and 1 to 16 hex digits.
+fn parse_id(text: &str) -> Result<u64> {
     let digits = text
         .strip_prefix("0x")
         .filter(|digits| (1..=16).contains(&digits.len()))
         .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| Error::BadId(text.to_owned()))?;
-    u64::from_str_radix(digits, 16)
-        .map(Oid)
-        .map_err(|_| Error::BadId(text.to_owned()))
+    u64::from_str_radix(digits, 16).map_err(|_| Error::BadId(text.to_owned()))
 }
 
 fn serialize_oid<S: Serializer>(oid: &Oid, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -252,6 +390,74 @@ mod tests {
         ] {
             assert!(parse_oid(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_tid_in_zodb_form_parses() {
+        let tid = Tid(0x033f2eeca6666666);
+        assert_eq!(parse_tid(&tid_repr(tid)).unwrap(), tid);
+        assert!(matches!(parse_tid("latest"), Err(Error::BadId(_))));
+    }
+
+    #[test]
+    fn a_long_note_shows_its_start() {
+        assert_eq!(note(b"edit"), "edit");
+        assert_eq!(note(b"caf\xe9"), "caf\u{fffd}");
+        let long = note(&b"a".repeat(MAX_NOTE + 1));
+        assert_eq!(long, format!("{}\u{2026}", "a".repeat(MAX_NOTE)));
+    }
+
+    #[test]
+    fn a_revision_serializes_with_a_zodb_tid() {
+        let revision = Revision {
+            tid: Tid(0x0100),
+            user: "editor".to_owned(),
+            description: "edit".to_owned(),
+            size: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&revision).unwrap(),
+            serde_json::json!({"tid": "0x0100", "user": "editor", "description": "edit", "size": 3})
+        );
+    }
+
+    #[test]
+    fn a_view_before_the_first_record_of_an_object_has_no_record() {
+        let dir = std::env::temp_dir().join(format!("zoe-loupe-as-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let store = Store::open(&dir).unwrap();
+            for (tid, oid) in [(Tid(0x10), Oid(0)), (Tid(0x20), Oid(1))] {
+                let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+                txn.restore(oid, Some(b"\x80\x03cm\nC\nq\x00.\x80\x03N."))
+                    .unwrap();
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+            }
+        }
+        let folder = Folder::open(&dir).unwrap();
+        let error = folder.as_of(Tid(0x1f)).object(Oid(1)).err();
+        assert!(
+            matches!(
+                error,
+                Some(Error::NoRecordAsOf {
+                    oid: Oid(1),
+                    tid: Tid(0x1f)
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            folder.as_of(Tid(0x20)).object(Oid(1)).unwrap().serial,
+            Tid(0x20)
+        );
+        assert_eq!(
+            folder.as_of(Tid(u64::MAX)).object(Oid(1)).unwrap().serial,
+            Tid(0x20)
+        );
+        let history = folder.history(Oid(1)).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tid, Tid(0x20));
     }
 
     #[test]
