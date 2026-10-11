@@ -8,6 +8,7 @@ dependencies = [
     # Direct dependencies, so that the sources below select the forks.
     "persistent",
     "zodbpickle",
+    "BTrees",
 ]
 
 [dependency-groups]
@@ -31,6 +32,11 @@ persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c5495
 # Its C extension declares that it can run without the GIL, so that
 # importing ZODB keeps the GIL off on 3.14t. The pickle bytes do not change.
 zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
+# The fork of BTrees, at a commit of the branch zoe-046-free-threading.
+# Its C extensions declare that they can run without the GIL, so that a
+# ZODB application that uses BTrees keeps the GIL off on 3.14t. The pickled
+# states and the conflict-resolution results do not change.
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
 
 [tool.uv.workspace]
 members = ["zoedb"]
