@@ -351,7 +351,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::backend::{BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::backend::{
+        BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn,
+    };
     use crate::format;
     use crate::format::Codec;
     use crate::vfs::LOCK;
@@ -442,6 +444,18 @@ mod tests {
 
         fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
             self.inner.pack(before, reachable)
+        }
+
+        fn pack_watermark(&self) -> Result<Tid> {
+            self.inner.pack_watermark()
+        }
+
+        fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
+            self.inner.record_keys(from, limit)
+        }
+
+        fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>> {
+            self.inner.txn_records(tid, oids)
         }
 
         fn sync(&self) -> Result<()> {

@@ -21,7 +21,7 @@ pub mod vfs;
 
 pub use backend::{
     Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnStatus, WriteTxn,
+    TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, timestamp};
