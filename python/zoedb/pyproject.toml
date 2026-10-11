@@ -31,6 +31,10 @@ uri = ["zodburi>=3"]
 [project.entry-points."zodburi.resolvers"]
 zoe = "zoe.config:resolve_uri"
 
+[project.scripts]
+# The `zoe` command. It runs the code of the `zoe` binary.
+zoe = "zoe.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/adeweb-be/ZOE"
 Documentation = "https://adeweb-be.github.io/ZOE/"

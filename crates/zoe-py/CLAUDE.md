@@ -9,6 +9,8 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
 - `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` section of ZConfig and the `zoe://` URI of zodburi.
+- `src/cli.rs`: `zoe._zoe.main`, the `zoe` command of the console script.
+- `python/zoedb/src/zoe/__main__.py`: `zoe.__main__.main`, the entry point of the console script `zoe` and of `python -m zoe`.
 - `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage` and `IBlobStorage`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
 
 ## Invariants
@@ -52,6 +54,10 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `supportsUndo()` is false.
 - The wheel never imports Plone. Only `zoe.plone`, through the `plone` extra, does.
 - The version of the wheel equals the version of the crates.
+- The wheel has one console script, `zoe`, on `zoe.__main__:main`. It runs `zoe._zoe.main(sys.argv)`, which runs `zoe_server::cli::main`, the code of the `zoe` binary, inside `py.detach`. The console script has no parser of its own. ADR 0028 records this.
+- The extension depends on `zoe-server` without the feature `serve`, so it never links tokio. `cargo tree -p zoe-py -e normal` must not list tokio.
+- `zoe.__main__.main` restores the default SIGINT handler before it calls the extension. The command runs without the GIL, and Python handles a signal only when it runs Python code. So Ctrl-C stops the console script at once, as it stops the binary.
+- The command writes its report and its messages to the file descriptors 1 and 2 of the process, not to `sys.stdout` and `sys.stderr`.
 - A change to a public Python API is a stop-and-ask.
 - `_lock_table_is_empty()` tells if no transaction of the core holds or waits for a lock. It is a private hook for the tests, not a public API.
 
@@ -94,6 +100,7 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 - `python/zoedb/tests/acceptance/test_storage.py` and `python/zoedb/tests/acceptance/test_conflict_resolution.py` are the acceptance tests of the storage and of conflict resolution. `python/zoedb/tests/acceptance/test_blobs.py` is the acceptance test of the blobs.
 - `python/zoedb/tests/test_zoe_blobs.py` holds the unit tests of the blobs: the refused calls, the copy, the savepoints, `blob_dir` and `restoreBlob`.
 - `python/zoedb/tests/acceptance/test_pack.py` is the acceptance test of pack. It also runs ZODB's `PackableStorage` suites.
+- `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script `zoe`.
 - `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
 - `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.

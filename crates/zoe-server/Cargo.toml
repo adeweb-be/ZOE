@@ -1,6 +1,6 @@
 [package]
 name = "zoe-server"
-description = "The zoe serve process: a tokio server that speaks the ZEO 6 msgpack protocol."
+description = "The zoe command: zoe serve, a tokio server that speaks the ZEO 6 msgpack protocol, and the other subcommands."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,20 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["serve"]
+# The server code. Only this feature may bring in tokio. The extension
+# module turns it off, so it never links tokio.
+serve = []
+
+[[bin]]
+name = "zoe"
+path = "src/main.rs"
+
 [dependencies]
+clap.workspace = true
+zoe-convert.workspace = true
+zoe-core.workspace = true
 
 [lints]
 workspace = true

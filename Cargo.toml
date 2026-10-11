@@ -11,9 +11,13 @@ repository = "https://github.com/adeweb-be/ZOE"
 publish = false
 
 [workspace.dependencies]
+zoe-convert = { path = "crates/zoe-convert" }
 zoe-core = { path = "crates/zoe-core" }
 zoe-pickle = { path = "crates/zoe-pickle" }
+# Without `serve`. A member that serves turns the feature on.
+zoe-server = { path = "crates/zoe-server", default-features = false }
 blake3 = "1.8"
+clap = { version = "4.6", features = ["derive", "env"] }
 libc = "0.2"
 pyo3 = "0.29"
 redb = "4.3"
