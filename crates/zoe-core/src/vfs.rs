@@ -12,6 +12,7 @@
 //! for example `blobs/tmp/1.tmp`. The empty name `""` is the store
 //! directory itself.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -80,6 +81,12 @@ pub trait Vfs: Send + Sync + 'static {
     /// Remove the write permissions of the file `name`.
     fn set_read_only(&self, name: &str) -> io::Result<()>;
 
+    /// Take an exclusive lock on the directory `name` itself, and keep it
+    /// until the returned lock drops. Another holder of the lock fails the
+    /// call with `WouldBlock`. A filesystem that cannot lock a directory
+    /// fails the call with its error: the call never skips the lock.
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock>;
+
     /// Return the path of `name`. A simulated filesystem returns `name`
     /// as a relative path.
     fn path(&self, name: &str) -> PathBuf;
@@ -146,8 +153,26 @@ impl<V: Vfs> Vfs for Arc<V> {
         (**self).set_read_only(name)
     }
 
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        (**self).lock_dir(name)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         (**self).path(name)
+    }
+}
+
+/// A lock that `Vfs::lock_dir` took. Dropping it releases the lock.
+pub struct DirLock {
+    _guard: Box<dyn Any + Send + Sync>,
+}
+
+impl DirLock {
+    /// Return the lock that `guard` holds until it drops.
+    pub fn new(guard: impl Any + Send + Sync) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
     }
 }
 
@@ -357,6 +382,28 @@ impl Vfs for OsVfs {
         fs::set_permissions(path, permissions)
     }
 
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let path = self.dir.join(name);
+        // flock on a descriptor of the directory itself: no file is
+        // created in it.
+        let dir = File::open(&path)?;
+        if !dir.metadata()?.is_dir() {
+            let message = format!("not a directory: {}", path.display());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        match dir.try_lock() {
+            Ok(()) => Ok(DirLock::new(dir)),
+            Err(TryLockError::WouldBlock) => {
+                let message = format!("{} is locked", path.display());
+                Err(io::Error::new(io::ErrorKind::WouldBlock, message))
+            }
+            Err(TryLockError::Error(e)) => {
+                let message = format!("cannot lock the directory {}: {e}", path.display());
+                Err(io::Error::new(e.kind(), message))
+            }
+        }
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -483,6 +530,8 @@ struct State {
     process: Process,
     /// The bytes that reads of the files returned.
     bytes_read: u64,
+    /// The directories that a `lock_dir` holds.
+    locked: BTreeSet<String>,
 }
 
 impl State {
@@ -550,6 +599,7 @@ impl MemVfs {
             log: Vec::new(),
             process: Process::Alive,
             bytes_read: 0,
+            locked: BTreeSet::new(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -593,7 +643,10 @@ impl MemVfs {
     /// on, so an operation that the killed process did not sync stays
     /// pending in the crash images.
     pub fn restart(&self) {
-        self.lock().process = Process::Alive;
+        let mut state = self.lock();
+        state.process = Process::Alive;
+        // The system releases the locks of a killed process.
+        state.locked.clear();
     }
 
     /// Return a filesystem with the files and the directories of this one,
@@ -915,6 +968,21 @@ impl Vfs for MemVfs {
         }
     }
 
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let mut state = self.lock();
+        state.alive()?;
+        if !state.has_dir(name) {
+            return Err(not_found(name));
+        }
+        if !state.locked.insert(name.to_owned()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, name.to_owned()));
+        }
+        Ok(DirLock::new(MemDirLock {
+            vfs: self.clone(),
+            name: name.to_owned(),
+        }))
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         PathBuf::from(name)
     }
@@ -1145,6 +1213,18 @@ impl WriteFile for MemWriteFile {
             file: self.name.clone(),
         });
         Ok(())
+    }
+}
+
+/// A lock on a directory of a `MemVfs`. Dropping it releases the lock.
+struct MemDirLock {
+    vfs: MemVfs,
+    name: String,
+}
+
+impl Drop for MemDirLock {
+    fn drop(&mut self) {
+        self.vfs.lock().locked.remove(&self.name);
     }
 }
 
@@ -1613,6 +1693,37 @@ mod tests {
             io::ErrorKind::NotFound
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_directory_lock_has_one_holder() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        vfs.create_dir("d").unwrap();
+        let lock = vfs.lock_dir("d").unwrap();
+        let error = vfs.lock_dir("d").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        drop(lock);
+        drop(vfs.lock_dir("d").unwrap());
+        fs::write(vfs.path("f"), b"x").unwrap();
+        let error = vfs.lock_dir("f").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(vfs.lock_dir("missing").is_err());
+        // The lock adds no file to the directory.
+        assert!(fs::read_dir(vfs.path("d")).unwrap().next().is_none());
+        fs::remove_dir_all(&root).unwrap();
+
+        // A simulated filesystem keeps its locks until they drop, or until
+        // the process is killed.
+        let vfs = MemVfs::new();
+        Vfs::create_dir(&vfs, "d").unwrap();
+        let lock = Vfs::lock_dir(&vfs, "d").unwrap();
+        let error = Vfs::lock_dir(&vfs, "d").err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        std::mem::forget(lock);
+        vfs.restart();
+        drop(Vfs::lock_dir(&vfs, "d").unwrap());
     }
 
     #[test]

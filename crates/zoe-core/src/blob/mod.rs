@@ -39,7 +39,7 @@ use crate::format::blob::{
 };
 use crate::store::Opened;
 use crate::types::{Oid, Tid};
-use crate::vfs::{Vfs, WriteFile, parent};
+use crate::vfs::{DirLock, Vfs, WriteFile, parent};
 
 /// The operations of a `Vfs` that the blob store uses, in a form that a
 /// trait object can hold. Every `Vfs` has them.
@@ -55,6 +55,7 @@ pub(crate) trait BlobDir: Send + Sync {
     fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>>;
     fn sync_file(&self, name: &str) -> io::Result<()>;
     fn set_read_only(&self, name: &str) -> io::Result<()>;
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock>;
     fn path(&self, name: &str) -> PathBuf;
 }
 
@@ -101,6 +102,10 @@ impl<V: Vfs> BlobDir for V {
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
         Vfs::set_read_only(self, name)
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        Vfs::lock_dir(self, name)
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -213,6 +218,11 @@ impl BlobDir for Relocated {
         dir.set_read_only(&name)
     }
 
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        let (dir, name) = self.locate(name);
+        dir.lock_dir(&name)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         let (dir, name) = self.locate(name);
         dir.path(&name)
@@ -227,6 +237,9 @@ pub(crate) struct BlobStore {
     dir: Box<dyn BlobDir>,
     /// Tells if `blobs/`, `blobs/tmp/` and the layout file are durable.
     ready: Mutex<bool>,
+    /// The lock on the blob directory itself, once a writer took it. Two
+    /// open stores never share a blob directory.
+    dir_lock: Mutex<Option<DirLock>>,
     /// The number of the next temporary file.
     next_temp: AtomicU64,
 }
@@ -238,6 +251,7 @@ impl BlobStore {
         Self {
             dir,
             ready: Mutex::new(false),
+            dir_lock: Mutex::new(None),
             next_temp: AtomicU64::new(0),
         }
     }
@@ -249,6 +263,11 @@ impl BlobStore {
     /// blob records, it is not the blob directory of the store:
     /// `MissingBlobDir`. When the directory holds files of another
     /// program, the store must not take it: `NotBlobDir`.
+    ///
+    /// A writer takes the lock on the blob directory first, when the
+    /// directory exists. A blob directory that another open store holds
+    /// fails the open with `Locked`, before the open reads or removes
+    /// anything there.
     ///
     /// Then a writer removes the leftovers of a crash in `blobs/tmp/`: the
     /// blob files that an intent file names and that `backend` has no blob
@@ -262,6 +281,9 @@ impl BlobStore {
     /// that a crash left without its blob record stays invisible, because
     /// every blob read starts from the blob record.
     pub(crate) fn open(&self, backend: &dyn Backend, read_only: bool) -> Result<()> {
+        if !read_only && self.dir.exists(BLOB_DIR)? {
+            self.lock_dir()?;
+        }
         let layout = self.dir.exists(LAYOUT_FILE)?;
         if layout {
             let mut text = String::new();
@@ -290,6 +312,31 @@ impl BlobStore {
             self.recover(backend)?;
         }
         Ok(())
+    }
+
+    /// Take the lock on the blob directory itself, when this store does not
+    /// hold it yet. The lock is `flock` on a descriptor of the directory,
+    /// so it adds no file to the directory. A lock that another open store
+    /// holds fails with `Locked`, and that store keeps its files. A
+    /// filesystem that cannot lock a directory fails the call: the store
+    /// never runs without the lock.
+    fn lock_dir(&self) -> Result<()> {
+        let mut held = self.dir_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return Ok(());
+        }
+        match self.dir.lock_dir(BLOB_DIR) {
+            Ok(lock) => {
+                *held = Some(lock);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(ZoeError::Locked),
+            Err(e) => {
+                let path = self.dir.path(BLOB_DIR);
+                let message = format!("cannot lock the blob directory {}: {e}", path.display());
+                Err(io::Error::new(e.kind(), message).into())
+            }
+        }
     }
 
     /// Check that a blob directory without a layout file holds no file of
@@ -407,6 +454,7 @@ impl BlobStore {
         if !self.dir.exists(BLOB_DIR)? {
             self.dir.create_dir(BLOB_DIR)?;
         }
+        self.lock_dir()?;
         self.dir.sync_dir_at(parent(BLOB_DIR))?;
         // The directory can come after the open. A layout file goes only
         // into a directory that holds no file of another program.
@@ -2160,6 +2208,80 @@ mod tests {
             .unwrap()
         );
         assert_eq!(contents(&parent, "elsewhere/tmp/report.txt"), b"theirs");
+    }
+
+    /// Return every file of `vfs` with its bytes.
+    fn snapshot(vfs: &MemVfs) -> Vec<(String, Vec<u8>)> {
+        vfs.names()
+            .into_iter()
+            .map(|name| {
+                let bytes = contents(vfs, &name);
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Two open stores never share a blob directory: the second store gets
+    /// `Locked`, at its open or at its first blob, and removes nothing.
+    #[test]
+    fn a_blob_directory_takes_one_open_store() {
+        let parent = MemVfs::new();
+        // This store opens before the blob directory exists.
+        let late = Store::open_relocated(MemVfs::new(), parent.clone(), "shared").unwrap();
+        let first = Store::open_relocated(MemVfs::new(), parent.clone(), "shared").unwrap();
+        commit_new_blob(&first, b"committed");
+        // A pending blob of the first store: a temporary file in tmp/.
+        let pending = blob_file(&first, b"pending");
+        let before = snapshot(&parent);
+        assert!(
+            before
+                .iter()
+                .any(|(name, _)| name.starts_with("shared/tmp/"))
+        );
+
+        let second = Store::open_relocated(MemVfs::new(), parent.clone(), "shared");
+        assert!(
+            matches!(second, Err(ZoeError::Locked)),
+            "{:?}",
+            second.err()
+        );
+        assert!(matches!(late.new_blob_file(), Err(ZoeError::Locked)));
+        assert_eq!(snapshot(&parent), before);
+        drop(pending);
+        drop(late);
+
+        // The lock goes with the store that holds it.
+        drop(first);
+        drop(Store::open_relocated(MemVfs::new(), parent, "shared").unwrap());
+    }
+
+    #[test]
+    fn two_os_stores_never_share_a_blob_directory() {
+        use crate::store::Options;
+
+        let root = std::env::temp_dir().join(format!("zoe-blob-dir-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let options = Options {
+            blob_dir: Some(root.join("shared")),
+            ..Options::default()
+        };
+        let first = Store::open_with(root.join("a"), options.clone()).unwrap();
+        commit_new_blob(&first, b"committed");
+        let mut pending = first.new_blob_file().unwrap();
+        pending.write_all(b"pending").unwrap();
+        let before = tree(&root.join("shared"));
+
+        let second = Store::open_with(root.join("b"), options.clone());
+        assert!(
+            matches!(second, Err(ZoeError::Locked)),
+            "{:?}",
+            second.err()
+        );
+        assert_eq!(tree(&root.join("shared")), before);
+        drop(pending);
+        drop(first);
+        drop(Store::open_with(root.join("a"), options).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
