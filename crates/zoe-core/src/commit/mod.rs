@@ -295,6 +295,8 @@ pub(crate) fn check_restore_tid(tid: Tid, last: Tid) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::vfs::MemVfs;
 
@@ -469,6 +471,37 @@ mod tests {
             txn.restore(Oid(2), Some(b"b")),
             Err(ZoeError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn a_restored_oid_takes_an_exclusive_lock_at_the_vote() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        // A zero lock timeout turns every wait into a conflict.
+        store.lock_timeout = Duration::ZERO;
+        let oid = Oid(1);
+        let first = voted_restore(&store, Tid(100), oid, b"a");
+
+        // Neither a store nor a second restore on the same oid gets the
+        // lock while the first restore holds it.
+        let mut stored = store.tpc_begin(b"", b"", b"").unwrap();
+        stored.store(oid, Tid::ZERO, b"b").unwrap();
+        let mut restored = store.tpc_begin_restore(Tid(200), b"", b"", b"").unwrap();
+        restored.restore(oid, Some(b"c")).unwrap();
+        for txn in [&mut stored, &mut restored] {
+            let error = txn.vote();
+            assert!(
+                matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })),
+                "{error:?}"
+            );
+        }
+        first.finish().unwrap();
+        assert!(store.locks.is_empty());
+
+        // The second restore read the serial before the first one finished,
+        // so it cannot commit on top of it.
+        assert!(matches!(restored.vote(), Err(ZoeError::Conflict { .. })));
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), Tid(100)));
+        assert!(store.locks.is_empty());
     }
 
     #[test]
