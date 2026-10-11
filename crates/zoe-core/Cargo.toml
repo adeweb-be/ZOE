@@ -12,6 +12,7 @@ publish.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
+zstd.workspace = true
 
 [lints]
 workspace = true

@@ -9,12 +9,12 @@
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
 //! | 0 | 1 | frame version |
-//! | 1 | 1 | flags: compressed, encrypted |
-//! | 2 | 1 | codec: 0 none, 1 zstd, 2 zstd with the store dictionary |
+//! | 1 | 1 | flags, 0: no flag is defined |
+//! | 2 | 1 | codec: 0 none, 1 zstd (see `codec`) |
 //! | 3 | 1 | reserved, 0 |
 //! | 4 | 4 | branch id |
 //! | 8 | 8 | previous serial |
-//! | 16 | 4 | payload length |
+//! | 16 | 4 | payload length, as stored |
 //! | 20 | 2 | length of the typed-field slots |
 //! | 22 | 2 | reserved, 0 |
 //! | 24 | 8 | checksum |
@@ -25,14 +25,25 @@
 //! `record_key`. The key of a transaction row is the 8 bytes of
 //! `txn_key`. So a frame that is read under another key fails the check.
 //!
+//! The payload holds the data in the form that the codec byte gives. The
+//! checksum covers the payload as stored, so a read verifies the stored
+//! bytes before it decodes them. `decode_frame` decodes every codec, so
+//! each read path gets the data, never the stored form.
+//!
 //! Keys are big-endian, so that the byte order of the keys is the numeric
 //! order of oids and tids. The numbers in the rows of `meta` are 8-byte
 //! big-endian values, as ZODB writes oids and tids.
+
+use std::borrow::Cow;
 
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::types::{Oid, Tid};
+
+mod codec;
+
+pub use codec::{Codec, Compression};
 
 /// The name and version of the format, in the `format` row of `meta`.
 pub const FORMAT_NAME: &[u8] = b"ZOE format 1";
@@ -46,8 +57,11 @@ pub const HEADER_LEN: usize = 32;
 /// The branch id of the main store. Forks use other ids.
 pub const MAIN_BRANCH: u32 = 0;
 
-/// The codec that stores the payload as it is.
+/// The codec byte of a payload that holds the data as it is.
 pub const CODEC_NONE: u8 = 0;
+
+/// The codec byte of a payload that is one zstd frame.
+pub const CODEC_ZSTD: u8 = 1;
 
 /// Why a frame cannot be read.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,48 +81,73 @@ pub enum FrameError {
         /// The value of the byte.
         value: u8,
     },
+    /// The payload does not decode with its codec. For zstd, the payload is
+    /// not one zstd frame, does not state the data length, states a length
+    /// over the bound, or decodes to another length.
+    Payload,
 }
 
-/// A frame that was read and checked.
+/// A frame that was read, checked and decoded.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
     /// The flags byte.
     pub flags: u8,
-    /// The codec byte.
-    pub codec: u8,
+    /// The codec of the payload.
+    pub codec: Codec,
     /// The branch id.
     pub branch: u32,
     /// The previous serial.
     pub prev: Tid,
     /// The typed-field slots.
     pub slots: &'a [u8],
-    /// The payload.
-    pub payload: &'a [u8],
+    /// The length of the payload as stored, before it is decoded.
+    pub stored_len: usize,
+    /// The data: the payload, decoded with its codec.
+    pub data: Cow<'a, [u8]>,
 }
 
-/// Encode the frame of the row `key`, with no flags, no codec and no
-/// typed-field slots.
-pub fn encode_frame(key: &[u8], branch: u32, prev: Tid, payload: &[u8]) -> Vec<u8> {
+/// Encode the frame of the row `key`, with the data as it is, no flags and
+/// no typed-field slots.
+pub fn encode_frame(key: &[u8], branch: u32, prev: Tid, data: &[u8]) -> Vec<u8> {
+    encode_frame_with(key, branch, prev, data, Compression::None)
+}
+
+/// Encode the frame of the row `key`, with no flags and no typed-field
+/// slots. `compression` selects the codec of the payload.
+pub fn encode_frame_with(
+    key: &[u8],
+    branch: u32,
+    prev: Tid,
+    data: &[u8],
+    compression: Compression,
+) -> Vec<u8> {
+    // The reader refuses a longer data length, for every codec.
+    assert!(
+        u32::try_from(data.len()).is_ok(),
+        "the data of a frame fits in 4 GiB"
+    );
+    let (codec, payload) = codec::encode(data, compression);
     let payload_len = u32::try_from(payload.len()).expect("a payload fits in 4 GiB");
     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
     frame.push(FRAME_VERSION);
     frame.push(0);
-    frame.push(CODEC_NONE);
+    frame.push(codec.byte());
     frame.push(0);
     frame.extend_from_slice(&branch.to_le_bytes());
     frame.extend_from_slice(&prev.0.to_le_bytes());
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
-    let checksum = checksum(key, &frame[..24], &[], payload);
+    let checksum = checksum(key, &frame[..24], &[], &payload);
     frame.extend_from_slice(&checksum.to_le_bytes());
-    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&payload);
     frame
 }
 
-/// Read the frame of the row `key` and verify its checksum.
+/// Read the frame of the row `key`, verify its checksum and decode its
+/// payload.
 ///
-/// A frame with a flag, a codec other than `CODEC_NONE` or a non-zero
+/// A frame with a flag, a codec that this code does not know or a non-zero
 /// reserved byte is refused. The typed-field slots are opaque, so slots
 /// of any length are accepted.
 pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameError> {
@@ -129,21 +168,26 @@ pub fn decode_frame<'a>(key: &[u8], bytes: &'a [u8]) -> Result<Frame<'a>, FrameE
     if checksum(key, &header[..24], slots, payload) != stored {
         return Err(FrameError::Checksum);
     }
-    for (offset, readable) in [(1, 0), (2, CODEC_NONE), (3, 0), (22, 0), (23, 0)] {
-        if header[offset] != readable {
+    for offset in [1, 3, 22, 23] {
+        if header[offset] != 0 {
             return Err(FrameError::Unsupported {
                 offset,
                 value: header[offset],
             });
         }
     }
+    let codec = Codec::from_byte(header[2]).ok_or(FrameError::Unsupported {
+        offset: 2,
+        value: header[2],
+    })?;
     Ok(Frame {
         flags: header[1],
-        codec: header[2],
+        codec,
         branch: u32::from_le_bytes(header[4..8].try_into().unwrap()),
         prev: Tid(u64::from_le_bytes(header[8..16].try_into().unwrap())),
         slots,
-        payload,
+        stored_len: payload.len(),
+        data: codec::decode(codec, payload)?,
     })
 }
 
@@ -257,8 +301,9 @@ mod tests {
         let read = decode_frame(&key(), &frame).unwrap();
         assert_eq!(read.prev, Tid(7));
         assert_eq!(read.branch, MAIN_BRANCH);
-        assert_eq!(read.codec, CODEC_NONE);
-        assert_eq!(read.payload, b"pickle");
+        assert_eq!(read.codec, Codec::None);
+        assert_eq!(read.stored_len, 6);
+        assert_eq!(&read.data[..], b"pickle");
         assert!(read.slots.is_empty());
     }
 
@@ -325,15 +370,85 @@ mod tests {
     #[test]
     fn a_frame_of_a_newer_format_is_refused() {
         let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
-        for offset in [1, 2, 3, 22, 23] {
+        for (offset, value) in [(1, 1), (2, 2), (2, 0xff), (3, 1), (22, 1), (23, 1)] {
             let mut header = frame[..24].to_vec();
-            header[offset] = 1;
+            header[offset] = value;
             assert_eq!(
                 decode_frame(&key(), &seal(&header, &[], b"pickle")),
-                Err(FrameError::Unsupported { offset, value: 1 }),
+                Err(FrameError::Unsupported { offset, value }),
                 "offset {offset}"
             );
         }
+    }
+
+    /// A pickle with the repetition of a content object: the same keys
+    /// many times.
+    fn pickle() -> Vec<u8> {
+        b"X\x05\x00\x00\x00titleq\x02X\x0b\x00\x00\x00descriptionq\x03".repeat(100)
+    }
+
+    /// The frame of `pickle()` under `key()`, compressed with zstd.
+    fn compressed() -> Vec<u8> {
+        let frame = encode_frame_with(
+            &key(),
+            MAIN_BRANCH,
+            Tid(7),
+            &pickle(),
+            Compression::default(),
+        );
+        assert_eq!(frame[2], CODEC_ZSTD);
+        frame
+    }
+
+    #[test]
+    fn a_compressed_frame_round_trips() {
+        let frame = compressed();
+        let read = decode_frame(&key(), &frame).unwrap();
+        assert_eq!(read.codec, Codec::Zstd);
+        assert_eq!(read.prev, Tid(7));
+        assert_eq!(read.stored_len, frame.len() - HEADER_LEN);
+        assert!(read.stored_len * 10 < pickle().len(), "{}", read.stored_len);
+        assert_eq!(&read.data[..], &pickle()[..]);
+    }
+
+    #[test]
+    fn the_header_states_the_stored_length_and_the_checksum_covers_the_stored_bytes() {
+        let frame = compressed();
+        let stored = &frame[HEADER_LEN..];
+        let payload_len = u32::from_le_bytes(frame[16..20].try_into().unwrap());
+        assert_eq!(payload_len as usize, stored.len());
+        let sum = u64::from_le_bytes(frame[24..32].try_into().unwrap());
+        assert_eq!(checksum(&key(), &frame[..24], &[], stored), sum);
+    }
+
+    #[test]
+    fn every_flipped_bit_of_a_compressed_frame_is_detected() {
+        let frame = compressed();
+        for byte in 0..frame.len() {
+            for bit in 0..8 {
+                let mut bad = frame.clone();
+                bad[byte] ^= 1 << bit;
+                assert!(decode_frame(&key(), &bad).is_err(), "byte {byte} bit {bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zstd_payload_that_does_not_decode_is_refused() {
+        let frame = encode_frame(&key(), MAIN_BRANCH, Tid(7), b"pickle");
+        let mut header = frame[..24].to_vec();
+        header[2] = CODEC_ZSTD;
+        assert_eq!(
+            decode_frame(&key(), &seal(&header, &[], b"pickle")),
+            Err(FrameError::Payload)
+        );
+    }
+
+    #[test]
+    fn a_transaction_row_is_written_as_it_is() {
+        let frame = encode_frame(&txn_key(Tid(9)), MAIN_BRANCH, Tid::ZERO, &pickle());
+        assert_eq!(frame[2], CODEC_NONE);
+        assert_eq!(frame.len(), HEADER_LEN + pickle().len());
     }
 
     #[test]
@@ -344,7 +459,7 @@ mod tests {
         let slotted = seal(&header, b"abc", b"pickle");
         let read = decode_frame(&key(), &slotted).unwrap();
         assert_eq!(read.slots, b"abc");
-        assert_eq!(read.payload, b"pickle");
+        assert_eq!(&read.data[..], b"pickle");
     }
 
     #[test]

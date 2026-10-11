@@ -113,7 +113,7 @@ impl RedbBackend {
         Ok(Record {
             tid,
             prev: frame.prev,
-            data: frame.payload.to_vec(),
+            data: frame.data.into_owned(),
         })
     }
 
@@ -179,7 +179,7 @@ impl Backend for RedbBackend {
                 let tid = Tid(u64::from_be_bytes(*key.value()));
                 let corrupt = ZoeError::CorruptTxn { tid };
                 let row = format::decode_frame(key.value(), value.value())
-                    .and_then(|frame| format::decode_txn(tid, frame.payload))
+                    .and_then(|frame| format::decode_txn(tid, &frame.data))
                     .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
                 rows.push(row);
             }
@@ -392,7 +392,7 @@ mod tests {
         let txn = backend.db.begin_write().unwrap();
         txn.open_table(RECORDS)
             .unwrap()
-            .insert(&key, frame_with_codec(&key, 1, b"pickle").as_slice())
+            .insert(&key, frame_with_codec(&key, 2, b"pickle").as_slice())
             .unwrap();
         txn.commit().unwrap();
 
