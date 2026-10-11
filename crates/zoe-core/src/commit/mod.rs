@@ -37,6 +37,7 @@
 //! they stage anything. A transaction logs its slow locks when it releases
 //! them, and logs itself when it ends, if it was slow.
 
+mod group;
 mod staging;
 
 use std::borrow::Cow;
@@ -46,14 +47,15 @@ use std::path::Path;
 use std::thread::{self, ThreadId};
 use std::time::SystemTime;
 
-use crate::backend::{Record, TxnMeta, TxnStatus};
+use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
-use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
+pub(crate) use group::GroupCommit;
+use group::Member;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -62,8 +64,9 @@ pub(crate) use staging::StagingArea;
 pub struct Finished {
     /// The tid of the commit.
     pub tid: Tid,
-    /// The tid of the commit just before this one in commit order: the
-    /// last tid of the store when this commit started to write.
+    /// The tid of the commit just before this one in commit order. In a
+    /// commit batch, it is the tid of the member before this one, or the
+    /// last tid of the store before the batch.
     pub previous: Tid,
 }
 
@@ -668,58 +671,26 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
-        let store: &Store = &self.store;
-        let mut sequencer = store.lock_sequencer();
-        let last = sequencer.ok_or(ZoeError::Halted)?;
-        let tid = match self.tid {
-            Some(tid) => {
-                check_restore_tid(tid, last)?;
-                tid
-            }
-            None => next_tid(timestamp(store.clock.now()), last)?,
-        };
-        // The sequencer stays empty if the write below fails.
-        *sequencer = None;
-        if let Some(oid) = self.staged.last_oid() {
-            store.raise_next_oid(oid);
-        }
-
-        // The blob files are durable in their place before the backend
-        // commit, so a blob record never lacks its file.
-        let intent = store.blobs().place(tid, &mut self.blobs)?;
-        let mut write = store.backend.begin_write()?;
-        // A spilled pickle is read back here, one at a time.
-        for record in self.staged.records() {
-            let (oid, serial, data) = record?;
-            write.put_record(oid, tid, serial, &data)?;
-            if let Some(blob) = self.blobs.get(&oid) {
-                write.put_blob(oid, tid, blob.record())?;
-            }
-        }
-        write.put_txn(&TxnMeta {
-            tid,
+        let member = Member {
+            tid: self.tid,
+            staged: std::mem::take(&mut self.staged),
+            blobs: std::mem::take(&mut self.blobs),
             user: std::mem::take(&mut self.user),
             description: std::mem::take(&mut self.description),
             extension: std::mem::take(&mut self.extension),
-            oid_count: self.staged.len() as u64,
-            status: TxnStatus::Committed,
-        })?;
-        write.commit()?;
-        store.blobs().finished(intent);
-        // A running pack marks what these records refer to before its next
-        // removal.
-        store
-            .packing
-            .note(tid, self.staged.iter().map(|(oid, _)| oid));
-        self.committed = Some(tid);
-
-        *sequencer = Some(tid);
-        drop(sequencer);
+        };
+        let store: &Store = &self.store;
+        let (member, finished) = store.group.finish(store, member);
+        // The transaction takes its staged records and its blobs back, so
+        // `Drop` removes its spill file and its unplaced blob files.
+        if let Some(member) = member {
+            self.staged = member.staged;
+            self.blobs = member.blobs;
+        }
+        let finished = finished?;
+        self.committed = Some(finished.tid);
         self.release();
-        Ok(Finished {
-            tid,
-            previous: last,
-        })
+        Ok(finished)
     }
 
     /// Abort the transaction: drop the staged records, remove the spill

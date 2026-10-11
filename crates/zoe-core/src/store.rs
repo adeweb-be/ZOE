@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
 use crate::blob::{self, BlobFile, BlobReader, BlobStore, PendingBlob};
 use crate::clock::{Clock, SystemClock};
-use crate::commit::{StagingArea, Txn};
+use crate::commit::{GroupCommit, StagingArea, Txn};
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::guard::Guardrails;
@@ -159,6 +159,8 @@ pub struct Store {
     /// `None` after a failed finish, because the outcome of that commit is
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
+    /// The commit batches. A batch leader takes the commit sequencer.
+    pub(crate) group: GroupCommit,
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
@@ -355,6 +357,7 @@ impl Store {
             lock_timeout: options.lock_timeout,
             guardrails: Guardrails::new(&options),
             sequencer: Mutex::new(Some(last_tid)),
+            group: GroupCommit::default(),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
             packing: PackState::default(),
