@@ -2013,14 +2013,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file"), b"x").unwrap();
-        for blob_dir in [root.join("file"), PathBuf::from("/")] {
+        // A blob directory under a file cannot be created.
+        let under_file = root.join("file").join("blobs");
+        for blob_dir in [root.join("file"), PathBuf::from("/"), under_file] {
             let options = Options {
                 blob_dir: Some(blob_dir.clone()),
                 ..Options::default()
             };
             let result = Store::open_with(root.join("store"), options);
             assert!(
-                matches!(&result, Err(ZoeError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput),
+                matches!(&result, Err(ZoeError::Io(_))),
                 "{}: {:?}",
                 blob_dir.display(),
                 result.err()

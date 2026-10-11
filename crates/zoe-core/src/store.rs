@@ -178,20 +178,21 @@ impl Store {
     ///
     /// With `options.blob_dir`, the blob files live in that directory. The
     /// call checks it before it creates anything: the path must end in a
-    /// name, and an existing entry must be a directory. Then it creates
-    /// the store directory, and the directory that holds the blob
-    /// directory, with their missing parents. The blob directory itself
+    /// name, and an existing entry must be a directory. Then it creates the
+    /// directory that holds the blob directory, and then the store
+    /// directory, each with its missing parents. So a blob directory that
+    /// fails leaves no lock file and no database. The blob directory itself
     /// comes with the first blob.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        let blob_dir = options.blob_dir.as_deref().map(blob_location).transpose()?;
-        let vfs = OsVfs::new(dir.as_ref())?;
-        let relocated = match blob_dir {
-            Some((parent, name)) => {
+        let relocated = match options.blob_dir.as_deref().map(blob_location) {
+            Some(location) => {
+                let (parent, name) = location?;
                 let parent: Box<dyn blob::BlobDir> = Box::new(OsVfs::unlocked(&parent)?);
                 Some((parent, name))
             }
             None => None,
         };
+        let vfs = OsVfs::new(dir.as_ref())?;
         Self::open_parts(vfs, SystemClock, options, relocated)
     }
 
