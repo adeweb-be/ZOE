@@ -1074,3 +1074,117 @@ def test_an_unreadable_record_stops_the_pack(storage):
     assert "opcode 0xff" in text
     # The pack stopped before it removed anything.
     assert present(storage, ZERO, first)
+
+
+def test_a_pack_at_an_earlier_time_than_the_last_pack_removes_nothing(storage):
+    holder, kept, other = (storage.new_oid() for _ in range(3))
+    first = commit_all(
+        storage, [(ZERO, ZERO, linking(holder)), (holder, ZERO, linking())]
+    )
+    second = commit_all(
+        storage, [(holder, first, linking(kept)), (kept, ZERO, record(1))]
+    )
+    earlier = past(second)
+    third = commit_all(
+        storage, [(holder, second, linking(kept, other)), (other, ZERO, record(2))]
+    )
+    storage.pack(past(third), None)
+    left = [(ZERO, first), (holder, third), (kept, second), (other, third)]
+    assert all(present(storage, *key) for key in left)
+    assert not present(storage, holder, second)
+
+    # A reader at the earlier time needs holder at second, which is gone.
+    # The earlier pack removes nothing more, and kept stays.
+    storage.pack(earlier, None)
+    assert all(present(storage, *key) for key in left)
+    assert storage.load(kept) == (record(1), second)
+
+
+def add_garbage(storage, count):
+    """Commit count records that no object refers to.
+
+    Return their oids and the tid of the last commit.
+    """
+    oids = []
+    while len(oids) < count:
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        for _ in range(min(5_000, count - len(oids))):
+            oid = storage.new_oid()
+            storage.store(oid, ZERO, record(len(oids)), "", txn)
+            oids.append(oid)
+        storage.tpc_vote(txn)
+        last = storage.tpc_finish(txn)
+    return oids, last
+
+
+def remaining(storage, oids):
+    """Return the number of oids that still have a record."""
+    found = 0
+    for oid in oids:
+        try:
+            storage.load(oid)
+        except POSKeyError:
+            continue
+        found += 1
+    return found
+
+
+def test_close_during_a_pack_returns_and_the_pack_ends(tmp_path):
+    path = str(tmp_path / "store")
+    storage = zoe.Storage(path)
+    # The pack removes these records in many batches. Probes spread over
+    # them tell how far the pack is.
+    oids, last = add_garbage(storage, 20_000)
+    probes = oids[::2_500] + oids[-1:]
+    pack_time = past(last)
+    ended = threading.Event()
+    errors = []
+
+    def pack():
+        try:
+            storage.pack(pack_time, None)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            ended.set()
+
+    thread = in_thread(pack)
+    deadline = time.monotonic() + TIMEOUT
+    while time.monotonic() < deadline:
+        if 0 < remaining(storage, probes) < len(probes):
+            break
+    storage.close()
+    # The close does not wait for the pack.
+    during = not ended.is_set()
+    thread.join(TIMEOUT)
+    assert ended.is_set(), "the pack did not end"
+    assert not errors, errors
+    assert during, "the pack ended before the close"
+
+    # The pack ran to its end, then it released the store.
+    reopened = zoe.Storage(path)
+    try:
+        assert remaining(reopened, probes) == 0
+    finally:
+        reopened.close()
+
+
+def test_two_packs_at_once_both_end(storage):
+    oids, last = add_garbage(storage, 5_000)
+    pack_time = past(last)
+    start = threading.Barrier(2)
+    outcomes = []
+
+    def pack():
+        start.wait(TIMEOUT)
+        try:
+            outcomes.append(storage.pack(pack_time, None))
+        except BaseException as error:
+            outcomes.append(error)
+
+    threads = [in_thread(pack) for _ in range(2)]
+    for thread in threads:
+        thread.join(TIMEOUT)
+    assert outcomes == [None, None]
+    assert remaining(storage, oids[::500] + oids[-1:]) == 0
