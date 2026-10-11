@@ -35,6 +35,7 @@
   - [0023. The blob record](adr/0023-blob-record.md)
   - [0025. Pack: what it removes, batches, and the progress record](adr/0025-pack.md)
   - [0026. The transaction index: a (tid, oid) key space](adr/0026-transaction-index.md)
+  - [0027. The blob directory](adr/0027-blob-directory.md)
 
 # Reference
 
