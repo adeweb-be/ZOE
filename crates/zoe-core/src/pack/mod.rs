@@ -39,6 +39,11 @@
 //! syncs their directories and removes the intent file. A crash between
 //! the commit and the removal leaves the intent file, and the next open
 //! removes the files that have no blob record.
+//!
+//! A dry run (`Store::pack_dry_run`) runs the mark and the selection of a
+//! pack. It adds each selected record to the report and removes nothing.
+//! It writes nothing. With no commit between them, the report of the dry
+//! run equals the report of the pack.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -158,8 +163,8 @@ impl Store {
     /// Pack the store at `at`, as `pack` does, in batches of at most
     /// `batch` records. `between` runs after each batch. It runs without
     /// the commit sequencer and without a backend transaction, so reads
-    /// and commits can run then. Only a second pack waits. Readers and
-    /// commits continue during the whole pack.
+    /// and commits can run then. Only a second pack or a dry run waits.
+    /// Readers and commits continue during the whole pack.
     ///
     /// The pack packs at the lower of `at` and the last tid. A pack at a
     /// tid before the last pack does nothing. A batch of 0 is a batch of
@@ -204,9 +209,49 @@ impl Store {
         }
         Ok(pack.report)
     }
+
+    /// Report what `pack(at)` would remove, and remove nothing.
+    ///
+    /// The dry run runs the mark and the selection of a pack, and adds
+    /// each selected record to the report. So with no commit between the
+    /// dry run and the pack, the two reports are equal.
+    ///
+    /// The dry run writes nothing. It opens no backend write transaction,
+    /// writes no watermark and no intent file, and the finishes note
+    /// nothing for it. It holds the commit sequencer only to read the last
+    /// tid. A read-only store runs it. A halted store refuses it with
+    /// `Halted`, as it refuses a pack. A dry run and a pack hold the same
+    /// lock, so one waits for the other.
+    ///
+    /// The dry run holds the reachable oids of the mark, as a pack does,
+    /// one batch of selected records and the report. The report has one
+    /// entry for each class.
+    ///
+    /// A record that the mark reads and that does not decode fails the dry
+    /// run with `Format`. A record that fails its checksum fails it with
+    /// `CorruptRecord`.
+    pub fn pack_dry_run(&self, at: Tid) -> Result<PackReport> {
+        let _running = lock(&self.packing.running);
+        let last = (*self.lock_sequencer()).ok_or(ZoeError::Halted)?;
+        if at < self.backend.pack_watermark()? {
+            return Ok(PackReport::default());
+        }
+        let mut pack = Pack::new(self, at.min(last), None);
+        pack.mark_roots(last)?;
+        loop {
+            let planned = pack.plan(BATCH)?;
+            if planned.is_empty() {
+                return Ok(pack.report);
+            }
+            // The selection of a pack. No finish is noted for a dry run,
+            // so the mark does not change, and each planned record stays.
+            let removed = pack.confirm(planned);
+            pack.account(&removed);
+        }
+    }
 }
 
-/// One record that a batch removes.
+/// One record that a batch removes, or that a dry run reports.
 struct Removal {
     oid: Oid,
     tid: Tid,
@@ -224,7 +269,7 @@ struct Removal {
     blob: Option<u64>,
 }
 
-/// One pack in progress.
+/// One pack or dry run in progress.
 struct Pack<'s> {
     store: &'s Store,
     /// The pack tid T.
@@ -752,7 +797,9 @@ mod tests {
         drop(store);
         let packed = |batch| {
             let store = Store::open_vfs(built.durable_copy()).unwrap();
+            let dry = store.pack_dry_run(last).unwrap();
             let report = store.pack_in_batches(last, batch, || {}).unwrap();
+            assert_eq!(dry, report, "batch {batch}");
             (report, transactions(&store))
         };
         let (report, left) = packed(1000);
@@ -788,7 +835,9 @@ mod tests {
         txn.vote().unwrap();
         txn.finish().unwrap();
 
+        let dry = store.pack_dry_run(t2).unwrap();
         let report = store.pack(t2).unwrap();
+        assert_eq!(dry, report);
 
         let unknown = (b"not a pickle".len() + persistent_class.len()) as u64;
         let classes: Vec<(&str, u64, u64)> = report
@@ -876,6 +925,7 @@ mod tests {
 
         assert_eq!(store.pack(t2).unwrap().records, 1);
         assert_eq!(store.backend.pack_watermark().unwrap(), t2);
+        assert_eq!(store.pack_dry_run(t1).unwrap(), PackReport::default());
         assert_eq!(store.pack(t1).unwrap(), PackReport::default());
         assert_eq!(store.load_serial(a, t2).unwrap(), record(&[]));
         assert_eq!(store.backend.pack_watermark().unwrap(), t2);
@@ -1215,19 +1265,88 @@ mod tests {
         let store = Store::open_vfs(vfs).unwrap();
 
         // A pack must not delete the evidence of a corruption. The error
-        // names the record.
-        let error = store.pack(t2);
-        assert!(
-            matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
-            "{error:?}"
-        );
+        // names the record. A dry run stops at the same record.
+        for error in [store.pack_dry_run(t2), store.pack(t2)] {
+            assert!(
+                matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
+                "{error:?}"
+            );
+        }
         assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
         assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
     }
 
     #[test]
+    fn a_reachable_record_that_does_not_decode_stops_the_dry_run() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let g = Oid(1);
+        commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+        let t2 = commit(&store, &[(ROOT, b"not a pickle".to_vec())]);
+        let named = format!("oid {ROOT:?}, tid {t2:?}");
+        for result in [store.pack_dry_run(t2), store.pack(t2)] {
+            assert!(
+                matches!(&result, Err(ZoeError::Format(text)) if text.contains(&named)),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// The bytes of each file under `dir`, by path.
+    fn tree(dir: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn a_read_only_store_runs_a_dry_run_and_changes_no_byte() {
+        let dir = std::env::temp_dir().join(format!("zoe-dry-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (f, g) = (Oid(1), Oid(2));
+        let last = {
+            let store = Store::open(&dir).unwrap();
+            commit(&store, &[(ROOT, record(&[f, g])), (g, record(&[]))]);
+            commit_blob(&store, f, &record(&[]), b"first");
+            commit_blob(&store, f, &record(&[]), b"second");
+            commit(&store, &[(ROOT, record(&[f]))])
+        };
+        let before = tree(&dir);
+
+        let store = Store::open_read_only(&dir).unwrap();
+        let report = store.pack_dry_run(last).unwrap();
+        drop(store);
+        assert!(tree(&dir) == before, "the dry run changed a file");
+        assert_eq!(
+            (
+                report.records,
+                report.objects,
+                report.blobs,
+                report.blob_bytes
+            ),
+            (3, 1, 1, 5),
+            "{report:?}"
+        );
+
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.pack(last).unwrap(), report);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_pack_of_an_empty_store_removes_nothing() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
+        assert_eq!(store.pack_dry_run(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.pack(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
     }

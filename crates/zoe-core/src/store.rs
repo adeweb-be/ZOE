@@ -628,6 +628,8 @@ mod tests {
 
         let error = store.pack(Tid::MAX);
         assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        let error = store.pack_dry_run(Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
         assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), first));
     }
 
