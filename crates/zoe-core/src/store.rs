@@ -14,6 +14,7 @@ use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::lock::LockManager;
+use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
 use crate::types::{Oid, Tid};
 use crate::vfs::{MemVfs, OsVfs, Vfs};
@@ -89,6 +90,9 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
+    /// The state that a pack shares with the finishes. A finish takes its
+    /// lock under the commit sequencer.
+    pub(crate) packing: PackState,
 }
 
 impl Store {
@@ -197,6 +201,7 @@ impl Store {
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
+            packing: PackState::default(),
         })
     }
 
@@ -557,6 +562,23 @@ mod tests {
         assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
         assert!(store.locks.is_empty());
         assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
+    }
+
+    #[test]
+    fn a_halted_store_refuses_a_pack() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"b").unwrap();
+        txn.vote().unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(txn.finish().is_err());
+        faults.write.store(false, Ordering::Relaxed);
+
+        let error = store.pack(Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), first));
     }
 
     #[test]

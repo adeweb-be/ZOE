@@ -44,6 +44,19 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// Pack cannot read the persistent references of a record: its pickle
+    /// does not decode, or a persistent id has a form that ZODB does not
+    /// write. Pack stops before it removes more.
+    #[error("cannot read the references of oid {oid:?}, tid {tid:?}: {message}")]
+    References {
+        /// The object id of the record.
+        oid: Oid,
+        /// The transaction id of the record.
+        tid: Tid,
+        /// What is wrong.
+        message: String,
+    },
+
     /// Another transaction changed the object since the serial that this
     /// transaction read, or held its lock past the lock timeout.
     /// `Txn::conflict_serials` gives the serials of a stale serial.

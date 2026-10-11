@@ -533,6 +533,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         })?;
         write.commit()?;
         store.blobs().finished(intent);
+        // A running pack marks what these records refer to before its next
+        // removal.
+        store.packing.note(tid, self.staged.keys().copied());
 
         *sequencer = Some(tid);
         drop(sequencer);

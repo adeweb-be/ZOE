@@ -15,6 +15,12 @@
 //! Opening a store reads only `blobs/tmp/`: it removes the blob files that
 //! an intent file names and that have no blob record, then the intent
 //! files and the temporary files.
+//!
+//! Pack uses the same intent files. Before it commits the removal of blob
+//! records, it writes and syncs an intent file for each tid of them. After
+//! the commit, it removes the blob files, syncs their directories and
+//! removes the intent files. So a crash after the commit leaves the intent
+//! file, and the next open removes the files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
@@ -314,13 +320,66 @@ impl BlobStore {
         Ok(Some(intent))
     }
 
-    /// Remove the intent file of a finish after its backend commit. A
-    /// failure leaves the file for the next open, which keeps the blob
-    /// files that have their blob record.
+    /// Remove the intent file of a finish after its backend commit, or of
+    /// a pack after its blob files are gone. A failure leaves the file for
+    /// the next open, which keeps the blob files that have their blob
+    /// record.
     pub(crate) fn finished(&self, intent: Option<String>) {
         if let Some(intent) = intent {
             let _ = self.dir.remove(&intent);
         }
+    }
+
+    /// Write the intent file of `tid` before a pack commits the removal of
+    /// the blob records of `oids` at `tid`, and make it durable. Return
+    /// its name.
+    ///
+    /// An intent file of `tid` that exists keeps its oids: the new file
+    /// names them too. The new file goes in under a temporary name and
+    /// replaces the old one by a rename, so a crash leaves one of the two.
+    pub(crate) fn intend_removal(&self, tid: Tid, oids: &[Oid]) -> Result<String> {
+        self.make_ready()?;
+        let intent = intent_name(tid);
+        let mut named: BTreeSet<Oid> = oids.iter().copied().collect();
+        if self.dir.exists(&intent)? {
+            let mut bytes = Vec::new();
+            self.dir.read_file(&intent)?.read_to_end(&mut bytes)?;
+            // An intent that does not decode was not synced, so it names
+            // nothing that a commit removed.
+            if let Ok(old) = decode_intent(tid, &bytes) {
+                named.extend(old);
+            }
+        }
+        let named: Vec<Oid> = named.into_iter().collect();
+        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
+        let temp = format!("{TMP_DIR}/{n}.tmp");
+        let mut file = self.dir.create_file(&temp)?;
+        file.write_all(&encode_intent(tid, &named))?;
+        file.sync()?;
+        drop(file);
+        self.dir.rename(&temp, &intent)?;
+        self.dir.sync_dir_at(TMP_DIR)?;
+        Ok(intent)
+    }
+
+    /// Remove the blob files of `blobs` after a pack made the removal of
+    /// their blob records durable, and sync their directories. A file that
+    /// is not there is not an error.
+    pub(crate) fn remove_files(&self, blobs: &[(Oid, Tid)]) -> Result<()> {
+        let mut dirs = BTreeSet::new();
+        for &(oid, tid) in blobs {
+            match self.dir.remove(&blob_name(oid, tid)) {
+                Ok(()) => {
+                    dirs.insert(oid_dir(oid));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for dir in &dirs {
+            self.dir.sync_dir_at(dir)?;
+        }
+        Ok(())
     }
 
     /// Open the blob file of `oid` at `tid`, whose blob record is
@@ -789,6 +848,30 @@ mod tests {
         }
         let orphan = blob_name(orphan, crashed);
         (vfs, Leftovers { oid, tid, orphan })
+    }
+
+    #[test]
+    fn a_removal_intent_keeps_the_oids_of_an_older_intent() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let tid = Tid(7);
+        let first = store.blobs().intend_removal(tid, &[Oid(2)]).unwrap();
+        let second = store
+            .blobs()
+            .intend_removal(tid, &[Oid(1), Oid(3)])
+            .unwrap();
+        assert_eq!(first, second);
+        let mut bytes = Vec::new();
+        Vfs::read_file(&vfs, &second)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            decode_intent(tid, &bytes).unwrap(),
+            [Oid(1), Oid(2), Oid(3)]
+        );
+        // The temporary files are gone: each one became the intent file.
+        assert_eq!(temp_files(&vfs), [second]);
     }
 
     #[test]

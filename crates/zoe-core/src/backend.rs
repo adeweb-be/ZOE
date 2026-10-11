@@ -27,8 +27,8 @@ pub struct Record {
     pub tid: Tid,
     /// The serial of the previous version of the object.
     pub prev: Tid,
-    /// The pickle bytes. An empty value marks a deletion by pack or by
-    /// `deleteObject`.
+    /// The pickle bytes. An empty value marks a deletion by
+    /// `deleteObject`. Pack removes records and writes no deletion.
     pub data: Bytes,
 }
 
