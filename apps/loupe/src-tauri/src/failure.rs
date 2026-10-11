@@ -4,7 +4,7 @@
 
 use serde::Serialize;
 use zoe_core::ZoeError;
-use zoe_loupe::{Error, oid_repr};
+use zoe_loupe::{Error, oid_repr, tid_repr};
 
 /// An error of an IPC command.
 #[derive(Debug, Serialize)]
@@ -20,11 +20,13 @@ pub(crate) enum Failure {
     NotClosedCleanly,
     /// The oid has no record.
     NoRecord { oid: String },
+    /// The oid has no record at or before the tid of the view.
+    NoRecordAsOf { oid: String, tid: String },
     /// A path leads to no object.
     NoObject { path: String, segment: String },
     /// zoe-pickle refuses a record that a path goes through.
     Refused { oid: String, message: String },
-    /// A text is not an oid in ZODB form.
+    /// A text is not an oid or a tid in ZODB form.
     BadId { text: String },
     /// Another error. `message` is the text of the error, for a report.
     Other { message: String },
@@ -52,6 +54,10 @@ impl From<Error> for Failure {
                 message: source.to_string(),
             },
             Error::BadId(text) => Failure::BadId { text },
+            Error::NoRecordAsOf { oid, tid } => Failure::NoRecordAsOf {
+                oid: oid_repr(oid),
+                tid: tid_repr(tid),
+            },
             other => Failure::other(other),
         }
     }
@@ -59,7 +65,7 @@ impl From<Error> for Failure {
 
 #[cfg(test)]
 mod tests {
-    use zoe_core::Oid;
+    use zoe_core::{Oid, Tid};
 
     use super::*;
 
@@ -69,6 +75,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(failure).unwrap(),
             serde_json::json!({"kind": "noRecord", "oid": "0x01"})
+        );
+        let failure = Failure::from(Error::NoRecordAsOf {
+            oid: Oid(8),
+            tid: Tid(0x0100),
+        });
+        assert_eq!(
+            serde_json::to_value(failure).unwrap(),
+            serde_json::json!({"kind": "noRecordAsOf", "oid": "0x08", "tid": "0x0100"})
         );
         let failure = Failure::from(Error::Store(ZoeError::NotClosedCleanly));
         assert_eq!(
