@@ -142,7 +142,13 @@ impl Server {
     fn shutdown(&mut self) {
         // Dropping the runtime drops every connection task. Each session
         // then ends after its current call, and the drop waits for it.
-        drop(self.runtime.take());
+        // Tokio refuses that drop on a thread of an async runtime, as in an
+        // async test, so another thread drops it.
+        if let Some(runtime) = self.runtime.take() {
+            std::thread::scope(|scope| {
+                scope.spawn(move || drop(runtime));
+            });
+        }
         // The sessions dropped their references, so this closes the store.
         drop(self.store.take());
     }
@@ -184,5 +190,45 @@ async fn accept(listener: TcpListener, store: Arc<Store>) {
                 tokio::task::yield_now().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zoe-serve-lib-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn stop_closes_the_store_also_in_an_async_context() {
+        let dir = fresh_dir("async-stop");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = Server::start(ServeOptions::new(&dir)).unwrap();
+            assert!(server.addr().ip().is_loopback());
+            assert_ne!(server.addr().port(), 0);
+            server.stop();
+        });
+        // The lock of the store is free again.
+        Store::open(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_that_cannot_listen_creates_no_store() {
+        let dir = fresh_dir("no-listen");
+        let first = Server::start(ServeOptions::new(fresh_dir("listening"))).unwrap();
+        let taken = first.addr();
+        // The port is taken by a listening socket, so the bind fails.
+        let error = Server::start(ServeOptions::new(&dir).listen(taken))
+            .err()
+            .expect("the port is taken");
+        assert!(matches!(error, Error::Listen(..)), "{error}");
+        assert!(!dir.exists());
     }
 }
