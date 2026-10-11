@@ -71,6 +71,9 @@ def test_lock_timeout_takes_whole_seconds():
     assert seconds("2m") == 120
     with pytest.raises(ValueError):
         seconds("1.5s")
+    assert seconds("0") == 0
+    with pytest.raises(ValueError, match="0 or more"):
+        seconds("-5s")
 
 
 def test_a_key_of_the_section_wins_over_its_twin(tmp_path, monkeypatch):
@@ -115,6 +118,14 @@ def test_a_missing_path_raises_value_error(monkeypatch):
         open_stanza()
 
 
+def test_a_negative_lock_timeout_names_its_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOE_LOCK_TIMEOUT", "-5s")
+    with pytest.raises(ValueError, match="ZOE_LOCK_TIMEOUT='-5s': .*0 or more"):
+        open_stanza(f"path {tmp_path / 'store'}")
+    with pytest.raises(ValueError, match="lock-timeout='-5s': .*0 or more"):
+        zodburi.resolve_uri(f"zoe://{tmp_path / 'store'}?lock-timeout=-5s")
+
+
 def test_a_bad_twin_names_the_variable(tmp_path, monkeypatch):
     monkeypatch.setenv("ZOE_LOCK_TIMEOUT", "1.5s")
     with pytest.raises(ValueError, match="ZOE_LOCK_TIMEOUT='1.5s'"):
@@ -153,7 +164,14 @@ def test_an_empty_path_of_the_section_takes_its_twin(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "line", ["lock-timeout 1.5s", "read-only maybe", "backend fdb", "early-locks on"]
+    "line",
+    [
+        "lock-timeout 1.5s",
+        "lock-timeout -5s",
+        "read-only maybe",
+        "backend fdb",
+        "early-locks on",
+    ],
 )
 def test_a_bad_value_in_the_section_names_the_key(tmp_path, line):
     key, value = line.split()

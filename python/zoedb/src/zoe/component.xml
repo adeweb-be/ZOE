@@ -37,7 +37,7 @@
     <key name="lock-timeout" datatype="string">
       <description>
         The longest time that a vote waits for the lock of an object, in
-        whole seconds, such as 10s or 2m. A longer wait raises
+        whole seconds, 0 or more, such as 10s or 2m. A longer wait raises
         ConflictError. The default is the default of the store.
       </description>
     </key>

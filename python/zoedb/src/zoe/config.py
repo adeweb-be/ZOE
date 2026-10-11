@@ -42,12 +42,23 @@ def early_locks(value):
     return False
 
 
+def lock_timeout(value):
+    """Return whole seconds, as ZConfig's time-interval gives them.
+
+    Refuse a negative time.
+    """
+    seconds = stock_datatypes["time-interval"](value)
+    if seconds < 0:
+        raise ValueError("the lock timeout is 0 or more seconds")
+    return seconds
+
+
 # The keys and the converters of their values.
 KEYS = {
     "path": stock_datatypes["string"],
     "blob-dir": stock_datatypes["string"],
     "backend": backend,
-    "lock-timeout": stock_datatypes["time-interval"],
+    "lock-timeout": lock_timeout,
     "early-locks": early_locks,
     "read-only": stock_datatypes["boolean"],
 }
