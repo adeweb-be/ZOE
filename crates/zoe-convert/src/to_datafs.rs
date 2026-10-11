@@ -256,11 +256,17 @@ impl OutBlobs {
 /// Copy `blob` into a new file at `path`. Make the file read-only, as ZODB
 /// makes a committed blob file, and sync it.
 ///
-/// Return the error of `blob` when it fails its check of the size and the
-/// hash. Any other error of `blob` is a `Store` error.
+/// A crash can leave a read-only file at `path`, so the call removes it
+/// first. Return the error of `blob` when it fails its check of the size
+/// and the hash. Any other error of `blob` is a `Store` error.
 fn write_blob_file(blob: &mut impl Read, path: &Path) -> Result<Option<io::Error>, Error> {
     let io = |source| io_error(path, source);
-    let mut file = File::create(path).map_err(io)?;
+    remove_if_exists(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(io)?;
     let mut buf = vec![0; CHUNK];
     loop {
         let n = match blob.read(&mut buf) {
@@ -678,14 +684,25 @@ mod tests {
     }
 
     #[test]
-    fn a_leftover_temporary_file_is_replaced() {
+    fn the_temporary_files_of_a_crash_are_replaced() {
         let (dir, store) = setup("exit-leftover");
-        commit(&store, b"", &[(1, b"a")], &[]);
+        let tid = commit(&store, b"", &[(1, b"a")], &[(2, b"blob")]);
         fs::write(dir.join("Data.fs.new"), b"the rest of a crash").unwrap();
+        // A crash after the sync of a blob file and before its rename
+        // leaves a read-only file.
+        let temp = dir.join(format!("blobs/tmp/{:016x}-{:016x}.blob", 2, tid.0));
+        fs::create_dir_all(temp.parent().unwrap()).unwrap();
+        fs::write(dir.join("blobs/.layout"), "bushy").unwrap();
+        fs::write(&temp, b"half").unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o444)).unwrap();
+
         let report = convert(&store, &dir).unwrap();
         assert!(report.problems.is_empty(), "{report:?}");
         assert_eq!(read_file(&dir.join("Data.fs")).len(), 1);
         assert!(!dir.join("Data.fs.new").exists());
+        assert!(!temp.exists());
+        let blobs = BlobDir::open(&dir.join("blobs")).unwrap();
+        assert_eq!(fs::read(blobs.path(Oid(2), tid)).unwrap(), b"blob");
     }
 
     #[test]
