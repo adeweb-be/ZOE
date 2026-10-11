@@ -57,7 +57,9 @@ const CHUNK: usize = 1 << 16;
 /// `DataFsDiverged` and changes nothing. A file that does not end with a
 /// whole transaction fails with `Corrupt`. The conversion never changes
 /// the bytes of an existing file: it only adds transactions after them. A
-/// resumed file is the file that one run writes.
+/// resumed file is the file that one run writes. A `data_fs` that is a
+/// symbolic link, and a read-only file that needs new transactions, fail
+/// with `Io`.
 ///
 /// The conversion takes the lock of FileStorage, `data_fs` with the suffix
 /// `.lock`. A lock that another process holds fails with `Locked`. The
@@ -88,6 +90,15 @@ pub fn to_datafs(source: &Store, data_fs: &Path, blob_dir: &Path) -> Result<Repo
 fn convert(source: &Store, data_fs: &Path, temp: &Path, blob_dir: &Path) -> Result<Report, Error> {
     let last = source.last_transaction();
     let existing = match fs::symlink_metadata(data_fs) {
+        // The rename would put a file in place of the link, and the target
+        // of the link would keep the old file.
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let message = "a symbolic link: give the path of the file that it points to";
+            return Err(io_error(
+                data_fs,
+                io::Error::new(ErrorKind::InvalidInput, message),
+            ));
+        }
         Ok(_) => Some(tail(data_fs)?),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(io_error(data_fs, error)),
@@ -171,7 +182,22 @@ fn lock(path: &Path) -> Result<File, Error> {
 }
 
 /// Copy the file `from` to `to`. The copy must have `len` bytes.
+///
+/// A read-only `from` is refused. The copy keeps the mode of `from`, so the
+/// append to the copy would fail with a less clear error.
 fn copy(from: &Path, to: &Path, len: u64) -> Result<(), Error> {
+    let mode = fs::metadata(from)
+        .map_err(|source| io_error(from, source))?
+        .permissions()
+        .mode();
+    if mode & 0o200 == 0 {
+        let message = format!(
+            "the file is read-only (mode {:04o}), so the conversion does not add transactions to it",
+            mode & 0o7777
+        );
+        let error = io::Error::new(ErrorKind::PermissionDenied, message);
+        return Err(io_error(from, error));
+    }
     let copied = fs::copy(from, to).map_err(|source| io_error(to, source))?;
     if copied != len {
         let message = format!("the file changed: it has {copied} bytes, not {len}");
@@ -885,6 +911,49 @@ mod tests {
             "{problems:?}"
         );
         assert_eq!(fs::read(&data_fs).unwrap(), before);
+        assert!(!dir.join("Data.fs.new").exists());
+    }
+
+    #[test]
+    fn a_symbolic_link_is_refused() {
+        let (dir, store) = setup("exit-symlink");
+        commit(&store, b"", &[(1, b"a")], &[]);
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        convert(&store, &target).unwrap();
+        std::os::unix::fs::symlink(target.join("Data.fs"), dir.join("Data.fs")).unwrap();
+        let error = convert(&store, &dir).unwrap_err();
+        assert!(
+            matches!(&error, Error::Io { source, .. } if source.kind() == ErrorKind::InvalidInput),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(
+            fs::symlink_metadata(dir.join("Data.fs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_read_only_file_that_needs_new_transactions_is_refused() {
+        let (dir, store) = setup("exit-read-only");
+        commit(&store, b"", &[(1, b"a")], &[]);
+        convert(&store, &dir).unwrap();
+        let data_fs = dir.join("Data.fs");
+        fs::set_permissions(&data_fs, fs::Permissions::from_mode(0o444)).unwrap();
+        // With nothing to add, the conversion only reads the file.
+        assert_eq!(convert(&store, &dir).unwrap().copied, 0);
+
+        commit(&store, b"", &[(1, b"b")], &[]);
+        let error = convert(&store, &dir).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("{}: ", data_fs.display())),
+            "{message}"
+        );
+        assert!(message.contains("read-only (mode 0444)"), "{message}");
         assert!(!dir.join("Data.fs.new").exists());
     }
 }
