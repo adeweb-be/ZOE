@@ -47,6 +47,9 @@ mod synthetic;
 
 pub use codec::{Codec, Compression};
 
+#[cfg(test)]
+pub(crate) use codec::EMPTY_ZSTD_PAYLOADS;
+
 /// The name and version of the format, in the `format` row of `meta`.
 pub const FORMAT_NAME: &[u8] = b"ZOE format 1";
 
@@ -84,8 +87,8 @@ pub enum FrameError {
         value: u8,
     },
     /// The payload does not decode with its codec. For zstd, the payload is
-    /// not one zstd frame, does not state the data length, states a length
-    /// over the bound, or decodes to another length.
+    /// not one zstd frame, does not state the data length, states 0 bytes or
+    /// a length over the bound, or decodes to another length.
     Payload,
 }
 
@@ -143,6 +146,18 @@ pub fn encode_frame_with(
     let checksum = checksum(key, &frame[..24], &[], &payload);
     frame.extend_from_slice(&checksum.to_le_bytes());
     frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Encode the frame of the row `key` with the codec byte `codec` and
+/// `payload` as the stored payload. Tests use it to write frames that the
+/// encoder never writes.
+#[cfg(test)]
+pub(crate) fn encode_stored_frame(key: &[u8], codec: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = encode_frame(key, MAIN_BRANCH, Tid::ZERO, payload);
+    frame[2] = codec;
+    let sum = checksum(key, &frame[..24], &[], payload);
+    frame[24..HEADER_LEN].copy_from_slice(&sum.to_le_bytes());
     frame
 }
 
@@ -444,6 +459,18 @@ mod tests {
             decode_frame(&key(), &seal(&header, &[], b"pickle")),
             Err(FrameError::Payload)
         );
+    }
+
+    #[test]
+    fn a_zstd_frame_that_states_no_data_is_refused() {
+        for payload in EMPTY_ZSTD_PAYLOADS {
+            let frame = encode_stored_frame(&key(), CODEC_ZSTD, payload);
+            assert_eq!(
+                decode_frame(&key(), &frame),
+                Err(FrameError::Payload),
+                "{payload:02x?}"
+            );
+        }
     }
 
     #[test]

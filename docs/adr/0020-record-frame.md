@@ -14,7 +14,7 @@ The codec byte says how the payload holds the data. Codec 0 is the data as it is
 
 A store writes each record with zstd at a configured level, 3 by default, and keeps the zstd payload only when it is smaller than the data. Otherwise it writes the data as it is, with codec 0. A store with compression off writes codec 0. Transaction rows and blob chunks use codec 0. A store reads every codec, whatever its own setting.
 
-Decompression is bounded. The zstd payload must be exactly one zstd frame and must state the data length. That length must be at most `u32::MAX`, the limit of the payload length field, and at most 32,768 times the stored length, because a zstd block of 4 bytes decodes to at most 128 KiB. The reader then decodes into a buffer of that length, and the payload must decode to exactly that length. A payload that breaks one of these rules is a `CorruptRecord`, not an allocation.
+Decompression is bounded. The zstd payload must be exactly one zstd frame and must state the data length. That length must be at least 1, because empty data marks a deletion and the writer never compresses it. It must be at most `u32::MAX`, the limit of the payload length field, and at most 32,768 times the stored length, because a zstd block of 4 bytes decodes to at most 128 KiB. The reader then decodes into a buffer of that length, and the payload must decode to exactly that length. A payload that breaks one of these rules is a `CorruptRecord`, not an allocation.
 
 ## Consequences
 

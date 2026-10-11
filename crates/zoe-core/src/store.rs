@@ -239,6 +239,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::format;
     use crate::format::Codec;
 
     /// A clock that never moves.
@@ -586,6 +587,39 @@ mod tests {
         assert_eq!((info.stored_len, info.data_len), (1, 1));
         let error = store.record_info(oid, Tid(tid.0 + 1));
         assert!(matches!(error, Err(ZoeError::NotFound { .. })), "{error:?}");
+    }
+
+    #[test]
+    fn a_zstd_record_that_states_no_data_is_corrupt_not_deleted() {
+        let records: redb::TableDefinition<&[u8; 16], &[u8]> =
+            redb::TableDefinition::new("records");
+        for payload in format::EMPTY_ZSTD_PAYLOADS {
+            let vfs = MemVfs::new();
+            let (oid, tid) = {
+                let store = Store::open_vfs(vfs.clone()).unwrap();
+                let oid = store.new_oid().unwrap();
+                (oid, commit(&store, oid, Tid::ZERO, b"pickle").unwrap())
+            };
+            let db = redb::Builder::new()
+                .create_with_backend(vfs.file("zoe.redb"))
+                .unwrap();
+            let txn = db.begin_write().unwrap();
+            let key = format::record_key(oid, tid);
+            let frame = format::encode_stored_frame(&key, format::CODEC_ZSTD, payload);
+            txn.open_table(records)
+                .unwrap()
+                .insert(&key, frame.as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+            drop(db);
+
+            let store = Store::open_vfs(vfs).unwrap();
+            let error = store.load(oid);
+            assert!(
+                matches!(error, Err(ZoeError::CorruptRecord { .. })),
+                "{payload:02x?}: {error:?}"
+            );
+        }
     }
 
     #[test]

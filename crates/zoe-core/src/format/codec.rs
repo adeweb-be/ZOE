@@ -12,8 +12,8 @@
 //! format.
 //!
 //! The reader checks the length that a zstd frame states before it
-//! allocates. The length must not be more than `MAX_DATA_LEN`, and not more
-//! than `ZSTD_MAX_EXPANSION` times the stored length. The reader then
+//! allocates. The length must be at least 1, not more than `MAX_DATA_LEN`,
+//! and not more than `ZSTD_MAX_EXPANSION` times the stored length. The reader then
 //! decodes into a buffer of that length. A payload that decodes to another
 //! length is an error.
 
@@ -147,6 +147,11 @@ fn zstd_data_len(stored: &[u8]) -> Result<usize, FrameError> {
     let Ok(Some(len)) = zstd_safe::get_frame_content_size(stored) else {
         return Err(FrameError::Payload);
     };
+    // Empty data marks a deletion. The writer never compresses empty data,
+    // so a zstd payload that states 0 bytes is not valid.
+    if len == 0 {
+        return Err(FrameError::Payload);
+    }
     let bound = (stored.len() as u64)
         .saturating_mul(ZSTD_MAX_EXPANSION)
         .min(MAX_DATA_LEN);
@@ -155,6 +160,20 @@ fn zstd_data_len(stored: &[u8]) -> Result<usize, FrameError> {
     }
     usize::try_from(len).map_err(|_| FrameError::Payload)
 }
+
+/// zstd payloads that state no data. Empty data marks a deletion, so a
+/// reader refuses each of them.
+#[cfg(test)]
+pub(crate) const EMPTY_ZSTD_PAYLOADS: [&[u8]; 4] = [
+    // A skippable frame with 4 bytes of content.
+    &[0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4],
+    // A skippable frame with no content.
+    &[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0],
+    // A frame that states 0 bytes, with one empty raw block.
+    &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0, 0x01, 0, 0],
+    // A frame that states 0 bytes, with two empty raw blocks.
+    &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0, 0x00, 0, 0, 0x01, 0, 0],
+];
 
 #[cfg(test)]
 mod tests {
@@ -312,6 +331,17 @@ mod tests {
         }
         let exact = rle_block(zstd_header(1_000), 7, 1_000);
         assert_eq!(decode(Codec::Zstd, &exact).unwrap(), vec![7; 1_000]);
+    }
+
+    #[test]
+    fn a_payload_that_states_no_data_is_refused() {
+        for payload in EMPTY_ZSTD_PAYLOADS {
+            assert_eq!(
+                decode(Codec::Zstd, payload),
+                Err(FrameError::Payload),
+                "{payload:02x?}"
+            );
+        }
     }
 
     #[test]

@@ -56,7 +56,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - `decode_frame` decodes every codec. A read path gets the data, never the stored form.
 - Compression never changes what a load returns. A store reads every codec, whatever its `compression` option.
 - A record is kept compressed only when zstd makes it smaller. Otherwise it is stored as it is, with codec 0. The zstd level is an option, 3 by default.
-- Decompression is bounded. The length that a zstd frame states is at most `u32::MAX` and at most 32,768 times the stored length, and the payload decodes to exactly that length. Any other zstd payload is `CorruptRecord`.
+- Decompression is bounded. The length that a zstd frame states is at least 1, at most `u32::MAX` and at most 32,768 times the stored length, and the payload decodes to exactly that length. Any other zstd payload is `CorruptRecord`, never data and never a deletion.
 - `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` before anything is written.
 - Pack never blocks readers. Writers pause only for the final meta update. A blob file is deleted after its record.
 - A blob file is immutable per `(oid, tid)`. `storeBlob` renames the file into place inside `tpc_finish`.
