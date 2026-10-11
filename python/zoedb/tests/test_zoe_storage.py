@@ -598,6 +598,25 @@ def test_a_new_object_over_a_committed_one_is_not_resolved(storage, monkeypatch)
     storage.tpc_abort(txn)
     assert error.value.oid == oid
     assert error.value.serials == (second, ZERO)
+    assert error.value.class_name == "ZODB.tests.ConflictResolution.PCounter"
+
+
+def test_a_serial_of_a_missing_record_is_not_resolved(storage, monkeypatch):
+    def resolve(self, old, committed, new):
+        raise AssertionError("an object without a committed state is never resolved")
+
+    monkeypatch.setattr(PCounter, "_p_resolveConflict", resolve)
+    oid, first, second = two_revisions(storage)
+    missing = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(missing, first, counter(2), "", txn)
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == missing
+    assert error.value.serials == (ZERO, first)
+    assert error.value.class_name == "ZODB.tests.ConflictResolution.PCounter"
 
 
 def test_an_unresolved_conflict_releases_the_locks_before_the_abort(tmp_path):
@@ -628,6 +647,29 @@ class Marked:
     def untransform_record_data(self, data):
         assert data.startswith(b"marked:")
         return data.removeprefix(b"marked:")
+
+
+def test_a_conflict_names_the_class_through_the_record_transforms(storage):
+    storage.registerDB(Marked())
+    mark = Marked().transform_record_data
+    oid, first, second = two_revisions(storage, lambda value: mark(counter(value)))
+
+    def vote_error(serial, data):
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, serial, data, "", txn)
+        with pytest.raises(ConflictError) as error:
+            storage.tpc_vote(txn)
+        storage.tpc_abort(txn)
+        return error.value
+
+    # The core does not resolve a new object over a committed one. A
+    # PCounter2 does not resolve.
+    for serial in (ZERO, first):
+        error = vote_error(serial, mark(counter(2, PCounter2)))
+        assert error.class_name == "ZODB.tests.ConflictResolution.PCounter2"
+    # A record that the database cannot untransform gives no class name.
+    assert vote_error(ZERO, counter(2, PCounter2)).class_name is None
 
 
 def test_the_resolution_uses_the_record_transforms_of_the_database(storage):

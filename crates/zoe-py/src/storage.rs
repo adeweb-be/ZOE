@@ -422,11 +422,16 @@ impl Storage {
     /// record, the serial that the transaction read, the committed pickle
     /// and the pickle of the transaction. Store a resolved pickle of each
     /// oid with the committed serial, then call `tpc_vote`.
+    ///
+    /// `untransform` gives the pickle of a stored record, as the
+    /// `_crs_untransform_record_data` of ZODB does. A `ConflictError` reads
+    /// the class name of the object from that pickle.
     #[pyo3(name = "_vote_resolving")]
     fn vote_resolving<'py>(
         &self,
         py: Python<'py>,
         transaction: &Bound<'py, PyAny>,
+        untransform: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<ConflictRow<'py>>> {
         let entry = self.entry(py, transaction)?;
         let conflicts = py
@@ -448,7 +453,12 @@ impl Storage {
                         .collect::<Vec<_>>())
                 })
             })
-            .map_err(|failure| failure.into_py(py))?;
+            .map_err(|mut failure| {
+                failure.data = failure
+                    .data
+                    .and_then(|data| untransformed(untransform, &data));
+                failure.into_py(py)
+            })?;
         Ok(conflicts
             .into_iter()
             .map(|(oid, committed, read, data)| {
@@ -622,6 +632,16 @@ fn vote_failure(txn: &SharedTxn, error: ZoeError) -> Failure {
         serials: txn.conflict_serials(),
         data,
     }
+}
+
+/// Return `untransform` applied to the stored record `data`: the pickle of
+/// the record. Return `None` when `untransform` fails.
+fn untransformed(untransform: &Bound<'_, PyAny>, data: &[u8]) -> Option<Vec<u8>> {
+    let pickle = untransform
+        .call1((PyBytes::new(untransform.py(), data),))
+        .ok()?;
+    let pickle = pickle.cast::<PyBytes>().ok()?;
+    Some(pickle.as_bytes().to_vec())
 }
 
 /// Return the exception of ZODB for a core error.

@@ -58,10 +58,10 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         objects.
 
         An object that does not resolve raises `ConflictError`, and the vote
-        releases the locks. A read-current object is never resolved: it
-        raises `ReadConflictError`.
+        releases the locks. The error names the class of the object. A
+        read-current object is never resolved: it raises `ReadConflictError`.
         """
-        conflicts = self._vote_resolving(transaction)
+        conflicts = self._vote_resolving(transaction, self._crs_untransform_record_data)
         if not conflicts:
             return []
         try:

@@ -25,7 +25,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `registerDB` hands the database to `ConflictResolvingStorage`, so the resolution uses the record transforms of the database.
 - `tpc_finish` runs its callback after the commit is durable. A commit is published when its callback has run. Callbacks run in commit order: a commit waits until the commit before it is published. A failed or panicking callback still publishes its commit.
 - A callback cannot commit in its own storage: that `tpc_finish` raises `StorageTransactionError` before it commits, because its commit would wait for the callback that runs it. A thread-local list of the storages whose callbacks run tells this.
-- A `ConflictError` on a stored object gets the stored pickle as `data`, so ZODB fills its class name. If ZODB cannot read the pickle, the error comes without `data`.
+- A `ConflictError` on a stored object gets the stored pickle as `data`, so ZODB fills its class name. If ZODB cannot read the pickle, the error comes without `data`. `_vote_resolving` first applies the `_crs_untransform_record_data` of the database to the pickle, so the class name comes from the pickle and not from the transformed record. A record that does not untransform gives no `data`.
 - `lastTransaction` gives only a published tid. It waits until the last tid of the core is published. A callback that calls it does not wait and gets the tid before its own commit.
 - A read-only storage refuses `tpc_begin`, `new_oid` and `store` with `ReadOnlyError`. It does not create a missing directory. It still opens the store for writes and takes the exclusive lock, until the core has a read-only open.
 - `close` marks the table closed and aborts the open transactions. A `tpc_begin` that read the store before the close finds the mark when it inserts its entry, aborts its transaction and raises `StorageError`. So no transaction keeps the store open after `close`, and the directory lock is free when no call is in progress. A second `close` does nothing. A call on a closed storage raises `StorageError`.
@@ -41,7 +41,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 | Core error | Python exception |
 | --- | --- |
 | `NotFound` | `POSKeyError(oid)` |
-| `Conflict` | `ConflictError` with `oid`, and `serials == (current, read)` for a stale serial; a lock-wait timeout gives no serials. A conflict that `_p_resolveConflict` does not resolve also gives `class_name` |
+| `Conflict` | `ConflictError` with `oid`, and `serials == (current, read)` for a stale serial; a lock-wait timeout gives no serials. A conflict on a stored object also gives `class_name`, whether the core or `_p_resolveConflict` does not resolve it |
 | `ReadConflict` | `ReadConflictError` with `oid` and `serials == (current, read)` |
 | `WrongThread` | `zoe.WrongThread` |
 | `Protocol`, `LockOrder` | `StorageTransactionError` |
