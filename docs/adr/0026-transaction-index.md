@@ -25,19 +25,19 @@ The value is empty. The value type of the table is the unit type `()` of redb, w
 
 **Writes.** `WriteTxn::put_record` stages the record and its index key in the same backend write transaction. A normal commit and a restore both write their records through it in `finish`. So both index each record, and a crash leaves a record and its key together, or neither. No trait signature changes: the contract of `put_record` now includes the key. A blob record (ADR 0023) has no index key of its own. The core stages each blob record with the record of the same `(oid, tid)`, and that record has the key.
 
-**Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. The iterator takes the oids of its range from it, then reads each record with `load_serial`. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
+**Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. The iterator reads the rows and the index keys of its range first. Then `Backend::txn_records(tid)` reads the row of each transaction, the index keys of its tid and their records, in one snapshot. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
 
 **Corruption.** The index has no frame and no checksum of its own. The checksum of each record frame covers the `(oid, tid)` key of the record. The iterator checks the index against the rows and the records:
 
 - The index keys of a transaction must match the oid count of its row. A record without its index key breaks this rule, and the iterator gives `CorruptTxn` for its transaction.
-- Each index key must have its record. An index key without its record is `CorruptTxn` for its transaction, never `NotFound`.
+- Each index key must have its record. An index key without its record is `CorruptTxn` for its transaction, never `NotFound`. The row, the keys and the records of a transaction come from one snapshot. So a key that a removal left behind is `CorruptTxn` also when the oid count of its row went down with the record.
 - Index keys of a tid that has no row give `CorruptTxn` for that tid, when the range of the iterator has a row.
 
 A record that no row counts and that no index key names is outside what the iterator reads. Only a scan of `records` finds it. A scrub that reads every record can check the index key of each record at the same time.
 
 **Open.** A store without the `txn_oids` table fails to open with `Format`. No migration exists, because no real store exists yet: the converters of phase 1 write the first real stores, with the index. So the format name stays `ZOE format 1`.
 
-**Pack.** Pack removes the index key of each record that it removes, in the backend write transaction that removes the record and lowers the oid count of its row. So in every snapshot, the index keys of a transaction match its row and its records.
+**Pack.** Pack removes records with `WriteTxn::remove_record`, which removes the index key with the record. Each batch of a pack is one backend write transaction that removes records, their index keys and their blob records, lowers the oid count of their rows, and removes a row that keeps no record (ADR 0025). So a row that pack removes has no index key left, and in every snapshot the index keys of a transaction match its row and its records. The crash simulation checks this on every crash image of a pack.
 
 ## Why the value is empty
 
@@ -59,8 +59,8 @@ The other choice was to write the oids of a transaction into the payload of its 
 - A read of one transaction, or of a tid range, reads the index keys, the rows and the records of the range. It reads nothing that grows with the rest of the store, except a deeper tree. In the acceptance test, a read of one commit of 8 records reads 124 KiB in a store, and 160 KiB in a store with 8 times more records.
 - Each record costs 16 bytes more in a leaf page, and its part of the branch pages. In a measured store of 500,000 records of about 270 bytes of pickle each, the index takes 2,003 pages of 4 KiB: 13% more pages than the store without it.
 - A commit writes one more key for each record, in the same write transaction.
-- The iterator holds the oids of its range in memory. The memory grows with the range, not with the store.
+- The iterator holds the tids of its range in memory, and the records of one transaction at a time. The memory grows with the range, not with the store.
 - The iterator does not see a record that no row counts and that no index key names.
-- Pack must remove the index key with its record.
-- Every backend writes the key in `put_record` and reads the index in `txn_oids`.
+- A pack removes one index key with each record.
+- Every backend writes the key in `put_record`, removes it in `remove_record`, and reads the index in `txn_oids` and `txn_records`.
 - A store written without the index does not open. No such store exists outside the tests.
