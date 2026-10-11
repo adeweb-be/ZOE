@@ -35,6 +35,13 @@
 //! Keys are big-endian, so that the byte order of the keys is the numeric
 //! order of oids and tids. The numbers in the rows of `meta` are 8-byte
 //! big-endian values, as ZODB writes oids and tids.
+//!
+//! The transaction index gives the oids of each transaction. It has one
+//! key for each record: the 16 bytes of `txn_oid_key`, the tid then the
+//! oid. Its value is empty. So a range scan over the keys of one tid gives
+//! the oids of that transaction in ascending order. The index has no
+//! frame and no checksum of its own: the checksum of a record frame covers
+//! the oid and the tid of the record.
 
 pub mod blob;
 
@@ -239,6 +246,22 @@ pub fn split_record_key(key: &[u8; 16]) -> (Oid, Tid) {
 /// Return the key of a transaction row: the tid, big-endian.
 pub fn txn_key(tid: Tid) -> [u8; 8] {
     tid.0.to_be_bytes()
+}
+
+/// Return the key of the transaction index for the record of `oid` at
+/// `tid`: the tid, then the oid, both big-endian.
+pub fn txn_oid_key(tid: Tid, oid: Oid) -> [u8; 16] {
+    let mut key = [0; 16];
+    key[..8].copy_from_slice(&tid.0.to_be_bytes());
+    key[8..].copy_from_slice(&oid.0.to_be_bytes());
+    key
+}
+
+/// Split a key of the transaction index into its tid and oid.
+pub fn split_txn_oid_key(key: &[u8; 16]) -> (Tid, Oid) {
+    let tid = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let oid = u64::from_be_bytes(key[8..].try_into().unwrap());
+    (Tid(tid), Oid(oid))
 }
 
 /// Encode a number for a row of `meta`.
@@ -514,6 +537,21 @@ mod tests {
         let b = record_key(Oid(2), Tid(0));
         assert!(a < b);
         assert_eq!(split_record_key(&b), (Oid(2), Tid(0)));
+    }
+
+    #[test]
+    fn index_keys_sort_by_tid_then_oid() {
+        let key = txn_oid_key(Tid(0x0102), Oid(0x0304));
+        assert_eq!(
+            key,
+            [0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 3, 4],
+            "the tid, then the oid, big-endian"
+        );
+        assert_eq!(split_txn_oid_key(&key), (Tid(0x0102), Oid(0x0304)));
+        let a = txn_oid_key(Tid(1), Oid(u64::MAX));
+        let b = txn_oid_key(Tid(2), Oid(0));
+        let c = txn_oid_key(Tid(2), Oid(1));
+        assert!(a < b && b < c);
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! The redb backend.
 //!
-//! Four tables hold the key spaces of the data model: `records`, `blobs`,
-//! `txns` and `meta`. `format` says how keys and values are written.
-//! `initialise` creates all four, so a new store has an empty `blobs`
-//! table. A store written before the `blobs` table has none until its
-//! first blob commit creates it. Until then it reads as a store without
-//! blob records.
+//! Five tables hold the key spaces of the data model: `records`,
+//! `txn_oids`, `blobs`, `txns` and `meta`. `format` says how keys and
+//! values are written. `txn_oids` is the transaction index: `put_record`
+//! writes the index key of each record in the write transaction of the
+//! record, and `remove_record` removes the key with the record.
+//! `initialise` creates all five, so a new store has an empty
+//! `blobs` table. A store written before the `blobs` table has none until
+//! its first blob commit creates it. Until then it reads as a store
+//! without blob records.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -25,6 +28,7 @@ use crate::format::{self, Compression};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
+const TXN_OIDS: TableDefinition<&[u8; 16], ()> = TableDefinition::new("txn_oids");
 const BLOBS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("blobs");
 const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -78,6 +82,17 @@ fn inside_txns(key: &[u8; 8], range: impl RangeBounds<[u8; 8]>) -> Result<()> {
     Err(ZoeError::CorruptTxn { tid })
 }
 
+/// Check that `key`, which a scan of the transaction index gave, is inside
+/// `range`, as `inside` does for `records`. A key outside it raises
+/// `CorruptTxn` with the tid of the key.
+fn inside_index(key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()> {
+    if range.contains(key) {
+        return Ok(());
+    }
+    let (tid, _) = format::split_txn_oid_key(key);
+    Err(ZoeError::CorruptTxn { tid })
+}
+
 /// The redb database of a store.
 enum Db {
     /// The database is open for reads and writes.
@@ -109,6 +124,7 @@ impl RedbBackend {
         let txn = db.begin_write().map_err(backend)?;
         {
             txn.open_table(RECORDS).map_err(backend)?;
+            txn.open_table(TXN_OIDS).map_err(backend)?;
             txn.open_table(BLOBS).map_err(backend)?;
             txn.open_table(TXNS).map_err(backend)?;
             let mut meta = txn.open_table(META).map_err(backend)?;
@@ -135,6 +151,9 @@ impl RedbBackend {
 
     /// Open the store in `db` and check its format.
     ///
+    /// A store without the transaction index is not in this format. Its
+    /// records have no index keys, so the open fails with `Format`.
+    ///
     /// The last tid is the greater of `last_tid` in `meta` and the tid of
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
     /// a second time. The row counts only when its frame passes the
@@ -151,6 +170,13 @@ impl RedbBackend {
                 return Err(ZoeError::Format(
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
+            }
+            match txn.open_table(TXN_OIDS) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(ZoeError::Format("no transaction index".to_owned()));
+                }
+                Err(e) => return Err(backend(e)),
             }
             let stored = read(META_LAST_TID)?
                 .as_deref()
@@ -387,22 +413,24 @@ impl Backend for RedbBackend {
     }
 
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
-        let txn = self.db.begin_read().map_err(backend)?;
-        let records = txn.open_table(RECORDS).map_err(backend)?;
         let mut oids: BTreeMap<Tid, Vec<Oid>> = BTreeMap::new();
-        // No key space maps a tid to its oids, so this scan reads every
-        // key. It does not decode the frames: each later read of a record
-        // verifies it. Each key is after the key before it, so no oid comes
-        // twice.
-        let mut after = Unbounded;
-        for entry in records.iter().map_err(backend)? {
+        if from > to {
+            return Ok(oids);
+        }
+        let txn = self.db.begin_read().map_err(backend)?;
+        let index = txn.open_table(TXN_OIDS).map_err(backend)?;
+        // The scan reads only the index keys of the range, and no record.
+        // Each key is inside the range and after the key before it, so no
+        // oid comes twice.
+        let start = format::txn_oid_key(from, Oid(0));
+        let end = format::txn_oid_key(to, Oid(u64::MAX));
+        let mut after = Included(start);
+        for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
-            let (oid, tid) = format::split_record_key(key.value());
-            inside(oid, key.value(), (after, Unbounded))?;
+            inside_index(key.value(), (after, Included(end)))?;
             after = Excluded(*key.value());
-            if (from..=to).contains(&tid) {
-                oids.entry(tid).or_default().push(oid);
-            }
+            let (tid, oid) = format::split_txn_oid_key(key.value());
+            oids.entry(tid).or_default().push(oid);
         }
         Ok(oids)
     }
@@ -571,6 +599,10 @@ impl WriteTxn for RedbWrite<'_> {
             format::encode_frame_with(&key, format::MAIN_BRANCH, prev, data, self.compression);
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         records.insert(&key, frame.as_slice()).map_err(backend)?;
+        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
+        index
+            .insert(&format::txn_oid_key(tid, oid), ())
+            .map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
         Ok(())
     }
@@ -600,6 +632,10 @@ impl WriteTxn for RedbWrite<'_> {
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         records
             .remove(&format::record_key(oid, tid))
+            .map_err(backend)?;
+        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
+        index
+            .remove(&format::txn_oid_key(tid, oid))
             .map_err(backend)?;
         Ok(())
     }
@@ -1083,6 +1119,7 @@ mod tests {
             .unwrap();
         let txn = db.begin_write().unwrap();
         txn.open_table(RECORDS).unwrap();
+        txn.open_table(TXN_OIDS).unwrap();
         txn.open_table(TXNS).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();
@@ -1404,5 +1441,69 @@ mod tests {
         // Without the check of the scan, these reads give the rows outside
         // it.
         assert!(scans.early > 0, "no forward scan started before its start");
+    }
+
+    #[test]
+    fn txn_oids_of_an_empty_range_is_empty() {
+        let backend = empty();
+        commit_record(&backend, Oid(1), Tid(5), b"pickle");
+        assert!(backend.txn_oids(Tid(6), Tid(5)).unwrap().is_empty());
+        assert!(backend.txn_oids(Tid(6), Tid(9)).unwrap().is_empty());
+        assert_eq!(
+            backend.txn_oids(Tid(5), Tid(5)).unwrap(),
+            BTreeMap::from([(Tid(5), vec![Oid(1)])])
+        );
+    }
+
+    #[test]
+    fn put_record_writes_one_index_key() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_record(Oid(2), Tid(5), Tid::ZERO, b"pickle")
+            .unwrap();
+        write.put_record(Oid(1), Tid(5), Tid::ZERO, b"").unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.db.begin_read().unwrap();
+        let index = txn.open_table(TXN_OIDS).unwrap();
+        let keys: Vec<[u8; 16]> = index
+            .iter()
+            .unwrap()
+            .map(|entry| *entry.unwrap().0.value())
+            .collect();
+        // A deletion has its index key too.
+        assert_eq!(
+            keys,
+            [
+                format::txn_oid_key(Tid(5), Oid(1)),
+                format::txn_oid_key(Tid(5), Oid(2))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_store_without_the_transaction_index_does_not_open() {
+        let db = redb::Builder::new()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(RECORDS).unwrap();
+        txn.open_table(TXNS).unwrap();
+        {
+            let mut meta = txn.open_table(META).unwrap();
+            meta.insert(META_FORMAT, format::FORMAT_NAME).unwrap();
+            meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
+                .unwrap();
+            meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let error = RedbBackend::open(db).err();
+        assert!(
+            matches!(&error, Some(ZoeError::Format(message)) if message.contains("transaction index")),
+            "{error:?}"
+        );
     }
 }

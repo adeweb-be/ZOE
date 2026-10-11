@@ -138,6 +138,10 @@ pub trait Backend: Send + Sync {
     /// Return the oids that each transaction from `from` to `to` wrote,
     /// both bounds included. The oids of a transaction are in ascending
     /// order. One snapshot gives the whole map.
+    ///
+    /// The map comes from the transaction index. The call reads only the
+    /// index keys of the range and no record, so its cost is the size of
+    /// the result. The caller checks each oid against its record.
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;
 
     /// Return the first oid at or after `from` that has a version, with
@@ -190,21 +194,25 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// One backend write transaction. It holds the records, the blob records,
-/// the transaction row and the meta update of one commit.
+/// One backend write transaction. It holds the records, their keys in
+/// the transaction index, the blob records, the transaction row and the
+/// meta update of one commit.
 pub trait WriteTxn {
-    /// Stage the version of `oid` that `tid` writes. `prev` is the serial
-    /// of the previous version.
+    /// Stage the version of `oid` that `tid` writes, and its key
+    /// `(tid, oid)` in the transaction index. `prev` is the serial of the
+    /// previous version.
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
 
     /// Stage the blob record of the version of `oid` that `tid` writes.
+    /// It has no key of its own in the transaction index: the record of
+    /// the same version has it.
     fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
 
     /// Stage the transaction row.
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
 
-    /// Stage the removal of the record of `oid` that `tid` wrote. Pack
-    /// uses this.
+    /// Stage the removal of the record of `oid` that `tid` wrote, and of
+    /// its key `(tid, oid)` in the transaction index. Pack uses this.
     fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()>;
 
     /// Stage the removal of the blob record of `oid` that `tid` wrote.

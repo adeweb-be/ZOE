@@ -39,9 +39,10 @@ pub enum ZoeError {
     },
 
     /// The checksum of a transaction row does not match its bytes, or its
-    /// payload does not decode, or a record has no transaction row, or the
-    /// records of a transaction do not match the oid count of its row, or a
-    /// scan of the rows gave the key of the tid outside the scan or out of
+    /// payload does not decode, or a record or an index key has no
+    /// transaction row, or an index key has no record, or the index keys of
+    /// a transaction do not match the oid count of its row, or a scan of
+    /// the rows or of the index gave a key outside the scan or out of
     /// order.
     #[error("corrupt transaction row: tid {tid:?}")]
     CorruptTxn {

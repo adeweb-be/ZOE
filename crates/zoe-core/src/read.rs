@@ -110,8 +110,8 @@ impl Iterator for Transactions {
                 self.oids.clear();
                 return Some(Err(ZoeError::Closed));
             };
-            // Records of a tid before the next row, or after the last row,
-            // have no row. They come in tid order, as an error.
+            // Index keys of a tid before the next row, or after the last
+            // row, have no row. They come in tid order, as an error.
             if let Some(&tid) = self.oids.keys().next() {
                 let no_row = match self.rows.front() {
                     Some(Ok(row)) => tid < row.tid,
@@ -126,7 +126,7 @@ impl Iterator for Transactions {
             let row = match self.rows.pop_front()? {
                 Ok(row) => row,
                 Err(error) => {
-                    // A row that does not read can own any records before
+                    // A row that does not read can own any index keys before
                     // the next row that reads. Drop them, so that they give
                     // no second error.
                     let next = self.rows.iter().find_map(|row| row.as_ref().ok());
@@ -154,9 +154,11 @@ impl Iterator for Transactions {
 /// the row. Return `None` when a pack removed the row. A row that is gone
 /// with no pack to explain it raises `CorruptTxn`.
 ///
-/// `oids` comes from an earlier snapshot. A pack can remove some of these
-/// records since, and then it lowers the oid count of the row in the same
-/// write.
+/// `oids` are the oids that the transaction index gave for `tid` in an
+/// earlier snapshot. A pack can remove some of these records since, and
+/// then it lowers the oid count of the row in the same write. A record
+/// without its index key, or an index key without its record, leaves the
+/// records short of the count.
 fn txn_info(backend: &dyn Backend, tid: Tid, oids: Vec<Oid>) -> Result<Option<TxnInfo>> {
     let Some((row, records)) = backend.txn_records(tid, &oids)? else {
         // The scan of the rows gave this row. Only a pack can remove it
@@ -283,11 +285,16 @@ impl Store {
     /// The iterator stops at the last tid at the time of this call. The
     /// iterator leaves out a transaction that commits after this call.
     ///
-    /// A transaction whose records do not match the oid count of its row
-    /// gives `CorruptTxn`. Records of a tid that has no row give
-    /// `CorruptTxn` too, but only when the range has a row. A row that does
-    /// not read gives its own error once, and the records before the next
-    /// row that reads give no error.
+    /// The oids of each transaction come from the transaction index. The
+    /// call reads only the index keys of the range, never every record
+    /// key, so a read of one transaction costs the size of its result.
+    ///
+    /// A transaction whose index keys do not match the oid count of its row
+    /// gives `CorruptTxn`: a record without its index key does this. An
+    /// index key without its record gives `CorruptTxn` too. Index keys of a
+    /// tid that has no row give `CorruptTxn`, but only when the range has a
+    /// row. A row that does not read gives its own error once, and the
+    /// index keys before the next row that reads give no error.
     pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
@@ -296,7 +303,7 @@ impl Store {
         } else {
             self.backend.iter_txns(start, stop).collect()
         };
-        // A range with no row needs no scan of the records.
+        // A range with no row needs no read of the index.
         let oids = if rows.is_empty() {
             BTreeMap::new()
         } else {
@@ -642,36 +649,47 @@ mod tests {
         assert_eq!(store.record_iternext(Some(Oid(u64::MAX))).unwrap(), None);
     }
 
-    /// Give the `records` table of the closed store in `vfs` to `change`,
-    /// and commit the change.
-    fn change_records(vfs: &MemVfs, change: impl FnOnce(&mut redb::Table<&[u8; 16], &[u8]>)) {
+    /// The `records` table.
+    type Records<'a> = redb::Table<'a, &'static [u8; 16], &'static [u8]>;
+
+    /// The table of the transaction index.
+    type Index<'a> = redb::Table<'a, &'static [u8; 16], ()>;
+
+    /// Give the `records` table and the transaction index of the closed
+    /// store in `vfs` to `change`, and commit the change.
+    fn change_tables(vfs: &MemVfs, change: impl FnOnce(&mut Records, &mut Index)) {
         let records: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
+        let index: TableDefinition<&[u8; 16], ()> = TableDefinition::new("txn_oids");
         let db = redb::Builder::new()
             .create_with_backend(vfs.file("zoe.redb"))
             .unwrap();
         let txn = db.begin_write().unwrap();
-        change(&mut txn.open_table(records).unwrap());
+        change(
+            &mut txn.open_table(records).unwrap(),
+            &mut txn.open_table(index).unwrap(),
+        );
         txn.commit().unwrap();
     }
 
     /// Flip the last bit of the record of `oid` at `tid` in the closed
     /// store in `vfs`.
     fn corrupt(vfs: &MemVfs, oid: Oid, tid: Tid) {
-        change_records(vfs, |table| {
+        change_tables(vfs, |records, _| {
             let key = format::record_key(oid, tid);
-            let mut frame = table.get(&key).unwrap().unwrap().value().to_vec();
+            let mut frame = records.get(&key).unwrap().unwrap().value().to_vec();
             *frame.last_mut().unwrap() ^= 1;
-            table.insert(&key, frame.as_slice()).unwrap();
+            records.insert(&key, frame.as_slice()).unwrap();
         });
     }
 
-    /// Write a valid record of `oid` at `tid` that no transaction row
-    /// counts, in the closed store in `vfs`.
+    /// Write a valid record of `oid` at `tid` and its index key, in the
+    /// closed store in `vfs`. No transaction row counts the record.
     fn add_record(vfs: &MemVfs, oid: Oid, tid: Tid) {
-        change_records(vfs, |table| {
+        change_tables(vfs, |records, index| {
             let key = format::record_key(oid, tid);
             let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, b"x");
-            table.insert(&key, frame.as_slice()).unwrap();
+            records.insert(&key, frame.as_slice()).unwrap();
+            index.insert(&format::txn_oid_key(tid, oid), ()).unwrap();
         });
     }
 
@@ -728,11 +746,11 @@ mod tests {
     }
 
     #[test]
-    fn the_iterator_checks_the_records_against_the_rows() {
+    fn the_iterator_checks_the_index_against_the_rows() {
         let vfs = MemVfs::new();
         drop(three_records_in(&vfs));
         // A second record for the transaction at 200, and records at 150
-        // and 250, where no transaction row is.
+        // and 250, where no transaction row is. Each has its index key.
         add_record(&vfs, Oid(2), Tid(200));
         add_record(&vfs, Oid(2), Tid(150));
         add_record(&vfs, Oid(3), Tid(250));
@@ -754,9 +772,99 @@ mod tests {
             checked(&store, Some(260)),
             [ok(Tid(100)), err(Tid(150)), err(Tid(200)), err(Tid(250))]
         );
-        // A range with no row reads no record, so it finds no error.
+        // A range with no row reads no index key, so it finds no error.
         let range = store.iterator(Some(Tid(140)), Some(Tid(160))).unwrap();
         assert_eq!(range.count(), 0);
+    }
+
+    #[test]
+    fn a_record_without_its_index_key_is_corrupt() {
+        let vfs = MemVfs::new();
+        drop(three_records_in(&vfs));
+        change_tables(&vfs, |_, index| {
+            let key = format::txn_oid_key(Tid(200), Oid(1));
+            assert!(index.remove(&key).unwrap().is_some());
+        });
+        let store = Store::open_vfs(vfs).unwrap();
+
+        // The index gives no oid for the row at 200, which counts one.
+        let (ok, err) = (Ok::<Tid, Tid>, Err::<Tid, Tid>);
+        assert_eq!(
+            checked(&store, None),
+            [ok(Tid(100)), err(Tid(200)), ok(Tid(300))]
+        );
+        assert_eq!(store.load_serial(Oid(1), Tid(200)).unwrap(), pickle(2));
+    }
+
+    #[test]
+    fn an_index_key_without_its_record_is_corrupt() {
+        let vfs = MemVfs::new();
+        drop(three_records_in(&vfs));
+        change_tables(&vfs, |records, _| {
+            let key = format::record_key(Oid(1), Tid(200));
+            assert!(records.remove(&key).unwrap().is_some());
+        });
+        let store = Store::open_vfs(vfs).unwrap();
+
+        // The count of the row matches the index, but a record is missing.
+        let (ok, err) = (Ok::<Tid, Tid>, Err::<Tid, Tid>);
+        assert_eq!(
+            checked(&store, None),
+            [ok(Tid(100)), err(Tid(200)), ok(Tid(300))]
+        );
+        let one: Vec<_> = store
+            .iterator(Some(Tid(200)), Some(Tid(200)))
+            .unwrap()
+            .collect();
+        assert!(
+            matches!(one[..], [Err(ZoeError::CorruptTxn { tid: Tid(200) })]),
+            "{one:?}"
+        );
+    }
+
+    #[test]
+    fn a_blob_commit_and_a_blob_restore_index_their_records() {
+        use std::io::Write;
+
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let blob = |bytes: &[u8]| {
+            let mut file = store.new_blob_file().unwrap();
+            file.write_all(bytes).unwrap();
+            file
+        };
+        let mut txn = store.tpc_begin(b"user", b"blob", b"").unwrap();
+        txn.store_blob(oid, Tid::ZERO, &pickle(1), blob(b"first"))
+            .unwrap();
+        txn.vote().unwrap();
+        let committed = txn.finish().unwrap();
+
+        // A restore copies a new version of the object with its blob.
+        let restored = Tid(committed.0 + 1);
+        let mut txn = store
+            .tpc_begin_restore(restored, b"user", b"copy", b"")
+            .unwrap();
+        txn.store_blob(oid, committed, &pickle(2), blob(b"second"))
+            .unwrap();
+        txn.restore(oid, Some(&pickle(2))).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+
+        // The blob record shares the index key of its record.
+        let expected = BTreeMap::from([(committed, vec![oid]), (restored, vec![oid])]);
+        assert_eq!(
+            store.backend.txn_oids(committed, restored).unwrap(),
+            expected
+        );
+        let txns: Vec<_> = store
+            .iterator(None, None)
+            .unwrap()
+            .map(|txn| {
+                let txn = txn.unwrap();
+                (txn.tid, txn.records.iter().map(|r| r.oid).collect())
+            })
+            .collect();
+        assert_eq!(BTreeMap::from_iter(txns), expected);
     }
 
     fn is_corrupt<T: std::fmt::Debug>(result: Result<T>, tid: u64) {
