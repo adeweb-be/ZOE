@@ -132,23 +132,49 @@ impl BlobStore {
     /// files are removed there.
     fn recover(&self, backend: &dyn Backend) -> Result<()> {
         let mut leftovers = Vec::new();
-        let mut orphan_dirs = BTreeSet::new();
+        let mut intents = Vec::new();
         for file in self.dir.list_files(TMP_DIR)? {
             let name = format!("{TMP_DIR}/{file}");
             if let Some(tid) = intent_tid(&file) {
                 let mut bytes = Vec::new();
                 self.dir.read_file(&name)?.read_to_end(&mut bytes)?;
                 // An intent that does not decode was not synced, so its
-                // finish renamed no blob file.
-                for oid in decode_intent(tid, &bytes).unwrap_or_default() {
-                    let blob = blob_name(oid, tid);
-                    if !has_blob_record(backend, oid, tid)? && self.dir.exists(&blob)? {
-                        self.dir.remove(&blob)?;
-                        orphan_dirs.insert(oid_dir(oid));
-                    }
+                // finish created no directory and renamed no blob file.
+                if let Ok(oids) = decode_intent(tid, &bytes) {
+                    intents.push((tid, oids));
                 }
             }
             leftovers.push(name);
+        }
+
+        // A finish creates oid directories only after its intent file is
+        // durable. A process that stops between a creation and the sync
+        // of the parent leaves a directory that exists but that a power
+        // loss can remove. A later finish does not create it again, so
+        // the sync happens here. The set gives a parent before its
+        // children.
+        let mut parents = BTreeSet::new();
+        for oid in intents.iter().flat_map(|(_, oids)| oids) {
+            for level in oid_levels(*oid) {
+                if !self.dir.exists(&level)? {
+                    break;
+                }
+                parents.insert(parent(&level).to_owned());
+            }
+        }
+        for dir in &parents {
+            self.dir.sync_dir_at(dir)?;
+        }
+
+        let mut orphan_dirs = BTreeSet::new();
+        for (tid, oids) in &intents {
+            for &oid in oids {
+                let blob = blob_name(oid, *tid);
+                if !has_blob_record(backend, oid, *tid)? && self.dir.exists(&blob)? {
+                    self.dir.remove(&blob)?;
+                    orphan_dirs.insert(oid_dir(oid));
+                }
+            }
         }
         // The removals of the blob files are durable before the removal of
         // their intent file.
@@ -166,13 +192,21 @@ impl BlobStore {
 
     /// Create `blobs/`, `blobs/tmp/` and the layout file when they do not
     /// exist, and make them durable.
+    ///
+    /// A process that stops before a sync can leave these entries in a
+    /// state that exists but is not durable. So the parents are synced
+    /// also when the entries exist.
     fn make_ready(&self) -> Result<()> {
         let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         if *ready {
             return Ok(());
         }
-        for dir in [BLOB_DIR, TMP_DIR] {
-            self.create_dir(dir)?;
+        if !self.dir.exists(BLOB_DIR)? {
+            self.dir.create_dir(BLOB_DIR)?;
+        }
+        self.dir.sync_dir_at(parent(BLOB_DIR))?;
+        if !self.dir.exists(TMP_DIR)? {
+            self.dir.create_dir(TMP_DIR)?;
         }
         if !self.dir.exists(LAYOUT_FILE)? {
             // The layout file is renamed into place, so a crash cannot
@@ -185,14 +219,16 @@ impl BlobStore {
             file.sync()?;
             drop(file);
             self.dir.rename(NEW_LAYOUT_FILE, LAYOUT_FILE)?;
-            self.dir.sync_dir_at(BLOB_DIR)?;
         }
+        self.dir.sync_dir_at(BLOB_DIR)?;
         *ready = true;
         Ok(())
     }
 
     /// Create the directory `dir` when it does not exist, and make it
-    /// durable. Its parent must exist and be durable.
+    /// durable. Its parent must exist and be durable. A directory that
+    /// exists is durable: `make_ready` and `recover` sync the ones that a
+    /// stopped process can leave.
     fn create_dir(&self, dir: &str) -> Result<()> {
         if !self.dir.exists(dir)? {
             self.dir.create_dir(dir)?;
@@ -243,10 +279,9 @@ impl BlobStore {
             let dir = oid_dir(oid);
             // Each level of the oid directory is durable before the next
             // one is created.
-            for (end, _) in dir.match_indices('/').skip(1) {
-                self.create_dir(&dir[..end])?;
+            for level in oid_levels(oid) {
+                self.create_dir(&level)?;
             }
-            self.create_dir(&dir)?;
             let temp = blob.temp.as_deref().expect("a blob is placed once");
             self.dir.set_read_only(temp)?;
             self.dir.rename(temp, &blob_name(oid, tid))?;
@@ -289,6 +324,16 @@ impl BlobStore {
     pub(crate) fn path(&self, oid: Oid, tid: Tid) -> PathBuf {
         self.dir.path(&blob_name(oid, tid))
     }
+}
+
+/// Return the 8 levels of the directory of `oid`, from the top down:
+/// `blobs/0xAA`, `blobs/0xAA/0xBB`, and so on to `oid_dir(oid)`.
+fn oid_levels(oid: Oid) -> Vec<String> {
+    let dir = oid_dir(oid);
+    let ends = dir.match_indices('/').skip(1).map(|(end, _)| end);
+    ends.chain([dir.len()])
+        .map(|end| dir[..end].to_owned())
+        .collect()
 }
 
 /// Tell if `backend` has the blob record of `oid` at `tid`. A damaged blob
@@ -571,40 +616,53 @@ mod tests {
 
     #[test]
     fn opening_removes_only_the_blob_files_without_a_record() {
-        let vfs = MemVfs::new();
-        let (committed, orphan, tid) = {
-            let store = Store::open_vfs(vfs.clone()).unwrap();
-            let committed = store.new_oid().unwrap();
-            let orphan = store.new_oid().unwrap();
-            let tid = commit_blobs(&store, &[committed], b"kept");
-            (committed, orphan, tid)
-        };
+        let (vfs, leftovers) = leftovers_of_a_crash();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        assert!(!Vfs::exists(&vfs, &leftovers.orphan).unwrap());
+        assert_eq!(read(&store, leftovers.oid, leftovers.tid).unwrap(), b"kept");
+        assert!(temp_files(&vfs).is_empty());
+    }
 
-        // A finish that placed its blob files and crashed before its
-        // backend commit, the intent of a finish that committed, and a
-        // temporary file.
+    /// What `leftovers_of_a_crash` leaves.
+    struct Leftovers {
+        /// An oid with a committed blob that holds `kept`.
+        oid: Oid,
+        /// The tid of that blob.
+        tid: Tid,
+        /// The name of a blob file that has no blob record.
+        orphan: String,
+    }
+
+    /// Return a store with a committed blob, and the leftovers of a crash:
+    /// a blob file that a finish placed before its backend commit, with
+    /// its intent file, the intent file of a finish that committed, and a
+    /// temporary file.
+    fn leftovers_of_a_crash() -> (MemVfs, Leftovers) {
+        let vfs = MemVfs::new();
+        let (oid, orphan, tid) = {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let oid = store.new_oid().unwrap();
+            let orphan = store.new_oid().unwrap();
+            let tid = commit_blobs(&store, &[oid], b"kept");
+            (oid, orphan, tid)
+        };
         let crashed = Tid(tid.0 + 1);
-        let dir = oid_dir(orphan);
-        let ends = dir.match_indices('/').map(|(end, _)| end);
-        for end in ends.chain([dir.len()]) {
-            if !Vfs::exists(&vfs, &dir[..end]).unwrap() {
-                Vfs::create_dir(&vfs, &dir[..end]).unwrap();
+        for level in oid_levels(orphan) {
+            if !Vfs::exists(&vfs, &level).unwrap() {
+                Vfs::create_dir(&vfs, &level).unwrap();
             }
         }
         for (name, bytes) in [
             (blob_name(orphan, crashed), b"orphan".to_vec()),
             (intent_name(crashed), encode_intent(crashed, &[orphan])),
-            (intent_name(tid), encode_intent(tid, &[committed])),
+            (intent_name(tid), encode_intent(tid, &[oid])),
             (format!("{TMP_DIR}/7.tmp"), b"temporary".to_vec()),
         ] {
             let mut file = Vfs::create_file(&vfs, &name).unwrap();
             file.write_all(&bytes).unwrap();
         }
-
-        let store = Store::open_vfs(vfs.clone()).unwrap();
-        assert!(!Vfs::exists(&vfs, &blob_name(orphan, crashed)).unwrap());
-        assert_eq!(read(&store, committed, tid).unwrap(), b"kept");
-        assert!(temp_files(&vfs).is_empty());
+        let orphan = blob_name(orphan, crashed);
+        (vfs, Leftovers { oid, tid, orphan })
     }
 
     #[test]
@@ -664,6 +722,108 @@ mod tests {
             })
             .count();
         assert!(orphans > 0);
+    }
+
+    /// Return a filesystem with an empty store, all durable.
+    fn empty_store() -> MemVfs {
+        let vfs = MemVfs::new();
+        drop(Store::open_vfs(vfs.clone()).unwrap());
+        vfs.settled()
+    }
+
+    /// Open each crash image of `vfs`. A blob record must have its file,
+    /// and each image after the mark `acknowledged` must have the blob
+    /// `bytes` of `oid` at `tid`.
+    fn check_images(vfs: &MemVfs, oid: Oid, tid: Tid, bytes: &[u8]) {
+        for image in vfs.crash_images() {
+            let store = Store::open_vfs(image.vfs())
+                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            match store.load(oid) {
+                Ok((_, found)) => {
+                    assert_eq!(found, tid, "{image:?}");
+                    let mut read = Vec::new();
+                    let result = store
+                        .open_blob(oid, tid)
+                        .and_then(|mut blob| Ok(blob.read_to_end(&mut read)?));
+                    assert!(result.is_ok(), "{image:?} lost a blob file: {result:?}");
+                    assert_eq!(read, bytes, "{image:?}");
+                }
+                Err(ZoeError::NotFound { .. }) => {
+                    assert!(!image.is_after("acknowledged"), "{image:?} lost a blob");
+                }
+                Err(e) => panic!("{image:?}: {e}"),
+            }
+        }
+    }
+
+    /// A process dies after it creates `blobs/` and before it syncs the
+    /// store directory. The next process finds `blobs/` and must still
+    /// make it durable.
+    #[test]
+    fn a_blob_directory_of_a_killed_process_becomes_durable() {
+        let vfs = empty_store();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        vfs.kill_at_dir_sync("");
+        assert!(store.new_blob_file().is_err());
+        // A killed process runs no destructor.
+        std::mem::forget(store);
+        vfs.restart();
+        assert!(Vfs::exists(&vfs, BLOB_DIR).unwrap());
+
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let tid = commit_blobs(&store, &[oid], b"blob");
+        vfs.mark("acknowledged");
+        drop(store);
+        check_images(&vfs, oid, tid, b"blob");
+    }
+
+    /// A finish dies after it creates the second level of an oid
+    /// directory and before it syncs the first level. The next process
+    /// finds the level and must still make it durable.
+    #[test]
+    fn an_oid_directory_of_a_killed_finish_becomes_durable() {
+        let vfs = empty_store();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"lost"))
+            .unwrap();
+        txn.vote().unwrap();
+        vfs.kill_at_dir_sync(&oid_levels(oid)[0]);
+        assert!(txn.finish().is_err());
+        std::mem::forget(store);
+        vfs.restart();
+        assert!(Vfs::exists(&vfs, &oid_levels(oid)[1]).unwrap());
+
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let tid = commit_blobs(&store, &[oid], b"blob");
+        vfs.mark("acknowledged");
+        drop(store);
+        check_images(&vfs, oid, tid, b"blob");
+    }
+
+    /// A crash while an open removes an orphan must leave its intent file
+    /// while the orphan is there. Then the next open removes the orphan.
+    #[test]
+    fn a_crash_during_recovery_leaves_no_orphan_behind() {
+        let (vfs, leftovers) = leftovers_of_a_crash();
+        // The leftovers are on disk when the recovery starts.
+        let vfs = vfs.settled();
+        drop(Store::open_vfs(vfs.clone()).unwrap());
+
+        let images = vfs.crash_images();
+        assert!(images.len() > 1);
+        for image in images {
+            let image_vfs = image.vfs();
+            let store = Store::open_vfs(image_vfs.clone()).unwrap();
+            let kept = read(&store, leftovers.oid, leftovers.tid);
+            assert_eq!(kept.ok().as_deref(), Some(&b"kept"[..]), "{image:?}");
+            assert!(
+                !Vfs::exists(&image_vfs, &leftovers.orphan).unwrap(),
+                "{image:?} kept an orphan"
+            );
+        }
     }
 
     #[test]

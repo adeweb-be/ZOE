@@ -321,6 +321,17 @@ enum Op {
     },
 }
 
+/// The state of the process that uses a `MemVfs`.
+#[derive(Debug, Default)]
+enum Process {
+    #[default]
+    Alive,
+    /// The process dies at the next sync of this directory.
+    KillAtDirSync(String),
+    /// The process is dead. Every operation fails.
+    Dead,
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// The files when the record starts.
@@ -334,9 +345,32 @@ struct State {
     dirs: BTreeSet<String>,
     /// Every operation since the record started, in order.
     log: Vec<Op>,
+    process: Process,
 }
 
 impl State {
+    /// Return an error when the process is dead.
+    fn alive(&self) -> io::Result<()> {
+        match self.process {
+            Process::Dead => Err(io::Error::other("the process was killed")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record the sync of the directory `dir`, or kill the process when
+    /// it dies at this sync.
+    fn sync_dir(&mut self, dir: &str) -> io::Result<()> {
+        self.alive()?;
+        if matches!(&self.process, Process::KillAtDirSync(at) if at == dir) {
+            self.process = Process::Dead;
+            return Err(io::Error::other("the process was killed"));
+        }
+        self.log.push(Op::SyncDir {
+            dir: dir.to_owned(),
+        });
+        Ok(())
+    }
+
     fn has_dir(&self, dir: &str) -> bool {
         dir.is_empty() || self.dirs.contains(dir)
     }
@@ -377,6 +411,7 @@ impl MemVfs {
             files,
             dirs,
             log: Vec::new(),
+            process: Process::Alive,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -406,6 +441,29 @@ impl MemVfs {
     /// Return the names of the files, in order.
     pub fn names(&self) -> Vec<String> {
         self.lock().files.keys().cloned().collect()
+    }
+
+    /// Kill the process at the next sync of the directory `dir`, as
+    /// `kill -9` does. That sync and every later operation fail and are
+    /// not recorded. The files keep every earlier operation, synced or
+    /// not, as the page cache of the system does.
+    pub fn kill_at_dir_sync(&self, dir: &str) {
+        self.lock().process = Process::KillAtDirSync(dir.to_owned());
+    }
+
+    /// Start a new process on the files of a killed one. The record goes
+    /// on, so an operation that the killed process did not sync stays
+    /// pending in the crash images.
+    pub fn restart(&self) {
+        self.lock().process = Process::Alive;
+    }
+
+    /// Return a filesystem with the files and the directories of this one,
+    /// all durable, and an empty record.
+    #[cfg(test)]
+    pub(crate) fn settled(&self) -> MemVfs {
+        let state = self.lock();
+        MemVfs::with_tree(state.files.clone(), state.dirs.clone())
     }
 
     /// Record a named point. `CrashImage::is_after` tells if a crash came
@@ -506,6 +564,7 @@ impl MemVfs {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let mut state = self.lock();
+        state.alive()?;
         state.check_parent(to)?;
         let bytes = state.files.remove(from).ok_or_else(|| not_found(from))?;
         state.files.insert(to.to_owned(), bytes);
@@ -518,6 +577,7 @@ impl MemVfs {
 
     fn remove(&self, name: &str) -> io::Result<()> {
         let mut state = self.lock();
+        state.alive()?;
         state.files.remove(name).ok_or_else(|| not_found(name))?;
         state.log.push(Op::Remove {
             file: name.to_owned(),
@@ -525,8 +585,10 @@ impl MemVfs {
         Ok(())
     }
 
+    #[cfg(test)]
     fn sync_dir(&self) {
-        self.lock().log.push(Op::SyncDir { dir: String::new() });
+        // The tests that call this kill no process.
+        let _ = self.lock().sync_dir("");
     }
 
     fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
@@ -534,14 +596,12 @@ impl MemVfs {
         if !state.has_dir(dir) {
             return Err(not_found(dir));
         }
-        state.log.push(Op::SyncDir {
-            dir: dir.to_owned(),
-        });
-        Ok(())
+        state.sync_dir(dir)
     }
 
     fn create_dir(&self, name: &str) -> io::Result<()> {
         let mut state = self.lock();
+        state.alive()?;
         if state.files.contains_key(name) || state.has_dir(name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -558,6 +618,7 @@ impl MemVfs {
 
     fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
         let state = self.lock();
+        state.alive()?;
         if !state.has_dir(dir) {
             return Err(not_found(dir));
         }
@@ -573,6 +634,7 @@ impl MemVfs {
 
     fn create_file(&self, name: &str) -> io::Result<MemWriteFile> {
         let mut state = self.lock();
+        state.alive()?;
         if state.files.contains_key(name) || state.has_dir(name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -592,7 +654,9 @@ impl MemVfs {
     }
 
     fn read_file(&self, name: &str) -> io::Result<MemReadFile> {
-        if !self.lock().files.contains_key(name) {
+        let state = self.lock();
+        state.alive()?;
+        if !state.files.contains_key(name) {
             return Err(not_found(name));
         }
         Ok(MemReadFile {
@@ -607,10 +671,12 @@ impl Vfs for MemVfs {
     type File = MemFile;
 
     fn exists(&self, name: &str) -> io::Result<bool> {
+        self.lock().alive()?;
         Ok(MemVfs::exists(self, name))
     }
 
     fn open(&self, name: &str) -> io::Result<Self::File> {
+        self.lock().alive()?;
         Ok(self.file(name))
     }
 
@@ -623,8 +689,7 @@ impl Vfs for MemVfs {
     }
 
     fn sync_dir(&self) -> io::Result<()> {
-        MemVfs::sync_dir(self);
-        Ok(())
+        self.lock().sync_dir("")
     }
 
     fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
@@ -650,7 +715,9 @@ impl Vfs for MemVfs {
     /// The simulation keeps no permissions, so this only checks that the
     /// file exists.
     fn set_read_only(&self, name: &str) -> io::Result<()> {
-        if self.lock().files.contains_key(name) {
+        let state = self.lock();
+        state.alive()?;
+        if state.files.contains_key(name) {
             Ok(())
         } else {
             Err(not_found(name))
@@ -784,11 +851,13 @@ pub struct MemFile {
 impl redb::StorageBackend for MemFile {
     fn len(&self) -> io::Result<u64> {
         let state = self.vfs.lock();
+        state.alive()?;
         Ok(state.files.get(&self.name).map_or(0, |f| f.len() as u64))
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         let state = self.vfs.lock();
+        state.alive()?;
         let empty = Vec::new();
         let bytes = state.files.get(&self.name).unwrap_or(&empty);
         let start = to_usize(offset);
@@ -805,6 +874,7 @@ impl redb::StorageBackend for MemFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.vfs.lock();
+        state.alive()?;
         state
             .files
             .entry(self.name.clone())
@@ -818,7 +888,9 @@ impl redb::StorageBackend for MemFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        self.vfs.lock().log.push(Op::Sync {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        state.log.push(Op::Sync {
             file: self.name.clone(),
         });
         Ok(())
@@ -826,6 +898,7 @@ impl redb::StorageBackend for MemFile {
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.vfs.lock();
+        state.alive()?;
         write_at(
             state.files.entry(self.name.clone()).or_default(),
             offset,
@@ -852,6 +925,7 @@ struct MemWriteFile {
 impl Write for MemWriteFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut state = self.vfs.lock();
+        state.alive()?;
         let bytes = state
             .files
             .get_mut(&self.name)
@@ -873,7 +947,9 @@ impl Write for MemWriteFile {
 
 impl WriteFile for MemWriteFile {
     fn sync(&mut self) -> io::Result<()> {
-        self.vfs.lock().log.push(Op::Sync {
+        let mut state = self.vfs.lock();
+        state.alive()?;
+        state.log.push(Op::Sync {
             file: self.name.clone(),
         });
         Ok(())
@@ -891,6 +967,7 @@ struct MemReadFile {
 impl Read for MemReadFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let state = self.vfs.lock();
+        state.alive()?;
         let bytes = state
             .files
             .get(&self.name)
