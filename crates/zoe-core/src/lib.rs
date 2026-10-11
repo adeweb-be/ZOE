@@ -7,6 +7,7 @@
 //! owns bytes, behind the [`Backend`] trait.
 
 mod backend;
+mod blob;
 mod clock;
 mod commit;
 mod error;
@@ -19,9 +20,10 @@ mod types;
 pub mod vfs;
 
 pub use backend::{
-    Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
-    WriteTxn,
+    Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
+    TxnStatus, WriteTxn,
 };
+pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, timestamp};
 pub use commit::{Finished, Txn};
 pub use error::{Result, ZoeError};

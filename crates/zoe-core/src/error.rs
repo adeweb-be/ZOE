@@ -25,6 +25,16 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// A blob file does not match the size and the BLAKE3 hash in its blob
+    /// record, or the file is missing, or the blob record is damaged.
+    #[error("corrupt blob: oid {oid:?}, tid {tid:?}")]
+    CorruptBlob {
+        /// The object id of the blob.
+        oid: Oid,
+        /// The transaction id of the blob.
+        tid: Tid,
+    },
+
     /// The checksum of a transaction row does not match its bytes, or its
     /// payload does not decode, or a record has no transaction row, or the
     /// records of a transaction do not match the oid count of its row.
@@ -69,8 +79,8 @@ pub enum ZoeError {
     Protocol(&'static str),
 
     /// A thread that did not begin the transaction called `store`,
-    /// `restore`, `check_current_serial` or `vote`. The transaction refuses
-    /// the call and does not change.
+    /// `store_blob`, `restore`, `check_current_serial` or `vote`. The
+    /// transaction refuses the call and does not change.
     #[error("the call came from a thread that did not begin the transaction")]
     WrongThread,
 
@@ -95,7 +105,8 @@ pub enum ZoeError {
     )]
     NotClosedCleanly,
 
-    /// The store is closed. A transaction iterator outlived its store.
+    /// The store is closed. A transaction iterator or a blob file outlived
+    /// its store.
     #[error("the store is closed")]
     Closed,
 

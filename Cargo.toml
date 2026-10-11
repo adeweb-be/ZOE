@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 zoe-core = { path = "crates/zoe-core" }
 zoe-pickle = { path = "crates/zoe-pickle" }
+blake3 = "1.8"
 pyo3 = "0.29"
 redb = "4.3"
 serde = { version = "1", features = ["derive"] }

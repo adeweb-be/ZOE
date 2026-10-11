@@ -89,6 +89,7 @@ impl Failure {
             | ZoeError::NotClosedCleanly => message(storage_error(py), &self.error),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
+            | ZoeError::CorruptBlob { .. }
             | ZoeError::CorruptTxn { .. }
             | ZoeError::Backend(_) => message(storage_system_error(py), &self.error),
         }

@@ -28,6 +28,16 @@ pub struct Record {
     pub data: Bytes,
 }
 
+/// The blob record of one blob file: a row of the `blobs` key space. The
+/// file itself is in the blob store, at the path of its `(oid, tid)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobRecord {
+    /// The BLAKE3 hash of the bytes of the blob file.
+    pub hash: [u8; 32],
+    /// The size of the blob file in bytes.
+    pub size: u64,
+}
+
 /// The metadata of one version of one object, for `history`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordMeta {
@@ -99,6 +109,9 @@ pub trait Backend: Send + Sync {
     /// Return how the record that `tid` wrote for `oid` is stored.
     fn record_info(&self, oid: Oid, tid: Tid) -> Result<Option<RecordEncoding>>;
 
+    /// Return the blob record that `tid` wrote for `oid`.
+    fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>>;
+
     /// Return the tid of the last committed transaction.
     fn last_tid(&self) -> Tid;
 
@@ -132,12 +145,15 @@ pub trait Backend: Send + Sync {
     fn sync(&self) -> Result<()>;
 }
 
-/// One backend write transaction. It holds the records, the transaction
-/// row and the meta update of one commit.
+/// One backend write transaction. It holds the records, the blob records,
+/// the transaction row and the meta update of one commit.
 pub trait WriteTxn {
     /// Stage the version of `oid` that `tid` writes. `prev` is the serial
     /// of the previous version.
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
+
+    /// Stage the blob record of the version of `oid` that `tid` writes.
+    fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
 
     /// Stage the transaction row.
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
@@ -161,6 +177,10 @@ mod tests {
             Ok(())
         }
 
+        fn put_blob(&mut self, _: Oid, _: Tid, _: &BlobRecord) -> Result<()> {
+            Ok(())
+        }
+
         fn put_txn(&mut self, _: &TxnMeta) -> Result<()> {
             Ok(())
         }
@@ -180,6 +200,10 @@ mod tests {
         }
 
         fn record_info(&self, _: Oid, _: Tid) -> Result<Option<RecordEncoding>> {
+            Ok(None)
+        }
+
+        fn load_blob(&self, _: Oid, _: Tid) -> Result<Option<BlobRecord>> {
             Ok(None)
         }
 

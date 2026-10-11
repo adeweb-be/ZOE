@@ -32,6 +32,7 @@
   - [0020. The record frame](adr/0020-record-frame.md)
   - [0021. Interactive sessions instead of automated loops](adr/0021-interactive-sessions.md)
   - [0022. Red zones: the on-disk format, pack and the process files](adr/0022-narrow-red-zones.md)
+  - [0023. The blob record](adr/0023-blob-record.md)
 
 # Reference
 

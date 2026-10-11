@@ -1,13 +1,14 @@
 //! A ZOE store: the entry point of the core.
 
-use std::any::Any;
+use std::io;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::backend::{Backend, RecordEncoding};
+use crate::backend::{Backend, BlobRecord, RecordEncoding};
+use crate::blob::{self, BlobFile, BlobReader, BlobStore};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
@@ -53,14 +54,15 @@ impl Default for Options {
     }
 }
 
-/// The open database of a store and the directory that holds its lock.
+/// The open database of a store and its blob store. The blob store owns
+/// the directory, and the directory holds the lock of the store.
 ///
 /// The fields drop in the order of their declaration. So the database
 /// closes, and writes its last bytes, before the directory releases the
 /// lock.
 pub(crate) struct Opened {
     backend: Box<dyn Backend>,
-    _dir: Box<dyn Any + Send + Sync>,
+    pub(crate) blobs: BlobStore,
 }
 
 impl Deref for Opened {
@@ -73,8 +75,9 @@ impl Deref for Opened {
 
 /// An open store.
 pub struct Store {
-    /// The database and the directory. A transaction iterator holds only a
-    /// weak reference, so dropping the `Store` closes the store.
+    /// The database, the blob store and the directory. A transaction
+    /// iterator and a blob file hold only a weak reference, so dropping
+    /// the `Store` closes the store.
     pub(crate) backend: Arc<Opened>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
@@ -170,18 +173,22 @@ impl Store {
     /// lock.
     fn assemble(
         backend: RedbBackend,
-        dir: Box<dyn Any + Send + Sync>,
+        dir: Box<dyn blob::BlobDir>,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
     ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
+        let opened = Arc::new(Opened {
+            backend: Box::new(backend),
+            blobs: BlobStore::new(dir),
+        });
+        // `Opened` holds the database and the directory here, so an error
+        // drops them in order: the database closes before the lock goes.
+        opened.blobs.open(&**opened, read_only)?;
         Ok(Self {
-            backend: Arc::new(Opened {
-                backend: Box::new(backend),
-                _dir: dir,
-            }),
+            backend: opened,
             clock,
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
@@ -271,6 +278,57 @@ impl Store {
         self.locks.is_empty()
     }
 
+    /// Return a new, empty blob file. Write the blob into it, then give it
+    /// to `Txn::store_blob`. Dropping a file that no transaction took
+    /// removes it. A read-only store fails with `ReadOnly` and creates
+    /// nothing.
+    pub fn new_blob_file(&self) -> Result<BlobFile> {
+        self.writable()?;
+        self.blobs().new_file(Arc::downgrade(&self.backend))
+    }
+
+    /// Open the blob that `tid` wrote for `oid`.
+    ///
+    /// The reader checks the size and the BLAKE3 hash of the blob when it
+    /// reaches the end of the file. A mismatch fails that read with
+    /// `InvalidData`. A missing file is `CorruptBlob`.
+    pub fn open_blob(&self, oid: Oid, tid: Tid) -> Result<BlobReader> {
+        let record = self.blob_record(oid, tid)?;
+        self.blobs().reader(oid, tid, record)
+    }
+
+    /// Read the whole blob that `tid` wrote for `oid`, and check its size
+    /// and its BLAKE3 hash. A mismatch is `CorruptBlob`.
+    pub fn verify_blob(&self, oid: Oid, tid: Tid) -> Result<()> {
+        let mut reader = self.open_blob(oid, tid)?;
+        match io::copy(&mut reader, &mut io::sink()) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                Err(ZoeError::CorruptBlob { oid, tid })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Return the path of the blob file that `tid` wrote for `oid`. The
+    /// file is read-only. A read through the path checks no hash.
+    pub fn blob_path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
+        self.blob_record(oid, tid)?;
+        Ok(self.blobs().path(oid, tid))
+    }
+
+    /// Return the blob store.
+    pub(crate) fn blobs(&self) -> &BlobStore {
+        &self.backend.blobs
+    }
+
+    /// Return the blob record that `tid` wrote for `oid`, or `NotFound`.
+    fn blob_record(&self, oid: Oid, tid: Tid) -> Result<BlobRecord> {
+        self.backend
+            .load_blob(oid, tid)?
+            .ok_or(ZoeError::NotFound { oid })
+    }
+
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -291,7 +349,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::backend::{BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
     use crate::format;
     use crate::format::Codec;
     use crate::vfs::LOCK;
@@ -342,6 +400,10 @@ mod tests {
             self.inner.record_info(oid, tid)
         }
 
+        fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
+            self.inner.load_blob(oid, tid)
+        }
+
         fn last_tid(&self) -> Tid {
             self.inner.last_tid()
         }
@@ -389,14 +451,15 @@ mod tests {
     fn faulty_store() -> (Store, Arc<Faults>) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
-        // The inner store keeps the directory.
+        // The inner store keeps the directory. The tests of this store use
+        // no blob, so its blob store has an empty directory of its own.
         let faulty = Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
         };
         let backend = Arc::new(Opened {
             backend: Box::new(faulty),
-            _dir: Box::new(()),
+            blobs: BlobStore::new(Box::new(MemVfs::new())),
         });
         (Store { backend, ..store }, faults)
     }
