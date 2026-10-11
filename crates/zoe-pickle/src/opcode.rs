@@ -96,8 +96,9 @@ pub fn memo_puts(bytes: &[u8]) -> Vec<u32> {
 
 /// Returns the length of the argument of an opcode, read from `rest`, the
 /// bytes after the opcode. Returns `None` if the bytes end too early or if
-/// the decoder does not know the opcode.
-fn argument_len(opcode: u8, rest: &[u8]) -> Option<usize> {
+/// the decoder does not know the opcode. PROTO and STOP are not in the
+/// list: they come only at the start and at the end of a pickle.
+pub(crate) fn argument_len(opcode: u8, rest: &[u8]) -> Option<usize> {
     let line = |rest: &[u8]| rest.iter().position(|byte| *byte == b'\n').map(|n| n + 1);
     let len = match opcode {
         BININT1 | BINPUT | BINGET | EXT1 => 1,
