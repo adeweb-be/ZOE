@@ -57,11 +57,13 @@ The stress test passing does not prove the pickle cache safe: it did not hit the
 
 ## The contract that stays a contract
 
-These are safe only under ZODB's rule that one thread at a time uses a Connection with its objects, cache and ring. The audit documents the rule and adds no lock to them, because the ring update on attribute access is the hottest path in Plone:
+These are safe only under ZODB's rule that one thread at a time uses a Connection with its objects, cache and ring. The audit documents the rule and adds no lock to them:
 
-- the LRU ring, the per-object state flags and the cache counters of `persistent`;
+- the per-object state flags of `persistent` and the instance dicts of its objects;
 - buckets, sets, nodes and iterators of `BTrees`, persistent or not, which a thread uses one at a time;
 - each Pickler and Unpickler of `zodbpickle`, which one thread uses at a time.
+
+The LRU ring and the cache counters of `persistent` were on this list. The audit proposed to leave the ring update on attribute access, the hottest path in Plone, without a lock. The build showed that a sweep from another thread corrupts the ring then, so the fork locks it (see the status below).
 
 ## The other packages that turn the GIL back on
 
@@ -90,14 +92,35 @@ The patches go upstream to zopefoundation as draft pull requests from the forks 
 
 ## Status of the patches
 
-The fixes above are written on the `free-threading` branch of each fork, with the declaration, except the pickle-cache rework:
+Every fix above is written on the `free-threading` branch of each fork, with the declaration:
 
-- `adeweb-be/persistent`: the interned strings and the `TimeStamp` import at module init, `PyType_Ready(TimeStamp_type)`, `PyDict_GetItemRef` in `pickle_slotnames`, and no `Py_DECREF` of the borrowed reference in `cc_new_ghost`, with a test that fails before the fix.
+- `adeweb-be/persistent`: the interned strings and the `TimeStamp` import at module init, `PyType_Ready(TimeStamp_type)`, `PyDict_GetItemRef` in `pickle_slotnames`, no `Py_DECREF` of the borrowed reference in `cc_new_ghost`, and the pickle-cache rework below. The declaration applies to CPython 3.14 and later only; 3.13t keeps the GIL.
 - `adeweb-be/BTrees`: `set_repr` without a static, and `PyType_Ready` for the items and iterator types.
 - `adeweb-be/zodbpickle`: the lazy statics created at module init, `PyDict_GetItemRef` on the copyreg dicts, `whichmodule` over a copy of `sys.modules`, and `find_class` through `PyImport_GetModule`.
 
-With the GIL off on 3.14t, and on 3.12 and 3.14, the suites pass: persistent 772 tests (778 with the GIL), BTrees 13,721 and zodbpickle 432, with no failures or errors. The acceptance test and the pool stress test pass with the GIL off.
+### The pickle-cache rework
 
-One persistent suite fails with the GIL off: `test_threading.py` segfaults on 3.14t in most runs. Eight threads call `full_sweep`, `minimize` or `incrgc` on one `PickleCache`, whose ring and dict of uncounted references have no locking. Upstream master crashes in the same way under `PYTHON_GIL=0`. This is the blocking pickle-cache rework above. Until it exists, the declaration in persistent makes its own 3.14t suite crash.
+- On the free-threaded build, a critical section per cache protects the dict, the ring and the counters in every cache method, in the sweeps, in `ghostify`, `unghostify`, `accessed` (the attribute path) and `Per_dealloc`. On the GIL builds the macros are empty and the generated code of the hot paths does not change.
+- The cache dict holds a small entry object per persistent object, not the object itself, because `PyDict_GetItem` on 3.14t takes and drops a reference on the value and so frees a dying object twice. Insertion calls `PyUnstable_EnableTryIncRef`; a lookup calls `PyUnstable_TryIncRef` and treats a failure as a miss. `Per_dealloc` removes the entry only if it points to the object being freed, so a newer object with the same oid stays.
+- Three variants were measured. Locking only the cache methods and the sweeps crashes persistent's own `test_threading` (7 runs in 10). Adding `unghostify` passes the upstream tests, but a sweep from another thread while a thread reads attributes of other objects of the same cache corrupts the ring (10 crashes in 10). The human chose the third variant, which also locks `accessed`.
+
+| Operation, ns | 3.14, unpatched | 3.14, patched | 3.14t, unpatched (unsafe) | 3.14t, patched |
+| --- | --- | --- | --- | --- |
+| attribute access, loaded object | 25.3 | 26.2 | 36.7 | 42.8 |
+| `get`, hit | 58.7 | 58.2 | 69.6 | 77.3 |
+| `new_ghost` | 170.7 | 173.9 | 203 | 222 |
+| ghost created then freed | 249 | 251 | 312 | 349 |
+| deactivate and activate | 348 | 351 | 435 | 499 |
+
+The 3.14 differences are noise: the code of the attribute path and of `get` is the same.
+
+With the GIL off on 3.14t, and on 3.12 and 3.14, the suites pass: persistent 783 tests, BTrees 13,721, zodbpickle 432, and ZODB 1,600 with one error that is not about persistent (`testdocumentation` needs a ZODB source checkout). `test_threading.py` passes 50 runs in a row with the GIL off and 50 with `PYTHON_GIL` unset; upstream master crashes in it on 3.14t. The acceptance test and the pool stress test pass with the GIL off.
+
+### Limits that stay
+
+- A sweep from another thread of a Connection in use (for example `DB.cacheMinimize()` while requests run) keeps the ring consistent but is still not supported: the thread that uses the Connection can get spurious `AttributeError`s or a `SystemError` from `unghostify`, and it can read an instance dict that the sweep frees. CPython delays the free of a managed dict for lock-free readers through private API only.
+- While the `__del__` of a cached object runs, lookups in other threads miss it. If `__del__` keeps the object alive, another object may have taken its oid meanwhile.
+- Two suspicions from the review are not reproduced: two threads that deactivate the same object can each build a dict over the same inline values, and the free-threaded GC can let a lookup succeed on a dead ghost in a short window before it clears it.
+- `persistent` cannot be installed on 3.13t, because cffi refuses that build.
 
 The human decided to keep the branches on the forks and to open no pull request upstream for now.
