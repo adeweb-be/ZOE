@@ -1,0 +1,29 @@
+[package]
+name = "loupe"
+description = "Loupe, the desktop inspector of ZOE stores."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+# Loupe is a workspace of its own. It links WebKitGTK, and the tests and
+# lints of the main workspace must build without it.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "~2.6", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "~2.11", features = [] }
+tauri-plugin-dialog = "~2.7"
+zoe-core = { path = "../../../crates/zoe-core" }
+zoe-loupe = { path = "../../../crates/zoe-loupe" }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

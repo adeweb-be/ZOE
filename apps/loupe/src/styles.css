@@ -1,0 +1,199 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1d2330;
+  --muted: #5d6677;
+  --line: #d9dde5;
+  --panel: #f5f6f8;
+  --accent: #2a5aa0;
+  --selected: #dce7f7;
+  --error: #a3261b;
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16191f;
+    --fg: #e3e6ec;
+    --muted: #9aa3b2;
+    --line: #2d333d;
+    --panel: #1d2128;
+    --accent: #7fa8e6;
+    --selected: #24344d;
+    --error: #f08a7e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.folder {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.folder h1 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.folder form,
+.folder label,
+.path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.folder input {
+  width: 36em;
+  max-width: 60vw;
+}
+
+input,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input {
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.status,
+.empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.empty {
+  padding: 24px 12px;
+}
+
+.error {
+  margin: 8px 12px;
+  color: var(--error);
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(260px, 35%) 1fr;
+  flex: 1;
+  min-height: 0;
+}
+
+.tree {
+  overflow: auto;
+  border-right: 1px solid var(--line);
+}
+
+.row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.row.selected {
+  background: var(--selected);
+}
+
+.row button,
+.references button {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  text-align: left;
+}
+
+.toggle {
+  width: 20px;
+  font-family: ui-monospace, monospace;
+}
+
+.label,
+.references button {
+  display: flex;
+  gap: 8px;
+}
+
+.at {
+  font-family: ui-monospace, monospace;
+}
+
+.class,
+.oid {
+  color: var(--muted);
+}
+
+.pane {
+  overflow: auto;
+  padding: 12px;
+}
+
+.path input {
+  flex: 1;
+  font-family: ui-monospace, monospace;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+}
+
+.pane h2 {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+
+.state {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  overflow: auto;
+  max-height: 50vh;
+}
+
+.references {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
