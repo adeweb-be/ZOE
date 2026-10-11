@@ -229,7 +229,7 @@ The core is a synchronous Rust library, `zoe-core`, with no Python and no tokio 
 
 `loadBefore(oid, tid)` is a reverse range scan from `(oid, tid - 1)`; `load(oid)` is `loadBefore(oid, MAX)`; `loadSerial` is a point read. This is the RelStorage history-preserving layout, which is what makes MVCC and `history()` free.
 
-**Tids.** A tid is ZODB's 8-byte `TimeStamp`, strictly increasing. The core allocates it at `tpc_finish` under the commit sequencer: `max(now, last_tid + 1 tick)`. Clients may pass a tid only through `restore` (copy and replication paths), never through normal commits: `tpc_begin` with a tid starts a restore transaction, and its `tpc_finish` commits under that tid. The tid must be after the last tid, both at `tpc_begin` and at `tpc_finish`; otherwise the call is refused. In Tier 3 the sequencer is one key updated inside the backend transaction (or an FDB versionstamp).
+**Tids.** A tid is ZODB's 8-byte `TimeStamp`, strictly increasing. The core allocates it at `tpc_finish` under the commit sequencer: `max(now, last_tid + 1 tick)`. Clients may pass a tid only through `restore` (copy and replication paths), never through normal commits: `tpc_begin` with a tid starts a restore transaction, and its `tpc_finish` commits under that tid. The tid must be after the last tid, both at `tpc_begin` and at `tpc_finish`, and `MAX` is refused; otherwise the call is refused, and a refusal at `tpc_finish` does not halt the store. A normal commit never gets `MAX`; when no tid below it is left, `tpc_finish` is refused. In Tier 3 the sequencer is one key updated inside the backend transaction (or an FDB versionstamp).
 
 **Two-phase commit, per transaction**
 
