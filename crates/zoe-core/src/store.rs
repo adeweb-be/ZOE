@@ -203,16 +203,14 @@ impl Store {
         let opened = Arc::new(Opened {
             backend: Box::new(backend),
             blobs: BlobStore::new(Box::new(Arc::clone(&dir))),
-            staging: StagingArea::new(Box::new(dir), options.staging_memory),
+            staging: StagingArea::new(Box::new(dir), options.staging_memory, read_only),
         });
         // `Opened` holds the database and the directory here, so an error
         // drops them in order: the database closes before the lock goes.
         opened.blobs.open(&**opened, read_only)?;
-        // A read-only open changes nothing in the directory, and a read-only
-        // store stages nothing.
-        if !read_only {
-            opened.staging.open()?;
-        }
+        // The staging area of a read-only store removes no leftover and
+        // creates no spill file.
+        opened.staging.open()?;
         Ok(Self {
             backend: opened,
             clock,
@@ -502,7 +500,7 @@ mod tests {
         let backend = Arc::new(Opened {
             backend: Box::new(faulty),
             blobs: BlobStore::new(Box::new(MemVfs::new())),
-            staging: StagingArea::new(Box::new(MemVfs::new()), 0),
+            staging: StagingArea::new(Box::new(MemVfs::new()), 0, false),
         });
         (Store { backend, ..store }, faults)
     }

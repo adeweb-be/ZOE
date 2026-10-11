@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redb::StorageBackend;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::error::Result;
+use crate::error::{Result, ZoeError};
 use crate::types::{Oid, Tid};
 use crate::vfs::Vfs;
 
@@ -73,6 +73,9 @@ pub(crate) struct StagingArea {
     /// The most bytes of staged pickles that a transaction keeps in
     /// memory.
     memory: usize,
+    /// True when the store is open for reads only. Then the area writes
+    /// nothing.
+    read_only: bool,
     /// Tells if `staging/` exists.
     ready: Mutex<bool>,
     /// The number of the next spill file.
@@ -81,23 +84,29 @@ pub(crate) struct StagingArea {
 
 impl StagingArea {
     /// Return the staging area of the store directory `dir`. Each
-    /// transaction keeps at most `memory` bytes of pickles in memory. This
-    /// reads nothing: `open` checks the directory.
-    pub(crate) fn new(dir: Box<dyn StagingDir>, memory: usize) -> Self {
+    /// transaction keeps at most `memory` bytes of pickles in memory. The
+    /// area of a read-only store writes nothing. This reads nothing:
+    /// `open` checks the directory.
+    pub(crate) fn new(dir: Box<dyn StagingDir>, memory: usize, read_only: bool) -> Self {
         Self {
             dir,
             memory,
+            read_only,
             ready: Mutex::new(false),
             next: AtomicU64::new(0),
         }
     }
 
     /// Remove the spill files that a crash left, when the store opens.
-    /// Only regular files are removed, and other entries stay.
+    /// Only regular files are removed, and other entries stay. The area of
+    /// a read-only store removes nothing.
     ///
     /// Nothing syncs the removals. If a crash undoes one, the next open
     /// removes the file again.
     pub(crate) fn open(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut ready = self.lock_ready();
         if self.dir.exists(STAGING_DIR)? {
             for file in self.dir.list_files(STAGING_DIR)? {
@@ -113,8 +122,11 @@ impl StagingArea {
     }
 
     /// Create a new, empty spill file. Create `staging/` first when it
-    /// does not exist.
+    /// does not exist. A read-only store fails with `ReadOnly`.
     fn create(&self) -> Result<Spill> {
+        if self.read_only {
+            return Err(ZoeError::ReadOnly);
+        }
         {
             let mut ready = self.lock_ready();
             if !*ready {
@@ -124,8 +136,9 @@ impl StagingArea {
                 *ready = true;
             }
         }
-        // The number is new in this store, and the open removed the files
-        // of earlier processes. So the file is new and empty.
+        // The number is new in this store, and the open of a writer
+        // removed the files of earlier processes. So the file is new and
+        // empty.
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let name = format!("{STAGING_DIR}/{n}.spill");
         let file = self.dir.open(&name)?;
@@ -317,7 +330,7 @@ impl Staging {
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::error::ZoeError;
+    use crate::commit::Txn;
     use crate::store::{Options, Store};
     use crate::vfs::MemVfs;
 
@@ -325,7 +338,8 @@ mod tests {
     /// `memory` bytes of pickles in memory.
     fn area(memory: usize) -> (MemVfs, StagingArea) {
         let vfs = MemVfs::new();
-        (vfs.clone(), StagingArea::new(Box::new(vfs.clone()), memory))
+        let area = StagingArea::new(Box::new(vfs.clone()), memory, false);
+        (vfs, area)
     }
 
     /// Open the store in `vfs`. Each transaction keeps `memory` bytes of
@@ -494,20 +508,43 @@ mod tests {
         assert!(spill_files(&vfs).is_empty());
     }
 
-    /// A read-only open changes nothing in `staging/`. The next writer
-    /// removes the spill files.
-    #[test]
-    fn a_read_only_open_keeps_the_spill_files() {
-        let name = format!("zoe-staging-read-only-{}", std::process::id());
+    /// Return a new, empty directory for a store in the temporary
+    /// directory of the system.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let name = format!("zoe-staging-{name}-{}", std::process::id());
         let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A read-only store writes nothing in `staging/`. Its open keeps the
+    /// spill files, and a pickle that would spill fails with `ReadOnly`.
+    /// The next writer removes the spill files.
+    #[test]
+    fn a_read_only_store_writes_nothing_in_staging() {
+        let dir = temp_dir("read-only");
         drop(Store::open(&dir).unwrap());
         let spill = dir.join(STAGING_DIR).join("0.spill");
         std::fs::create_dir(dir.join(STAGING_DIR)).unwrap();
         std::fs::write(&spill, b"left").unwrap();
 
-        drop(Store::open_read_only(&dir).unwrap());
+        let store = Store::open_read_only(&dir).unwrap();
+        let mut txn = Txn::begin(&store, b"", b"", b"");
+        // A pickle in memory stages, and the vote refuses the transaction.
+        txn.store(Oid(1), Tid::ZERO, b"small").unwrap();
+        let large = vec![1; Options::default().staging_memory];
+        let error = txn.store(Oid(2), Tid::ZERO, &large);
+        assert!(matches!(error, Err(ZoeError::ReadOnly)), "{error:?}");
+        assert!(matches!(txn.vote(), Err(ZoeError::ReadOnly)));
+        drop(txn);
+        drop(store);
+        let names: Vec<_> = std::fs::read_dir(dir.join(STAGING_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["0.spill"]);
         assert_eq!(std::fs::read(&spill).unwrap(), b"left");
+
         drop(Store::open(&dir).unwrap());
         assert!(!spill.exists());
         std::fs::remove_dir_all(&dir).unwrap();
