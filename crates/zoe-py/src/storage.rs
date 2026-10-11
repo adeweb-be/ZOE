@@ -18,6 +18,10 @@
 //! gives the path of a committed blob file. The core keeps the blob files
 //! in `blob_dir`, `<path>/blobs` by default.
 //!
+//! `_iterator` reads one transaction at a time through the transaction
+//! index of the core. `restore` and `restoreBlob` copy a record into a
+//! restore transaction under the tid of the transaction.
+//!
 //! `_vote_resolving` votes and keeps the locks when it finds conflicts.
 //! `zoe.storage.Storage.tpc_vote` resolves them in Python, stores the
 //! resolved pickles and calls `tpc_vote` of this class. `tpc_abort` and
@@ -366,6 +370,60 @@ impl Storage {
             .collect())
     }
 
+    /// Return an iterator over the transactions from `start` to `stop`,
+    /// both included, in tid order. `None` leaves a bound open. Each item
+    /// is a tuple of the tid, the user name, the description, the pickled
+    /// extension and the records. Each record is a tuple of the oid, the
+    /// tid and the pickle, which is `None` for a deletion.
+    /// `zoe.storage.Storage.iterator` makes the records of ZODB.
+    ///
+    /// The iterator stops at the last tid at the time of this call. It
+    /// holds the rows of the range, and the records of one transaction at
+    /// a time.
+    #[pyo3(name = "_iterator", signature = (start = None, stop = None))]
+    fn iterator(
+        &self,
+        py: Python<'_>,
+        start: Option<&Bound<'_, PyAny>>,
+        stop: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Transactions> {
+        let start = start.map(u64_of).transpose()?.map(Tid);
+        let stop = stop.map(u64_of).transpose()?.map(Tid);
+        let store = self.opened(py)?;
+        let transactions = py
+            .detach(move || store.iterator(start, stop))
+            .map_err(|e| core(py, e))?;
+        Ok(Transactions {
+            transactions: Mutex::new(transactions),
+        })
+    }
+
+    /// Return the current record of the first object at or after the oid
+    /// `next`, and the next oid that has a current record: a tuple of the
+    /// oid, the serial, the pickle and the next oid. The next oid is `None`
+    /// at the end. `None` starts at the first oid. A deleted object has no
+    /// current record. Raise `ValueError` when no object at or after `next`
+    /// has one, as FileStorage does.
+    #[pyo3(signature = (next = None))]
+    fn record_iternext<'py>(
+        &self,
+        py: Python<'py>,
+        next: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<CurrentRow<'py>> {
+        let next = next.map(u64_of).transpose()?.map(Oid);
+        let store = self.opened(py)?;
+        let record = py
+            .detach(move || store.record_iternext(next))
+            .map_err(|e| core(py, e))?
+            .ok_or_else(|| PyValueError::new_err("no object at or after the oid"))?;
+        Ok((
+            p64(py, record.oid.0),
+            p64(py, record.tid.0),
+            PyBytes::new(py, &record.data),
+            record.next.map(|oid| p64(py, oid.0)),
+        ))
+    }
+
     /// Pack the store at `tid`: remove the records that no reader at or
     /// after `tid` needs, with their blob files. `zoe.storage.Storage.pack`
     /// gives the tid of the pack time.
@@ -549,6 +607,39 @@ impl Storage {
             )
         })
         .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage a copy of a version of `oid` in a restore transaction: a
+    /// transaction that `tpc_begin` began with a tid. The version gets that
+    /// tid. `data` is the pickle, or `None` for a deletion.
+    ///
+    /// The previous serial of the version is the current serial of `oid` in
+    /// the store, not `serial`. If another transaction changes `oid` before
+    /// the vote, the vote raises `ConflictError`. The store keeps every
+    /// pickle whole, so `prev_txn` is not used. A read-only storage refuses
+    /// the call.
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: Option<&[u8]>,
+        version: &Bound<'_, PyAny>,
+        prev_txn: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (serial, prev_txn);
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let entry = self.entry(py, transaction)?;
+        if version.is_truthy()? {
+            return Err(errors::version(py));
+        }
+        let oid = Oid(u64_of(oid)?);
+        py.detach(|| entry.with(|txn| Ok(txn.restore(oid, data)?)))
+            .map_err(|failure| failure.into_py(py))
     }
 
     /// Stage a copy of a version of `oid` with the blob in the file
@@ -820,6 +911,57 @@ impl Drop for Storage {
     }
 }
 
+/// The transactions that `_iterator` gives, in tid order.
+///
+/// The iterator holds only a weak reference to the store. After `close`,
+/// the next call raises `StorageError`, then the iterator ends.
+#[pyclass(frozen, module = "zoe._zoe", name = "Transactions")]
+pub(crate) struct Transactions {
+    transactions: Mutex<zoe_core::Transactions>,
+}
+
+#[pymethods]
+impl Transactions {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Return the next transaction as a tuple of the tid, the user name,
+    /// the description, the pickled extension and the records.
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<TxnRow<'py>>> {
+        // The mutex is taken without the GIL, and no Python code runs while
+        // it is held.
+        let next = py.detach(|| {
+            self.transactions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next()
+        });
+        let txn = match next {
+            None => return Ok(None),
+            Some(txn) => txn.map_err(|e| core(py, e))?,
+        };
+        let records = txn
+            .records
+            .into_iter()
+            .map(|record| {
+                (
+                    p64(py, record.oid.0),
+                    p64(py, record.tid.0),
+                    record.data.map(|data| PyBytes::new(py, &data)),
+                )
+            })
+            .collect();
+        Ok(Some((
+            p64(py, txn.tid.0),
+            PyBytes::new(py, &txn.user),
+            PyBytes::new(py, &txn.description),
+            PyBytes::new(py, &txn.extension),
+            records,
+        )))
+    }
+}
+
 /// Abort the transactions of `entries`.
 ///
 /// A vote that waits for a lock uses its entry until the wait ends. So the
@@ -869,6 +1011,33 @@ type HistoryRow<'py> = (
     Bound<'py, PyBytes>,
     Bound<'py, PyBytes>,
     u64,
+);
+
+/// A record that `record_iternext` gives: the oid, the serial, the pickle
+/// and the next oid.
+type CurrentRow<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Option<Bound<'py, PyBytes>>,
+);
+
+/// A record of a transaction of `_iterator`: the oid, the tid and the
+/// pickle, `None` for a deletion.
+type RecordRow<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Option<Bound<'py, PyBytes>>,
+);
+
+/// A transaction of `_iterator`: the tid, the user name, the description,
+/// the pickled extension and the records.
+type TxnRow<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Vec<RecordRow<'py>>,
 );
 
 /// Return the `StorageError` for a staged pickle that the core cannot read

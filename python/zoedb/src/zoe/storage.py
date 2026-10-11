@@ -2,17 +2,26 @@
 
 The extension class `zoe._zoe.Storage` calls the core. This module adds the
 parts that need ZODB: the interface declarations, the history records, the
-conflict resolution, the committed blob files and the `WrongThread`
-exception.
+records of the iterator, the copy from another storage, the conflict
+resolution, the committed blob files and the `WrongThread` exception.
 """
 
+import contextlib
+import os
+import shutil
+import tempfile
 import time
 
 import zope.interface
-from ZODB.blob import BlobFile
+from ZODB.BaseStorage import DataRecord, TransactionRecord
+from ZODB.blob import BlobFile, is_blob_record
 from ZODB.ConflictResolution import ConflictResolvingStorage
-from ZODB.interfaces import IBlobStorage, IStorage
-from ZODB.POSException import ConflictError, StorageTransactionError
+from ZODB.interfaces import (
+    IBlobStorageRestoreable,
+    IStorageCurrentRecordIteration,
+    IStorageIteration,
+)
+from ZODB.POSException import ConflictError, POSKeyError, StorageTransactionError
 from ZODB.TimeStamp import TimeStamp
 
 from zoe import _zoe
@@ -28,7 +37,12 @@ class WrongThread(StorageTransactionError):
     """
 
 
-@zope.interface.implementer(IStorage, IBlobStorage)
+# `IBlobStorageRestoreable` extends `IBlobStorage` and
+# `IStorageRestoreable`, and `IStorageCurrentRecordIteration` extends
+# `IStorage`.
+@zope.interface.implementer(
+    IBlobStorageRestoreable, IStorageCurrentRecordIteration, IStorageIteration
+)
 class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
@@ -37,8 +51,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
     lock of an object. A longer wait raises `ConflictError`. `None` keeps the
     default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
-    `store`, `pack`, `storeBlob` and `temporaryDirectory` with
-    `ReadOnlyError`, and it does not create a missing directory.
+    `store`, `pack`, `restore`, `storeBlob`, `restoreBlob` and
+    `temporaryDirectory` with `ReadOnlyError`, and it does not create a
+    missing directory.
 
     `blob_dir` is the directory of the blob files, in ZODB's BushyLayout;
     `None` is `path/blobs`. The store does not record it, so each open must
@@ -67,6 +82,13 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     the store: an `int`, unique and strictly increasing per store and per
     name. It is not part of a transaction, so an abort does not give the
     value back. Each reopen of the store can skip up to 100 values.
+
+    `iterator` gives the transactions in tid order, and `record_iternext`
+    the current record of each object. `tpc_begin(transaction, tid,
+    status)` begins a restore transaction, which commits under `tid`, and
+    `restore` and `restoreBlob` copy a record into it unchanged.
+    `copyTransactionsFrom` copies every transaction of another storage with
+    them, as `zodbconvert` asks.
     """
 
     def tpc_vote(self, transaction):
@@ -142,6 +164,77 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
             for tid, user_name, description, length in self._history(oid, size)
         ]
 
+    def iterator(self, start=None, stop=None):
+        """Return an iterator over the transactions from `start` to `stop`.
+
+        Both bounds are included, and `None` leaves a bound open. The
+        iterator gives the transactions in tid order, up to the last
+        transaction at the time of this call. Each transaction gives its
+        records in oid order. A record has the pickle as `data`, or `None`
+        for a deletion. Its `data_txn` is `None`, because the store keeps
+        every pickle whole. The store keeps no transaction status, so the
+        status is always `" "`.
+
+        The iterator holds the rows of the range and the pickles of one
+        transaction at a time.
+        """
+        return _transactions(self._iterator(start, stop))
+
+    def copyTransactionsFrom(self, other):
+        """Copy every transaction of `other` into this storage.
+
+        Each transaction keeps its tid, its metadata and its records,
+        byte for byte. Each tid must be after the last tid of this storage.
+        A record with a blob gets a copy of the blob file of `other`. A
+        blob record whose file `other` does not have is copied without its
+        blob, as ZODB's own copy does. An error aborts the transaction that
+        it stops, and the transactions before it stay.
+        """
+        transactions = other.iterator()
+        try:
+            for txn in transactions:
+                self.tpc_begin(txn, txn.tid, txn.status)
+                try:
+                    for record in txn:
+                        self._copy_record(other, record, txn)
+                    self.tpc_vote(txn)
+                    self.tpc_finish(txn)
+                except BaseException:
+                    self.tpc_abort(txn)
+                    raise
+        finally:
+            close = getattr(transactions, "close", None)
+            if close is not None:
+                close()
+
+    def _copy_record(self, other, record, transaction):
+        """Restore `record` of the storage `other` into `transaction`.
+
+        The blob file of `other` is copied into the temporary directory of
+        this storage, and `restoreBlob` takes the copy by rename. A refused
+        call removes the copy.
+        """
+        blob = None
+        if is_blob_record(record.data):
+            with contextlib.suppress(POSKeyError):
+                blob = other.loadBlob(record.oid, record.tid)
+        if blob is None:
+            self.restore(
+                record.oid, record.tid, record.data, "", record.data_txn, transaction
+            )
+            return
+        fd, name = tempfile.mkstemp(suffix=".tmp", dir=self.temporaryDirectory())
+        try:
+            with open(fd, "wb") as target, open(blob, "rb") as source:
+                shutil.copyfileobj(source, target)
+            self.restoreBlob(
+                record.oid, record.tid, record.data, name, record.data_txn, transaction
+            )
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(name)
+            raise
+
     def pack(self, pack_time, referencesf):
         """Pack the store as of `pack_time`, in seconds since the epoch.
 
@@ -174,3 +267,25 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     def supportsUndo(self):
         """Return False: the storage does not undo transactions."""
         return False
+
+
+class _Transaction(TransactionRecord):
+    """A transaction that `Storage.iterator` gives.
+
+    Each iteration gives its records as ZODB's `DataRecord`, with `None` as
+    `data_txn`.
+    """
+
+    def __init__(self, tid, user, description, extension, records):
+        super().__init__(tid, " ", user, description, extension)
+        self._records = records
+
+    def __iter__(self):
+        for oid, tid, data in self._records:
+            yield DataRecord(oid, tid, data, None)
+
+
+def _transactions(rows):
+    """Give a `_Transaction` for each row of `Storage._iterator`."""
+    for tid, user, description, extension, records in rows:
+        yield _Transaction(tid, user, description, extension, records)

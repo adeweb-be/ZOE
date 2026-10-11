@@ -24,7 +24,7 @@ mod _zoe {
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]
-    use crate::storage::Storage;
+    use crate::storage::{Storage, Transactions};
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
