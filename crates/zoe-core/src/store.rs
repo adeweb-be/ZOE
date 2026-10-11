@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
-use crate::blob::{BlobFile, BlobReader, BlobStore, PendingBlob};
+use crate::blob::{self, BlobFile, BlobReader, BlobStore, PendingBlob};
 use crate::clock::{Clock, SystemClock};
 use crate::commit::{StagingArea, Txn};
 use crate::error::{Result, ZoeError};
@@ -26,12 +26,38 @@ const DATABASE: &str = "zoe.redb";
 /// The name under which a new database is written before it is renamed.
 const NEW_DATABASE: &str = "zoe.redb.new";
 
+/// Return the directory that holds the blob directory `blob_dir`, and the
+/// name of the blob directory there.
+///
+/// A relative path is taken from the current directory. The path must end
+/// in a name that is UTF-8, as every name of the core. An existing entry at
+/// `blob_dir` must be a directory. The call creates nothing.
+fn blob_location(blob_dir: &Path) -> Result<(PathBuf, String)> {
+    let invalid = |message: &str| {
+        let message = format!("blob directory {}: {message}", blob_dir.display());
+        ZoeError::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
+    };
+    let blob_dir = std::path::absolute(blob_dir)?;
+    let (Some(parent), Some(name)) = (blob_dir.parent(), blob_dir.file_name()) else {
+        return Err(invalid("the path does not end in a name"));
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| invalid("the name is not UTF-8"))?;
+    match std::fs::metadata(&blob_dir) {
+        Ok(metadata) if !metadata.is_dir() => Err(invalid("not a directory")),
+        Ok(_) => Ok((parent.to_owned(), name.to_owned())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((parent.to_owned(), name.to_owned())),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The options of a store.
 ///
 /// Build it from the defaults, for example
 /// `Options { lock_timeout, ..Options::default() }`. Then a new option does
 /// not break the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// The longest time that a vote waits for its locks. A longer wait
     /// fails the vote with `Conflict`. This is `lock-timeout` in the
@@ -66,6 +92,13 @@ pub struct Options {
     /// the time that it was open. `None`, the default, logs no
     /// transaction. This is `transaction-warn` in the configuration.
     pub transaction_warn: Option<Duration>,
+    /// The directory of the blob files. `None` is `blobs` in the store
+    /// directory. This is `blob-dir` in the configuration.
+    ///
+    /// The store does not record this directory: each open must give the
+    /// same one. A writer open refuses a store with blob records whose
+    /// blob directory has no layout file, with `MissingBlobDir`.
+    pub blob_dir: Option<PathBuf>,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -83,6 +116,7 @@ impl Default for Options {
             max_blob_size: None,
             lock_warn: None,
             transaction_warn: None,
+            blob_dir: None,
             _more: (),
         }
     }
@@ -141,8 +175,24 @@ impl Store {
 
     /// Open the store in the directory `dir` with `options`, and create it
     /// if necessary.
+    ///
+    /// With `options.blob_dir`, the blob files live in that directory. The
+    /// call checks it before it creates anything: the path must end in a
+    /// name, and an existing entry must be a directory. Then it creates
+    /// the store directory, and the directory that holds the blob
+    /// directory, with their missing parents. The blob directory itself
+    /// comes with the first blob.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
-        Self::open_full(OsVfs::new(dir.as_ref())?, SystemClock, options)
+        let blob_dir = options.blob_dir.as_deref().map(blob_location).transpose()?;
+        let vfs = OsVfs::new(dir.as_ref())?;
+        let relocated = match blob_dir {
+            Some((parent, name)) => {
+                let parent: Box<dyn blob::BlobDir> = Box::new(OsVfs::unlocked(&parent)?);
+                Some((parent, name))
+            }
+            None => None,
+        };
+        Self::open_parts(vfs, SystemClock, options, relocated)
     }
 
     /// Open the store in the simulated filesystem `vfs`, and create it if
@@ -157,6 +207,15 @@ impl Store {
         Self::open_full(vfs, clock, Options::default())
     }
 
+    /// Open the store in the simulated filesystem `vfs`, with its blob
+    /// directory `name` in the simulated filesystem `parent`.
+    #[cfg(test)]
+    pub(crate) fn open_relocated(vfs: MemVfs, parent: MemVfs, name: &str) -> Result<Self> {
+        let parent: Box<dyn blob::BlobDir> = Box::new(parent);
+        let relocated = Some((parent, name.to_owned()));
+        Self::open_parts(vfs, SystemClock, Options::default(), relocated)
+    }
+
     /// Open the store in `vfs` with the clock `clock` and `options`, and
     /// create it if necessary. The store reads the time only from `clock`:
     /// the tids, and the durations of `lock-warn` and `transaction-warn`.
@@ -168,6 +227,18 @@ impl Store {
         vfs: V,
         clock: impl Clock + 'static,
         options: Options,
+    ) -> Result<Self> {
+        Self::open_parts(vfs, clock, options, None)
+    }
+
+    /// Open the store in `vfs` as `open_full` does. `relocated` is the
+    /// directory that holds the blob directory, and the name of the blob
+    /// directory there. `None` keeps the blob files in `blobs` in `vfs`.
+    pub(crate) fn open_parts<V: Vfs>(
+        vfs: V,
+        clock: impl Clock + 'static,
+        options: Options,
+        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
     ) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
@@ -188,7 +259,7 @@ impl Store {
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
-        Self::assemble(backend, vfs, Box::new(clock), options, false)
+        Self::assemble(backend, vfs, Box::new(clock), options, false, relocated)
     }
 
     /// Open the existing store in the directory `dir` for reads only.
@@ -214,24 +285,32 @@ impl Store {
             })?;
         let backend = RedbBackend::open_read_only(db)?;
         let options = Options::default();
-        Self::assemble(backend, dir, Box::new(SystemClock), options, true)
+        Self::assemble(backend, dir, Box::new(SystemClock), options, true, None)
     }
 
     /// Make a store from an open backend and the directory that holds its
     /// lock. The blob store and the staging area share the directory.
+    /// `relocated` puts the blob directory outside it, as `open_full`
+    /// tells: the staging area stays in the store directory.
     fn assemble<V: Vfs>(
         backend: RedbBackend,
         dir: V,
         clock: Box<dyn Clock>,
         options: Options,
         read_only: bool,
+        relocated: Option<(Box<dyn blob::BlobDir>, String)>,
     ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         let dir = Arc::new(dir);
+        let store_dir: Box<dyn blob::BlobDir> = Box::new(Arc::clone(&dir));
+        let blob_dir = match relocated {
+            Some((parent, name)) => Box::new(blob::Relocated::new(store_dir, parent, name)),
+            None => store_dir,
+        };
         let opened = Arc::new(Opened {
             backend: Box::new(backend),
-            blobs: BlobStore::new(Box::new(Arc::clone(&dir))),
+            blobs: BlobStore::new(blob_dir),
             staging: StagingArea::new(Box::new(dir), options.staging_memory, read_only),
         });
         // `Opened` holds the database and the directory here, so an error
@@ -478,6 +557,10 @@ mod tests {
 
         fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
             self.inner.load_blob(oid, tid)
+        }
+
+        fn has_blobs(&self) -> Result<bool> {
+            self.inner.has_blobs()
         }
 
         fn last_tid(&self) -> Tid {

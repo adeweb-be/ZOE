@@ -103,6 +103,112 @@ impl<V: Vfs> BlobDir for V {
     }
 }
 
+/// The blob directory of a store whose blob files live outside the store
+/// directory: the directory `name` in `parent`.
+///
+/// It maps `blobs` and the names in `blobs/` onto that directory. It maps
+/// the store directory `""`, the parent of `blobs`, onto `parent`, so the
+/// sync of the parent of `blobs` syncs the directory that holds the blob
+/// directory. Any other name stays in the store directory. Every operation
+/// goes through the `Vfs` of `parent` or of the store directory, so the
+/// crash simulation covers it.
+pub(crate) struct Relocated {
+    /// The store directory. It holds the lock of the store.
+    store: Box<dyn BlobDir>,
+    /// The directory that holds the blob directory.
+    parent: Box<dyn BlobDir>,
+    /// The name of the blob directory in `parent`: one part, no `/`.
+    name: String,
+}
+
+impl Relocated {
+    /// Return the blob directory `name` in `parent`, for the store in the
+    /// directory `store`.
+    pub(crate) fn new(store: Box<dyn BlobDir>, parent: Box<dyn BlobDir>, name: String) -> Self {
+        Self {
+            store,
+            parent,
+            name,
+        }
+    }
+
+    /// Return the directory that holds the file or directory `name` of the
+    /// blob store, and its name there.
+    fn locate(&self, name: &str) -> (&dyn BlobDir, String) {
+        if name.is_empty() {
+            return (&*self.parent, String::new());
+        }
+        match name.strip_prefix(BLOB_DIR) {
+            Some("") => (&*self.parent, self.name.clone()),
+            Some(rest) if rest.starts_with('/') => (&*self.parent, format!("{}{rest}", self.name)),
+            _ => (&*self.store, name.to_owned()),
+        }
+    }
+}
+
+impl BlobDir for Relocated {
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        let (dir, name) = self.locate(name);
+        dir.exists(&name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let (dir, from) = self.locate(from);
+        let (to_dir, to) = self.locate(to);
+        if !std::ptr::addr_eq(dir, to_dir) {
+            return Err(io::Error::other(
+                "a rename between the store directory and the blob directory",
+            ));
+        }
+        dir.rename(&from, &to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let (dir, name) = self.locate(name);
+        dir.remove(&name)
+    }
+
+    fn sync_dir_at(&self, name: &str) -> io::Result<()> {
+        let (dir, name) = self.locate(name);
+        dir.sync_dir_at(&name)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        let (dir, name) = self.locate(name);
+        dir.create_dir(&name)
+    }
+
+    fn list_files(&self, name: &str) -> io::Result<Vec<String>> {
+        let (dir, name) = self.locate(name);
+        dir.list_files(&name)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        let (dir, name) = self.locate(name);
+        dir.create_file(&name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        let (dir, name) = self.locate(name);
+        dir.read_file(&name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        let (dir, name) = self.locate(name);
+        dir.sync_file(&name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        let (dir, name) = self.locate(name);
+        dir.set_read_only(&name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        let (dir, name) = self.locate(name);
+        dir.path(&name)
+    }
+}
+
 /// The blob files of a store.
 pub(crate) struct BlobStore {
     /// The store directory. It holds the single-writer lock while the
@@ -128,10 +234,12 @@ impl BlobStore {
 
     /// Check the blob store when the store opens.
     ///
-    /// The layout file must name the bushy layout. Then the leftovers of a
-    /// crash in `blobs/tmp/` are removed: the blob files that an intent
-    /// file names and that `backend` has no blob record for, the intent
-    /// files and the temporary files.
+    /// The layout file must name the bushy layout. A writer refuses a blob
+    /// directory without a layout file when `backend` has blob records,
+    /// with `MissingBlobDir`: it is not the blob directory of the store.
+    /// Then the leftovers of a crash in `blobs/tmp/` are removed: the blob
+    /// files that an intent file names and that `backend` has no blob
+    /// record for, the intent files and the temporary files.
     ///
     /// A read-only store only reads the layout file and changes nothing.
     /// It leaves the leftovers of a crash to the next writer. A blob file
@@ -149,6 +257,12 @@ impl BlobStore {
                     layout.trim()
                 )));
             }
+        } else if !read_only && backend.has_blobs()? {
+            // The first blob of a store makes its layout file durable
+            // before any blob record.
+            return Err(ZoeError::MissingBlobDir {
+                path: self.dir.path(BLOB_DIR),
+            });
         }
         if !read_only && self.dir.exists(TMP_DIR)? {
             self.recover(backend)?;
@@ -1182,11 +1296,21 @@ mod tests {
     /// and each image after the mark `acknowledged` must have the blob
     /// `bytes` of `oid` at `tid`.
     fn check_images(vfs: &MemVfs, oid: Oid, tid: Tid, bytes: &[u8]) {
+        check_images_in(vfs, BLOB_DIR, oid, tid, bytes);
+    }
+
+    /// Check the crash images of `vfs` as `check_images` does, for a store
+    /// whose blob directory is `blob_dir` in the same filesystem.
+    fn check_images_in(vfs: &MemVfs, blob_dir: &str, oid: Oid, tid: Tid, bytes: &[u8]) {
         for image in vfs.crash_images() {
             let image_vfs = image.vfs();
-            let store = Store::open_vfs(image_vfs.clone())
-                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
-            assert_no_orphan(&store, &image_vfs, &image);
+            let opened = if blob_dir == BLOB_DIR {
+                Store::open_vfs(image_vfs.clone())
+            } else {
+                Store::open_relocated(image_vfs.clone(), image_vfs.clone(), blob_dir)
+            };
+            let store = opened.unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            assert_no_orphan_in(&store, &image_vfs, &image, blob_dir);
             match store.load(oid) {
                 Ok((_, found)) => {
                     assert_eq!(found, tid, "{image:?}");
@@ -1225,9 +1349,18 @@ mod tests {
 
     /// Check that every blob file of `vfs` has its blob record in `store`.
     fn assert_no_orphan(store: &Store, vfs: &MemVfs, image: &CrashImage) {
+        assert_no_orphan_in(store, vfs, image, BLOB_DIR);
+    }
+
+    /// Check that every blob file in the blob directory `blob_dir` of `vfs`
+    /// has its blob record in `store`.
+    fn assert_no_orphan_in(store: &Store, vfs: &MemVfs, image: &CrashImage, blob_dir: &str) {
         for name in vfs.names().iter().filter(|name| name.ends_with(".blob")) {
-            let (oid, tid) =
-                blob_of(name).unwrap_or_else(|| panic!("{image:?}: {name} is no blob file"));
+            let Some(rest) = name.strip_prefix(blob_dir) else {
+                continue;
+            };
+            let (oid, tid) = blob_of(&format!("{BLOB_DIR}{rest}"))
+                .unwrap_or_else(|| panic!("{image:?}: {name} is no blob file"));
             assert!(
                 store.blob_path(oid, tid).is_ok(),
                 "{image:?} kept {name}, which has no blob record"
@@ -1741,5 +1874,159 @@ mod tests {
             store.open_blob(oid, tid),
             Err(ZoeError::NotFound { .. })
         ));
+    }
+
+    /// Commit a blob that holds `bytes` for a new oid. Return the oid and
+    /// the tid.
+    fn commit_new_blob(store: &Store, bytes: &[u8]) -> (Oid, Tid) {
+        let oid = store.new_oid().unwrap();
+        (oid, commit_blobs(store, &[oid], bytes))
+    }
+
+    #[test]
+    fn a_relocated_blob_store_keeps_its_files_in_its_directory() {
+        let (vfs, parent) = (MemVfs::new(), MemVfs::new());
+        let store = Store::open_relocated(vfs.clone(), parent.clone(), "elsewhere").unwrap();
+        let tmp = store.blob_temp_dir().unwrap();
+        assert_eq!(tmp, PathBuf::from("elsewhere/tmp"));
+        let (oid, tid) = commit_new_blob(&store, b"new");
+        let taken = store.new_oid().unwrap();
+        let path = client_file(&parent, "elsewhere/tmp/client", b"taken");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob_at(taken, Tid::ZERO, PICKLE, &path).unwrap();
+        txn.vote().unwrap();
+        let second = txn.finish().unwrap();
+
+        assert_eq!(read(&store, oid, tid).unwrap(), b"new");
+        assert_eq!(read(&store, taken, second).unwrap(), b"taken");
+        let name = blob_name(oid, tid).replacen(BLOB_DIR, "elsewhere", 1);
+        assert_eq!(store.blob_path(oid, tid).unwrap(), PathBuf::from(&name));
+        assert_eq!(contents(&parent, &name), b"new");
+        assert_eq!(contents(&parent, "elsewhere/.layout"), LAYOUT.as_bytes());
+        assert!(!Vfs::exists(&vfs, BLOB_DIR).unwrap());
+        drop(store);
+
+        let store = Store::open_relocated(vfs, parent, "elsewhere").unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"new");
+    }
+
+    /// The blob file and its directories are durable in the filesystem of
+    /// the blob directory when `finish` returns: the parent of the blob
+    /// directory is synced, not the store directory.
+    #[test]
+    fn a_relocated_blob_is_durable_in_its_own_filesystem() {
+        let parent = MemVfs::new();
+        let store = Store::open_relocated(MemVfs::new(), parent.clone(), "elsewhere").unwrap();
+        let (oid, tid) = commit_new_blob(&store, b"blob");
+        parent.mark("acknowledged");
+        let name = blob_name(oid, tid).replacen(BLOB_DIR, "elsewhere", 1);
+        let images = parent.crash_images();
+        assert!(images.iter().any(|image| !image.is_after("acknowledged")));
+        for image in images.iter().filter(|image| image.is_after("acknowledged")) {
+            assert_eq!(contents(&image.vfs(), &name), b"blob", "{image:?}");
+        }
+    }
+
+    #[test]
+    fn every_crash_image_of_a_relocated_blob_commit_opens_without_an_orphan() {
+        let vfs = empty_store();
+        let store = Store::open_relocated(vfs.clone(), vfs.clone(), "elsewhere").unwrap();
+        let (oid, tid) = commit_new_blob(&store, b"blob");
+        vfs.mark("acknowledged");
+        drop(store);
+        check_images_in(&vfs, "elsewhere", oid, tid, b"blob");
+    }
+
+    #[test]
+    fn a_writer_refuses_a_store_whose_blob_directory_has_no_layout() {
+        let (vfs, parent) = (MemVfs::new(), MemVfs::new());
+        // A store without blobs takes any blob directory.
+        drop(Store::open_relocated(vfs.clone(), MemVfs::new(), "other").unwrap());
+        let (oid, tid) = {
+            let store = Store::open_relocated(vfs.clone(), parent.clone(), "elsewhere").unwrap();
+            commit_new_blob(&store, b"blob")
+        };
+
+        // The default directory, another directory, or a directory that
+        // lost its layout file is not the blob directory of the store.
+        let refused = [
+            Store::open_vfs(vfs.clone()),
+            Store::open_relocated(vfs.clone(), MemVfs::new(), "elsewhere"),
+            Store::open_relocated(vfs.clone(), parent.clone(), "other"),
+        ];
+        for result in refused {
+            assert!(
+                matches!(result, Err(ZoeError::MissingBlobDir { .. })),
+                "{:?}",
+                result.err()
+            );
+        }
+        assert!(!Vfs::exists(&vfs, BLOB_DIR).unwrap());
+        Vfs::remove(&parent, "elsewhere/.layout").unwrap();
+        let result = Store::open_relocated(vfs.clone(), parent.clone(), "elsewhere");
+        assert!(matches!(result, Err(ZoeError::MissingBlobDir { .. })));
+
+        let mut file = Vfs::create_file(&parent, "elsewhere/.layout").unwrap();
+        file.write_all(LAYOUT.as_bytes()).unwrap();
+        drop(file);
+        let store = Store::open_relocated(vfs, parent, "elsewhere").unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
+    }
+
+    #[test]
+    fn an_os_store_takes_its_blob_directory_from_the_options() {
+        use crate::store::Options;
+
+        let root = std::env::temp_dir().join(format!("zoe-blob-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, blob_dir) = (root.join("store"), root.join("a").join("blobs"));
+        let options = Options {
+            blob_dir: Some(blob_dir.clone()),
+            ..Options::default()
+        };
+        let (oid, tid) = {
+            let store = Store::open_with(&dir, options.clone()).unwrap();
+            assert_eq!(store.blob_temp_dir().unwrap(), blob_dir.join("tmp"));
+            let (oid, tid) = commit_new_blob(&store, b"blob");
+            let path = store.blob_path(oid, tid).unwrap();
+            assert!(path.starts_with(&blob_dir), "{}", path.display());
+            (oid, tid)
+        };
+        assert_eq!(std::fs::read(blob_dir.join(".layout")).unwrap(), b"bushy");
+        assert!(!dir.join(BLOB_DIR).exists());
+
+        let refused = Store::open(&dir);
+        assert!(matches!(refused, Err(ZoeError::MissingBlobDir { .. })));
+        let store = Store::open_with(&dir, options).unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A blob directory that a store refuses before it opens leaves no
+    /// trace: no store directory, no database and no lock file.
+    #[test]
+    fn a_refused_blob_directory_creates_nothing() {
+        use crate::store::Options;
+
+        let root = std::env::temp_dir().join(format!("zoe-blob-dir-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        for blob_dir in [root.join("file"), PathBuf::from("/")] {
+            let options = Options {
+                blob_dir: Some(blob_dir.clone()),
+                ..Options::default()
+            };
+            let result = Store::open_with(root.join("store"), options);
+            assert!(
+                matches!(&result, Err(ZoeError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput),
+                "{}: {:?}",
+                blob_dir.display(),
+                result.err()
+            );
+            assert!(!root.join("store").exists());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

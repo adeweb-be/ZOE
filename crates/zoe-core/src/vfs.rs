@@ -160,7 +160,9 @@ pub(crate) fn parent(name: &str) -> &str {
 #[derive(Debug)]
 pub struct OsVfs {
     dir: PathBuf,
-    _lock: File,
+    /// The lock file of the store. A directory that holds the blob
+    /// directory of a store has none.
+    _lock: Option<File>,
 }
 
 impl OsVfs {
@@ -174,6 +176,18 @@ impl OsVfs {
             .truncate(false)
             .open(dir.join(LOCK))?;
         Self::locked(dir, lock)
+    }
+
+    /// Open the directory `dir` without a lock, and create it if necessary.
+    /// It is the directory that holds the blob directory of a store whose
+    /// blob files are outside the store directory. The lock of the store
+    /// stays in the store directory.
+    pub(crate) fn unlocked(dir: &Path) -> Result<Self> {
+        create_dir_durable(dir)?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            _lock: None,
+        })
     }
 
     /// Open the directory `dir` of an existing store to read it, and take
@@ -206,7 +220,7 @@ impl OsVfs {
         match lock.try_lock() {
             Ok(()) => Ok(Self {
                 dir: dir.to_owned(),
-                _lock: lock,
+                _lock: Some(lock),
             }),
             Err(TryLockError::WouldBlock) => Err(ZoeError::Locked),
             Err(TryLockError::Error(e)) => Err(e.into()),

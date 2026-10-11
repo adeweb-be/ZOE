@@ -286,6 +286,16 @@ impl Backend for RedbBackend {
         Ok(Some(blob))
     }
 
+    fn has_blobs(&self) -> Result<bool> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        match txn.open_table(BLOBS) {
+            Ok(blobs) => Ok(blobs.first().map_err(backend)?.is_some()),
+            // A store written before the blob table has no blob record.
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(backend(e)),
+        }
+    }
+
     fn last_tid(&self) -> Tid {
         Tid(self.last_tid.load(Ordering::Acquire))
     }
