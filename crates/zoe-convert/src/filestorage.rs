@@ -26,6 +26,7 @@
 //! before a tail that ZODB takes for the junk of a crash. ZODB cuts the
 //! file at the same offset when it opens the file for writing.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::os::unix::fs::FileExt;
@@ -46,6 +47,10 @@ const DATA_HEADER_LEN: u64 = 42;
 
 /// The length of a number: a length, an offset or a back pointer.
 const NUMBER_LEN: u64 = 8;
+
+/// The most chain ends that the reader keeps. When the cache is full, the
+/// reader empties it.
+const MAX_CHAINS: usize = 1 << 16;
 
 /// Where the reader stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +129,20 @@ pub(crate) struct Reader {
     last: Tid,
     /// Where the reader stopped. It is `None` until the reader stops.
     end: Option<End>,
+    /// The chain ends of the records with a back pointer that the reader
+    /// read, by the offset of the record. A chain that reaches such a
+    /// record ends where its chain ends, so a long chain costs one step.
+    chains: HashMap<u64, ChainEnd>,
+}
+
+/// The end of the chain of back pointers of a record.
+#[derive(Clone, Copy, Debug)]
+struct ChainEnd {
+    /// The oid of the record.
+    oid: Oid,
+    /// The offset of the record that holds the data, and the data length.
+    /// It is `None` when the chain leads to no data.
+    data: Option<(u64, u64)>,
 }
 
 impl Reader {
@@ -172,6 +191,7 @@ impl Reader {
             next: start,
             last: Tid::ZERO,
             end: None,
+            chains: HashMap::new(),
         })
     }
 
@@ -375,9 +395,15 @@ impl Reader {
 
     /// Follow the back pointer `back` of the record of `oid` at `record`
     /// to the data. A chain of back pointers is followed to its end. A
-    /// back pointer of 0 gives `None`.
-    fn load_back(&self, oid: Oid, back: u64, record: u64) -> Result<Option<Vec<u8>>, Error> {
-        let Some((pos, len)) = self.chain_end(oid, back, record)? else {
+    /// back pointer of 0 gives `None`. The end of the chain goes into the
+    /// cache of chain ends.
+    fn load_back(&mut self, oid: Oid, back: u64, record: u64) -> Result<Option<Vec<u8>>, Error> {
+        let data = self.chain_end(oid, back, record)?;
+        if self.chains.len() >= MAX_CHAINS {
+            self.chains.clear();
+        }
+        self.chains.insert(record, ChainEnd { oid, data });
+        let Some((pos, len)) = data else {
             return Ok(None);
         };
         let mut data = self.buffer(len, pos)?;
@@ -416,14 +442,24 @@ impl Reader {
             if back < start || back >= from || from - back < DATA_HEADER_LEN {
                 return Err(self.corrupt(from, format!("back pointer {back} is out of range")));
             }
-            let mut header = [0; DATA_HEADER_LEN as usize];
-            self.read_at(&mut header, back)?;
-            let (target, len) = self.check_data_header(&header, back)?;
+            // A record in the cache was checked when the reader read it.
+            let cached = self.chains.get(&back).copied();
+            let (target, len) = match cached {
+                Some(chain) => (chain.oid, 0),
+                None => {
+                    let mut header = [0; DATA_HEADER_LEN as usize];
+                    self.read_at(&mut header, back)?;
+                    self.check_data_header(&header, back)?
+                }
+            };
             if target != oid {
                 return Err(self.corrupt(
                     from,
                     format!("back pointer {back} leads to oid {}", hex(target.0)),
                 ));
+            }
+            if let Some(chain) = cached {
+                return Ok(chain.data);
             }
             let room = from - back - DATA_HEADER_LEN;
             if len > 0 {
@@ -1093,6 +1129,29 @@ pub(crate) mod tests {
             panic!("not an I/O error: {error:?}");
         };
         assert_eq!(source.kind(), ErrorKind::OutOfMemory, "{error:?}");
+    }
+
+    #[test]
+    fn a_long_chain_of_back_pointers_leads_to_its_data() {
+        let mut file = FileBuilder::new();
+        let mut back = file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"one"))])[0];
+        for tid in 11..300 {
+            back = file.txn(tid, b' ', [b"", b"", b""], &[(1, Data::Back(back))])[0];
+        }
+        let (txns, _) = read_all(&file.write("long-chain")).unwrap();
+        assert_eq!(txns.len(), 290);
+        for (_, records) in &txns {
+            assert_eq!(records, &[record(1, Some(b"one"))]);
+        }
+    }
+
+    #[test]
+    fn a_back_pointer_to_a_known_chain_of_another_oid_is_refused() {
+        let mut file = FileBuilder::new();
+        let first = file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"one"))]);
+        let second = file.txn(20, b' ', [b"", b"", b""], &[(1, Data::Back(first[0]))]);
+        let at = file.txn(30, b' ', [b"", b"", b""], &[(2, Data::Back(second[0]))]);
+        assert_eq!(corrupt_at(read_all(&file.write("known-chain"))), at[0]);
     }
 
     #[test]
