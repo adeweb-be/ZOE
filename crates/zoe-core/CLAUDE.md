@@ -39,5 +39,5 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Nothing is undoable past the last pack.
 - A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename.
 - `next_oid` in `meta` is always greater than every committed oid.
-- The core reads the time only through the `Clock` trait and the filesystem only through the `Vfs` trait, so the crash simulation and the deterministic simulator can replace them.
+- The core reads the time only through the `Clock` trait and the filesystem only through the `Vfs` trait, so the crash simulation and the deterministic simulator can replace them. One exception: lock waits use `Instant`, because `Clock` gives wall time and a `Condvar` wait cannot run on a simulated clock.
 - A change to the `Backend` or `WriteTxn` signatures is a stop-and-ask: other crates implement and call them.
