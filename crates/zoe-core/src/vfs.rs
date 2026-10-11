@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -301,13 +302,20 @@ impl Vfs for OsVfs {
 
     fn sync_file(&self, name: &str) -> io::Result<()> {
         let path = self.dir.join(name);
-        // The metadata of a symbolic link is the metadata of the link.
-        if !fs::symlink_metadata(&path)?.is_file() {
+        // O_NOFOLLOW refuses a symbolic link. O_NONBLOCK keeps the open of
+        // a pipe from waiting for a writer. A sync needs no write
+        // permission.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        // The type comes from the open file, so no other file can take its
+        // place between the check and the sync.
+        if !file.metadata()?.is_file() {
             let message = format!("not a regular file: {}", path.display());
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
-        // A sync needs no write permission.
-        File::open(path)?.sync_all()
+        file.sync_all()
     }
 
     fn set_read_only(&self, name: &str) -> io::Result<()> {
@@ -1540,11 +1548,13 @@ mod tests {
         vfs.sync_file("f").unwrap();
 
         vfs.create_dir("d").unwrap();
+        let error = vfs.sync_file("d").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        let _socket = std::os::unix::net::UnixListener::bind(vfs.path("socket")).unwrap();
+        assert!(vfs.sync_file("socket").is_err());
         symlink(vfs.path("f"), vfs.path("link")).unwrap();
-        for name in ["d", "link"] {
-            let error = vfs.sync_file(name).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}");
-        }
+        let error = vfs.sync_file("link").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error}");
         assert_eq!(
             vfs.sync_file("missing").unwrap_err().kind(),
             io::ErrorKind::NotFound
