@@ -684,9 +684,15 @@ impl WriteTxn for RedbWrite<'_> {
             .remove(&format::record_key(oid, tid))
             .map_err(backend)?;
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
-        index
+        let removed = index
             .remove(&format::txn_oid_key(tid, oid))
-            .map_err(backend)?;
+            .map_err(backend)?
+            .is_some();
+        // A record without its index key is a damaged store. The removal
+        // fails, so the write does not erase the evidence.
+        if !removed {
+            return Err(ZoeError::CorruptTxn { tid });
+        }
         Ok(())
     }
 
@@ -1597,6 +1603,26 @@ mod tests {
         assert!(
             scans.early + scans.late > 0,
             "no scan of the index went outside its range"
+        );
+    }
+
+    #[test]
+    fn remove_record_refuses_a_record_without_its_index_key() {
+        let backend = empty();
+        commit_txn_of(&backend, Tid(5), &[1, 2]);
+        backend.remove_index_key_for_test(Tid(5), Oid(1)).unwrap();
+
+        let mut write = backend.begin_write().unwrap();
+        let error = write.remove_record(Oid(1), Tid(5));
+        assert!(
+            matches!(error, Err(ZoeError::CorruptTxn { tid: Tid(5) })),
+            "{error:?}"
+        );
+        drop(write);
+        // The failed write removed nothing.
+        assert_eq!(
+            backend.load_serial(Oid(1), Tid(5)).unwrap(),
+            Some(b"pickle".to_vec())
         );
     }
 

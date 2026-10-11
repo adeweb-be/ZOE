@@ -626,6 +626,25 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_its_index_key_stops_the_pack_and_stays() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let g = Oid(1);
+        let t1 = commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+        let t2 = commit(&store, &[(ROOT, record(&[]))]);
+        store.remove_index_key_for_test(t1, g).unwrap();
+
+        // The batch removes ROOT and g at t1. Its write fails, so it
+        // removes neither.
+        let error = store.pack(t2);
+        assert!(
+            matches!(error, Err(ZoeError::CorruptTxn { tid }) if tid == t1),
+            "{error:?}"
+        );
+        assert_eq!(store.load_serial(g, t1).unwrap(), record(&[]));
+        assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
+    }
+
+    #[test]
     fn the_iterator_after_a_pack_gives_the_transactions_that_remain() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let [t1, t2, t3, t4] = packable(&store);

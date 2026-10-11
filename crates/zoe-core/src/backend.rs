@@ -235,7 +235,9 @@ pub trait WriteTxn {
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
 
     /// Stage the removal of the record of `oid` that `tid` wrote, and of
-    /// its key `(tid, oid)` in the transaction index. Pack uses this.
+    /// its key `(tid, oid)` in the transaction index. Pack uses this. A
+    /// missing index key is `CorruptTxn`, so the write does not erase the
+    /// evidence of a damaged store.
     fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()>;
 
     /// Stage the removal of the blob record of `oid` that `tid` wrote.
