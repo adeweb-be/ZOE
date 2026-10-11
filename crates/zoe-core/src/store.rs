@@ -582,6 +582,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pack_write_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let second = commit(&store, oid, first, b"b").unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        let error = store.pack(second);
+        assert!(matches!(error, Err(ZoeError::Backend(_))), "{error:?}");
+        faults.write.store(false, Ordering::Relaxed);
+
+        // The outcome of the pack write is unknown, as after a failed
+        // finish.
+        let error = commit(&store, oid, second, b"c");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert!(matches!(store.pack(second), Err(ZoeError::Halted)));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
     fn an_aborted_transaction_leaves_nothing() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let oid = store.new_oid().unwrap();

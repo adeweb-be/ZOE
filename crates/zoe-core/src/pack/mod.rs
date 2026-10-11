@@ -389,7 +389,7 @@ impl Pack<'_> {
         // Most of the marking happens here, outside the commit sequencer.
         self.mark_written()?;
         let removed: Vec<Removal> = {
-            let sequencer = store.lock_sequencer();
+            let mut sequencer = store.lock_sequencer();
             if sequencer.is_none() {
                 return Err(ZoeError::Halted);
             }
@@ -399,7 +399,7 @@ impl Pack<'_> {
                 .into_iter()
                 .filter(|r| !(r.newest && self.reachable.contains(&r.oid)))
                 .collect();
-            self.commit(&removed)?;
+            self.commit(&removed, &mut sequencer)?;
             removed
         };
         self.account(&removed);
@@ -418,8 +418,13 @@ impl Pack<'_> {
 
     /// Commit the removal of `removed`: the records, the blob records and
     /// the changes to the transaction rows, with the watermark if it is
-    /// due.
-    fn commit(&mut self, removed: &[Removal]) -> Result<()> {
+    /// due. `sequencer` is the commit sequencer, which the caller holds.
+    ///
+    /// An error of the backend write leaves the outcome unknown, as an
+    /// error in `finish` does. So it empties `sequencer`, and the store
+    /// refuses every later finish and pack with `Halted` until it is
+    /// reopened.
+    fn commit(&mut self, removed: &[Removal], sequencer: &mut Option<Tid>) -> Result<()> {
         let backend = &self.store.backend;
         let mut counts: BTreeMap<Tid, u64> = BTreeMap::new();
         for removal in removed {
@@ -440,27 +445,33 @@ impl Pack<'_> {
             rows.push((row, left));
         }
 
-        let mut write = backend.begin_write()?;
-        for removal in removed {
-            write.remove_record(removal.oid, removal.tid)?;
-            if removal.blob.is_some() {
-                write.remove_blob(removal.oid, removal.tid)?;
+        let written = (|| {
+            let mut write = backend.begin_write()?;
+            for removal in removed {
+                write.remove_record(removal.oid, removal.tid)?;
+                if removal.blob.is_some() {
+                    write.remove_blob(removal.oid, removal.tid)?;
+                }
             }
-        }
-        for (row, left) in rows {
-            if left == 0 {
-                write.remove_txn(row.tid)?;
-            } else {
-                write.replace_txn(&TxnMeta {
-                    oid_count: left,
-                    ..row
-                })?;
+            for (row, left) in rows {
+                if left == 0 {
+                    write.remove_txn(row.tid)?;
+                } else {
+                    write.replace_txn(&TxnMeta {
+                        oid_count: left,
+                        ..row
+                    })?;
+                }
             }
+            if let Some(watermark) = self.watermark {
+                write.put_pack_watermark(watermark)?;
+            }
+            write.commit()
+        })();
+        if let Err(error) = written {
+            *sequencer = None;
+            return Err(error);
         }
-        if let Some(watermark) = self.watermark {
-            write.put_pack_watermark(watermark)?;
-        }
-        write.commit()?;
         self.watermark = None;
         Ok(())
     }
