@@ -1308,24 +1308,42 @@ mod tests {
         files
     }
 
+    /// A directory of one test. Dropping it removes the directory, also
+    /// when the test fails.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn a_read_only_store_runs_a_dry_run_and_changes_no_byte() {
-        let dir = std::env::temp_dir().join(format!("zoe-dry-run-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = TempDir::new("dry-run");
+        let dir = &temp.0;
         let (f, g) = (Oid(1), Oid(2));
         let last = {
-            let store = Store::open(&dir).unwrap();
+            let store = Store::open(dir).unwrap();
             commit(&store, &[(ROOT, record(&[f, g])), (g, record(&[]))]);
             commit_blob(&store, f, &record(&[]), b"first");
             commit_blob(&store, f, &record(&[]), b"second");
             commit(&store, &[(ROOT, record(&[f]))])
         };
-        let before = tree(&dir);
+        let before = tree(dir);
 
-        let store = Store::open_read_only(&dir).unwrap();
+        let store = Store::open_read_only(dir).unwrap();
         let report = store.pack_dry_run(last).unwrap();
         drop(store);
-        assert!(tree(&dir) == before, "the dry run changed a file");
+        assert!(tree(dir) == before, "the dry run changed a file");
         assert_eq!(
             (
                 report.records,
@@ -1337,10 +1355,8 @@ mod tests {
             "{report:?}"
         );
 
-        let store = Store::open(&dir).unwrap();
+        let store = Store::open(dir).unwrap();
         assert_eq!(store.pack(last).unwrap(), report);
-        drop(store);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
