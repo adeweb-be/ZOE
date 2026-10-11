@@ -449,3 +449,23 @@ def test_zodb_copies_a_storage_with_its_tids(tmp_path):
     finally:
         storage.close()
         source.close()
+
+
+def test_a_serial_as_text_is_taken_as_filestorage_takes_it(storage):
+    # ZODB's blob_transaction.txt passes the serial of a new object as
+    # '\0' * 8, a str.
+    oid = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    path = write_temporary(storage, DATA)
+    storage.storeBlob(oid, "\0" * 8, blob_record(), path, "", txn)
+    storage.store(storage.new_oid(), "\0" * 8, blob_record(), "", txn)
+    storage.tpc_vote(txn)
+    tid = storage.tpc_finish(txn)
+    assert read(storage.loadBlob(oid, tid)) == DATA
+    for serial in ("\0" * 7, "\u0100" * 8):
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        with pytest.raises(ValueError):
+            storage.store(storage.new_oid(), serial, blob_record(), "", txn)
+        storage.tpc_abort(txn)
