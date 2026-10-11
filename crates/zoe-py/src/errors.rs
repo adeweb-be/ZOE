@@ -62,6 +62,12 @@ impl From<ZoeError> for Failure {
     }
 }
 
+impl From<std::io::Error> for Failure {
+    fn from(error: std::io::Error) -> Self {
+        ZoeError::from(error).into()
+    }
+}
+
 impl Failure {
     /// Return the exception of ZODB for this failure.
     pub(crate) fn into_py(self, py: Python<'_>) -> PyErr {
@@ -116,6 +122,11 @@ pub(crate) fn pack_failure(py: Python<'_>, error: ZoeError) -> PyErr {
 /// Return the exception for a call on a storage that is closed.
 pub(crate) fn closed(py: Python<'_>) -> PyErr {
     raise(storage_error(py), ("the storage is closed",), None)
+}
+
+/// Return the exception for a `blob_dir` that the store refuses.
+pub(crate) fn blob_dir(py: Python<'_>, message: String) -> PyErr {
+    raise(storage_error(py), (message,), None)
 }
 
 /// Return the exception for a transaction that the storage does not

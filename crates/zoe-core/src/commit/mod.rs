@@ -405,7 +405,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn restore_blob(&mut self, oid: Oid, data: &[u8], file: BlobFile) -> Result<()> {
         let current = self.check_restore_blob(oid, data)?;
         let blob = file.close(&self.store.backend)?;
-        self.stage_blob(oid, current, data, true, blob)
+        self.stage_blob(oid, current, data, true, self.stored_bytes, blob)
     }
 
     /// Stage a copy of a version of `oid` with the blob in the file at
@@ -415,7 +415,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn restore_blob_at(&mut self, oid: Oid, data: &[u8], path: &Path) -> Result<()> {
         let current = self.check_restore_blob(oid, data)?;
         let blob = self.store.take_blob_file(path)?;
-        self.stage_blob(oid, current, data, true, blob)
+        self.stage_blob(oid, current, data, true, self.stored_bytes, blob)
     }
 
     /// Check that `restore` can stage a copy of `oid`, and return the
