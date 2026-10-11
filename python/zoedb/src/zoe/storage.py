@@ -1,13 +1,16 @@
 """The in-process storage: `zoe.Storage` implements the ZODB storage interfaces.
 
 The extension class `zoe._zoe.Storage` calls the core. This module adds the
-parts that need ZODB: the interface declaration, the history records and the
-`WrongThread` exception.
+parts that need ZODB: the interface declaration, the history records, the
+conflict resolution and the `WrongThread` exception.
 """
 
+import contextlib
+
 import zope.interface
+from ZODB.ConflictResolution import ConflictResolvingStorage
 from ZODB.interfaces import IStorage
-from ZODB.POSException import StorageTransactionError
+from ZODB.POSException import ConflictError, StorageTransactionError
 from ZODB.TimeStamp import TimeStamp
 
 from zoe import _zoe
@@ -24,7 +27,7 @@ class WrongThread(StorageTransactionError):
 
 
 @zope.interface.implementer(IStorage)
-class Storage(_zoe.Storage):
+class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
     `Storage(path, *, read_only=False, lock_timeout=None)` opens the store in
@@ -38,7 +41,50 @@ class Storage(_zoe.Storage):
     begins a transaction stores and votes in it; another thread gets
     `WrongThread`. The storage releases the GIL in every call into the
     store.
+
+    The vote resolves a conflict in this process, through the
+    `_p_resolveConflict` method of the class of the object, as ZODB's
+    `ConflictResolvingStorage` does.
     """
+
+    def tpc_vote(self, transaction):
+        """Vote on `transaction`, and resolve its conflicts.
+
+        The vote locks the objects of the transaction. Then, for each object
+        that another transaction changed, `tryToResolveConflict` runs the
+        `_p_resolveConflict` method of its class. The vote keeps the locks
+        while the method runs. It stores the resolved state over the
+        committed serial and votes again. Return the oids of the resolved
+        objects.
+
+        An object that does not resolve raises `ConflictError`, and the vote
+        releases the locks. A read-current object is never resolved: it
+        raises `ReadConflictError`.
+        """
+        conflicts = self._vote_resolving(transaction)
+        if not conflicts:
+            return []
+        try:
+            for oid, committed, read, committed_data, data in conflicts:
+                try:
+                    data = self.tryToResolveConflict(
+                        oid, committed, read, data, committed_data
+                    )
+                except ConflictError:
+                    raise
+                except Exception:
+                    # ZODB cannot read the class name from the pickle, so
+                    # the error comes without it.
+                    raise ConflictError(oid=oid, serials=(committed, read)) from None
+                self.store(oid, committed, data, "", transaction)
+        except BaseException:
+            # An oid that did not resolve is still stale. So the second vote
+            # fails, and it releases the locks.
+            with contextlib.suppress(Exception):
+                super().tpc_vote(transaction)
+            raise
+        super().tpc_vote(transaction)
+        return [conflict[0] for conflict in conflicts]
 
     def history(self, oid, size=1):
         """Return at most `size` records of `oid`, newest first."""
@@ -62,8 +108,10 @@ class Storage(_zoe.Storage):
         """Accept the database. The storage sends it no invalidations.
 
         Only this process writes the store, and ZODB gets the
-        invalidations of each commit from the `tpc_finish` callback.
+        invalidations of each commit from the `tpc_finish` callback. The
+        conflict resolution takes the record transforms of the database.
         """
+        super().registerDB(wrapper)
 
     def supportsUndo(self):
         """Return False: the storage does not undo transactions."""
