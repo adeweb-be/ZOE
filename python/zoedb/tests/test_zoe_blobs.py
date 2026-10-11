@@ -3,7 +3,8 @@
 The acceptance test covers the commit of a blob, the rename from the
 temporary directory, the read-only files and the layout. These tests cover
 the rest: the refused calls, the copy of a file from elsewhere, a blob of a
-savepoint, `blob_dir` and the calls on a read-only or a closed storage.
+savepoint, `blob_dir`, `restoreBlob` and the calls on a read-only or a
+closed storage.
 """
 
 import os
@@ -17,6 +18,8 @@ from ZODB import DB
 from ZODB.blob import Blob
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import (
+    ConflictError,
+    POSKeyError,
     ReadOnlyError,
     StorageError,
     StorageTransactionError,
@@ -31,6 +34,14 @@ DATA = bytes(range(256)) * 64
 def blob_record():
     """Return the record that ZODB writes for a blob."""
     return pickle.dumps((("ZODB.blob", "Blob"), None), 3) + pickle.dumps(None, 3)
+
+
+def p64(value):
+    return value.to_bytes(8, "big")
+
+
+def u64(value):
+    return int.from_bytes(value, "big")
 
 
 def write_temporary(storage, data):
@@ -227,6 +238,9 @@ def test_a_read_only_storage_refuses_the_blob_writes(tmp_path):
         for call in (
             storage.temporaryDirectory,
             lambda: storage.storeBlob(oid, tid, blob_record(), str(outside), "", txn),
+            lambda: storage.restoreBlob(
+                oid, tid, blob_record(), str(outside), None, txn
+            ),
         ):
             with pytest.raises(ReadOnlyError):
                 call()
@@ -258,7 +272,70 @@ def test_the_blob_calls_of_a_closed_storage_raise_storage_error(tmp_path):
         lambda: storage.loadBlob(oid, tid),
         lambda: storage.openCommittedBlobFile(oid, tid),
         lambda: storage.storeBlob(oid, tid, blob_record(), path, "", txn),
+        lambda: storage.restoreBlob(oid, tid, blob_record(), path, None, txn),
     ):
         with pytest.raises(StorageError):
             call()
     assert read(path) == DATA
+
+
+def test_restore_blob_commits_under_the_tid_of_the_transaction(storage, tmp_path):
+    oid = storage.new_oid()
+    first = store_blob(storage, oid, ZERO, write_temporary(storage, b"first"))
+    tid = p64(u64(first) + 1000)
+    outside = tmp_path / "outside.blob"
+    outside.write_bytes(b"copied")
+    other = storage.new_oid()
+
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn, tid)
+    # The serial and the previous transaction of ZODB are not used: the
+    # previous serial is the current serial of the store.
+    storage.restoreBlob(
+        oid, tid, blob_record(), write_temporary(storage, b"restored"), None, txn
+    )
+    storage.restoreBlob(other, tid, blob_record(), str(outside), first, txn)
+    storage.tpc_vote(txn)
+    assert storage.tpc_finish(txn) == tid
+
+    assert storage.lastTransaction() == tid
+    assert read(storage.loadBlob(oid, tid)) == b"restored"
+    assert read(storage.loadBlob(oid, first)) == b"first"
+    assert read(storage.loadBlob(other, tid)) == b"copied"
+    assert storage.loadBefore(oid, p64(2**63 - 1))[:2] == (blob_record(), tid)
+    assert not outside.exists()
+
+
+def test_restore_blob_needs_a_restore_transaction(storage):
+    oid = storage.new_oid()
+    path = write_temporary(storage, DATA)
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    with pytest.raises(StorageTransactionError):
+        storage.restoreBlob(oid, ZERO, blob_record(), path, None, txn)
+    storage.tpc_abort(txn)
+    assert read(path) == DATA
+
+    # A restore transaction needs a tid after the last one.
+    last = store_blob(storage, oid, ZERO, path)
+    with pytest.raises(StorageTransactionError):
+        storage.tpc_begin(TransactionMetaData(), last)
+
+
+def test_restore_blob_conflicts_when_the_object_changes_before_the_vote(storage):
+    oid = storage.new_oid()
+    first = store_blob(storage, oid, ZERO, write_temporary(storage, b"first"))
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn, p64(2**63 - 2))
+    storage.restoreBlob(
+        oid, ZERO, blob_record(), write_temporary(storage, b"restored"), None, txn
+    )
+
+    second = store_blob(storage, oid, first, write_temporary(storage, b"second"))
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.serials == (second, first)
+    assert storage._lock_table_is_empty()
+    with pytest.raises(POSKeyError):
+        storage.loadBlob(oid, p64(2**63 - 2))

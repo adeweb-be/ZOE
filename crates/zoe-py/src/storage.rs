@@ -13,8 +13,8 @@
 //! to a local before an exception is built. The last reference to the
 //! store drops without the GIL, so the database closes without it.
 //!
-//! `storeBlob` takes a file of `temporaryDirectory()` by rename, through
-//! the core, and copies a file from elsewhere. `loadBlob`
+//! `storeBlob` and `restoreBlob` take a file of `temporaryDirectory()` by
+//! rename, through the core, and copy a file from elsewhere. `loadBlob`
 //! gives the path of a committed blob file. A `blob_dir` other than
 //! `<path>/blobs` becomes the symbolic link `<path>/blobs` to it.
 //!
@@ -350,7 +350,17 @@ impl Storage {
 
     /// Begin a two-phase commit of `transaction`. The calling thread
     /// drives it.
-    fn tpc_begin(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// With `tid`, the transaction is a restore transaction: a copy of a
+    /// transaction of another storage, which commits under `tid`. It takes
+    /// `restoreBlob`. `tid` must be after the last tid of the store.
+    #[pyo3(signature = (transaction, tid = None))]
+    fn tpc_begin(
+        &self,
+        py: Python<'_>,
+        transaction: &Bound<'_, PyAny>,
+        tid: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         if self.read_only {
             return Err(errors::read_only(py));
         }
@@ -359,11 +369,17 @@ impl Storage {
         if begun {
             return Err(errors::duplicate_transaction(py));
         }
+        let tid = tid.map(u64_of).transpose()?.map(Tid);
         let user = text(&transaction.getattr("user")?)?;
         let description = text(&transaction.getattr("description")?)?;
         let extension = text(&transaction.getattr("extension_bytes")?)?;
         let store = self.opened(py)?;
-        let txn = py.detach(move || Txn::begin(store, &user, &description, &extension));
+        let txn = py
+            .detach(move || match tid {
+                None => Ok(Txn::begin(store, &user, &description, &extension)),
+                Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension),
+            })
+            .map_err(|e| core(py, e))?;
         let entry = Arc::new(Entry {
             _transaction: transaction.clone().unbind(),
             txn: Mutex::new(Some(txn)),
@@ -484,6 +500,50 @@ impl Storage {
                 &blobfilename,
                 |txn, path| txn.store_blob_at(oid, serial, data, path),
                 |txn, file| txn.store_blob(oid, serial, data, file),
+            )
+        })
+        .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage a copy of a version of `oid` with the blob in the file
+    /// `blobfilename`, in a restore transaction: a transaction that
+    /// `tpc_begin` began with a tid. The version gets that tid. The storage
+    /// takes the file as `storeBlob` does.
+    ///
+    /// The previous serial of the version is the current serial of `oid` in
+    /// the store, not `serial`. If another transaction changes `oid` before
+    /// the vote, the vote raises `ConflictError`. The store keeps every
+    /// pickle whole, so `prev_txn` is not used.
+    #[pyo3(name = "restoreBlob")]
+    #[allow(clippy::too_many_arguments)]
+    fn restore_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: Option<&[u8]>,
+        blobfilename: PathBuf,
+        prev_txn: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (serial, prev_txn);
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let store = self.opened(py)?;
+        let entry = self.entry(py, transaction)?;
+        let oid = Oid(u64_of(oid)?);
+        let data = data.unwrap_or_default();
+        // The entry holds a Python reference, so it drops while the thread
+        // is attached. The store drops while it is detached.
+        py.detach(|| {
+            let store = store;
+            take_blob(
+                &store,
+                &entry,
+                &blobfilename,
+                |txn, path| txn.restore_blob_at(oid, data, path),
+                |txn, file| txn.restore_blob(oid, data, file),
             )
         })
         .map_err(|failure| failure.into_py(py))
