@@ -755,11 +755,14 @@ impl WriteTxn for RedbWrite<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use redb::StorageBackend;
     use redb::backends::InMemoryBackend;
     use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
+    use crate::store::Store;
     use crate::vfs::MemVfs;
 
     impl RedbBackend {
@@ -1575,5 +1578,98 @@ mod tests {
             matches!(&error, Some(ZoeError::Format(message)) if message.contains("transaction index")),
             "{error:?}"
         );
+    }
+
+    /// Check that the records and the transaction index of `backend` name
+    /// the same `(oid, tid)` pairs, and that each transaction row counts
+    /// the index keys of its tid. Return the tids of the rows.
+    fn assert_consistent(backend: &RedbBackend, image: &crate::vfs::CrashImage) -> Vec<Tid> {
+        let txn = backend.db.begin_read().unwrap();
+        let records: BTreeSet<(Tid, Oid)> = txn
+            .open_table(RECORDS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (oid, tid) = format::split_record_key(entry.unwrap().0.value());
+                (tid, oid)
+            })
+            .collect();
+        let index: BTreeSet<(Tid, Oid)> = txn
+            .open_table(TXN_OIDS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| format::split_txn_oid_key(entry.unwrap().0.value()))
+            .collect();
+        assert_eq!(records, index, "{image:?}");
+
+        let rows: Vec<TxnMeta> = backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(Result::unwrap)
+            .collect();
+        let mut counts: BTreeMap<Tid, u64> = BTreeMap::new();
+        for (tid, _) in &index {
+            *counts.entry(*tid).or_default() += 1;
+        }
+        for row in &rows {
+            let count = counts.remove(&row.tid).unwrap_or(0);
+            assert_eq!(count, row.oid_count, "{image:?}: {:?}", row.tid);
+        }
+        assert!(counts.is_empty(), "{image:?}: index keys without a row");
+        rows.iter().map(|row| row.tid).collect()
+    }
+
+    #[test]
+    fn every_crash_image_keeps_the_index_and_the_records_together() {
+        // The record of the filesystem starts after the store is created.
+        let created = MemVfs::new();
+        drop(Store::open_vfs(created.clone()).unwrap());
+        let vfs = created.crash_images().pop().unwrap().vfs();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+
+        // A normal commit of three new objects.
+        let oids: Vec<Oid> = (0..3).map(|_| store.new_oid().unwrap()).collect();
+        let mut txn = store.tpc_begin(b"user", b"commit", b"").unwrap();
+        for &oid in &oids {
+            txn.store(oid, Tid::ZERO, b"pickle").unwrap();
+        }
+        txn.vote().unwrap();
+        let committed = txn.finish().unwrap();
+        vfs.mark("committed");
+
+        // A restore of a new version, a deletion and a new object.
+        let restored = Tid(committed.0 + 1);
+        let mut txn = store
+            .tpc_begin_restore(restored, b"user", b"restore", b"")
+            .unwrap();
+        txn.restore(oids[0], Some(b"copy")).unwrap();
+        txn.restore(oids[1], None).unwrap();
+        txn.restore(Oid(oids[2].0 + 1), Some(b"new")).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        vfs.mark("restored");
+
+        // A crash does not close the store, so the images end here.
+        let images = vfs.crash_images();
+        drop(store);
+        assert!(images.len() > 1, "the simulation produced crash images");
+        for image in &images {
+            let db = redb::Builder::new()
+                .create_with_backend(image.vfs().file("zoe.redb"))
+                .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            let backend = RedbBackend::open(db).unwrap();
+            let tids = assert_consistent(&backend, image);
+            // A commit is whole or absent, and no acknowledged commit is
+            // lost.
+            let allowed: &[&[Tid]] = if image.is_after("restored") {
+                &[&[committed, restored]]
+            } else if image.is_after("committed") {
+                &[&[committed], &[committed, restored]]
+            } else {
+                &[&[], &[committed]]
+            };
+            assert!(allowed.contains(&&tids[..]), "{image:?}: {tids:?}");
+        }
     }
 }
