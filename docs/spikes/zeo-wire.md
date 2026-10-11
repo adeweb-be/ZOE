@@ -8,19 +8,19 @@ What do a stock ZEO 6 server and an unmodified `ZEO.ClientStorage` send each oth
 
 - Versions: ZEO 6.2 and ZODB 6.3 from `python/uv.lock`, msgpack 1.2.3, CPython 3.13. The server is `runzeo` in a child process, with `msgpack true`, on a FileStorage with a blob directory. The clients are `ZEO.ClientStorage` with no change.
 - A TCP proxy between them (`zoe.testing.wire.Recorder`) cuts the byte stream into frames and decodes each frame as ZEO does (`msgpack.unpackb(raw=False, use_list=False)`). It records a frame before it forwards it.
-- A driver (`zoe.testing.wire_scenarios`) runs seven scenarios. Each one writes a trace, one JSON line per frame: `connection`, `direction`, `id`, `flags`, `method`, `args` (Python reprs) and `raw` (the payload, in hex). The traces are in [`zeo-wire/`](zeo-wire/):
+- A driver (`zoe.testing.wire_scenarios`) runs seven scenarios. Each one writes a trace, one JSON line per frame: `connection`, `direction`, `id`, `flags`, `method`, `args` (Python reprs) and `raw` (the payload, in hex). The traces are in `zeo-wire/`:
 
 | Trace | What it does |
 | --- | --- |
-| `plain.jsonl` | two clients; handshake, reads, commits, invalidations, the five error forms, a conflict that the server resolves, blob upload and download, the iterators and `iterator_gc`, pack |
-| `client-resolution.jsonl` | server with `client-conflict-resolution`: the conflict dicts of the vote and the second vote round |
-| `copy.jsonl` | `copyTransactionsFrom`: `tpc_begin` with a tid, `restorea` |
-| `shared-blobs.jsonl` | a shared blob directory: `storeBlobShared` |
-| `read-only.jsonl` | a read-only server and `read_only_fallback`: `ReadOnlyError` on `register` and on `new_oids` |
-| `unregistered.jsonl` | a call of `get_size_info`, and the `ruok` probe |
-| `heartbeat.jsonl` | an idle client: the heartbeat frame |
+| [`plain.jsonl`](zeo-wire/plain.jsonl) | two clients; handshake, reads, commits, invalidations, the five error forms, a conflict that the server resolves, blob upload and download, the iterators and `iterator_gc`, pack |
+| [`client-resolution.jsonl`](zeo-wire/client-resolution.jsonl) | server with `client-conflict-resolution`: the conflict dicts of the vote and the second vote round |
+| [`copy.jsonl`](zeo-wire/copy.jsonl) | `copyTransactionsFrom`: `tpc_begin` with a tid, `restorea` |
+| [`shared-blobs.jsonl`](zeo-wire/shared-blobs.jsonl) | a shared blob directory: `storeBlobShared` |
+| [`read-only.jsonl`](zeo-wire/read-only.jsonl) | a read-only server and `read_only_fallback`: `ReadOnlyError` on `register` and on `new_oids` |
+| [`unregistered.jsonl`](zeo-wire/unregistered.jsonl) | a call of `get_size_info`, and the `ruok` probe |
+| [`heartbeat.jsonl`](zeo-wire/heartbeat.jsonl) | an idle client: the heartbeat frame |
 
-The `start` value of `server_status` and of the `ruok` reply is a fixed placeholder of the same length, `<start time placeholder>`, in `args` and in `raw`. The tids stay as recorded.
+The `start` value of `server_status` and of the `ruok` reply is a fixed placeholder of the same length, `<start time placeholder>`, in `args` and in `raw`. The tids stay as recorded, and so do the floats that come from them: the `time` of each `history` entry and the time of `pack`, in epoch seconds.
 
 The code (the proxy, the server helper and the driver) stays on the branch `card/ZOE-049`. Run it again with `python -m zoe.testing.wire_scenarios OUT [scenario...]`.
 
@@ -113,8 +113,9 @@ Details:
 - In `tpc_begin`, `user` and `description` are bin, `status` is a str (`" "`, or the status of a copied transaction), and `tid` is nil, or a `bin8` in a copy. The extension is a msgpack map of the extension dict, not its pickle: `{}` when empty, `{"note": "spike"}` in the traces. The stock server pickles the map that it decodes. The client cannot send an extension that msgpack cannot encode.
 - `storeBlob` sends `storea` for the oid first, then `storeBlobStart`, the chunks and `storeBlobEnd`, all async. The server writes the chunks to one temporary file per connection.
 - The calls with flags `true` get no reply even on error. When an async call raises in the server, the server closes the connection.
-- `iterator_gc` goes out when the client has dropped an iterator before its end, at the next `tpc_abort` or `tpc_finish`. The iterator ids of transactions and of records share one counter per connection. An iterator at its end is gone on the server.
-- `pack` replies only when the pack is done, then the server sends `info` to every client of the storage. Without the root object (oid 0), the FileStorage pack fails with `["builtins.KeyError", [bin8]]`.
+- `iterator_gc` goes out at the next `tpc_abort` or `tpc_finish` after the client drops an iterator. It lists each transaction iterator that the client dropped before its end, and every record iterator that the client dropped, at its end or not: the client forgets only a transaction iterator at its end. An iterator at its end is gone on the server, so the list can name ids that the server no longer has. In `plain.jsonl`, `iterator_gc` sends `[[1, 2, 3, 4, 5, 6, 7]]`, and ids 1 to 6 are record iterators that ended. The stock server ignores an unknown id. A server that refuses one closes the connection, because `iterator_gc` is async. The iterator ids of transactions and of records share one counter per connection.
+- `storeBlob` stores its oid twice in the transaction, through `storea` and through `storeBlobEnd`, and the stock server keeps both. `invalidateTransaction` then lists the oid twice (`plain.jsonl`, line 111), and `iterator_record_next` gives the record twice (lines 172 and 174).
+- `pack` replies only when the pack is done. Before the reply, the server sends `info` to every client of the storage, so the packing client gets `info` first. Without the root object (oid 0), the FileStorage pack fails with `["builtins.KeyError", [bin8]]`.
 
 ## Commit and the calls of the server
 
@@ -190,7 +191,8 @@ With `client-conflict-resolution` on (`client-resolution.jsonl`), a store with a
 | Frames | "length-prefixed msgpack … `[message_id, async_flag, method, args]`" | the first frame of each side is the raw protocol `M5`, not msgpack; the flags are a bool in calls and an int (0, or 2 for an error) in replies |
 | `ruok` | a handshake method | a protocol payload that replaces `M5`; the answer is JSON, then a close |
 | `get_size_info` | a read method | not registered: a call closes the connection; it reaches clients only as the argument of `info` |
-| Methods that the matrix does not list | silent | registered: `lastTransaction`, `loadSerial` (used by client conflict resolution), `record_iternext`, `getTid`, `new_oid` (an `AttributeError` reply), `undoa`, `undoLog`, `undoInfo` |
+| Methods that the matrix does not list | silent | registered: `lastTransaction`, `loadSerial` (used by client conflict resolution), `record_iternext`, `getTid`, `new_oid` (an `AttributeError` reply) |
+| `undo` | listed with the undo methods (phase 3) | not registered: a call closes the connection; `undoa`, `undoLog` and `undoInfo` are registered |
 | Unknown method | silent | the server closes the connection, with no reply |
 | Error replies | silent | flags 2, `[class, __dict__ or args]`, as in "Errors" |
 | An error in an async call | silent | the server closes the connection |
@@ -198,12 +200,12 @@ With `client-conflict-resolution` on (`client-resolution.jsonl`), a store with a
 | Heartbeat | silent | the client sends `[-1, 0, ".reply", nil]` every 60 s; the server ignores it |
 | `vote` with client resolution | "for a client that negotiated `client_resolve`, the committed states of the unresolved ones for a second vote round", "with the locks still held" (section 5) | a server option; the conflict map carries the client's own pickle (`data`), not the committed state; a stock client accepts the maps with no negotiation; the stock server releases the commit lock between the rounds |
 | Invalidations | "each connection task forwards one `invalidateTransaction` message to its client" | the committing client gets none; it gets `info` before its `tpc_finish` reply |
-| `getInvalidations` | "`None` when the gap is longer than `invalidation-queue-size` (default 100,000 tids)" | nil, as written; the stock default queue is 100 transactions; for a tid older than the queue, nil |
+| `getInvalidations` | "`None` when the gap is longer than `invalidation-queue-size` (default 100,000 tids)" | nil, as written; the stock default queue is 100 transactions; for a tid older than the queue, nil, while `invalidation-age` is not set (the default) |
 | Extension of `tpc_begin` | silent | a msgpack map of the dict, which the server pickles; never the pickle bytes |
 | `register` | `register(storage_id, read_only)`, and the client declares `extensions` there | two args only in the stock client; `read_only` arrives as an int or a bool; a stock server has no third argument |
 | `get_info` | advertises `supportsUndo` and `extensions` | `length`, `size`, `name`, `supportsUndo`, `supports_record_iternext`, `interfaces`; no `extensions` key; the `interfaces` list turns client features on |
 | Blob chunks | "`sendBlob` streams the file in 64 KiB chunks" | the stock server and client use 59,000-byte chunks; the client accepts any size |
-| `iterator_gc`, `iterator_record_*` | listed | the shapes above; the ids share one counter per connection |
+| `iterator_gc`, `iterator_record_*` | listed | the shapes above; the ids share one counter per connection; `iterator_gc` can name ids that the server no longer has, and the server ignores them |
 
 ## Proposed subsection for the specification: "Wire contract"
 
@@ -218,7 +220,7 @@ The stock contract is small and regular, and the traces fix every shape that the
 1. `ruok` and `get_size_info` are not methods. The matrix must move `ruok` to the handshake payload and drop `get_size_info` as a client method. A server that answers `get_size_info` is harmless; a client never sends it.
 2. The matrix must add `lastTransaction`, `loadSerial`, `record_iternext` and `getTid`. `loadSerial` is on the path of every conflict that the client resolves.
 3. The error reply, the closes and the id forms above are the contract. A test must check them byte for byte against the traces.
-4. Client conflict resolution already exists in stock ZEO, with no negotiation. Tier 4 of section 5 can use it for stock clients. The difference is that the stock server releases the lock between the rounds.
+4. Client conflict resolution already exists in stock ZEO, with no negotiation. Tier 3 of section 5 can use it for stock clients. The difference is that the stock server releases the lock between the rounds.
 
 ## Not tested
 
