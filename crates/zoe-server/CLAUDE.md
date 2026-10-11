@@ -30,6 +30,8 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - The server has no Python inside and needs no Plone eggs. It ships as one static binary.
 - Core calls run on the blocking pool, never on the async runtime threads. Each connection runs its calls in order on one thread of the pool, so one thread drives each core transaction and the core never answers `WrongThread`.
 - The server announces `M5` and takes only `M5`. A frame is a 4-byte big-endian length, then the bytes. A reply carries the message id of its call, whatever its msgpack type. The id -1 is a heartbeat and gets no reply. An error goes out with the flags 2 and `[class, args]`, with the class names of ZODB's exceptions. An error of a call without a reply closes the connection, as in ZEO.
+- A frame with the id -1 is a heartbeat whatever its other parts: it gets no reply and changes nothing.
+- The decode of a frame has a depth bound of 128 steps of rmpv, about 60 levels of arrays or maps. A deeper frame closes its connection, and the server stays up. A stock server takes deeper frames, but a ZEO message nests at most about 3 levels, and a transaction extension nests as deep as its dict.
 - `tpc_finish` replies only after the core made the commit durable.
 - stdout carries only the lines `admin <address>` and `listening <address>`. The logs go to stderr.
 - SIGTERM closes the store and exits with 0. `Server::stop` and the drop of a `Server` close it too: they drop the runtime, which waits for the session threads, and then the store.
