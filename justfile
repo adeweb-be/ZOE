@@ -10,12 +10,15 @@ pythons := "3.12 3.13 3.14 3.14t"
 default:
     @just --list
 
-# Check the format and run clippy and the Python lints.
-check:
+# Check the format and run clippy, the Python lints and the type check of
+# the Loupe window.
+check: _loupe-modules
     cargo fmt --all --check
+    rustfmt --check --edition 2024 apps/loupe/src-tauri/build.rs apps/loupe/src-tauri/src/main.rs
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src
     ruff format --check python ci/src
+    npm --prefix apps/loupe run lint
 
 # Run the Rust tests, then the Python tests on every interpreter.
 test:
@@ -105,9 +108,50 @@ bench *args="run":
     fi
     exec "${shootout[@]}" python -m shootout {{ args }}
 
-# Build and run Loupe.
-loupe:
-    @echo "just loupe: builds and runs the Loupe desktop app from apps/loupe/. Not built yet."
+# Build and run Loupe. `just loupe` builds a release app and runs it,
+# `just loupe dev` runs it on the Vite dev server, `just loupe check` lints
+# the app, and `just loupe e2e` builds a debug app and runs the end-to-end
+# tests under xvfb-run.
+loupe command="run": _loupe-modules
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd apps/loupe
+    # Loupe is a Cargo workspace of its own. Its build goes to target/loupe.
+    export CARGO_TARGET_DIR="{{ justfile_directory() }}/target/loupe"
+    case "{{ command }}" in
+        run)
+            cargo tauri build --no-bundle -- --locked
+            exec "$CARGO_TARGET_DIR/release/loupe"
+            ;;
+        dev)
+            exec cargo tauri dev
+            ;;
+        check)
+            npm run lint
+            rustfmt --check --edition 2024 src-tauri/build.rs src-tauri/src/main.rs
+            # The Tauri context embeds dist/, so clippy needs a build of it.
+            npm run build
+            cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings
+            ;;
+        e2e)
+            cargo tauri build --debug --no-bundle -- --locked
+            # Xvfb has no GPU, so Mesa renders in software.
+            LIBGL_ALWAYS_SOFTWARE=1 exec xvfb-run --auto-servernum npm run e2e
+            ;;
+        *)
+            echo "just loupe: unknown command {{ command }}. Use run, dev, check or e2e." >&2
+            exit 2
+            ;;
+    esac
+
+# Install the node modules of the Loupe window when the lock file is newer.
+_loupe-modules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd apps/loupe
+    if [ ! node_modules/.package-lock.json -nt package-lock.json ]; then
+        npm ci --no-audit --no-fund
+    fi
 
 # Build the documentation site from docs/ into target/book.
 docs:
