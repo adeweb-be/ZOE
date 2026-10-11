@@ -48,12 +48,14 @@ def blob_directory(storage):
     return os.path.dirname(os.path.realpath(storage.temporaryDirectory()))
 
 
-def test_the_section_and_the_uri_convert_each_key_the_same_way():
+def test_the_section_gives_each_key_as_text_to_the_converters():
+    # zoe.config converts the text of the section, the twins and the URI
+    # with the same converters. So ZConfig must not convert it first.
     schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
     datatypes = {key: info.datatype for key, info in schema.gettype("zoe")}
     assert datatypes.keys() == config.KEYS.keys()
     for key, datatype in datatypes.items():
-        assert datatype is config.KEYS[key], key
+        assert datatype is str, key
 
 
 def test_a_twin_is_zoe_and_the_key_in_snake_case():
@@ -119,10 +121,44 @@ def test_a_bad_twin_names_the_variable(tmp_path, monkeypatch):
         open_stanza(f"path {tmp_path / 'store'}")
 
 
-def test_a_bad_value_in_the_section_raises_value_error(tmp_path):
-    for line in ("lock-timeout 1.5s", "read-only maybe", "backend fdb"):
-        with pytest.raises(ValueError):
-            open_stanza(f"path {tmp_path / 'store'}", line)
+def test_an_empty_key_of_the_section_counts_as_not_set(tmp_path, monkeypatch):
+    path = f"path {tmp_path / 'store'}"
+    open_stanza(path).close()
+
+    # An empty typed key takes its twin, or else its default.
+    monkeypatch.setenv("ZOE_READ_ONLY", "true")
+    empty = ("read-only", "lock-timeout", "early-locks", "backend", "blob-dir")
+    storage = open_stanza(path, *empty)
+    try:
+        assert storage.isReadOnly() is True
+    finally:
+        storage.close()
+
+    monkeypatch.delenv("ZOE_READ_ONLY")
+    storage = open_stanza(path, *empty)
+    try:
+        assert storage.isReadOnly() is False
+        assert blob_directory(storage) == os.path.realpath(tmp_path / "store" / "blobs")
+    finally:
+        storage.close()
+
+
+def test_an_empty_path_of_the_section_takes_its_twin(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOE_PATH", str(tmp_path / "store"))
+    storage = open_stanza("path")
+    try:
+        assert storage.getName() == os.path.realpath(tmp_path / "store")
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    "line", ["lock-timeout 1.5s", "read-only maybe", "backend fdb", "early-locks on"]
+)
+def test_a_bad_value_in_the_section_names_the_key(tmp_path, line):
+    key, value = line.split()
+    with pytest.raises(ValueError, match=f"<zoe> {key} '{value}'"):
+        open_stanza(f"path {tmp_path / 'store'}", line)
 
 
 def test_the_uri_does_not_read_the_twins(tmp_path, monkeypatch):

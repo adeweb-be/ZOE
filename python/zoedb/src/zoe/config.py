@@ -8,7 +8,9 @@ The keys are in kebab-case. The query of the URI takes the same keys with
 the same values. Each key has an environment variable, its twin: `ZOE_` and
 the key in upper case, with `_` for `-`. The twin gives the value of a key
 only when the section does not set it. The URI does not read the twins. An
-empty value counts as not set.
+empty value counts as not set. ZConfig gives each value of the section as
+text, and this module converts the section, the twins and the URI with the
+same converters.
 """
 
 import os
@@ -40,8 +42,7 @@ def early_locks(value):
     return False
 
 
-# The keys and the converters of their values. component.xml names the same
-# datatypes.
+# The keys and the converters of their values.
 KEYS = {
     "path": stock_datatypes["string"],
     "blob-dir": stock_datatypes["string"],
@@ -90,13 +91,13 @@ class ZoeStorage(BaseConfig):
     def open(self):
         settings = {}
         for key in KEYS:
-            value = getattr(self.config, key.replace("-", "_"))
-            if value is None or value == "":
+            text = getattr(self.config, key.replace("-", "_"))
+            source = f"<zoe> {key} {text!r}"
+            if not text:
                 text = os.environ.get(twin(key), "")
-                if not text:
-                    continue
-                value = convert(key, text, f"{twin(key)}={text!r}")
-            settings[key] = value
+                source = f"{twin(key)}={text!r}"
+            if text:
+                settings[key] = convert(key, text, source)
         return open_storage(settings)
 
 

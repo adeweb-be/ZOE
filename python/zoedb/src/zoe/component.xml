@@ -12,7 +12,9 @@
       environment variable, its twin. The twin is "ZOE_" and the key in
       upper case, with "_" for "-". The twin gives the value only when the
       section does not set the key. An empty value counts as not set. The
-      twin takes the same values as the key.
+      twin takes the same values as the key. ZConfig gives each value as
+      text, and zoe.config converts it, so that an empty value of any key
+      reaches the twin.
     </description>
     <key name="path" datatype="string">
       <description>
@@ -26,25 +28,25 @@
         directory in path.
       </description>
     </key>
-    <key name="backend" datatype=".backend">
+    <key name="backend" datatype="string">
       <description>
         The backend of the store. The only backend is redb, the default.
       </description>
     </key>
-    <key name="lock-timeout" datatype="time-interval">
+    <key name="lock-timeout" datatype="string">
       <description>
         The longest time that a vote waits for the lock of an object, in
         whole seconds, such as 10s or 2m. A longer wait raises
         ConflictError. The default is the default of the store.
       </description>
     </key>
-    <key name="early-locks" datatype=".early_locks">
+    <key name="early-locks" datatype="string">
       <description>
         Early write-intent locks. The storage has none yet: off is the
         only value, and the default.
       </description>
     </key>
-    <key name="read-only" datatype="boolean">
+    <key name="read-only" datatype="string">
       <description>
         If true, the storage refuses writes and does not create a missing
         directory. The default is false.
