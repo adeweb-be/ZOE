@@ -25,9 +25,7 @@ The run collects the suites of ZODB unchanged and runs each test under
 
 The run skips only the tests in `SKIPS`, each with its reason. The storage
 does not undo, so `supportsUndo()` is false and the undo tests are skipped.
-On a free-threaded build, the run also skips one race test, because the
-stock persistent is not thread-safe there. ZODB itself skips the tests in
-`OWN_SKIPS`.
+ZODB itself skips the tests in `OWN_SKIPS`.
 
 These parts of ZODB do not apply to the storage, so the run does not
 collect them:
@@ -53,15 +51,12 @@ collect them:
 
 import doctest
 import importlib
-import sysconfig
 import unittest
 
 import pytest
 
 import zoe
 import zoe.testing
-
-FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 # The storage suites of ZODB: each module and its test classes.
 STORAGE_SUITES = {
@@ -125,13 +120,6 @@ SKIPS = {
     "BlobUndoTests.testRedo": UNDO,
     "BlobUndoTests.testRedoOfCreation": UNDO,
 }
-if FREE_THREADED:
-    # The cache of the stock persistent is not thread-safe on a
-    # free-threaded build. This race crashes the interpreter, with
-    # FileStorage too.
-    SKIPS["RaceTests.test_race_loadopen_vs_local_invalidate"] = (
-        "the stock persistent is not thread-safe on a free-threaded build"
-    )
 
 # ZODB skips these tests itself when the test case cannot open a second
 # client of the storage. They can also pass.
