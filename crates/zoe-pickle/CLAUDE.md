@@ -14,3 +14,7 @@ Decode and encode ZODB records (the class pickle and the state pickle) as a gene
 - Offline tools that must read every record, such as pack and the converters, give a budget equal to the length of the record. The node count never gets above that length, so this budget refuses nothing that the input can hold. For these tools, any refusal is a hard error. Pack never reads a refused record as a record with no references.
 - A memo get resolves to the latest put of its index before it, across the class pickle and the state pickle. A put inside an opaque node hides the value of its index.
 - The decoder refuses the bytes that Python's unpickler refuses as malformed, for example an unknown protocol or a BINSTRING or LONG4 length of 2³¹ or more. It can refuse more, for example a pickle that leaves values on the stack at STOP. An error that Python finds only when it calls a class or a function, for example REDUCE with arguments that are not a tuple, stays inside an opaque node.
+
+## Known differences from Python
+
+- A dict key that Python cannot hash, such as a list, stays modelled. Python refuses such a record when it loads it, so no store holds one.
