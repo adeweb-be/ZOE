@@ -482,7 +482,9 @@ mod tests {
     #[test]
     fn a_restore_tid_that_fails_its_check_fails_only_its_member() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
-        let tid = Tid(timestamp(std::time::SystemTime::now()).0 + 1_000_000);
+        // The restore tid is far after the clock, so it is after the first
+        // commit also on a slow build.
+        let tid = timestamp(std::time::SystemTime::now() + Duration::from_secs(3600));
         let first = store.new_oid().unwrap();
         let txns = vec![
             voted(&store, first, b"first"),
