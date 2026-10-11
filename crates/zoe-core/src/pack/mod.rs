@@ -512,6 +512,7 @@ fn class_name(data: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::Write;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -566,6 +567,145 @@ mod tests {
                 (txn.tid, txn.records.iter().map(|r| r.oid).collect())
             })
             .collect()
+    }
+
+    /// Check that the records and the transaction index of `store` name
+    /// the same `(oid, tid)` pairs, and that each transaction row counts
+    /// the index keys of its tid. Return the tids of the rows. `what`
+    /// names the store in a failure.
+    fn assert_indexed(store: &Store, what: &str) -> Vec<Tid> {
+        let backend = &store.backend;
+        let records: BTreeSet<(Tid, Oid)> = backend
+            .record_keys(Oid(0), usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(oid, tid)| (tid, oid))
+            .collect();
+        let index = backend.txn_oids(Tid::ZERO, Tid::MAX).unwrap();
+        let keys: BTreeSet<(Tid, Oid)> = index
+            .iter()
+            .flat_map(|(&tid, oids)| oids.iter().map(move |&oid| (tid, oid)))
+            .collect();
+        assert_eq!(records, keys, "{what}: records and index keys");
+
+        let rows: Vec<TxnMeta> = backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(Result::unwrap)
+            .collect();
+        let counted: BTreeMap<Tid, u64> = rows
+            .iter()
+            .filter(|row| row.oid_count > 0)
+            .map(|row| (row.tid, row.oid_count))
+            .collect();
+        let indexed: BTreeMap<Tid, u64> = index
+            .iter()
+            .map(|(&tid, oids)| (tid, oids.len() as u64))
+            .collect();
+        assert_eq!(counted, indexed, "{what}: oid counts and index keys");
+        rows.iter().map(|row| row.tid).collect()
+    }
+
+    /// Commit four transactions, then return their tids. A pack at the
+    /// last one keeps one record of the first transaction, no record of
+    /// the second, and every record of the other two.
+    fn packable(store: &Store) -> [Tid; 4] {
+        let [a, g, h] = [1, 2, 3].map(Oid);
+        let t1 = commit(
+            store,
+            &[
+                (ROOT, record(&[a, g, h])),
+                (a, record(&[])),
+                (g, record(&[])),
+                (h, record(&[])),
+            ],
+        );
+        let t2 = commit(store, &[(g, record(&[]))]);
+        let t3 = commit(store, &[(ROOT, record(&[a, h]))]);
+        let t4 = commit(store, &[(a, record(&[]))]);
+        [t1, t2, t3, t4]
+    }
+
+    #[test]
+    fn a_record_without_its_index_key_stops_the_pack_and_stays() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let g = Oid(1);
+        let t1 = commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+        let t2 = commit(&store, &[(ROOT, record(&[]))]);
+        store.remove_index_key_for_test(t1, g).unwrap();
+
+        // The batch removes ROOT and g at t1. Its write fails, so it
+        // removes neither.
+        let error = store.pack(t2);
+        assert!(
+            matches!(error, Err(ZoeError::CorruptTxn { tid }) if tid == t1),
+            "{error:?}"
+        );
+        assert_eq!(store.load_serial(g, t1).unwrap(), record(&[]));
+        assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
+    }
+
+    #[test]
+    fn the_iterator_after_a_pack_gives_the_transactions_that_remain() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let [t1, t2, t3, t4] = packable(&store);
+        let (a, h) = (Oid(1), Oid(3));
+
+        let report = store.pack(t4).unwrap();
+
+        // ROOT, a and g go from t1, and g from t2, so the row of t2 goes.
+        assert_eq!(report.records, 4, "{report:?}");
+        assert_eq!(assert_indexed(&store, "after the pack"), [t1, t3, t4]);
+        let expected = [(t1, vec![h]), (t3, vec![ROOT]), (t4, vec![a])];
+        assert_eq!(transactions(&store), expected);
+        let range = |start, stop| -> Vec<Tid> {
+            store
+                .iterator(Some(start), Some(stop))
+                .unwrap()
+                .map(|txn| txn.unwrap().tid)
+                .collect()
+        };
+        assert!(range(t2, t2).is_empty());
+        assert_eq!(range(t1, t3), [t1, t3]);
+    }
+
+    #[test]
+    fn every_crash_image_of_a_pack_keeps_the_index_and_the_records_together() {
+        let built = MemVfs::new();
+        let [t1, _, t3, t4] = packable(&Store::open_vfs(built.clone()).unwrap());
+        let (a, h) = (Oid(1), Oid(3));
+
+        // The crash images cover the pack, one record per batch, not the
+        // commits before it.
+        let vfs = built.durable_copy();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let report = store.pack_in_batches(t4, 1, || {}).unwrap();
+            assert_eq!(report.records, 4, "{report:?}");
+            vfs.mark("packed");
+        }
+
+        let images = vfs.crash_images();
+        assert!(images.len() > 1, "the simulation produced crash images");
+        for image in &images {
+            let what = format!("{image:?}");
+            let store = Store::open_vfs(image.vfs())
+                .unwrap_or_else(|e| panic!("{what} does not open without repair: {e}"));
+            let rows = assert_indexed(&store, &what);
+            // The iterator gives each row that is left, with no error.
+            let tids: Vec<Tid> = store
+                .iterator(None, None)
+                .unwrap()
+                .map(|txn| txn.unwrap_or_else(|e| panic!("{what}: {e}")).tid)
+                .collect();
+            assert_eq!(tids, rows, "{what}");
+            for tid in [t1, t3, t4] {
+                assert!(rows.contains(&tid), "{what} lost {tid:?}");
+            }
+            if image.is_after("packed") {
+                let expected = [(t1, vec![h]), (t3, vec![ROOT]), (t4, vec![a])];
+                assert_eq!(transactions(&store), expected, "{what}");
+            }
+        }
     }
 
     #[test]
@@ -839,6 +979,7 @@ mod tests {
             let image_vfs = image.vfs();
             let store = Store::open_vfs(image_vfs.clone())
                 .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
+            assert_indexed(&store, &format!("{image:?}"));
             store.verify_blob(f, t2).unwrap();
             for (oid, tid) in [(f, t1), (g, g1)] {
                 match store.verify_blob(oid, tid) {
@@ -908,6 +1049,7 @@ mod tests {
             }
             let image_vfs = image.vfs();
             let store = Store::open_vfs(image_vfs.clone()).unwrap();
+            assert_indexed(&store, &format!("{image:?}"));
             assert!(is_removed(&store, f, t1), "{image:?}");
             let left = orphans(&store, &image_vfs, &[(f, t1), (f, t2)]);
             assert!(left.is_empty(), "{image:?} keeps {left:?}");

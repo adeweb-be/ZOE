@@ -6,6 +6,7 @@
 //! files and directories in memory and records every write, length change,
 //! sync and directory change. `MemVfs::crash_images` replays that record
 //! and returns the states that a crash can leave on disk.
+//! `MemVfs::bytes_read` counts the bytes that its files give to reads.
 //!
 //! A name is a path in the store directory, with `/` between its parts,
 //! for example `blobs/tmp/1.tmp`. The empty name `""` is the store
@@ -421,6 +422,8 @@ struct State {
     /// Every operation since the record started, in order.
     log: Vec<Op>,
     process: Process,
+    /// The bytes that reads of the files returned.
+    bytes_read: u64,
 }
 
 impl State {
@@ -487,6 +490,7 @@ impl MemVfs {
             dirs,
             log: Vec::new(),
             process: Process::Alive,
+            bytes_read: 0,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -539,6 +543,12 @@ impl MemVfs {
     pub fn durable_copy(&self) -> MemVfs {
         let state = self.lock();
         MemVfs::with_tree(state.files.clone(), state.dirs.clone())
+    }
+
+    /// Return the number of bytes that reads of the files returned since
+    /// this filesystem was made. Clones share the count.
+    pub fn bytes_read(&self) -> u64 {
+        self.lock().bytes_read
     }
 
     /// Record a named point. `CrashImage::is_after` tells if a crash came
@@ -945,7 +955,7 @@ impl redb::StorageBackend for MemFile {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        let state = self.vfs.lock();
+        let mut state = self.vfs.lock();
         state.alive()?;
         let empty = Vec::new();
         let bytes = state.files.get(&self.name).unwrap_or(&empty);
@@ -958,6 +968,7 @@ impl redb::StorageBackend for MemFile {
             ));
         }
         out.copy_from_slice(&bytes[start..end]);
+        state.bytes_read += out.len() as u64;
         Ok(())
     }
 
@@ -1297,6 +1308,22 @@ mod tests {
 
         // None, all, the n - 1 proper prefixes and the n single ones.
         assert_eq!(last_point(&vfs).len(), 2 + (n - 1) + n);
+    }
+
+    #[test]
+    fn clones_share_the_count_of_bytes_read() {
+        let (vfs, file) = with_file();
+        file.write(0, b"abcdef").unwrap();
+        let mut out = [0; 4];
+        vfs.clone().file("f").read(1, &mut out).unwrap();
+        assert_eq!(&out, b"bcde");
+        assert_eq!(vfs.bytes_read(), 4);
+
+        // A read past the end fails and counts nothing.
+        assert!(file.read(4, &mut out).is_err());
+        assert_eq!(vfs.bytes_read(), 4);
+        // An image starts a fresh count.
+        assert_eq!(vfs.crash_images().pop().unwrap().vfs().bytes_read(), 0);
     }
 
     #[test]

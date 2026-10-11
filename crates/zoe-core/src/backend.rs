@@ -6,9 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::Result;
-#[cfg(feature = "testing")]
-use crate::error::ZoeError;
+use crate::error::{Result, ZoeError};
 use crate::format::Codec;
 use crate::types::{Oid, Tid};
 
@@ -18,8 +16,8 @@ pub type Bytes = Vec<u8>;
 /// An iterator over the transaction log, in tid order.
 pub type TxnIter<'a> = Box<dyn Iterator<Item = Result<TxnMeta>> + 'a>;
 
-/// The row of a transaction, and the records of it that one read found,
-/// as `(oid, pickle)`.
+/// The row of a transaction and its records, as `(oid, pickle)`, from one
+/// snapshot.
 pub type TxnRecords = (TxnMeta, Vec<(Oid, Bytes)>);
 
 /// One version of one object: a row of the `records` key space.
@@ -138,6 +136,13 @@ pub trait Backend: Send + Sync {
     /// Return the oids that each transaction from `from` to `to` wrote,
     /// both bounds included. The oids of a transaction are in ascending
     /// order. One snapshot gives the whole map.
+    ///
+    /// The map comes from the transaction index. The call reads only the
+    /// index keys of the range and no record, so its cost is the size of
+    /// the result. A key outside the range, or a key that does not come
+    /// after the key before it, is `CorruptTxn`. The iterator takes only
+    /// the tids of the map: `txn_records` reads the oids of each
+    /// transaction with their records.
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;
 
     /// Return the first oid at or after `from` that has a version, with
@@ -160,10 +165,16 @@ pub trait Backend: Send + Sync {
     /// snapshot gives the list.
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;
 
-    /// Return the transaction row of `tid` and the records of `oids` that
-    /// `tid` wrote and that exist, in one snapshot. Return `None` when the
-    /// row does not exist.
-    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>>;
+    /// Return the transaction row of `tid` and the records that the
+    /// transaction index gives for `tid`, in oid order, in one snapshot.
+    /// Return `None` when the row does not exist and no index key of `tid`
+    /// is left.
+    ///
+    /// An index key without its record is `CorruptTxn`. Index keys of a
+    /// `tid` that has no row are `CorruptTxn` too, and so is a key of
+    /// another tid or a key that does not come after the key before it.
+    /// The caller compares the records with the oid count of the row.
+    fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;
 
     /// Make all committed writes durable. Group commit uses this barrier.
     fn sync(&self) -> Result<()>;
@@ -188,23 +199,45 @@ pub trait Backend: Send + Sync {
             format!("no test hook to write {key:?}").into(),
         ))
     }
+
+    /// Remove the key `(tid, oid)` of the transaction index and keep the
+    /// record. A test uses it to damage a store. Fail with `NotFound` when
+    /// the key does not exist.
+    #[doc(hidden)]
+    fn remove_index_key_for_test(&self, _tid: Tid, _oid: Oid) -> Result<()> {
+        Err(ZoeError::Backend("this backend has no test hooks".into()))
+    }
+
+    /// Remove the record of `oid` at `tid` and keep its key in the
+    /// transaction index. A test uses it to damage a store. Fail with
+    /// `NotFound` when the record does not exist.
+    #[doc(hidden)]
+    fn remove_record_for_test(&self, _oid: Oid, _tid: Tid) -> Result<()> {
+        Err(ZoeError::Backend("this backend has no test hooks".into()))
+    }
 }
 
-/// One backend write transaction. It holds the records, the blob records,
-/// the transaction row and the meta update of one commit.
+/// One backend write transaction. It holds the records, their keys in
+/// the transaction index, the blob records, the transaction row and the
+/// meta update of one commit.
 pub trait WriteTxn {
-    /// Stage the version of `oid` that `tid` writes. `prev` is the serial
-    /// of the previous version.
+    /// Stage the version of `oid` that `tid` writes, and its key
+    /// `(tid, oid)` in the transaction index. `prev` is the serial of the
+    /// previous version.
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
 
     /// Stage the blob record of the version of `oid` that `tid` writes.
+    /// It has no key of its own in the transaction index: the record of
+    /// the same version has it.
     fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
 
     /// Stage the transaction row.
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
 
-    /// Stage the removal of the record of `oid` that `tid` wrote. Pack
-    /// uses this.
+    /// Stage the removal of the record of `oid` that `tid` wrote, and of
+    /// its key `(tid, oid)` in the transaction index. Pack uses this. A
+    /// missing index key is `CorruptTxn`, so the write does not erase the
+    /// evidence of a damaged store.
     fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()>;
 
     /// Stage the removal of the blob record of `oid` that `tid` wrote.
@@ -332,7 +365,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn txn_records(&self, _: Tid, _: &[Oid]) -> Result<Option<TxnRecords>> {
+        fn txn_records(&self, _: Tid) -> Result<Option<TxnRecords>> {
             Ok(None)
         }
 
