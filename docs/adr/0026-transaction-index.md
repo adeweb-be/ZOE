@@ -1,6 +1,6 @@
 # 0026. The transaction index: a `(tid, oid)` key space
 
-Status: proposed. The choice of a key space over an oid list in the `txns` row was made while the human was away. The human confirms it at merge.
+Status: proposed. The choice of a key space over an oid list in the `txns` row was made while the human was away. The human confirms it at merge, with the signature change of `Backend::txn_records` below.
 
 ## Context
 
@@ -23,21 +23,24 @@ So the key is the `records` key with its two halves swapped. For example, the re
 
 The value is empty. The value type of the table is the unit type `()` of redb, with a fixed width of 0.
 
-**Writes.** `WriteTxn::put_record` stages the record and its index key in the same backend write transaction. A normal commit and a restore both write their records through it in `finish`. So both index each record, and a crash leaves a record and its key together, or neither. No trait signature changes: the contract of `put_record` now includes the key. A blob record (ADR 0023) has no index key of its own. The core stages each blob record with the record of the same `(oid, tid)`, and that record has the key.
+**Writes.** `WriteTxn::put_record` stages the record and its index key in the same backend write transaction. A normal commit and a restore both write their records through it in `finish`. So both index each record, and a crash leaves a record and its key together, or neither. The signature of `put_record` does not change: its contract now includes the key. A blob record (ADR 0023) has no index key of its own. The core stages each blob record with the record of the same `(oid, tid)`, and that record has the key.
 
 **Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. The iterator reads the rows and the index keys of its range first. Then `Backend::txn_records(tid)` reads the row of each transaction, the index keys of its tid and their records, in one snapshot. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
+
+**A trait signature changes.** `Backend::txn_records(tid, oids)` becomes `Backend::txn_records(tid)`. It reads the oids of the transaction from the index, in the snapshot of the row and the records, and no longer takes the oids of an earlier read. Pack added the method, and nothing outside `zoe-core` implements `Backend`. The rule of the crate makes every change of an existing signature a decision of the human, so the human confirms this one at merge.
 
 **Corruption.** The index has no frame and no checksum of its own. The checksum of each record frame covers the `(oid, tid)` key of the record. The iterator checks the index against the rows and the records:
 
 - The index keys of a transaction must match the oid count of its row. A record without its index key breaks this rule, and the iterator gives `CorruptTxn` for its transaction.
 - Each index key must have its record. An index key without its record is `CorruptTxn` for its transaction, never `NotFound`. The row, the keys and the records of a transaction come from one snapshot. So a key that a removal left behind is `CorruptTxn` also when the oid count of its row went down with the record.
 - Index keys of a tid that has no row give `CorruptTxn` for that tid, when the range of the iterator has a row.
+- Each scan of the index checks that each key is inside its range and after the key before it. A damaged branch page of redb can move the seek of a scan, and the scan then gives a key of another transaction, or a key twice. Such a key is `CorruptTxn` with its tid.
 
 A record that no row counts and that no index key names is outside what the iterator reads. Only a scan of `records` finds it. A scrub that reads every record can check the index key of each record at the same time.
 
 **Open.** A store without the `txn_oids` table fails to open with `Format`. No migration exists, because no real store exists yet: the converters of phase 1 write the first real stores, with the index. So the format name stays `ZOE format 1`.
 
-**Pack.** Pack removes records with `WriteTxn::remove_record`, which removes the index key with the record. Each batch of a pack is one backend write transaction that removes records, their index keys and their blob records, lowers the oid count of their rows, and removes a row that keeps no record (ADR 0025). So a row that pack removes has no index key left, and in every snapshot the index keys of a transaction match its row and its records. The crash simulation checks this on every crash image of a pack.
+**Pack.** Pack removes records with `WriteTxn::remove_record`, which removes the index key with the record. Each batch of a pack is one backend write transaction that removes records, their index keys and their blob records, lowers the oid count of their rows, and removes a row that keeps no record (ADR 0025). So a row that pack removes has no index key left, and in every snapshot the index keys of a transaction match its row and its records. `remove_record` refuses a record without its index key with `CorruptTxn`. The batch write then fails and removes nothing, so pack never erases the evidence of a damaged store; as after any failed batch write, the store halts until it is reopened. The crash simulation checks this on every crash image of a pack.
 
 ## Why the value is empty
 
