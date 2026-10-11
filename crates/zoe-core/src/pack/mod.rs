@@ -39,6 +39,11 @@
 //! syncs their directories and removes the intent file. A crash between
 //! the commit and the removal leaves the intent file, and the next open
 //! removes the files that have no blob record.
+//!
+//! A dry run (`Store::pack_dry_run`) runs the mark and the selection of a
+//! pack. It adds each selected record to the report and removes nothing.
+//! It writes nothing. With no commit between them, the report of the dry
+//! run equals the report of the pack.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -59,7 +64,8 @@ const BATCH: usize = 1000;
 /// The number of record keys that one read of the key scan asks for.
 const KEY_CHUNK: usize = 4096;
 
-/// What a pack removed.
+/// What a pack removed. A dry run gives the same report for what a pack
+/// would remove.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackReport {
     /// The number of records that the pack removed.
@@ -73,14 +79,23 @@ pub struct PackReport {
     /// The size of these blob files, in bytes.
     pub blob_bytes: u64,
     /// The removed records by class. The key is `module.name` from the
-    /// class pickle. It is `None` for a deletion, for a persistent class
-    /// and for a class pickle that does not decode.
-    pub by_class: BTreeMap<Option<String>, ClassReport>,
+    /// class pickle, or [`PackReport::UNKNOWN_CLASS`]. The map has one
+    /// entry for each class, so it grows with the number of classes, not
+    /// with the number of records.
+    pub by_class: BTreeMap<String, ClassTotals>,
+}
+
+impl PackReport {
+    /// The `by_class` key of a record that gives no class name: a
+    /// deletion, a record of a persistent class, and a record whose class
+    /// pickle does not decode. The key holds no dot, so no `module.name`
+    /// key is equal to it.
+    pub const UNKNOWN_CLASS: &str = "<unknown>";
 }
 
 /// What a pack removed of one class.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClassReport {
+pub struct ClassTotals {
     /// The number of records.
     pub records: u64,
     /// The size of their pickles, in bytes.
@@ -148,8 +163,8 @@ impl Store {
     /// Pack the store at `at`, as `pack` does, in batches of at most
     /// `batch` records. `between` runs after each batch. It runs without
     /// the commit sequencer and without a backend transaction, so reads
-    /// and commits can run then. Only a second pack waits. Readers and
-    /// commits continue during the whole pack.
+    /// and commits can run then. Only a second pack or a dry run waits.
+    /// Readers and commits continue during the whole pack.
     ///
     /// The pack packs at the lower of `at` and the last tid. A pack at a
     /// tid before the last pack does nothing. A batch of 0 is a batch of
@@ -179,15 +194,7 @@ impl Store {
             (at.min(last), last, watermark)
         };
         let _noting = Noting(&self.packing);
-        let mut pack = Pack {
-            store: self,
-            tid,
-            reachable: HashSet::new(),
-            written: HashSet::new(),
-            cursor: Some(Oid(0)),
-            watermark: (tid > watermark).then_some(tid),
-            report: PackReport::default(),
-        };
+        let mut pack = Pack::new(self, tid, (tid > watermark).then_some(tid));
         pack.mark_roots(last)?;
         loop {
             let removals = pack.plan(batch.max(1))?;
@@ -202,9 +209,49 @@ impl Store {
         }
         Ok(pack.report)
     }
+
+    /// Report what `pack(at)` would remove, and remove nothing.
+    ///
+    /// The dry run runs the mark and the selection of a pack, and adds
+    /// each selected record to the report. So with no commit between the
+    /// dry run and the pack, the two reports are equal.
+    ///
+    /// The dry run writes nothing. It opens no backend write transaction,
+    /// writes no watermark and no intent file, and the finishes note
+    /// nothing for it. It holds the commit sequencer only to read the last
+    /// tid. A read-only store runs it. A halted store refuses it with
+    /// `Halted`, as it refuses a pack. A dry run and a pack hold the same
+    /// lock, so one waits for the other.
+    ///
+    /// The dry run holds the reachable oids of the mark, as a pack does,
+    /// one batch of selected records and the report. The report has one
+    /// entry for each class.
+    ///
+    /// A record that the mark reads and that does not decode fails the dry
+    /// run with `Format`. A record that fails its checksum fails it with
+    /// `CorruptRecord`.
+    pub fn pack_dry_run(&self, at: Tid) -> Result<PackReport> {
+        let _running = lock(&self.packing.running);
+        let last = (*self.lock_sequencer()).ok_or(ZoeError::Halted)?;
+        if at < self.backend.pack_watermark()? {
+            return Ok(PackReport::default());
+        }
+        let mut pack = Pack::new(self, at.min(last), None);
+        pack.mark_roots(last)?;
+        loop {
+            let planned = pack.plan(BATCH)?;
+            if planned.is_empty() {
+                return Ok(pack.report);
+            }
+            // The selection of a pack. No finish is noted for a dry run,
+            // so the mark does not change, and each planned record stays.
+            let removed = pack.confirm(planned);
+            pack.account(&removed);
+        }
+    }
 }
 
-/// One record that a batch removes.
+/// One record that a batch removes, or that a dry run reports.
 struct Removal {
     oid: Oid,
     tid: Tid,
@@ -217,12 +264,12 @@ struct Removal {
     /// The size of the pickle.
     size: u64,
     /// The class of the record, for the report.
-    class: Option<String>,
+    class: String,
     /// The size of the blob file, if the record has a blob.
     blob: Option<u64>,
 }
 
-/// One pack in progress.
+/// One pack or dry run in progress.
 struct Pack<'s> {
     store: &'s Store,
     /// The pack tid T.
@@ -232,14 +279,29 @@ struct Pack<'s> {
     /// The oids that a finish wrote during the pack. Each has a record
     /// after T.
     written: HashSet<Oid>,
-    /// The first oid that the key scan has not finished. `None` at the end.
-    cursor: Option<Oid>,
+    /// The first key that the key scan has not selected or passed. `None`
+    /// at the end.
+    cursor: Option<(Oid, Tid)>,
     /// The watermark that the next batch writes, if it must write one.
     watermark: Option<Tid>,
     report: PackReport,
 }
 
-impl Pack<'_> {
+impl<'s> Pack<'s> {
+    /// Start a pack of `store` at `tid` with nothing marked. `watermark`
+    /// is the watermark that the first batch writes, if any.
+    fn new(store: &'s Store, tid: Tid, watermark: Option<Tid>) -> Self {
+        Pack {
+            store,
+            tid,
+            reachable: HashSet::new(),
+            written: HashSet::new(),
+            cursor: Some((Oid(0), Tid::ZERO)),
+            watermark,
+            report: PackReport::default(),
+        }
+    }
+
     /// Mark the root and each object that a record after T, up to `last`,
     /// refers to, and what they reach.
     fn mark_roots(&mut self, last: Tid) -> Result<()> {
@@ -320,11 +382,16 @@ impl Pack<'_> {
     }
 
     /// Select the next records to remove, at most `batch` of them, in key
-    /// order. Of a marked oid, every record at or before T but the newest
-    /// goes. Of another oid, every record at or before T goes.
+    /// order from the cursor. Of a marked oid, every record at or before T
+    /// but the newest goes. Of another oid, every record at or before T
+    /// goes.
+    ///
+    /// The cursor names the next key to select, so the scan does not
+    /// depend on the removal of the records that it selected before. A
+    /// pack and a dry run select the same records.
     fn plan(&mut self, batch: usize) -> Result<Vec<Removal>> {
         let mut removals = Vec::new();
-        while let Some(from) = self.cursor {
+        while let Some((from, first)) = self.cursor {
             let keys = self.store.backend.record_keys(from, KEY_CHUNK)?;
             if keys.is_empty() {
                 self.cursor = None;
@@ -339,23 +406,35 @@ impl Pack<'_> {
                     .collect();
                 let no_later = keys.iter().all(|&(_, tid)| tid <= self.tid);
                 let kept = self.reachable.contains(&oid);
-                let count = older.len() - usize::from(kept && !older.is_empty());
-                let room = batch - removals.len();
-                for &tid in older.iter().take(count.min(room)) {
+                let selected = &older[..older.len() - usize::from(kept && !older.is_empty())];
+                // Of the oid at the cursor, the records before the cursor
+                // are selected already.
+                let start = if oid == from { first } else { Tid::ZERO };
+                for &tid in selected.iter().filter(|&&tid| tid >= start) {
+                    if removals.len() == batch {
+                        self.cursor = Some((oid, tid));
+                        return Ok(removals);
+                    }
                     let newest = older.last() == Some(&tid);
                     removals.push(self.removal(oid, tid, newest, no_later)?);
                 }
-                if count > room {
-                    self.cursor = Some(oid);
-                    return Ok(removals);
-                }
-                self.cursor = oid.0.checked_add(1).map(Oid);
+                self.cursor = oid.0.checked_add(1).map(|next| (Oid(next), Tid::ZERO));
                 if removals.len() == batch {
                     return Ok(removals);
                 }
             }
         }
         Ok(removals)
+    }
+
+    /// Return the records of `planned` that the pack removes. A finish
+    /// can link an oid again after the plan. The mark then reaches it, and
+    /// its newest record at or before T stays.
+    fn confirm(&self, planned: Vec<Removal>) -> Vec<Removal> {
+        planned
+            .into_iter()
+            .filter(|r| !(r.newest && self.reachable.contains(&r.oid)))
+            .collect()
     }
 
     /// Read what the report needs of the record of `oid` at `tid`.
@@ -401,10 +480,7 @@ impl Pack<'_> {
             }
             // No finish runs from here to the commit below.
             self.mark_written()?;
-            let removed: Vec<Removal> = removals
-                .into_iter()
-                .filter(|r| !(r.newest && self.reachable.contains(&r.oid)))
-                .collect();
+            let removed = self.confirm(removals);
             self.commit(&removed, &mut sequencer)?;
             removed
         };
@@ -502,12 +578,15 @@ impl Pack<'_> {
     }
 }
 
-/// Return `module.name` of the class of the record `data`, or `None` when
-/// the class pickle names no class or does not decode. Only the class
-/// pickle is decoded, so a large state takes no memory here.
-fn class_name(data: &[u8]) -> Option<String> {
-    let (module, name) = decode_class_name(data).ok()??;
-    Some(format!("{module}.{name}"))
+/// Return `module.name` of the class of the record `data`. Return
+/// `PackReport::UNKNOWN_CLASS` when the class pickle names no class or
+/// does not decode, and for a deletion. Only the class pickle is decoded,
+/// so a large state takes no memory here.
+fn class_name(data: &[u8]) -> String {
+    match decode_class_name(data) {
+        Ok(Some((module, name))) => format!("{module}.{name}"),
+        Ok(None) | Err(_) => PackReport::UNKNOWN_CLASS.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -794,14 +873,126 @@ mod tests {
         assert_eq!(
             classes,
             [(
-                &Some("m.C".to_owned()),
-                &ClassReport {
+                &"m.C".to_owned(),
+                &ClassTotals {
                     records: 3,
                     bytes: report.bytes
                 }
             )]
         );
         assert_eq!((report.records, report.objects), (3, 1), "{report:?}");
+    }
+
+    /// Write a store in `vfs` where `x` stays and `g` goes, each with `n`
+    /// records.
+    fn revisions(vfs: MemVfs, n: usize) -> Store {
+        let store = Store::open_vfs(vfs).unwrap();
+        let (x, g) = (Oid(1), Oid(2));
+        commit(&store, &[(ROOT, record(&[x, g]))]);
+        for _ in 0..n {
+            commit(&store, &[(x, record(&[])), (g, record(&[]))]);
+        }
+        commit(&store, &[(ROOT, record(&[x]))]);
+        store
+    }
+
+    /// The key of each record that the plans of a pack at `tid` select in
+    /// batches of `batch`, with nothing removed between them.
+    fn selected(store: &Store, tid: Tid, batch: usize) -> Vec<(Oid, Tid)> {
+        let mut pack = Pack::new(store, tid, None);
+        pack.mark_roots(store.last_transaction()).unwrap();
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let planned = pack.plan(batch).unwrap();
+            if planned.is_empty() {
+                return keys;
+            }
+            assert!(planned.len() <= batch);
+            for removal in planned {
+                let key = (removal.oid, removal.tid);
+                assert!(seen.insert(key), "the plan selects {key:?} twice");
+                keys.push(key);
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_selects_each_record_once_when_nothing_removes_them() {
+        let store = revisions(MemVfs::new(), 5);
+        let last = store.last_transaction();
+        let all = selected(&store, last, usize::MAX);
+        // The old root, four records of x and five of g.
+        assert_eq!(all.len(), 10, "{all:?}");
+        for batch in [1, 2, 3, 4, 9] {
+            assert_eq!(selected(&store, last, batch), all, "batch {batch}");
+        }
+    }
+
+    #[test]
+    fn a_pack_in_small_batches_removes_what_one_batch_removes() {
+        let built = MemVfs::new();
+        let store = revisions(built.clone(), 5);
+        let last = store.last_transaction();
+        drop(store);
+        let packed = |batch| {
+            let store = Store::open_vfs(built.durable_copy()).unwrap();
+            let dry = store.pack_dry_run(last).unwrap();
+            let report = store.pack_in_batches(last, batch, || {}).unwrap();
+            assert_eq!(dry, report, "batch {batch}");
+            (report, transactions(&store))
+        };
+        let (report, left) = packed(1000);
+        assert_eq!((report.records, report.objects), (10, 1), "{report:?}");
+        for batch in [1, 2, 3, 4] {
+            assert_eq!(
+                packed(batch),
+                (report.clone(), left.clone()),
+                "batch {batch}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_without_a_class_name_goes_under_the_unknown_key() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let [x, garbage, persistent, deleted] = [1, 2, 3, 4].map(Oid);
+        // The class pickle of a persistent class is a persistent reference.
+        let persistent_class = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x09Q.\x80\x03}.";
+        let t1 = commit(
+            &store,
+            &[
+                (ROOT, record(&[x])),
+                (x, record(&[])),
+                (garbage, b"not a pickle".to_vec()),
+                (persistent, persistent_class.to_vec()),
+                (deleted, record(&[])),
+            ],
+        );
+        let t2 = Tid(t1.0 + 1);
+        let mut txn = store.tpc_begin_restore(t2, b"", b"", b"").unwrap();
+        txn.restore(deleted, None).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+
+        let dry = store.pack_dry_run(t2).unwrap();
+        let report = store.pack(t2).unwrap();
+        assert_eq!(dry, report);
+
+        let unknown = (b"not a pickle".len() + persistent_class.len()) as u64;
+        let classes: Vec<(&str, u64, u64)> = report
+            .by_class
+            .iter()
+            .map(|(class, totals)| (class.as_str(), totals.records, totals.bytes))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                (PackReport::UNKNOWN_CLASS, 3, unknown),
+                ("m.C", 1, record(&[]).len() as u64),
+            ]
+        );
+        assert_eq!((report.records, report.objects), (4, 3), "{report:?}");
     }
 
     #[test]
@@ -874,6 +1065,7 @@ mod tests {
 
         assert_eq!(store.pack(t2).unwrap().records, 1);
         assert_eq!(store.backend.pack_watermark().unwrap(), t2);
+        assert_eq!(store.pack_dry_run(t1).unwrap(), PackReport::default());
         assert_eq!(store.pack(t1).unwrap(), PackReport::default());
         assert_eq!(store.load_serial(a, t2).unwrap(), record(&[]));
         assert_eq!(store.backend.pack_watermark().unwrap(), t2);
@@ -1215,19 +1407,104 @@ mod tests {
         let store = Store::open_vfs(vfs).unwrap();
 
         // A pack must not delete the evidence of a corruption. The error
-        // names the record.
-        let error = store.pack(t2);
-        assert!(
-            matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
-            "{error:?}"
-        );
+        // names the record. A dry run stops at the same record.
+        for error in [store.pack_dry_run(t2), store.pack(t2)] {
+            assert!(
+                matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
+                "{error:?}"
+            );
+        }
         assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
         assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
     }
 
     #[test]
+    fn a_reachable_record_that_does_not_decode_stops_the_dry_run() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let g = Oid(1);
+        commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+        let t2 = commit(&store, &[(ROOT, b"not a pickle".to_vec())]);
+        let named = format!("oid {ROOT:?}, tid {t2:?}");
+        for result in [store.pack_dry_run(t2), store.pack(t2)] {
+            assert!(
+                matches!(&result, Err(ZoeError::Format(text)) if text.contains(&named)),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// The bytes of each file under `dir`, by path.
+    fn tree(dir: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    /// A directory of one test. Dropping it removes the directory, also
+    /// when the test fails.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_read_only_store_runs_a_dry_run_and_changes_no_byte() {
+        let temp = TempDir::new("dry-run");
+        let dir = &temp.0;
+        let (f, g) = (Oid(1), Oid(2));
+        let last = {
+            let store = Store::open(dir).unwrap();
+            commit(&store, &[(ROOT, record(&[f, g])), (g, record(&[]))]);
+            commit_blob(&store, f, &record(&[]), b"first");
+            commit_blob(&store, f, &record(&[]), b"second");
+            commit(&store, &[(ROOT, record(&[f]))])
+        };
+        let before = tree(dir);
+
+        let store = Store::open_read_only(dir).unwrap();
+        let report = store.pack_dry_run(last).unwrap();
+        drop(store);
+        assert!(tree(dir) == before, "the dry run changed a file");
+        assert_eq!(
+            (
+                report.records,
+                report.objects,
+                report.blobs,
+                report.blob_bytes
+            ),
+            (3, 1, 1, 5),
+            "{report:?}"
+        );
+
+        let store = Store::open(dir).unwrap();
+        assert_eq!(store.pack(last).unwrap(), report);
+    }
+
+    #[test]
     fn a_pack_of_an_empty_store_removes_nothing() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
+        assert_eq!(store.pack_dry_run(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.pack(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
     }
