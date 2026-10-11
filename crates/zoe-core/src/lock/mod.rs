@@ -21,7 +21,8 @@
 //! Each lock that a call takes keeps the time when the call took it, on
 //! the store clock. `lock-warn` measures the hold time from it. The
 //! timeout uses the monotonic clock instead, because a `Condvar` wait
-//! cannot run on a simulated clock.
+//! cannot run on a simulated clock. The call never reads the store clock
+//! under the mutex.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -205,7 +206,7 @@ impl LockManager {
     /// gives the released locks.
     ///
     /// Each lock keeps the time of `clock` when the call took it. The call
-    /// reads `clock` at its start and after each wait.
+    /// reads `clock` at its start and after each wait, without the mutex.
     pub(crate) fn acquire(
         &self,
         requests: &[(Oid, Mode)],
@@ -230,7 +231,8 @@ impl LockManager {
         let mut wake: Option<Arc<Condvar>> = None;
         for &(oid, mode) in requests {
             let entry = table.entries.entry(oid).or_default();
-            if entry.queue.is_empty() && entry.admits(mode) {
+            let free = entry.queue.is_empty() && entry.admits(mode);
+            if free {
                 entry.take(mode);
             } else {
                 let wake: &Arc<Condvar> = wake.get_or_insert_default();
@@ -253,9 +255,19 @@ impl LockManager {
                         released: std::mem::take(&mut locks.held),
                     });
                 }
-                since = clock.now();
             }
             locks.held.push(Held { oid, since });
+            if !free {
+                // The call holds the lock now. It reads the clock without
+                // the mutex, so a slow clock stops no other call. If the
+                // clock panics, `locks` drops and releases this lock too.
+                drop(table);
+                since = clock.now();
+                table = self.table();
+                if let Some(last) = locks.held.last_mut() {
+                    last.since = since;
+                }
+            }
         }
         Ok(locks)
     }
@@ -371,6 +383,38 @@ mod tests {
                 ]
             );
             locks.release(&held);
+        });
+        assert!(locks.is_empty());
+    }
+
+    /// A clock that panics on each read after the first one.
+    struct FailingClock(AtomicIsize);
+
+    impl Clock for FailingClock {
+        fn now(&self) -> SystemTime {
+            assert!(
+                self.0.fetch_add(1, Ordering::SeqCst) == 0,
+                "the clock fails"
+            );
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    #[test]
+    fn a_clock_that_panics_after_a_wait_leaks_no_lock() {
+        let locks = LockManager::default();
+        let holder = locks
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
+        let clock = FailingClock(AtomicIsize::new(0));
+        thread::scope(|scope| {
+            // The call takes `Oid(1)`, then waits for `Oid(2)`. The clock
+            // panics when the call reads it after the wait.
+            let waiter = scope
+                .spawn(|| locks.acquire(&[(Oid(1), Exclusive), (Oid(2), Exclusive)], LONG, &clock));
+            until_waiting(&locks, Oid(2), 1);
+            drop(holder);
+            assert!(waiter.join().is_err());
         });
         assert!(locks.is_empty());
     }
