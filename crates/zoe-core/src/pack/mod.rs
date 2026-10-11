@@ -43,7 +43,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 
-use zoe_pickle::{Limits, PersistentId, decode_record_with, persistent_ids};
+use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
 
 use crate::backend::TxnMeta;
 use crate::error::{Result, ZoeError};
@@ -486,13 +486,10 @@ impl Pack<'_> {
 }
 
 /// Return `module.name` of the class of the record `data`, or `None` when
-/// the class pickle names no class or does not decode.
+/// the class pickle names no class or does not decode. Only the class
+/// pickle is decoded, so a large state takes no memory here.
 fn class_name(data: &[u8]) -> Option<String> {
-    let limits = Limits {
-        node_budget: data.len(),
-    };
-    let tree = decode_record_with(data, limits).ok()?;
-    let (module, name) = tree.class_name()?;
+    let (module, name) = decode_class_name(data).ok()??;
     Some(format!("{module}.{name}"))
 }
 

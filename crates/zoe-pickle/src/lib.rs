@@ -15,7 +15,8 @@
 //!
 //! [`persistent_ids`] lists the persistent references of a record, also
 //! those inside opaque nodes, for pack and the other tools that follow
-//! references.
+//! references. [`decode_class_name`] reads the class of a record from its
+//! class pickle alone.
 
 mod decode;
 mod encode;
@@ -26,7 +27,7 @@ mod references;
 mod text;
 mod tree;
 
-pub use decode::{Limits, NODE_BUDGET, decode_record, decode_record_with};
+pub use decode::{Limits, NODE_BUDGET, decode_class_name, decode_record, decode_record_with};
 pub use encode::encode_record;
 pub use error::Error;
 pub use references::{PersistentId, persistent_ids};
