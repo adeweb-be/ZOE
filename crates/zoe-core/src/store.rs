@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::Backend;
@@ -49,7 +49,7 @@ impl Default for Options {
 
 /// An open store.
 pub struct Store {
-    pub(crate) backend: Box<dyn Backend>,
+    pub(crate) backend: Arc<dyn Backend>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
@@ -58,9 +58,9 @@ pub struct Store {
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
-    /// The directory. It holds the single-writer lock while the store is
-    /// open.
-    _vfs: Box<dyn Any + Send + Sync>,
+    /// The directory. It holds the single-writer lock while the store or
+    /// one of its transaction iterators is open.
+    pub(crate) dir: Arc<dyn Any + Send + Sync>,
 }
 
 impl Store {
@@ -115,13 +115,13 @@ impl Store {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
-            backend: Box::new(backend),
+            backend: Arc::new(backend),
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
-            _vfs: Box::new(vfs),
+            dir: Arc::new(vfs),
         })
     }
 
@@ -187,7 +187,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -214,7 +213,7 @@ mod tests {
 
     /// A backend that fails when a test turns a fault on.
     struct Faulty {
-        inner: Box<dyn Backend>,
+        inner: Arc<dyn Backend>,
         faults: Arc<Faults>,
     }
 
@@ -278,7 +277,7 @@ mod tests {
     fn faulty_store() -> (Store, Arc<Faults>) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
-        let backend = Box::new(Faulty {
+        let backend = Arc::new(Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
         });

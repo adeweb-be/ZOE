@@ -5,9 +5,11 @@
 //! fails with `NotFound`. Each backend read verifies the checksum of every
 //! frame that it returns.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::backend::{Record, TxnIter, TxnMeta};
+use crate::backend::{Backend, Record, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -78,13 +80,19 @@ pub struct CurrentRecord {
 
 /// An iterator over transactions in tid order. Each item holds the
 /// records of its transaction.
-pub struct Transactions<'s> {
-    store: &'s Store,
-    rows: TxnIter<'s>,
+///
+/// The iterator does not borrow the store, and it can move to another
+/// thread. It keeps the store directory locked until it is dropped, also
+/// after the `Store` is dropped.
+pub struct Transactions {
+    backend: Arc<dyn Backend>,
+    /// The directory of the store. It holds the single-writer lock.
+    _dir: Arc<dyn Any + Send + Sync>,
+    rows: std::vec::IntoIter<Result<TxnMeta>>,
     oids: BTreeMap<Tid, Vec<Oid>>,
 }
 
-impl Iterator for Transactions<'_> {
+impl Iterator for Transactions {
     type Item = Result<TxnInfo>;
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
@@ -97,7 +105,7 @@ impl Iterator for Transactions<'_> {
     }
 }
 
-impl Transactions<'_> {
+impl Transactions {
     /// Read the records of the transaction `row`.
     fn txn_info(&self, row: TxnMeta, oids: Vec<Oid>) -> Result<TxnInfo> {
         let tid = row.tid;
@@ -105,7 +113,6 @@ impl Transactions<'_> {
             .into_iter()
             .map(|oid| {
                 let data = self
-                    .store
                     .backend
                     .load_serial(oid, tid)?
                     .ok_or(ZoeError::NotFound { oid })?;
@@ -187,18 +194,19 @@ impl Store {
     /// The iterator stops at the last tid at the time of this call. A
     /// later transaction can commit while the iterator runs, so it is left
     /// out. Each transaction comes with all of its records.
-    pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions<'_>> {
+    pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
-        let (rows, oids): (TxnIter<'_>, _) = if start > stop {
-            (Box::new(std::iter::empty()), BTreeMap::new())
+        let (rows, oids) = if start > stop {
+            (Vec::new(), BTreeMap::new())
         } else {
-            let rows = self.backend.iter_txns(start, stop);
+            let rows = self.backend.iter_txns(start, stop).collect();
             (rows, self.backend.txn_oids(start, stop)?)
         };
         Ok(Transactions {
-            store: self,
-            rows,
+            backend: Arc::clone(&self.backend),
+            _dir: Arc::clone(&self.dir),
+            rows: rows.into_iter(),
             oids,
         })
     }
@@ -454,6 +462,30 @@ mod tests {
         assert!(tids(&store, None, Some(99)).is_empty());
         assert!(tids(&store, Some(300), Some(100)).is_empty());
         assert_eq!(tids(&store, Some(150), Some(300)), [Tid(200), Tid(300)]);
+    }
+
+    #[test]
+    fn the_iterator_moves_to_another_thread_and_outlives_the_store() {
+        let store = three_records();
+        let iterator = store.iterator(None, None).unwrap();
+        drop(store);
+        let tids =
+            std::thread::spawn(move || iterator.map(|txn| txn.unwrap().tid).collect::<Vec<Tid>>())
+                .join()
+                .unwrap();
+        assert_eq!(tids, [Tid(100), Tid(200), Tid(300)]);
+    }
+
+    #[test]
+    fn the_iterator_keeps_the_store_locked() {
+        let dir = std::env::temp_dir().join(format!("zoe-iterator-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let iterator = store.iterator(None, None).unwrap();
+        drop(store);
+        assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
+        drop(iterator);
+        Store::open(&dir).unwrap();
     }
 
     #[test]
