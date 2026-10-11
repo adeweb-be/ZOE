@@ -17,6 +17,7 @@ mod lock;
 mod pack;
 mod read;
 mod redb_backend;
+mod sequence;
 mod store;
 #[cfg(feature = "testing")]
 #[doc(hidden)]
@@ -36,5 +37,6 @@ pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
 pub use pack::{ClassTotals, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
+pub use sequence::Sequence;
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};

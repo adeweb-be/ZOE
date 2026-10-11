@@ -17,6 +17,7 @@ use crate::guard::Guardrails;
 use crate::lock::LockManager;
 use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
+use crate::sequence::{Sequence, Sequences};
 use crate::types::{Oid, Tid};
 use crate::vfs::{MemVfs, OsVfs, Vfs};
 
@@ -130,6 +131,8 @@ pub struct Store {
     /// The state that a pack shares with the finishes. A finish takes its
     /// lock under the commit sequencer.
     pub(crate) packing: PackState,
+    /// The reserved values of the sequences that this store uses.
+    pub(crate) sequences: Sequences,
 }
 
 impl Store {
@@ -274,6 +277,7 @@ impl Store {
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
             packing: PackState::default(),
+            sequences: Sequences::default(),
         })
     }
 
@@ -296,6 +300,16 @@ impl Store {
             })
             .map(Oid)
             .map_err(|_| ZoeError::Protocol("no oid is left"))
+    }
+
+    /// Return the sequence `name` of the store.
+    ///
+    /// `Sequence::next` gives values that are unique and strictly
+    /// increasing per store and per name, from 1. A crash or a reopen can
+    /// skip values, at most one block of 100. An allocation is not part of
+    /// a transaction: an abort does not give its values back.
+    pub fn sequence(&self, name: &str) -> Sequence<'_> {
+        Sequence::new(self, name)
     }
 
     /// Begin a transaction that borrows the store, driven by the calling
@@ -893,6 +907,29 @@ mod tests {
                 "{payload:02x?}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_reservation_that_fails_before_its_write_loses_no_value() {
+        let (store, faults) = faulty_store();
+        let sequence = store.sequence("intids");
+        for fault in [&faults.write, &faults.load] {
+            fault.store(true, Ordering::Relaxed);
+            let error = sequence.next();
+            assert!(matches!(error, Err(ZoeError::Backend(_))), "{error:?}");
+            fault.store(false, Ordering::Relaxed);
+        }
+        let values: Vec<u64> = (0..101).map(|_| sequence.next().unwrap()).collect();
+        assert_eq!(values, (1..=101).collect::<Vec<_>>());
+
+        // A reservation that fails at the block end keeps the next value.
+        for _ in 102..=200 {
+            sequence.next().unwrap();
+        }
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(sequence.next().is_err());
+        faults.write.store(false, Ordering::Relaxed);
+        assert_eq!(sequence.next().unwrap(), 201);
     }
 
     #[test]
