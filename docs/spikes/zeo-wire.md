@@ -20,6 +20,8 @@ What do a stock ZEO 6 server and an unmodified `ZEO.ClientStorage` send each oth
 | `unregistered.jsonl` | a call of `get_size_info`, and the `ruok` probe |
 | `heartbeat.jsonl` | an idle client: the heartbeat frame |
 
+The `start` value of `server_status` and of the `ruok` reply is a fixed placeholder of the same length, `<start time placeholder>`, in `args` and in `raw`. The tids stay as recorded.
+
 The code (the proxy, the server helper and the driver) stays on the branch `card/ZOE-049`. Run it again with `python -m zoe.testing.wire_scenarios OUT [scenario...]`.
 
 Below, `bin8` is a msgpack bin of 8 bytes (an oid or a tid), `bin` a bin of any length, `str` a msgpack str, `[...]` an array and `{...}` a map.
@@ -226,16 +228,20 @@ The stock contract is small and regular, and the traces fix every shape that the
 - A `vote` that waits for the commit lock (a delayed reply), and `transaction_timeout`.
 - TLS.
 - `BTreesConflictError` and `MultipleUndoErrors` replies; their shapes come from the client code only.
-- Python 3.12, 3.14 and 3.14t: the traces come from 3.13 only.
+- Python 3.12, 3.14 and 3.14t: the traces come from 3.13 only. The acceptance test, which checks the method set and some of the forms, passes on all four.
 
 ## The acceptance test
 
-`python/zoedb/tests/server/test_wire_capture.py` cannot pass against stock ZEO 6.2 and an unmodified client. The second test passes. The first test fails, and the question is on the card:
+`python/zoedb/tests/server/test_wire_capture.py` passes on CPython 3.12, 3.13, 3.14 and 3.14t (`just test` on `card/ZOE-049`).
 
-1. `storage._server.get_size_info()` and `storage._server.getInvalidations(tid)`: `storage._server` is a `ZEO.asyncio.client.ClientThread`, which has neither method (`AttributeError`). `storage._call("getInvalidations", tid)` works.
+As first written, the test could not pass against stock ZEO 6.2 and an unmodified client:
+
+1. `storage._server.get_size_info()` and `storage._server.getInvalidations(tid)`: `storage._server` is a `ZEO.asyncio.client.ClientThread`, which has neither method (`AttributeError`).
 2. `get_size_info` is not a registered method. Through `storage._call`, the server closes the connection and the call raises `ClientDisconnected`.
-3. A stock pair never sends `lastTransaction` in that test, and `list(storage.iterator())` sends neither `iterator_record_start`, `iterator_record_next` nor `iterator_gc`. The coverage assertion fails for these four.
-4. After the stale-serial `ConflictError`, the test does not call `tpc_abort`. The commit lock of `ClientStorage` is a `threading.Lock` that `tpc_begin` takes, so the next `commit` in the same thread waits forever.
-5. `storage.pack` fails with `KeyError`, because the test never stores the root object (oid 0).
+3. A stock pair never sends `lastTransaction` in that test, and `list(storage.iterator())` sends neither `iterator_record_start`, `iterator_record_next` nor `iterator_gc`.
+4. After the stale-serial `ConflictError`, the test did not call `tpc_abort`. The commit lock of `ClientStorage` is a `threading.Lock` that `tpc_begin` takes, so the next `commit` in the same thread waits forever.
+5. `storage.pack` fails with `KeyError` when the store has no root object (oid 0).
 
-`zoe.testing.wire_scenarios.plain` shows a sequence with stock calls that covers every method of the test.
+The human approved one edit of the test for each point. `get_size_info` is not an expected client method. `getInvalidations` and `lastTransaction` go through `storage._call`. The test reads the records of each transaction of the iterator, and drops one iterator before its end. `commit` calls `tpc_abort` when a store or the vote fails. The test stores the root object before `pack`.
+
+With `ZOE_WIRE_TRACES` set, the test writes four traces. They show the same methods and the same forms of ids and flags as the traces of the driver, which also cover `getTid`, `new_oid`, more error replies, the heartbeat, the read-only server and the unregistered call. This directory keeps the traces of the driver.
