@@ -116,6 +116,9 @@ pub trait Backend: Send + Sync {
     /// Return the blob record that `tid` wrote for `oid`.
     fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>>;
 
+    /// Tell if the store holds at least one blob record.
+    fn has_blobs(&self) -> Result<bool>;
+
     /// Return the tid of the last committed transaction.
     fn last_tid(&self) -> Tid;
 
@@ -323,6 +326,10 @@ mod tests {
 
         fn load_blob(&self, _: Oid, _: Tid) -> Result<Option<BlobRecord>> {
             Ok(None)
+        }
+
+        fn has_blobs(&self) -> Result<bool> {
+            Ok(false)
         }
 
         fn last_tid(&self) -> Tid {

@@ -93,7 +93,8 @@ impl Failure {
             | ZoeError::Format(_)
             | ZoeError::ReadOnly
             | ZoeError::NotClosedCleanly
-            | ZoeError::TooLarge { .. } => message(storage_error(py), &self.error),
+            | ZoeError::TooLarge { .. }
+            | ZoeError::MissingBlobDir { .. } => message(storage_error(py), &self.error),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }
