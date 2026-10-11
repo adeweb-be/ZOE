@@ -824,11 +824,13 @@ mod tests {
 
         // Every crash image of the killed pack and the open after it
         // opens, keeps the current blob and has a file for each blob
+        // record. After the open, no blob file is left without its blob
         // record.
         let images = vfs.crash_images();
         assert!(images.iter().any(|image| image.is_after("killed")));
         for image in images {
-            let store = Store::open_vfs(image.vfs())
+            let image_vfs = image.vfs();
+            let store = Store::open_vfs(image_vfs.clone())
                 .unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
             store.verify_blob(f, t2).unwrap();
             for (oid, tid) in [(f, t1), (g, g1)] {
@@ -838,7 +840,73 @@ mod tests {
                     Err(e) => panic!("{image:?}: {e}"),
                 }
             }
+            let left = orphans(&store, &image_vfs, &[(f, t1), (f, t2), (g, g1)]);
+            assert!(left.is_empty(), "{image:?} keeps {left:?}");
         }
+    }
+
+    /// Return the blob files in `vfs` that have no blob record in `store`.
+    /// The blob files of `known` are the only ones that a test can make.
+    fn orphans(store: &Store, vfs: &MemVfs, known: &[(Oid, Tid)]) -> Vec<String> {
+        let names = vfs.names();
+        let mut orphans: Vec<String> = names
+            .iter()
+            .filter(|name| name.ends_with(".blob"))
+            .filter(|name| !known.iter().any(|&(o, t)| blob_name(o, t) == **name))
+            .cloned()
+            .collect();
+        for &(oid, tid) in known {
+            let name = blob_name(oid, tid);
+            if names.contains(&name) && store.backend.load_blob(oid, tid).unwrap().is_none() {
+                orphans.push(name);
+            }
+        }
+        orphans
+    }
+
+    #[test]
+    fn a_killed_pack_then_an_open_then_a_power_loss() {
+        let built = MemVfs::new();
+        let f = Oid(1);
+        let (t1, t2) = {
+            let store = Store::open_vfs(built.clone()).unwrap();
+            commit(&store, &[(ROOT, record(&[f]))]);
+            let t1 = commit_blob(&store, f, &record(&[]), b"one");
+            let t2 = commit_blob(&store, f, &record(&[]), b"two");
+            (t1, t2)
+        };
+        let vfs = built.durable_copy();
+        let old = blob_name(f, t1);
+
+        // The pack commits the removal of f at t1, removes its file and
+        // dies at the sync of its directory. So the removal of the file is
+        // not durable.
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        vfs.kill_at_dir_sync(&oid_dir(f));
+        assert!(store.pack(t2).is_err());
+        std::mem::forget(store);
+        vfs.restart();
+        // The next open finds no file to remove, and removes the intent
+        // file.
+        drop(Store::open_vfs(vfs.clone()).unwrap());
+        vfs.mark("opened");
+        assert!(!vfs.names().contains(&old));
+
+        // A power loss after the open must not bring back a file that no
+        // intent file names.
+        let mut checked = 0;
+        for image in vfs.crash_images() {
+            if !image.is_after("opened") {
+                continue;
+            }
+            let image_vfs = image.vfs();
+            let store = Store::open_vfs(image_vfs.clone()).unwrap();
+            assert!(is_removed(&store, f, t1), "{image:?}");
+            let left = orphans(&store, &image_vfs, &[(f, t1), (f, t2)]);
+            assert!(left.is_empty(), "{image:?} keeps {left:?}");
+            checked += 1;
+        }
+        assert!(checked > 0);
     }
 
     /// Return the tid of the only blob record of `oid` in the store in
