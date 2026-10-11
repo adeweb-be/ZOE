@@ -12,6 +12,7 @@ mod commit;
 mod error;
 mod format;
 mod lock;
+mod read;
 mod redb_backend;
 mod store;
 mod types;
@@ -23,5 +24,6 @@ pub use backend::{
 pub use clock::{Clock, SystemClock, timestamp};
 pub use commit::Txn;
 pub use error::{Result, ZoeError};
+pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};
