@@ -1,10 +1,11 @@
 //! The on-disk format: the frame and its checksum, the keys, and the
-//! values of the transaction rows and the `meta` rows. This module is a
-//! red zone.
+//! values of the transaction rows and the `meta` rows. `blob` gives the
+//! format of the blob store and of the blob records. This module is a red
+//! zone.
 //!
-//! Every record and every transaction row is a frame: a 32-byte header,
-//! the typed-field slots, then the payload. The header fields are
-//! little-endian:
+//! Every record, every blob record and every transaction row is a frame: a
+//! 32-byte header, the typed-field slots, then the payload. The header
+//! fields are little-endian:
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
@@ -21,9 +22,10 @@
 //!
 //! The checksum is the xxh3-64 hash, with the default seed 0, of these
 //! bytes in this order: the key of the row, header bytes 0 to 23, the
-//! slots, then the payload. The key of a record is the 16 bytes of
-//! `record_key`. The key of a transaction row is the 8 bytes of
-//! `txn_key`. So a frame that is read under another key fails the check.
+//! slots, then the payload. The key of a record and of a blob record is
+//! the 16 bytes of `record_key`. The key of a transaction row is the 8
+//! bytes of `txn_key`. So a frame that is read under another key fails the
+//! check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
 //! checksum covers the payload as stored, so a read verifies the stored
@@ -33,6 +35,8 @@
 //! Keys are big-endian, so that the byte order of the keys is the numeric
 //! order of oids and tids. The numbers in the rows of `meta` are 8-byte
 //! big-endian values, as ZODB writes oids and tids.
+
+pub mod blob;
 
 use std::borrow::Cow;
 

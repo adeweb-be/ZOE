@@ -1,7 +1,9 @@
 //! The redb backend.
 //!
-//! Three tables hold the key spaces of the data model: `records`, `txns`
-//! and `meta`. `format` says how keys and values are written.
+//! Four tables hold the key spaces of the data model: `records`, `blobs`,
+//! `txns` and `meta`. `format` says how keys and values are written. A
+//! store without the `blobs` table has no blob records. The first write of
+//! a blob record creates the table.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,14 +13,15 @@ use redb::{
 };
 
 use crate::backend::{
-    Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
-    WriteTxn,
+    Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
+    TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
+const BLOBS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("blobs");
 const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -74,6 +77,7 @@ impl RedbBackend {
         let txn = db.begin_write().map_err(backend)?;
         {
             txn.open_table(RECORDS).map_err(backend)?;
+            txn.open_table(BLOBS).map_err(backend)?;
             txn.open_table(TXNS).map_err(backend)?;
             let mut meta = txn.open_table(META).map_err(backend)?;
             meta.insert(META_FORMAT, format::FORMAT_NAME)
@@ -211,6 +215,26 @@ impl Backend for RedbBackend {
             stored_len: frame.stored_len as u64,
             data_len: frame.data.len() as u64,
         }))
+    }
+
+    fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let blobs = match txn.open_table(BLOBS) {
+            Ok(blobs) => blobs,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let key = format::record_key(oid, tid);
+        let Some(value) = blobs.get(&key).map_err(backend)? else {
+            return Ok(None);
+        };
+        let blob = format::decode_frame(&key, value.value())
+            .and_then(|frame| format::blob::decode_blob(&frame.data))
+            .map_err(|e| {
+                let row = format!("blob record of oid {oid:?}, tid {tid:?}");
+                refused(e, &row, ZoeError::CorruptBlob { oid, tid })
+            })?;
+        Ok(Some(blob))
     }
 
     fn last_tid(&self) -> Tid {
@@ -377,6 +401,16 @@ impl WriteTxn for RedbWrite<'_> {
             format::encode_frame_with(&key, format::MAIN_BRANCH, prev, data, self.compression);
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         records.insert(&key, frame.as_slice()).map_err(backend)?;
+        self.max_oid = self.max_oid.max(Some(oid));
+        Ok(())
+    }
+
+    fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()> {
+        let key = format::record_key(oid, tid);
+        let payload = format::blob::encode_blob(blob);
+        let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
+        let mut blobs = self.txn.open_table(BLOBS).map_err(backend)?;
+        blobs.insert(&key, frame.as_slice()).map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
         Ok(())
     }
@@ -664,5 +698,80 @@ mod tests {
         ]);
         assert_eq!(oids, expected);
         assert!(backend.txn_oids(Tid(10), Tid::MAX).unwrap().is_empty());
+    }
+
+    fn blob() -> BlobRecord {
+        BlobRecord {
+            hash: *blake3::hash(b"blob").as_bytes(),
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn a_blob_record_round_trips() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        write.put_blob(Oid(1), Tid(5), &blob()).unwrap();
+        write.commit().unwrap();
+
+        assert_eq!(backend.load_blob(Oid(1), Tid(5)).unwrap(), Some(blob()));
+        assert_eq!(backend.load_blob(Oid(1), Tid(6)).unwrap(), None);
+        assert_eq!(backend.next_oid().unwrap(), Oid(2));
+    }
+
+    #[test]
+    fn a_store_without_the_blobs_table_has_no_blob_record() {
+        let db = redb::Builder::new()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(RECORDS).unwrap();
+        txn.open_table(TXNS).unwrap();
+        {
+            let mut meta = txn.open_table(META).unwrap();
+            meta.insert(META_FORMAT, format::FORMAT_NAME).unwrap();
+            meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
+                .unwrap();
+            meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let backend = RedbBackend::open(db).unwrap();
+        assert_eq!(backend.load_blob(Oid(1), Tid(5)).unwrap(), None);
+        let mut write = backend.begin_write().unwrap();
+        write.put_blob(Oid(1), Tid(5), &blob()).unwrap();
+        write.commit().unwrap();
+        assert_eq!(backend.load_blob(Oid(1), Tid(5)).unwrap(), Some(blob()));
+    }
+
+    #[test]
+    fn a_damaged_blob_record_is_a_corrupt_blob() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        write.put_blob(Oid(1), Tid(5), &blob()).unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.database().begin_write().unwrap();
+        {
+            let mut blobs = txn.open_table(BLOBS).unwrap();
+            let key = format::record_key(Oid(1), Tid(5));
+            let mut frame = blobs.get(&key).unwrap().unwrap().value().to_vec();
+            *frame.last_mut().unwrap() ^= 1;
+            blobs.insert(&key, frame.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let error = backend.load_blob(Oid(1), Tid(5));
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::CorruptBlob {
+                    oid: Oid(1),
+                    tid: Tid(5)
+                })
+            ),
+            "{error:?}"
+        );
     }
 }

@@ -25,6 +25,16 @@ pub enum ZoeError {
         tid: Tid,
     },
 
+    /// A blob file does not match the size and the BLAKE3 hash in its blob
+    /// record, or the file is missing, or the blob record is damaged.
+    #[error("corrupt blob: oid {oid:?}, tid {tid:?}")]
+    CorruptBlob {
+        /// The object id of the blob.
+        oid: Oid,
+        /// The transaction id of the blob.
+        tid: Tid,
+    },
+
     /// The checksum of a transaction row does not match its bytes, or its
     /// payload does not decode, or a record has no transaction row, or the
     /// records of a transaction do not match the oid count of its row.

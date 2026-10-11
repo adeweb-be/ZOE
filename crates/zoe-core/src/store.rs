@@ -291,7 +291,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::backend::{BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
     use crate::format;
     use crate::format::Codec;
     use crate::vfs::LOCK;
@@ -340,6 +340,10 @@ mod tests {
 
         fn record_info(&self, oid: Oid, tid: Tid) -> Result<Option<RecordEncoding>> {
             self.inner.record_info(oid, tid)
+        }
+
+        fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
+            self.inner.load_blob(oid, tid)
         }
 
         fn last_tid(&self) -> Tid {

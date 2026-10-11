@@ -19,8 +19,8 @@ mod types;
 pub mod vfs;
 
 pub use backend::{
-    Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
-    WriteTxn,
+    Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
+    TxnStatus, WriteTxn,
 };
 pub use clock::{Clock, SystemClock, timestamp};
 pub use commit::{Finished, Txn};
