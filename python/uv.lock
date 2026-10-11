@@ -149,8 +149,8 @@ wheels = [
 
 [[package]]
 name = "btrees"
-version = "6.5+zoe.1"
-source = { git = "https://github.com/adeweb-be/BTrees?rev=5f863e0ea6757b4720e568a4c929321e1b6e8ebc#5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
+version = "6.5+zoe.3"
+source = { git = "https://github.com/adeweb-be/BTrees?rev=f7dfacc28befc038263390fa448df0b8e772f2f0#f7dfacc28befc038263390fa448df0b8e772f2f0" }
 dependencies = [
     { name = "persistent" },
     { name = "zope-interface" },
@@ -3752,7 +3752,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "btrees", git = "https://github.com/adeweb-be/BTrees?rev=5f863e0ea6757b4720e568a4c929321e1b6e8ebc" },
+    { name = "btrees", git = "https://github.com/adeweb-be/BTrees?rev=f7dfacc28befc038263390fa448df0b8e772f2f0" },
     { name = "persistent", git = "https://github.com/adeweb-be/persistent?rev=57a8c54959112f49ef563267f0ed2cb96228c21a" },
     { name = "zodbpickle", git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f" },
     { name = "zoedb", editable = "zoedb" },
