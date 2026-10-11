@@ -12,3 +12,5 @@
 pub mod cli;
 #[cfg(feature = "serve")]
 mod protocol;
+#[cfg(feature = "serve")]
+pub mod serve;

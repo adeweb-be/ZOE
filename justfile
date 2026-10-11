@@ -24,6 +24,8 @@ test:
     # change what a damaged database file does. The harness prints its
     # counts.
     cargo test --release --locked -p zoe-core --test bit_flip_harness -- --show-output
+    # The tests of the server run the `zoe` binary that cargo test built.
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
