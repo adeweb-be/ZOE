@@ -115,8 +115,9 @@ pub enum ZoeError {
     #[error("a finish failed: reopen the store to commit again")]
     Halted,
 
-    /// Another process holds the lock of the store.
-    #[error("the store is locked by another process")]
+    /// Another open store holds the lock of the store directory, or of the
+    /// blob directory.
+    #[error("the store or its blob directory is locked by another open store")]
     Locked,
 
     /// The store is open for reads only. It refuses every write.

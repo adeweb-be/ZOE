@@ -226,6 +226,21 @@ def test_a_blob_dir_with_other_files_is_refused(tmp_path):
     assert not (blob_dir / ".layout").exists()
 
 
+def test_two_storages_never_share_a_blob_dir(tmp_path):
+    blob_dir = str(tmp_path / "shared")
+    first = zoe.Storage(str(tmp_path / "a"), blob_dir=blob_dir)
+    try:
+        oid = first.new_oid()
+        tid = store_blob(first, oid, ZERO, write_temporary(first, DATA))
+        pending = write_temporary(first, b"pending")
+        with pytest.raises(StorageError):
+            zoe.Storage(str(tmp_path / "b"), blob_dir=blob_dir)
+        assert read(pending) == b"pending"
+        assert read(first.loadBlob(oid, tid)) == DATA
+    finally:
+        first.close()
+
+
 def test_a_copy_of_the_store_directory_keeps_its_own_blobs(tmp_path):
     original = tmp_path / "original"
     storage = zoe.Storage(str(original))
