@@ -24,6 +24,10 @@ classifiers = [
 [project.optional-dependencies]
 plone = ["Products.CMFPlone>=6.1"]
 
+[project.scripts]
+# The `zoe` command. It runs the code of the `zoe` binary.
+zoe = "zoe.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/adeweb-be/ZOE"
 Documentation = "https://adeweb-be.github.io/ZOE/"
