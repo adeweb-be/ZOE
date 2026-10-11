@@ -15,7 +15,8 @@ pub enum ZoeError {
         oid: Oid,
     },
 
-    /// The checksum of a stored record does not match its bytes.
+    /// The checksum of a stored record does not match its bytes, or its
+    /// payload does not decode.
     #[error("corrupt record: oid {oid:?}, tid {tid:?}")]
     CorruptRecord {
         /// The object id of the record.
