@@ -15,6 +15,7 @@ import time
 import pytest
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import (
+    ConflictError,
     ReadOnlyError,
     StorageError,
     StorageTransactionError,
@@ -71,8 +72,9 @@ class ZODBStorageTests(
     def test_race_loadopen_vs_local_invalidate(self):
         if FREE_THREADED:
             # The cache of the stock persistent is not thread-safe on a
-            # free-threaded build. ZODB's MappingStorage and FileStorage
-            # fail this test there too, and can crash the interpreter.
+            # free-threaded build. There, this test fails with a SystemError
+            # in ZODB.serialize, also on FileStorage, and MappingStorage and
+            # FileStorage can crash the interpreter.
             pytest.skip("the stock persistent is not thread-safe here")
         super().test_race_loadopen_vs_local_invalidate()
 
@@ -141,6 +143,12 @@ def test_history_gives_the_time_of_the_tid(storage):
     tid = commit(storage, oid, ZERO, record(1))
     (entry,) = storage.history(oid)
     assert entry["time"] == TimeStamp(tid).timeTime()
+
+
+def test_a_read_only_storage_creates_no_directory(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        zoe.Storage(str(tmp_path / "missing"), read_only=True)
+    assert not (tmp_path / "missing").exists()
 
 
 def test_read_only(tmp_path):
@@ -310,6 +318,201 @@ def test_parallel_commits_without_the_gil(tmp_path):
     flags = ["-X", "gil=0"] if FREE_THREADED else []
     result = subprocess.run(
         [sys.executable, *flags, "-c", child, str(tmp_path / "store")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_a_conflict_names_the_class_of_the_object(storage):
+    oid = storage.new_oid()
+    first = commit(storage, oid, ZERO, record(1))
+    second = commit(storage, oid, first, record(2))
+    for data, class_name in [
+        (record(3), "ZODB.tests.MinPO.MinPO"),
+        # ZODB cannot read a class from this pickle. The error comes all the
+        # same, without the class name.
+        (b"c\x00", None),
+    ]:
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, first, data, "", txn)
+        with pytest.raises(ConflictError) as error:
+            storage.tpc_vote(txn)
+        storage.tpc_abort(txn)
+        assert error.value.oid == oid
+        assert error.value.serials == (second, first)
+        assert error.value.class_name == class_name
+
+
+def test_a_callback_cannot_commit_in_its_own_storage(storage):
+    first, second = storage.new_oid(), storage.new_oid()
+    txn = voted(storage, first, ZERO, record(1))
+    raised = []
+
+    def callback(tid):
+        inner = voted(storage, second, ZERO, record(2))
+        try:
+            storage.tpc_finish(inner)
+        except StorageTransactionError as error:
+            raised.append(error)
+        storage.tpc_abort(inner)
+
+    tid = storage.tpc_finish(txn, callback)
+    assert len(raised) == 1
+    assert storage.lastTransaction() == tid
+    with pytest.raises(KeyError):
+        storage.load(second)
+    assert commit(storage, second, ZERO, record(2)) > tid
+
+
+def test_a_transaction_that_begins_during_close_does_not_keep_the_store(tmp_path):
+    path = str(tmp_path / "store")
+    for _ in range(20):
+        storage = zoe.Storage(path)
+        started = threading.Event()
+        outcome = []
+
+        def begin_until_closed(storage=storage, started=started, outcome=outcome):
+            try:
+                while True:
+                    storage.tpc_begin(TransactionMetaData())
+                    started.set()
+            except StorageError as error:
+                outcome.append(error)
+
+        thread = in_thread(begin_until_closed)
+        assert started.wait(TIMEOUT)
+        storage.close()
+        thread.join(TIMEOUT)
+        assert len(outcome) == 1
+        # No transaction keeps the store open, so it opens again at once.
+        zoe.Storage(path).close()
+
+
+def test_close_does_not_wait_for_a_vote_on_an_open_transaction(tmp_path):
+    storage = zoe.Storage(str(tmp_path / "store"), lock_timeout=TIMEOUT)
+    oid = storage.new_oid()
+    voted(storage, oid, ZERO, record(1))
+    waiting = threading.Event()
+    outcome = []
+
+    def vote_behind():
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.store(oid, ZERO, record(2), "", txn)
+        waiting.set()
+        try:
+            storage.tpc_vote(txn)
+            outcome.append("voted")
+        except Exception as error:
+            outcome.append(error)
+
+    thread = in_thread(vote_behind)
+    assert waiting.wait(TIMEOUT)
+    time.sleep(0.2)
+    start = time.monotonic()
+    # The close aborts the transaction that holds the lock first, so the
+    # waiting vote ends at once.
+    storage.close()
+    assert time.monotonic() - start < TIMEOUT / 3
+    thread.join(TIMEOUT)
+    assert outcome == ["voted"]
+    zoe.Storage(str(tmp_path / "store")).close()
+
+
+def test_publication_under_stress(storage):
+    # Writers commit, abort after the vote or fail in their callback.
+    # Readers check that lastTransaction never goes back and gives only a
+    # tid whose callback ran.
+    writers, rounds = 4, 30
+    called, lock = [], threading.Lock()
+    stop = threading.Event()
+    problems = []
+    first = storage.lastTransaction()
+
+    def write(n):
+        oid = storage.new_oid()
+        serial = ZERO
+        for i in range(rounds):
+            txn = voted(storage, oid, serial, record(i))
+            if (n + i) % 5 == 0:
+                storage.tpc_abort(txn)
+                continue
+
+            def callback(tid, fail=(n + i) % 3 == 0):
+                with lock:
+                    called.append(tid)
+                if fail:
+                    raise RuntimeError("callback")
+
+            try:
+                serial = storage.tpc_finish(txn, callback)
+            except RuntimeError:
+                serial = storage.load(oid)[1]
+
+    def read():
+        last = first
+        while not stop.is_set():
+            tid = storage.lastTransaction()
+            with lock:
+                seen = tid == first or tid in called
+            if tid < last or not seen:
+                problems.append((last, tid))
+            last = tid
+
+    readers = [in_thread(read) for _ in range(2)]
+    threads = [in_thread(lambda n=n: write(n)) for n in range(writers)]
+    for thread in threads:
+        thread.join(TIMEOUT * 4)
+    stop.set()
+    for thread in readers:
+        thread.join(TIMEOUT)
+    assert not problems
+    # The callbacks ran in commit order, and the last one is published.
+    assert called == sorted(called) and len(set(called)) == len(called)
+    assert storage.lastTransaction() == called[-1]
+
+
+def test_no_lock_is_held_while_an_error_is_built(tmp_path):
+    # The first error of a fresh interpreter imports ZODB. Threads that
+    # meet errors at once must not wait for each other forever.
+    child = textwrap.dedent(
+        """
+        import sys
+        import threading
+
+        from zoe import _zoe
+
+        storage = _zoe.Storage(sys.argv[1])
+        assert "ZODB" not in sys.modules
+
+        def fail(call):
+            for _ in range(20):
+                try:
+                    call()
+                except Exception:
+                    pass
+
+        def run(call):
+            threads = [
+                threading.Thread(target=fail, args=(call,)) for _ in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        run(lambda: storage.tpc_vote(object()))
+        storage.close()
+        run(storage.new_oid)
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path / "store")],
         capture_output=True,
         text=True,
         timeout=120,
