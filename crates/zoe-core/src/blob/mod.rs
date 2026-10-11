@@ -2037,7 +2037,7 @@ mod tests {
         };
         let blob_parent: Box<dyn BlobDir> = Box::new(parent.clone());
         let relocated = Some((blob_parent, "elsewhere".to_owned()));
-        let store = Store::open_full(vfs.clone(), SystemClock, options, relocated).unwrap();
+        let store = Store::open_parts(vfs.clone(), SystemClock, options, relocated).unwrap();
         let oid = store.new_oid().unwrap();
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"blob"))
