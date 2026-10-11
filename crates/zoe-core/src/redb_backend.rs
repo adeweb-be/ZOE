@@ -137,7 +137,8 @@ impl RedbBackend {
     ///
     /// The last tid is the greater of `last_tid` in `meta` and the tid of
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
-    /// a second time.
+    /// a second time. The row counts only when its frame passes the
+    /// checksum under its key. So a damaged key cannot raise the last tid.
     fn open_db(db: Db) -> Result<Self> {
         let last_tid = {
             let txn = db.begin_read().map_err(backend)?;
@@ -156,7 +157,13 @@ impl RedbBackend {
                 .and_then(format::decode_u64)
                 .ok_or_else(|| ZoeError::Format("no last tid".to_owned()))?;
             let txns = txn.open_table(TXNS).map_err(backend)?;
-            let last_row = txns.last().map_err(backend)?;
+            let last_row = txns.last().map_err(backend)?.filter(|(key, value)| {
+                // A frame of a newer format passed the checksum too.
+                matches!(
+                    format::decode_frame(key.value(), value.value()),
+                    Ok(_) | Err(format::FrameError::Unsupported { .. })
+                )
+            });
             stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())))
         };
         Ok(Self {
@@ -879,6 +886,32 @@ mod tests {
             .unwrap()
             .insert(META_LAST_TID, &format::encode_u64(7)[..])
             .unwrap();
+        txn.commit().unwrap();
+
+        let reopened = RedbBackend::open_db(backend.db).unwrap();
+        assert_eq!(reopened.last_tid(), Tid(500));
+    }
+
+    /// A flipped bit in the key of the last row gives a tid that the store
+    /// never gave. The frame of the row fails the checksum under that key,
+    /// so the tid does not raise the last tid.
+    #[test]
+    fn a_last_row_under_a_damaged_key_does_not_raise_the_last_tid() {
+        let backend = empty();
+        commit_txn(&backend, Tid(500));
+        let txn = backend.database().begin_write().unwrap();
+        {
+            let mut txns = txn.open_table(TXNS).unwrap();
+            let frame = txns
+                .get(&format::txn_key(Tid(500)))
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let damaged = Tid(500 | 1 << 62);
+            txns.insert(&format::txn_key(damaged), frame.as_slice())
+                .unwrap();
+        }
         txn.commit().unwrap();
 
         let reopened = RedbBackend::open_db(backend.db).unwrap();
