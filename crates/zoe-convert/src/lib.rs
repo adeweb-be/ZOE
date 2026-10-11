@@ -78,7 +78,8 @@ pub enum Error {
     /// source. So the store does not hold a part of the source, and the
     /// conversion copies nothing.
     #[error(
-        "the store does not continue the source: its last tid {last:?} is not a tid of the source"
+        "the store does not continue the source: its last tid {:#018x} is not a tid of the source",
+        .last.0
     )]
     Diverged {
         /// The last tid of the store.

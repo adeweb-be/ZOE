@@ -516,6 +516,7 @@ mod tests {
                 matches!(error, Error::Diverged { last: found } if found == last),
                 "{error:?}"
             );
+            assert!(error.to_string().contains(&hex(last.0)), "{error}");
             assert_eq!(store.last_transaction(), last);
         }
     }
