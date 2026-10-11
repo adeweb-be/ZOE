@@ -1,6 +1,6 @@
 # The only environment of the project. A tool that is not here does not
 # exist for the project.
-{ pkgs, inputs, ... }:
+{ pkgs, inputs, config, ... }:
 
 let
   dagger = inputs.dagger.packages.${pkgs.stdenv.hostPlatform.system}.dagger;
@@ -16,6 +16,19 @@ let
     ln -s ${pkgs.python314FreeThreading}/bin/python3.14t $out/bin/python3.14t
     ln -s ${pkgs.python313}/bin/python3.13 $out/bin/python3
   '';
+
+  # The WebDriver server of the Loupe end-to-end tests. nixpkgs does not
+  # package it, so it builds from its crate with the pinned toolchain.
+  rust = config.languages.rust.toolchainPackage;
+  tauri-driver = (pkgs.makeRustPlatform { cargo = rust; rustc = rust; }).buildRustPackage rec {
+    pname = "tauri-driver";
+    version = "2.0.6";
+    src = pkgs.fetchCrate {
+      inherit pname version;
+      hash = "sha256-fTCkEs4NLBW0khaHL4jpVNkrbQg22YPsRMjfJNqnCWA=";
+    };
+    cargoHash = "sha256-MThAcU+U8PyBGauh3dy7ZRvRX9INmOEeghIlQEGLAPs=";
+  };
 in
 {
   languages.rust = {
@@ -51,5 +64,38 @@ in
     # uv uses the interpreters above and never downloads one.
     UV_PYTHON_DOWNLOADS = "never";
     UV_PYTHON_PREFERENCE = "only-system";
+  };
+
+  # Loupe, the Tauri app, and its end-to-end tests. Enter the profile with
+  # `devenv --profile loupe shell`. The default shell and CI do not build
+  # it.
+  profiles.loupe.module = {
+    packages = [
+      # The Tauri CLI and the libraries that a Tauri app links on Linux.
+      pkgs.cargo-tauri
+      pkgs.webkitgtk_4_1
+      pkgs.libsoup_3
+      pkgs.gtk3
+      pkgs.glib
+      pkgs.cairo
+      pkgs.pango
+      pkgs.gdk-pixbuf
+      pkgs.at-spi2-atk
+      pkgs.harfbuzz
+      pkgs.librsvg
+      # The end-to-end tests: webkitgtk gives WebKitWebDriver, which
+      # tauri-driver drives, and xvfb-run gives them a display.
+      tauri-driver
+      pkgs.xvfb-run
+    ];
+
+    env = {
+      # The GTK file dialog of Loupe reads these GSettings schemas.
+      XDG_DATA_DIRS = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}";
+      # WebKitGTK needs EGL. The EGL of the shell finds no driver of the
+      # host, so it uses Mesa. Without it, the web process of Loupe stops
+      # at start.
+      __EGL_VENDOR_LIBRARY_FILENAMES = "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
+    };
   };
 }

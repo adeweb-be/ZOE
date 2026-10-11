@@ -327,6 +327,13 @@ dependencies = [
 [[package]]
 name = "zoe-loupe"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zoe-core",
+ "zoe-pickle",
+]
 
 [[package]]
 name = "zoe-mcp"

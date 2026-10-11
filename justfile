@@ -105,9 +105,52 @@ bench *args="run":
     fi
     exec "${shootout[@]}" python -m shootout {{ args }}
 
-# Build and run Loupe.
-loupe:
-    @echo "just loupe: builds and runs the Loupe desktop app from apps/loupe/. Not built yet."
+# Build and run Loupe. `just loupe` builds a release app and runs it,
+# `just loupe dev` runs it on the Vite dev server, `just loupe check` lints
+# the app, and `just loupe e2e` builds a debug app and runs the end-to-end
+# tests under xvfb-run. Run them in the loupe profile of the shell:
+# `devenv --profile loupe shell -- just loupe <command>`.
+loupe command="run":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-tauri >/dev/null; then
+        echo "just loupe: the Tauri toolchain is in the loupe profile of the shell." >&2
+        echo "Run: devenv --profile loupe shell -- just loupe {{ command }}" >&2
+        exit 1
+    fi
+    cd apps/loupe
+    # Install the node modules when the lock file is newer than them.
+    if [ ! node_modules/.package-lock.json -nt package-lock.json ]; then
+        npm ci --no-audit --no-fund
+    fi
+    # Loupe is a Cargo workspace of its own. Its build goes to target/loupe.
+    export CARGO_TARGET_DIR="{{ justfile_directory() }}/target/loupe"
+    case "{{ command }}" in
+        run)
+            cargo tauri build --no-bundle -- --locked
+            exec "$CARGO_TARGET_DIR/release/loupe"
+            ;;
+        dev)
+            exec cargo tauri dev
+            ;;
+        check)
+            npm run lint
+            rustfmt --check --edition 2024 src-tauri/build.rs src-tauri/src/main.rs
+            # The Tauri context embeds dist/, so clippy needs a build of it.
+            npm run build
+            cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+            cargo test --manifest-path src-tauri/Cargo.toml --locked
+            ;;
+        e2e)
+            cargo tauri build --debug --no-bundle -- --locked
+            # Xvfb has no GPU, so Mesa renders in software.
+            LIBGL_ALWAYS_SOFTWARE=1 exec xvfb-run --auto-servernum npm run e2e
+            ;;
+        *)
+            echo "just loupe: unknown command {{ command }}. Use run, dev, check or e2e." >&2
+            exit 2
+            ;;
+    esac
 
 # Build the documentation site from docs/ into target/book.
 docs:

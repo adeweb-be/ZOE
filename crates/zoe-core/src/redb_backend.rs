@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+};
 
 use crate::backend::{
     Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
@@ -41,9 +43,26 @@ fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError 
     }
 }
 
+/// The redb database of a store.
+enum Db {
+    /// The database is open for reads and writes.
+    ReadWrite(Database),
+    /// The database file is open read-only. Every write fails.
+    ReadOnly(ReadOnlyDatabase),
+}
+
+impl Db {
+    fn begin_read(&self) -> std::result::Result<ReadTransaction, redb::TransactionError> {
+        match self {
+            Db::ReadWrite(db) => db.begin_read(),
+            Db::ReadOnly(db) => db.begin_read(),
+        }
+    }
+}
+
 /// A store in one redb database.
 pub(crate) struct RedbBackend {
-    db: Database,
+    db: Db,
     last_tid: AtomicU64,
     /// How new records are written.
     compression: Compression,
@@ -68,11 +87,22 @@ impl RedbBackend {
     }
 
     /// Open a store that `initialise` wrote, and check its format.
+    pub(crate) fn open(db: Database) -> Result<Self> {
+        Self::open_db(Db::ReadWrite(db))
+    }
+
+    /// Open a store that `initialise` wrote, for reads only, and check its
+    /// format. `begin_write` fails with `ReadOnly`.
+    pub(crate) fn open_read_only(db: ReadOnlyDatabase) -> Result<Self> {
+        Self::open_db(Db::ReadOnly(db))
+    }
+
+    /// Open the store in `db` and check its format.
     ///
     /// The last tid is the greater of `last_tid` in `meta` and the tid of
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
     /// a second time.
-    pub(crate) fn open(db: Database) -> Result<Self> {
+    fn open_db(db: Db) -> Result<Self> {
         let last_tid = {
             let txn = db.begin_read().map_err(backend)?;
             let meta = txn.open_table(META).map_err(backend)?;
@@ -188,8 +218,11 @@ impl Backend for RedbBackend {
     }
 
     fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
         Ok(Box::new(RedbWrite {
-            txn: self.db.begin_write().map_err(backend)?,
+            txn: db.begin_write().map_err(backend)?,
             last_tid: &self.last_tid,
             compression: self.compression,
             written_tid: None,
@@ -392,6 +425,16 @@ mod tests {
 
     use super::*;
 
+    impl RedbBackend {
+        /// Return the database of a store that is open for writes.
+        fn database(&self) -> &Database {
+            match &self.db {
+                Db::ReadWrite(db) => db,
+                Db::ReadOnly(_) => panic!("the store is read-only"),
+            }
+        }
+    }
+
     /// Return an empty store in memory.
     fn empty() -> RedbBackend {
         let db = redb::Builder::new()
@@ -419,7 +462,7 @@ mod tests {
     /// and the payload `payload`.
     fn insert_with_codec(backend: &RedbBackend, oid: Oid, tid: Tid, codec: u8, payload: &[u8]) {
         let key = format::record_key(oid, tid);
-        let txn = backend.db.begin_write().unwrap();
+        let txn = backend.database().begin_write().unwrap();
         txn.open_table(RECORDS)
             .unwrap()
             .insert(&key, frame_with_codec(&key, codec, payload).as_slice())
@@ -521,7 +564,7 @@ mod tests {
             .unwrap();
         write.commit().unwrap();
 
-        let txn = backend.db.begin_write().unwrap();
+        let txn = backend.database().begin_write().unwrap();
         {
             let mut records = txn.open_table(RECORDS).unwrap();
             let frame = records
@@ -569,14 +612,14 @@ mod tests {
     fn the_last_transaction_row_raises_a_damaged_last_tid() {
         let backend = empty();
         commit_txn(&backend, Tid(500));
-        let txn = backend.db.begin_write().unwrap();
+        let txn = backend.database().begin_write().unwrap();
         txn.open_table(META)
             .unwrap()
             .insert(META_LAST_TID, &format::encode_u64(7)[..])
             .unwrap();
         txn.commit().unwrap();
 
-        let reopened = RedbBackend::open(backend.db).unwrap();
+        let reopened = RedbBackend::open_db(backend.db).unwrap();
         assert_eq!(reopened.last_tid(), Tid(500));
     }
 
@@ -586,7 +629,7 @@ mod tests {
         let tid = Tid(5);
         commit_txn(&backend, tid);
 
-        let txn = backend.db.begin_write().unwrap();
+        let txn = backend.database().begin_write().unwrap();
         {
             let mut txns = txn.open_table(TXNS).unwrap();
             let key = format::txn_key(tid);

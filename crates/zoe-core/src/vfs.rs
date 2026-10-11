@@ -56,7 +56,37 @@ impl OsVfs {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join("lock"))?;
+            .open(dir.join(LOCK))?;
+        Self::locked(dir, lock)
+    }
+
+    /// Open the directory `dir` of an existing store to read it, and take
+    /// the lock.
+    ///
+    /// The file `database` must be in `dir`. Otherwise the call fails and
+    /// changes nothing. The call opens the lock file read-only. It creates
+    /// the lock file only when the store has none.
+    pub(crate) fn existing(dir: &Path, database: &str) -> Result<Self> {
+        if !dir.join(database).is_file() {
+            let message = format!("no store in {}", dir.display());
+            return Err(io::Error::new(io::ErrorKind::NotFound, message).into());
+        }
+        let path = dir.join(LOCK);
+        let lock = match File::open(&path) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?,
+            Err(e) => return Err(e.into()),
+        };
+        Self::locked(dir, lock)
+    }
+
+    /// Take the exclusive lock on the open lock file `lock` of `dir`.
+    fn locked(dir: &Path, lock: File) -> Result<Self> {
         match lock.try_lock() {
             Ok(()) => Ok(Self {
                 dir: dir.to_owned(),
@@ -66,7 +96,15 @@ impl OsVfs {
             Err(TryLockError::Error(e)) => Err(e.into()),
         }
     }
+
+    /// Return the path of the file `name` in the directory.
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
 }
+
+/// The name of the lock file in the directory of a store.
+pub(crate) const LOCK: &str = "lock";
 
 impl Vfs for OsVfs {
     type File = redb::backends::FileBackend;

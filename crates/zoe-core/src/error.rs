@@ -83,6 +83,18 @@ pub enum ZoeError {
     #[error("the store is locked by another process")]
     Locked,
 
+    /// The store is open for reads only. It refuses every write.
+    #[error("the store is open for reads only")]
+    ReadOnly,
+
+    /// The store was not closed cleanly. A read-only open cannot rebuild
+    /// the free-space map of its database. Open the store once with a
+    /// writer: the writer rebuilds it.
+    #[error(
+        "the store was not closed cleanly: open it once with a writer, which rebuilds the free-space map of its database"
+    )]
+    NotClosedCleanly,
+
     /// The store is closed. A transaction iterator outlived its store.
     #[error("the store is closed")]
     Closed,
