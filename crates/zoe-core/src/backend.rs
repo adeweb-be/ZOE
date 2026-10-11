@@ -16,6 +16,10 @@ pub type Bytes = Vec<u8>;
 /// An iterator over the transaction log, in tid order.
 pub type TxnIter<'a> = Box<dyn Iterator<Item = Result<TxnMeta>> + 'a>;
 
+/// The row of a transaction, and the records of it that one read found,
+/// as `(oid, pickle)`.
+pub type TxnRecords = (TxnMeta, Vec<(Oid, Bytes)>);
+
 /// One version of one object: a row of the `records` key space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -23,8 +27,8 @@ pub struct Record {
     pub tid: Tid,
     /// The serial of the previous version of the object.
     pub prev: Tid,
-    /// The pickle bytes. An empty value marks a deletion by pack or by
-    /// `deleteObject`.
+    /// The pickle bytes. An empty value marks a deletion by
+    /// `deleteObject`. Pack removes records and writes no deletion.
     pub data: Bytes,
 }
 
@@ -139,7 +143,25 @@ pub trait Backend: Send + Sync {
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;
 
     /// Remove the versions older than `before` that `reachable` rejects.
+    ///
+    /// The core does not call this method: pack removes records through
+    /// the removal methods of `WriteTxn`, in batches.
     fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>;
+
+    /// Return the tid of the last pack, from `pack_watermark` in `meta`.
+    /// A store that was never packed gives `Tid::ZERO`.
+    fn pack_watermark(&self) -> Result<Tid>;
+
+    /// Return the keys of the records of the oids from `from` up, in key
+    /// order. The list stops after the first oid that brings it to `limit`
+    /// keys or more, so it holds all the keys of each oid in it. One
+    /// snapshot gives the list.
+    fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;
+
+    /// Return the transaction row of `tid` and the records of `oids` that
+    /// `tid` wrote and that exist, in one snapshot. Return `None` when the
+    /// row does not exist.
+    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>>;
 
     /// Make all committed writes durable. Group commit uses this barrier.
     fn sync(&self) -> Result<()>;
@@ -157,6 +179,26 @@ pub trait WriteTxn {
 
     /// Stage the transaction row.
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
+
+    /// Stage the removal of the record of `oid` that `tid` wrote. Pack
+    /// uses this.
+    fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()>;
+
+    /// Stage the removal of the blob record of `oid` that `tid` wrote.
+    /// Pack uses this.
+    fn remove_blob(&mut self, oid: Oid, tid: Tid) -> Result<()>;
+
+    /// Stage a new value of the existing transaction row of `meta.tid`.
+    /// Unlike `put_txn`, it does not change the last tid. Pack uses this
+    /// to lower the oid count of a row.
+    fn replace_txn(&mut self, meta: &TxnMeta) -> Result<()>;
+
+    /// Stage the removal of the transaction row of `tid`. Pack uses this
+    /// when no record of the transaction is left.
+    fn remove_txn(&mut self, tid: Tid) -> Result<()>;
+
+    /// Stage `pack_watermark` in `meta`: the tid of the last pack.
+    fn put_pack_watermark(&mut self, tid: Tid) -> Result<()>;
 
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;
@@ -182,6 +224,26 @@ mod tests {
         }
 
         fn put_txn(&mut self, _: &TxnMeta) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_record(&mut self, _: Oid, _: Tid) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_blob(&mut self, _: Oid, _: Tid) -> Result<()> {
+            Ok(())
+        }
+
+        fn replace_txn(&mut self, _: &TxnMeta) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_txn(&mut self, _: Tid) -> Result<()> {
+            Ok(())
+        }
+
+        fn put_pack_watermark(&mut self, _: Tid) -> Result<()> {
             Ok(())
         }
 
@@ -237,6 +299,18 @@ mod tests {
 
         fn pack(&self, _: Tid, _: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
             Ok(PackStats::default())
+        }
+
+        fn pack_watermark(&self) -> Result<Tid> {
+            Ok(Tid::ZERO)
+        }
+
+        fn record_keys(&self, _: Oid, _: usize) -> Result<Vec<(Oid, Tid)>> {
+            Ok(Vec::new())
+        }
+
+        fn txn_records(&self, _: Tid, _: &[Oid]) -> Result<Option<TxnRecords>> {
+            Ok(None)
         }
 
         fn sync(&self) -> Result<()> {

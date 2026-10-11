@@ -360,6 +360,7 @@ dependencies = [
  "redb",
  "thiserror",
  "xxhash-rust",
+ "zoe-pickle",
  "zstd",
 ]
 

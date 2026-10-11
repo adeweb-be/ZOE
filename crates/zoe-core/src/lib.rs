@@ -13,6 +13,7 @@ mod commit;
 mod error;
 mod format;
 mod lock;
+mod pack;
 mod read;
 mod redb_backend;
 mod store;
@@ -21,13 +22,14 @@ pub mod vfs;
 
 pub use backend::{
     Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnStatus, WriteTxn,
+    TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, timestamp};
 pub use commit::{Finished, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
+pub use pack::{ClassReport, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};

@@ -27,3 +27,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0021](0021-interactive-sessions.md) | Interactive sessions instead of automated loops |
 | [0022](0022-narrow-red-zones.md) | Red zones: the on-disk format, pack and the process files |
 | [0023](0023-blob-record.md) | The blob record |
+| [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record |

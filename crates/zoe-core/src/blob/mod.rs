@@ -15,6 +15,12 @@
 //! Opening a store reads only `blobs/tmp/`: it removes the blob files that
 //! an intent file names and that have no blob record, then the intent
 //! files and the temporary files.
+//!
+//! Pack uses the same intent files. Before it commits the removal of blob
+//! records, it writes and syncs an intent file for each tid of them. After
+//! the commit, it removes the blob files, syncs their directories and
+//! removes the intent files. So a crash after the commit leaves the intent
+//! file, and the next open removes the files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
@@ -314,13 +320,75 @@ impl BlobStore {
         Ok(Some(intent))
     }
 
-    /// Remove the intent file of a finish after its backend commit. A
-    /// failure leaves the file for the next open, which keeps the blob
-    /// files that have their blob record.
+    /// Remove the intent file of a finish after its backend commit, or of
+    /// a pack after its blob files are gone. A failure leaves the file for
+    /// the next open, which keeps the blob files that have their blob
+    /// record.
     pub(crate) fn finished(&self, intent: Option<String>) {
         if let Some(intent) = intent {
             let _ = self.dir.remove(&intent);
         }
+    }
+
+    /// Write the intent file of `tid` before a pack commits the removal of
+    /// the blob records of `oids` at `tid`, and make it durable. Return
+    /// its name.
+    ///
+    /// An intent file of `tid` that exists keeps its oids: the new file
+    /// names them too. The new file goes in under a temporary name and
+    /// replaces the old one by a rename, so a crash leaves one of the two.
+    pub(crate) fn intend_removal(&self, tid: Tid, oids: &[Oid]) -> Result<String> {
+        self.make_ready()?;
+        let intent = intent_name(tid);
+        let mut named: BTreeSet<Oid> = oids.iter().copied().collect();
+        if self.dir.exists(&intent)? {
+            let mut bytes = Vec::new();
+            self.dir.read_file(&intent)?.read_to_end(&mut bytes)?;
+            // An intent that does not decode was not synced, so it names
+            // nothing that a commit removed.
+            if let Ok(old) = decode_intent(tid, &bytes) {
+                named.extend(old);
+            }
+        }
+        let named: Vec<Oid> = named.into_iter().collect();
+        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
+        let temp = format!("{TMP_DIR}/{n}.tmp");
+        let mut file = self.dir.create_file(&temp)?;
+        file.write_all(&encode_intent(tid, &named))?;
+        file.sync()?;
+        drop(file);
+        self.dir.rename(&temp, &intent)?;
+        self.dir.sync_dir_at(TMP_DIR)?;
+        Ok(intent)
+    }
+
+    /// Remove the blob files of `blobs` after a pack made the removal of
+    /// their blob records durable, and sync their directories. A file that
+    /// is not there is not an error.
+    ///
+    /// The directory of a file that is not there is synced too, when it
+    /// exists. A killed process can remove a file and stop before the
+    /// sync, and then the removal is not durable.
+    pub(crate) fn remove_files(&self, blobs: &[(Oid, Tid)]) -> Result<()> {
+        let mut dirs = BTreeSet::new();
+        for &(oid, tid) in blobs {
+            let dir = oid_dir(oid);
+            match self.dir.remove(&blob_name(oid, tid)) {
+                Ok(()) => {
+                    dirs.insert(dir);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if self.dir.exists(&dir)? {
+                        dirs.insert(dir);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for dir in &dirs {
+            self.dir.sync_dir_at(dir)?;
+        }
+        Ok(())
     }
 
     /// Open the blob file of `oid` at `tid`, whose blob record is
@@ -792,6 +860,52 @@ mod tests {
     }
 
     #[test]
+    fn a_pack_syncs_the_directory_of_a_blob_file_that_is_gone() {
+        let vfs = MemVfs::new();
+        let (oid, tid) = {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let oid = store.new_oid().unwrap();
+            (oid, commit_blobs(&store, &[oid], b"blob"))
+        };
+        let vfs = vfs.durable_copy();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        // A killed process removed the file and did not sync its
+        // directory.
+        Vfs::remove(&vfs, &blob_name(oid, tid)).unwrap();
+        store.blobs().remove_files(&[(oid, tid)]).unwrap();
+        vfs.mark("synced");
+
+        for image in vfs.crash_images().iter().filter(|i| i.is_after("synced")) {
+            let names = image.vfs().names();
+            assert!(!names.contains(&blob_name(oid, tid)), "{image:?}");
+        }
+    }
+
+    #[test]
+    fn a_removal_intent_keeps_the_oids_of_an_older_intent() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let tid = Tid(7);
+        let first = store.blobs().intend_removal(tid, &[Oid(2)]).unwrap();
+        let second = store
+            .blobs()
+            .intend_removal(tid, &[Oid(1), Oid(3)])
+            .unwrap();
+        assert_eq!(first, second);
+        let mut bytes = Vec::new();
+        Vfs::read_file(&vfs, &second)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            decode_intent(tid, &bytes).unwrap(),
+            [Oid(1), Oid(2), Oid(3)]
+        );
+        // The temporary files are gone: each one became the intent file.
+        assert_eq!(temp_files(&vfs), [second]);
+    }
+
+    #[test]
     fn a_torn_intent_is_removed() {
         let vfs = MemVfs::new();
         let tid = {
@@ -854,7 +968,7 @@ mod tests {
     fn empty_store() -> MemVfs {
         let vfs = MemVfs::new();
         drop(Store::open_vfs(vfs.clone()).unwrap());
-        vfs.settled()
+        vfs.durable_copy()
     }
 
     /// Open each crash image of `vfs`. A blob record must have its file,
@@ -940,7 +1054,7 @@ mod tests {
             commit_blobs(&store, &[oid], b"one");
             oid
         };
-        let vfs = built.settled();
+        let vfs = built.durable_copy();
         let dir = oid_dir(oid);
 
         let store = Store::open_vfs(vfs.clone()).unwrap();
@@ -1023,7 +1137,7 @@ mod tests {
     fn a_crash_during_recovery_leaves_no_orphan_behind() {
         let (vfs, leftovers) = leftovers_of_a_crash();
         // The leftovers are on disk when the recovery starts.
-        let vfs = vfs.settled();
+        let vfs = vfs.durable_copy();
         drop(Store::open_vfs(vfs.clone()).unwrap());
 
         let images = vfs.crash_images();

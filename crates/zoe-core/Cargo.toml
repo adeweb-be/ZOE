@@ -13,6 +13,7 @@ blake3.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
+zoe-pickle = { path = "../zoe-pickle" }
 zstd.workspace = true
 
 [lints]

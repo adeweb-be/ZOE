@@ -459,9 +459,9 @@ impl MemVfs {
     }
 
     /// Return a filesystem with the files and the directories of this one,
-    /// all durable, and an empty record.
-    #[cfg(test)]
-    pub(crate) fn settled(&self) -> MemVfs {
+    /// all durable, and an empty record. The crash images of the copy
+    /// cover only what comes after this call.
+    pub fn durable_copy(&self) -> MemVfs {
         let state = self.lock();
         MemVfs::with_tree(state.files.clone(), state.dirs.clone())
     }

@@ -76,6 +76,31 @@ pub fn decode_record_with(bytes: &[u8], limits: Limits) -> Result<Tree, Error> {
     Decoder::new(bytes, limits.node_budget).record()
 }
 
+/// Returns the module and the name of the class of a record, as
+/// [`Tree::class_name`] gives them, from the class pickle alone.
+///
+/// The decoder stops at the end of the class pickle and does not read the
+/// state pickle. So the memory stays in proportion to the class pickle,
+/// and a state pickle that does not decode does not matter. The node
+/// budget is the length of the record, so no budget refuses the class
+/// pickle. Returns `None` when the class pickle names no class.
+pub fn decode_class_name(bytes: &[u8]) -> Result<Option<(String, String)>, Error> {
+    let mut decoder = Decoder::new(bytes, bytes.len());
+    let mut class = decoder.pickle()?;
+    let mut spans = std::mem::take(&mut decoder.spans).into_iter();
+    decoder.copy_spans(&mut class.root, &mut spans)?;
+    let tree = Tree {
+        class,
+        state: Pickle {
+            protocol: None,
+            root: Node::None,
+        },
+    };
+    Ok(tree
+        .class_name()
+        .map(|(module, name)| (module.to_owned(), name.to_owned())))
+}
+
 /// One stack entry.
 struct Entry {
     /// The offset where the bytes of the entry start.
@@ -903,6 +928,28 @@ mod tests {
 
     fn batch<T>(items: Vec<T>, marked: bool) -> Batch<T> {
         Batch { items, marked }
+    }
+
+    #[test]
+    fn the_class_name_comes_from_the_class_pickle_alone() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "record") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let tree = decode_record(&bytes).unwrap();
+            let expected = tree
+                .class_name()
+                .map(|(module, name)| (module.to_owned(), name.to_owned()));
+            assert_eq!(decode_class_name(&bytes).unwrap(), expected, "{path:?}");
+        }
+        // A state pickle that does not decode does not matter.
+        let class = (String::from("m"), String::from("C"));
+        assert_eq!(decode_class_name(&record(b"\xff")).unwrap(), Some(class));
+        assert!(decode_class_name(b"\x80\x03cm\n").is_err());
+        assert_eq!(decode_class_name(b"\x80\x03N.\x80\x03}.").unwrap(), None);
     }
 
     #[test]

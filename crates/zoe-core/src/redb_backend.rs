@@ -16,7 +16,7 @@ use redb::{
 
 use crate::backend::{
     Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnStatus, WriteTxn,
+    TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression};
@@ -30,6 +30,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_FORMAT: &str = "format";
 const META_LAST_TID: &str = "last_tid";
 const META_NEXT_OID: &str = "next_oid";
+const META_PACK_WATERMARK: &str = "pack_watermark";
 
 /// Wrap a redb error.
 fn backend(error: impl Into<redb::Error>) -> ZoeError {
@@ -166,6 +167,15 @@ impl RedbBackend {
         })
     }
 
+    /// Decode and verify the transaction row stored under `key`.
+    fn txn_row(key: &[u8; 8], bytes: &[u8]) -> Result<TxnMeta> {
+        let tid = Tid(u64::from_be_bytes(*key));
+        let corrupt = ZoeError::CorruptTxn { tid };
+        format::decode_frame(key, bytes)
+            .and_then(|frame| format::decode_txn(tid, &frame.data))
+            .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt))
+    }
+
     /// Decode and verify the record frame stored under `key` for `oid`.
     /// Return the tid of the key and the frame.
     fn frame<'a>(oid: Oid, key: &[u8; 16], bytes: &'a [u8]) -> Result<(Tid, format::Frame<'a>)> {
@@ -253,6 +263,7 @@ impl Backend for RedbBackend {
             compression: self.compression,
             written_tid: None,
             max_oid: None,
+            pack_watermark: None,
         }))
     }
 
@@ -264,12 +275,7 @@ impl Backend for RedbBackend {
             let mut rows = Vec::new();
             for entry in txns.range::<&[u8; 8]>(&start..=&end).map_err(backend)? {
                 let (key, value) = entry.map_err(backend)?;
-                let tid = Tid(u64::from_be_bytes(*key.value()));
-                let corrupt = ZoeError::CorruptTxn { tid };
-                let row = format::decode_frame(key.value(), value.value())
-                    .and_then(|frame| format::decode_txn(tid, &frame.data))
-                    .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
-                rows.push(row);
+                rows.push(Self::txn_row(key.value(), value.value()));
             }
             Ok(rows)
         };
@@ -377,7 +383,55 @@ impl Backend for RedbBackend {
     }
 
     fn pack(&self, _before: Tid, _reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
-        Err(ZoeError::Backend("pack is not built yet".into()))
+        Err(ZoeError::Backend(
+            "pack goes through Store::pack and the removal methods".into(),
+        ))
+    }
+
+    fn pack_watermark(&self) -> Result<Tid> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let meta = txn.open_table(META).map_err(backend)?;
+        match meta.get(META_PACK_WATERMARK).map_err(backend)? {
+            None => Ok(Tid::ZERO),
+            Some(value) => format::decode_u64(value.value())
+                .map(Tid)
+                .ok_or_else(|| ZoeError::Format("pack watermark is not 8 bytes".to_owned())),
+        }
+    }
+
+    fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let start = format::record_key(from, Tid::ZERO);
+        let mut keys: Vec<(Oid, Tid)> = Vec::new();
+        for entry in records.range::<&[u8; 16]>(&start..).map_err(backend)? {
+            let (key, _) = entry.map_err(backend)?;
+            let (oid, tid) = format::split_record_key(key.value());
+            if keys.len() >= limit && keys.last().is_some_and(|&(last, _)| last != oid) {
+                break;
+            }
+            keys.push((oid, tid));
+        }
+        Ok(keys)
+    }
+
+    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let txns = txn.open_table(TXNS).map_err(backend)?;
+        let key = format::txn_key(tid);
+        let row = match txns.get(&key).map_err(backend)? {
+            Some(value) => Self::txn_row(&key, value.value())?,
+            None => return Ok(None),
+        };
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let mut found = Vec::new();
+        for &oid in oids {
+            let key = format::record_key(oid, tid);
+            if let Some(value) = records.get(&key).map_err(backend)? {
+                found.push((oid, Self::record(oid, &key, value.value())?.data));
+            }
+        }
+        Ok(Some((row, found)))
     }
 
     fn sync(&self) -> Result<()> {
@@ -394,6 +448,7 @@ struct RedbWrite<'a> {
     compression: Compression,
     written_tid: Option<Tid>,
     max_oid: Option<Oid>,
+    pack_watermark: Option<Tid>,
 }
 
 impl WriteTxn for RedbWrite<'_> {
@@ -428,9 +483,72 @@ impl WriteTxn for RedbWrite<'_> {
         Ok(())
     }
 
+    fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()> {
+        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        records
+            .remove(&format::record_key(oid, tid))
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn remove_blob(&mut self, oid: Oid, tid: Tid) -> Result<()> {
+        let mut blobs = self.txn.open_table(BLOBS).map_err(backend)?;
+        blobs
+            .remove(&format::record_key(oid, tid))
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn replace_txn(&mut self, meta: &TxnMeta) -> Result<()> {
+        let key = format::txn_key(meta.tid);
+        let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
+        // The new frame keeps the branch id and the previous serial of the
+        // row. This code writes no typed-field slots, so it refuses to
+        // rewrite a row that has some.
+        let (branch, prev) = {
+            let tid = meta.tid;
+            let old = txns
+                .get(&key)
+                .map_err(backend)?
+                .ok_or(ZoeError::CorruptTxn { tid })?;
+            let frame = format::decode_frame(&key, old.value()).map_err(|e| {
+                refused(
+                    e,
+                    &format!("transaction row {tid:?}"),
+                    ZoeError::CorruptTxn { tid },
+                )
+            })?;
+            if !frame.slots.is_empty() {
+                return Err(ZoeError::Format(format!(
+                    "transaction row {tid:?} has typed-field slots, which this build cannot rewrite"
+                )));
+            }
+            (frame.branch, frame.prev)
+        };
+        let payload = format::encode_txn(meta);
+        let frame = format::encode_frame(&key, branch, prev, &payload);
+        txns.insert(&key, frame.as_slice()).map_err(backend)?;
+        Ok(())
+    }
+
+    fn remove_txn(&mut self, tid: Tid) -> Result<()> {
+        let mut txns = self.txn.open_table(TXNS).map_err(backend)?;
+        txns.remove(&format::txn_key(tid)).map_err(backend)?;
+        Ok(())
+    }
+
+    fn put_pack_watermark(&mut self, tid: Tid) -> Result<()> {
+        self.pack_watermark = Some(tid);
+        Ok(())
+    }
+
     fn commit(self: Box<Self>) -> Result<()> {
         {
             let mut meta = self.txn.open_table(META).map_err(backend)?;
+            if let Some(tid) = self.pack_watermark {
+                meta.insert(META_PACK_WATERMARK, &format::encode_u64(tid.0)[..])
+                    .map_err(backend)?;
+            }
             if let Some(tid) = self.written_tid {
                 meta.insert(META_LAST_TID, &format::encode_u64(tid.0)[..])
                     .map_err(backend)?;
@@ -680,6 +798,75 @@ mod tests {
             matches!(rows[..], [Err(ZoeError::CorruptTxn { tid: Tid(5) })]),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn a_replaced_row_keeps_its_branch_and_its_previous_serial() {
+        let backend = empty();
+        let tid = Tid(5);
+        commit_txn(&backend, tid);
+        // A row of another branch, with a previous serial.
+        let key = format::txn_key(tid);
+        let row = backend.iter_txns(tid, tid).next().unwrap().unwrap();
+        let frame = format::encode_frame(&key, 7, Tid(3), &format::encode_txn(&row));
+        let txn = backend.database().begin_write().unwrap();
+        txn.open_table(TXNS)
+            .unwrap()
+            .insert(&key, frame.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let mut write = backend.begin_write().unwrap();
+        write
+            .replace_txn(&TxnMeta {
+                oid_count: 4,
+                ..row.clone()
+            })
+            .unwrap();
+        write.commit().unwrap();
+
+        let txn = backend.db.begin_read().unwrap();
+        let txns = txn.open_table(TXNS).unwrap();
+        let stored = txns.get(&key).unwrap().unwrap();
+        let frame = format::decode_frame(&key, stored.value()).unwrap();
+        assert_eq!((frame.branch, frame.prev), (7, Tid(3)));
+        let replaced = format::decode_txn(tid, &frame.data).unwrap();
+        assert_eq!(replaced.oid_count, 4);
+        assert_eq!(replaced.user, row.user);
+        assert_eq!(backend.last_tid(), tid);
+    }
+
+    #[test]
+    fn a_row_with_typed_field_slots_is_not_replaced() {
+        let backend = empty();
+        let tid = Tid(5);
+        commit_txn(&backend, tid);
+        let key = format::txn_key(tid);
+        let row = backend.iter_txns(tid, tid).next().unwrap().unwrap();
+        // The frame of a newer build: two bytes of typed-field slots.
+        let payload = format::encode_txn(&row);
+        let mut frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, &payload);
+        frame[20..22].copy_from_slice(&2u16.to_le_bytes());
+        frame.splice(format::HEADER_LEN..format::HEADER_LEN, [1, 2]);
+        let mut hasher = Xxh3::new();
+        hasher.update(&key);
+        hasher.update(&frame[..24]);
+        hasher.update(&frame[format::HEADER_LEN..]);
+        let checksum = hasher.digest().to_le_bytes();
+        frame[24..32].copy_from_slice(&checksum);
+        let txn = backend.database().begin_write().unwrap();
+        txn.open_table(TXNS)
+            .unwrap()
+            .insert(&key, frame.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let mut write = backend.begin_write().unwrap();
+        let error = write.replace_txn(&TxnMeta {
+            oid_count: 4,
+            ..row
+        });
+        assert!(matches!(error, Err(ZoeError::Format(_))), "{error:?}");
     }
 
     #[test]

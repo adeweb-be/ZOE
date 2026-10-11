@@ -14,6 +14,7 @@ use crate::commit::Txn;
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::lock::LockManager;
+use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
 use crate::types::{Oid, Tid};
 use crate::vfs::{MemVfs, OsVfs, Vfs};
@@ -89,6 +90,9 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
+    /// The state that a pack shares with the finishes. A finish takes its
+    /// lock under the commit sequencer.
+    pub(crate) packing: PackState,
 }
 
 impl Store {
@@ -197,6 +201,7 @@ impl Store {
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
+            packing: PackState::default(),
         })
     }
 
@@ -351,7 +356,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::backend::{BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
+    use crate::backend::{
+        BlobRecord, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnRecords, WriteTxn,
+    };
     use crate::format;
     use crate::format::Codec;
     use crate::vfs::LOCK;
@@ -442,6 +449,18 @@ mod tests {
 
         fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
             self.inner.pack(before, reachable)
+        }
+
+        fn pack_watermark(&self) -> Result<Tid> {
+            self.inner.pack_watermark()
+        }
+
+        fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
+            self.inner.record_keys(from, limit)
+        }
+
+        fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>> {
+            self.inner.txn_records(tid, oids)
         }
 
         fn sync(&self) -> Result<()> {
@@ -543,6 +562,42 @@ mod tests {
         assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
         assert!(store.locks.is_empty());
         assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
+    }
+
+    #[test]
+    fn a_halted_store_refuses_a_pack() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, first, b"b").unwrap();
+        txn.vote().unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(txn.finish().is_err());
+        faults.write.store(false, Ordering::Relaxed);
+
+        let error = store.pack(Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), first));
+    }
+
+    #[test]
+    fn a_failed_pack_write_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let second = commit(&store, oid, first, b"b").unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        let error = store.pack(second);
+        assert!(matches!(error, Err(ZoeError::Backend(_))), "{error:?}");
+        faults.write.store(false, Ordering::Relaxed);
+
+        // The outcome of the pack write is unknown, as after a failed
+        // finish.
+        let error = commit(&store, oid, second, b"c");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert!(matches!(store.pack(second), Err(ZoeError::Halted)));
+        assert!(store.locks.is_empty());
     }
 
     #[test]
@@ -816,6 +871,25 @@ mod tests {
         assert!(matches!(txn.vote(), Err(ZoeError::ReadOnly)));
         assert!(matches!(txn.vote_resolving(), Err(ZoeError::ReadOnly)));
         assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_read_only_store_refuses_a_pack() {
+        let dir = fresh_dir("read-only-pack");
+        // The root does not decode, so a pack that reads it fails with
+        // another error.
+        let tid = {
+            let store = Store::open(&dir).unwrap();
+            commit(&store, Oid(0), Tid::ZERO, b"a").unwrap()
+        };
+        let before = files(&dir);
+
+        let store = Store::open_read_only(&dir).unwrap();
+        let error = store.pack(Tid::MAX);
+        assert!(matches!(error, Err(ZoeError::ReadOnly)), "{error:?}");
+        assert_eq!(store.load(Oid(0)).unwrap(), (b"a".to_vec(), tid));
+        drop(store);
+        assert!(files(&dir) == before, "the refused pack changed a file");
     }
 
     #[test]

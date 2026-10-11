@@ -110,7 +110,9 @@ pub enum ZoeError {
     #[error("the store is closed")]
     Closed,
 
-    /// The store is not in a format that this code reads.
+    /// The store is not in a format that this code reads. Pack also gives
+    /// it for a record whose persistent references it cannot read: the
+    /// text then names the oid and the tid of the record.
     #[error("unknown store format: {0}")]
     Format(String),
 
