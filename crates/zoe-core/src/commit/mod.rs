@@ -48,7 +48,7 @@ use crate::blob::{BlobFile, PendingBlob};
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::guard::SizeLimit;
-use crate::lock::{Held, Mode};
+use crate::lock::{Held, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 use staging::Staging;
@@ -394,17 +394,27 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 
     /// Take the locks of the vote, and keep them until `finish`, `abort` or
-    /// a failed vote. A lock timeout releases the locks that the call took.
-    /// A read-only store fails with `ReadOnly` and gives no lock.
+    /// a failed vote. A lock timeout releases the locks that the call took,
+    /// and logs each one held past `lock-warn`. A read-only store fails
+    /// with `ReadOnly` and gives no lock.
     fn lock(&mut self) -> Result<()> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        let locks = store
+        match store
             .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock)?;
-        self.locks = Some(locks.keep());
-        Ok(())
+            .acquire(&requests, store.lock_timeout, &*store.clock)
+        {
+            Ok(locks) => {
+                self.locks = Some(locks.keep());
+                Ok(())
+            }
+            Err(Refused { error, released }) => {
+                let now = store.clock.now();
+                store.guardrails.locks_released(&released, now);
+                Err(error)
+            }
+        }
     }
 
     /// Check the serials with the locks held. Return the stale written oids
@@ -1724,6 +1734,63 @@ mod tests {
             [Some(1_100), Some(1_200), Some(1_300), Some(1_400)],
             "{events:?}"
         );
+    }
+
+    /// A clock that moves on by `step` at each read.
+    struct StepClock {
+        now: std::sync::Mutex<std::time::SystemTime>,
+        step: Duration,
+    }
+
+    impl crate::clock::Clock for StepClock {
+        fn now(&self) -> std::time::SystemTime {
+            let mut now = self.now.lock().unwrap();
+            *now += self.step;
+            *now
+        }
+    }
+
+    #[test]
+    fn the_locks_that_a_lock_wait_timeout_releases_are_logged() {
+        let step = Duration::from_secs(2);
+        let clock = StepClock {
+            now: std::sync::Mutex::new(std::time::UNIX_EPOCH),
+            step,
+        };
+        // A zero lock timeout turns every wait into a timeout.
+        let options = Options {
+            lock_timeout: Duration::ZERO,
+            lock_warn: Some(Duration::from_secs(1)),
+            ..Options::default()
+        };
+        let store = Store::open_full(MemVfs::new(), clock, options).unwrap();
+        let (low, high) = (Oid(1), Oid(2));
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"a").unwrap();
+        holder.vote().unwrap();
+
+        // The vote takes `low`, then times out on `high`. It reads the
+        // clock when it takes `low` and after it releases `low`, so the
+        // hold lasts one step.
+        let ((), events) = events_of(|| {
+            let mut waiter = store.tpc_begin(b"", b"", b"").unwrap();
+            waiter.check_current_serial(low, Tid::ZERO).unwrap();
+            waiter.store(high, Tid::ZERO, b"b").unwrap();
+            let error = waiter.vote();
+            assert!(
+                matches!(error, Err(ZoeError::Conflict { oid }) if oid == high),
+                "{error:?}"
+            );
+        });
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|e| e.message().contains("lock-warn"))
+            .map(|e| (e.number("oid"), e.number("duration_ms")))
+            .collect();
+        let step = Some(step.as_millis() as u64);
+        assert_eq!(logged, [(Some(low.0), step), (None, None)], "{events:?}");
+        holder.abort();
+        assert!(store.lock_table_is_empty());
     }
 
     #[test]

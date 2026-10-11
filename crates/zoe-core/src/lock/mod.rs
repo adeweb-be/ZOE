@@ -10,7 +10,8 @@
 //! A vote that must wait keeps the locks that it holds and waits in one
 //! queue at a time. Its waits together last at most the lock timeout. At
 //! the timeout, the vote leaves the queue, releases the locks that it took,
-//! and fails with a conflict on the oid that it waits for.
+//! and fails with a conflict on the oid that it waits for. The error gives
+//! back the released locks, so the caller can log them.
 //!
 //! One mutex protects the lock table. A thread that releases a lock grants
 //! it to the waiters at the head of the queue, under the mutex, and then
@@ -27,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::clock::Clock;
-use crate::error::{Result, ZoeError};
+use crate::error::ZoeError;
 use crate::types::Oid;
 
 /// The mode of a lock request.
@@ -179,6 +180,15 @@ impl Locks<'_> {
     }
 }
 
+/// An `acquire` call that failed.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub(crate) error: ZoeError,
+    /// The locks that the call took and released at a lock-wait timeout.
+    /// The list is empty for other errors.
+    pub(crate) released: Vec<Held>,
+}
+
 impl LockManager {
     fn table(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
@@ -187,11 +197,12 @@ impl LockManager {
     /// Lock each oid of `requests` in its mode.
     ///
     /// The oids must be in strictly ascending order. Otherwise the call
-    /// takes no lock and returns `LockOrder`. The call takes the locks in
+    /// takes no lock and fails with `LockOrder`. The call takes the locks in
     /// that order and waits when a lock is not free. It measures `timeout`
     /// from its start on the monotonic clock. If it still waits at that
     /// time, it leaves the queue, releases the locks that it took and
-    /// returns `Conflict` on the oid that it waits for.
+    /// fails with `Conflict` on the oid that it waits for. `Refused` then
+    /// gives the released locks.
     ///
     /// Each lock keeps the time of `clock` when the call took it. The call
     /// reads `clock` at its start and after each wait.
@@ -200,9 +211,12 @@ impl LockManager {
         requests: &[(Oid, Mode)],
         timeout: Duration,
         clock: &dyn Clock,
-    ) -> Result<Locks<'_>> {
+    ) -> Result<Locks<'_>, Refused> {
         if let Some(pair) = requests.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
-            return Err(ZoeError::LockOrder { oid: pair[1].0 });
+            return Err(Refused {
+                error: ZoeError::LockOrder { oid: pair[1].0 },
+                released: Vec::new(),
+            });
         }
         let start = Instant::now();
         let mut since = clock.now();
@@ -234,8 +248,10 @@ impl LockManager {
                 if table.waits(oid, wake) {
                     table.withdraw(oid, wake);
                     table.release(&locks.held);
-                    locks.held.clear();
-                    return Err(ZoeError::Conflict { oid });
+                    return Err(Refused {
+                        error: ZoeError::Conflict { oid },
+                        released: std::mem::take(&mut locks.held),
+                    });
                 }
                 since = clock.now();
             }
@@ -366,7 +382,9 @@ mod tests {
             [(Oid(2), Exclusive), (Oid(1), Exclusive)],
             [(Oid(1), Shared), (Oid(1), Exclusive)],
         ] {
-            let error = locks.acquire(&requests, Duration::ZERO, &SystemClock);
+            let error = locks
+                .acquire(&requests, Duration::ZERO, &SystemClock)
+                .map_err(|refused| refused.error);
             assert!(
                 matches!(error, Err(ZoeError::LockOrder { oid: Oid(1) })),
                 "{requests:?}"
@@ -383,7 +401,9 @@ mod tests {
             let _held = locks
                 .acquire(&[(oid, held)], Duration::ZERO, &SystemClock)
                 .unwrap();
-            let result = locks.acquire(&[(oid, asked)], Duration::ZERO, &SystemClock);
+            let result = locks
+                .acquire(&[(oid, asked)], Duration::ZERO, &SystemClock)
+                .map_err(|refused| refused.error);
             match result {
                 Ok(_) => true,
                 Err(ZoeError::Conflict { oid: Oid(1) }) => false,
@@ -446,7 +466,9 @@ mod tests {
             until_waiting(locks, oid, 1);
 
             // The shared lock is free for a reader, but a writer waits.
-            let refused = locks.acquire(&[(oid, Shared)], Duration::ZERO, &SystemClock);
+            let refused = locks
+                .acquire(&[(oid, Shared)], Duration::ZERO, &SystemClock)
+                .map_err(|refused| refused.error);
             assert!(matches!(refused, Err(ZoeError::Conflict { .. })));
 
             scope.spawn(move || {
@@ -510,13 +532,18 @@ mod tests {
             .unwrap();
         let timeout = Duration::from_millis(50);
         let start = Instant::now();
-        let error = locks.acquire(
-            &[(Oid(1), Exclusive), (Oid(2), Shared)],
-            timeout,
-            &SystemClock,
-        );
+        let refused = locks
+            .acquire(
+                &[(Oid(1), Exclusive), (Oid(2), Shared)],
+                timeout,
+                &SystemClock,
+            )
+            .unwrap_err();
         assert!(start.elapsed() >= timeout);
-        assert!(matches!(error, Err(ZoeError::Conflict { oid: Oid(2) })));
+        assert!(matches!(refused.error, ZoeError::Conflict { oid: Oid(2) }));
+        // The error gives back the lock that the call released.
+        let released: Vec<_> = refused.released.iter().map(|lock| lock.oid).collect();
+        assert_eq!(released, [Oid(1)]);
         assert_eq!(locks.waiting(Oid(2)), 0);
         locks
             .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
@@ -545,7 +572,8 @@ mod tests {
                     timeout,
                     &SystemClock,
                 );
-                (result.map(drop), start, Instant::now())
+                let result = result.map(drop).map_err(|refused| refused.error);
+                (result, start, Instant::now())
             });
             until_waiting(&locks, Oid(1), 1);
             thread::sleep(timeout / 2);
@@ -575,6 +603,7 @@ mod tests {
                 locks
                     .acquire(&[(oid, Exclusive)], Duration::from_secs(1), &SystemClock)
                     .map(drop)
+                    .map_err(|refused| refused.error)
             });
             until_waiting(&locks, oid, 1);
             let second = scope.spawn(|| {
@@ -600,7 +629,9 @@ mod tests {
         let holder = locks
             .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
             .unwrap();
-        let error = locks.acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock);
+        let error = locks
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
+            .map_err(|refused| refused.error);
         assert!(matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })));
         assert_eq!(locks.waiting(Oid(1)), 0);
         drop(holder);
