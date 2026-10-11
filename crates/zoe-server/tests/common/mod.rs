@@ -1,14 +1,17 @@
 //! Spawns of `zoe` and opens of a store that do not race each other.
 //!
 //! The lock of a store is `flock` on a file descriptor. A spawned child
-//! gets a copy of each descriptor of the test process, and keeps it until
-//! it runs `exec`. During that time, the lock of a store that a test closed
-//! stays held. If another test opens that store again during that time,
-//! the open fails with `Locked`.
+//! gets a copy of each descriptor of the test process. The lock of a store
+//! that a test closed stays held while the child keeps its copy. If a test
+//! opens that store again during that time, the open fails with `Locked`.
 //!
-//! So each spawn and each open of a store in the test process holds the
-//! same mutex. A spawn returns after the child runs `exec`, so an open
-//! that comes after it finds no copy of an old descriptor.
+//! The child keeps its copies until `exec` returns in the child.
+//! `Command::spawn` can return before that: it uses `vfork`, and the kernel
+//! wakes the parent before it releases these copies.
+//!
+//! So each open of a store holds a mutex, and each child holds the same
+//! mutex from its spawn to its end. When `wait` returns, the child holds no
+//! descriptor.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -32,9 +35,6 @@ pub fn open(dir: &Path) -> Store {
 /// Run `command` to its end and return its output. The caller sets the
 /// standard streams.
 pub fn output(command: &mut Command) -> Output {
-    let child = {
-        let _spawn = spawn_lock();
-        command.spawn().unwrap()
-    };
-    child.wait_with_output().unwrap()
+    let _spawn = spawn_lock();
+    command.spawn().unwrap().wait_with_output().unwrap()
 }
