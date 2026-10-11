@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use zoe_core::{Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::blobs::{BlobDir, is_blob_record};
-use crate::filestorage::{DataRecord, End, Reader, TxnHeader, hex};
+use crate::filestorage::{Cut, DataRecord, End, Reader, TxnHeader, hex};
 use crate::{Error, Report};
 
 /// The verification compares the first blob, then one blob in this many,
@@ -29,7 +29,8 @@ use crate::{Error, Report};
 /// store against the source.
 const BLOB_SAMPLE_STRIDE: u64 = 16;
 
-/// The report lists at most this many problems, then a count of the others.
+/// The report lists at most this many problems about single transactions,
+/// records and blobs, then a count of the others.
 const MAX_PROBLEMS: usize = 100;
 
 /// The size of the buffers of the blob comparison.
@@ -160,15 +161,23 @@ fn current_serial(store: &Store, oid: Oid) -> Result<Tid, Error> {
     }
 }
 
-/// The problems that a verification found. The list stops at
-/// `MAX_PROBLEMS`, and the others are counted.
+/// The problems that a verification found.
+///
+/// A summary problem is about the whole source. The summary problems come
+/// first, and the list keeps all of them. The list keeps `MAX_PROBLEMS`
+/// other problems, and a last line counts the others.
 #[derive(Default)]
 struct Problems {
+    summary: Vec<String>,
     list: Vec<String>,
     more: u64,
 }
 
 impl Problems {
+    fn summary(&mut self, problem: String) {
+        self.summary.push(problem);
+    }
+
     fn push(&mut self, problem: String) {
         if self.list.len() < MAX_PROBLEMS {
             self.list.push(problem);
@@ -178,10 +187,11 @@ impl Problems {
     }
 
     fn finish(mut self) -> Vec<String> {
+        self.summary.append(&mut self.list);
         if self.more > 0 {
-            self.list.push(format!("{} more problems", self.more));
+            self.summary.push(format!("{} more problems", self.more));
         }
-        self.list
+        self.summary
     }
 }
 
@@ -203,6 +213,9 @@ fn verify(
         problems: Vec::new(),
     };
     let mut problems = Problems::default();
+    if let Some(problem) = stop_problem(stop) {
+        problems.summary(problem);
+    }
     // The blob records of the file when no blob directory is given.
     let mut without_dir = 0u64;
     let mut stored = target.iterator(None, None)?.peekable();
@@ -275,20 +288,37 @@ fn verify(
     }
 
     if without_dir > 0 {
-        problems.push(format!(
+        problems.summary(format!(
             "the Data.fs has {without_dir} blob records, and no blob directory was given"
         ));
     }
-    for end in [Some(stop), reader.end()] {
-        if let Some(End::Truncated(pos)) = end {
-            problems.push(format!(
-                "the Data.fs ends inside the transaction at offset {pos}: \
-                 the conversion stops before it"
-            ));
-        }
+    // The verification reads only up to where the copy stopped. So it
+    // stops early only when the file changed between the two passes.
+    if let Some(problem) = reader.end().and_then(stop_problem) {
+        problems.summary(problem);
     }
     report.problems = problems.finish();
     Ok(report)
+}
+
+/// Describe a stop of the reader before the end of the file. A clean end
+/// and a commit in progress at the end are not problems.
+fn stop_problem(end: End) -> Option<String> {
+    let End::Cut { pos, cut } = end else {
+        return None;
+    };
+    let what = match cut {
+        Cut::Truncated => format!("the Data.fs ends inside the transaction at offset {pos}"),
+        Cut::Junk => format!(
+            "the Data.fs holds no valid transaction from offset {pos} to its end, \
+             as after a crash"
+        ),
+        Cut::Commit => format!(
+            "the transaction at offset {pos} has the status c, \
+             but it is not a whole last transaction"
+        ),
+    };
+    Some(format!("{what}: the conversion stops there"))
 }
 
 /// Describe a transaction of the store that the file does not have, or an
@@ -642,7 +672,7 @@ mod tests {
             report.problems,
             [format!(
                 "the Data.fs ends inside the transaction at offset {pos}: \
-                 the conversion stops before it"
+                 the conversion stops there"
             )]
         );
 
@@ -651,6 +681,80 @@ mod tests {
         let report = from_datafs(&file.write("tail-in-progress"), None, &store).unwrap();
         assert_eq!((report.transactions, report.copied), (1, 1));
         assert!(report.problems.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_commit_status_before_the_last_transaction_is_a_problem() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', NO_META, &[(1, Data::Bytes(b"a"))]);
+        let pos = file.bytes.len();
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"b"))]);
+        file.txn(30, b' ', NO_META, &[(1, Data::Bytes(b"c"))]);
+        file.bytes[pos + 16] = b'c';
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let report = from_datafs(&file.write("commit-not-last"), None, &store).unwrap();
+        assert_eq!((report.transactions, report.copied), (1, 1));
+        assert_eq!(
+            report.problems,
+            [format!(
+                "the transaction at offset {pos} has the status c, \
+                 but it is not a whole last transaction: the conversion stops there"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_tail_of_zeros_is_a_problem_on_every_run() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', NO_META, &[(1, Data::Bytes(b"a"))]);
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"b"))]);
+        let pos = file.bytes.len();
+        file.bytes.resize(pos + 4096, 0);
+        let path = file.write("tail-of-zeros");
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let problem = format!(
+            "the Data.fs holds no valid transaction from offset {pos} to its end, \
+             as after a crash: the conversion stops there"
+        );
+        for copied in [2, 0] {
+            let report = from_datafs(&path, None, &store).unwrap();
+            assert_eq!((report.transactions, report.copied), (2, copied));
+            assert_eq!(report.last_tid, Tid(20));
+            assert_eq!(report.problems, std::slice::from_ref(&problem));
+        }
+    }
+
+    #[test]
+    fn the_lines_about_the_whole_source_come_before_the_cap() {
+        let records: Vec<_> = (1..=105).map(|oid| (oid, Data::Bytes(b"a"))).collect();
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', NO_META, &records);
+        file.txn(20, b' ', NO_META, &[(200, Data::Bytes(BLOB))]);
+        let pos = file.bytes.len();
+        file.bytes.resize(pos + 64, 0);
+        let path = file.write("summary-first");
+        // The store holds the first transaction with other pickles, so
+        // each of its records is a problem.
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin_restore(Tid(10), b"", b"", b"").unwrap();
+        for oid in 1..=105 {
+            txn.restore(Oid(oid), Some(b"b")).unwrap();
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+
+        let report = from_datafs(&path, None, &store).unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(report.problems.len(), 2 + MAX_PROBLEMS + 1, "{report:?}");
+        assert!(
+            report.problems[0].starts_with("the Data.fs holds no valid transaction"),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.problems[1],
+            "the Data.fs has 1 blob records, and no blob directory was given"
+        );
+        assert_eq!(report.problems.last().unwrap(), "5 more problems");
     }
 
     #[test]

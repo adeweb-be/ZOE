@@ -20,6 +20,11 @@
 //! transaction header and one record at a time. It reads the record that a
 //! back pointer leads to, and the redundant length, at their offsets. These
 //! reads do not move the buffer.
+//!
+//! The reader stops where ZODB stops: before a commit in progress at the
+//! end of the file, before a transaction that the end of the file cuts, and
+//! before a tail that ZODB takes for the junk of a crash. ZODB cuts the
+//! file at the same offset when it opens the file for writing.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -47,12 +52,30 @@ const NUMBER_LEN: u64 = 8;
 pub(crate) enum End {
     /// The last transaction ends at the end of the file.
     Clean,
-    /// The transaction at this offset has the status `c`. It is a commit
-    /// in progress. The reader stops before it, as ZODB does.
+    /// The last transaction of the file, at this offset, has the status
+    /// `c`. It is a commit in progress, and the reader stops before it.
     InProgress(u64),
-    /// The file ends inside the transaction at this offset. The reader
-    /// stops before it.
-    Truncated(u64),
+    /// The reader stops before the end of the file, at the offset `pos`.
+    Cut {
+        /// The offset where the reader stops.
+        pos: u64,
+        /// Why the reader stops there.
+        cut: Cut,
+    },
+}
+
+/// Why the reader stops before the end of the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// The file ends inside the transaction.
+    Truncated,
+    /// The transaction header is not valid, and the last length of the file
+    /// is not the length of a transaction after it. ZODB takes such a tail
+    /// for the junk of a crash.
+    Junk,
+    /// The transaction has the status `c`, but it is not a whole last
+    /// transaction: data follows it, or its length is not valid.
+    Commit,
 }
 
 /// The header of a transaction record.
@@ -161,6 +184,9 @@ impl Reader {
     /// returns. A transaction with the status `u` is skipped, as the index
     /// of ZODB skips it. The next call moves past the data records of this
     /// transaction, read or not.
+    ///
+    /// A header that is not valid is `Corrupt`, except in a tail that ZODB
+    /// takes for junk. There the reader stops with `Cut::Junk`.
     pub(crate) fn next_txn(&mut self) -> Result<Option<TxnHeader>, Error> {
         loop {
             if self.end.is_some() {
@@ -173,8 +199,7 @@ impl Reader {
                 return Ok(None);
             }
             if left < TXN_HEADER_LEN {
-                self.end = Some(End::Truncated(pos));
-                return Ok(None);
+                return self.stop(pos, Cut::Truncated);
             }
             self.goto(pos)?;
             let mut header = [0; TXN_HEADER_LEN as usize];
@@ -184,25 +209,40 @@ impl Reader {
             let status = header[16];
             let lens = [&header[17..19], &header[19..21], &header[21..23]]
                 .map(|field| u64::from(u16::from_be_bytes([field[0], field[1]])));
+            let header_len = TXN_HEADER_LEN + lens.iter().sum::<u64>();
+            let total = len.checked_add(NUMBER_LEN);
 
             if status == b'c' {
-                self.end = Some(End::InProgress(pos));
-                return Ok(None);
+                // ZODB writes the status `c` only on the last transaction.
+                // A commit can still write the end of that transaction.
+                let writing = total.is_none_or(|total| total > left);
+                let whole = total == Some(left) && len >= header_len;
+                if writing || whole {
+                    self.end = Some(End::InProgress(pos));
+                    return Ok(None);
+                }
+                return self.stop(pos, Cut::Commit);
             }
-            if len.checked_add(NUMBER_LEN).is_none_or(|total| total > left) {
-                self.end = Some(End::Truncated(pos));
-                return Ok(None);
+            if total.is_none_or(|total| total > left) {
+                return self.stop(pos, Cut::Truncated);
             }
-            if !matches!(status, b' ' | b'p' | b'u') {
-                let status = [status].escape_ascii().to_string();
-                return Err(self.corrupt(pos, format!("unknown transaction status {status:?}")));
-            }
-            let header_len = TXN_HEADER_LEN + lens.iter().sum::<u64>();
-            if len < header_len {
-                return Err(self.corrupt(
-                    pos,
-                    format!("transaction length {len} is shorter than its header"),
-                ));
+            let invalid = if !matches!(status, b' ' | b'p' | b'u') {
+                let status = status.escape_ascii();
+                Some(format!("unknown transaction status \"{status}\""))
+            } else if len < header_len {
+                Some(format!(
+                    "transaction length {len} is shorter than its header"
+                ))
+            } else if tid <= self.last {
+                Some(format!("tid {} is not after the tid before it", hex(tid.0)))
+            } else {
+                None
+            };
+            if let Some(reason) = invalid {
+                if self.junk_from(pos)? {
+                    return self.stop(pos, Cut::Junk);
+                }
+                return Err(self.corrupt(pos, reason));
             }
             let end = pos + len;
             let redundant = self.number_at(end)?;
@@ -210,12 +250,6 @@ impl Reader {
                 return Err(self.corrupt(
                     end,
                     format!("redundant transaction length {redundant} is not {len}"),
-                ));
-            }
-            if tid <= self.last {
-                return Err(self.corrupt(
-                    pos,
-                    format!("tid {} is not after the tid before it", hex(tid.0)),
                 ));
             }
             self.last = tid;
@@ -240,6 +274,22 @@ impl Reader {
             self.read(&mut txn.extension)?;
             return Ok(Some(txn));
         }
+    }
+
+    /// Stop the reader at `pos` for the reason `cut`.
+    fn stop(&mut self, pos: u64, cut: Cut) -> Result<Option<TxnHeader>, Error> {
+        self.end = Some(End::Cut { pos, cut });
+        Ok(None)
+    }
+
+    /// Tell if the bytes from `pos` to the end are junk, as ZODB decides
+    /// for a header that is not valid. The last 8 bytes of the file are the
+    /// length of its last transaction. The tail is junk when that length is
+    /// shorter than a header, or when it leads to a transaction before
+    /// `pos`. So a tail of zeros is junk.
+    fn junk_from(&self, pos: u64) -> Result<bool, Error> {
+        let last = self.number_at(self.size - NUMBER_LEN)?;
+        Ok(last < TXN_HEADER_LEN || self.size.checked_sub(last).is_none_or(|at| at < pos))
     }
 
     /// Return an iterator over the data records of `txn`, which must be the
@@ -689,7 +739,14 @@ pub(crate) mod tests {
             cut_file.bytes.truncate(file.bytes.len() - cut);
             let (txns, end) = read_all(&cut_file.write("truncated")).unwrap();
             assert_eq!(txns.len(), 1, "{cut}");
-            assert_eq!(end, End::Truncated(pos), "{cut}");
+            assert_eq!(
+                end,
+                End::Cut {
+                    pos,
+                    cut: Cut::Truncated
+                },
+                "{cut}"
+            );
         }
 
         file.bytes[pos as usize + 16] = b'c';
@@ -759,6 +816,120 @@ pub(crate) mod tests {
         // The user length grows past the transaction length.
         file.bytes[4 + 18] = 200;
         assert_eq!(corrupt_at(read_all(&file.write("short-txn"))), 4);
+    }
+
+    #[test]
+    fn a_commit_status_before_the_last_transaction_stops_the_reader() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"a"))]);
+        let pos = file.bytes.len() as u64;
+        file.txn(20, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"b"))]);
+        file.txn(30, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"c"))]);
+        file.bytes[pos as usize + 16] = b'c';
+        let (txns, end) = read_all(&file.write("commit-before-last")).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(
+            end,
+            End::Cut {
+                pos,
+                cut: Cut::Commit
+            }
+        );
+    }
+
+    #[test]
+    fn a_commit_status_with_a_wrong_length_stops_the_reader() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"a"))]);
+        let pos = file.bytes.len() as u64;
+        file.txn(20, b'c', [b"user", b"", b""], &[(1, Data::Bytes(b"b"))]);
+        // The user length grows past the transaction length.
+        file.bytes[pos as usize + 18] = 200;
+        let (txns, end) = read_all(&file.write("commit-wrong-length")).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(
+            end,
+            End::Cut {
+                pos,
+                cut: Cut::Commit
+            }
+        );
+    }
+
+    #[test]
+    fn a_commit_that_is_still_written_is_in_progress() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"a"))]);
+        let pos = file.bytes.len() as u64;
+        file.txn(20, b'c', [b"", b"", b""], &[(1, Data::Bytes(b"b"))]);
+        file.bytes.truncate(file.bytes.len() - 5);
+        let (txns, end) = read_all(&file.write("commit-written")).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(end, End::InProgress(pos));
+    }
+
+    #[test]
+    fn a_junk_tail_stops_the_reader() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"a"))]);
+        file.txn(20, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"b"))]);
+        let pos = file.bytes.len() as u64;
+
+        // A tail of zeros.
+        let mut zeros = FileBuilder {
+            bytes: file.bytes.clone(),
+        };
+        zeros.bytes.resize(zeros.bytes.len() + 64, 0);
+        // A header with a short length, and a last length that is too
+        // short for a transaction.
+        let mut short = FileBuilder {
+            bytes: file.bytes.clone(),
+        };
+        short.bytes.extend_from_slice(&30u64.to_be_bytes());
+        short.bytes.extend_from_slice(&5u64.to_be_bytes());
+        short.bytes.extend_from_slice(b" \0\0\0\0\0\0");
+        short.bytes.extend_from_slice(&9u64.to_be_bytes());
+        // A header with an unknown status, and a last length that leads
+        // before the start of the file.
+        let mut long = FileBuilder {
+            bytes: file.bytes.clone(),
+        };
+        long.bytes.extend_from_slice(&40u64.to_be_bytes());
+        long.bytes.extend_from_slice(&TXN_HEADER_LEN.to_be_bytes());
+        long.bytes.extend_from_slice(&[0xff, 0, 0, 0, 0, 0, 0]);
+        long.bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+
+        for (name, junk) in [("zeros", zeros), ("short", short), ("long", long)] {
+            let (txns, end) = read_all(&junk.write(&format!("junk-{name}"))).unwrap();
+            assert_eq!(txns.len(), 2, "{name}");
+            assert_eq!(
+                end,
+                End::Cut {
+                    pos,
+                    cut: Cut::Junk
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_header_before_a_valid_last_transaction_is_corrupt() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"a"))]);
+        let pos = file.bytes.len() as u64;
+        file.txn(20, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"b"))]);
+        file.txn(30, b' ', [b"", b"", b""], &[(1, Data::Bytes(b"c"))]);
+        file.bytes[pos as usize + 16] = 0;
+        let error = read_all(&file.write("bad-header-middle")).unwrap_err();
+        let Error::Corrupt {
+            pos: at, reason, ..
+        } = error
+        else {
+            panic!("not a corrupt file: {error:?}");
+        };
+        assert_eq!(at, pos);
+        assert_eq!(reason, r#"unknown transaction status "\x00""#);
     }
 
     #[test]

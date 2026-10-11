@@ -32,8 +32,11 @@ pub struct Report {
     /// The tid of the last transaction of the source. It is `Tid::ZERO`
     /// when the source has no transaction.
     pub last_tid: Tid,
-    /// What the verification found, one problem per line. The list stops
-    /// at 100 problems, and a last line counts the others.
+    /// What the verification found, one problem per line. The lines about
+    /// the whole source come first: where the conversion stopped before
+    /// the end of the file, and the blob records without a blob directory.
+    /// At most 100 lines about single transactions, records and blobs
+    /// follow, and a last line counts the others.
     pub problems: Vec<String>,
 }
 
