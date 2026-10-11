@@ -84,6 +84,8 @@ pub struct Store {
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
+    /// True when the store is open for reads only.
+    read_only: bool,
 }
 
 impl Store {
@@ -135,25 +137,69 @@ impl Store {
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
+        Self::assemble(backend, Box::new(vfs), Box::new(clock), options, false)
+    }
+
+    /// Open the existing store in the directory `dir` for reads only.
+    ///
+    /// The call takes the lock of the store, so a writer that opens the
+    /// store later gets `Locked`. It opens the database file read-only and
+    /// changes no byte in `dir`. It creates the lock file only when the
+    /// store has none. A directory without a store fails, and the call
+    /// creates nothing in it. Every write call of the store fails with
+    /// `ReadOnly`.
+    ///
+    /// redb opens a database read-only only from a path. So this call
+    /// reaches the files directly, not through a `Vfs`. A store that a
+    /// crash left open does not open read-only: `open` repairs it first.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
+        let db = redb::Builder::new()
+            .open_read_only(dir.path(DATABASE))
+            .map_err(|e| ZoeError::Backend(Box::new(e)))?;
+        let backend = RedbBackend::open_read_only(db)?;
+        let options = Options::default();
+        Self::assemble(backend, Box::new(dir), Box::new(SystemClock), options, true)
+    }
+
+    /// Make a store from an open backend and the directory that holds its
+    /// lock.
+    fn assemble(
+        backend: RedbBackend,
+        dir: Box<dyn Any + Send + Sync>,
+        clock: Box<dyn Clock>,
+        options: Options,
+        read_only: bool,
+    ) -> Result<Self> {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
             backend: Arc::new(Opened {
                 backend: Box::new(backend),
-                _dir: Box::new(vfs),
+                _dir: dir,
             }),
-            clock: Box::new(clock),
+            clock,
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
+            read_only,
         })
+    }
+
+    /// Fail with `ReadOnly` when the store is open for reads only.
+    pub(crate) fn writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(ZoeError::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Return a new oid. An oid that no commit uses can come back after
     /// the store reopens. When no oid below `u64::MAX` is left, fail with
-    /// `Protocol`.
+    /// `Protocol`. A read-only store fails with `ReadOnly`.
     pub fn new_oid(&self) -> Result<Oid> {
+        self.writable()?;
         self.next_oid
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next < u64::MAX).then(|| next + 1)
@@ -164,13 +210,14 @@ impl Store {
 
     /// Begin a transaction that borrows the store, driven by the calling
     /// thread. `Txn::begin` with an `Arc<Store>` gives a transaction that
-    /// borrows nothing.
+    /// borrows nothing. A read-only store fails with `ReadOnly`.
     pub fn tpc_begin(
         &self,
         user: &[u8],
         description: &[u8],
         extension: &[u8],
     ) -> Result<Txn<&Self>> {
+        self.writable()?;
         Ok(Txn::begin(self, user, description, extension))
     }
 
@@ -180,7 +227,7 @@ impl Store {
     ///
     /// `tid` must be after the last tid of the store. Otherwise the call
     /// fails with `Protocol`. `finish` checks this again under the commit
-    /// sequencer.
+    /// sequencer. A read-only store fails with `ReadOnly`.
     pub fn tpc_begin_restore(
         &self,
         tid: Tid,
@@ -188,6 +235,7 @@ impl Store {
         description: &[u8],
         extension: &[u8],
     ) -> Result<Txn<&Self>> {
+        self.writable()?;
         Txn::begin_restore(self, tid, user, description, extension)
     }
 
@@ -234,6 +282,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -241,6 +290,7 @@ mod tests {
     use crate::backend::{Bytes, PackStats, Record, RecordMeta, TxnIter, WriteTxn};
     use crate::format;
     use crate::format::Codec;
+    use crate::vfs::LOCK;
 
     /// A clock that never moves.
     struct FrozenClock;
@@ -626,6 +676,119 @@ mod tests {
     fn a_second_process_cannot_open_a_locked_store() {
         let dir = std::env::temp_dir().join(format!("zoe-locked-{}", std::process::id()));
         let _store = Store::open(&dir).unwrap();
+        assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
+    }
+
+    /// Return a new empty directory for one test.
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zoe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a store with one object to `dir` and close it. Return the oid
+    /// and the tid of the commit.
+    fn write_store(dir: &Path) -> (Oid, Tid) {
+        let store = Store::open(dir).unwrap();
+        let oid = store.new_oid().unwrap();
+        (oid, commit(&store, oid, Tid::ZERO, b"a").unwrap())
+    }
+
+    /// Return the bytes of each file in `dir`, by name.
+    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&path).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_read_only_store_reads_and_changes_no_byte() {
+        let dir = fresh_dir("read-only");
+        let (oid, tid) = write_store(&dir);
+        let before = files(&dir);
+
+        let store = Store::open_read_only(&dir).unwrap();
+        assert_eq!(store.last_transaction(), tid);
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), tid));
+        assert_eq!(store.history(oid, 10).unwrap().len(), 1);
+        assert_eq!(store.iterator(None, None).unwrap().count(), 1);
+        drop(store);
+
+        assert!(files(&dir) == before, "the read-only store changed a file");
+    }
+
+    #[test]
+    fn a_read_only_store_refuses_every_write() {
+        let dir = fresh_dir("read-only-writes");
+        let (_, tid) = write_store(&dir);
+        let store = Store::open_read_only(&dir).unwrap();
+        assert!(matches!(store.new_oid(), Err(ZoeError::ReadOnly)));
+        assert!(matches!(
+            store.tpc_begin(b"", b"", b""),
+            Err(ZoeError::ReadOnly)
+        ));
+        assert!(matches!(
+            store.tpc_begin_restore(Tid(tid.0 + 1), b"", b"", b""),
+            Err(ZoeError::ReadOnly)
+        ));
+        assert!(matches!(
+            store.backend.begin_write(),
+            Err(ZoeError::ReadOnly)
+        ));
+        // A transaction that a skin begins on the store itself votes no.
+        let mut txn = Txn::begin(&store, b"", b"", b"");
+        txn.store(Oid(1), tid, b"b").unwrap();
+        assert!(matches!(txn.vote(), Err(ZoeError::ReadOnly)));
+        assert!(matches!(txn.vote_resolving(), Err(ZoeError::ReadOnly)));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_read_only_store_and_a_writer_exclude_each_other() {
+        let dir = fresh_dir("read-only-lock");
+        write_store(&dir);
+
+        let reader = Store::open_read_only(&dir).unwrap();
+        assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
+        assert!(matches!(Store::open_read_only(&dir), Err(ZoeError::Locked)));
+        drop(reader);
+
+        let writer = Store::open(&dir).unwrap();
+        assert!(matches!(Store::open_read_only(&dir), Err(ZoeError::Locked)));
+        drop(writer);
+        Store::open_read_only(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_open_without_a_store_fails_and_creates_nothing() {
+        let dir = fresh_dir("read-only-none");
+        let missing = dir.join("missing");
+        assert!(Store::open_read_only(&missing).is_err());
+        assert!(!missing.exists());
+
+        assert!(Store::open_read_only(&dir).is_err());
+        assert!(files(&dir).is_empty());
+
+        let file = dir.join("file");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(Store::open_read_only(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"data");
+    }
+
+    #[test]
+    fn a_read_only_open_creates_a_missing_lock_file() {
+        let dir = fresh_dir("read-only-no-lock");
+        write_store(&dir);
+        std::fs::remove_file(dir.join(LOCK)).unwrap();
+
+        let _reader = Store::open_read_only(&dir).unwrap();
+        assert!(dir.join(LOCK).is_file());
         assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
     }
 }

@@ -125,7 +125,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// `tid` must be after the last tid of the store. Otherwise the call
     /// fails with `Protocol`. `finish` checks this again under the commit
-    /// sequencer.
+    /// sequencer. A read-only store fails with `ReadOnly`.
     pub fn begin_restore(
         store: S,
         tid: Tid,
@@ -133,6 +133,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         description: &[u8],
         extension: &[u8],
     ) -> Result<Self> {
+        store.writable()?;
         check_restore_tid(tid, store.last_transaction())?;
         let mut txn = Self::begin(store, user, description, extension);
         txn.tid = Some(tid);
@@ -249,7 +250,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// The vote waits for a lock that another transaction holds, at most
     /// the lock timeout of the store. A longer wait fails with `Conflict`.
-    /// A failed vote releases every lock that it took.
+    /// A failed vote releases every lock that it took. On a read-only store
+    /// the vote fails with `ReadOnly` and takes no lock.
     ///
     /// After `vote_resolving` gave conflicts, `vote` takes no lock. It
     /// checks every serial again with the locks that `vote_resolving` took.
@@ -298,7 +300,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Take the locks of the vote, and keep them until `finish`, `abort` or
     /// a failed vote. A lock timeout releases the locks that the call took.
+    /// A read-only store fails with `ReadOnly` and gives no lock.
     fn lock(&mut self) -> Result<()> {
+        self.store.writable()?;
         let store: &Store = &self.store;
         let locks = store
             .locks
