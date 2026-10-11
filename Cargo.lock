@@ -347,6 +347,10 @@ version = "0.0.0"
 [[package]]
 name = "zoe-convert"
 version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "zoe-core",
+]
 
 [[package]]
 name = "zoe-core"
