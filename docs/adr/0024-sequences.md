@@ -8,7 +8,7 @@ F29 asks for sequences: `storage.sequence(name).next()` gives values that increa
 
 A value must never come twice, also after a crash. If each value were durable on its own, each `next` would cost one fsync. If no value were durable, a crash could give a value again. The data model has no key space for this state, so the sequences need one, and that is a format change.
 
-The human decided the trade-off: values are reserved in durable blocks of 100, and a crash can leave a gap of up to 100 values. Values stay unique and strictly increasing per store, as RelStorage's oid allocation does.
+The human decided the trade-off: values are reserved in durable blocks of 100, and each crash or reopen can skip up to 100 values. Values stay unique and strictly increasing per store, as RelStorage's oid allocation does.
 
 ## Decision
 
@@ -61,12 +61,14 @@ A reservation that fails gives no value, and the next call tries the same block 
 
 Each reopen skips at most 100 values of a name. Take the last reservation of the name that reached the disk. It started at `s` and wrote `s + 100`. If the store gave values of that block, the last one is at least `s`, so the reopen skips at most 99 values. If it gave none, the reopen skips the whole block, `s` to `s + 99`: 100 values. A clean close writes nothing, so a clean reopen also skips the rest of the block.
 
-The crash simulation checks this. The acceptance test gives 120 values, so two reservations run. Then it opens the store on each of the 1027 crash images of the run. On every image the first value is above the last value given, with a gap of at most 100.
+The skips add up. A session that reserves a block and gives none of its values adds the whole block to the gap that a caller sees. That happens when the session crashes right after the reservation, closes before it gives a value, or gets an error from a reservation whose row reached the disk all the same. For example, session 1 gives 1 to 5 and closes with the end at 101. Session 2 reserves up to 201 and dies before it gives 101. Session 3 starts at 201, so a caller sees 5 and then 201: a gap of 195. The values stay unique and increasing in every case.
+
+The crash simulation checks this. The acceptance test gives 120 values, so two reservations run. Then it opens the store on each of the 1027 crash images of the run. On every image the first value is above the last value given, with a gap of at most 100. A unit test runs the example of the 195 gap on every crash image of session 2 and checks that no value comes twice.
 
 ## Why blocks of 100
 
 - One fsync for every 100 values, not for each value. A content import that creates thousands of objects costs tens of reservations.
-- A crash or a reopen costs at most 100 values of a 64-bit space.
+- Each crash or reopen costs at most 100 values of a 64-bit space.
 - Intids, `_nextwid` and the like need values that are unique and increasing, not dense.
 
 ## Alternatives
@@ -80,7 +82,7 @@ The crash simulation checks this. The acceptance test gives 120 values, so two r
 ## Consequences
 
 - An id allocation never conflicts and never waits for the locks of a transaction.
-- Values are unique and strictly increasing per store and per name, but not dense: each crash or reopen can skip up to 100 values of each name that was used.
+- Values are unique and strictly increasing per store and per name, but not dense: each crash or reopen can skip up to 100 values of each name that was used, and the skips of reopens in a row add up.
 - The values of an aborted transaction are lost.
 - A store holds one 40-byte row per name, plus the name. Names stay in the store, because nothing deletes a row.
 - A copy through `iterator` and `restore`, as `zodbconvert` does, does not copy the sequences: the copy starts each name at 1. A copy that must keep the values given before has to copy the `sequences` rows too. No tool does that yet.

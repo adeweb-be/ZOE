@@ -27,7 +27,7 @@ impl Sequence {
     /// Return the next value of the sequence.
     ///
     /// The value is not part of a transaction: an abort does not give it
-    /// back. A reopen of the store can skip values, at most 100. A
+    /// back. Each reopen of the store can skip up to 100 values. A
     /// read-only storage raises `ReadOnlyError`.
     fn next(&self, py: Python<'_>) -> PyResult<u64> {
         self.storage.get().next_value(py, &self.name)

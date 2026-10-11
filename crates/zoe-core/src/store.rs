@@ -305,9 +305,10 @@ impl Store {
     /// Return the sequence `name` of the store.
     ///
     /// `Sequence::next` gives values that are unique and strictly
-    /// increasing per store and per name, from 1. A crash or a reopen can
-    /// skip values, at most one block of 100. An allocation is not part of
-    /// a transaction: an abort does not give its values back.
+    /// increasing per store and per name, from 1. Each crash or reopen can
+    /// skip up to 100 values, and the skips of reopens in a row add up. An
+    /// allocation is not part of a transaction: an abort does not give its
+    /// values back.
     pub fn sequence(&self, name: &str) -> Sequence<'_> {
         Sequence::new(self, name)
     }

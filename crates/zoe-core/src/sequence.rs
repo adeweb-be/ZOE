@@ -9,7 +9,8 @@
 //! the row of the name, and the write is durable before the sequence gives
 //! a value of the block. An open store reads the stored end at the first
 //! use of a name and starts there. So a crash or a reopen never gives a
-//! value twice, and it skips at most `BLOCK` values.
+//! value twice. Each reopen skips at most `BLOCK` values of a name. The
+//! skips of reopens in a row add up.
 //!
 //! An allocation is not part of a transaction: an abort does not give its
 //! values back. It takes no per-OID lock and not the commit sequencer. It
@@ -212,6 +213,49 @@ mod tests {
         let store = Store::open_vfs(vfs).unwrap();
         assert_eq!(store.sequence("intids").next().unwrap(), 1 + BLOCK);
         assert_eq!(stored(&store, "intids"), Some(1 + 2 * BLOCK));
+    }
+
+    #[test]
+    fn the_skips_of_reopens_in_a_row_add_up_but_no_value_comes_twice() {
+        // Session 1 gives 1 to 5 and closes with the stored end at 101.
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            for _ in 0..5 {
+                store.sequence("intids").next().unwrap();
+            }
+        }
+        vfs.mark("session 2 opens");
+        // Session 2 reserves up to 201 and gives 101.
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            assert_eq!(store.sequence("intids").next().unwrap(), 1 + BLOCK);
+            vfs.mark("returned 101");
+        }
+
+        // Session 3 opens each crash image of session 2.
+        let mut largest = 0;
+        let images = vfs.crash_images();
+        for image in images
+            .iter()
+            .filter(|image| image.is_after("session 2 opens"))
+        {
+            let returned = if image.is_after("returned 101") {
+                1 + BLOCK
+            } else {
+                5
+            };
+            let store = Store::open_vfs(image.vfs()).unwrap();
+            let first = store.sequence("intids").next().unwrap();
+            assert!(
+                first > returned,
+                "{image:?}: {first} came again after {returned}"
+            );
+            largest = largest.max(first - returned - 1);
+        }
+        // An image where session 2 died after its reservation and before it
+        // gave 101 shows a caller 5, then 201.
+        assert_eq!(largest, 195);
     }
 
     #[test]
