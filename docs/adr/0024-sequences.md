@@ -1,6 +1,6 @@
 # 0024. Sequences: one row per name, reserved in durable blocks of 100
 
-Status: accepted
+Status: accepted. ADR 0029 amends the checksum input: it starts with the tag 5 of `sequences`.
 
 ## Context
 

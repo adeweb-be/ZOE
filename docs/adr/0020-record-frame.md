@@ -1,6 +1,6 @@
 # 0020. The record frame
 
-Status: accepted
+Status: accepted. ADR 0029 amends the checksum input: it starts with a tag of the key space.
 
 ## Context
 
