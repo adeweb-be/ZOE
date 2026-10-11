@@ -321,11 +321,17 @@ impl Snapshot<'_> {
 /// Return the user or the description of a transaction as text, with at
 /// most `MAX_NOTE` bytes of the record.
 fn note(bytes: &[u8]) -> String {
-    let start = &bytes[..bytes.len().min(MAX_NOTE)];
-    let mut text = String::from_utf8_lossy(start).into_owned();
-    if start.len() < bytes.len() {
-        text.push('…');
+    if bytes.len() <= MAX_NOTE {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
+    // Cut before a UTF-8 character, not inside it. A continuation byte is
+    // `0b10xxxxxx`, and a character has at most three of them.
+    let mut end = MAX_NOTE;
+    while end > MAX_NOTE - 3 && bytes[end] & 0xc0 == 0x80 {
+        end -= 1;
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    text.push('…');
     text
 }
 
@@ -422,6 +428,12 @@ mod tests {
         assert_eq!(note(b"caf\xe9"), "caf\u{fffd}");
         let long = note(&b"a".repeat(MAX_NOTE + 1));
         assert_eq!(long, format!("{}\u{2026}", "a".repeat(MAX_NOTE)));
+        // The cut does not split a character.
+        let text = format!("{}\u{e9}a", "a".repeat(MAX_NOTE - 1));
+        assert_eq!(
+            note(text.as_bytes()),
+            format!("{}\u{2026}", "a".repeat(MAX_NOTE - 1))
+        );
     }
 
     #[test]
