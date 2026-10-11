@@ -628,38 +628,8 @@ wheels = [
 
 [[package]]
 name = "zodbpickle"
-version = "4.5"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fa/55/e96f0860b2fcb00c1791467104d331489695fe4cbc87b2c9fe7a3a4fa46b/zodbpickle-4.5.tar.gz", hash = "sha256:67d4295ddb68b2410fe417094ffe1a8b0ed41834ee308020f58ee1b633e1f751", size = 118283, upload-time = "2026-08-20T11:31:59.102Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/96/b50d44768bab5e560ffca862c501e0edd9f326d643ab0725104c3a29119a/zodbpickle-4.5-cp312-cp312-macosx_10_9_x86_64.whl", hash = "sha256:5774ff98010725377df77258b09748d41e68c096d0e710975bea7a7ffeddcc1d", size = 145754, upload-time = "2026-08-20T11:31:17.999Z" },
-    { url = "https://files.pythonhosted.org/packages/f7/55/01f3a0a74b32295e86928022df9b47c5d47f71df9ce89321bcc8d3e184d2/zodbpickle-4.5-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:ca5978f0c31bd3d16a804f6baf99452189b99fffb15ec4922c66d93596277524", size = 143037, upload-time = "2026-08-20T11:31:19.586Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/2e/82d7ac37cf06c3bd238f286ff58c4be1fc3f125b0df9f10a1b79e5c2ace7/zodbpickle-4.5-cp312-cp312-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:be2b28a7203d933bfcabbff8e5ccd2db6cfd39f53be0fec0127feacb1bbbf26f", size = 303528, upload-time = "2026-08-20T11:31:21.04Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/d4/d62b380bf93c523bd93d44774a2f113d2b228ea10175668a12cd9e91e161/zodbpickle-4.5-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ed82ee7f67952aeb10ce354c88b4135a5583c3d1220baf3833a4c5f8ea9db425", size = 307021, upload-time = "2026-08-20T11:31:22.457Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/bb/b86da4e4c241322b1ffa3226ccb43ce6072c441decd510048aaedb7ce4e5/zodbpickle-4.5-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:b15e9385b41d4453e11006cbcf31d312d9163967ed41561ba51bdf0332167a65", size = 306244, upload-time = "2026-08-20T11:31:23.925Z" },
-    { url = "https://files.pythonhosted.org/packages/72/ef/d59bf8bab316ed6d7eec0bdfcd65229b2d2b7eeda974d21078cc4a41ee2b/zodbpickle-4.5-cp312-cp312-win_amd64.whl", hash = "sha256:ed7aad91352fa66fe60704c802ca260d67da967dfa74622c74844b7891cd31bb", size = 141469, upload-time = "2026-08-20T11:31:25.359Z" },
-    { url = "https://files.pythonhosted.org/packages/8f/80/643461506704c909053f36761865632d4849775baefd13464b07d3d28f7c/zodbpickle-4.5-cp312-cp312-win_arm64.whl", hash = "sha256:f230a9116f053fc8fdf9b0cd17f1bd4a2e3708b376dc6a80865f95e5cf6cd1ae", size = 140690, upload-time = "2026-08-20T11:31:26.716Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/64/59e05c83b2a24a09412515ed1a608c57e5ba0c36613760fb7d70b48fe0d9/zodbpickle-4.5-cp313-cp313-macosx_10_9_x86_64.whl", hash = "sha256:24e97718e93cb8236baa8004036ef087371cee7a1202cd9c7b7367bef83daf40", size = 146747, upload-time = "2026-08-20T11:31:28.518Z" },
-    { url = "https://files.pythonhosted.org/packages/81/e3/ac6bf334a374f38773317deb6c029189a74d6ba5ad96140e8a6f4d5d8ceb/zodbpickle-4.5-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:93069bd3e60f3e099d99d691a5d6c4a829d1a6b2c53a66c132aca25e178d0c7a", size = 143584, upload-time = "2026-08-20T11:31:29.835Z" },
-    { url = "https://files.pythonhosted.org/packages/3b/b5/3d1c4d0bb05d748391e5a646fcd80e9ce644e06ee8869753d27901a1da5d/zodbpickle-4.5-cp313-cp313-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:b3f866f3caaf13f23c513dc0d5ec79896340a5f7f2cc669868d15f08916c985f", size = 303896, upload-time = "2026-08-20T11:31:31.31Z" },
-    { url = "https://files.pythonhosted.org/packages/0e/e7/2311187a0d508a5b31c93896b1b292b8a67f89a2ac68d141cf55a84e0351/zodbpickle-4.5-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:71d6d97a30a2871632b3b5e4de5fb563f3d506e5a978fd91c93a133d36281c21", size = 307910, upload-time = "2026-08-20T11:31:32.938Z" },
-    { url = "https://files.pythonhosted.org/packages/cd/08/bf6ff40d72fc449a92eabbb1b98fed92daa370c6321754f7ef7c74058deb/zodbpickle-4.5-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:673508c28bb762f7d2ede2a63724061c23cae0d685197fb6ca260b74a7a0bda9", size = 307117, upload-time = "2026-08-20T11:31:34.738Z" },
-    { url = "https://files.pythonhosted.org/packages/fe/10/c955213c4ee792024e588b79f53e23c96067319c6bfb13d335c2bd166c8f/zodbpickle-4.5-cp313-cp313-win_amd64.whl", hash = "sha256:a8304d7e531323751305cb36f03b94393d1dc244bcb72ae470408c8d8c0d579f", size = 141546, upload-time = "2026-08-20T11:31:36.141Z" },
-    { url = "https://files.pythonhosted.org/packages/8b/05/f988ccd261bbcbfaaaf6284c3f748e42d9739a47ab05073de8a8499e4ece/zodbpickle-4.5-cp313-cp313-win_arm64.whl", hash = "sha256:6c41c7067ff55bf4624c3f86173dfc3642383d0434a0009e4abcdc34bef6d1f8", size = 140713, upload-time = "2026-08-20T11:31:37.561Z" },
-    { url = "https://files.pythonhosted.org/packages/c0/27/3ba5ffd31af83b60b6b817f624ed0eb700391c98f86e191b4cdd407d6682/zodbpickle-4.5-cp314-cp314-macosx_10_9_x86_64.whl", hash = "sha256:6e5b2a19c28c87c53d52f85dc803699dfc5bfce1fa1bd3f75f6ea189c2bed0ca", size = 146876, upload-time = "2026-08-20T11:31:39.07Z" },
-    { url = "https://files.pythonhosted.org/packages/de/89/4e2c81d7e11426e99cd21bc7e8dec1218b1b5f0b4b54caf0abda318c97a2/zodbpickle-4.5-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f91ccccad738a06385e546729a584e171093048cddea6ad2fd672bb7c67b0de9", size = 143734, upload-time = "2026-08-20T11:31:40.445Z" },
-    { url = "https://files.pythonhosted.org/packages/a6/c9/3fb811a3e749399f7925ea07d9323f91e74293c3a83b6d2a4b9ae786618d/zodbpickle-4.5-cp314-cp314-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:ef348b1255f9415842736c81ab5cad1d63a004df654fa8f5d287e5eaec735af2", size = 303963, upload-time = "2026-08-20T11:31:41.892Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/54/46df5b5494eea5fd2477886e7252e816dbf37680b219f1190ed5c4f64d33/zodbpickle-4.5-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:90d5b0ed22b6f08b1fcb6fa5ba8244faa5bab3ceafb60af69063934f79aa7da9", size = 307707, upload-time = "2026-08-20T11:31:43.999Z" },
-    { url = "https://files.pythonhosted.org/packages/ab/21/f52535043193de0aa9e261ccc53797d5bb8a85bb5c960bdced02c02ee45e/zodbpickle-4.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:6b4d372fd3f8e2782f3d6d631b47a68ff2b4f169dbc661f78e9aac2ae4a41248", size = 306949, upload-time = "2026-08-20T11:31:45.611Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/8c/481bcf37e1f159e8eb155b897e1786fc4c7c9497bdef92872ab3436eaa77/zodbpickle-4.5-cp314-cp314-win_amd64.whl", hash = "sha256:1ec7b32a85508111646c253fe38f8fae761cd48e2965a30a97afcf3141dee472", size = 142333, upload-time = "2026-08-20T11:31:47.235Z" },
-    { url = "https://files.pythonhosted.org/packages/6b/2d/72090c80ceae91d622c6615bbb1929efaaf3ade29feb27d947dc08c9521a/zodbpickle-4.5-cp314-cp314-win_arm64.whl", hash = "sha256:a361732fed94e5181bb31c280ff4527bfcb8ad9c216623a1476a3471b19daa1e", size = 142222, upload-time = "2026-08-20T11:31:48.662Z" },
-    { url = "https://files.pythonhosted.org/packages/4e/35/7e0b5c16389f6f0204d717ffd93b072720255f70c013ac46fc84a0b017a9/zodbpickle-4.5-cp314-cp314t-macosx_10_9_x86_64.whl", hash = "sha256:173b7c10bddf31511a44b154e7fbea69134b110634c485b12fb88b1de179898b", size = 149956, upload-time = "2026-08-20T11:31:49.991Z" },
-    { url = "https://files.pythonhosted.org/packages/d3/1a/98ef79fca4b49f7f849255497b6f04e0d99d5dd2581d52cf54d6ae3fa517/zodbpickle-4.5-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:a50b83f35a05837a46f4daece7df64ac629047580528b43e07cb31d4f9027a6b", size = 146383, upload-time = "2026-08-20T11:31:51.306Z" },
-    { url = "https://files.pythonhosted.org/packages/e6/ec/ad98db7a01344fb49054de1f1b3cc4cd3c26acc146fc6e83964d3c3ff069/zodbpickle-4.5-cp314-cp314t-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:e242b1c48bf7ad7701355b93c60feaf7a5ac2812c82b77b8d04fa2821740bb5b", size = 298357, upload-time = "2026-08-20T11:31:52.748Z" },
-    { url = "https://files.pythonhosted.org/packages/2c/01/263eb46ab84b6bdc421a1fbe248d7471dd5b1eabb2a5542e0aaf3f0d9d49/zodbpickle-4.5-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b3d6ee7e7da2779e700e9cdfc903160aababdf17af0ef04f19df9f717add89d0", size = 305511, upload-time = "2026-08-20T11:31:54.38Z" },
-    { url = "https://files.pythonhosted.org/packages/bc/97/a192b508ead018afbf60fccb890d90d2f0ce8b37564b8fb203345d8f0a95/zodbpickle-4.5-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e18f1ad0d6382dd2c1ceac2ca93abac9007d6fe2985b6e267b796bc1c4d4630b", size = 301249, upload-time = "2026-08-20T11:31:55.834Z" },
-    { url = "https://files.pythonhosted.org/packages/f6/d6/f613781640947fea0a8e10648b3caf551f080a4095195396e24b8ac3ea28/zodbpickle-4.5-cp314-cp314t-win_amd64.whl", hash = "sha256:2bc3507a5ef661a8db1c2fc2053425b18c92cbc239fcd260b81911fd19ec0e69", size = 143616, upload-time = "2026-08-20T11:31:57.781Z" },
-]
+version = "4.5+zoe.1"
+source = { git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f#84029ffb1d5e636b2fa20f44c65272832519263f" }
 
 [[package]]
 name = "zodbshootout"
@@ -690,6 +660,7 @@ dependencies = [
     { name = "six" },
     { name = "zeo" },
     { name = "zodb" },
+    { name = "zodbpickle" },
     { name = "zodbshootout" },
     { name = "zoedb" },
 ]
@@ -709,6 +680,7 @@ requires-dist = [
     { name = "six" },
     { name = "zeo", specifier = ">=6" },
     { name = "zodb", specifier = ">=6" },
+    { name = "zodbpickle", git = "https://github.com/adeweb-be/zodbpickle?rev=84029ffb1d5e636b2fa20f44c65272832519263f" },
     { name = "zodbshootout", specifier = "==0.8.0" },
     { name = "zoedb", editable = "../../python/zoedb" },
 ]
