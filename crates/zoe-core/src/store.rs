@@ -133,8 +133,10 @@ impl Store {
             RedbBackend::initialise(&db)?;
             drop(db);
             vfs.rename(NEW_DATABASE, DATABASE)?;
-            vfs.sync_dir()?;
         }
+        // An earlier open can stop after the rename and before its sync.
+        // This sync makes that rename durable. It also covers a new store.
+        vfs.sync_dir()?;
 
         let db = redb::Builder::new()
             .create_with_backend(vfs.open(DATABASE)?)

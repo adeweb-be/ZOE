@@ -72,6 +72,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - A read-only open writes nothing under `blobs/`: no intent replay, no removal in `blobs/tmp/`, no directory sync. It only checks the layout file. A blob file that a crash left without its blob record stays invisible to it, because every blob read starts from the blob record, and the next writer open removes it. `new_blob_file` fails with `ReadOnly`.
 - A staged blob holds only a weak reference to the store, as a blob file does. So it works the same in `Txn<&Store>` and in `Txn<Arc<Store>>`.
 - Nothing is undoable past the last pack.
+- Every writable open syncs the store directory, also when `zoe.redb` exists, so a creation or a rename that an earlier open left unsynced becomes durable before the open acknowledges anything.
 - A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename, and the leftovers of an unfinished commit: the blob files in the tree that an intent file names and that have no blob record, then the files in `blobs/tmp/`.
 - `next_oid` in `meta` is always greater than every committed oid.
 - `finish` raises the next oid of the store above every oid that it writes, before the write. So `new_oid` never gives an oid that a restore wrote.
