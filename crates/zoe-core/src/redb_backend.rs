@@ -3,6 +3,7 @@
 //! Three tables hold the key spaces of the data model: `records`, `txns`
 //! and `meta`. `format` says how keys and values are written.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -108,16 +109,23 @@ impl RedbBackend {
 
     /// Read the record frame stored under `key` for `oid`.
     fn record(oid: Oid, key: &[u8; 16], bytes: &[u8]) -> Result<Record> {
-        let (_, tid) = format::split_record_key(key);
-        let frame = format::decode_frame(key, bytes).map_err(|e| {
-            let row = format!("record of oid {oid:?}, tid {tid:?}");
-            refused(e, &row, ZoeError::CorruptRecord { oid, tid })
-        })?;
+        let (tid, frame) = Self::frame(oid, key, bytes)?;
         Ok(Record {
             tid,
             prev: frame.prev,
             data: frame.payload.to_vec(),
         })
+    }
+
+    /// Decode and verify the record frame stored under `key` for `oid`.
+    /// Return the tid of the key and the frame.
+    fn frame<'a>(oid: Oid, key: &[u8; 16], bytes: &'a [u8]) -> Result<(Tid, format::Frame<'a>)> {
+        let (_, tid) = format::split_record_key(key);
+        let frame = format::decode_frame(key, bytes).map_err(|e| {
+            let row = format!("record of oid {oid:?}, tid {tid:?}");
+            refused(e, &row, ZoeError::CorruptRecord { oid, tid })
+        })?;
+        Ok((tid, frame))
     }
 }
 
@@ -204,6 +212,80 @@ impl Backend for RedbBackend {
             });
         }
         Ok(history)
+    }
+
+    fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let start = format::record_key(oid, Tid::ZERO);
+        let split = format::record_key(oid, tid);
+        let end = format::record_key(oid, Tid::MAX);
+        let before = match records
+            .range::<&[u8; 16]>(&start..&split)
+            .map_err(backend)?
+            .next_back()
+        {
+            Some(entry) => {
+                let (key, value) = entry.map_err(backend)?;
+                Some(Self::record(oid, key.value(), value.value())?)
+            }
+            None => None,
+        };
+        let next = match records
+            .range::<&[u8; 16]>(&split..=&end)
+            .map_err(backend)?
+            .next()
+        {
+            Some(entry) => {
+                let (key, value) = entry.map_err(backend)?;
+                Some(Self::frame(oid, key.value(), value.value())?.0)
+            }
+            None => None,
+        };
+        Ok((before, next))
+    }
+
+    fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let mut oids: BTreeMap<Tid, Vec<Oid>> = BTreeMap::new();
+        // No key space maps a tid to its oids, so this scan reads every
+        // key. It does not decode the frames: each later read of a record
+        // verifies it.
+        for entry in records.iter().map_err(backend)? {
+            let (key, _) = entry.map_err(backend)?;
+            let (oid, tid) = format::split_record_key(key.value());
+            if (from..=to).contains(&tid) {
+                oids.entry(tid).or_default().push(oid);
+            }
+        }
+        Ok(oids)
+    }
+
+    fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let start = format::record_key(from, Tid::ZERO);
+        let oid = match records
+            .range::<&[u8; 16]>(&start..)
+            .map_err(backend)?
+            .next()
+        {
+            Some(entry) => format::split_record_key(entry.map_err(backend)?.0.value()).0,
+            None => return Ok(None),
+        };
+        let first = format::record_key(oid, Tid::ZERO);
+        let last = format::record_key(oid, Tid::MAX);
+        let mut versions = records
+            .range::<&[u8; 16]>(&first..=&last)
+            .map_err(backend)?;
+        match versions.next_back() {
+            Some(entry) => {
+                let (key, value) = entry.map_err(backend)?;
+                Ok(Some((oid, Self::record(oid, key.value(), value.value())?)))
+            }
+            None => Ok(None),
+        }
     }
 
     fn pack(&self, _before: Tid, _reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
@@ -407,5 +489,25 @@ mod tests {
             matches!(rows[..], [Err(ZoeError::CorruptTxn { tid: Tid(5) })]),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn txn_oids_groups_the_oids_of_each_transaction() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        for (oid, tid) in [(3, 5), (1, 9), (1, 5), (2, 7), (2, 5)] {
+            write
+                .put_record(Oid(oid), Tid(tid), Tid::ZERO, b"pickle")
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let oids = backend.txn_oids(Tid(5), Tid(7)).unwrap();
+        let expected = BTreeMap::from([
+            (Tid(5), vec![Oid(1), Oid(2), Oid(3)]),
+            (Tid(7), vec![Oid(2)]),
+        ]);
+        assert_eq!(oids, expected);
+        assert!(backend.txn_oids(Tid(10), Tid::MAX).unwrap().is_empty());
     }
 }

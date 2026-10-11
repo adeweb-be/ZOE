@@ -1,14 +1,15 @@
 //! A ZOE store: the entry point of the core.
 
 use std::any::Any;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
-use crate::commit::Txn;
+use crate::commit::{Txn, check_restore_tid};
 use crate::error::{Result, ZoeError};
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
@@ -47,9 +48,29 @@ impl Default for Options {
     }
 }
 
+/// The open database of a store and the directory that holds its lock.
+///
+/// The fields drop in the order of their declaration. So the database
+/// closes, and writes its last bytes, before the directory releases the
+/// lock.
+pub(crate) struct Opened {
+    backend: Box<dyn Backend>,
+    _dir: Box<dyn Any + Send + Sync>,
+}
+
+impl Deref for Opened {
+    type Target = dyn Backend;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.backend
+    }
+}
+
 /// An open store.
 pub struct Store {
-    pub(crate) backend: Box<dyn Backend>,
+    /// The database and the directory. A transaction iterator holds only a
+    /// weak reference, so dropping the `Store` closes the store.
+    pub(crate) backend: Arc<Opened>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
@@ -58,9 +79,6 @@ pub struct Store {
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
-    /// The directory. It holds the single-writer lock while the store is
-    /// open.
-    _vfs: Box<dyn Any + Send + Sync>,
 }
 
 impl Store {
@@ -115,25 +133,50 @@ impl Store {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
-            backend: Box::new(backend),
+            backend: Arc::new(Opened {
+                backend: Box::new(backend),
+                _dir: Box::new(vfs),
+            }),
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
-            _vfs: Box::new(vfs),
         })
     }
 
     /// Return a new oid. An oid that no commit uses can come back after
-    /// the store reopens.
+    /// the store reopens. When no oid below `u64::MAX` is left, fail with
+    /// `Protocol`.
     pub fn new_oid(&self) -> Result<Oid> {
-        Ok(Oid(self.next_oid.fetch_add(1, Ordering::Relaxed)))
+        self.next_oid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next < u64::MAX).then(|| next + 1)
+            })
+            .map(Oid)
+            .map_err(|_| ZoeError::Protocol("no oid is left"))
     }
 
     /// Begin a transaction.
     pub fn tpc_begin(&self, user: &[u8], description: &[u8], extension: &[u8]) -> Result<Txn<'_>> {
         Ok(Txn::new(self, user, description, extension))
+    }
+
+    /// Begin a restore transaction: a copy of a transaction with its own
+    /// tid. `finish` commits it under `tid` and allocates no tid.
+    ///
+    /// `tid` must be after the last tid of the store. Otherwise the call
+    /// fails with `Protocol`. `finish` checks this again under the commit
+    /// sequencer.
+    pub fn tpc_begin_restore(
+        &self,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<'_>> {
+        check_restore_tid(tid, self.last_transaction())?;
+        Ok(Txn::new(self, user, description, extension).with_tid(tid))
     }
 
     /// Return the current pickle of `oid` and its serial.
@@ -152,11 +195,18 @@ impl Store {
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Make the next oid greater than `oid`, so that `new_oid` never gives
+    /// an oid that a commit wrote.
+    pub(crate) fn raise_next_oid(&self, oid: Oid) {
+        self.next_oid
+            .fetch_max(oid.0.saturating_add(1), Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -179,11 +229,13 @@ mod tests {
         load: AtomicBool,
         /// `begin_write` fails.
         write: AtomicBool,
+        /// `iter_txns` fails as a whole.
+        rows: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
     struct Faulty {
-        inner: Box<dyn Backend>,
+        inner: Arc<Opened>,
         faults: Arc<Faults>,
     }
 
@@ -215,11 +267,26 @@ mod tests {
         }
 
         fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
+            if self.faults.rows.load(Ordering::Relaxed) {
+                return Box::new(std::iter::once(Err(injected())));
+            }
             self.inner.iter_txns(from, to)
         }
 
         fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
             self.inner.history(oid, limit)
+        }
+
+        fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)> {
+            self.inner.load_before_next(oid, tid)
+        }
+
+        fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
+            self.inner.txn_oids(from, to)
+        }
+
+        fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
+            self.inner.current_from(from)
         }
 
         fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats> {
@@ -235,9 +302,14 @@ mod tests {
     fn faulty_store() -> (Store, Arc<Faults>) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
-        let backend = Box::new(Faulty {
+        // The inner store keeps the directory.
+        let faulty = Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
+        };
+        let backend = Arc::new(Opened {
+            backend: Box::new(faulty),
+            _dir: Box::new(()),
         });
         (Store { backend, ..store }, faults)
     }
@@ -290,6 +362,17 @@ mod tests {
         // A second vote does not wait on a lock of the first one.
         failed.vote().unwrap();
         failed.finish().unwrap();
+    }
+
+    #[test]
+    fn a_failed_transaction_log_gives_one_iterator_error() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        commit(&store, oid, first, b"b").unwrap();
+        faults.rows.store(true, Ordering::Relaxed);
+        let txns: Vec<_> = store.iterator(None, None).unwrap().collect();
+        assert!(matches!(txns[..], [Err(ZoeError::Backend(_))]), "{txns:?}");
     }
 
     #[test]
@@ -449,6 +532,16 @@ mod tests {
         assert_eq!((row.tid, row.oid_count), (tid, 1));
         assert_eq!(row.user, b"user");
         assert_eq!(store.backend.history(oid, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_oid_fails_when_no_oid_is_left() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.next_oid.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(store.new_oid().unwrap(), Oid(u64::MAX - 1));
+        for _ in 0..2 {
+            assert!(matches!(store.new_oid(), Err(ZoeError::Protocol(_))));
+        }
     }
 
     #[test]

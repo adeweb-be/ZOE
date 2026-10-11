@@ -30,6 +30,9 @@ struct Staged {
 /// Dropping a transaction aborts it.
 pub struct Txn<'s> {
     store: &'s Store,
+    /// The tid of a restore transaction. A normal transaction gets its tid
+    /// at finish.
+    tid: Option<Tid>,
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
@@ -46,6 +49,7 @@ impl<'s> Txn<'s> {
     pub(crate) fn new(store: &'s Store, user: &[u8], description: &[u8], extension: &[u8]) -> Self {
         Self {
             store,
+            tid: None,
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
@@ -59,17 +63,58 @@ impl<'s> Txn<'s> {
         self.locks.is_some()
     }
 
+    /// Make this transaction a restore transaction that commits under
+    /// `tid`.
+    pub(crate) fn with_tid(mut self, tid: Tid) -> Self {
+        self.tid = Some(tid);
+        self
+    }
+
     /// Stage a new version of `oid`. `serial` is the serial that the client
     /// read; it is `Tid::ZERO` for a new object.
+    ///
+    /// An empty pickle marks a deletion, so `store` refuses it with
+    /// `Protocol`. A restore transaction takes `store` too, with the same
+    /// serial check at the vote.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
         }
+        if data.is_empty() {
+            return Err(ZoeError::Protocol("store of an empty pickle"));
+        }
+        check_oid(oid)?;
         self.staged.insert(
             oid,
             Staged {
                 serial,
                 data: data.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Stage a copy of a version of `oid` in a restore transaction. `None`
+    /// copies a deletion. The version gets the tid of the transaction.
+    ///
+    /// The previous serial of the version is the current serial of `oid` in
+    /// this store. The vote takes an exclusive lock on `oid`, as for
+    /// `store`. If another transaction changes `oid` before the vote, the
+    /// vote fails with `Conflict`.
+    pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
+        if self.tid.is_none() {
+            return Err(ZoeError::Protocol("restore outside a restore transaction"));
+        }
+        if self.voted() {
+            return Err(ZoeError::Protocol("restore after vote"));
+        }
+        check_oid(oid)?;
+        let current = self.current_serial(oid)?;
+        self.staged.insert(
+            oid,
+            Staged {
+                serial: current,
+                data: data.unwrap_or_default().to_vec(),
             },
         );
         Ok(())
@@ -152,6 +197,12 @@ impl<'s> Txn<'s> {
     /// Commit the transaction and return its tid. The commit is durable
     /// when this returns.
     ///
+    /// A restore transaction commits under its own tid. If that tid is not
+    /// after the last tid, `finish` fails with `Protocol`. A normal
+    /// transaction gets a tid after the last tid, below `Tid::MAX`. When no
+    /// such tid is left, `finish` fails with `Protocol`. The store does
+    /// not halt for these errors.
+    ///
     /// An error other than `Protocol` and `Halted` leaves the outcome of
     /// the commit unknown until the store is reopened: the commit can be
     /// on disk or not. After such an error, the store refuses every later
@@ -162,9 +213,19 @@ impl<'s> Txn<'s> {
             return Err(ZoeError::Protocol("finish before vote"));
         }
         let mut sequencer = self.store.lock_sequencer();
+        let last = sequencer.ok_or(ZoeError::Halted)?;
+        let tid = match self.tid {
+            Some(tid) => {
+                check_restore_tid(tid, last)?;
+                tid
+            }
+            None => next_tid(timestamp(self.store.clock.now()), last)?,
+        };
         // The sequencer stays empty if the write below fails.
-        let last = sequencer.take().ok_or(ZoeError::Halted)?;
-        let tid = timestamp(self.store.clock.now()).max(Tid(last.0 + 1));
+        *sequencer = None;
+        if let Some(&oid) = self.staged.keys().next_back() {
+            self.store.raise_next_oid(oid);
+        }
 
         let mut write = self.store.backend.begin_write()?;
         for (&oid, staged) in &self.staged {
@@ -194,5 +255,279 @@ impl<'s> Txn<'s> {
 
     fn release(&mut self) {
         self.locks = None;
+    }
+}
+
+/// Check that a transaction can write `oid`. `Oid(u64::MAX)` is refused
+/// with `Protocol`, because the next oid must stay greater than every
+/// written oid.
+fn check_oid(oid: Oid) -> Result<()> {
+    if oid == Oid(u64::MAX) {
+        return Err(ZoeError::Protocol("oid u64::MAX is reserved"));
+    }
+    Ok(())
+}
+
+/// Return the tid of a normal commit after the tid `last`: `now`, or the
+/// tid after `last` if `now` is not after it. `Tid::MAX` is never given,
+/// because `load` reads the versions before it. When no tid is left, fail
+/// with `Protocol`.
+fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
+    match last.0.checked_add(1) {
+        Some(after) if after < Tid::MAX.0 => Ok(now.max(Tid(after)).min(Tid(Tid::MAX.0 - 1))),
+        _ => Err(ZoeError::Protocol("no tid is left after the last tid")),
+    }
+}
+
+/// Check that a restore transaction can commit under `tid` when `last` is
+/// the last tid. A failed check is `Protocol`.
+///
+/// `Tid::MAX` is refused, because `load` reads the versions before it.
+pub(crate) fn check_restore_tid(tid: Tid, last: Tid) -> Result<()> {
+    if tid == Tid::MAX {
+        return Err(ZoeError::Protocol("restore tid is the maximum tid"));
+    }
+    if tid <= last {
+        return Err(ZoeError::Protocol("restore tid is not after the last tid"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::vfs::MemVfs;
+
+    fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, serial, data).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap()
+    }
+
+    /// Begin a restore at `tid` that restores `data` for `oid`, and vote.
+    fn voted_restore<'s>(store: &'s Store, tid: Tid, oid: Oid, data: &[u8]) -> Txn<'s> {
+        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+        txn.restore(oid, Some(data)).unwrap();
+        txn.vote().unwrap();
+        txn
+    }
+
+    #[test]
+    fn a_restore_over_an_existing_oid_replaces_it() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a");
+        let tid = Tid(first.0 + 10);
+        voted_restore(&store, tid, oid, b"b").finish().unwrap();
+
+        assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
+        let restored = store.backend.load_before(oid, Tid::MAX).unwrap().unwrap();
+        // The restored record points to the record that it replaced, and
+        // that record stays readable.
+        assert_eq!(restored.prev, first);
+        let replaced = store.backend.load_before(oid, tid).unwrap().unwrap();
+        assert_eq!((replaced.tid, replaced.data), (first, b"a".to_vec()));
+    }
+
+    #[test]
+    fn a_restore_tid_behind_a_later_commit_fails_at_finish() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let early = voted_restore(&store, Tid(200), Oid(1), b"a");
+        let late = voted_restore(&store, Tid(300), Oid(2), b"b");
+        assert_eq!(late.finish().unwrap(), Tid(300));
+        assert!(matches!(early.finish(), Err(ZoeError::Protocol(_))));
+        assert!(store.locks.is_empty());
+
+        // The store does not halt.
+        assert_eq!(store.last_transaction(), Tid(300));
+        voted_restore(&store, Tid(400), Oid(1), b"c")
+            .finish()
+            .unwrap();
+        commit(&store, Oid(2), Tid(300), b"d");
+    }
+
+    #[test]
+    fn a_normal_commit_never_gets_the_maximum_tid() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        voted_restore(&store, Tid(u64::MAX - 2), oid, b"a")
+            .finish()
+            .unwrap();
+        let tid = commit(&store, oid, Tid(u64::MAX - 2), b"b");
+        assert_eq!(tid, Tid(u64::MAX - 1));
+        assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
+    }
+
+    #[test]
+    fn a_commit_after_a_restore_at_the_last_tid_fails() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let last = Tid(u64::MAX - 1);
+        voted_restore(&store, last, oid, b"a").finish().unwrap();
+
+        // No tid is left. The store refuses each finish and does not halt.
+        for _ in 0..2 {
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, last, b"b").unwrap();
+            txn.vote().unwrap();
+            assert!(matches!(txn.finish(), Err(ZoeError::Protocol(_))));
+            assert!(store.locks.is_empty());
+        }
+        assert!(store.tpc_begin_restore(Tid::MAX, b"", b"", b"").is_err());
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), last));
+        assert_eq!(store.last_transaction(), last);
+    }
+
+    #[test]
+    fn the_next_tid_is_after_the_last_and_below_the_maximum() {
+        let max = u64::MAX;
+        for (now, last, tid) in [
+            (10, 5, 10),
+            (10, 10, 11),
+            (10, 20, 21),
+            (max, 5, max - 1),
+            (max, max - 2, max - 1),
+        ] {
+            assert_eq!(
+                next_tid(Tid(now), Tid(last)).unwrap(),
+                Tid(tid),
+                "{now} {last}"
+            );
+        }
+        for last in [max - 1, max] {
+            assert!(matches!(
+                next_tid(Tid(0), Tid(last)),
+                Err(ZoeError::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn store_refuses_an_empty_pickle() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        for mut txn in [
+            store.tpc_begin(b"", b"", b"").unwrap(),
+            store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap(),
+        ] {
+            let error = txn.store(Oid(1), Tid::ZERO, b"");
+            assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        }
+    }
+
+    #[test]
+    fn store_in_a_restore_transaction_checks_the_serial() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.restore(Oid(2), Some(b"b")).unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), Tid(100));
+        assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), Tid(100)));
+
+        let mut stale = store.tpc_begin_restore(Tid(200), b"", b"", b"").unwrap();
+        stale.store(Oid(1), Tid::ZERO, b"c").unwrap();
+        assert!(matches!(stale.vote(), Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn the_maximum_oid_is_refused() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let error = txn.store(Oid(u64::MAX), Tid::ZERO, b"a");
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+        let mut txn = store.tpc_begin_restore(Tid(100), b"", b"", b"").unwrap();
+        let error = txn.restore(Oid(u64::MAX), Some(b"a"));
+        assert!(matches!(error, Err(ZoeError::Protocol(_))));
+
+        // The highest oid that a commit can write uses up the oids.
+        voted_restore(&store, Tid(100), Oid(u64::MAX - 1), b"a")
+            .finish()
+            .unwrap();
+        assert!(matches!(store.new_oid(), Err(ZoeError::Protocol(_))));
+    }
+
+    #[test]
+    fn the_maximum_tid_is_refused() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let result = store.tpc_begin_restore(Tid::MAX, b"", b"", b"");
+        assert!(matches!(result, Err(ZoeError::Protocol(_))));
+    }
+
+    #[test]
+    fn restore_needs_a_restore_transaction_before_the_vote() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        assert!(matches!(
+            txn.restore(Oid(1), Some(b"a")),
+            Err(ZoeError::Protocol(_))
+        ));
+
+        let mut txn = voted_restore(&store, Tid(100), Oid(1), b"a");
+        assert!(matches!(
+            txn.restore(Oid(2), Some(b"b")),
+            Err(ZoeError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn a_restored_oid_takes_an_exclusive_lock_at_the_vote() {
+        let mut store = Store::open_vfs(MemVfs::new()).unwrap();
+        // A zero lock timeout turns every wait into a conflict.
+        store.lock_timeout = Duration::ZERO;
+        let oid = Oid(1);
+        let first = voted_restore(&store, Tid(100), oid, b"a");
+
+        // Neither a store nor a second restore on the same oid gets the
+        // lock while the first restore holds it.
+        let mut stored = store.tpc_begin(b"", b"", b"").unwrap();
+        stored.store(oid, Tid::ZERO, b"b").unwrap();
+        let mut restored = store.tpc_begin_restore(Tid(200), b"", b"", b"").unwrap();
+        restored.restore(oid, Some(b"c")).unwrap();
+        for txn in [&mut stored, &mut restored] {
+            let error = txn.vote();
+            assert!(
+                matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })),
+                "{error:?}"
+            );
+        }
+        first.finish().unwrap();
+        assert!(store.locks.is_empty());
+
+        // The second restore read the serial before the first one finished,
+        // so it cannot commit on top of it.
+        assert!(matches!(restored.vote(), Err(ZoeError::Conflict { .. })));
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), Tid(100)));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_change_between_restore_and_vote_is_a_conflict() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store
+            .tpc_begin_restore(Tid(u64::MAX - 1), b"", b"", b"")
+            .unwrap();
+        txn.restore(oid, Some(b"a")).unwrap();
+        commit(&store, oid, Tid::ZERO, b"b");
+        assert!(matches!(txn.vote(), Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn new_oids_stay_above_a_restored_oid() {
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            voted_restore(&store, Tid(100), Oid(1000), b"a")
+                .finish()
+                .unwrap();
+            assert!(store.new_oid().unwrap() > Oid(1000));
+        }
+        let store = Store::open_vfs(vfs).unwrap();
+        assert!(store.new_oid().unwrap() > Oid(1000));
     }
 }

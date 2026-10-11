@@ -25,7 +25,8 @@ pub enum ZoeError {
     },
 
     /// The checksum of a transaction row does not match its bytes, or its
-    /// payload does not decode.
+    /// payload does not decode, or a record has no transaction row, or the
+    /// records of a transaction do not match the oid count of its row.
     #[error("corrupt transaction row: tid {tid:?}")]
     CorruptTxn {
         /// The transaction id of the row.
@@ -57,8 +58,10 @@ pub enum ZoeError {
         oid: Oid,
     },
 
-    /// A two-phase commit call came out of order, for example `finish`
-    /// before `vote`.
+    /// The store refuses a call. A two-phase commit call came out of order,
+    /// for example `finish` before `vote`, or a restore gave a tid that is
+    /// not after the last tid, or no tid or oid is left, or an oid is
+    /// reserved.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
 
@@ -70,6 +73,10 @@ pub enum ZoeError {
     /// Another process holds the lock of the store.
     #[error("the store is locked by another process")]
     Locked,
+
+    /// The store is closed. A transaction iterator outlived its store.
+    #[error("the store is closed")]
+    Closed,
 
     /// The store is not in a format that this code reads.
     #[error("unknown store format: {0}")]
