@@ -5,14 +5,13 @@
 //! fails with `NotFound`. Each backend read verifies the checksum of every
 //! frame that it returns.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::Peekable;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::backend::{Backend, Record, TxnMeta};
 use crate::error::{Result, ZoeError};
-use crate::store::Store;
+use crate::store::{Opened, Store};
 use crate::types::{Oid, Tid};
 
 /// A record that `load_before` found.
@@ -83,12 +82,10 @@ pub struct CurrentRecord {
 /// records of its transaction.
 ///
 /// The iterator does not borrow the store, and it can move to another
-/// thread. It keeps the store directory locked until it is dropped, also
-/// after the `Store` is dropped.
+/// thread. It does not keep the store open: after the `Store` is dropped,
+/// the next call gives `Closed`, then the iterator ends.
 pub struct Transactions {
-    backend: Arc<dyn Backend>,
-    /// The directory of the store. It holds the single-writer lock.
-    _dir: Arc<dyn Any + Send + Sync>,
+    store: Weak<Opened>,
     rows: Peekable<std::vec::IntoIter<Result<TxnMeta>>>,
     oids: BTreeMap<Tid, Vec<Oid>>,
 }
@@ -97,6 +94,15 @@ impl Iterator for Transactions {
     type Item = Result<TxnInfo>;
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
+        if self.rows.peek().is_none() && self.oids.is_empty() {
+            return None;
+        }
+        // The store stays open until this call returns.
+        let Some(store) = self.store.upgrade() else {
+            self.rows = Vec::new().into_iter().peekable();
+            self.oids.clear();
+            return Some(Err(ZoeError::Closed));
+        };
         // Records of a tid before the next row, or after the last row, have
         // no row. They come in tid order, as an error.
         if let Some(&tid) = self.oids.keys().next() {
@@ -121,37 +127,34 @@ impl Iterator for Transactions {
             }
         };
         let oids = self.oids.remove(&row.tid).unwrap_or_default();
-        Some(self.txn_info(row, oids))
+        Some(txn_info(&**store, row, oids))
     }
 }
 
-impl Transactions {
-    /// Read the records of the transaction `row`. The records must match
-    /// the oid count of the row.
-    fn txn_info(&self, row: TxnMeta, oids: Vec<Oid>) -> Result<TxnInfo> {
-        let tid = row.tid;
-        if oids.len() as u64 != row.oid_count {
-            return Err(ZoeError::CorruptTxn { tid });
-        }
-        let records = oids
-            .into_iter()
-            .map(|oid| {
-                let data = self
-                    .backend
-                    .load_serial(oid, tid)?
-                    .ok_or(ZoeError::NotFound { oid })?;
-                let data = (!data.is_empty()).then_some(data);
-                Ok(RecordInfo { oid, tid, data })
-            })
-            .collect::<Result<_>>()?;
-        Ok(TxnInfo {
-            tid,
-            user: row.user,
-            description: row.description,
-            extension: row.extension,
-            records,
-        })
+/// Read the records of the transaction `row` from `backend`. The records
+/// must match the oid count of the row.
+fn txn_info(backend: &dyn Backend, row: TxnMeta, oids: Vec<Oid>) -> Result<TxnInfo> {
+    let tid = row.tid;
+    if oids.len() as u64 != row.oid_count {
+        return Err(ZoeError::CorruptTxn { tid });
     }
+    let records = oids
+        .into_iter()
+        .map(|oid| {
+            let data = backend
+                .load_serial(oid, tid)?
+                .ok_or(ZoeError::NotFound { oid })?;
+            let data = (!data.is_empty()).then_some(data);
+            Ok(RecordInfo { oid, tid, data })
+        })
+        .collect::<Result<_>>()?;
+    Ok(TxnInfo {
+        tid,
+        user: row.user,
+        description: row.description,
+        extension: row.extension,
+        records,
+    })
 }
 
 impl Store {
@@ -237,8 +240,7 @@ impl Store {
             self.backend.txn_oids(start, stop)?
         };
         Ok(Transactions {
-            backend: Arc::clone(&self.backend),
-            _dir: Arc::clone(&self.dir),
+            store: Arc::downgrade(&self.backend),
             rows: rows.into_iter().peekable(),
             oids,
         })
@@ -498,10 +500,9 @@ mod tests {
     }
 
     #[test]
-    fn the_iterator_moves_to_another_thread_and_outlives_the_store() {
+    fn the_iterator_moves_to_another_thread() {
         let store = three_records();
         let iterator = store.iterator(None, None).unwrap();
-        drop(store);
         let tids =
             std::thread::spawn(move || iterator.map(|txn| txn.unwrap().tid).collect::<Vec<Tid>>())
                 .join()
@@ -510,15 +511,22 @@ mod tests {
     }
 
     #[test]
-    fn the_iterator_keeps_the_store_locked() {
-        let dir = std::env::temp_dir().join(format!("zoe-iterator-lock-{}", std::process::id()));
+    fn a_lingering_iterator_fails_after_the_store_closes() {
+        let dir = std::env::temp_dir().join(format!("zoe-iterator-closed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir).unwrap();
-        let iterator = store.iterator(None, None).unwrap();
+        for tid in [100, 200] {
+            restore(&store, tid, &[(Oid(1), Some(pickle(1)))]);
+        }
+        let mut iterator = store.iterator(None, None).unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap().tid, Tid(100));
+
+        // The iterator does not keep the store locked.
         drop(store);
-        assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
-        drop(iterator);
-        Store::open(&dir).unwrap();
+        let reopened = Store::open(&dir).unwrap();
+        assert!(matches!(iterator.next(), Some(Err(ZoeError::Closed))));
+        assert!(iterator.next().is_none());
+        assert_eq!(reopened.last_transaction(), Tid(200));
     }
 
     #[test]

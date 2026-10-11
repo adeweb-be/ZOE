@@ -74,6 +74,10 @@ pub enum ZoeError {
     #[error("the store is locked by another process")]
     Locked,
 
+    /// The store is closed. A transaction iterator outlived its store.
+    #[error("the store is closed")]
+    Closed,
+
     /// The store is not in a format that this code reads.
     #[error("unknown store format: {0}")]
     Format(String),

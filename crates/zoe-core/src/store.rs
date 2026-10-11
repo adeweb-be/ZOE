@@ -1,6 +1,7 @@
 //! A ZOE store: the entry point of the core.
 
 use std::any::Any;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -47,9 +48,29 @@ impl Default for Options {
     }
 }
 
+/// The open database of a store and the directory that holds its lock.
+///
+/// The fields drop in the order of their declaration. So the database
+/// closes, and writes its last bytes, before the directory releases the
+/// lock.
+pub(crate) struct Opened {
+    backend: Box<dyn Backend>,
+    _dir: Box<dyn Any + Send + Sync>,
+}
+
+impl Deref for Opened {
+    type Target = dyn Backend;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.backend
+    }
+}
+
 /// An open store.
 pub struct Store {
-    pub(crate) backend: Arc<dyn Backend>,
+    /// The database and the directory. A transaction iterator holds only a
+    /// weak reference, so dropping the `Store` closes the store.
+    pub(crate) backend: Arc<Opened>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
@@ -58,9 +79,6 @@ pub struct Store {
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
     next_oid: AtomicU64,
-    /// The directory. It holds the single-writer lock while the store or
-    /// one of its transaction iterators is open.
-    pub(crate) dir: Arc<dyn Any + Send + Sync>,
 }
 
 impl Store {
@@ -115,13 +133,15 @@ impl Store {
         let next_oid = backend.next_oid()?;
         let last_tid = backend.last_tid();
         Ok(Self {
-            backend: Arc::new(backend),
+            backend: Arc::new(Opened {
+                backend: Box::new(backend),
+                _dir: Box::new(vfs),
+            }),
             clock: Box::new(clock),
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             sequencer: Mutex::new(Some(last_tid)),
             next_oid: AtomicU64::new(next_oid.0),
-            dir: Arc::new(vfs),
         })
     }
 
@@ -213,7 +233,7 @@ mod tests {
 
     /// A backend that fails when a test turns a fault on.
     struct Faulty {
-        inner: Arc<dyn Backend>,
+        inner: Arc<Opened>,
         faults: Arc<Faults>,
     }
 
@@ -277,9 +297,14 @@ mod tests {
     fn faulty_store() -> (Store, Arc<Faults>) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let faults = Arc::new(Faults::default());
-        let backend = Arc::new(Faulty {
+        // The inner store keeps the directory.
+        let faulty = Faulty {
             inner: store.backend,
             faults: Arc::clone(&faults),
+        };
+        let backend = Arc::new(Opened {
+            backend: Box::new(faulty),
+            _dir: Box::new(()),
         });
         (Store { backend, ..store }, faults)
     }
