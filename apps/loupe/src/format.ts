@@ -1,6 +1,7 @@
 // Write the JSON state of an object as indented text. Values print as
-// JSON, except two tags of the Rust side: bytes print as a bytes literal,
-// so their escapes show once, and a cut value shows its size. The text
+// JSON, except some tags of the Rust side: bytes print as a bytes literal,
+// so their escapes show once; a Python 2 str prints as a string with a
+// note; a float prints as its text; a cut value shows its size. The text
 // stops at a limit, so a large state does not block the window.
 
 import { t } from "./i18n";
@@ -27,6 +28,12 @@ function tagged(value: Record<string, unknown>): string | null {
   }
   if (typeof value.$str === "string") {
     return `${JSON.stringify(value.$str)}${cut(value)}`;
+  }
+  if (typeof value.$str2 === "string") {
+    return `${JSON.stringify(value.$str2)} ${t("state.str2")}${cut(value)}`;
+  }
+  if (typeof value.$float === "string") {
+    return value.$float;
   }
   return null;
 }

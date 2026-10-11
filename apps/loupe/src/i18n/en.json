@@ -23,6 +23,7 @@
   "object.references": "Outbound references",
   "object.noReferences": "No outbound references.",
   "state.cut": "({length} bytes in the record, cut)",
+  "state.str2": "(Python 2 str)",
   "state.partial": "The state is large. The window shows its start.",
   "state.showAll": "Show all",
   "error.noFolder": "No folder is open.",
