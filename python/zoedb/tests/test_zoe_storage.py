@@ -6,6 +6,8 @@ mode, `close`, `pack`, the conflict resolution and the parallel commits
 without the GIL.
 """
 
+import io
+import pickle
 import subprocess
 import sys
 import sysconfig
@@ -14,12 +16,15 @@ import threading
 import time
 
 import pytest
+from persistent.mapping import PersistentMapping
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import (
     ConflictError,
+    POSKeyError,
     ReadConflictError,
     ReadOnlyError,
     StorageError,
+    StorageSystemError,
     StorageTransactionError,
     Unsupported,
 )
@@ -34,6 +39,7 @@ from ZODB.tests import (
 )
 from ZODB.tests.ConflictResolution import PCounter, PCounter2
 from ZODB.TimeStamp import TimeStamp
+from ZODB.utils import u64
 
 import zoe
 import zoe.storage
@@ -133,11 +139,6 @@ def test_wrong_thread_is_a_storage_transaction_error():
     assert issubclass(zoe.WrongThread, StorageTransactionError)
     assert zoe.WrongThread is zoe.storage.WrongThread
     assert zoe.Storage is zoe.storage.Storage
-
-
-def test_pack_is_not_implemented(storage):
-    with pytest.raises(NotImplementedError):
-        storage.pack(time.time(), None)
 
 
 def test_a_version_is_unsupported(storage):
@@ -910,3 +911,280 @@ def test_a_damaged_spill_file_fails_the_resolution(tmp_path):
         storage.tpc_abort(txn)
     finally:
         storage.close()
+
+
+class Ref:
+    """A reference to the object `oid` in a record."""
+
+    def __init__(self, oid):
+        self.oid = oid
+
+
+class RecordPickler(pickle.Pickler):
+    """A pickler that writes each Ref as a persistent reference."""
+
+    def persistent_id(self, obj):
+        return (obj.oid, None) if isinstance(obj, Ref) else None
+
+
+def linking(*oids):
+    """Return a record of a persistent mapping that refers to each oid."""
+    file = io.BytesIO()
+    pickler = RecordPickler(file, 3)
+    pickler.dump((PersistentMapping, None))
+    pickler.dump({"data": {str(n): Ref(oid) for n, oid in enumerate(oids)}})
+    return file.getvalue()
+
+
+def commit_all(storage, writes):
+    """Commit writes in one transaction and return the tid.
+
+    Each write is an oid, the serial that the transaction read and a pickle.
+    """
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    for oid, serial, data in writes:
+        storage.store(oid, serial, data, "", txn)
+    storage.tpc_vote(txn)
+    return storage.tpc_finish(txn)
+
+
+def past(tid):
+    """Wait until the clock is past the time of tid. Return the time then."""
+    instant = TimeStamp(tid).timeTime()
+    while time.time() <= instant + 0.01:
+        time.sleep(0.001)
+    return time.time()
+
+
+def present(storage, oid, tid):
+    """Tell if the store holds the record of oid at tid."""
+    try:
+        storage.loadSerial(oid, tid)
+    except POSKeyError:
+        return False
+    return True
+
+
+def test_a_closed_or_read_only_storage_refuses_to_pack(tmp_path):
+    path = str(tmp_path / "store")
+    storage = zoe.Storage(path)
+    # No object refers to oid, so a pack removes it.
+    oid = storage.new_oid()
+    tid = commit(storage, oid, ZERO, record(1))
+    storage.close()
+    pack_time = past(tid)
+    with pytest.raises(StorageError, match="closed"):
+        storage.pack(pack_time, None)
+    read_only = zoe.Storage(path, read_only=True)
+    try:
+        with pytest.raises(ReadOnlyError):
+            read_only.pack(pack_time, None)
+        assert present(read_only, oid, tid)
+    finally:
+        read_only.close()
+
+    storage = zoe.Storage(path)
+    try:
+        storage.pack(pack_time, None)
+        assert not present(storage, oid, tid)
+    finally:
+        storage.close()
+
+
+def test_a_pack_before_the_first_transaction_removes_nothing(storage):
+    oid = storage.new_oid()
+    first = commit_all(storage, [(ZERO, ZERO, linking(oid)), (oid, ZERO, record(1))])
+    second = commit_all(storage, [(ZERO, first, linking()), (oid, first, record(2))])
+    records = [(ZERO, first), (ZERO, second), (oid, first), (oid, second)]
+    for pack_time in (0, TimeStamp(first).timeTime() - 1):
+        storage.pack(pack_time, None)
+        assert all(present(storage, *key) for key in records), pack_time
+
+    # Such a pack does not stop a later pack. The root no longer refers to
+    # oid at the second commit, so oid goes.
+    storage.pack(past(second), None)
+    assert [present(storage, *key) for key in records] == [False, True, False, False]
+
+
+def test_a_pack_while_another_thread_commits(storage):
+    kept, dropped = storage.new_oid(), storage.new_oid()
+    first = commit_all(
+        storage,
+        [
+            (ZERO, ZERO, linking(kept)),
+            (kept, ZERO, record(1)),
+            (dropped, ZERO, record(1)),
+        ],
+    )
+    is_voted, finish, called, release = (threading.Event() for _ in range(4))
+    # The writer notes if each of its waits ended before the timeout. A
+    # pack that waits for the writer makes a wait time out.
+    tids, waits = [], []
+
+    def callback(tid):
+        tids.append(tid)
+        called.set()
+        waits.append(release.wait(TIMEOUT))
+
+    def write():
+        txn = voted(storage, kept, first, record(2))
+        is_voted.set()
+        waits.append(finish.wait(TIMEOUT))
+        storage.tpc_finish(txn, callback)
+
+    writer = in_thread(write)
+    try:
+        assert is_voted.wait(TIMEOUT)
+        # The vote holds the lock of kept. The pack takes no lock of an
+        # object, so it does not wait for the commit.
+        storage.pack(past(first), None)
+        assert not present(storage, dropped, first)
+        assert present(storage, kept, first)
+
+        finish.set()
+        assert called.wait(TIMEOUT)
+        # The commit is durable and its callback runs. The pack does not
+        # wait for the callback.
+        (second,) = tids
+        storage.pack(past(second), None)
+        assert not present(storage, kept, first)
+        assert storage.loadSerial(kept, second) == record(2)
+    finally:
+        finish.set()
+        release.set()
+        writer.join(TIMEOUT)
+    assert not writer.is_alive()
+    assert waits == [True, True]
+    assert storage.lastTransaction() == second
+    assert storage.load(kept) == (record(2), second)
+
+
+def test_an_unreadable_record_stops_the_pack(storage):
+    bad = storage.new_oid()
+    first = commit(storage, ZERO, ZERO, linking())
+    second = commit_all(
+        storage, [(ZERO, first, linking(bad)), (bad, ZERO, b"\xffnot a pickle")]
+    )
+    with pytest.raises(StorageSystemError) as error:
+        storage.pack(past(second), None)
+    text = str(error.value)
+    assert text.startswith("pack stopped: ")
+    assert f"oid Oid({u64(bad)}), tid Tid({u64(second)})" in text
+    assert "opcode 0xff" in text
+    # The pack stopped before it removed anything.
+    assert present(storage, ZERO, first)
+
+
+def test_a_pack_at_an_earlier_time_than_the_last_pack_removes_nothing(storage):
+    holder, kept, other = (storage.new_oid() for _ in range(3))
+    first = commit_all(
+        storage, [(ZERO, ZERO, linking(holder)), (holder, ZERO, linking())]
+    )
+    second = commit_all(
+        storage, [(holder, first, linking(kept)), (kept, ZERO, record(1))]
+    )
+    earlier = past(second)
+    third = commit_all(
+        storage, [(holder, second, linking(kept, other)), (other, ZERO, record(2))]
+    )
+    storage.pack(past(third), None)
+    left = [(ZERO, first), (holder, third), (kept, second), (other, third)]
+    assert all(present(storage, *key) for key in left)
+    assert not present(storage, holder, second)
+
+    # A reader at the earlier time needs holder at second, which is gone.
+    # The earlier pack removes nothing more, and kept stays.
+    storage.pack(earlier, None)
+    assert all(present(storage, *key) for key in left)
+    assert storage.load(kept) == (record(1), second)
+
+
+def add_garbage(storage, count):
+    """Commit count records that no object refers to.
+
+    Return their oids and the tid of the last commit.
+    """
+    oids = []
+    while len(oids) < count:
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        for _ in range(min(5_000, count - len(oids))):
+            oid = storage.new_oid()
+            storage.store(oid, ZERO, record(len(oids)), "", txn)
+            oids.append(oid)
+        storage.tpc_vote(txn)
+        last = storage.tpc_finish(txn)
+    return oids, last
+
+
+def remaining(storage, oids):
+    """Return the number of oids that still have a record."""
+    found = 0
+    for oid in oids:
+        try:
+            storage.load(oid)
+        except POSKeyError:
+            continue
+        found += 1
+    return found
+
+
+def test_close_during_a_pack_returns_and_the_pack_ends(tmp_path):
+    path = str(tmp_path / "store")
+    storage = zoe.Storage(path)
+    # The pack removes these records in many batches. Probes spread over
+    # them tell how far the pack is.
+    oids, last = add_garbage(storage, 20_000)
+    probes = oids[::2_500] + oids[-1:]
+    pack_time = past(last)
+    ended = threading.Event()
+    errors = []
+
+    def pack():
+        try:
+            storage.pack(pack_time, None)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            ended.set()
+
+    thread = in_thread(pack)
+    deadline = time.monotonic() + TIMEOUT
+    while time.monotonic() < deadline:
+        if 0 < remaining(storage, probes) < len(probes):
+            break
+    storage.close()
+    # The close does not wait for the pack.
+    during = not ended.is_set()
+    thread.join(TIMEOUT)
+    assert ended.is_set(), "the pack did not end"
+    assert not errors, errors
+    assert during, "the pack ended before the close"
+
+    # The pack ran to its end, then it released the store.
+    reopened = zoe.Storage(path)
+    try:
+        assert remaining(reopened, probes) == 0
+    finally:
+        reopened.close()
+
+
+def test_two_packs_at_once_both_end(storage):
+    oids, last = add_garbage(storage, 5_000)
+    pack_time = past(last)
+    start = threading.Barrier(2)
+    outcomes = []
+
+    def pack():
+        start.wait(TIMEOUT)
+        try:
+            outcomes.append(storage.pack(pack_time, None))
+        except BaseException as error:
+            outcomes.append(error)
+
+    threads = [in_thread(pack) for _ in range(2)]
+    for thread in threads:
+        thread.join(TIMEOUT)
+    assert outcomes == [None, None]
+    assert remaining(storage, oids[::500] + oids[-1:]) == 0

@@ -314,6 +314,24 @@ impl Storage {
             .collect())
     }
 
+    /// Pack the store at `tid`: remove the records that no reader at or
+    /// after `tid` needs, with their blob files. `zoe.storage.Storage.pack`
+    /// gives the tid of the pack time.
+    ///
+    /// The whole pack runs without the GIL. Other threads read and commit
+    /// while it runs. A read-only storage refuses the pack.
+    #[pyo3(name = "_pack")]
+    fn pack(&self, py: Python<'_>, tid: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let tid = Tid(u64_of(tid)?);
+        let store = self.opened(py)?;
+        py.detach(move || store.pack(tid))
+            .map(|_report| ())
+            .map_err(|error| errors::pack_failure(py, error))
+    }
+
     /// Begin a two-phase commit of `transaction`. The calling thread
     /// drives it.
     fn tpc_begin(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<()> {
