@@ -27,7 +27,7 @@ use crate::{Error, Report};
 /// byte for byte. It checks the size of every other blob. The copy hashes
 /// each blob as it writes it, so the sample checks the read path of the
 /// store against the source.
-const BLOB_SAMPLE_STRIDE: u64 = 16;
+pub(crate) const BLOB_SAMPLE_STRIDE: u64 = 16;
 
 /// The report lists at most this many problems about single transactions,
 /// records and blobs, then a count of the others.
@@ -167,18 +167,18 @@ fn current_serial(store: &Store, oid: Oid) -> Result<Tid, Error> {
 /// first, and the list keeps all of them. The list keeps `MAX_PROBLEMS`
 /// other problems, and a last line counts the others.
 #[derive(Default)]
-struct Problems {
+pub(crate) struct Problems {
     summary: Vec<String>,
     list: Vec<String>,
     more: u64,
 }
 
 impl Problems {
-    fn summary(&mut self, problem: String) {
+    pub(crate) fn summary(&mut self, problem: String) {
         self.summary.push(problem);
     }
 
-    fn push(&mut self, problem: String) {
+    pub(crate) fn push(&mut self, problem: String) {
         if self.list.len() < MAX_PROBLEMS {
             self.list.push(problem);
         } else {
@@ -186,7 +186,7 @@ impl Problems {
         }
     }
 
-    fn finish(mut self) -> Vec<String> {
+    pub(crate) fn finish(mut self) -> Vec<String> {
         self.summary.append(&mut self.list);
         if self.more > 0 {
             self.summary.push(format!("{} more problems", self.more));
@@ -303,7 +303,7 @@ fn verify(
 
 /// Describe a stop of the reader before the end of the file. A clean end
 /// and a commit in progress at the end are not problems.
-fn stop_problem(end: End) -> Option<String> {
+pub(crate) fn stop_problem(end: End) -> Option<String> {
     let End::Cut { pos, cut } = end else {
         return None;
     };
@@ -335,7 +335,12 @@ fn not_in_file(txn: Result<TxnInfo, ZoeError>) -> String {
 
 /// Compare the transaction `header` of the file and its `records` with
 /// the transaction `txn` of the store.
-fn compare_txn(header: &TxnHeader, records: &[DataRecord], txn: &TxnInfo, problems: &mut Problems) {
+pub(crate) fn compare_txn(
+    header: &TxnHeader,
+    records: &[DataRecord],
+    txn: &TxnInfo,
+    problems: &mut Problems,
+) {
     let tid = hex(header.tid.0);
     for (name, file, store) in [
         ("user", &header.user, &txn.user),
@@ -380,7 +385,7 @@ fn compare_txn(header: &TxnHeader, records: &[DataRecord], txn: &TxnInfo, proble
 /// Check that `target` holds the blob of `oid` at `tid` with `size`
 /// bytes. When `sample` is true, also compare it byte for byte with the
 /// blob file `source`, and check its hash. Return the problem found.
-fn check_blob(
+pub(crate) fn check_blob(
     target: &Store,
     oid: Oid,
     tid: Tid,

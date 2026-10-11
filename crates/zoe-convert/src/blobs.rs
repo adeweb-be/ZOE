@@ -19,7 +19,7 @@ use zoe_core::{Oid, Tid};
 use crate::Error;
 
 /// The file in a blob directory that names its layout.
-const LAYOUT_FILE: &str = ".layout";
+pub(crate) const LAYOUT_FILE: &str = ".layout";
 
 /// The layout of a blob directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
