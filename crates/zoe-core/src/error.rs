@@ -58,7 +58,8 @@ pub enum ZoeError {
     },
 
     /// A two-phase commit call came out of order, for example `finish`
-    /// before `vote`.
+    /// before `vote`, or a restore gave a tid that is not after the last
+    /// tid.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
 

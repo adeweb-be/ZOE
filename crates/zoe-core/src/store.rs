@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
-use crate::commit::Txn;
+use crate::commit::{Txn, check_restore_tid};
 use crate::error::{Result, ZoeError};
 use crate::lock::LockManager;
 use crate::redb_backend::RedbBackend;
@@ -136,6 +136,23 @@ impl Store {
         Ok(Txn::new(self, user, description, extension))
     }
 
+    /// Begin a restore transaction: a copy of a transaction with its own
+    /// tid. `finish` commits it under `tid` and allocates no tid.
+    ///
+    /// `tid` must be after the last tid of the store. Otherwise the call
+    /// fails with `Protocol`. `finish` checks this again under the commit
+    /// sequencer.
+    pub fn tpc_begin_restore(
+        &self,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<'_>> {
+        check_restore_tid(tid, self.last_transaction())?;
+        Ok(Txn::new(self, user, description, extension).with_tid(tid))
+    }
+
     /// Return the current pickle of `oid` and its serial.
     pub fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid)> {
         match self.backend.load_before(oid, Tid::MAX)? {
@@ -151,6 +168,13 @@ impl Store {
 
     pub(crate) fn lock_sequencer(&self) -> MutexGuard<'_, Option<Tid>> {
         self.sequencer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make the next oid greater than `oid`, so that `new_oid` never gives
+    /// an oid that a commit wrote.
+    pub(crate) fn raise_next_oid(&self, oid: Oid) {
+        self.next_oid
+            .fetch_max(oid.0.saturating_add(1), Ordering::Relaxed);
     }
 }
 
