@@ -222,10 +222,10 @@ The core is a synchronous Rust library, `zoe-core`, with no Python and no tokio 
 
 | Key space | Key | Value | Notes |
 | --- | --- | --- | --- |
-| `records` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a record frame; its header carries the serial of the previous record, its payload the pickle bytes or their zstd frame, as the codec byte says | one row per object version; a 0-length payload marks deletion by pack or `deleteObject` |
-| `txns` | `tid: u64` big-endian, 8 bytes | a frame whose payload is the status byte, the oid count as a `u64`, then user, description and extension, each with a `u32` length; the oid count and the three lengths are little-endian | the transaction log; status is `committing` until the finish record lands |
+| `records` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a record frame; its header carries the serial of the previous record, its payload the pickle bytes or their zstd frame, as the codec byte says | one row per object version; a 0-length payload marks a deletion by `deleteObject`; pack removes rows and writes no deletion |
+| `txns` | `tid: u64` big-endian, 8 bytes | a frame whose payload is the status byte, the oid count as a `u64`, then user, description and extension, each with a `u32` length; the oid count and the three lengths are little-endian | the transaction log; status is `committing` until the finish record lands; pack lowers the oid count to the records that remain and removes a row that keeps none |
 | `blobs` | `(oid: u64, tid: u64)` big-endian, 16 bytes | a frame with previous serial 0 whose payload is the BLAKE3 hash of the blob file (32 bytes), then the size of the file in bytes as a little-endian `u64` | one row per blob revision, written in the same backend transaction as its record; the file lives in the blob store, at the BushyLayout path of `(oid, tid)`; a store without the table has no blobs |
-| `meta` | fixed text keys | `format` (`ZOE format 1`), `last_tid`, `next_oid`, `pack_watermark`; numbers are 8-byte big-endian | one row each |
+| `meta` | fixed text keys | `format` (`ZOE format 1`), `last_tid`, `next_oid`, `pack_watermark`; numbers are 8-byte big-endian | one row each; `pack_watermark` is the tid of the last pack, and a store that was never packed has no such row |
 
 `loadBefore(oid, tid)` is a reverse range scan from `(oid, tid - 1)`; `load(oid)` is `loadBefore(oid, MAX)`; `loadSerial` is a point read. This is the RelStorage history-preserving layout, which is what makes MVCC and `history()` free.
 
@@ -258,7 +258,7 @@ Begin ──storea*──▶ Staged ──vote──▶ Locked ──tpc_finish�
 
 The merge policy is a versioned object in the store, so it is transactional and the server reloads it on change. `zoe.plone` generates it from Dexterity schemas (a type whose schema declares no `@invariant` is mergeable field by field; fields named in an invariant are coupled) plus a short overrides file, and Loupe shows and edits it. Shadow mode runs tiers 1 and 2 on every conflict but still raises, recording what would have been merged by class, tier and field; merging is switched on per class once a production run shows it would have been right, judged by replaying the merged states through the differential suite. Every resolution, merged or raised, is logged with oid, class, tier, the keys merged and both transactions' user and description. Tier 1 and 2 merges are replayed through the Python resolvers in the test suite and must produce identical pickles.
 
-**Pack.** Pack at tid T walks `records` and `txns` in reverse, marks reachable versions from the root as of T, deletes unreachable versions and every version older than the newest at or before T. It runs in batches inside MVCC read snapshots, so it never blocks readers; writers are only paused for the final meta update. Blob files are deleted after their record. `pack` is exposed on both skins and as a CLI (`zoe pack --days 7`).
+**Pack.** Pack at tid T keeps what a reader at T or later needs; T is the lower of the requested tid and the last tid. It keeps every record after T and, for each object that such a reader can reach, the newest record at or before T, a deletion included; it removes every other record at or before T with its blob record, then its blob file. It removes rows and writes no deletion record. The roots of the mark are the root object and every object that a record after T refers to, so an object that a later record links again stays; from each root the mark follows the newest record at or before T. References come from `zoe-pickle`, which reads the persistent id of every BINPERSID of a record, opaque parts included, as ZODB's `referencesf` does, and never unpickles; weak references and references into another database keep nothing. A reachable record that does not decode fails the pack before it removes anything. Pack runs in batches, in key order, the oldest record of an object first. Each batch is one backend write transaction that removes records and their blob records, lowers the oid count of their transaction rows and removes a row that keeps no record, so `history` and the iterator stay consistent. Readers never wait. A finish waits for at most one batch: while a pack runs, each finish notes its oids, and before each batch the pack holds the commit sequencer, marks what the noted records refer to and commits the batch, so a record committed during the pack that links an object again keeps it. The first batch writes `pack_watermark`; nothing is undoable past it, and a pack at an earlier tid does nothing. Blob files are deleted after the removal of their blob records is durable: before the commit, an intent file in `blobs/tmp/` names them, so a crash leaves no blob file that the next open does not remove. A client that links an object from a reference read before T can still link an object that a batch removed, as with ZODB's own pack. `pack` is exposed on both skins and as a CLI (`zoe pack --days 7`).
 
 **Blobs.** The blob store is a trait with two implementations: a directory tree beside the store, and an S3-compatible store with a local LRU cache. The directory tree is `blobs/` in ZODB's `BushyLayout`, so existing tools understand it: `blobs/.layout` holds `bushy`, and the file of `(oid, tid)` is one directory per big-endian byte of the oid, then the tid as ZODB's `tid_repr` writes it, for example `blobs/0x00/0x00/0x00/0x00/0x00/0x00/0x12/0x34/0x03f6db4f24444444.blob`. A committed blob file is read-only and immutable per `(oid, tid)`. `storeBlob` writes into a temp file in `blobs/tmp/`, computes its BLAKE3 hash on the way, and syncs it. `tpc_finish` places the files before the backend commit: it writes and syncs an intent file in `blobs/tmp/` that names the tid and the oids, renames each file into place and syncs its directory. The backend write transaction then holds each blob record (hash and size) next to its record, and the intent file is removed. So a crash never leaves a blob record without its file. A crash can leave a file without its record: the next open reads only `blobs/tmp/`, never the whole tree, and removes the files that an intent file names and that have no blob record. Every read through the core checks the size and the hash at the end of the file; a mismatch is a distinct `CorruptBlob` error with the oid and tid. `loadBlob` returns a path (simple mode) or streams chunks (server mode). ADR 0023 records the blob record and the crash order.
 
@@ -268,7 +268,7 @@ The merge policy is a versioned object in the store, so it is transactional and 
 
 **Forks.** A fork is an overlay store: reads fall through to the base at a fixed tid, writes land in the overlay, and the overlay has its own tids, pack and blobs. `zoe fork base sandbox --at <tid>` opens one without copying the base; discarding it is deleting a directory. It is ZODB's `DemoStorage` done natively, so `plone.app.testing` layers stack forks instead of DemoStorages, an upgrade is rehearsed on a fork of a production copy before it touches the real store, and Loupe opens a fork as it opens any store. A fork is never merged back; what is kept is reapplied as a normal transaction.
 
-**Pack safety.** `zoe pack --dry-run` prints what a pack would remove, by class and by size, without touching the store. A pack never deletes at once: removed records move into a retention window (`pack-retention`, a number of days) during which `zoe pack --revert` restores them, and physical deletion happens when the window closes. Pack is incremental by default, a bounded slice of oids per step interleaved with normal traffic, so there is no pack weekend; a full pack remains available for migrations.
+**Pack safety.** `zoe pack --dry-run` prints what a pack would remove, by class and by size, without touching the store. A pack never deletes at once: removed records move into a retention window (`pack-retention`, a number of days) during which `zoe pack --revert` restores them, and physical deletion happens when the window closes. Pack is incremental by default, a bounded slice of oids per step interleaved with normal traffic, so there is no pack weekend; a full pack remains available for migrations. Until the retention window and incremental pack ship in phase 6, a pack removes records at once and every pack is a full pack.
 
 **Guardrails.** `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` with a clear error before anything is written; a lock held longer than `lock-warn` and a transaction open longer than `transaction-warn` are logged with their oid, client and duration, and counted in the metrics.
 
@@ -280,13 +280,16 @@ pub trait Backend: Send + Sync {
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
     fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>>;
     fn last_tid(&self) -> Tid;
-    fn begin_write(&self) -> Result<WriteTxn<'_>>;      // one per tpc_finish
+    fn begin_write(&self) -> Result<WriteTxn<'_>>;      // one per tpc_finish or pack batch
     fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_>;
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>>;
     fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)>; // loadBefore and the next serial, one snapshot
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;              // the oids of each transaction, for the iterator
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>>;                     // the current record of the first oid ≥ from
-    fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>;
+    fn pack(&self, before: Tid, reachable: &dyn Fn(Oid, Tid) -> bool) -> Result<PackStats>; // not used: pack goes through the methods below
+    fn pack_watermark(&self) -> Result<Tid>;                                                 // the tid of the last pack, 0 before the first
+    fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;              // the record keys of whole oids from `from`, for the pack scan
+    fn txn_records(&self, tid: Tid, oids: &[Oid]) -> Result<Option<TxnRecords>>;           // a transaction row and its records, one snapshot
     fn sync(&self) -> Result<()>;                         // fsync barrier used by group commit
 }
 
@@ -294,6 +297,11 @@ pub trait WriteTxn {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
     fn put_blob(&mut self, oid: Oid, tid: Tid, blob: &BlobRecord) -> Result<()>;
     fn put_txn(&mut self, meta: &TxnMeta) -> Result<()>;
+    fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()>;  // pack
+    fn remove_blob(&mut self, oid: Oid, tid: Tid) -> Result<()>;    // pack
+    fn replace_txn(&mut self, meta: &TxnMeta) -> Result<()>;        // pack: a lower oid count, the last tid unchanged
+    fn remove_txn(&mut self, tid: Tid) -> Result<()>;               // pack: a row that keeps no record
+    fn put_pack_watermark(&mut self, tid: Tid) -> Result<()>;       // pack
     fn commit(self) -> Result<()>;                        // durable on return
 }
 ```
