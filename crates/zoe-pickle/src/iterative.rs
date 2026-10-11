@@ -97,7 +97,7 @@ impl Clone for Node {
 fn clone_leaf(node: &Node) -> Option<Node> {
     Some(match node {
         Node::None => Node::None,
-        Node::Bool(value) => Node::Bool(*value),
+        Node::Bool(value) => Node::Bool(value.clone()),
         Node::Int(value) => Node::Int(value.clone()),
         Node::Float(value) => Node::Float(value.clone()),
         Node::Bytes(value) => Node::Bytes(value.clone()),

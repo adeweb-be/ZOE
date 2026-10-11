@@ -22,6 +22,17 @@ pub fn is_int(text: &[u8], long: bool) -> bool {
     }
 }
 
+/// Reads the text of INT as a bool, as the C unpickler of Python does. A
+/// text of two characters that gives 0 or 1 is a bool: `00`, `+0` and `-0`
+/// give False, and `01` and `+1` give True. Other texts give `None`.
+pub fn int_bool(text: &[u8]) -> Option<bool> {
+    match text {
+        b"01" | b"+1" => Some(true),
+        b"00" | b"+0" | b"-0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Checks the text of FLOAT: a number that Rust can parse as an `f64`,
 /// for example `1.5`, `-1e+300`, `inf` or `nan`. The C unpickler refuses a
 /// number too large for an `f64`, such as `1e999`, so this check does too.
@@ -155,6 +166,22 @@ mod tests {
         assert!(is_int(b"12", true));
         assert!(!is_int(b"L", true));
         assert!(!is_int(b"12LL", true));
+    }
+
+    #[test]
+    fn two_characters_that_give_0_or_1_are_a_bool() {
+        for (text, value) in [
+            ("01", true),
+            ("+1", true),
+            ("00", false),
+            ("+0", false),
+            ("-0", false),
+        ] {
+            assert_eq!(int_bool(text.as_bytes()), Some(value), "{text}");
+        }
+        for text in ["0", "1", "-1", "10", "001", "+01"] {
+            assert_eq!(int_bool(text.as_bytes()), None, "{text}");
+        }
     }
 
     #[test]

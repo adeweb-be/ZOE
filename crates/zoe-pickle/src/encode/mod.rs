@@ -43,7 +43,10 @@ fn leaf(out: &mut Vec<u8>, node: &Node) -> Result<(), Error> {
     match node {
         Node::None => out.push(NONE),
         Node::Bool(Bool::New(value)) => out.push(if *value { NEWTRUE } else { NEWFALSE }),
-        Node::Bool(Bool::Text(value)) => out.extend(if *value { b"I01\n" } else { b"I00\n" }),
+        Node::Bool(Bool::Text(value)) => {
+            let valid = text::int_bool(value.as_bytes()).is_some();
+            line(out, INT, value.as_bytes(), valid)?;
+        }
         Node::Int(value) => int(out, value)?,
         Node::Float(Float::Binary(value)) => {
             out.push(BINFLOAT);
@@ -110,9 +113,10 @@ fn int(out: &mut Vec<u8>, value: &Int) -> Result<(), Error> {
             sized(out, [LONG1, LONG4], bytes, *width, i32::MAX as usize)?;
         }
         Int::Text(value) => {
-            // Python reads the texts 01 and 00 as True and False.
-            let valid = text::is_int(value.as_bytes(), false) && !matches!(&**value, "01" | "00");
-            line(out, INT, value.as_bytes(), valid)?;
+            // The C unpickler of Python reads some texts as a bool.
+            let bytes = value.as_bytes();
+            let valid = text::is_int(bytes, false) && text::int_bool(bytes).is_none();
+            line(out, INT, bytes, valid)?;
         }
         Int::LongText(value) => {
             line(
@@ -377,7 +381,7 @@ mod tests {
             Node::Tuple(Tuple {
                 items: vec![
                     dict,
-                    Node::Bool(Bool::Text(true)),
+                    Node::Bool(Bool::Text("01".to_owned())),
                     Node::Int(Int::LongText("7L".to_owned())),
                     Node::ByteString(ByteString::Text(b"'x'".to_vec())),
                     Node::Get(Get {
@@ -433,6 +437,9 @@ mod tests {
             global("m", "a\nb"),
             global("", "b"),
             Node::Int(Int::Text("01".to_owned())),
+            Node::Int(Int::Text("+1".to_owned())),
+            Node::Bool(Bool::Text("1".to_owned())),
+            Node::Bool(Bool::Text("10".to_owned())),
             Node::Int(Int::Text("1x".to_owned())),
             Node::Int(Int::LongText("1LL".to_owned())),
             Node::Float(Float::Text("one".to_owned())),

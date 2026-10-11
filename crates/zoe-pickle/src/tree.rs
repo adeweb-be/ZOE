@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use crate::encode::order::{Op, Order};
 use crate::opcode::memo_puts;
+use crate::text;
 
 /// The decoded form of one record: the class pickle and the state pickle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,12 +247,25 @@ pub enum Node {
 }
 
 /// A bool, with the opcode that holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bool {
     /// NEWTRUE or NEWFALSE (protocol 2 and later).
     New(bool),
-    /// INT with the text `01` or `00` (protocols 0 and 1).
-    Text(bool),
+    /// INT with a text of two characters that gives 0 or 1, as stored,
+    /// without the newline. Python 2 writes `01` for True and `00` for
+    /// False (protocols 0 and 1). The C unpickler of Python also reads
+    /// `+1`, `+0` and `-0` as a bool.
+    Text(String),
+}
+
+impl Bool {
+    /// Returns the value of the bool.
+    pub fn value(&self) -> bool {
+        match self {
+            Bool::New(value) => *value,
+            Bool::Text(text) => text::int_bool(text.as_bytes()) == Some(true),
+        }
+    }
 }
 
 /// An int, with the opcode that holds it.
@@ -750,6 +764,15 @@ mod tests {
         ] {
             let tree = crate::decode_record(&[class, state].concat()).unwrap();
             assert_eq!(tree.class_name(), None, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn a_bool_gives_its_value_in_each_form() {
+        assert!(Bool::New(true).value());
+        assert!(!Bool::New(false).value());
+        for (text, value) in [("01", true), ("+1", true), ("00", false), ("-0", false)] {
+            assert_eq!(Bool::Text(text.to_owned()).value(), value, "{text}");
         }
     }
 
