@@ -80,9 +80,14 @@ tsan:
     grep -h '^SUMMARY: ThreadSanitizer' "$tmp"/*
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
 
-# Run the ZODB and ZEO conformance suites.
+# Run the test suites of ZODB in-process against zoe.Storage, on every
+# interpreter. `just test` does not collect them. The ZEO suites against
+# zoe serve are not built yet.
 conformance:
-    @echo "just conformance: runs ZODB.tests in-process and ZEO.tests against zoe serve. Not built yet."
+    for py in {{ pythons }}; do \
+        echo "== CPython $py"; \
+        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
+    done
 
 # Build the Plone instance of a scenario under plone/ with buildout, and run
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
