@@ -198,7 +198,7 @@ impl Model {
     }
 }
 
-fn store_blob(store: &Store, txn: &mut Txn<'_>, oid: Oid, serial: Tid, bytes: &[u8]) {
+fn store_blob(store: &Store, txn: &mut Txn<&Store>, oid: Oid, serial: Tid, bytes: &[u8]) {
     let mut file = store.new_blob_file().unwrap();
     file.write_all(bytes).unwrap();
     txn.store_blob(oid, serial, &blob_record(), file).unwrap();
