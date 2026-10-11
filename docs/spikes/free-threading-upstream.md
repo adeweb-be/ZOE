@@ -11,14 +11,14 @@ Can `persistent`, `BTrees` and `zodbpickle` declare `Py_MOD_GIL_NOT_USED`, so th
 ## Method
 
 1. Read the upstream sources at the heads of `zopefoundation/persistent`, `BTrees` and `zodbpickle`. Find every piece of process-wide mutable state, every borrowed reference on a shared object, and every read-modify-write that relies on the GIL.
-2. Add the declaration to every module: `PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED)` under `#ifdef Py_GIL_DISABLED`, right after `PyModule_Create`. All five init functions use single-phase init. One edit in `BTreeModuleTemplate.c` covers the 22 BTrees modules.
+2. Add the declaration to every module: `PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED)` under `#ifdef Py_GIL_DISABLED`, right after `PyModule_Create`. The pickle-cache rework later narrows the guard of `cPersistence` and `cPickleCache` to CPython 3.14 and later. All five init functions use single-phase init. One edit in `BTreeModuleTemplate.c` covers the 22 BTrees modules.
 3. Build the patched packages for CPython 3.14.7t. Run the acceptance test and the upstream test suites with `PYTHON_GIL=0`, so that a test dependency cannot turn the GIL back on.
 4. Run a stress test that moves Connections, their caches and their objects between threads: 32 threads, a ZODB connection pool of 8, a cache of 50 objects, 200 rounds per thread, 2,000 objects.
 5. Import the other C extensions that a Zope process loads, one at a time, and check `sys._is_gil_enabled()`.
 
 ## Results
 
-| Check | Released packages | Patched packages |
+| Check | Released packages | Declaration only, before the fixes |
 | --- | --- | --- |
 | GIL after `import persistent, BTrees, zodbpickle` on 3.14t | on (first: `persistent._timestamp`) | off |
 | Acceptance test `test_free_threading_upstream.py` | 2 failed | 2 passed |
@@ -35,7 +35,7 @@ The stress test passing does not prove the pickle cache safe: it did not hit the
 
 ### persistent
 
-- **The uncounted references of the pickle cache (blocking).** The cache dict holds "stolen" references. The protocol needs "the reference count reaches 0, then the entry leaves the dict" to be atomic against every lookup. On 3.14t that is not guaranteed. Biased reference counting hands a final cross-thread decrement to the thread that allocated the object, and the free-threaded GC clears objects while other threads run. With the Connection pool, a thread routinely holds ghosts that another thread allocated, so `Per_dealloc` can run while another thread looks the same oid up. Fix without touching the attribute path: `PyUnstable_EnableTryIncRef` on insert; lookups and `cc_oid_unreferenced` in a `Py_BEGIN_CRITICAL_SECTION` on the cache dict with `PyUnstable_TryIncRef`; rework the `Py_SET_REFCNT(self, 2)` workaround in `Per_dealloc`. These APIs need CPython 3.14, so the declaration needs a `PY_VERSION_HEX >= 0x030E0000` guard (3.13t keeps the GIL; 3.13t is not a ZOE target).
+- **The uncounted references of the pickle cache (blocking).** The cache dict holds "stolen" references. The protocol needs "the reference count reaches 0, then the entry leaves the dict" to be atomic against every lookup. On 3.14t that is not guaranteed. Biased reference counting hands a final cross-thread decrement to the thread that allocated the object, and the free-threaded GC clears objects while other threads run. With the Connection pool, a thread routinely holds ghosts that another thread allocated, so `Per_dealloc` can run while another thread looks the same oid up. The fix is in "The pickle-cache rework" below. It needs APIs of CPython 3.14, so `cPersistence` and `cPickleCache` declare only on 3.14 and later (3.13t keeps the GIL; 3.13t is not a ZOE target).
 - `PyDict_GetItem(cls->tp_dict, "__slotnames__")` reads a class dict that every Connection shares: use `PyDict_GetItemRef` (3.13 and later; guard for 3.12).
 - Lazy statics: `s_register`, `s_readCurrent`, the `TimeStamp` import in `cPersistence.c`, and `_p_invalidate` in `cPickleCache.c`. Move them to module init.
 - `TimeStamp_type` is never passed to `PyType_Ready`. Ready it in module init.
@@ -63,7 +63,7 @@ These are safe only under ZODB's rule that one thread at a time uses a Connectio
 - buckets, sets, nodes and iterators of `BTrees`, persistent or not, which a thread uses one at a time;
 - each Pickler and Unpickler of `zodbpickle`, which one thread uses at a time.
 
-The LRU ring and the cache counters of `persistent` were on this list. The audit proposed to leave the ring update on attribute access, the hottest path in Plone, without a lock. The build showed that a sweep from another thread corrupts the ring then, so the fork locks it (see the status below).
+The LRU ring and the cache counters of `persistent` are not on this list. The fork locks them, the attribute path included, because a sweep from another thread corrupts the ring otherwise (see the status below).
 
 ## The other packages that turn the GIL back on
 
@@ -94,7 +94,7 @@ The patches go upstream to zopefoundation as draft pull requests from the forks 
 
 Every fix above is written on the `free-threading` branch of each fork, with the declaration:
 
-- `adeweb-be/persistent`: the interned strings and the `TimeStamp` import at module init, `PyType_Ready(TimeStamp_type)`, `PyDict_GetItemRef` in `pickle_slotnames`, no `Py_DECREF` of the borrowed reference in `cc_new_ghost`, and the pickle-cache rework below. The declaration applies to CPython 3.14 and later only; 3.13t keeps the GIL.
+- `adeweb-be/persistent`: the interned strings and the `TimeStamp` import at module init, `PyType_Ready(TimeStamp_type)`, `PyDict_GetItemRef` in `pickle_slotnames`, no `Py_DECREF` of the borrowed reference in `cc_new_ghost`, and the pickle-cache rework below. The declaration in `cPersistence` and `cPickleCache` applies to CPython 3.14 and later only, so 3.13t keeps the GIL.
 - `adeweb-be/BTrees`: `set_repr` without a static, and `PyType_Ready` for the items and iterator types.
 - `adeweb-be/zodbpickle`: the lazy statics created at module init, `PyDict_GetItemRef` on the copyreg dicts, `whichmodule` over a copy of `sys.modules`, and `find_class` through `PyImport_GetModule`.
 
@@ -114,7 +114,7 @@ Every fix above is written on the `free-threading` branch of each fork, with the
 
 The 3.14 differences are noise: the code of the attribute path and of `get` is the same.
 
-With the GIL off on 3.14t, and on 3.12 and 3.14, the suites pass: persistent 783 tests, BTrees 13,721, zodbpickle 432, and ZODB 1,600 with one error that is not about persistent (`testdocumentation` needs a ZODB source checkout). `test_threading.py` passes 50 runs in a row with the GIL off and 50 with `PYTHON_GIL` unset; upstream master crashes in it on 3.14t. The acceptance test and the pool stress test pass with the GIL off.
+With the GIL off on 3.14t, and on 3.12 and 3.14, the suites pass: persistent 783 tests (the same count with the GIL), BTrees 13,721, zodbpickle 432, and ZODB 1,600 with one error that is not about persistent (`testdocumentation` needs a ZODB source checkout). `test_threading.py` passes 50 runs in a row with the GIL off and 50 with `PYTHON_GIL` unset; upstream master crashes in it on 3.14t. The acceptance test and the pool stress test pass with the GIL off.
 
 ### Limits that stay
 
