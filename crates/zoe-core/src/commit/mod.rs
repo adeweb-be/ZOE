@@ -249,12 +249,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let size = data.len() as u64;
         guardrails.check(SizeLimit::Record, oid, size)?;
         // A pickle that replaces a staged pickle of the same oid counts
-        // once.
+        // once. The check reads the length of the staged pickle, never its
+        // bytes, so a spilled pickle costs no read.
         let staged = self
             .staged
             .record(oid)
             .map_or(0, |staged| staged.pickle_len() as u64);
-        let stored_bytes = (self.stored_bytes - staged).saturating_add(size);
+        let stored_bytes = self
+            .stored_bytes
+            .saturating_sub(staged)
+            .saturating_add(size);
         guardrails.check(SizeLimit::Transaction, oid, stored_bytes)?;
         Ok(stored_bytes)
     }
@@ -1869,5 +1873,44 @@ mod tests {
             "{events:?}"
         );
         assert!(store.lock_table_is_empty());
+    }
+
+    /// The size checks read the length of a spilled pickle, never its
+    /// bytes. So a damaged spill file does not change them.
+    #[test]
+    fn the_size_checks_read_no_spilled_pickle() {
+        let vfs = MemVfs::new();
+        let options = Options {
+            staging_memory: 0,
+            max_transaction_size: Some(6),
+            ..Options::default()
+        };
+        let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, b"abcd").unwrap();
+        assert!(spills(&vfs));
+        let name = &Vfs::list_files(&vfs, "staging").unwrap()[0];
+        vfs.file(&format!("staging/{name}"))
+            .write(0, b"xxxx")
+            .unwrap();
+
+        // The spilled pickles of `Oid(1)` count once, with their length.
+        txn.store(Oid(1), Tid::ZERO, b"abcdef").unwrap();
+        let error = txn.store(Oid(2), Tid::ZERO, b"g");
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::TooLarge {
+                    size: 7,
+                    max: 6,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        txn.store(Oid(1), Tid::ZERO, b"abcde").unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"g").unwrap();
+        txn.abort();
+        assert!(!spills(&vfs));
     }
 }
