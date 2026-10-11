@@ -104,8 +104,10 @@ class Ci:
     @function
     async def tsan(self, source: Source) -> str:
         """Run the zoe-core tests under ThreadSanitizer and check the canary race."""
-        # ThreadSanitizer turns off ASLR for the test process. The seccomp
-        # filter of a normal container refuses that call.
+        # On a host with high-entropy ASLR, ThreadSanitizer turns off ASLR with
+        # the personality call and runs the test again. The seccomp filter of a
+        # normal container refuses this call. So this exec runs with all root
+        # capabilities and no seccomp filter.
         return await self.recipe(source, "tsan", privileged=True).stdout()
 
     @function
