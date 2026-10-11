@@ -151,12 +151,15 @@ impl Store {
     ///
     /// redb opens a database read-only only from a path. So this call
     /// reaches the files directly, not through a `Vfs`. A store that a
-    /// crash left open does not open read-only: `open` repairs it first.
+    /// crash left open fails with `NeedsRepair`: `open` repairs it.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
         let db = redb::Builder::new()
             .open_read_only(dir.path(DATABASE))
-            .map_err(|e| ZoeError::Backend(Box::new(e)))?;
+            .map_err(|e| match e {
+                redb::DatabaseError::RepairAborted => ZoeError::NeedsRepair,
+                e => ZoeError::Backend(Box::new(e)),
+            })?;
         let backend = RedbBackend::open_read_only(db)?;
         let options = Options::default();
         Self::assemble(backend, Box::new(dir), Box::new(SystemClock), options, true)
@@ -779,6 +782,27 @@ mod tests {
         std::fs::write(&file, b"data").unwrap();
         assert!(Store::open_read_only(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"data");
+    }
+
+    #[test]
+    fn a_store_left_open_needs_a_repair_before_a_read_only_open() {
+        let open = fresh_dir("read-only-open");
+        let copy = fresh_dir("read-only-copy");
+        let (oid, _) = write_store(&open);
+        // A copy of the database of an open store is what a crash leaves.
+        let store = Store::open(&open).unwrap();
+        std::fs::copy(open.join(DATABASE), copy.join(DATABASE)).unwrap();
+        drop(store);
+
+        let result = Store::open_read_only(&copy);
+        assert!(
+            matches!(result, Err(ZoeError::NeedsRepair)),
+            "{:?}",
+            result.err()
+        );
+        drop(Store::open(&copy).unwrap());
+        let store = Store::open_read_only(&copy).unwrap();
+        assert_eq!(store.load(oid).unwrap().0, b"a");
     }
 
     #[test]

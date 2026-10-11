@@ -87,6 +87,11 @@ pub enum ZoeError {
     #[error("the store is open for reads only")]
     ReadOnly,
 
+    /// The store was not closed cleanly, so its database needs a repair. A
+    /// read-only open cannot repair it: open the store once for writes.
+    #[error("the store was not closed cleanly: open it once for writes to repair it")]
+    NeedsRepair,
+
     /// The store is closed. A transaction iterator outlived its store.
     #[error("the store is closed")]
     Closed,
