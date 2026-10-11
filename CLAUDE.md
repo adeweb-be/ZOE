@@ -18,6 +18,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | --- | --- |
 | `just check` | `cargo fmt` check, clippy with warnings as errors, ruff lint and format check |
 | `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t |
+| `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan` |
 | `just conformance` | ZODB and ZEO conformance suites (not built yet) |
 | `just plone` | builds the Plone instances under `plone/` (not built yet) |
 | `just bench` | benchmarks (not built yet) |
