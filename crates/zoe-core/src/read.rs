@@ -4,11 +4,18 @@
 //! A record with an empty pickle is a deletion. A load of a deletion
 //! fails with `NotFound`. Each backend read verifies the checksum of every
 //! frame that it returns.
+//!
+//! A pack can remove records and transaction rows between two reads. It
+//! removes a record and the row of its transaction in one write, and it
+//! removes a row only when no record of the transaction is left. So
+//! `history` drops a record that it finds without a row only when the
+//! record is gone too, and the iterator reads each transaction and its
+//! records in one snapshot.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Weak};
 
-use crate::backend::{Backend, Record, TxnMeta};
+use crate::backend::{Backend, Record, RecordMeta, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::store::{Opened, Store};
 use crate::types::{Oid, Tid};
@@ -93,71 +100,84 @@ impl Iterator for Transactions {
     type Item = Result<TxnInfo>;
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
-        if self.rows.is_empty() && self.oids.is_empty() {
-            return None;
-        }
-        // The store stays open until this call returns.
-        let Some(store) = self.store.upgrade() else {
-            self.rows.clear();
-            self.oids.clear();
-            return Some(Err(ZoeError::Closed));
-        };
-        // Records of a tid before the next row, or after the last row, have
-        // no row. They come in tid order, as an error.
-        if let Some(&tid) = self.oids.keys().next() {
-            let no_row = match self.rows.front() {
-                Some(Ok(row)) => tid < row.tid,
-                Some(Err(_)) => false,
-                None => true,
+        loop {
+            if self.rows.is_empty() && self.oids.is_empty() {
+                return None;
+            }
+            // The store stays open until this call returns.
+            let Some(store) = self.store.upgrade() else {
+                self.rows.clear();
+                self.oids.clear();
+                return Some(Err(ZoeError::Closed));
             };
-            if no_row {
-                self.oids.remove(&tid);
-                return Some(Err(ZoeError::CorruptTxn { tid }));
+            // Records of a tid before the next row, or after the last row,
+            // have no row. They come in tid order, as an error.
+            if let Some(&tid) = self.oids.keys().next() {
+                let no_row = match self.rows.front() {
+                    Some(Ok(row)) => tid < row.tid,
+                    Some(Err(_)) => false,
+                    None => true,
+                };
+                if no_row {
+                    self.oids.remove(&tid);
+                    return Some(Err(ZoeError::CorruptTxn { tid }));
+                }
+            }
+            let row = match self.rows.pop_front()? {
+                Ok(row) => row,
+                Err(error) => {
+                    // A row that does not read can own any records before
+                    // the next row that reads. Drop them, so that they give
+                    // no second error.
+                    let next = self.rows.iter().find_map(|row| row.as_ref().ok());
+                    match next {
+                        Some(row) => self.oids = self.oids.split_off(&row.tid),
+                        None => self.oids.clear(),
+                    }
+                    return Some(Err(error));
+                }
+            };
+            let oids = self.oids.remove(&row.tid).unwrap_or_default();
+            match txn_info(&**store, row.tid, oids) {
+                Ok(Some(txn)) => return Some(Ok(txn)),
+                // A pack removed the transaction after the iterator read
+                // its row.
+                Ok(None) => {}
+                Err(error) => return Some(Err(error)),
             }
         }
-        let row = match self.rows.pop_front()? {
-            Ok(row) => row,
-            Err(error) => {
-                // A row that does not read can own any records before the
-                // next row that reads. Drop them, so that they give no
-                // second error.
-                let next = self.rows.iter().find_map(|row| row.as_ref().ok());
-                match next {
-                    Some(row) => self.oids = self.oids.split_off(&row.tid),
-                    None => self.oids.clear(),
-                }
-                return Some(Err(error));
-            }
-        };
-        let oids = self.oids.remove(&row.tid).unwrap_or_default();
-        Some(txn_info(&**store, row, oids))
     }
 }
 
-/// Read the records of the transaction `row` from `backend`. The records
-/// must match the oid count of the row.
-fn txn_info(backend: &dyn Backend, row: TxnMeta, oids: Vec<Oid>) -> Result<TxnInfo> {
-    let tid = row.tid;
-    if oids.len() as u64 != row.oid_count {
+/// Read the transaction `tid` and its records of `oids` from `backend`, in
+/// one snapshot. The records that are there must match the oid count of
+/// the row. Return `None` when the row is gone.
+///
+/// `oids` comes from an earlier snapshot. A pack can remove some of these
+/// records since, and then it lowers the oid count of the row in the same
+/// write.
+fn txn_info(backend: &dyn Backend, tid: Tid, oids: Vec<Oid>) -> Result<Option<TxnInfo>> {
+    let Some((row, records)) = backend.txn_records(tid, &oids)? else {
+        return Ok(None);
+    };
+    if records.len() as u64 != row.oid_count {
         return Err(ZoeError::CorruptTxn { tid });
     }
-    let records = oids
+    let records = records
         .into_iter()
-        .map(|oid| {
-            let data = backend
-                .load_serial(oid, tid)?
-                .ok_or(ZoeError::NotFound { oid })?;
-            let data = (!data.is_empty()).then_some(data);
-            Ok(RecordInfo { oid, tid, data })
+        .map(|(oid, data)| RecordInfo {
+            oid,
+            tid,
+            data: (!data.is_empty()).then_some(data),
         })
-        .collect::<Result<_>>()?;
-    Ok(TxnInfo {
+        .collect();
+    Ok(Some(TxnInfo {
         tid,
         user: row.user,
         description: row.description,
         extension: row.extension,
         records,
-    })
+    }))
 }
 
 impl Store {
@@ -193,29 +213,45 @@ impl Store {
     /// Return at most `size` records of `oid`, newest first, with the user
     /// and the description of their transactions. Fail with `NotFound`
     /// when `oid` has no record.
+    ///
+    /// A record without a transaction row is `CorruptTxn`. But when a pack
+    /// removed the record and the row after this call read the record, the
+    /// record is left out.
     pub fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>> {
         let versions = self.backend.history(oid, size.max(1))?;
         if versions.is_empty() {
             return Err(ZoeError::NotFound { oid });
         }
-        versions
-            .into_iter()
-            .take(size)
-            .map(|version| {
-                let tid = version.tid;
-                let row = self
-                    .backend
-                    .iter_txns(tid, tid)
-                    .next()
-                    .unwrap_or(Err(ZoeError::CorruptTxn { tid }))?;
-                Ok(HistoryEntry {
-                    tid,
-                    user: row.user,
-                    description: row.description,
-                    size: version.size,
-                })
-            })
-            .collect()
+        self.history_entries(oid, versions, size)
+    }
+
+    /// Return the history entries of the first `size` records of
+    /// `versions`, the records of `oid` that an earlier snapshot read.
+    pub(crate) fn history_entries(
+        &self,
+        oid: Oid,
+        versions: Vec<RecordMeta>,
+        size: usize,
+    ) -> Result<Vec<HistoryEntry>> {
+        let mut entries = Vec::new();
+        for version in versions.into_iter().take(size) {
+            let tid = version.tid;
+            let row = match self.backend.iter_txns(tid, tid).next() {
+                Some(row) => row?,
+                None if self.backend.load_serial(oid, tid)?.is_none() => continue,
+                None => return Err(ZoeError::CorruptTxn { tid }),
+            };
+            entries.push(HistoryEntry {
+                tid,
+                user: row.user,
+                description: row.description,
+                size: version.size,
+            });
+        }
+        if entries.is_empty() && size > 0 {
+            return Err(ZoeError::NotFound { oid });
+        }
+        Ok(entries)
     }
 
     /// Iterate over the transactions from `start` to `stop`, both included,
