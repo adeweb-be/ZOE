@@ -129,8 +129,11 @@ pub(crate) fn decode(codec: Codec, stored: &[u8]) -> Result<Cow<'_, [u8]>, Frame
 /// Decompress the zstd payload `stored`.
 fn unzstd(stored: &[u8]) -> Result<Vec<u8>, FrameError> {
     let len = zstd_data_len(stored)?;
-    // The capacity of the buffer limits the output of zstd.
-    let mut data = Vec::with_capacity(len);
+    // The capacity of the buffer limits the output of zstd. A failed
+    // allocation is an error, not an abort of the process.
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|_| FrameError::Payload)?;
     let written = Decompressor::new()
         .and_then(|mut decompressor| decompressor.decompress_to_buffer(stored, &mut data))
         .map_err(|_| FrameError::Payload)?;
