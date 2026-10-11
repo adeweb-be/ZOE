@@ -53,14 +53,15 @@ async function listening(port: number): Promise<void> {
 
 /**
  * Stop tauri-driver, WebKitWebDriver and the app. tauri-driver leads a
- * process group of its own, and the other two are in it.
+ * process group of its own, and the other two are in it. Signal the group
+ * also when tauri-driver has stopped, because the app can outlive it.
  */
 function stopDriver(): void {
-  if (driver?.pid !== undefined && driver.exitCode === null) {
+  if (driver?.pid !== undefined) {
     try {
       process.kill(-driver.pid, "SIGTERM");
     } catch {
-      // The group has stopped already.
+      // No process of the group is left.
     }
   }
   driver = undefined;
