@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::backend::{
-    Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
+    Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
+    WriteTxn,
 };
 use crate::error::{Result, ZoeError};
-use crate::format;
+use crate::format::{self, Compression};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
@@ -44,6 +45,8 @@ fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError 
 pub(crate) struct RedbBackend {
     db: Database,
     last_tid: AtomicU64,
+    /// How new records are written.
+    compression: Compression,
 }
 
 impl RedbBackend {
@@ -93,7 +96,17 @@ impl RedbBackend {
         Ok(Self {
             db,
             last_tid: AtomicU64::new(last_tid),
+            compression: Compression::default(),
         })
+    }
+
+    /// Write new records with `compression`. The backend reads records of
+    /// every codec, whatever this setting.
+    pub(crate) fn with_compression(self, compression: Compression) -> Self {
+        Self {
+            compression,
+            ..self
+        }
     }
 
     /// Return the next oid that no committed record uses.
@@ -113,7 +126,7 @@ impl RedbBackend {
         Ok(Record {
             tid,
             prev: frame.prev,
-            data: frame.payload.to_vec(),
+            data: frame.data.into_owned(),
         })
     }
 
@@ -155,6 +168,21 @@ impl Backend for RedbBackend {
         }
     }
 
+    fn record_info(&self, oid: Oid, tid: Tid) -> Result<Option<RecordEncoding>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let key = format::record_key(oid, tid);
+        let Some(value) = records.get(&key).map_err(backend)? else {
+            return Ok(None);
+        };
+        let (_, frame) = Self::frame(oid, &key, value.value())?;
+        Ok(Some(RecordEncoding {
+            codec: frame.codec,
+            stored_len: frame.stored_len as u64,
+            data_len: frame.data.len() as u64,
+        }))
+    }
+
     fn last_tid(&self) -> Tid {
         Tid(self.last_tid.load(Ordering::Acquire))
     }
@@ -163,6 +191,7 @@ impl Backend for RedbBackend {
         Ok(Box::new(RedbWrite {
             txn: self.db.begin_write().map_err(backend)?,
             last_tid: &self.last_tid,
+            compression: self.compression,
             written_tid: None,
             max_oid: None,
         }))
@@ -179,7 +208,7 @@ impl Backend for RedbBackend {
                 let tid = Tid(u64::from_be_bytes(*key.value()));
                 let corrupt = ZoeError::CorruptTxn { tid };
                 let row = format::decode_frame(key.value(), value.value())
-                    .and_then(|frame| format::decode_txn(tid, frame.payload))
+                    .and_then(|frame| format::decode_txn(tid, &frame.data))
                     .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt));
                 rows.push(row);
             }
@@ -303,6 +332,7 @@ impl Backend for RedbBackend {
 struct RedbWrite<'a> {
     txn: redb::WriteTransaction,
     last_tid: &'a AtomicU64,
+    compression: Compression,
     written_tid: Option<Tid>,
     max_oid: Option<Oid>,
 }
@@ -310,7 +340,8 @@ struct RedbWrite<'a> {
 impl WriteTxn for RedbWrite<'_> {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
         let key = format::record_key(oid, tid);
-        let frame = format::encode_frame(&key, format::MAIN_BRANCH, prev, data);
+        let frame =
+            format::encode_frame_with(&key, format::MAIN_BRANCH, prev, data, self.compression);
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         records.insert(&key, frame.as_slice()).map_err(backend)?;
         self.max_oid = self.max_oid.max(Some(oid));
@@ -384,20 +415,101 @@ mod tests {
         frame
     }
 
-    #[test]
-    fn a_record_of_a_newer_format_is_a_format_error() {
-        let backend = empty();
-        let (oid, tid) = (Oid(1), Tid(5));
+    /// Store the record frame of `oid` at `tid` with the codec byte `codec`
+    /// and the payload `payload`.
+    fn insert_with_codec(backend: &RedbBackend, oid: Oid, tid: Tid, codec: u8, payload: &[u8]) {
         let key = format::record_key(oid, tid);
         let txn = backend.db.begin_write().unwrap();
         txn.open_table(RECORDS)
             .unwrap()
-            .insert(&key, frame_with_codec(&key, 1, b"pickle").as_slice())
+            .insert(&key, frame_with_codec(&key, codec, payload).as_slice())
             .unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_record_of_a_newer_format_is_a_format_error() {
+        let backend = empty();
+        let (oid, tid) = (Oid(1), Tid(5));
+        insert_with_codec(&backend, oid, tid, 2, b"pickle");
 
         let error = backend.load_before(oid, Tid::MAX);
+        assert!(
+            matches!(&error, Err(ZoeError::Format(message)) if message.contains("header byte 2")),
+            "{error:?}"
+        );
+        let error = backend.record_info(oid, tid);
         assert!(matches!(error, Err(ZoeError::Format(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_zstd_record_that_does_not_decode_is_corrupt() {
+        let backend = empty();
+        let (oid, tid) = (Oid(1), Tid(5));
+        insert_with_codec(&backend, oid, tid, format::Codec::Zstd.byte(), b"pickle");
+
+        let error = backend.load_before(oid, Tid::MAX);
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::CorruptRecord {
+                    oid: Oid(1),
+                    tid: Tid(5)
+                })
+            ),
+            "{error:?}"
+        );
+        let error = backend.load_serial(oid, tid);
+        assert!(
+            matches!(error, Err(ZoeError::CorruptRecord { .. })),
+            "{error:?}"
+        );
+    }
+
+    /// A pickle that zstd makes much smaller.
+    fn compressible() -> Vec<u8> {
+        b"X\x05\x00\x00\x00titleq\x02X\x0b\x00\x00\x00descriptionq\x03".repeat(100)
+    }
+
+    /// Commit the record of `oid` at `tid` with `data`.
+    fn commit_record(backend: &RedbBackend, oid: Oid, tid: Tid, data: &[u8]) {
+        let mut write = backend.begin_write().unwrap();
+        write.put_record(oid, tid, Tid::ZERO, data).unwrap();
+        write.commit().unwrap();
+    }
+
+    #[test]
+    fn every_read_path_decodes_a_compressed_record() {
+        let backend = empty();
+        let (oid, tid) = (Oid(1), Tid(5));
+        let data = compressible();
+        commit_record(&backend, oid, tid, &data);
+
+        let info = backend.record_info(oid, tid).unwrap().unwrap();
+        assert_eq!(info.codec, format::Codec::Zstd);
+        assert_eq!(info.data_len, data.len() as u64);
+        assert!(info.stored_len < info.data_len, "{info:?}");
+        let record = backend.load_before(oid, Tid::MAX).unwrap().unwrap();
+        assert_eq!(record.data, data);
+        assert_eq!(backend.load_serial(oid, tid).unwrap(), Some(data.clone()));
+        let history = backend.history(oid, 10).unwrap();
+        assert_eq!(history[0].size, data.len() as u64);
+        assert_eq!(backend.record_info(oid, Tid(6)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_backend_without_compression_writes_plain_records() {
+        let backend = empty().with_compression(Compression::None);
+        let (oid, tid) = (Oid(1), Tid(5));
+        let data = compressible();
+        commit_record(&backend, oid, tid, &data);
+
+        let info = backend.record_info(oid, tid).unwrap().unwrap();
+        assert_eq!(info.codec, format::Codec::None);
+        assert_eq!(
+            (info.stored_len, info.data_len),
+            (data.len() as u64, data.len() as u64)
+        );
     }
 
     #[test]

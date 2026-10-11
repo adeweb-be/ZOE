@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::Result;
+use crate::format::Codec;
 use crate::types::{Oid, Tid};
 
 /// The bytes of a pickle or of a metadata field.
@@ -36,6 +37,17 @@ pub struct RecordMeta {
     pub prev: Tid,
     /// The size of the pickle in bytes.
     pub size: u64,
+}
+
+/// How one version of one object is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordEncoding {
+    /// The codec of the stored payload.
+    pub codec: Codec,
+    /// The length of the payload as stored.
+    pub stored_len: u64,
+    /// The length of the pickle.
+    pub data_len: u64,
 }
 
 /// The state of a transaction in the transaction log.
@@ -83,6 +95,9 @@ pub trait Backend: Send + Sync {
 
     /// Return the pickle that `tid` wrote for `oid`.
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
+
+    /// Return how the record that `tid` wrote for `oid` is stored.
+    fn record_info(&self, oid: Oid, tid: Tid) -> Result<Option<RecordEncoding>>;
 
     /// Return the tid of the last committed transaction.
     fn last_tid(&self) -> Tid;
@@ -161,6 +176,10 @@ mod tests {
         }
 
         fn load_serial(&self, _: Oid, _: Tid) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        fn record_info(&self, _: Oid, _: Tid) -> Result<Option<RecordEncoding>> {
             Ok(None)
         }
 

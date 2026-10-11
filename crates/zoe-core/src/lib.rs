@@ -19,11 +19,13 @@ mod types;
 pub mod vfs;
 
 pub use backend::{
-    Backend, Bytes, PackStats, Record, RecordMeta, TxnIter, TxnMeta, TxnStatus, WriteTxn,
+    Backend, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta, TxnStatus,
+    WriteTxn,
 };
 pub use clock::{Clock, SystemClock, timestamp};
 pub use commit::{Finished, Txn};
 pub use error::{Result, ZoeError};
+pub use format::{Codec, Compression};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};
