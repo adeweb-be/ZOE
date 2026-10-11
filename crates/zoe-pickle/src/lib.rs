@@ -25,5 +25,5 @@ pub use encode::encode_record;
 pub use error::Error;
 pub use tree::{
     Batch, Bool, ByteString, Bytes, Dict, Float, Get, Global, Int, List, MemoForm, Node, Opaque,
-    Put, Reduce, Tree, Tuple, Unicode, Walk, Width,
+    Put, Reduce, Resolver, Tree, Tuple, Unicode, Walk, Width,
 };

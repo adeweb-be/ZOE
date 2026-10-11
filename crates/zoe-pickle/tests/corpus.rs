@@ -118,9 +118,11 @@ fn a_persistent_reference_names_its_class_through_the_shared_memo() {
 #[test]
 fn every_get_outside_opaque_bytes_resolves() {
     for (stem, tree) in corpus() {
+        let resolver = tree.resolver();
         for node in nodes(&tree) {
             if matches!(node, Node::Get(_)) {
-                assert!(tree.resolve(node).is_some(), "{stem}: {node:?}");
+                assert!(resolver.resolve(node).is_some(), "{stem}: {node:?}");
+                assert_eq!(resolver.resolve(node), tree.resolve(node), "{stem}");
             }
         }
     }

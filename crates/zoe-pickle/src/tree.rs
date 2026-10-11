@@ -89,18 +89,50 @@ impl Tree {
     /// For a [`Node::Put`], this is the value inside it. Other nodes stay as
     /// they are.
     ///
-    /// For a get, the cost is one pass over the tree.
+    /// For a get, the cost is one pass over the tree. To resolve many gets,
+    /// use [`Tree::resolver`]: it makes one pass for all of them.
     pub fn resolve<'a>(&'a self, node: &'a Node) -> Option<&'a Node> {
         let node = node.value();
-        let Node::Get(get) = node else {
+        if !matches!(node, Node::Get(_)) {
             return Some(node);
-        };
-        // The memo of the unpickler: an index gives the value of its latest
-        // put, or `None` if an opaque node holds that put.
+        }
+        let mut found = None;
+        self.replay(|get, value| {
+            let target = std::ptr::eq(get, node);
+            if target {
+                found = value;
+            }
+            target
+        });
+        found
+    }
+
+    /// Returns a resolver that knows the value of each get of this tree.
+    ///
+    /// The resolver makes one pass over the tree. After that, each lookup
+    /// takes constant time.
+    pub fn resolver(&self) -> Resolver<'_> {
+        let mut values = HashMap::new();
+        self.replay(|get, value| {
+            values.insert(std::ptr::from_ref(get).addr(), value);
+            false
+        });
+        Resolver { values }
+    }
+
+    /// Runs the memo of the unpickler over both pickles, in pickle order.
+    /// For each get, calls `visit` with the get and its value. Stops when
+    /// `visit` returns true, or at a node that the encoder refuses.
+    fn replay<'a>(&'a self, mut visit: impl FnMut(&'a Node, Option<&'a Node>) -> bool) {
+        // An index gives the value of its latest put, or `None` if an
+        // opaque node holds that put.
         let mut memo: HashMap<u32, Option<&Node>> = HashMap::new();
         for root in [self.class(), self.state()] {
             for op in Order::new(root) {
-                match op.ok()? {
+                let Ok(op) = op else {
+                    return;
+                };
+                match op {
                     Op::Put(put, Node::Get(earlier)) => {
                         let value = memo.get(&earlier.index).copied().flatten();
                         memo.insert(put.index, value);
@@ -108,8 +140,10 @@ impl Tree {
                     Op::Put(put, value) => {
                         memo.insert(put.index, Some(value));
                     }
-                    Op::Leaf(leaf) if std::ptr::eq(leaf, node) => {
-                        return memo.get(&get.index).copied().flatten();
+                    Op::Leaf(leaf @ Node::Get(get)) => {
+                        if visit(leaf, memo.get(&get.index).copied().flatten()) {
+                            return;
+                        }
                     }
                     Op::Leaf(Node::Opaque(opaque)) => {
                         for index in memo_puts(&opaque.bytes) {
@@ -120,7 +154,31 @@ impl Tree {
                 }
             }
         }
-        None
+    }
+}
+
+/// The values of all the gets of a tree, from one pass over it. See
+/// [`Tree::resolver`].
+#[derive(Clone, Debug)]
+pub struct Resolver<'a> {
+    /// The value of each get, by the address of the get node. The borrow of
+    /// the tree keeps each address valid and unique.
+    values: HashMap<usize, Option<&'a Node>>,
+}
+
+impl<'a> Resolver<'a> {
+    /// Returns the value that a node stands for, as [`Tree::resolve`] does,
+    /// in constant time.
+    pub fn resolve(&self, node: &'a Node) -> Option<&'a Node> {
+        let node = node.value();
+        match node {
+            Node::Get(_) => self
+                .values
+                .get(&std::ptr::from_ref(node).addr())
+                .copied()
+                .flatten(),
+            other => Some(other),
+        }
     }
 }
 
@@ -546,12 +604,18 @@ mod tests {
     }
 
     /// Returns the values that the gets of a tree resolve to, in order.
+    /// Checks that the resolver agrees with `Tree::resolve` on each get.
     fn resolved(tree: &Tree) -> Vec<Option<&Node>> {
-        tree.state()
-            .walk()
-            .filter(|node| matches!(node, Node::Get(_)))
-            .map(|get| tree.resolve(get))
-            .collect()
+        let resolver = tree.resolver();
+        let gets = || {
+            tree.state()
+                .walk()
+                .filter(|node| matches!(node, Node::Get(_)))
+        };
+        let one_pass: Vec<_> = gets().map(|get| resolver.resolve(get)).collect();
+        let one_off: Vec<_> = gets().map(|get| tree.resolve(get)).collect();
+        assert_eq!(one_pass, one_off);
+        one_off
     }
 
     fn int(value: u8) -> Node {
@@ -603,6 +667,48 @@ mod tests {
             form: MemoForm::Short,
         });
         assert_eq!(tree.resolve(&stranger), None);
+    }
+
+    #[test]
+    fn the_resolver_resolves_every_get_of_a_large_record_in_one_pass() {
+        // A list of persistent references: the class in each persistent id
+        // is a get of the GLOBAL in the class pickle, as ZODB writes it.
+        const REFERENCES: usize = 40_000;
+        let mut state = b"](".to_vec();
+        for oid in 0..REFERENCES as u64 {
+            state.extend(b"C\x08");
+            state.extend(oid.to_be_bytes());
+            state.extend(b"h\x00\x86Q");
+        }
+        state.push(b'e');
+        let tree = decode(&state);
+        let global = Node::Global(Global {
+            module: "m".to_owned(),
+            name: "C".to_owned(),
+        });
+        let started = std::time::Instant::now();
+        let resolver = tree.resolver();
+        let resolved = tree
+            .state()
+            .walk()
+            .filter(|node| matches!(node, Node::Get(_)))
+            .filter(|get| resolver.resolve(get) == Some(&global))
+            .count();
+        let elapsed = started.elapsed();
+        assert_eq!(resolved, REFERENCES);
+        // One pass takes some tens of milliseconds, also in a debug build.
+        // One pass per get takes minutes.
+        assert!(elapsed.as_secs() < 10, "{elapsed:?}");
+    }
+
+    #[test]
+    fn the_resolver_gives_none_for_a_get_of_another_tree() {
+        let tree = decode(b"h\x00");
+        let other = decode(b"h\x00");
+        let resolver = tree.resolver();
+        assert!(resolver.resolve(tree.state()).is_some());
+        assert_eq!(resolver.resolve(other.state()), None);
+        assert_eq!(resolver.resolve(&Node::None), Some(&Node::None));
     }
 
     #[test]

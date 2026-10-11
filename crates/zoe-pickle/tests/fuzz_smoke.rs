@@ -131,11 +131,10 @@ fn check(input: &[u8]) -> bool {
         let copy = tree.clone();
         assert_eq!(copy, tree);
         assert!(!format!("{copy:?}").is_empty());
+        let resolver = tree.resolver();
         for root in [tree.class(), tree.state()] {
-            for node in root.walk() {
-                if matches!(node, Node::Get(_)) {
-                    let _ = tree.resolve(node);
-                }
+            for node in root.walk().filter(|node| matches!(node, Node::Get(_))) {
+                let _ = resolver.resolve(node);
             }
         }
         let _ = tree.class_name();
