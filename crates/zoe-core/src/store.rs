@@ -157,6 +157,15 @@ impl Store {
         Self::open_full(vfs, clock, Options::default())
     }
 
+    /// Open the store in the simulated filesystem `vfs` with no page
+    /// cache, and create it if necessary. Each page that a read needs then
+    /// comes from the file, so a test can count the bytes that a read
+    /// costs.
+    #[doc(hidden)]
+    pub fn open_vfs_uncached(vfs: MemVfs) -> Result<Self> {
+        Self::open_cached(vfs, SystemClock, Options::default(), Some(0))
+    }
+
     /// Open the store in `vfs` with the clock `clock` and `options`, and
     /// create it if necessary. The store reads the time only from `clock`:
     /// the tids, and the durations of `lock-warn` and `transaction-warn`.
@@ -168,6 +177,17 @@ impl Store {
         vfs: V,
         clock: impl Clock + 'static,
         options: Options,
+    ) -> Result<Self> {
+        Self::open_cached(vfs, clock, options, None)
+    }
+
+    /// Open the store as `open_full` does. `cache_size` sets the page cache
+    /// of the database in bytes. `None` keeps the default of redb.
+    fn open_cached<V: Vfs>(
+        vfs: V,
+        clock: impl Clock + 'static,
+        options: Options,
+        cache_size: Option<usize>,
     ) -> Result<Self> {
         if !vfs.exists(DATABASE)? {
             if vfs.exists(NEW_DATABASE)? {
@@ -184,7 +204,11 @@ impl Store {
         // This sync makes that rename durable. It also covers a new store.
         vfs.sync_dir()?;
 
-        let db = redb::Builder::new()
+        let mut builder = redb::Builder::new();
+        if let Some(bytes) = cache_size {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder
             .create_with_backend(vfs.open(DATABASE)?)
             .map_err(|e| ZoeError::Backend(Box::new(e)))?;
         let backend = RedbBackend::open(db)?.with_compression(options.compression);
@@ -324,6 +348,22 @@ impl Store {
     /// Return the tid of the last committed transaction.
     pub fn last_transaction(&self) -> Tid {
         self.backend.last_tid()
+    }
+
+    /// Remove the key `(tid, oid)` of the transaction index and keep the
+    /// record. A test uses it to damage the store. Fail with `NotFound`
+    /// when the key does not exist.
+    #[doc(hidden)]
+    pub fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
+        self.backend.remove_index_key_for_test(tid, oid)
+    }
+
+    /// Remove the record of `oid` at `tid` and keep its key in the
+    /// transaction index. A test uses it to damage the store. Fail with
+    /// `NotFound` when the record does not exist.
+    #[doc(hidden)]
+    pub fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
+        self.backend.remove_record_for_test(oid, tid)
     }
 
     /// Tell if no transaction holds or waits for a lock. A test of a skin

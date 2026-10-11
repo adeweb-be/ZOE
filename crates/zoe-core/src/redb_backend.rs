@@ -248,6 +248,30 @@ impl RedbBackend {
         })?;
         Ok((tid, frame))
     }
+
+    /// Remove `key` from `table` in a write transaction of its own. Fail
+    /// with `NotFound` for `oid` when the key does not exist.
+    fn remove_for_test<V: redb::Value + 'static>(
+        &self,
+        table: TableDefinition<&[u8; 16], V>,
+        key: &[u8; 16],
+        oid: Oid,
+    ) -> Result<()> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        let removed = txn
+            .open_table(table)
+            .map_err(backend)?
+            .remove(key)
+            .map_err(backend)?
+            .is_some();
+        if !removed {
+            return Err(ZoeError::NotFound { oid });
+        }
+        txn.commit().map_err(backend)
+    }
 }
 
 impl Backend for RedbBackend {
@@ -579,6 +603,14 @@ impl Backend for RedbBackend {
             }
         }
         txn.commit().map_err(backend)
+    }
+
+    fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
+        self.remove_for_test(TXN_OIDS, &format::txn_oid_key(tid, oid), oid)
+    }
+
+    fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
+        self.remove_for_test(RECORDS, &format::record_key(oid, tid), oid)
     }
 }
 
@@ -1479,6 +1511,44 @@ mod tests {
                 format::txn_oid_key(Tid(5), Oid(1)),
                 format::txn_oid_key(Tid(5), Oid(2))
             ]
+        );
+    }
+
+    #[test]
+    fn txn_oids_reads_the_index_and_no_record() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        for oid in [1, 2, 3] {
+            write
+                .put_record(Oid(oid), Tid(5), Tid::ZERO, b"pickle")
+                .unwrap();
+        }
+        write.commit().unwrap();
+        let rest = BTreeMap::from([(Tid(5), vec![Oid(1), Oid(3)])]);
+
+        // A record without its index key is not in the map.
+        backend.remove_index_key_for_test(Tid(5), Oid(2)).unwrap();
+        assert_eq!(
+            backend.load_serial(Oid(2), Tid(5)).unwrap(),
+            Some(b"pickle".to_vec())
+        );
+        assert_eq!(backend.txn_oids(Tid(5), Tid(5)).unwrap(), rest);
+
+        // An index key without its record stays in the map.
+        backend.remove_record_for_test(Oid(3), Tid(5)).unwrap();
+        assert_eq!(backend.load_serial(Oid(3), Tid(5)).unwrap(), None);
+        assert_eq!(backend.txn_oids(Tid(5), Tid(5)).unwrap(), rest);
+
+        // A hook that finds nothing to remove fails.
+        let error = backend.remove_index_key_for_test(Tid(5), Oid(2));
+        assert!(
+            matches!(error, Err(ZoeError::NotFound { oid: Oid(2) })),
+            "{error:?}"
+        );
+        let error = backend.remove_record_for_test(Oid(3), Tid(5));
+        assert!(
+            matches!(error, Err(ZoeError::NotFound { oid: Oid(3) })),
+            "{error:?}"
         );
     }
 
