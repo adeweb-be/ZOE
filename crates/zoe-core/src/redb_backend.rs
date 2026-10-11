@@ -873,7 +873,7 @@ mod tests {
         RedbBackend::open(db).unwrap()
     }
 
-    /// Return the frame of the row `key` with the codec byte `codec` and a
+    /// Return the record frame of the row `key` with the codec byte `codec` and a
     /// valid checksum.
     fn frame_with_codec(key: &[u8], codec: u8, payload: &[u8]) -> Vec<u8> {
         format::encode_stored_frame(KeySpace::Records, key, codec, payload)
