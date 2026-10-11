@@ -97,7 +97,9 @@ const SLICE: usize = 1024;
 ///
 /// It reads the rows and the tids of the transaction index a slice at a
 /// time, as it goes. So it holds one transaction and one slice of each,
-/// whatever the length of its range.
+/// whatever the length of its range. A slice of rows ends only after a row
+/// that reads. So a run of rows that do not read stays in one slice, and
+/// the iterator holds the error of each row of that run.
 pub struct Transactions {
     store: Weak<Opened>,
     /// The last tid of the range.
@@ -165,7 +167,10 @@ impl Transactions {
     }
 
     /// Read the next slice of rows, in one snapshot. The slice ends after
-    /// a row that reads, so the next slice starts after its tid.
+    /// a row that reads, so the next slice starts after its tid. The error
+    /// of a row that does not read does not always name its tid, and an
+    /// error with a tid can come from a failed scan. So the slice does not
+    /// end after an error.
     fn read_rows(&mut self, backend: &dyn Backend) {
         let Some(from) = self.next_row else {
             return;
@@ -424,6 +429,8 @@ impl Store {
     /// reads each transaction with its index keys and its records in one
     /// snapshot. Each slice is one snapshot. So the iterator holds one
     /// transaction and a slice of tids, whatever the length of the range.
+    /// A slice ends only after a row that reads, so a run of rows that do
+    /// not read stays in one slice, with the error of each row.
     /// It never reads every record key, so a read of one transaction costs
     /// the size of its result. A transaction that a pack removes after
     /// this call is left out.

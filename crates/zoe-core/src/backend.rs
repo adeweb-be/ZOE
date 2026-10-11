@@ -162,12 +162,15 @@ pub trait Backend: Send + Sync {
 
     /// Return the tids from `from` to `to`, both included, that have keys
     /// in the transaction index, in tid order. The list stops at `limit`
-    /// tids. One snapshot gives the list.
+    /// tids. One snapshot gives the list. The call reads only the index. A
+    /// key outside the range, or a key that does not come after the key
+    /// before it, is `CorruptTxn`, as in `txn_oids`.
     ///
-    /// The call reads only the index, and it keeps only the tids, so its
-    /// memory does not grow with the oids of a transaction. A key outside
-    /// the range, or a key that does not come after the key before it, is
-    /// `CorruptTxn`, as in `txn_oids`.
+    /// This default calls `txn_oids`, which holds every oid of the range.
+    /// So its memory grows with the range. A backend must override this
+    /// method to bound the memory of the transaction iterator: the
+    /// override keeps only the tids, at most `limit` of them. The redb
+    /// backend does this.
     fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>> {
         Ok(self.txn_oids(from, to)?.into_keys().take(limit).collect())
     }
