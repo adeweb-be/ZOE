@@ -10,15 +10,12 @@ pythons := "3.12 3.13 3.14 3.14t"
 default:
     @just --list
 
-# Check the format and run clippy, the Python lints and the type check of
-# the Loupe window.
-check: _loupe-modules
+# Check the format and run clippy and the Python lints.
+check:
     cargo fmt --all --check
-    rustfmt --check --edition 2024 apps/loupe/src-tauri/build.rs apps/loupe/src-tauri/src/main.rs
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src
     ruff format --check python ci/src
-    npm --prefix apps/loupe run lint
 
 # Run the Rust tests, then the Python tests on every interpreter.
 test:
@@ -111,11 +108,21 @@ bench *args="run":
 # Build and run Loupe. `just loupe` builds a release app and runs it,
 # `just loupe dev` runs it on the Vite dev server, `just loupe check` lints
 # the app, and `just loupe e2e` builds a debug app and runs the end-to-end
-# tests under xvfb-run.
-loupe command="run": _loupe-modules
+# tests under xvfb-run. Run them in the loupe profile of the shell:
+# `devenv --profile loupe shell -- just loupe <command>`.
+loupe command="run":
     #!/usr/bin/env bash
     set -euo pipefail
+    if ! command -v cargo-tauri >/dev/null; then
+        echo "just loupe: the Tauri toolchain is in the loupe profile of the shell." >&2
+        echo "Run: devenv --profile loupe shell -- just loupe {{ command }}" >&2
+        exit 1
+    fi
     cd apps/loupe
+    # Install the node modules when the lock file is newer than them.
+    if [ ! node_modules/.package-lock.json -nt package-lock.json ]; then
+        npm ci --no-audit --no-fund
+    fi
     # Loupe is a Cargo workspace of its own. Its build goes to target/loupe.
     export CARGO_TARGET_DIR="{{ justfile_directory() }}/target/loupe"
     case "{{ command }}" in
@@ -143,15 +150,6 @@ loupe command="run": _loupe-modules
             exit 2
             ;;
     esac
-
-# Install the node modules of the Loupe window when the lock file is newer.
-_loupe-modules:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd apps/loupe
-    if [ ! node_modules/.package-lock.json -nt package-lock.json ]; then
-        npm ci --no-audit --no-fund
-    fi
 
 # Build the documentation site from docs/ into target/book.
 docs:
