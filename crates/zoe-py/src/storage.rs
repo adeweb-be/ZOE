@@ -361,12 +361,18 @@ impl Storage {
     /// With `tid`, the transaction is a restore transaction: a copy of a
     /// transaction of another storage, which commits under `tid`. It takes
     /// `restoreBlob`. `tid` must be after the last tid of the store.
-    #[pyo3(signature = (transaction, tid = None))]
+    ///
+    /// `status` is the status of the copied transaction, as ZODB's copy
+    /// functions give it: `" "` or `"p"`, as text or bytes. The store keeps
+    /// no transaction status, so the status is not kept. Any other status
+    /// raises `StorageTransactionError`.
+    #[pyo3(signature = (transaction, tid = None, status = None))]
     fn tpc_begin(
         &self,
         py: Python<'_>,
         transaction: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
+        status: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         if self.read_only {
             return Err(errors::read_only(py));
@@ -375,6 +381,9 @@ impl Storage {
         let begun = self.table().entries.contains_key(&key);
         if begun {
             return Err(errors::duplicate_transaction(py));
+        }
+        if let Some(status) = status {
+            check_status(status)?;
         }
         let tid = tid.map(u64_of).transpose()?.map(Tid);
         let user = text(&transaction.getattr("user")?)?;
@@ -883,6 +892,17 @@ fn untransformed(untransform: &Bound<'_, PyAny>, data: &[u8]) -> Option<Vec<u8>>
 /// Return the exception of ZODB for a core error.
 fn core(py: Python<'_>, error: ZoeError) -> PyErr {
     Failure::from(error).into_py(py)
+}
+
+/// Check the status that ZODB gives to a copied transaction: `" "` for a
+/// normal one, `"p"` for one that a pack changed. Raise
+/// `StorageTransactionError` for any other status.
+fn check_status(status: &Bound<'_, PyAny>) -> PyResult<()> {
+    let value = text(status)?;
+    if value == b" " || value == b"p" {
+        return Ok(());
+    }
+    Err(errors::status(status.py(), status))
 }
 
 /// Return the bytes of a metadata field of a transaction. A `str` gives

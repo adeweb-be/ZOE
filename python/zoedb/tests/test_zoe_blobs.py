@@ -378,3 +378,48 @@ def test_restore_blob_conflicts_when_the_object_changes_before_the_vote(storage)
     assert storage._lock_table_is_empty()
     with pytest.raises(POSKeyError):
         storage.loadBlob(oid, p64(2**63 - 2))
+
+
+def test_tpc_begin_takes_the_status_of_a_copied_transaction(storage):
+    last = storage.lastTransaction()
+    for n, status in enumerate([" ", "p", b" ", b"p"], start=1):
+        tid = p64(u64(last) + n)
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn, tid, status)
+        storage.store(storage.new_oid(), ZERO, blob_record(), "", txn)
+        storage.tpc_vote(txn)
+        assert storage.tpc_finish(txn) == tid
+    for status in ("u", "c", ""):
+        with pytest.raises(StorageTransactionError):
+            storage.tpc_begin(TransactionMetaData(), p64(u64(last) + 10), status)
+    with pytest.raises(TypeError):
+        storage.tpc_begin(TransactionMetaData(), p64(u64(last) + 10), 1)
+
+
+def test_zodb_copies_a_storage_with_its_tids(tmp_path):
+    from ZODB.BaseStorage import copy
+    from ZODB.FileStorage import FileStorage
+
+    source = FileStorage(str(tmp_path / "Data.fs"))
+    db = DB(source)
+    try:
+        for n in range(3):
+            with db.transaction() as conn:
+                conn.root()[n] = n
+    finally:
+        db.close()
+
+    source = FileStorage(str(tmp_path / "Data.fs"), read_only=True)
+    storage = zoe.Storage(str(tmp_path / "store"))
+    try:
+        # ZODB calls tpc_begin with the tid and the status of each
+        # transaction of the source.
+        copy(source, storage)
+        assert storage.lastTransaction() == source.lastTransaction()
+        records = [record for txn in source.iterator() for record in txn]
+        assert len(records) > 3
+        for record in records:
+            assert storage.loadSerial(record.oid, record.tid) == record.data
+    finally:
+        storage.close()
+        source.close()

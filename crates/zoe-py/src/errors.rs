@@ -125,6 +125,16 @@ pub(crate) fn closed(py: Python<'_>) -> PyErr {
     raise(storage_error(py), ("the storage is closed",), None)
 }
 
+/// Return the exception for a transaction status that the storage does
+/// not take.
+pub(crate) fn status(py: Python<'_>, status: &Bound<'_, PyAny>) -> PyErr {
+    let message = match status.repr() {
+        Ok(repr) => format!("transaction status {repr} is not supported"),
+        Err(_) => "transaction status is not supported".to_owned(),
+    };
+    raise(storage_transaction_error(py), (message,), None)
+}
+
 /// Return the exception for a transaction that the storage does not
 /// know.
 pub(crate) fn unknown_transaction(py: Python<'_>) -> PyErr {
