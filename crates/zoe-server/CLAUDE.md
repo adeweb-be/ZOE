@@ -9,7 +9,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - `src/cli/serve.rs`: `zoe serve`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/cli/mcp.rs`: `zoe mcp`. It calls `zoe-mcp`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/serve.rs`: `zoe_server::serve::{Server, ServeOptions}`, the server as a library. The binary and the Rust tests run it.
-- `src/protocol/`: the frames, the messages, the extension pickle and the session of a connection. It compiles only with the feature `serve`.
+- `src/protocol/`: the frames, the messages, the extension pickle, the session of a connection, the status of a storage and the times that the protocol sends. It compiles only with the feature `serve`.
 
 ## Invariants of the command
 
@@ -35,6 +35,10 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - A frame with the id -1 is a heartbeat whatever its other parts: it gets no reply and changes nothing.
 - The decode of a frame has a depth bound of 128 steps of rmpv, about 60 levels of arrays or maps. A deeper frame closes its connection, and the server stays up. A stock server takes deeper frames, but a ZEO message nests at most about 3 levels, and a transaction extension nests as deep as its dict.
 - `tpc_finish` replies only after the core made the commit durable.
+- A client can send `ruok` in place of `M5`. It needs no `register` and is not a connection of the status. The server sends `M5`, then one JSON payload `{storage id: status}` as Python's `json.dumps` writes it, then closes. The status reads the store on the blocking pool.
+- `server_status` and the `ruok` reply have the 13 keys of ZEO 6's server, in its order. All the connections of a storage share its counters through `NamedStorage`, and the session counts each call where ZEO counts it. The store has no storage-wide commit lock: `lock_time` is nil, `waiting` is 0 and `timeout-thread-is-alive` is `"stub"`.
+- `get_info` says `supportsUndo` false and `supports_record_iternext` true. Its `interfaces` are those of `zoe.Storage`, in `__iro__` order: never `IStorageUndoable` or `IExternalGC`. Its `length` is 0, as `len(zoe.Storage)`, and its `size` is the size of the files in the store directory. `get_size_info` gives the same `length` and `size`; a stock ZEO server does not answer it.
+- `history` is newest first, with at most `size` entries. A size of 0 or less gives none. The `time` of an entry is `TimeStamp(tid).timeTime()` to the last bit.
 - stdout carries only the lines `admin <address>` and `listening <address>`. The logs go to stderr.
 - SIGTERM closes the store and exits with 0. `Server::stop` and the drop of a `Server` close it too: they drop the runtime, which waits for the session threads, and then the store.
 - An unmodified `ZEO.ClientStorage` works. A stock client never sees an extension that it did not declare in `register`.
