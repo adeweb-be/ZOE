@@ -189,7 +189,10 @@ impl<'s> Txn<'s> {
     /// when this returns.
     ///
     /// A restore transaction commits under its own tid. If that tid is not
-    /// after the last tid, `finish` fails with `Protocol`.
+    /// after the last tid, `finish` fails with `Protocol`. A normal
+    /// transaction gets a tid after the last tid, below `Tid::MAX`. When no
+    /// such tid is left, `finish` fails with `Protocol`. The store does
+    /// not halt for these errors.
     ///
     /// An error other than `Protocol` and `Halted` leaves the outcome of
     /// the commit unknown until the store is reopened: the commit can be
@@ -207,7 +210,7 @@ impl<'s> Txn<'s> {
                 check_restore_tid(tid, last)?;
                 tid
             }
-            None => timestamp(self.store.clock.now()).max(Tid(last.0 + 1)),
+            None => next_tid(timestamp(self.store.clock.now()), last)?,
         };
         // The sequencer stays empty if the write below fails.
         *sequencer = None;
@@ -243,6 +246,17 @@ impl<'s> Txn<'s> {
 
     fn release(&mut self) {
         self.locks = None;
+    }
+}
+
+/// Return the tid of a normal commit after the tid `last`: `now`, or the
+/// tid after `last` if `now` is not after it. `Tid::MAX` is never given,
+/// because `load` reads the versions before it. When no tid is left, fail
+/// with `Protocol`.
+fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
+    match last.0.checked_add(1) {
+        Some(after) if after < Tid::MAX.0 => Ok(now.max(Tid(after)).min(Tid(Tid::MAX.0 - 1))),
+        _ => Err(ZoeError::Protocol("no tid is left after the last tid")),
     }
 }
 
@@ -312,6 +326,62 @@ mod tests {
             .finish()
             .unwrap();
         commit(&store, Oid(2), Tid(300), b"d");
+    }
+
+    #[test]
+    fn a_normal_commit_never_gets_the_maximum_tid() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        voted_restore(&store, Tid(u64::MAX - 2), oid, b"a")
+            .finish()
+            .unwrap();
+        let tid = commit(&store, oid, Tid(u64::MAX - 2), b"b");
+        assert_eq!(tid, Tid(u64::MAX - 1));
+        assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
+    }
+
+    #[test]
+    fn a_commit_after_a_restore_at_the_last_tid_fails() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let last = Tid(u64::MAX - 1);
+        voted_restore(&store, last, oid, b"a").finish().unwrap();
+
+        // No tid is left. The store refuses each finish and does not halt.
+        for _ in 0..2 {
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, last, b"b").unwrap();
+            txn.vote().unwrap();
+            assert!(matches!(txn.finish(), Err(ZoeError::Protocol(_))));
+            assert!(store.locks.is_empty());
+        }
+        assert!(store.tpc_begin_restore(Tid::MAX, b"", b"", b"").is_err());
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), last));
+        assert_eq!(store.last_transaction(), last);
+    }
+
+    #[test]
+    fn the_next_tid_is_after_the_last_and_below_the_maximum() {
+        let max = u64::MAX;
+        for (now, last, tid) in [
+            (10, 5, 10),
+            (10, 10, 11),
+            (10, 20, 21),
+            (max, 5, max - 1),
+            (max, max - 2, max - 1),
+        ] {
+            assert_eq!(
+                next_tid(Tid(now), Tid(last)).unwrap(),
+                Tid(tid),
+                "{now} {last}"
+            );
+        }
+        for last in [max - 1, max] {
+            assert!(matches!(
+                next_tid(Tid(0), Tid(last)),
+                Err(ZoeError::Protocol(_))
+            ));
+        }
     }
 
     #[test]

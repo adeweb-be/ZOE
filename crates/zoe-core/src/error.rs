@@ -57,9 +57,9 @@ pub enum ZoeError {
         oid: Oid,
     },
 
-    /// A two-phase commit call came out of order, for example `finish`
-    /// before `vote`, or a restore gave a tid that is not after the last
-    /// tid.
+    /// The store refuses a call. A two-phase commit call came out of order,
+    /// for example `finish` before `vote`, or a restore gave a tid that is
+    /// not after the last tid, or no tid is left for a commit.
     #[error("two-phase commit out of order: {0}")]
     Protocol(&'static str),
 
