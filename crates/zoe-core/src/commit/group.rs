@@ -257,11 +257,12 @@ fn fail(members: &mut [(Member, Result<Finished>)], error: ZoeError) {
     }
 }
 
-/// Return a copy of `error` for another member of a failed batch. An I/O
-/// error keeps its kind.
+/// Return a copy of `error` for another member of a failed batch. The copy
+/// has the message of `error`. An I/O error keeps its kind.
 fn copy(error: &ZoeError) -> ZoeError {
     match error {
         ZoeError::Io(error) => ZoeError::Io(io::Error::new(error.kind(), error.to_string())),
+        ZoeError::Backend(inner) => ZoeError::Backend(inner.to_string().into()),
         other => ZoeError::Backend(other.to_string().into()),
     }
 }
@@ -428,10 +429,12 @@ mod tests {
     /// Finish `txns`, each on a thread of its own, while the test holds the
     /// commit sequencer. The first finish leads a batch of its own and
     /// waits for the sequencer. The others join in the order of `txns`
-    /// and wait for the next batch. Return the outcomes in that order.
+    /// and wait for the next batch. Call `first` when the first finish
+    /// returns. Return the outcomes in the order of `txns`.
     fn finish_in_two_batches<'s>(
         store: &'s Store,
         txns: Vec<Txn<&'s Store>>,
+        first: impl FnOnce(),
     ) -> Vec<Result<Finished>> {
         let sequencer = store.lock_sequencer();
         let joined = store.group.joined();
@@ -442,10 +445,11 @@ mod tests {
                 wait_until(|| store.group.joined() == joined + n);
             }
             drop(sequencer);
-            finishes
-                .into_iter()
-                .map(|finish| finish.join().unwrap())
-                .collect()
+            let mut finishes = finishes.into_iter();
+            let mut outcomes = vec![finishes.next().unwrap().join().unwrap()];
+            first();
+            outcomes.extend(finishes.map(|finish| finish.join().unwrap()));
+            outcomes
         })
     }
 
@@ -458,7 +462,7 @@ mod tests {
             .map(|_| voted(&store, store.new_oid().unwrap(), b"pickle"))
             .collect();
         let before = vfs.syncs();
-        let finished = finish_in_two_batches(&store, txns);
+        let finished = finish_in_two_batches(&store, txns, || {});
         let syncs = vfs.syncs() - before;
 
         // One sync for the first batch, one for the others. A file that
@@ -492,7 +496,7 @@ mod tests {
             restore(&store, tid, Oid(101), b"b"),
             voted(&store, store.new_oid().unwrap(), b"after"),
         ];
-        let finished = finish_in_two_batches(&store, txns);
+        let finished = finish_in_two_batches(&store, txns, || {});
 
         assert_eq!(finished[1].as_ref().unwrap().tid, tid);
         assert!(matches!(finished[2], Err(ZoeError::Protocol(_))));
@@ -519,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_of_an_error_keeps_its_message() {
+        let backend = ZoeError::Backend(Box::new(io::Error::other("disk full")));
+        assert_eq!(copy(&backend).to_string(), "backend error: disk full");
+        let full = ZoeError::Io(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
+        let copied = copy(&full);
+        assert!(matches!(&copied, ZoeError::Io(e) if e.kind() == io::ErrorKind::StorageFull));
+        assert_eq!(copied.to_string(), full.to_string());
+        let corrupt = ZoeError::CorruptTxn { tid: Tid(7) };
+        assert_eq!(
+            copy(&corrupt).to_string(),
+            "backend error: corrupt transaction row: tid Tid(7)"
+        );
+    }
+
+    #[test]
     fn every_crash_image_keeps_each_acknowledged_batch() {
         // The record of the filesystem starts after the store is created.
         let created = MemVfs::new();
@@ -530,7 +549,9 @@ mod tests {
             .iter()
             .map(|&oid| voted(&store, oid, b"pickle"))
             .collect();
-        for finish in finish_in_two_batches(&store, txns) {
+        // The first batch is acknowledged before the second one ends.
+        let mark = || vfs.mark("first acknowledged");
+        for finish in finish_in_two_batches(&store, txns, mark) {
             finish.unwrap();
         }
         vfs.mark("acknowledged");
@@ -553,6 +574,8 @@ mod tests {
             // lost.
             if image.is_after("acknowledged") {
                 assert_eq!(found, all, "{image:?}");
+            } else if image.is_after("first acknowledged") {
+                assert!(found == first || found == all, "{image:?}: {found:?}");
             } else {
                 assert!(
                     found.is_empty() || found == first || found == all,

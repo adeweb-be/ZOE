@@ -559,10 +559,11 @@ impl Storage {
         let oid = Oid(u64_of(oid)?);
         let serial = serial_of(serial)?;
         let stage = |txn: &mut SharedTxn| Ok(txn.store(oid, serial, data)?);
-        // Staging is short: it does not wait and does not sync. So it keeps
-        // the GIL when no other call uses the transaction. A detach at each
-        // store would give the GIL to another thread at each object of a
-        // commit.
+        // Staging never waits for a lock that a thread with the GIL needs,
+        // and it does not sync. A pickle that spills goes to the spill file
+        // with the GIL held. So store keeps the GIL when no other call uses
+        // the transaction. A detach at each store would give the GIL to
+        // another thread at each object of a commit.
         let staged = match entry.try_with(stage) {
             Some(staged) => staged,
             None => py.detach(|| entry.with(stage)),

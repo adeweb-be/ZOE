@@ -589,6 +589,8 @@ mod tests {
         rows: AtomicBool,
         /// The commit of a write transaction writes, then fails.
         landed: AtomicBool,
+        /// `load_current` gives one record fewer than it got oids.
+        short: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
@@ -653,6 +655,16 @@ mod tests {
                 return Err(injected());
             }
             self.inner.load_before(oid, tid)
+        }
+
+        fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
+            let mut records: Vec<_> = oids
+                .map(|oid| self.load_before(oid, Tid::MAX))
+                .collect::<Result<_>>()?;
+            if self.faults.short.load(Ordering::Relaxed) {
+                records.pop();
+            }
+            Ok(records)
         }
 
         fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
@@ -779,6 +791,26 @@ mod tests {
         commit(&store, oid, Tid::ZERO, b"a").unwrap();
         let error = commit(&store, oid, Tid::ZERO, b"b");
         assert!(matches!(error, Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_vote_fails_when_the_backend_skips_a_current_record() {
+        let (store, faults) = faulty_store();
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        commit(&store, low, Tid::ZERO, b"a").unwrap();
+        commit(&store, high, Tid::ZERO, b"b").unwrap();
+        // The serial of `high` is stale, and the backend skips its record.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(low, store.load(low).unwrap().1, b"c").unwrap();
+        txn.store(high, Tid::ZERO, b"d").unwrap();
+        faults.short.store(true, Ordering::Relaxed);
+        let error = txn.vote().unwrap_err();
+        assert!(matches!(error, ZoeError::Backend(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "backend error: the backend gave 1 current records for 2 oids"
+        );
         assert!(store.locks.is_empty());
     }
 

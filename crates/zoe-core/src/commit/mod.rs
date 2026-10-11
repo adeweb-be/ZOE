@@ -594,12 +594,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// gives each such oid with its committed record.
     fn check_serials(&self, resolve: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
-        let backend = &self.store.backend;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
         for chunk in staged.chunks(READ_CHUNK) {
-            let current = backend.load_current(&mut chunk.iter().map(|(oid, _)| *oid))?;
+            let current = self.load_current(chunk.iter().map(|(oid, _)| *oid))?;
             for (&(oid, staged), record) in chunk.iter().zip(current) {
                 let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
                 if current == staged.serial {
@@ -627,7 +626,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let read_current: Vec<_> = self.read_current.iter().collect();
         for chunk in read_current.chunks(READ_CHUNK) {
-            let current = backend.load_current(&mut chunk.iter().map(|&(&oid, _)| oid))?;
+            let current = self.load_current(chunk.iter().map(|&(&oid, _)| oid))?;
             for (&(&oid, &read), record) in chunk.iter().zip(current) {
                 let current = record.map_or(Tid::ZERO, |record| record.tid);
                 if current != read {
@@ -641,6 +640,26 @@ impl<S: Deref<Target = Store>> Txn<S> {
             }
         }
         Ok(Check::Passed(conflicts))
+    }
+
+    /// Return the current record of each oid of `oids`, in order, from one
+    /// backend read. A backend that gives another number of records fails
+    /// with a backend error, so the vote never skips an oid.
+    fn load_current(
+        &self,
+        oids: impl ExactSizeIterator<Item = Oid>,
+    ) -> Result<Vec<Option<Record>>> {
+        let expected = oids.len();
+        let mut oids = oids;
+        let records = self.store.backend.load_current(&mut oids)?;
+        if records.len() != expected {
+            let error = format!(
+                "the backend gave {} current records for {expected} oids",
+                records.len()
+            );
+            return Err(ZoeError::Backend(error.into()));
+        }
+        Ok(records)
     }
 
     /// Return the serial of the current record of `oid`, or `Tid::ZERO`
