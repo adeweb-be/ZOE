@@ -498,8 +498,8 @@ impl Storage {
 
 impl Drop for Storage {
     /// Close the store without the GIL when Python frees a storage that
-    /// was not closed. During the shutdown of the interpreter, the store
-    /// closes with the GIL.
+    /// was not closed. This also holds during the shutdown of the
+    /// interpreter, on the thread that finalizes it.
     fn drop(&mut self) {
         let store = self
             .store

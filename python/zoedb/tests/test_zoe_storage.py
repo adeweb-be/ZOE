@@ -72,9 +72,10 @@ class ZODBStorageTests(
     def test_race_loadopen_vs_local_invalidate(self):
         if FREE_THREADED:
             # The cache of the stock persistent is not thread-safe on a
-            # free-threaded build. There, this test fails with a SystemError
-            # in ZODB.serialize, also on FileStorage, and MappingStorage and
-            # FileStorage can crash the interpreter.
+            # free-threaded build. A heavier stress of this pattern fails
+            # with a SystemError in ZODB.serialize or a spurious
+            # AttributeError, on zoe.Storage and on FileStorage, and
+            # MappingStorage can crash the interpreter.
             pytest.skip("the stock persistent is not thread-safe here")
         super().test_race_loadopen_vs_local_invalidate()
 
