@@ -1,8 +1,9 @@
 //! `zoe._zoe.Storage`: the ZODB storage API over a core store.
 //!
 //! `zoe.storage.Storage` subclasses it in Python. The class releases the
-//! GIL around every call into the core, and holds no lock while Python
-//! code runs.
+//! GIL around every call into the core, and holds no mutex while Python
+//! code runs. The per-OID locks of a vote are not mutexes: they stay held
+//! while `_p_resolveConflict` runs.
 //!
 //! The storage keeps a table of the open transactions, keyed by the
 //! address of the ZODB transaction object. Each entry keeps the object
@@ -14,8 +15,9 @@
 //!
 //! `_vote_resolving` votes and keeps the locks when it finds conflicts.
 //! `zoe.storage.Storage.tpc_vote` resolves them in Python, stores the
-//! resolved pickles and calls `tpc_vote` of this class. The per-OID locks
-//! stay held while the Python code runs, but no mutex does.
+//! resolved pickles and calls `tpc_vote` of this class. `tpc_abort` and
+//! `close` can release the locks while the resolution runs, because the
+//! resolution holds no mutex of the transaction.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
