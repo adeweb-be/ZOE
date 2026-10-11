@@ -30,7 +30,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - After `vote_resolving` gives conflicts, the transaction holds its locks and takes only a `store` of an oid in conflict, with the serial of the committed record. The next `vote` takes no lock. It checks every serial again with the locks held. An oid that is still stale fails it, and it releases the locks. So the locks are taken once, in ascending oid order. While the caller resolves, only an abort or a drop of the transaction releases them, from any thread: the in-process storage does this at `tpc_abort` and at `close`. The core runs no resolution code.
 - The lock table has an entry only for an oid that a transaction holds or waits for.
 - No conflict tier runs Python on the server.
-- One backend write transaction holds the records, the transaction row and the meta update of a commit. It is durable before the client gets the acknowledgement.
+- One backend write transaction holds the records, the blob records, the transaction row and the meta update of a commit. It is durable before the client gets the acknowledgement.
 - A crash before the fsync leaves nothing. A crash after it leaves a complete transaction. No repair step exists.
 - Invalidations go out only after the acknowledgement.
 - Locks that group-commit members hold stay held until the batch is durable. A failed fsync fails every member.
@@ -60,9 +60,13 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Decompression is bounded. The length that a zstd frame states is at least 1, at most `u32::MAX` and at most 32,768 times the stored length, and the payload decodes to exactly that length. Any other zstd payload is `CorruptRecord`, never data and never a deletion.
 - `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` before anything is written.
 - Pack never blocks readers. Writers pause only for the final meta update. A blob file is deleted after its record.
-- A blob file is immutable per `(oid, tid)`. `storeBlob` renames the file into place inside `tpc_finish`.
+- A blob file is immutable per `(oid, tid)` and read-only once committed. It lives at the BushyLayout path of `(oid, tid)` under `blobs/`, and `blobs/.layout` holds `bushy`.
+- `store_blob` syncs the blob file. `finish` writes and syncs an intent file in `blobs/tmp/`, then renames each blob file into place and syncs its directory, all before the backend commit. A new directory is synced into its parent before anything goes into it. So a durable blob record always has its file.
+- Opening a store reads only `blobs/tmp/`, never the whole blob tree. It removes the blob files that an intent file names and that have no blob record, syncs their directories, then removes the intent files and the temporary files.
+- A read through `open_blob` checks the size and the BLAKE3 hash at the end of the file. A mismatch or a missing file is `CorruptBlob` with the oid and the tid.
+- Every blob file operation goes through the `Vfs`, so the crash simulation covers it.
 - Nothing is undoable past the last pack.
-- A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename.
+- A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename, and the leftovers of a finish in `blobs/tmp/`.
 - `next_oid` in `meta` is always greater than every committed oid.
 - `finish` raises the next oid of the store above every oid that it writes, before the write. So `new_oid` never gives an oid that a restore wrote.
 - The core reads the time only through the `Clock` trait and the filesystem only through the `Vfs` trait, so the crash simulation and the deterministic simulator can replace them. One exception: lock waits use `Instant`, because `Clock` gives wall time and a `Condvar` wait cannot run on a simulated clock.
