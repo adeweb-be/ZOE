@@ -229,6 +229,8 @@ mod tests {
         load: AtomicBool,
         /// `begin_write` fails.
         write: AtomicBool,
+        /// `iter_txns` fails as a whole.
+        rows: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
@@ -265,6 +267,9 @@ mod tests {
         }
 
         fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_> {
+            if self.faults.rows.load(Ordering::Relaxed) {
+                return Box::new(std::iter::once(Err(injected())));
+            }
             self.inner.iter_txns(from, to)
         }
 
@@ -357,6 +362,17 @@ mod tests {
         // A second vote does not wait on a lock of the first one.
         failed.vote().unwrap();
         failed.finish().unwrap();
+    }
+
+    #[test]
+    fn a_failed_transaction_log_gives_one_iterator_error() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        commit(&store, oid, first, b"b").unwrap();
+        faults.rows.store(true, Ordering::Relaxed);
+        let txns: Vec<_> = store.iterator(None, None).unwrap().collect();
+        assert!(matches!(txns[..], [Err(ZoeError::Backend(_))]), "{txns:?}");
     }
 
     #[test]

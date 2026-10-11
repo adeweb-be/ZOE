@@ -5,8 +5,7 @@
 //! fails with `NotFound`. Each backend read verifies the checksum of every
 //! frame that it returns.
 
-use std::collections::BTreeMap;
-use std::iter::Peekable;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Weak};
 
 use crate::backend::{Backend, Record, TxnMeta};
@@ -86,7 +85,7 @@ pub struct CurrentRecord {
 /// the next call gives `Closed`, then the iterator ends.
 pub struct Transactions {
     store: Weak<Opened>,
-    rows: Peekable<std::vec::IntoIter<Result<TxnMeta>>>,
+    rows: VecDeque<Result<TxnMeta>>,
     oids: BTreeMap<Tid, Vec<Oid>>,
 }
 
@@ -94,19 +93,19 @@ impl Iterator for Transactions {
     type Item = Result<TxnInfo>;
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
-        if self.rows.peek().is_none() && self.oids.is_empty() {
+        if self.rows.is_empty() && self.oids.is_empty() {
             return None;
         }
         // The store stays open until this call returns.
         let Some(store) = self.store.upgrade() else {
-            self.rows = Vec::new().into_iter().peekable();
+            self.rows.clear();
             self.oids.clear();
             return Some(Err(ZoeError::Closed));
         };
         // Records of a tid before the next row, or after the last row, have
         // no row. They come in tid order, as an error.
         if let Some(&tid) = self.oids.keys().next() {
-            let no_row = match self.rows.peek() {
+            let no_row = match self.rows.front() {
                 Some(Ok(row)) => tid < row.tid,
                 Some(Err(_)) => false,
                 None => true,
@@ -116,12 +115,16 @@ impl Iterator for Transactions {
                 return Some(Err(ZoeError::CorruptTxn { tid }));
             }
         }
-        let row = match self.rows.next()? {
+        let row = match self.rows.pop_front()? {
             Ok(row) => row,
             Err(error) => {
-                // The records of a corrupt row give no second error.
-                if let ZoeError::CorruptTxn { tid } = error {
-                    self.oids.remove(&tid);
+                // A row that does not read can own any records before the
+                // next row that reads. Drop them, so that they give no
+                // second error.
+                let next = self.rows.iter().find_map(|row| row.as_ref().ok());
+                match next {
+                    Some(row) => self.oids = self.oids.split_off(&row.tid),
+                    None => self.oids.clear(),
                 }
                 return Some(Err(error));
             }
@@ -224,7 +227,9 @@ impl Store {
     ///
     /// A transaction whose records do not match the oid count of its row
     /// gives `CorruptTxn`. Records of a tid that has no row give
-    /// `CorruptTxn` too, but only when the range has a row.
+    /// `CorruptTxn` too, but only when the range has a row. A row that does
+    /// not read gives its own error once, and the records before the next
+    /// row that reads give no error.
     pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
@@ -241,7 +246,7 @@ impl Store {
         };
         Ok(Transactions {
             store: Arc::downgrade(&self.backend),
-            rows: rows.into_iter().peekable(),
+            rows: rows.into(),
             oids,
         })
     }
@@ -286,6 +291,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use redb::{ReadableTable, TableDefinition};
+    use xxhash_rust::xxh3::Xxh3;
 
     use super::*;
     use crate::format;
@@ -609,6 +615,44 @@ mod tests {
             let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, b"x");
             table.insert(&key, frame.as_slice()).unwrap();
         });
+    }
+
+    /// Set the flags byte of the transaction row of `tid` in the closed
+    /// store in `vfs`, with a valid checksum. A newer format writes such a
+    /// row.
+    fn flag_row(vfs: &MemVfs, tid: Tid) {
+        let txns: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
+        let db = redb::Builder::new()
+            .create_with_backend(vfs.file("zoe.redb"))
+            .unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(txns).unwrap();
+            let key = format::txn_key(tid);
+            let mut frame = table.get(&key).unwrap().unwrap().value().to_vec();
+            frame[1] = 1;
+            let mut hasher = Xxh3::new();
+            hasher.update(&key);
+            hasher.update(&frame[..24]);
+            hasher.update(&frame[format::HEADER_LEN..]);
+            frame[24..32].copy_from_slice(&hasher.digest().to_le_bytes());
+            table.insert(&key, frame.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_row_of_a_newer_format_gives_one_error() {
+        let vfs = MemVfs::new();
+        drop(three_records_in(&vfs));
+        flag_row(&vfs, Tid(200));
+        let store = Store::open_vfs(vfs).unwrap();
+
+        let txns: Vec<_> = store.iterator(None, None).unwrap().collect();
+        assert_eq!(txns.len(), 3, "{txns:?}");
+        assert_eq!(txns[0].as_ref().unwrap().tid, Tid(100));
+        assert!(matches!(txns[1], Err(ZoeError::Format(_))), "{txns:?}");
+        assert_eq!(txns[2].as_ref().unwrap().tid, Tid(300));
     }
 
     /// Return the tid of each transaction of the iterator, or the tid of
