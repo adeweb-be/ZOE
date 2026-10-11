@@ -59,11 +59,13 @@ Oids and tids are strings in ZODB form, as `ZODB.utils.oid_repr` writes them: `0
 
 `root`, `object` and `resolve` read as of the tid of the switch. The switch includes its own tid, and every read of one call uses that tid. `open_folder` sets the switch to null.
 
+The window sends `open_folder` and `set_as_of` one at a time, in order, so the last call wins. A read of an object waits for these calls, so it reads as of the switch that the window asked for last. Once the switch moves, the window shows the new tid and a new tree, even when a newer request has started. It drops only the replies that are too late.
+
 An object is `{ oid, serial, class, size, state, references, error }`. `state` is the decoded state as JSON; the module documentation of `crates/zoe-loupe/src/state.rs` gives the form of each value and the limits on its size. Each reference is `{ oid, at }`, where `at` is a JSON pointer into `state`. `error` holds the refusal of zoe-pickle when the record does not decode.
 
 A revision is `{ tid, user, description, size }`. A deletion has size 0. `history` gives at most 4096 revisions, `HISTORY_LIMIT` of `zoe-loupe`.
 
-A change is `{ path, before, after }`. `path` is a JSON pointer into the two states, and `""` is the whole state. A side that does not have the value has no field. The diff compares the decoded trees, not the bytes: key order, memo puts and opcode width are not changes, and a reference compares by oid. The module documentation of `crates/zoe-loupe/src/diff.rs` gives the rules and the limits. A value that the state cuts can change in a part that does not show; then the two sides of the change look the same, and the view says so.
+A change is `{ path, before, after }`. `path` is a JSON pointer into the two states, and `""` is the whole state. A side that does not have the value has no field. The diff compares the decoded trees, not the bytes: key order, memo puts and opcode width are not changes, and a reference compares by oid. The module documentation of `crates/zoe-loupe/src/diff.rs` gives the rules and the limits. A value that the state cuts can change in a part that does not show; then the two sides of the change look the same, and the view says so. A deletion has no state: against a deletion, the diff is one change of the whole state without a value on the side of the deletion.
 
 A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notClosedCleanly`, `noRecord`, `noRecordAsOf`, `noObject`, `refused`, `badId` and `other`. `noRecordAsOf` has the oid and the tid of the view: a later transaction creates the object. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
 
