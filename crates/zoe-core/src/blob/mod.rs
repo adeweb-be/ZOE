@@ -594,21 +594,82 @@ mod tests {
     }
 
     #[test]
-    fn a_later_store_drops_the_blob_of_its_oid() {
+    fn a_later_store_keeps_the_blob_of_its_oid() {
         let vfs = MemVfs::new();
         let store = Store::open_vfs(vfs.clone()).unwrap();
         let oid = store.new_oid().unwrap();
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"blob"))
             .unwrap();
-        txn.store(oid, Tid::ZERO, PICKLE).unwrap();
+        txn.store(oid, Tid::ZERO, b"later").unwrap();
         txn.vote().unwrap();
         let tid = txn.finish().unwrap();
-        assert!(matches!(
-            store.blob_path(oid, tid),
-            Err(ZoeError::NotFound { .. })
-        ));
+        assert_eq!(store.load(oid).unwrap(), (b"later".to_vec(), tid));
+        assert_eq!(read(&store, oid, tid).unwrap(), b"blob");
         assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_blob_survives_a_resolved_conflict() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit_blobs(&store, &[oid], b"first");
+
+        // This transaction read `first`, then another one commits.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob(oid, first, b"mine", blob_file(&store, b"mine"))
+            .unwrap();
+        let other = {
+            let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+            other
+                .store_blob(oid, first, b"other", blob_file(&store, b"other"))
+                .unwrap();
+            other.vote().unwrap();
+            other.finish().unwrap()
+        };
+
+        let conflicts = txn.vote_resolving().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!((conflicts[0].0, conflicts[0].1.tid), (oid, other));
+        assert_eq!(temp_files(&vfs).len(), 1, "the blob survives the vote");
+        txn.store(oid, other, b"resolved").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(oid).unwrap(), (b"resolved".to_vec(), tid));
+        assert_eq!(read(&store, oid, tid).unwrap(), b"mine");
+        assert_eq!(read(&store, oid, other).unwrap(), b"other");
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn store_blob_from_another_thread_is_refused() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let file = blob_file(&store, b"blob");
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| txn.store_blob(oid, Tid::ZERO, PICKLE, file))
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(refused, Err(ZoeError::WrongThread)), "{refused:?}");
+        assert!(txn.staged(oid).is_none());
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn a_transaction_that_shares_its_store_commits_a_blob() {
+        let store = std::sync::Arc::new(Store::open_vfs(MemVfs::new()).unwrap());
+        let oid = store.new_oid().unwrap();
+        let mut txn = crate::commit::Txn::begin(std::sync::Arc::clone(&store), b"", b"", b"");
+        txn.store_blob(oid, Tid::ZERO, PICKLE, blob_file(&store, b"shared"))
+            .unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        assert_eq!(read(&store, oid, tid).unwrap(), b"shared");
     }
 
     #[test]

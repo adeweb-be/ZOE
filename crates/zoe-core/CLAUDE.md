@@ -35,7 +35,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Invalidations go out only after the acknowledgement.
 - Locks that group-commit members hold stay held until the batch is durable. A failed fsync fails every member.
 - Only the commit-batch leader opens a backend write transaction. Readers use snapshots and never block it.
-- The thread that begins a transaction drives it. `store`, `restore`, `check_current_serial` and `vote` from another thread fail with `WrongThread`, and the refused call changes nothing. `finish` and `abort` may run on any thread, because ZODB lets another thread finish or abort a transaction.
+- The thread that begins a transaction drives it. `store`, `store_blob`, `restore`, `check_current_serial` and `vote` from another thread fail with `WrongThread`, and the refused call changes nothing. A refused `store_blob` stages nothing and drops its blob file, which removes the file. `finish` and `abort` may run on any thread, because ZODB lets another thread finish or abort a transaction.
 - `Txn` reaches its store through `S: Deref<Target = Store>`. `Txn<&Store>` borrows the store. `Txn<Arc<Store>>` shares it and borrows nothing, so a skin can keep it across calls and threads.
 - A successful vote hands its locks to the transaction with `Locks::keep`. The transaction then releases them with `LockManager::release` at `finish`, at `abort` or when it is dropped. A failed vote drops its `Locks`, and that releases them.
 - After a vote fails on a stale serial, `conflict_serials` gives the current serial and the serial that the transaction read, the `serials` of a ZODB `ConflictError`. After a lock-wait timeout it gives `None`. `staged` gives the read serial and the pickle that the transaction staged for an oid.
@@ -67,6 +67,8 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - Opening a store reads only `blobs/tmp/` and the oid directories that its intent files name, never the whole blob tree. It removes the blob files in the tree that an intent file names and that have no blob record, and syncs their directories. Then it removes the intent files and the temporary files: only regular files, and other entries stay.
 - A read through `open_blob` checks the size and the BLAKE3 hash at the end of the file. A mismatch or a missing file is `CorruptBlob` with the oid and the tid.
 - Every blob file operation goes through the `Vfs`, so the crash simulation covers it.
+- A staged blob stays with its oid until `finish` or `abort`, also across the two votes of `vote_resolving`. A later `store` of the oid, the store of a resolved conflict too, and `restore` replace only the pickle and keep the blob, as ZODB's blob storages do. A restored deletion drops the blob. A second `store_blob` of the oid replaces the blob.
+- A staged blob holds only a weak reference to the store, as a blob file does. So it works the same in `Txn<&Store>` and in `Txn<Arc<Store>>`.
 - Nothing is undoable past the last pack.
 - A store creates its database as `zoe.redb.new`, syncs it, renames it to `zoe.redb` and syncs the directory. Opening never repairs a store; it only removes a `zoe.redb.new` that a crash left before the rename, and the leftovers of an unfinished commit: the blob files in the tree that an intent file names and that have no blob record, then the files in `blobs/tmp/`.
 - `next_oid` in `meta` is always greater than every committed oid.

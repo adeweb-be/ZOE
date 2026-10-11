@@ -15,14 +15,17 @@
 //! calls `vote` again. That vote takes no lock: it checks the serials
 //! again with the locks that the first vote took.
 //!
-//! The thread that begins a transaction drives it: `store`, `restore`,
-//! `check_current_serial`, `vote` and `vote_resolving` from another thread
-//! fail with `WrongThread`. `finish` and `abort` work from any thread.
+//! The thread that begins a transaction drives it: `store`, `store_blob`,
+//! `restore`, `check_current_serial`, `vote` and `vote_resolving` from
+//! another thread fail with `WrongThread`. `finish` and `abort` work from
+//! any thread.
 //!
-//! `store_blob` stages a record with a synced blob file. `finish` places
-//! the blob files before the backend commit, and the same backend write
-//! transaction holds their blob records. Dropping a transaction removes
-//! the blob files that it did not place.
+//! `store_blob` stages a record with a synced blob file. The blob stays
+//! with its oid until finish or abort: a later `store` of the oid, the
+//! store of a resolved conflict too, replaces only the pickle, as in ZODB.
+//! `finish` places the blob files before the backend commit, and the same
+//! backend write transaction holds their blob records. Dropping a
+//! transaction removes the blob files that it did not place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -176,7 +179,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// After a vote, `store` takes only an oid that `vote_resolving` gave
     /// as a conflict. Then `serial` is the serial of the committed record.
+    ///
+    /// A blob that `store_blob` staged for `oid` stays, as in ZODB.
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
+        self.check_store(oid, data)?;
+        self.staged.insert(
+            oid,
+            Staged {
+                serial,
+                data: data.to_vec(),
+                restored: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Check that `store` or `store_blob` can stage `data` for `oid`. A
+    /// refused call changes nothing.
+    fn check_store(&self, oid: Oid, data: &[u8]) -> Result<()> {
         self.check_thread()?;
         if self.voted() {
             return Err(ZoeError::Protocol("store after vote"));
@@ -189,17 +209,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if data.is_empty() {
             return Err(ZoeError::Protocol("store of an empty pickle"));
         }
-        check_oid(oid)?;
-        self.blobs.remove(&oid);
-        self.staged.insert(
-            oid,
-            Staged {
-                serial,
-                data: data.to_vec(),
-                restored: false,
-            },
-        );
-        Ok(())
+        check_oid(oid)
     }
 
     /// Return the serial that the transaction read for `oid` and the pickle
@@ -212,14 +222,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 
     /// Stage a new version of `oid` with the blob in `file`, as `store`
-    /// does. This syncs the file. `finish` renames it into the blob store.
+    /// does, with the same checks. Then sync the file. `finish` renames it
+    /// into the blob store. A second blob of `oid` replaces the first.
     ///
     /// `file` must come from `new_blob_file` of this store. A file of
     /// another store is refused with `Protocol`, and a file of a closed
-    /// store with `Closed`.
+    /// store with `Closed`. A refused call stages nothing and drops
+    /// `file`, which removes it.
     pub fn store_blob(&mut self, oid: Oid, serial: Tid, data: &[u8], file: BlobFile) -> Result<()> {
+        self.check_store(oid, data)?;
         let blob = file.close(&self.store.backend)?;
-        self.store(oid, serial, data)?;
+        self.staged.insert(
+            oid,
+            Staged {
+                serial,
+                data: data.to_vec(),
+                restored: false,
+            },
+        );
         self.blobs.insert(oid, blob);
         Ok(())
     }
@@ -231,6 +251,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// this store. The vote takes an exclusive lock on `oid`, as for
     /// `store`. If another transaction changes `oid` before the vote, the
     /// vote fails with `Conflict`.
+    ///
+    /// A blob that `store_blob` staged for `oid` stays, unless `data` is a
+    /// deletion: a deleted object has no blob.
     pub fn restore(&mut self, oid: Oid, data: Option<&[u8]>) -> Result<()> {
         self.check_thread()?;
         if self.tid.is_none() {
@@ -241,7 +264,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         check_oid(oid)?;
         let current = self.current_serial(oid)?;
-        self.blobs.remove(&oid);
+        if data.is_none() {
+            self.blobs.remove(&oid);
+        }
         self.staged.insert(
             oid,
             Staged {

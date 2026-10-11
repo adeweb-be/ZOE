@@ -79,8 +79,8 @@ pub enum ZoeError {
     Protocol(&'static str),
 
     /// A thread that did not begin the transaction called `store`,
-    /// `restore`, `check_current_serial` or `vote`. The transaction refuses
-    /// the call and does not change.
+    /// `store_blob`, `restore`, `check_current_serial` or `vote`. The
+    /// transaction refuses the call and does not change.
     #[error("the call came from a thread that did not begin the transaction")]
     WrongThread,
 
