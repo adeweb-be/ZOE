@@ -528,7 +528,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         store.blobs().finished(intent);
         // A running pack marks what these records refer to before its next
         // removal.
-        store.packing.note(tid, self.staged.keys().copied());
+        store
+            .packing
+            .note(tid, self.staged.iter().map(|(oid, _)| oid));
 
         *sequencer = Some(tid);
         drop(sequencer);

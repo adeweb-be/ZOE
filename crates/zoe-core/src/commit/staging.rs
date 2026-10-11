@@ -601,7 +601,7 @@ mod tests {
             let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
             txn.store(Oid(9), Tid::ZERO, b"x").unwrap();
         }
-        let vfs = vfs.settled();
+        let vfs = vfs.durable_copy();
         let store = open(&vfs, 2);
         // The first pickle stays in memory, and the second one spills.
         let oids = [Oid(1), Oid(2)];
