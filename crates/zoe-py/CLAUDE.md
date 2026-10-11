@@ -37,6 +37,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - The wheel never imports Plone. Only `zoe.plone`, through the `plone` extra, does.
 - The version of the wheel equals the version of the crates.
 - A change to a public Python API is a stop-and-ask.
+- `_lock_table_is_empty()` tells if no transaction of the core holds or waits for a lock. It is a private hook for the tests, not a public API.
 
 ## Errors
 

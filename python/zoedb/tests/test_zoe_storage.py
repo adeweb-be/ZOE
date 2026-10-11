@@ -203,6 +203,23 @@ def test_close_aborts_the_open_transactions_and_releases_the_store(tmp_path):
         reopened.close()
 
 
+def test_the_lock_table_is_empty_after_finish_and_abort(storage):
+    assert storage._lock_table_is_empty()
+    oid = storage.new_oid()
+    # The vote holds the lock of the object until the end of the transaction.
+    txn = voted(storage, oid, ZERO, record(1))
+    assert not storage._lock_table_is_empty()
+    tid = storage.tpc_finish(txn)
+    assert storage._lock_table_is_empty()
+    txn = voted(storage, oid, tid, record(2))
+    assert not storage._lock_table_is_empty()
+    storage.tpc_abort(txn)
+    assert storage._lock_table_is_empty()
+    storage.close()
+    with pytest.raises(StorageError):
+        storage._lock_table_is_empty()
+
+
 def test_last_transaction_waits_for_the_callback(storage):
     oid = storage.new_oid()
     first = commit(storage, oid, ZERO, record(1))
