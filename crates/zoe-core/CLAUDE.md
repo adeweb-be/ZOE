@@ -51,6 +51,12 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 - No key space maps a tid to its oids. `Backend::txn_oids` scans every key of `records`, so each iterator call reads all the keys of the store.
 - An error in `finish` leaves the outcome unknown until the store is reopened. Until then, every later finish is refused with `Halted`.
 - Every record carries a codec byte, a branch id and a typed-field-slot header. Every blob record carries its BLAKE3 hash. This holds from the first store written.
+- `CODEC_NONE` is 0 and stores the data as it is. `CODEC_ZSTD` is 1 and stores one zstd frame that states the data length. These values never change. An unknown codec on read is a `Format` error, never data.
+- The checksum and the payload length cover the payload as stored. A read verifies the checksum before it decompresses.
+- `decode_frame` decodes every codec. A read path gets the data, never the stored form.
+- Compression never changes what a load returns. A store reads every codec, whatever its `compression` option.
+- A record is kept compressed only when zstd makes it smaller. Otherwise it is stored as it is, with codec 0. The zstd level is an option, 3 by default.
+- Decompression is bounded. The length that a zstd frame states is at most `u32::MAX` and at most 32,768 times the stored length, and the payload decodes to exactly that length. Any other zstd payload is `CorruptRecord`.
 - `max-record-size`, `max-transaction-size` and `max-blob-size` refuse a `store` before anything is written.
 - Pack never blocks readers. Writers pause only for the final meta update. A blob file is deleted after its record.
 - A blob file is immutable per `(oid, tid)`. `storeBlob` renames the file into place inside `tpc_finish`.
