@@ -154,6 +154,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(())
     }
 
+    /// Return the serial that the transaction read for `oid` and the pickle
+    /// that it staged. Return `None` when the transaction did not stage
+    /// `oid`.
+    pub fn staged(&self, oid: Oid) -> Option<(Tid, &[u8])> {
+        self.staged
+            .get(&oid)
+            .map(|staged| (staged.serial, staged.data.as_slice()))
+    }
+
     /// Stage a copy of a version of `oid` in a restore transaction. `None`
     /// copies a deletion. The version gets the tid of the transaction.
     ///
@@ -716,6 +725,8 @@ mod tests {
         txn.store(read, first, b"c").unwrap();
         assert!(matches!(txn.vote(), Err(ZoeError::Conflict { oid }) if oid == read));
         assert_eq!(txn.conflict_serials(), Some((second, first)));
+        assert_eq!(txn.staged(read), Some((first, &b"c"[..])));
+        assert_eq!(txn.staged(written), None);
 
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store(read, second, b"c").unwrap();
