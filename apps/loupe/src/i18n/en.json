@@ -22,5 +22,17 @@
   "object.refused": "zoe-pickle refuses this record: {error}",
   "object.references": "Outbound references",
   "object.noReferences": "No outbound references.",
-  "error.label": "Error"
+  "state.cut": "({length} bytes in the record, cut)",
+  "state.partial": "The state is large. The window shows its start.",
+  "state.showAll": "Show all",
+  "error.noFolder": "No folder is open.",
+  "error.noStore": "{path} holds no ZOE store.",
+  "error.locked": "Another process holds the lock of this store. Stop the instance that uses it, then open the folder again.",
+  "error.needsRepair": "This store was not closed cleanly. Open it once with a writer, such as a ZOE instance, to repair it. Then open it in Loupe.",
+  "error.noRecord": "Oid {oid} has no record.",
+  "error.noObject": "{path}: {segment} leads to no object.",
+  "error.refused": "zoe-pickle refuses the record of oid {oid}: {message}",
+  "error.badId": "{text} is not an oid in ZODB form, such as 0x00.",
+  "error.other": "Unexpected error: {message}",
+  "error.shown": "Error: {message}"
 }

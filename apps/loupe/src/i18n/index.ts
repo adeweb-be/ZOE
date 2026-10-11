@@ -7,14 +7,16 @@ import catalog from "./en.json";
 /** The key of a UI string. */
 export type MessageKey = keyof typeof catalog;
 
+/** Tell if `key` is a key of the catalog. */
+export function isMessageKey(key: string): key is MessageKey {
+  return Object.hasOwn(catalog, key);
+}
+
 /**
  * Return the UI string `key`. Each `{name}` in the string becomes the
  * parameter `name`.
  */
-export function t(
-  key: MessageKey,
-  params: Record<string, string | number> = {},
-): string {
+export function t(key: MessageKey, params: Record<string, unknown> = {}): string {
   return catalog[key].replace(/\{(\w+)\}/g, (match, name: string) =>
     name in params ? String(params[name]) : match,
   );

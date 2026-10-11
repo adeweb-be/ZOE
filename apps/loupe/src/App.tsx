@@ -1,9 +1,10 @@
 // The window of Loupe: the folder bar, the object tree and the object
 // pane.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import {
+  describe,
   type FolderInfo,
   type LoupeObject,
   object,
@@ -25,24 +26,34 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   // Each open gets a new tree, with nothing loaded.
   const [opens, setOpens] = useState(0);
+  // The number of the last request. A reply to an older request comes
+  // too late, and the window drops it.
+  const latest = useRef(0);
 
-  /** Run an IPC call. Show its error, if any. */
-  const run = async (call: () => Promise<void>) => {
+  /** Run an IPC call. Show its error, unless a newer request started. */
+  const run = async (call: (current: () => boolean) => Promise<void>) => {
+    const ticket = ++latest.current;
+    const current = () => ticket === latest.current;
     setError(null);
     try {
-      await call();
+      await call(current);
     } catch (failure) {
-      setError(String(failure));
+      if (current()) {
+        setError(describe(failure));
+      }
     }
   };
 
   const open = (path: string) =>
-    run(async () => {
+    run(async (current) => {
       setFolder(null);
       setRootObject(null);
       setCurrent(null);
       const opened = await openFolder(path);
       const found = await root();
+      if (!current()) {
+        return;
+      }
       setFolder(opened);
       setOpens((count) => count + 1);
       setRootObject(found);
@@ -50,23 +61,32 @@ export function App() {
       setObjectPath("");
     });
 
-  const browse = () =>
-    run(async () => {
+  const browse = async () => {
+    try {
       const picked = await pickFolder();
       if (picked !== null) {
         setFolderPath(picked);
         await open(picked);
       }
-    });
+    } catch (failure) {
+      setError(describe(failure));
+    }
+  };
 
   const show = (oid: string) =>
-    run(async () => {
-      setCurrent(await object(oid));
+    run(async (current) => {
+      const found = await object(oid);
+      if (current()) {
+        setCurrent(found);
+      }
     });
 
   const go = (path: string) =>
-    run(async () => {
-      setCurrent(await resolve(path));
+    run(async (current) => {
+      const found = await resolve(path);
+      if (current()) {
+        setCurrent(found);
+      }
     });
 
   return (
@@ -105,7 +125,7 @@ export function App() {
       </header>
       {error && (
         <p className="error" role="alert">
-          {t("error.label")}: {error}
+          {t("error.shown", { message: error })}
         </p>
       )}
       {rootObject ? (
@@ -115,7 +135,7 @@ export function App() {
             root={rootObject}
             selected={current?.oid ?? null}
             onSelect={(oid) => void show(oid)}
-            onError={setError}
+            onError={(failure) => setError(describe(failure))}
           />
           <ObjectPane
             object={current}

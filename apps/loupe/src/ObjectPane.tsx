@@ -1,9 +1,15 @@
 // The object pane: the path bar, then the class, the oid, the serial,
 // the size, the decoded state and the outbound references of one object.
 
+import { useMemo, useState } from "react";
+
 import type { LoupeObject } from "./api";
 import { referenceClass } from "./api";
+import { formatState } from "./format";
 import { t } from "./i18n";
+
+/** The most characters of state that the pane shows before "Show all". */
+const STATE_LIMIT = 200_000;
 
 interface Props {
   object: LoupeObject | null;
@@ -20,6 +26,14 @@ export function ObjectPane({
   onGo,
   onSelect,
 }: Props) {
+  // The object whose whole state shows. Another object shows its start.
+  const [shownWhole, setShownWhole] = useState<LoupeObject | null>(null);
+  const state = useMemo(
+    () =>
+      object &&
+      formatState(object.state, shownWhole === object ? Infinity : STATE_LIMIT),
+    [object, shownWhole],
+  );
   return (
     <section className="pane">
       <label className="path">
@@ -59,8 +73,16 @@ export function ObjectPane({
             </p>
           )}
           <pre className="state" data-testid="object-state">
-            {JSON.stringify(object.state, null, 2)}
+            {state?.text}
           </pre>
+          {state && !state.complete && (
+            <p>
+              {t("state.partial")}{" "}
+              <button type="button" onClick={() => setShownWhole(object)}>
+                {t("state.showAll")}
+              </button>
+            </p>
+          )}
           <h2>{t("object.references")}</h2>
           {object.references.length === 0 ? (
             <p>{t("object.noReferences")}</p>

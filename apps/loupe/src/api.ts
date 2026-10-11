@@ -3,6 +3,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { isMessageKey, t } from "./i18n";
+
 /** An outbound reference: the oid and a JSON pointer into the state. */
 export interface Reference {
   oid: string;
@@ -59,4 +61,19 @@ export function referenceClass(state: unknown, at: string): string | null {
     return typeof name === "string" ? name : null;
   }
   return null;
+}
+
+/**
+ * Return the UI string of an error of an IPC call. The Rust side gives
+ * `{ kind, ...parameters }`, and the catalog has the key `error.<kind>`.
+ */
+export function describe(failure: unknown): string {
+  if (failure !== null && typeof failure === "object" && "kind" in failure) {
+    const params = failure as Record<string, unknown>;
+    const key = `error.${String(params.kind)}`;
+    if (isMessageKey(key)) {
+      return t(key, params);
+    }
+  }
+  return t("error.other", { message: String(failure) });
 }

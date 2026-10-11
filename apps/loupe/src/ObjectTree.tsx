@@ -24,7 +24,7 @@ interface Props {
   root: LoupeObject;
   selected: string | null;
   onSelect: (oid: string) => void;
-  onError: (message: string) => void;
+  onError: (failure: unknown) => void;
 }
 
 export function ObjectTree({ root, selected, onSelect, onError }: Props) {
@@ -69,23 +69,27 @@ export function ObjectTree({ root, selected, onSelect, onError }: Props) {
     overscan: 12,
   });
 
+  // The updates start from the current sets, so that a row that opens
+  // while another row loads keeps the other row open.
   const toggle = async (row: Row) => {
-    const next = new Set(expanded);
-    if (next.has(row.key)) {
-      next.delete(row.key);
-    } else {
-      next.add(row.key);
-      if (!loaded.has(row.oid)) {
-        try {
-          const found = await object(row.oid);
-          setLoaded((current) => new Map(current).set(row.oid, found));
-        } catch (error) {
-          onError(String(error));
-          return;
-        }
+    if (expanded.has(row.key)) {
+      setExpanded((current) => {
+        const next = new Set(current);
+        next.delete(row.key);
+        return next;
+      });
+      return;
+    }
+    if (!loaded.has(row.oid)) {
+      try {
+        const found = await object(row.oid);
+        setLoaded((current) => new Map(current).set(row.oid, found));
+      } catch (failure) {
+        onError(failure);
+        return;
       }
     }
-    setExpanded(next);
+    setExpanded((current) => new Set(current).add(row.key));
   };
 
   return (
