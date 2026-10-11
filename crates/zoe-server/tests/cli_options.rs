@@ -91,3 +91,38 @@ fn a_source_that_is_not_a_data_fs_creates_no_store() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run `zoe` with `args` and a stdout whose reader is gone.
+fn run_with_closed_stdout(args: &[&str]) -> Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    zoe(args, &[]).stdout(writer).output().unwrap()
+}
+
+#[test]
+fn a_reader_that_closes_stdout_does_not_fail_the_command() {
+    let dir = fresh_dir("closed-stdout");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zoe-convert/tests/data-fs");
+    let (data_fs, blobs) = (fixture.join("Data.fs"), fixture.join("blobs-bushy"));
+    let store = dir.join("zoe");
+    let path = store.to_str().unwrap();
+    let convert = [
+        "convert",
+        "--from-data-fs",
+        data_fs.to_str().unwrap(),
+        "--data-fs-blob-dir",
+        blobs.to_str().unwrap(),
+        "--path",
+        path,
+    ];
+    let output = run_with_closed_stdout(&convert);
+    assert_exit(&output, 0, "convert with a closed stdout");
+    let last = Store::open(&store).unwrap().last_transaction();
+    assert_ne!(last, zoe_core::Tid::ZERO, "the conversion copied nothing");
+
+    let output = run_with_closed_stdout(&["pack", "--path", path, "--days", "7"]);
+    assert_exit(&output, 0, "pack with a closed stdout");
+    let output = run_with_closed_stdout(&["--help"]);
+    assert_exit(&output, 0, "help with a closed stdout");
+    let _ = std::fs::remove_dir_all(&dir);
+}

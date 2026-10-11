@@ -64,7 +64,7 @@ pub(super) fn run(args: &ConvertArgs, out: &mut dyn Write) -> Result<(), Failure
         (Some(data_fs), None, _) => from_data_fs(data_fs, blob_dir, &args.path, out),
         (None, Some(data_fs), Some(blob_dir)) => to_data_fs(&args.path, data_fs, blob_dir, out),
         // The parser refuses these cases. This arm keeps the match whole.
-        _ => Err(Failure(
+        _ => Err(Failure::Message(
             "give --from-data-fs, or --to-data-fs with --data-fs-blob-dir".to_owned(),
         )),
     }
@@ -84,15 +84,19 @@ fn from_data_fs(
     let report = zoe_convert::from_datafs(data_fs, blob_dir, &store)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("{} into the store {}", data_fs.display(), path.display());
-    write_report(out, &title, &report)?;
-    verified(&report)
+    // A conversion that does not verify fails, also when the report does
+    // not go out.
+    let written = write_report(out, &title, &report);
+    verified(&report)?;
+    Ok(written?)
 }
 
 /// Check that `data_fs` is a regular file that starts with the magic of a
 /// FileStorage file. The reader of `zoe-convert` checks this too, but
 /// only after the open of the store.
 fn check_data_fs(data_fs: &Path) -> Result<(), Failure> {
-    let failure = |what: &dyn std::fmt::Display| Failure(format!("{}: {what}", data_fs.display()));
+    let failure =
+        |what: &dyn std::fmt::Display| Failure::Message(format!("{}: {what}", data_fs.display()));
     // A FIFO is not a regular file. Its open would wait for a writer.
     let metadata = std::fs::metadata(data_fs).map_err(|e| failure(&e))?;
     if !metadata.is_file() {
@@ -124,8 +128,11 @@ fn to_data_fs(
     let report =
         zoe_convert::to_datafs(&store, data_fs, blob_dir).map_err(|e| convert_failure(path, e))?;
     let title = format!("the store {} into {}", path.display(), data_fs.display());
-    write_report(out, &title, &report)?;
-    verified(&report)
+    // A conversion that does not verify fails, also when the report does
+    // not go out.
+    let written = write_report(out, &title, &report);
+    verified(&report)?;
+    Ok(written?)
 }
 
 /// Return the failure of a conversion with the store in `path`. A
@@ -140,9 +147,9 @@ fn convert_failure(path: &Path, error: zoe_convert::Error) -> Failure {
                 message.push_str("\n  ");
                 message.push_str(problem);
             }
-            Failure(message)
+            Failure::Message(message)
         }
-        e => Failure(e.to_string()),
+        e => Failure::Message(e.to_string()),
     }
 }
 
@@ -167,7 +174,7 @@ fn verified(report: &Report) -> Result<(), Failure> {
     if report.problems.is_empty() {
         Ok(())
     } else {
-        Err(Failure(
+        Err(Failure::Message(
             "the conversion does not verify: the report lists the problems".to_owned(),
         ))
     }

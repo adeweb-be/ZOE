@@ -61,24 +61,37 @@ enum Command {
 /// Why a subcommand failed. The command writes it to stderr and exits with
 /// [`FAILURE`].
 #[derive(Debug)]
-struct Failure(String);
+enum Failure {
+    /// The work failed, or a conversion does not verify.
+    Message(String),
+    /// The command cannot write its report.
+    Report(io::Error),
+}
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::Report(error) => write!(f, "cannot write the report: {error}"),
+        }
     }
 }
 
-/// A report that the command cannot write is a failure.
 impl From<io::Error> for Failure {
     fn from(error: io::Error) -> Self {
-        Self(format!("cannot write the report: {error}"))
+        Self::Report(error)
     }
 }
 
 /// Return the failure of the store in `path`.
 fn store_failure(path: &Path, error: ZoeError) -> Failure {
-    Failure(format!("{}: {error}", path.display()))
+    Failure::Message(format!("{}: {error}", path.display()))
+}
+
+/// Tell if `error` comes from a reader that closed its end of the output,
+/// as `head` does.
+fn closed_by_reader(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::BrokenPipe
 }
 
 /// Run the `zoe` command with `args`, the program name first, and return
@@ -103,7 +116,10 @@ fn usage(error: &clap::Error) -> i32 {
         io::stdout().flush()?;
         io::stderr().flush()
     });
-    if printed.is_ok() { code } else { FAILURE }
+    match printed {
+        Err(error) if !closed_by_reader(&error) => FAILURE,
+        _ => code,
+    }
 }
 
 /// Run the subcommand of `cli` with the time of `clock`. Write the report
@@ -118,6 +134,9 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
     let flushed = out.flush().map_err(Failure::from);
     match result.and(flushed) {
         Ok(()) => SUCCESS,
+        // The work is done when the report goes out. So a reader that
+        // stops reading does not fail the command.
+        Err(Failure::Report(error)) if closed_by_reader(&error) => SUCCESS,
         Err(failure) => {
             let mut stderr = io::stderr().lock();
             let _ = writeln!(stderr, "zoe {name}: {failure}");

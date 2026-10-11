@@ -96,7 +96,7 @@ fn days_ago(now: SystemTime, days: u64) -> Tid {
 /// store fails, and the call creates nothing.
 fn open_existing(path: &Path) -> Result<Store, Failure> {
     if !path.join(DATABASE).is_file() {
-        return Err(Failure(format!("no store in {}", path.display())));
+        return Err(Failure::Message(format!("no store in {}", path.display())));
     }
     Store::open(path).map_err(|e| store_failure(path, e))
 }
