@@ -11,6 +11,7 @@
 //! reservation creates it. Until then it reads as a store without blob
 //! records or without sequences.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
@@ -21,8 +22,8 @@ use redb::{
 };
 
 use crate::backend::{
-    Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnRecords, TxnStatus, WriteTxn,
+    Backend, BlobRecord, Bytes, NewRecord, PackStats, Record, RecordEncoding, RecordMeta, TxnIter,
+    TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
@@ -292,6 +293,26 @@ impl Backend for RedbBackend {
             }
             None => Ok(None),
         }
+    }
+
+    fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
+        // One read transaction serves every oid.
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        oids.map(|oid| {
+            let start = format::record_key(oid, Tid::ZERO);
+            let end = format::record_key(oid, Tid::MAX);
+            let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
+            match range.next_back() {
+                Some(entry) => {
+                    let (key, value) = entry.map_err(backend)?;
+                    inside(oid, key.value(), start..end)?;
+                    Self::record(oid, key.value(), value.value()).map(Some)
+                }
+                None => Ok(None),
+            }
+        })
+        .collect()
     }
 
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
@@ -678,22 +699,35 @@ struct RedbWrite<'a> {
 
 impl WriteTxn for RedbWrite<'_> {
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()> {
-        let key = format::record_key(oid, tid);
-        let frame = format::encode_frame_with(
-            KeySpace::Records,
-            &key,
-            format::MAIN_BRANCH,
-            prev,
-            data,
-            self.compression,
-        );
+        let data = Cow::Borrowed(data);
+        self.put_records(tid, &mut std::iter::once(Ok((oid, prev, data))))
+    }
+
+    fn put_records(
+        &mut self,
+        tid: Tid,
+        new: &mut dyn Iterator<Item = Result<NewRecord<'_>>>,
+    ) -> Result<()> {
+        // The two tables stay open for all the records of the call.
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
-        records.insert(&key, frame.as_slice()).map_err(backend)?;
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
-        index
-            .insert(&format::txn_oid_key(tid, oid), ())
-            .map_err(backend)?;
-        self.max_oid = self.max_oid.max(Some(oid));
+        for record in new {
+            let (oid, prev, data) = record?;
+            let key = format::record_key(oid, tid);
+            let frame = format::encode_frame_with(
+                KeySpace::Records,
+                &key,
+                format::MAIN_BRANCH,
+                prev,
+                &data,
+                self.compression,
+            );
+            records.insert(&key, frame.as_slice()).map_err(backend)?;
+            index
+                .insert(&format::txn_oid_key(tid, oid), ())
+                .map_err(backend)?;
+            self.max_oid = self.max_oid.max(Some(oid));
+        }
         Ok(())
     }
 
@@ -940,6 +974,43 @@ mod tests {
         let mut write = backend.begin_write().unwrap();
         write.put_record(oid, tid, Tid::ZERO, data).unwrap();
         write.commit().unwrap();
+    }
+
+    #[test]
+    fn load_current_reads_each_oid_as_load_before_does() {
+        let backend = empty();
+        commit_record(&backend, Oid(1), Tid(10), b"a");
+        commit_record(&backend, Oid(1), Tid(20), &compressible());
+        commit_record(&backend, Oid(3), Tid(30), b"c");
+        let oids = [Oid(3), Oid(2), Oid(1)];
+        let current = backend.load_current(&mut oids.into_iter()).unwrap();
+        let expected: Vec<_> = oids
+            .iter()
+            .map(|&oid| backend.load_before(oid, Tid::MAX).unwrap())
+            .collect();
+        assert_eq!(current, expected);
+        assert_eq!(current[2].as_ref().unwrap().data, compressible());
+    }
+
+    #[test]
+    fn put_records_writes_each_record_and_its_index_key() {
+        let backend = empty();
+        let mut write = backend.begin_write().unwrap();
+        let new = [(Oid(1), Tid::ZERO, b"a"), (Oid(2), Tid(5), b"b")];
+        let mut records = new
+            .iter()
+            .map(|&(oid, prev, data)| Ok((oid, prev, Cow::Borrowed(&data[..]))));
+        write.put_records(Tid(10), &mut records).unwrap();
+        write.commit().unwrap();
+        for (oid, prev, data) in new {
+            let record = backend.load_before(oid, Tid::MAX).unwrap().unwrap();
+            assert_eq!(
+                (record.tid, record.prev, &record.data[..]),
+                (Tid(10), prev, &data[..])
+            );
+        }
+        let oids = backend.txn_oids(Tid(10), Tid(11)).unwrap();
+        assert_eq!(oids[&Tid(10)], vec![Oid(1), Oid(2)]);
     }
 
     #[test]

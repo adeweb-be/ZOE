@@ -26,8 +26,8 @@ mod types;
 pub mod vfs;
 
 pub use backend::{
-    Backend, BlobRecord, Bytes, PackStats, Record, RecordEncoding, RecordMeta, TxnIter, TxnMeta,
-    TxnRecords, TxnStatus, WriteTxn,
+    Backend, BlobRecord, Bytes, NewRecord, PackStats, Record, RecordEncoding, RecordMeta, TxnIter,
+    TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, timestamp};

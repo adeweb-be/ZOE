@@ -220,9 +220,8 @@ fn write(store: &Store, members: &mut [(Member, Result<Finished>)]) -> Result<Ve
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
         // A spilled pickle is read back here, one at a time.
-        for record in member.staged.records() {
-            let (oid, serial, data) = record?;
-            write.put_record(oid, tid, serial, &data)?;
+        write.put_records(tid, &mut member.staged.records())?;
+        for (oid, _) in member.staged.iter() {
             if let Some(blob) = member.blobs.get(&oid) {
                 write.put_blob(oid, tid, blob.record())?;
             }
