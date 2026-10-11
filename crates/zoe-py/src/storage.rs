@@ -74,6 +74,23 @@ impl Entry {
         }
     }
 
+    /// Call `f` with the transaction of the core, as `with` does, if no
+    /// other call uses it now. Return `None` when another call uses it.
+    fn try_with<T>(
+        &self,
+        f: impl FnOnce(&mut SharedTxn) -> Result<T, Failure>,
+    ) -> Option<Result<T, Failure>> {
+        let mut txn = match self.txn.try_lock() {
+            Ok(txn) => txn,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(match txn.as_mut() {
+            Some(txn) => f(txn),
+            None => Err(ZoeError::Protocol("the transaction is finished or aborted").into()),
+        })
+    }
+
     /// Take the transaction of the core out of the entry.
     fn take(&self) -> Option<SharedTxn> {
         self.lock().take()
@@ -541,8 +558,16 @@ impl Storage {
         }
         let oid = Oid(u64_of(oid)?);
         let serial = serial_of(serial)?;
-        py.detach(|| entry.with(|txn| Ok(txn.store(oid, serial, data)?)))
-            .map_err(|failure| failure.into_py(py))
+        let stage = |txn: &mut SharedTxn| Ok(txn.store(oid, serial, data)?);
+        // Staging is short: it does not wait and does not sync. So it keeps
+        // the GIL when no other call uses the transaction. A detach at each
+        // store would give the GIL to another thread at each object of a
+        // commit.
+        let staged = match entry.try_with(stage) {
+            Some(staged) => staged,
+            None => py.detach(|| entry.with(stage)),
+        };
+        staged.map_err(|failure| failure.into_py(py))
     }
 
     /// Declare that `transaction` read `oid` at `serial` and depends on it.
