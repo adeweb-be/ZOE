@@ -47,7 +47,7 @@ persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c5495
 # The fork of zodbpickle that the workspace in python/ uses.
 zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
 # The fork of BTrees that the workspace in python/ uses.
-BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "fb36949ed6b53e289f799a45a06580c9e2cd7e3e" }
 
 [tool.uv.build-backend]
 module-name = "shootout"

@@ -36,7 +36,7 @@ zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1
 # Its C extensions declare that they can run without the GIL, so that a
 # ZODB application that uses BTrees keeps the GIL off on 3.14t. The pickled
 # states and the conflict-resolution results do not change.
-BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "fb36949ed6b53e289f799a45a06580c9e2cd7e3e" }
 
 [tool.uv.workspace]
 members = ["zoedb"]
