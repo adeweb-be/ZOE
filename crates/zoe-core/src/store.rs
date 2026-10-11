@@ -554,6 +554,13 @@ mod tests {
         fn sync(&self) -> Result<()> {
             self.inner.sync()
         }
+
+        fn sequence_end(&self, name: &str) -> Result<Option<u64>> {
+            if self.faults.load.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.sequence_end(name)
+        }
     }
 
     /// Open a store whose backend fails when a test turns a fault on.
