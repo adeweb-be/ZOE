@@ -102,8 +102,8 @@ impl Failure {
 /// A record that fails its checksum stops the pack with `CorruptRecord`.
 /// A record or a row that the pack cannot read stops it with `Format`.
 /// Both raise `StorageSystemError`. The text starts with "pack stopped"
-/// and gives the text of the core, which names the record. Other errors
-/// map as for every call.
+/// and gives the text of the core, which names the record or the row.
+/// Other errors map as for every call.
 pub(crate) fn pack_failure(py: Python<'_>, error: ZoeError) -> PyErr {
     let text = match &error {
         ZoeError::CorruptRecord { .. } => format!("pack stopped: {error}"),
