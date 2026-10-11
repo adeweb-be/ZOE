@@ -24,6 +24,15 @@ from ZODB.tests import StorageTestBase
 import zoe
 
 
+def _default_db(*args, **kw):
+    """Open a database on the default storage.
+
+    `ZODB.MappingStorage.DB` runs this code in its module, where `ZODB` is
+    the package of ZODB.
+    """
+    return ZODB.DB(None, *args, **kw)
+
+
 class StorageLayer:
     """A layer that makes a `zoe.Storage` the default storage of ZODB.
 
@@ -65,12 +74,11 @@ class StorageLayer:
                 storage = layer.open_storage()
             init(db, storage, *args, **kw)
 
-        def DB(*args, **kw):
-            return ZODB.DB(layer.open_storage(), *args, **kw)
-
         self._patch(ZODB.DB, "__init__", __init__)
-        self._patch(ZODB.MappingStorage, "DB", DB)
-        self._patch(ZODB.tests.util, "DB", DB)
+        # A module or a doctest can bind the function of ZODB, as
+        # `from ZODB.tests.util import DB` does. So the function itself
+        # gets the code of `_default_db`.
+        self._patch(ZODB.MappingStorage.DB, "__code__", _default_db.__code__)
 
     def testTearDown(self):
         # A test can leave a connection open, and a later test can commit

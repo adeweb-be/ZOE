@@ -1,10 +1,13 @@
 """Unit tests of `zoe.testing`."""
 
+import importlib
 import os
 
 import pytest
 import transaction
 import ZODB
+import ZODB.MappingStorage
+from test_zodb_suites import FULL, walk
 from ZODB.POSException import ReadOnlyError, StorageError
 from ZODB.tests.MinPO import MinPO
 from ZODB.tests.StorageTestBase import zodb_unpickle
@@ -57,6 +60,44 @@ def test_each_database_of_a_test_has_a_new_store():
         assert all(name.startswith(real + os.sep) for name in names)
     finally:
         layer.tearDown()
+
+
+def bindings(value):
+    """Yield each name of the FULL modules and of their doctests bound to value."""
+    for name in FULL:
+        module = importlib.import_module(f"ZODB.tests.{name}")
+        for key, item in vars(module).items():
+            if item is value:
+                yield f"{module.__name__}.{key}"
+        if hasattr(module, "test_suite"):
+            for test, _ in walk(module.test_suite()):
+                globs = getattr(getattr(test, "_dt_test", None), "globs", {})
+                for key, item in globs.items():
+                    if item is value:
+                        yield f"{test.id()}: {key}"
+
+
+def test_no_module_of_full_keeps_the_function_of_zodb():
+    original = ZODB.MappingStorage.DB
+    names = list(bindings(original))
+    # testBroken binds the function at import, and its doctests copy it.
+    assert "ZODB.tests.testBroken.DB" in names
+    assert "ZODB.tests.testBroken.test_integration: DB" in names
+    layer = zoe.testing.STORAGE_LAYER
+    layer.setUp()
+    try:
+        layer.testSetUp()
+        try:
+            db = original()
+            assert isinstance(db.storage, zoe.Storage)
+            db.close()
+        finally:
+            layer.testTearDown()
+    finally:
+        layer.tearDown()
+    db = original()
+    assert not isinstance(db.storage, zoe.Storage)
+    db.close()
 
 
 class TestStorageTestCase(zoe.testing.StorageTestCase):
