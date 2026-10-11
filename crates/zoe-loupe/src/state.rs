@@ -51,7 +51,10 @@
 //!   longer pointer gives way to the pointer of a value that holds the
 //!   reference, at most the root, `""`.
 //! - Each get of one value at one depth converts that value once. The
-//!   other gets reuse the JSON, and pay for it from the budgets.
+//!   other gets reuse the JSON, and pay for it from the budgets. The
+//!   reused JSON holds at most `CACHE_BUDGET` values in all. A JSON with a
+//!   cycle marker for a value outside it is not reused, because the
+//!   marker is wrong in another place.
 
 use std::collections::HashMap;
 
@@ -87,21 +90,16 @@ const MAX_POINTER: usize = 1 << 10;
 /// The most bytes that the pointers of the references of one state take.
 const POINTER_BUDGET: usize = 1 << 24;
 
+/// The most JSON values that the reused JSON of the gets holds in all.
+/// A chain of gets would else keep a copy of its values at each link.
+const CACHE_BUDGET: usize = 1 << 18;
+
 /// The largest int that a JSON number holds without a loss in the window.
 const MAX_SAFE_INT: i128 = (1 << 53) - 1;
 
 /// Return the state of `tree` as JSON, and its outbound references.
 pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
-    let mut converter = Converter {
-        resolver: tree.resolver(),
-        budget: VALUE_BUDGET,
-        text_budget: TEXT_BUDGET,
-        pointer_budget: POINTER_BUDGET,
-        ancestors: Vec::new(),
-        gets: 0,
-        expanded: HashMap::new(),
-        references: Vec::new(),
-    };
+    let mut converter = Converter::new(tree);
     let mut at = String::new();
     let state = converter.value(tree.state(), &mut at, 0);
     (state, converter.references)
@@ -262,10 +260,30 @@ struct Converter<'t> {
     /// The JSON of each value that a get expanded, by the address of the
     /// value and the depth.
     expanded: HashMap<(usize, usize), Expanded>,
+    /// The JSON values that `expanded` holds in all.
+    cached: usize,
+    /// The lowest index in `ancestors` that a cycle marker named since the
+    /// start of the innermost expansion. `usize::MAX` for none.
+    lowest_cycle: usize,
     references: Vec<Reference>,
 }
 
 impl<'t> Converter<'t> {
+    fn new(tree: &'t Tree) -> Self {
+        Converter {
+            resolver: tree.resolver(),
+            budget: VALUE_BUDGET,
+            text_budget: TEXT_BUDGET,
+            pointer_budget: POINTER_BUDGET,
+            ancestors: Vec::new(),
+            gets: 0,
+            expanded: HashMap::new(),
+            cached: 0,
+            lowest_cycle: usize::MAX,
+            references: Vec::new(),
+        }
+    }
+
     /// Return `node` as JSON. `at` is the JSON pointer of the value.
     fn value(&mut self, node: &'t Node, at: &mut String, depth: usize) -> Value {
         let node = node.value();
@@ -408,7 +426,8 @@ impl<'t> Converter<'t> {
     /// it.
     fn expand(&mut self, value: &'t Node, index: u32, at: &mut String, depth: usize) -> Value {
         let address = std::ptr::from_ref(value.value()).addr();
-        if self.ancestors.contains(&address) {
+        if let Some(ancestor) = self.ancestors.iter().position(|&a| a == address) {
+            self.lowest_cycle = self.lowest_cycle.min(ancestor);
             return json!({ "$cycle": index });
         }
         if let Some(earlier) = self.expanded.get(&(address, depth))
@@ -420,17 +439,27 @@ impl<'t> Converter<'t> {
             return earlier.value.clone();
         }
         let (budget, text_budget) = (self.budget, self.text_budget);
+        // The value goes into `ancestors` at this index.
+        let base = self.ancestors.len();
+        let outer = std::mem::replace(&mut self.lowest_cycle, usize::MAX);
         self.gets += 1;
         let json = self.value(value, at, depth);
         self.gets -= 1;
-        self.expanded.insert(
-            (address, depth),
-            Expanded {
-                value: json.clone(),
-                values: budget - self.budget,
-                text: text_budget - self.text_budget,
-            },
-        );
+        let lowest = self.lowest_cycle;
+        self.lowest_cycle = outer.min(lowest);
+        let values = budget - self.budget;
+        // A marker for a value outside this one is wrong in another place.
+        if lowest >= base && self.cached + values <= CACHE_BUDGET {
+            self.cached += values;
+            self.expanded.insert(
+                (address, depth),
+                Expanded {
+                    value: json.clone(),
+                    values,
+                    text: text_budget - self.text_budget,
+                },
+            );
+        }
         json
     }
 
@@ -789,6 +818,45 @@ mod tests {
         for reference in &found {
             assert!(state.pointer(&reference.at).is_some(), "{}", reference.at);
         }
+    }
+
+    #[test]
+    fn a_cycle_marker_stays_in_its_cycle() {
+        // X = [V, W], V = [get X], W = [get V], and P = [[get V]] after X.
+        // In W, V holds a cycle marker for X. In P, V holds X itself.
+        let x = b"]q\x01(]q\x02(h\x01e](h\x02ee";
+        let p = b"](](h\x02ee";
+        let (state, _) = decode(&[&b"("[..], x, p, b"t"].concat());
+        assert_eq!(state[0][0], json!([{"$cycle": 1}]));
+        assert_eq!(state[0][1][0], json!([{"$cycle": 1}]));
+        let x_in_p = &state[1][0][0][0];
+        assert!(x_in_p.is_array(), "{x_in_p}");
+        assert_eq!(x_in_p[0], json!([{"$cycle": 1}]));
+    }
+
+    #[test]
+    fn the_reused_json_of_the_gets_stays_within_its_budget() {
+        // A list of 100,000 ints, then a chain of lists, each with a get of
+        // the list before it.
+        let mut state = b"(]q\x01(".to_vec();
+        state.extend(b"K\x01".repeat(100_000));
+        state.push(b'e');
+        for index in 2..12_u8 {
+            state.extend(b"]q");
+            state.push(index);
+            state.extend(b"(h");
+            state.push(index - 1);
+            state.push(b'e');
+        }
+        state.push(b't');
+        let record = [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], &state, b"."].concat();
+        let tree = zoe_pickle::decode_record(&record).unwrap();
+        let mut converter = Converter::new(&tree);
+        converter.value(tree.state(), &mut String::new(), 0);
+        let held: usize = converter.expanded.values().map(|e| e.values).sum();
+        assert_eq!(held, converter.cached);
+        assert!(converter.cached > 0);
+        assert!(converter.cached <= CACHE_BUDGET, "{}", converter.cached);
     }
 
     #[test]
