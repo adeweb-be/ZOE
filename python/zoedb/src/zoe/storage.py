@@ -5,8 +5,6 @@ parts that need ZODB: the interface declaration, the history records, the
 conflict resolution and the `WrongThread` exception.
 """
 
-import contextlib
-
 import zope.interface
 from ZODB.ConflictResolution import ConflictResolvingStorage
 from ZODB.interfaces import IStorage
@@ -57,34 +55,42 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         committed serial and votes again. Return the oids of the resolved
         objects.
 
-        An object that does not resolve raises `ConflictError`, and the vote
-        releases the locks. The error names the class of the object. A
-        read-current object is never resolved: it raises `ReadConflictError`.
+        An object that does not resolve raises `ConflictError`. The error
+        names the class of the object. A read-current object is never
+        resolved: it raises `ReadConflictError`. A failed first vote
+        releases the locks. An error during the resolution or the second
+        vote aborts the transaction, and that releases the locks.
         """
         conflicts = self._vote_resolving(transaction, self._crs_untransform_record_data)
         if not conflicts:
             return []
         try:
             for oid, committed, read, committed_data, data in conflicts:
-                try:
-                    data = self.tryToResolveConflict(
-                        oid, committed, read, data, committed_data
-                    )
-                except ConflictError:
-                    raise
-                except Exception:
-                    # ZODB cannot read the class name from the pickle, so
-                    # the error comes without it.
-                    raise ConflictError(oid=oid, serials=(committed, read)) from None
+                data = self._resolve(oid, committed, read, data, committed_data)
                 self.store(oid, committed, data, "", transaction)
+            super().tpc_vote(transaction)
         except BaseException:
-            # An oid that did not resolve is still stale. So the second vote
-            # fails, and it releases the locks.
-            with contextlib.suppress(Exception):
-                super().tpc_vote(transaction)
+            # Release the locks on every error, also on an error that comes
+            # after the last store. ZODB aborts the transaction after a
+            # failed vote, and a second abort does nothing.
+            self.tpc_abort(transaction)
             raise
-        super().tpc_vote(transaction)
         return [conflict[0] for conflict in conflicts]
+
+    def _resolve(self, oid, committed, read, data, committed_data):
+        """Return the resolved pickle of `oid`, or raise `ConflictError`.
+
+        `tryToResolveConflict` merges the committed pickle and `data`, the
+        pickle of the transaction, from the pickle at the serial `read`. If
+        ZODB cannot read the class name from `data`, the error comes without
+        it.
+        """
+        try:
+            return self.tryToResolveConflict(oid, committed, read, data, committed_data)
+        except ConflictError:
+            raise
+        except Exception:
+            raise ConflictError(oid=oid, serials=(committed, read)) from None
 
     def history(self, oid, size=1):
         """Return at most `size` records of `oid`, newest first."""
