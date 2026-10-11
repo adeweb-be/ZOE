@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::iter::Peekable;
 use std::sync::Arc;
 
 use crate::backend::{Backend, Record, TxnMeta};
@@ -88,7 +89,7 @@ pub struct Transactions {
     backend: Arc<dyn Backend>,
     /// The directory of the store. It holds the single-writer lock.
     _dir: Arc<dyn Any + Send + Sync>,
-    rows: std::vec::IntoIter<Result<TxnMeta>>,
+    rows: Peekable<std::vec::IntoIter<Result<TxnMeta>>>,
     oids: BTreeMap<Tid, Vec<Oid>>,
 }
 
@@ -96,9 +97,28 @@ impl Iterator for Transactions {
     type Item = Result<TxnInfo>;
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
+        // Records of a tid before the next row, or after the last row, have
+        // no row. They come in tid order, as an error.
+        if let Some(&tid) = self.oids.keys().next() {
+            let no_row = match self.rows.peek() {
+                Some(Ok(row)) => tid < row.tid,
+                Some(Err(_)) => false,
+                None => true,
+            };
+            if no_row {
+                self.oids.remove(&tid);
+                return Some(Err(ZoeError::CorruptTxn { tid }));
+            }
+        }
         let row = match self.rows.next()? {
             Ok(row) => row,
-            Err(error) => return Some(Err(error)),
+            Err(error) => {
+                // The records of a corrupt row give no second error.
+                if let ZoeError::CorruptTxn { tid } = error {
+                    self.oids.remove(&tid);
+                }
+                return Some(Err(error));
+            }
         };
         let oids = self.oids.remove(&row.tid).unwrap_or_default();
         Some(self.txn_info(row, oids))
@@ -106,9 +126,13 @@ impl Iterator for Transactions {
 }
 
 impl Transactions {
-    /// Read the records of the transaction `row`.
+    /// Read the records of the transaction `row`. The records must match
+    /// the oid count of the row.
     fn txn_info(&self, row: TxnMeta, oids: Vec<Oid>) -> Result<TxnInfo> {
         let tid = row.tid;
+        if oids.len() as u64 != row.oid_count {
+            return Err(ZoeError::CorruptTxn { tid });
+        }
         let records = oids
             .into_iter()
             .map(|oid| {
@@ -189,24 +213,33 @@ impl Store {
     }
 
     /// Iterate over the transactions from `start` to `stop`, both included,
-    /// in tid order. `None` leaves a bound open.
+    /// in tid order. `None` leaves a bound open. Each transaction comes
+    /// with all of its records.
     ///
-    /// The iterator stops at the last tid at the time of this call. A
-    /// later transaction can commit while the iterator runs, so it is left
-    /// out. Each transaction comes with all of its records.
+    /// The iterator stops at the last tid at the time of this call. The
+    /// iterator leaves out a transaction that commits after this call.
+    ///
+    /// A transaction whose records do not match the oid count of its row
+    /// gives `CorruptTxn`. Records of a tid that has no row give
+    /// `CorruptTxn` too, but only when the range has a row.
     pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
-        let (rows, oids) = if start > stop {
-            (Vec::new(), BTreeMap::new())
+        let rows: Vec<_> = if start > stop {
+            Vec::new()
         } else {
-            let rows = self.backend.iter_txns(start, stop).collect();
-            (rows, self.backend.txn_oids(start, stop)?)
+            self.backend.iter_txns(start, stop).collect()
+        };
+        // A range with no row needs no scan of the records.
+        let oids = if rows.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.backend.txn_oids(start, stop)?
         };
         Ok(Transactions {
             backend: Arc::clone(&self.backend),
             _dir: Arc::clone(&self.dir),
-            rows: rows.into_iter(),
+            rows: rows.into_iter().peekable(),
             oids,
         })
     }
@@ -537,22 +570,83 @@ mod tests {
         assert_eq!(store.record_iternext(Some(Oid(u64::MAX))).unwrap(), None);
     }
 
-    /// Flip the last bit of the record of `oid` at `tid` in the store in
-    /// `vfs`. The store must be closed.
-    fn corrupt(vfs: &MemVfs, oid: Oid, tid: Tid) {
+    /// Give the `records` table of the closed store in `vfs` to `change`,
+    /// and commit the change.
+    fn change_records(vfs: &MemVfs, change: impl FnOnce(&mut redb::Table<&[u8; 16], &[u8]>)) {
         let records: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
         let db = redb::Builder::new()
             .create_with_backend(vfs.file("zoe.redb"))
             .unwrap();
         let txn = db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(records).unwrap();
+        change(&mut txn.open_table(records).unwrap());
+        txn.commit().unwrap();
+    }
+
+    /// Flip the last bit of the record of `oid` at `tid` in the closed
+    /// store in `vfs`.
+    fn corrupt(vfs: &MemVfs, oid: Oid, tid: Tid) {
+        change_records(vfs, |table| {
             let key = format::record_key(oid, tid);
             let mut frame = table.get(&key).unwrap().unwrap().value().to_vec();
             *frame.last_mut().unwrap() ^= 1;
             table.insert(&key, frame.as_slice()).unwrap();
-        }
-        txn.commit().unwrap();
+        });
+    }
+
+    /// Write a valid record of `oid` at `tid` that no transaction row
+    /// counts, in the closed store in `vfs`.
+    fn add_record(vfs: &MemVfs, oid: Oid, tid: Tid) {
+        change_records(vfs, |table| {
+            let key = format::record_key(oid, tid);
+            let frame = format::encode_frame(&key, format::MAIN_BRANCH, Tid::ZERO, b"x");
+            table.insert(&key, frame.as_slice()).unwrap();
+        });
+    }
+
+    /// Return the tid of each transaction of the iterator, or the tid of
+    /// its `CorruptTxn` error.
+    fn checked(store: &Store, stop: Option<u64>) -> Vec<std::result::Result<Tid, Tid>> {
+        store
+            .iterator(None, stop.map(Tid))
+            .unwrap()
+            .map(|txn| match txn {
+                Ok(txn) => Ok(txn.tid),
+                Err(ZoeError::CorruptTxn { tid }) => Err(tid),
+                Err(error) => panic!("{error:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_iterator_checks_the_records_against_the_rows() {
+        let vfs = MemVfs::new();
+        drop(three_records_in(&vfs));
+        // A second record for the transaction at 200, and records at 150
+        // and 250, where no transaction row is.
+        add_record(&vfs, Oid(2), Tid(200));
+        add_record(&vfs, Oid(2), Tid(150));
+        add_record(&vfs, Oid(3), Tid(250));
+        let store = Store::open_vfs(vfs).unwrap();
+
+        let (ok, err) = (Ok::<Tid, Tid>, Err::<Tid, Tid>);
+        assert_eq!(
+            checked(&store, None),
+            [
+                ok(Tid(100)),
+                err(Tid(150)),
+                err(Tid(200)),
+                err(Tid(250)),
+                ok(Tid(300))
+            ]
+        );
+        // Records after the last row of the range come last.
+        assert_eq!(
+            checked(&store, Some(260)),
+            [ok(Tid(100)), err(Tid(150)), err(Tid(200)), err(Tid(250))]
+        );
+        // A range with no row reads no record, so it finds no error.
+        let range = store.iterator(Some(Tid(140)), Some(Tid(160))).unwrap();
+        assert_eq!(range.count(), 0);
     }
 
     fn is_corrupt<T: std::fmt::Debug>(result: Result<T>, tid: u64) {
