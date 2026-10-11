@@ -1,11 +1,13 @@
 // The object pane: the path bar, then the class, the oid, the serial,
-// the size, the decoded state and the outbound references of one object.
+// the size, the decoded state, the outbound references and the history
+// of one object.
 
 import { useMemo, useState } from "react";
 
 import type { LoupeObject } from "./api";
 import { referenceClass } from "./api";
 import { formatState } from "./format";
+import { History } from "./History";
 import { t } from "./i18n";
 
 /** The most characters of state that the pane shows before "Show all". */
@@ -13,18 +15,25 @@ const STATE_LIMIT = 200_000;
 
 interface Props {
   object: LoupeObject | null;
+  /** The count of folder opens. A new open gets a new history. */
+  store: number;
   path: string;
   onPathChange: (path: string) => void;
   onGo: (path: string) => void;
   onSelect: (oid: string) => void;
+  onAsOf: (tid: string) => void;
+  onError: (failure: unknown) => void;
 }
 
 export function ObjectPane({
   object,
+  store,
   path,
   onPathChange,
   onGo,
   onSelect,
+  onAsOf,
+  onError,
 }: Props) {
   // The object whose whole state shows. Another object shows its start.
   const [shownWhole, setShownWhole] = useState<LoupeObject | null>(null);
@@ -104,6 +113,13 @@ export function ObjectPane({
               ))}
             </ul>
           )}
+          <History
+            key={`${store}:${object.oid}`}
+            oid={object.oid}
+            serial={object.serial}
+            onAsOf={onAsOf}
+            onError={onError}
+          />
         </>
       )}
     </section>

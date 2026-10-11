@@ -8,37 +8,39 @@
 //! - in a folder, through the item of its `_tree`, as in BTreeFolder2;
 //! - else through the attribute of that name, such as `__annotations__`.
 //!
-//! The value of each step must be a persistent reference.
+//! The value of each step must be a persistent reference. Each step reads
+//! the record of the next object as of the tid of the view.
 
 use zoe_core::Oid;
 use zoe_pickle::{Node, Resolver, Tree};
 
 use crate::state::{dict_entries, target};
 use crate::text::{self, IntValue, text};
-use crate::{Error, Folder, Result};
+use crate::{Error, Result, Snapshot};
 
 /// The most BTree nodes that one lookup reads. A damaged tree can hold a
 /// cycle, so the lookup stops after this count.
 const MAX_TREE_NODES: usize = 100_000;
 
-/// Return the oid that `path` leads to from the Zope application.
-pub(crate) fn resolve(folder: &Folder, path: &str) -> Result<Oid> {
+/// Return the oid that `path` leads to from the Zope application in the
+/// view `view`.
+pub(crate) fn resolve(view: &Snapshot<'_>, path: &str) -> Result<Oid> {
     let no_object = |segment: &str| Error::NoObject {
         path: path.to_owned(),
         segment: segment.to_owned(),
     };
-    let mut oid = step(folder, Oid(0), "Application")?.ok_or_else(|| no_object("Application"))?;
+    let mut oid = step(view, Oid(0), "Application")?.ok_or_else(|| no_object("Application"))?;
     for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        oid = step(folder, oid, segment)?.ok_or_else(|| no_object(segment))?;
+        oid = step(view, oid, segment)?.ok_or_else(|| no_object(segment))?;
     }
     Ok(oid)
 }
 
 /// Return the oid that `name` leads to from the object `oid`.
-fn step(folder: &Folder, oid: Oid, name: &str) -> Result<Option<Oid>> {
-    let tree = folder.tree(oid)?;
+fn step(view: &Snapshot<'_>, oid: Oid, name: &str) -> Result<Option<Oid>> {
+    let tree = view.tree(oid)?;
     if let Some(kind) = btree_kind(&tree) {
-        return btree_get(folder, oid, tree, kind, name);
+        return btree_get(view, oid, tree, kind, name);
     }
     let resolver = tree.resolver();
     let Some(state) = resolver.resolve(tree.state()) else {
@@ -49,9 +51,9 @@ fn step(folder: &Folder, oid: Oid, name: &str) -> Result<Option<Oid>> {
     }
     let items = attribute(&resolver, state, "_tree").and_then(|value| reference(&resolver, value));
     if let Some(items) = items {
-        let items_tree = folder.tree(items)?;
+        let items_tree = view.tree(items)?;
         if let Some(kind) = btree_kind(&items_tree)
-            && let Some(found) = btree_get(folder, items, items_tree, kind, name)?
+            && let Some(found) = btree_get(view, items, items_tree, kind, name)?
         {
             return Ok(Some(found));
         }
@@ -124,7 +126,7 @@ impl Key {
 /// state of a bucket is `((key, value, ...), next_bucket)`. An empty tree
 /// has no state.
 fn btree_get(
-    folder: &Folder,
+    view: &Snapshot<'_>,
     oid: Oid,
     tree: Tree,
     (kind, int_keys): (Kind, bool),
@@ -148,7 +150,7 @@ fn btree_get(
                 let Some(next) = pending.pop() else {
                     return Ok(None);
                 };
-                let tree = folder.tree(next)?;
+                let tree = view.tree(next)?;
                 match btree_kind(&tree) {
                     Some((kind, _)) => (tree, kind),
                     None => continue,
@@ -275,6 +277,7 @@ mod tests {
     use zoe_core::{Store, Tid};
 
     use super::*;
+    use crate::Folder;
 
     /// A record of the class `module.name` with the state pickle `state`.
     fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
@@ -345,10 +348,11 @@ mod tests {
     fn an_int_key_resolves_and_text_does_not() {
         let dir = int_tree_store();
         let folder = Folder::open(&dir).unwrap();
-        assert_eq!(resolve(&folder, "/ids/7").unwrap(), Oid(3));
+        let view = folder.as_of(folder.last_tid());
+        assert_eq!(resolve(&view, "/ids/7").unwrap(), Oid(3));
         for path in ["/ids/8", "/ids/item", "/ids/7x"] {
             assert!(
-                matches!(resolve(&folder, path), Err(Error::NoObject { .. })),
+                matches!(resolve(&view, path), Err(Error::NoObject { .. })),
                 "{path}"
             );
         }

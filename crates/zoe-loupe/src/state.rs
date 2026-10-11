@@ -44,8 +44,9 @@
 //!   cut shows its start and its size in the record: `{"$str": "<start>",
 //!   "length": n}`, `{"$str2": ..., "length": n}`, `{"$bytes": ...,
 //!   "length": n}`, `{"$opaque": ..., "pickle": ..., "length": n}`,
-//!   `{"$int": ..., "length": n}` or `{"$global": ..., "length": n}`. A
-//!   class name that is cut shows its start only.
+//!   `{"$int": ..., "length": n}`, `{"$global": ..., "length": n}` or
+//!   `{"$call": ..., "length": n, "args": ...}`. A class name that is cut
+//!   shows its start only.
 //! - A pointer of a reference has at most `MAX_POINTER` bytes, and the
 //!   pointers of one state at most `POINTER_BUDGET` bytes together. A
 //!   longer pointer gives way to the pointer of a value that holds the
@@ -85,10 +86,10 @@ const TEXT_BUDGET: usize = 1 << 24;
 const MAX_KEY: usize = 256;
 
 /// The longest pointer of a reference.
-const MAX_POINTER: usize = 1 << 10;
+pub(crate) const MAX_POINTER: usize = 1 << 10;
 
 /// The most bytes that the pointers of the references of one state take.
-const POINTER_BUDGET: usize = 1 << 24;
+pub(crate) const POINTER_BUDGET: usize = 1 << 24;
 
 /// The most JSON values that the reused JSON of the gets holds in all.
 /// A chain of gets would else keep a copy of its values at each link.
@@ -99,9 +100,15 @@ const MAX_SAFE_INT: i128 = (1 << 53) - 1;
 
 /// Return the state of `tree` as JSON, and its outbound references.
 pub(crate) fn state(tree: &Tree) -> (Value, Vec<Reference>) {
-    let mut converter = Converter::new(tree);
+    convert(&tree.resolver(), tree.state())
+}
+
+/// Return the state `root` of a tree as JSON, and its outbound references.
+/// `resolver` is the resolver of the tree.
+pub(crate) fn convert<'t>(resolver: &Resolver<'t>, root: &'t Node) -> (Value, Vec<Reference>) {
+    let mut converter = Converter::new(resolver);
     let mut at = String::new();
-    let state = converter.value(tree.state(), &mut at, 0);
+    let state = converter.value(root, &mut at, 0);
     (state, converter.references)
 }
 
@@ -189,7 +196,7 @@ pub(crate) fn dict_entries(node: &Node) -> Vec<&(Node, Node)> {
 }
 
 /// Add the segment `segment` to the JSON pointer `at`.
-fn push_segment(at: &mut String, segment: &str) {
+pub(crate) fn push_segment(at: &mut String, segment: &str) {
     at.push('/');
     for c in segment.chars() {
         match c {
@@ -244,8 +251,8 @@ struct Expanded {
     text: usize,
 }
 
-struct Converter<'t> {
-    resolver: Resolver<'t>,
+struct Converter<'r, 't> {
+    resolver: &'r Resolver<'t>,
     /// The JSON values that the state can still get.
     budget: usize,
     /// The JSON bytes of text that the state can still take.
@@ -268,10 +275,10 @@ struct Converter<'t> {
     references: Vec<Reference>,
 }
 
-impl<'t> Converter<'t> {
-    fn new(tree: &'t Tree) -> Self {
+impl<'r, 't> Converter<'r, 't> {
+    fn new(resolver: &'r Resolver<'t>) -> Self {
         Converter {
-            resolver: tree.resolver(),
+            resolver,
             budget: VALUE_BUDGET,
             text_budget: TEXT_BUDGET,
             pointer_budget: POINTER_BUDGET,
@@ -389,15 +396,23 @@ impl<'t> Converter<'t> {
             }
             Node::Persistent(pid) => self.reference(pid, at, depth),
             Node::Reduce(reduce) => {
-                let callable = match self.resolver.resolve(&reduce.callable) {
-                    Some(Node::Global(global)) => self.qualified(global).0,
-                    _ => String::new(),
+                let mut call = match self.resolver.resolve(&reduce.callable) {
+                    Some(Node::Global(global)) => {
+                        let (name, whole) = self.qualified(global);
+                        tagged(
+                            "$call",
+                            name,
+                            whole,
+                            global.module.len() + 1 + global.name.len(),
+                        )
+                    }
+                    _ => json!({ "$call": "" }),
                 };
                 let len = at.len();
                 push_segment(at, "args");
-                let args = self.value(&reduce.args, at, depth + 1);
+                call["args"] = self.value(&reduce.args, at, depth + 1);
                 at.truncate(len);
-                json!({ "$call": callable, "args": args })
+                call
             }
             Node::Get(get) => match self.resolver.resolve(node) {
                 None => json!({ "$memo": get.index }),
@@ -543,7 +558,7 @@ impl<'t> Converter<'t> {
         // decoded.
         let mut size = 0;
         for (key, _) in entries {
-            let len = text::text_len(&self.resolver, key)?;
+            let len = text::text_len(self.resolver, key)?;
             if len > MAX_KEY {
                 return None;
             }
@@ -554,7 +569,7 @@ impl<'t> Converter<'t> {
         }
         let keys: Vec<String> = entries
             .iter()
-            .map(|(key, _)| text::text(&self.resolver, key))
+            .map(|(key, _)| text::text(self.resolver, key))
             .collect::<Option<_>>()?;
         if keys
             .iter()
@@ -606,7 +621,7 @@ impl<'t> Converter<'t> {
     }
 
     fn reference(&mut self, pid: &'t Node, at: &mut String, depth: usize) -> Value {
-        let Some(target) = target(&self.resolver, pid) else {
+        let Some(target) = target(self.resolver, pid) else {
             let len = at.len();
             push_segment(at, "$persistent");
             let pid = self.value(pid, at, depth + 1);
@@ -640,7 +655,7 @@ impl<'t> Converter<'t> {
                 Node::Persistent(pid) => Some(pid),
                 _ => None,
             }) {
-                if let Some(target) = target(&self.resolver, pid).filter(|t| !t.weak) {
+                if let Some(target) = target(self.resolver, pid).filter(|t| !t.weak) {
                     let at = self.pointer(at);
                     self.references.push(Reference {
                         oid: target.oid,
@@ -851,7 +866,8 @@ mod tests {
         state.push(b't');
         let record = [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], &state, b"."].concat();
         let tree = zoe_pickle::decode_record(&record).unwrap();
-        let mut converter = Converter::new(&tree);
+        let resolver = tree.resolver();
+        let mut converter = Converter::new(&resolver);
         converter.value(tree.state(), &mut String::new(), 0);
         let held: usize = converter.expanded.values().map(|e| e.values).sum();
         assert_eq!(held, converter.cached);
@@ -898,6 +914,23 @@ mod tests {
         let full = items.iter().filter(|item| item.is_string()).count();
         assert_eq!(full, TEXT_BUDGET / MAX_TEXT);
         assert_eq!(items[gets], json!({"$str": "", "length": MAX_TEXT}));
+    }
+
+    #[test]
+    fn a_call_name_past_the_text_budget_shows_its_length() {
+        // Gets of one str of MAX_TEXT bytes spend the text budget. Then a
+        // set has no room for the name of its constructor.
+        let mut state = [&b"(X"[..], &(MAX_TEXT as u32).to_le_bytes()].concat();
+        state.extend(b"a".repeat(MAX_TEXT));
+        state.extend(b"q\x01");
+        state.extend(b"h\x01".repeat(TEXT_BUDGET / MAX_TEXT));
+        state.extend(b"cbuiltins\nset\n)\x85R");
+        state.push(b't');
+        let (state, _) = decode(&state);
+        let call = state.as_array().unwrap().last().unwrap();
+        assert_eq!(call, &json!({"$call": "", "length": 12, "args": [[]]}));
+        let (whole, _) = decode(b"cbuiltins\nset\n)\x85R");
+        assert_eq!(whole, json!({"$call": "builtins.set", "args": [[]]}));
     }
 
     #[test]
