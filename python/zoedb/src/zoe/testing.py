@@ -46,14 +46,13 @@ class StorageLayer:
         self._names = itertools.count()
 
     def tearDown(self):
-        # Close the stores that the tests left open. A second close does
-        # nothing.
+        # Abort the current transaction and remove the connections that the
+        # tests left open from the transaction manager. Then close the
+        # stores. A second close does nothing.
+        transaction.abort()
+        transaction.manager.clearSynchs()
         while self._storages:
             self._storages.pop().close()
-        # The connections that the tests left open use the closed stores.
-        # Remove them from the transaction manager, so that a later commit
-        # does not call them.
-        transaction.manager.clearSynchs()
         shutil.rmtree(self._directory, ignore_errors=True)
         self._directory = None
 
