@@ -77,11 +77,12 @@ def open_storage(settings):
     path = settings.get("path")
     if not path:
         raise ValueError(f"<zoe> needs path, or the {twin('path')} variable")
+    blob_dir = settings.get("blob-dir")
     return zoe.Storage(
-        path,
+        os.path.expanduser(path),
         read_only=settings.get("read-only", False),
         lock_timeout=settings.get("lock-timeout"),
-        blob_dir=settings.get("blob-dir") or None,
+        blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
     )
 
 

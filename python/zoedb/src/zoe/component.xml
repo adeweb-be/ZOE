@@ -19,13 +19,14 @@
     <key name="path" datatype="string">
       <description>
         The directory of the store. The storage creates it when it is
-        missing. The section or ZOE_PATH must give it.
+        missing. The section or ZOE_PATH must give it. A leading ~ is the
+        home directory.
       </description>
     </key>
     <key name="blob-dir" datatype="string">
       <description>
         The directory of the blob files. The default is the blobs
-        directory in path.
+        directory in path. A leading ~ is the home directory.
       </description>
     </key>
     <key name="backend" datatype="string">

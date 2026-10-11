@@ -2,8 +2,8 @@
 
 The acceptance test covers each key through the section, its twin and the
 URI. These tests cover the rest: the datatypes of the keys, which source
-wins, the empty values, the missing path, the errors and the form of the
-URI.
+wins, the empty values, the home directory, the missing path, the errors
+and the form of the URI.
 """
 
 import io
@@ -159,6 +159,31 @@ def test_a_bad_value_in_the_section_names_the_key(tmp_path, line):
     key, value = line.split()
     with pytest.raises(ValueError, match=f"<zoe> {key} '{value}'"):
         open_stanza(f"path {tmp_path / 'store'}", line)
+
+
+def test_path_and_blob_dir_expand_the_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    storage = open_stanza("path ~/store", "blob-dir ~/blobs")
+    try:
+        assert storage.getName() == os.path.realpath(tmp_path / "store")
+        assert blob_directory(storage) == os.path.realpath(tmp_path / "blobs")
+    finally:
+        storage.close()
+    assert not os.path.exists("~")
+
+    monkeypatch.setenv("ZOE_PATH", "~/other")
+    storage = open_stanza()
+    try:
+        assert storage.getName() == os.path.realpath(tmp_path / "other")
+    finally:
+        storage.close()
+
+    factory, _ = zodburi.resolve_uri(f"zoe://{tmp_path / 'third'}?blob-dir=~/more")
+    storage = factory()
+    try:
+        assert blob_directory(storage) == os.path.realpath(tmp_path / "more")
+    finally:
+        storage.close()
 
 
 def test_the_uri_does_not_read_the_twins(tmp_path, monkeypatch):
