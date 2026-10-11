@@ -44,8 +44,9 @@
 //!   cut shows its start and its size in the record: `{"$str": "<start>",
 //!   "length": n}`, `{"$str2": ..., "length": n}`, `{"$bytes": ...,
 //!   "length": n}`, `{"$opaque": ..., "pickle": ..., "length": n}`,
-//!   `{"$int": ..., "length": n}` or `{"$global": ..., "length": n}`. A
-//!   class name that is cut shows its start only.
+//!   `{"$int": ..., "length": n}`, `{"$global": ..., "length": n}` or
+//!   `{"$call": ..., "length": n, "args": ...}`. A class name that is cut
+//!   shows its start only.
 //! - A pointer of a reference has at most `MAX_POINTER` bytes, and the
 //!   pointers of one state at most `POINTER_BUDGET` bytes together. A
 //!   longer pointer gives way to the pointer of a value that holds the
@@ -395,15 +396,23 @@ impl<'r, 't> Converter<'r, 't> {
             }
             Node::Persistent(pid) => self.reference(pid, at, depth),
             Node::Reduce(reduce) => {
-                let callable = match self.resolver.resolve(&reduce.callable) {
-                    Some(Node::Global(global)) => self.qualified(global).0,
-                    _ => String::new(),
+                let mut call = match self.resolver.resolve(&reduce.callable) {
+                    Some(Node::Global(global)) => {
+                        let (name, whole) = self.qualified(global);
+                        tagged(
+                            "$call",
+                            name,
+                            whole,
+                            global.module.len() + 1 + global.name.len(),
+                        )
+                    }
+                    _ => json!({ "$call": "" }),
                 };
                 let len = at.len();
                 push_segment(at, "args");
-                let args = self.value(&reduce.args, at, depth + 1);
+                call["args"] = self.value(&reduce.args, at, depth + 1);
                 at.truncate(len);
-                json!({ "$call": callable, "args": args })
+                call
             }
             Node::Get(get) => match self.resolver.resolve(node) {
                 None => json!({ "$memo": get.index }),
@@ -905,6 +914,23 @@ mod tests {
         let full = items.iter().filter(|item| item.is_string()).count();
         assert_eq!(full, TEXT_BUDGET / MAX_TEXT);
         assert_eq!(items[gets], json!({"$str": "", "length": MAX_TEXT}));
+    }
+
+    #[test]
+    fn a_call_name_past_the_text_budget_shows_its_length() {
+        // Gets of one str of MAX_TEXT bytes spend the text budget. Then a
+        // set has no room for the name of its constructor.
+        let mut state = [&b"(X"[..], &(MAX_TEXT as u32).to_le_bytes()].concat();
+        state.extend(b"a".repeat(MAX_TEXT));
+        state.extend(b"q\x01");
+        state.extend(b"h\x01".repeat(TEXT_BUDGET / MAX_TEXT));
+        state.extend(b"cbuiltins\nset\n)\x85R");
+        state.push(b't');
+        let (state, _) = decode(&state);
+        let call = state.as_array().unwrap().last().unwrap();
+        assert_eq!(call, &json!({"$call": "", "length": 12, "args": [[]]}));
+        let (whole, _) = decode(b"cbuiltins\nset\n)\x85R");
+        assert_eq!(whole, json!({"$call": "builtins.set", "args": [[]]}));
     }
 
     #[test]
