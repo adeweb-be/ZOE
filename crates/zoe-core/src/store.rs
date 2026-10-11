@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::backend::{Backend, BlobRecord, RecordEncoding};
 use crate::blob::{self, BlobFile, BlobReader, BlobStore, PendingBlob};
 use crate::clock::{Clock, SystemClock};
-use crate::commit::{StagingArea, Txn};
+use crate::commit::{GroupCommit, StagingArea, Txn};
 use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::guard::Guardrails;
@@ -159,6 +159,8 @@ pub struct Store {
     /// `None` after a failed finish, because the outcome of that commit is
     /// unknown.
     sequencer: Mutex<Option<Tid>>,
+    /// The commit batches. A batch leader takes the commit sequencer.
+    pub(crate) group: GroupCommit,
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
@@ -355,6 +357,7 @@ impl Store {
             lock_timeout: options.lock_timeout,
             guardrails: Guardrails::new(&options),
             sequencer: Mutex::new(Some(last_tid)),
+            group: GroupCommit::default(),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
             packing: PackState::default(),
@@ -586,6 +589,8 @@ mod tests {
         rows: AtomicBool,
         /// The commit of a write transaction writes, then fails.
         landed: AtomicBool,
+        /// `load_current` gives one record fewer than it got oids.
+        short: AtomicBool,
     }
 
     /// A backend that fails when a test turns a fault on.
@@ -650,6 +655,16 @@ mod tests {
                 return Err(injected());
             }
             self.inner.load_before(oid, tid)
+        }
+
+        fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
+            let mut records: Vec<_> = oids
+                .map(|oid| self.load_before(oid, Tid::MAX))
+                .collect::<Result<_>>()?;
+            if self.faults.short.load(Ordering::Relaxed) {
+                records.pop();
+            }
+            Ok(records)
         }
 
         fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
@@ -776,6 +791,26 @@ mod tests {
         commit(&store, oid, Tid::ZERO, b"a").unwrap();
         let error = commit(&store, oid, Tid::ZERO, b"b");
         assert!(matches!(error, Err(ZoeError::Conflict { .. })));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_vote_fails_when_the_backend_skips_a_current_record() {
+        let (store, faults) = faulty_store();
+        let (low, high) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        commit(&store, low, Tid::ZERO, b"a").unwrap();
+        commit(&store, high, Tid::ZERO, b"b").unwrap();
+        // The serial of `high` is stale, and the backend skips its record.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(low, store.load(low).unwrap().1, b"c").unwrap();
+        txn.store(high, Tid::ZERO, b"d").unwrap();
+        faults.short.store(true, Ordering::Relaxed);
+        let error = txn.vote().unwrap_err();
+        assert!(matches!(error, ZoeError::Backend(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "backend error: the backend gave 1 current records for 2 oids"
+        );
         assert!(store.locks.is_empty());
     }
 

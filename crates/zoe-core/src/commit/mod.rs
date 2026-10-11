@@ -37,6 +37,7 @@
 //! they stage anything. A transaction logs its slow locks when it releases
 //! them, and logs itself when it ends, if it was slow.
 
+mod group;
 mod staging;
 
 use std::borrow::Cow;
@@ -46,14 +47,15 @@ use std::path::Path;
 use std::thread::{self, ThreadId};
 use std::time::SystemTime;
 
-use crate::backend::{Record, TxnMeta, TxnStatus};
+use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
-use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
+pub(crate) use group::GroupCommit;
+use group::Member;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -62,8 +64,9 @@ pub(crate) use staging::StagingArea;
 pub struct Finished {
     /// The tid of the commit.
     pub tid: Tid,
-    /// The tid of the commit just before this one in commit order: the
-    /// last tid of the store when this commit started to write.
+    /// The tid of the commit just before this one in commit order. In a
+    /// commit batch, it is the tid of the member before this one, or the
+    /// last tid of the store before the batch.
     pub previous: Tid,
 }
 
@@ -591,43 +594,72 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// gives each such oid with its committed record.
     fn check_serials(&self, resolve: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
-        for (oid, staged) in self.staged.iter() {
-            let record = self.store.backend.load_before(oid, Tid::MAX)?;
-            let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
-            if current == staged.serial {
-                continue;
-            }
-            match record {
-                Some(record)
-                    if resolve
-                        && !staged.restored
-                        && staged.serial != Tid::ZERO
-                        && !record.data.is_empty() =>
-                {
-                    conflicts.push((oid, record));
+        // One backend read serves a chunk of oids. The chunk bounds the
+        // committed records in memory.
+        let staged: Vec<_> = self.staged.iter().collect();
+        for chunk in staged.chunks(READ_CHUNK) {
+            let current = self.load_current(chunk.iter().map(|(oid, _)| *oid))?;
+            for (&(oid, staged), record) in chunk.iter().zip(current) {
+                let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
+                if current == staged.serial {
+                    continue;
                 }
-                _ => {
+                match record {
+                    Some(record)
+                        if resolve
+                            && !staged.restored
+                            && staged.serial != Tid::ZERO
+                            && !record.data.is_empty() =>
+                    {
+                        conflicts.push((oid, record));
+                    }
+                    _ => {
+                        return Ok(Check::Failed(Stale {
+                            oid,
+                            current,
+                            read: staged.serial,
+                            read_only: false,
+                        }));
+                    }
+                }
+            }
+        }
+        let read_current: Vec<_> = self.read_current.iter().collect();
+        for chunk in read_current.chunks(READ_CHUNK) {
+            let current = self.load_current(chunk.iter().map(|&(&oid, _)| oid))?;
+            for (&(&oid, &read), record) in chunk.iter().zip(current) {
+                let current = record.map_or(Tid::ZERO, |record| record.tid);
+                if current != read {
                     return Ok(Check::Failed(Stale {
                         oid,
                         current,
-                        read: staged.serial,
-                        read_only: false,
+                        read,
+                        read_only: true,
                     }));
                 }
             }
         }
-        for (&oid, &read) in &self.read_current {
-            let current = self.current_serial(oid)?;
-            if current != read {
-                return Ok(Check::Failed(Stale {
-                    oid,
-                    current,
-                    read,
-                    read_only: true,
-                }));
-            }
-        }
         Ok(Check::Passed(conflicts))
+    }
+
+    /// Return the current record of each oid of `oids`, in order, from one
+    /// backend read. A backend that gives another number of records fails
+    /// with a backend error, so the vote never skips an oid.
+    fn load_current(
+        &self,
+        oids: impl ExactSizeIterator<Item = Oid>,
+    ) -> Result<Vec<Option<Record>>> {
+        let expected = oids.len();
+        let mut oids = oids;
+        let records = self.store.backend.load_current(&mut oids)?;
+        if records.len() != expected {
+            let error = format!(
+                "the backend gave {} current records for {expected} oids",
+                records.len()
+            );
+            return Err(ZoeError::Backend(error.into()));
+        }
+        Ok(records)
     }
 
     /// Return the serial of the current record of `oid`, or `Tid::ZERO`
@@ -668,58 +700,26 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
-        let store: &Store = &self.store;
-        let mut sequencer = store.lock_sequencer();
-        let last = sequencer.ok_or(ZoeError::Halted)?;
-        let tid = match self.tid {
-            Some(tid) => {
-                check_restore_tid(tid, last)?;
-                tid
-            }
-            None => next_tid(timestamp(store.clock.now()), last)?,
-        };
-        // The sequencer stays empty if the write below fails.
-        *sequencer = None;
-        if let Some(oid) = self.staged.last_oid() {
-            store.raise_next_oid(oid);
-        }
-
-        // The blob files are durable in their place before the backend
-        // commit, so a blob record never lacks its file.
-        let intent = store.blobs().place(tid, &mut self.blobs)?;
-        let mut write = store.backend.begin_write()?;
-        // A spilled pickle is read back here, one at a time.
-        for record in self.staged.records() {
-            let (oid, serial, data) = record?;
-            write.put_record(oid, tid, serial, &data)?;
-            if let Some(blob) = self.blobs.get(&oid) {
-                write.put_blob(oid, tid, blob.record())?;
-            }
-        }
-        write.put_txn(&TxnMeta {
-            tid,
+        let member = Member {
+            tid: self.tid,
+            staged: std::mem::take(&mut self.staged),
+            blobs: std::mem::take(&mut self.blobs),
             user: std::mem::take(&mut self.user),
             description: std::mem::take(&mut self.description),
             extension: std::mem::take(&mut self.extension),
-            oid_count: self.staged.len() as u64,
-            status: TxnStatus::Committed,
-        })?;
-        write.commit()?;
-        store.blobs().finished(intent);
-        // A running pack marks what these records refer to before its next
-        // removal.
-        store
-            .packing
-            .note(tid, self.staged.iter().map(|(oid, _)| oid));
-        self.committed = Some(tid);
-
-        *sequencer = Some(tid);
-        drop(sequencer);
+        };
+        let store: &Store = &self.store;
+        let (member, finished) = store.group.finish(store, member);
+        // The transaction takes its staged records and its blobs back, so
+        // `Drop` removes its spill file and its unplaced blob files.
+        if let Some(member) = member {
+            self.staged = member.staged;
+            self.blobs = member.blobs;
+        }
+        let finished = finished?;
+        self.committed = Some(finished.tid);
         self.release();
-        Ok(Finished {
-            tid,
-            previous: last,
-        })
+        Ok(finished)
     }
 
     /// Abort the transaction: drop the staged records, remove the spill
@@ -776,6 +776,10 @@ fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
         _ => Err(ZoeError::Protocol("no tid is left after the last tid")),
     }
 }
+
+/// The number of oids whose current records the vote reads in one backend
+/// read.
+const READ_CHUNK: usize = 256;
 
 /// Check that a restore transaction can commit under `tid` when `last` is
 /// the last tid. A failed check is `Protocol`.

@@ -4,6 +4,7 @@
 //! conflict resolution, invalidations and blobs. A backend stores and
 //! reads bytes under the keys of the data model.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::error::{Result, ZoeError};
@@ -106,6 +107,13 @@ pub struct PackStats {
 pub trait Backend: Send + Sync {
     /// Return the newest version of `oid` with a tid lower than `tid`.
     fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>>;
+
+    /// Return the current version of each oid of `oids`, in the order of
+    /// `oids`, as `load_before` at `Tid::MAX` does. A backend can read
+    /// them all in one snapshot.
+    fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
+        oids.map(|oid| self.load_before(oid, Tid::MAX)).collect()
+    }
 
     /// Return the pickle that `tid` wrote for `oid`.
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
@@ -225,14 +233,35 @@ pub trait Backend: Send + Sync {
     fn sequence_end(&self, name: &str) -> Result<Option<u64>>;
 }
 
+/// A version that a commit writes: the oid, the serial of the previous
+/// version and the pickle.
+pub type NewRecord<'a> = (Oid, Tid, Cow<'a, [u8]>);
+
 /// One backend write transaction. It holds the records, their keys in
-/// the transaction index, the blob records, the transaction row and the
-/// meta update of one commit, or the sequence row of one reservation.
+/// the transaction index, the blob records, the transaction rows and the
+/// meta update of the commits of one commit batch, or the sequence row of
+/// one reservation.
 pub trait WriteTxn {
     /// Stage the version of `oid` that `tid` writes, and its key
     /// `(tid, oid)` in the transaction index. `prev` is the serial of the
     /// previous version.
     fn put_record(&mut self, oid: Oid, tid: Tid, prev: Tid, data: &[u8]) -> Result<()>;
+
+    /// Stage each version that `tid` writes, as `put_record` does.
+    /// `records` gives the oid, the serial of the previous version and the
+    /// pickle of each version. An error of `records` stops the call with
+    /// that error.
+    fn put_records(
+        &mut self,
+        tid: Tid,
+        records: &mut dyn Iterator<Item = Result<NewRecord<'_>>>,
+    ) -> Result<()> {
+        for record in records {
+            let (oid, prev, data) = record?;
+            self.put_record(oid, tid, prev, &data)?;
+        }
+        Ok(())
+    }
 
     /// Stage the blob record of the version of `oid` that `tid` writes.
     /// It has no key of its own in the transaction index: the record of
