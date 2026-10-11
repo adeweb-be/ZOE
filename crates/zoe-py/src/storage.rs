@@ -171,9 +171,9 @@ impl Storage {
                 // storage uses it.
                 if read_only {
                     let blob_parent = match &options.blob_dir {
-                        Some(blob_dir) => std::path::absolute(blob_dir)?
-                            .parent()
-                            .map(Path::to_owned),
+                        Some(blob_dir) => {
+                            std::path::absolute(blob_dir)?.parent().map(Path::to_owned)
+                        }
                         None => None,
                     };
                     for dir in std::iter::once(path.clone()).chain(blob_parent) {
@@ -468,9 +468,10 @@ impl Storage {
     ///
     /// The storage takes the file. A file of `temporaryDirectory()`, or of
     /// one of its subdirectories, moves into the store by rename, never by
-    /// copy. A file from elsewhere is copied, then removed. A refused call
-    /// leaves the file in its place. An abort removes a file that the
-    /// transaction took.
+    /// copy. Another file of the store directory or of the blob directory
+    /// is refused with `StorageTransactionError`. A file from elsewhere is
+    /// copied, then removed. A refused call leaves the file in its place.
+    /// An abort removes a file that the transaction took.
     #[pyo3(name = "storeBlob")]
     #[allow(clippy::too_many_arguments)]
     fn store_blob(
@@ -503,6 +504,7 @@ impl Storage {
             let store = store;
             take_blob(
                 &store,
+                Path::new(&self.path),
                 &entry,
                 &blobfilename,
                 |txn, path| txn.store_blob_at(oid, serial, data, path),
@@ -547,6 +549,7 @@ impl Storage {
             let store = store;
             take_blob(
                 &store,
+                Path::new(&self.path),
                 &entry,
                 &blobfilename,
                 |txn, path| txn.restore_blob_at(oid, data, path),
@@ -887,29 +890,33 @@ fn text(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// Stage the blob in the file `path` in the transaction of `entry`.
 ///
 /// A file in the blob temporary directory of `store`, or in one of its
-/// subdirectories, goes to `at`, which takes it by rename. Another file is
-/// copied into a new blob file of `store`, which goes to `copied`. Then the
-/// file is removed, unless it is a file of the blob directory: the store
-/// keeps its committed blob files. A refused call leaves the file in its
-/// place.
+/// subdirectories, goes to `at`, which takes it by rename. A file of the
+/// store directory `store_dir` or of the blob directory outside that
+/// temporary directory, the database or a committed blob file for example,
+/// is refused with `Protocol`: the store owns it. Another file is copied
+/// into a new blob file of `store`, which goes to `copied`, and then it is
+/// removed. A refused call leaves the file in its place.
 fn take_blob(
     store: &Store,
+    store_dir: &Path,
     entry: &Entry,
     path: &Path,
     at: impl FnOnce(&mut SharedTxn, &Path) -> zoe_core::Result<()>,
     copied: impl FnOnce(&mut SharedTxn, BlobFile) -> zoe_core::Result<()>,
 ) -> Result<(), Failure> {
-    let source = blob_source(store, path)?;
-    if let Source::Temporary(temporary) = source {
-        return entry.with(|txn| Ok(at(txn, &temporary)?));
+    match blob_source(store, store_dir, path)? {
+        Source::Temporary(temporary) => entry.with(|txn| Ok(at(txn, &temporary)?)),
+        Source::Store => {
+            Err(ZoeError::Protocol("the blob file is a file of the store, not a new blob").into())
+        }
+        Source::Elsewhere => {
+            let mut file = store.new_blob_file()?;
+            io::copy(&mut File::open(path)?, &mut file)?;
+            entry.with(|txn| Ok(copied(txn, file)?))?;
+            fs::remove_file(path)?;
+            Ok(())
+        }
     }
-    let mut file = store.new_blob_file()?;
-    io::copy(&mut File::open(path)?, &mut file)?;
-    entry.with(|txn| Ok(copied(txn, file)?))?;
-    if let Source::Elsewhere = source {
-        fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
 /// Where a blob file that a client gives is.
@@ -917,19 +924,20 @@ enum Source {
     /// In the blob temporary directory or in one of its subdirectories,
     /// with the path that the core gives to the file.
     Temporary(PathBuf),
-    /// In the blob directory, outside its temporary directory: a committed
-    /// blob file, for example.
-    BlobDir,
+    /// In the store directory or in the blob directory, outside the blob
+    /// temporary directory.
+    Store,
     /// Elsewhere.
     Elsewhere,
 }
 
-/// Tell where the file `path` is.
+/// Tell where the file `path` is. `store_dir` is the real path of the
+/// store directory.
 ///
 /// The directories compare by their real paths, so a path through a
 /// symbolic link or a relative path is found too. The name of the file
 /// stays as it is: the core refuses a symbolic link.
-fn blob_source(store: &Store, path: &Path) -> Result<Source, Failure> {
+fn blob_source(store: &Store, store_dir: &Path, path: &Path) -> Result<Source, Failure> {
     let temp = store.blob_temp_dir()?;
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(Source::Elsewhere);
@@ -945,10 +953,13 @@ fn blob_source(store: &Store, path: &Path) -> Result<Source, Failure> {
     if let Ok(rest) = dir.strip_prefix(&real_temp) {
         return Ok(Source::Temporary(temp.join(rest).join(name)));
     }
-    match real_temp.parent() {
-        Some(blobs) if dir.starts_with(blobs) => Ok(Source::BlobDir),
-        _ => Ok(Source::Elsewhere),
+    let in_blob_dir = real_temp
+        .parent()
+        .is_some_and(|blobs| dir.starts_with(blobs));
+    if in_blob_dir || dir.starts_with(store_dir) {
+        return Ok(Source::Store);
     }
+    Ok(Source::Elsewhere)
 }
 
 /// Return the total size of the files in the directory `dir`, in bytes.

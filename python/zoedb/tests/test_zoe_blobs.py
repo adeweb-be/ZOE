@@ -118,13 +118,36 @@ def test_a_file_from_elsewhere_is_copied_then_removed(storage, tmp_path):
     assert not outside.exists()
 
 
-def test_a_committed_blob_file_is_copied_and_kept(storage):
-    oid = storage.new_oid()
-    first = store_blob(storage, oid, ZERO, write_temporary(storage, DATA))
-    committed = storage.loadBlob(oid, first)
-    second = store_blob(storage, oid, first, committed)
-    assert read(storage.loadBlob(oid, second)) == DATA
-    assert read(committed) == DATA
+@pytest.mark.parametrize("blob_dir", [None, "elsewhere"], ids=["default", "blob_dir"])
+def test_a_file_of_the_store_is_refused(tmp_path, blob_dir):
+    store = tmp_path / "store"
+    options = {} if blob_dir is None else {"blob_dir": str(tmp_path / blob_dir)}
+    storage = zoe.Storage(str(store), **options)
+    try:
+        oid = storage.new_oid()
+        first = store_blob(storage, oid, ZERO, write_temporary(storage, DATA))
+        committed = storage.loadBlob(oid, first)
+        layout = os.path.join(os.path.dirname(storage.temporaryDirectory()), ".layout")
+        database = store / "zoe.redb"
+        size = database.stat().st_size
+        for path in (
+            str(database),
+            committed,
+            layout,
+            str(store / ".." / "store" / "lock"),
+        ):
+            txn = TransactionMetaData()
+            storage.tpc_begin(txn)
+            with pytest.raises(StorageTransactionError):
+                storage.storeBlob(oid, first, blob_record(), path, "", txn)
+            storage.tpc_abort(txn)
+            assert os.path.exists(path), path
+        assert database.stat().st_size == size
+        assert read(committed) == DATA
+        second = store_blob(storage, oid, first, write_temporary(storage, b"second"))
+        assert read(storage.loadBlob(oid, second)) == b"second"
+    finally:
+        storage.close()
 
 
 def test_a_relative_path_in_the_temporary_directory_moves_by_rename(storage, tmp_path):
