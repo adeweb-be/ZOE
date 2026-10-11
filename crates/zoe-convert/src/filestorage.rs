@@ -349,8 +349,15 @@ impl Reader {
             if len > room {
                 return Err(self.corrupt(pos, "data record crosses the transaction end"));
             }
-            let mut data = vec![0; len as usize];
-            self.read(&mut data)?;
+            let mut data = self.buffer(len, pos)?;
+            (&mut self.file)
+                .take(len)
+                .read_to_end(&mut data)
+                .map_err(|source| self.io(source))?;
+            if data.len() as u64 != len {
+                return Err(self.io(ErrorKind::UnexpectedEof.into()));
+            }
+            self.at += len;
             let record = DataRecord {
                 oid,
                 data: Some(data),
@@ -366,13 +373,41 @@ impl Reader {
         Ok((DataRecord { oid, data }, DATA_HEADER_LEN + NUMBER_LEN))
     }
 
-    /// Follow the back pointer `back` of the record of `oid` at `from` to
-    /// the data. A chain of back pointers is followed to its end. A back
-    /// pointer of 0 gives `None`.
+    /// Follow the back pointer `back` of the record of `oid` at `record`
+    /// to the data. A chain of back pointers is followed to its end. A
+    /// back pointer of 0 gives `None`.
+    fn load_back(&self, oid: Oid, back: u64, record: u64) -> Result<Option<Vec<u8>>, Error> {
+        let Some((pos, len)) = self.chain_end(oid, back, record)? else {
+            return Ok(None);
+        };
+        let mut data = self.buffer(len, pos)?;
+        let mut source = ReadAt {
+            file: self.file.get_ref(),
+            pos: pos + DATA_HEADER_LEN,
+        };
+        source
+            .by_ref()
+            .take(len)
+            .read_to_end(&mut data)
+            .map_err(|source| self.io(source))?;
+        if data.len() as u64 != len {
+            return Err(self.io(ErrorKind::UnexpectedEof.into()));
+        }
+        Ok(Some(data))
+    }
+
+    /// Return the end of the chain of back pointers that starts with the
+    /// back pointer `back` of the record of `oid` at `from`: the offset of
+    /// the record with the data and its length, or `None` for no data.
     ///
     /// Each back pointer must point before the record that holds it, so
     /// the chain always ends.
-    fn load_back(&self, oid: Oid, mut back: u64, mut from: u64) -> Result<Option<Vec<u8>>, Error> {
+    fn chain_end(
+        &self,
+        oid: Oid,
+        mut back: u64,
+        mut from: u64,
+    ) -> Result<Option<(u64, u64)>, Error> {
         loop {
             if back == 0 {
                 return Ok(None);
@@ -395,9 +430,7 @@ impl Reader {
                 if len > room {
                     return Err(self.corrupt(back, "data record crosses the record after it"));
                 }
-                let mut data = vec![0; len as usize];
-                self.read_at(&mut data, back + DATA_HEADER_LEN)?;
-                return Ok(Some(data));
+                return Ok(Some((back, len)));
             }
             if room < NUMBER_LEN {
                 return Err(self.corrupt(back, "back pointer crosses the record after it"));
@@ -407,6 +440,16 @@ impl Reader {
             from = back;
             back = number(&next);
         }
+    }
+
+    /// Return an empty buffer with room for `len` bytes of the record at
+    /// `pos`. A length that the memory cannot hold is `Io` with
+    /// `OutOfMemory`, not an abort of the process.
+    fn buffer(&self, len: u64, pos: u64) -> Result<Vec<u8>, Error> {
+        buffer(len).ok_or_else(|| {
+            let message = format!("the data record at offset {pos} needs {len} bytes of memory");
+            self.io(io::Error::new(ErrorKind::OutOfMemory, message))
+        })
     }
 
     /// Check the version length of the data record header `header` at
@@ -505,6 +548,29 @@ impl Iterator for Records<'_> {
                 Some(Err(error))
             }
         }
+    }
+}
+
+/// Return an empty buffer with room for `len` bytes, or `None` when the
+/// memory cannot hold them.
+fn buffer(len: u64) -> Option<Vec<u8>> {
+    let len = usize::try_from(len).ok()?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    Some(buf)
+}
+
+/// A reader of a file from an offset, with positioned reads.
+struct ReadAt<'f> {
+    file: &'f File,
+    pos: u64,
+}
+
+impl Read for ReadAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read_at(buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -968,6 +1034,65 @@ pub(crate) mod tests {
             };
             assert_eq!(source.kind(), ErrorKind::InvalidInput, "{error:?}");
         }
+    }
+
+    #[test]
+    fn a_length_that_the_memory_cannot_hold_gives_no_buffer() {
+        assert!(buffer(u64::MAX).is_none());
+        assert!(buffer(isize::MAX as u64 + 1).is_none());
+        assert!(buffer(16).unwrap().capacity() >= 16);
+    }
+
+    /// Write a sparse file whose one data record claims 1 TiB, and return
+    /// its path. Return `None` when the system cannot make such a file.
+    pub(crate) fn sparse_data_fs(name: &str) -> Option<PathBuf> {
+        let len: u64 = 1 << 40;
+        let txn_len = TXN_HEADER_LEN + DATA_HEADER_LEN + len;
+        let mut head = MAGIC.to_vec();
+        head.extend_from_slice(&10u64.to_be_bytes());
+        head.extend_from_slice(&txn_len.to_be_bytes());
+        head.extend_from_slice(&[b' ', 0, 0, 0, 0, 0, 0]);
+        head.extend_from_slice(&1u64.to_be_bytes());
+        head.extend_from_slice(&10u64.to_be_bytes());
+        head.extend_from_slice(&0u64.to_be_bytes());
+        head.extend_from_slice(&4u64.to_be_bytes());
+        head.extend_from_slice(&[0, 0]);
+        head.extend_from_slice(&len.to_be_bytes());
+
+        let path = test_dir(name).join("Data.fs");
+        std::fs::write(&path, &head).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let size = MAGIC.len() as u64 + txn_len + NUMBER_LEN;
+        file.set_len(size).ok()?;
+        file.write_all_at(&txn_len.to_be_bytes(), size - NUMBER_LEN)
+            .ok()?;
+        Some(path)
+    }
+
+    /// Tell if the system refuses an allocation that is larger than its
+    /// memory. With the overcommit mode 1, it does not, and a test that
+    /// reads a sparse record would fill the memory.
+    pub(crate) fn refuses_huge_allocations() -> bool {
+        std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
+            .is_ok_and(|mode| mode.trim() != "1")
+    }
+
+    #[test]
+    fn a_record_longer_than_the_memory_is_an_error() {
+        if !refuses_huge_allocations() {
+            return;
+        }
+        let Some(path) = sparse_data_fs("sparse-reader") else {
+            return;
+        };
+        let mut reader = Reader::open(&path).unwrap();
+        let txn = reader.next_txn().unwrap().unwrap();
+        let error = reader.records(&txn).next().unwrap().unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        let Error::Io { source, .. } = &error else {
+            panic!("not an I/O error: {error:?}");
+        };
+        assert_eq!(source.kind(), ErrorKind::OutOfMemory, "{error:?}");
     }
 
     #[test]

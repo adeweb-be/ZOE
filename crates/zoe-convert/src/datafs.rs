@@ -456,7 +456,7 @@ mod tests {
     use zoe_core::vfs::MemVfs;
 
     use super::*;
-    use crate::filestorage::tests::{Data, FileBuilder};
+    use crate::filestorage::tests::{Data, FileBuilder, refuses_huge_allocations, sparse_data_fs};
 
     /// The record of a blob.
     const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
@@ -755,6 +755,24 @@ mod tests {
             "the Data.fs has 1 blob records, and no blob directory was given"
         );
         assert_eq!(report.problems.last().unwrap(), "5 more problems");
+    }
+
+    #[test]
+    fn a_record_longer_than_the_memory_stops_the_conversion() {
+        if !refuses_huge_allocations() {
+            return;
+        }
+        let Some(path) = sparse_data_fs("sparse-conversion") else {
+            return;
+        };
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let error = from_datafs(&path, None, &store).unwrap_err();
+        fs::remove_file(&path).unwrap();
+        let Error::Io { source, .. } = &error else {
+            panic!("not an I/O error: {error:?}");
+        };
+        assert_eq!(source.kind(), ErrorKind::OutOfMemory, "{error:?}");
+        assert_eq!(store.last_transaction(), Tid::ZERO);
     }
 
     #[test]
