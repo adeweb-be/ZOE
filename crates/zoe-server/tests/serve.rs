@@ -252,8 +252,8 @@ fn a_store_written_in_process_serves_as_it_is() {
     let path = dir.join("store");
     let tid = {
         let store = open_store(&path);
-        let oid = store.new_oid().unwrap();
-        assert_eq!(oid, Oid(0));
+        // The root is oid 0. ZODB writes it without new_oid.
+        let oid = Oid(0);
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.store(oid, Tid(0), &record(b"root")).unwrap();
         txn.vote().unwrap();
