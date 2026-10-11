@@ -1,9 +1,9 @@
 //! Tests of the `zoe` binary beside its acceptance test.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
-use zoe_core::Store;
+mod common;
 
 /// The binary under test.
 const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
@@ -16,7 +16,7 @@ fn fresh_dir(name: &str) -> PathBuf {
 }
 
 /// Return a command that runs `zoe` with `args` and the variables `env`.
-/// No other `ZOE_*` variable reaches it.
+/// No other `ZOE_*` variable reaches it. Its stdout and stderr are pipes.
 fn zoe(args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(ZOE);
     for (name, _) in std::env::vars_os() {
@@ -24,12 +24,17 @@ fn zoe(args: &[&str], env: &[(&str, &str)]) -> Command {
             command.env_remove(name);
         }
     }
-    command.args(args).envs(env.iter().copied());
+    command
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
 fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
-    zoe(args, env).output().unwrap()
+    common::output(&mut zoe(args, env))
 }
 
 /// Check the exit code, and show the output if it is not the one expected.
@@ -45,7 +50,7 @@ fn assert_exit(output: &Output, code: i32, what: &str) {
 
 /// Make an empty store in `dir`.
 fn empty_store(dir: &Path) {
-    drop(Store::open(dir).unwrap());
+    drop(common::open(dir));
 }
 
 #[test]
@@ -96,7 +101,7 @@ fn a_source_that_is_not_a_data_fs_creates_no_store() {
 fn run_with_closed_stdout(args: &[&str]) -> Output {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    zoe(args, &[]).stdout(writer).output().unwrap()
+    common::output(zoe(args, &[]).stdout(writer))
 }
 
 #[test]
@@ -117,7 +122,7 @@ fn a_reader_that_closes_stdout_does_not_fail_the_command() {
     ];
     let output = run_with_closed_stdout(&convert);
     assert_exit(&output, 0, "convert with a closed stdout");
-    let last = Store::open(&store).unwrap().last_transaction();
+    let last = common::open(&store).last_transaction();
     assert_ne!(last, zoe_core::Tid::ZERO, "the conversion copied nothing");
 
     let output = run_with_closed_stdout(&["pack", "--path", path, "--days", "7"]);
