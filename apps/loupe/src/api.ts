@@ -50,24 +50,43 @@ export interface Change {
 /** The most revisions that `history` gives: `HISTORY_LIMIT` of zoe-loupe. */
 export const HISTORY_LIMIT = 4096;
 
+// `open_folder` and `set_as_of` move the "as of" switch of the Rust side.
+// They go through one queue, one call at a time and in order, so the last
+// call wins. A read of an object waits for the calls before it, so it
+// reads as of the switch that the window asked for last.
+let switchCalls: Promise<unknown> = Promise.resolve();
+
+/** Add a call that moves the switch to the queue. */
+function moveSwitch<T>(call: () => Promise<T>): Promise<T> {
+  const next = switchCalls.then(call);
+  switchCalls = next.catch(() => undefined);
+  return next;
+}
+
+/** Run a read after the calls in the queue. */
+function afterSwitch<T>(call: () => Promise<T>): Promise<T> {
+  return switchCalls.then(call);
+}
+
 export const openFolder = (path: string) =>
-  invoke<FolderInfo>("open_folder", { path });
+  moveSwitch(() => invoke<FolderInfo>("open_folder", { path }));
 
 export const pickFolder = () => invoke<string | null>("pick_folder");
 
-export const root = () => invoke<LoupeObject>("root");
+export const root = () => afterSwitch(() => invoke<LoupeObject>("root"));
 
-export const object = (oid: string) => invoke<LoupeObject>("object", { oid });
+export const object = (oid: string) =>
+  afterSwitch(() => invoke<LoupeObject>("object", { oid }));
 
 export const resolve = (path: string) =>
-  invoke<LoupeObject>("resolve", { path });
+  afterSwitch(() => invoke<LoupeObject>("resolve", { path }));
 
 export const history = (oid: string) =>
   invoke<Revision[]>("history", { oid });
 
 /** Set the "as of" switch to a tid, or to null for the last transaction. */
 export const setAsOf = (tid: string | null) =>
-  invoke<null>("set_as_of", { tid });
+  moveSwitch(() => invoke<null>("set_as_of", { tid }));
 
 export const diff = (oid: string, tidA: string, tidB: string) =>
   invoke<Change[]>("diff", { oid, tidA, tidB });
