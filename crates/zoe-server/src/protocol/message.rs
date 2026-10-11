@@ -12,6 +12,12 @@ pub(crate) const HEARTBEAT: i64 = -1;
 /// The flags of an error reply.
 const ERROR: u8 = 2;
 
+/// The decode budget for one frame. rmpv spends about two steps on each
+/// level of arrays or maps, so this allows about 60 levels. A deeper frame
+/// is not a call. The bound keeps the decode far from the end of the stack
+/// of a runtime thread.
+const MAX_DEPTH: usize = 128;
+
 /// A call from the client.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Call {
@@ -36,7 +42,8 @@ impl Call {
 /// not a call.
 pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
     let mut bytes = frame;
-    let value = rmpv::decode::read_value(&mut bytes).map_err(|e| e.to_string())?;
+    let value = rmpv::decode::read_value_with_max_depth(&mut bytes, MAX_DEPTH)
+        .map_err(|e| e.to_string())?;
     if !bytes.is_empty() {
         return Err("bytes after the message".into());
     }
@@ -46,6 +53,16 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
     let Ok([id, flags, method, args]) = <[Value; 4]>::try_from(parts) else {
         return Err("a message does not have four parts".into());
     };
+    // The stock client sends its heartbeat with nil args. A heartbeat gets
+    // no reply, so its other parts do not matter.
+    if id.as_i64() == Some(HEARTBEAT) {
+        return Ok(Call {
+            id,
+            oneway: true,
+            method: String::new(),
+            args: Vec::new(),
+        });
+    }
     let oneway = match flags {
         Value::Boolean(flag) => flag,
         Value::Integer(n) => n.as_u64() != Some(0),
@@ -129,6 +146,34 @@ mod tests {
             Value::Array(vec![]),
         ]));
         assert!(decode(&bytes).unwrap().is_heartbeat());
+    }
+
+    #[test]
+    fn the_heartbeat_of_a_stock_client_with_nil_args_is_a_heartbeat() {
+        // [-1, 0, ".reply", nil], as ZEO 6.2 sends it.
+        let bytes = [
+            0x94, 0xff, 0x00, 0xa6, b'.', b'r', b'e', b'p', b'l', b'y', 0xc0,
+        ];
+        assert!(decode(&bytes).unwrap().is_heartbeat());
+    }
+
+    #[test]
+    fn a_frame_nested_too_deep_is_refused() {
+        let mut deep = vec![0x91; 100_000];
+        deep.push(0xc0);
+        assert!(decode(&deep).is_err());
+        // A call with 20 levels of arrays in its args decodes.
+        let mut args = Value::Nil;
+        for _ in 0..20 {
+            args = Value::Array(vec![args]);
+        }
+        let bytes = frame(Value::Array(vec![
+            Value::from(1),
+            Value::Boolean(false),
+            Value::from("ping"),
+            Value::Array(vec![args.clone()]),
+        ]));
+        assert_eq!(decode(&bytes).unwrap().args, vec![args]);
     }
 
     #[test]
