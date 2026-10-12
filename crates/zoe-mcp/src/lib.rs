@@ -133,33 +133,49 @@ mod tests {
     }
 
     /// Serve `folder` to a client that writes `input` and then closes its
-    /// end. Return the result of the session.
-    fn session(folder: Folder, input: &'static [u8]) -> Result<(), Error> {
+    /// end. Return the result of the session and what the server wrote.
+    fn session(folder: Folder, input: &'static [u8]) -> (Result<(), Error>, String) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async move {
-                use tokio::io::AsyncWriteExt;
-                let (mut client, server) = tokio::io::duplex(1 << 16);
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (client, server) = tokio::io::duplex(1 << 16);
                 let session = tokio::spawn(serve(folder, server));
-                client.write_all(input).await.unwrap();
-                drop(client);
-                session.await.unwrap()
+                let (mut read, mut write) = tokio::io::split(client);
+                write.write_all(input).await.unwrap();
+                write.shutdown().await.unwrap();
+                let mut output = String::new();
+                read.read_to_string(&mut output).await.unwrap();
+                (session.await.unwrap(), output)
             })
     }
 
     #[test]
     fn a_client_that_leaves_before_initialize_ends_the_session_cleanly() {
-        assert!(session(folder("eof"), b"").is_ok());
+        let (result, output) = session(folder("eof"), b"");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "");
         // rmcp skips a line that is not JSON.
-        assert!(session(folder("not-json"), b"not json\n").is_ok());
+        let (result, output) = session(folder("not-json"), b"not json\n");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "");
     }
 
     #[test]
-    fn a_first_message_that_is_not_initialize_fails_the_session() {
+    fn a_request_before_initialize_gets_a_reply_and_the_session_waits() {
+        let line = b"{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\"}\n";
+        let (result, output) = session(folder("request-first"), line);
+        assert!(result.is_ok(), "{result:?}");
+        let reply: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(reply["id"], 1, "{output}");
+    }
+
+    #[test]
+    fn a_notification_before_initialize_fails_the_session() {
         let line = b"{\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"}\n";
-        let error = session(folder("no-initialize"), line).err();
-        assert!(matches!(error, Some(Error::Session(_))), "{error:?}");
+        let (result, _) = session(folder("no-initialize"), line);
+        assert!(matches!(result, Err(Error::Session(_))), "{result:?}");
     }
 }

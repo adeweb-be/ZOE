@@ -116,9 +116,9 @@ pub struct Reference {
     /// The oid that the reference leads to.
     #[serde(serialize_with = "serialize_oid")]
     pub oid: Oid,
-    /// A JSON pointer to the reference in the state of the object. A
-    /// reference inside an opaque node points to that node, or to a value
-    /// that holds it.
+    /// A JSON pointer into the state of the object. The value at the
+    /// pointer holds the reference: its place when the state shows it,
+    /// else a value that holds every place that the state does not show.
     pub at: String,
 }
 
@@ -288,8 +288,11 @@ impl Snapshot<'_> {
                     .class_name()
                     .map(|(module, name)| format!("{module}.{name}"));
                 let (state, found) = state::state(&tree);
-                // The tree holds at most the default node budget, so the
-                // decode of `persistent_ids` also stays inside it.
+                // `persistent_ids` decodes the record again. Drop the first
+                // tree, so that one tree at a time is in memory. The tree
+                // held at most the default node budget, so the second
+                // decode also stays inside it.
+                drop(tree);
                 let (references, error) = match strong_references(&data) {
                     Ok(oids) => (found.place(&oids), None),
                     Err(error) => (Vec::new(), Some(error)),
