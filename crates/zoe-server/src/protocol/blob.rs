@@ -185,7 +185,7 @@ mod tests {
     use zoe_core::Store;
 
     use super::*;
-    use crate::serve::{ServeOptions, Server};
+    use crate::serve::{ServeOptions, Server, StorageOptions};
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -570,6 +570,31 @@ mod tests {
         let lengths = check_download(&frames, Oid(1), tid, &data);
         assert_eq!(lengths, [CHUNK, CHUNK, CHUNK, 12_345]);
         server.stop();
+    }
+
+    #[test]
+    fn a_storage_keeps_its_blobs_in_its_blob_directory() {
+        let dir = fresh_dir("blob-dir");
+        let (path, blobs) = (dir.join("store"), dir.join("blobs"));
+        let storage = StorageOptions::new("1", &path).blob_dir(&blobs);
+        let server = Server::start(ServeOptions::with_storages([storage])).unwrap();
+        let mut client = Client::connect(server.addr());
+        let tid = client.commit_blob(Oid(1), b"the bytes of the blob");
+        server.stop();
+        let options = zoe_core::Options {
+            blob_dir: Some(blobs.clone()),
+            ..zoe_core::Options::default()
+        };
+        let store = Store::open_with(&path, options).unwrap();
+        let mut blob = String::new();
+        store
+            .open_blob(Oid(1), tid)
+            .unwrap()
+            .read_to_string(&mut blob)
+            .unwrap();
+        assert_eq!(blob, "the bytes of the blob");
+        assert!(blobs.is_dir());
+        assert!(!path.join("blobs").exists());
     }
 
     #[test]
