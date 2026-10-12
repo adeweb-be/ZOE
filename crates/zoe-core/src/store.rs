@@ -756,6 +756,13 @@ mod tests {
             }
             self.inner.sequence_end(name)
         }
+
+        fn sequence_names(&self) -> Result<Vec<String>> {
+            if self.faults.load.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.sequence_names()
+        }
     }
 
     /// Open a store whose backend fails when a test turns a fault on.

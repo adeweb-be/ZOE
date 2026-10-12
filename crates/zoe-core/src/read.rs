@@ -16,7 +16,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 
-use crate::backend::{Backend, Record, RecordMeta};
+use crate::backend::{Backend, BlobRecord, Record, RecordMeta, TxnMeta};
 use crate::error::{Result, ZoeError};
 use crate::store::{Opened, Store};
 use crate::types::{Oid, Tid};
@@ -533,6 +533,45 @@ impl Store {
             data: record.data,
             next,
         }))
+    }
+
+    /// Return the keys of the records of the oids from `from` up, in key
+    /// order, deletions too. The list stops after the first oid that
+    /// brings it to `limit` keys or more, so it holds all the keys of each
+    /// oid in it. The call reads no frame. A walk of the frames gives each
+    /// key to `load_serial` and `load_blob`.
+    pub fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
+        self.backend.record_keys(from, limit)
+    }
+
+    /// Iterate over every transaction row, in tid order. Each row comes
+    /// with its own result, so a row that does not read does not hide the
+    /// others. The iterator reads one row at a time, so its memory does not
+    /// grow with the number of rows. It reads no record.
+    pub fn txn_rows(&self) -> impl Iterator<Item = Result<TxnMeta>> + '_ {
+        self.backend.iter_txns(Tid::ZERO, Tid::MAX)
+    }
+
+    /// Return the blob record that `tid` wrote for `oid`, or `None`. A
+    /// blob record that does not pass its checksum is `CorruptBlob`. The
+    /// call does not read the blob file: `verify_blob` reads it.
+    pub fn load_blob(&self, oid: Oid, tid: Tid) -> Result<Option<BlobRecord>> {
+        self.backend.load_blob(oid, tid)
+    }
+
+    /// Return the names of the sequences that have a row, in key order.
+    /// The call reads no row: `sequence_end` reads the row of a name. A
+    /// name that does not decode fails the whole call with an error.
+    pub fn sequence_names(&self) -> Result<Vec<String>> {
+        self.backend.sequence_names()
+    }
+
+    /// Return the end of the row of the sequence `name`: the first value
+    /// that the store has not reserved. Return `None` when the name has no
+    /// row. A row that does not pass its checksum is `CorruptSequence`.
+    /// The call reserves no value, so a read-only store takes it.
+    pub fn sequence_end(&self, name: &str) -> Result<Option<u64>> {
+        self.backend.sequence_end(name)
     }
 
     /// Return the first oid at or after `from` whose current record is not
@@ -1369,5 +1408,20 @@ mod tests {
             matches!(history, Err(ZoeError::CorruptTxn { tid: Tid(200) })),
             "{history:?}"
         );
+    }
+
+    #[test]
+    fn the_sequence_rows_list_and_read_without_a_reservation() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        assert!(store.sequence_names().unwrap().is_empty());
+        store.sequence("lexicon").next().unwrap();
+        store.sequence("intids").next().unwrap();
+        assert_eq!(store.sequence_names().unwrap(), ["intids", "lexicon"]);
+        // The first reservation reserves the values 1 to 100.
+        assert_eq!(store.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(store.sequence_end("absent").unwrap(), None);
+        // The read reserved nothing.
+        assert_eq!(store.sequence("intids").next().unwrap(), 2);
+        assert_eq!(store.sequence_end("intids").unwrap(), Some(101));
     }
 }

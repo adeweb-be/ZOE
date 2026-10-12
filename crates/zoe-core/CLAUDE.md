@@ -147,7 +147,8 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`. A dat
 
 ## Known limits
 
-- Three faults of redb with a damaged database file, to file upstream later. Do not file them from a card.
+- Four faults of redb with a damaged database file, to file upstream later. Do not file them from a card.
   - redb does not verify its page checksums on a read, only in `check_integrity`.
   - The walk of `prepare_leaf` has no bound. A damaged page can make it loop, and the read hangs.
   - The commit that closes the database can panic on a damaged page tree, then panic again while it unwinds. That double panic aborts the process.
+  - redb decodes a `&str` key with `from_utf8(..).unwrap()`: when it gives the key, and in each comparison of a lookup. The tables `sequences` and `meta` have `&str` keys. A flipped bit can make a stored key invalid UTF-8. Then a lookup in that table that compares against the damaged key panics, for example `sequence_end` or the reservation of `Sequence::next`. `Backend::sequence_names` catches the panic of its scan and returns a `Backend` error with redb's `Corrupted`, so `zoe verify` reports one finding. The default panic hook still prints the panic message to stderr. The key type stays `&str`, because a change of a table definition is a format change.
