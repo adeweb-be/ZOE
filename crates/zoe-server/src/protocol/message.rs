@@ -240,6 +240,21 @@ mod tests {
     }
 
     #[test]
+    fn receive_blob_stop_has_the_bytes_of_a_stock_server() {
+        // `receiveBlobStop [oid, serial]` as `plain.jsonl` of the wire spike
+        // recorded it.
+        let oid = Value::Binary(unhex("0000000000000004"));
+        let serial = Value::Binary(unhex("040c458fd0d4a466"));
+        assert_eq!(
+            notify("receiveBlobStop", vec![oid, serial]),
+            unhex(
+                "9400c3af72656365697665426c6f6253746f7092\
+                 c4080000000000000004c408040c458fd0d4a466"
+            )
+        );
+    }
+
+    #[test]
     fn a_reply_carries_the_id_and_an_error_the_flags_2() {
         let id = Value::from(7);
         let ok = rmpv::decode::read_value(&mut reply(id.clone(), Value::Nil).as_slice()).unwrap();

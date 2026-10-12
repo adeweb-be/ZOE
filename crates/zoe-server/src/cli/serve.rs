@@ -47,7 +47,7 @@ pub(super) struct ServeArgs {
 
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection, and the client reconnects and verifies its
-    /// cache. The replies of the client wait in a queue of the same size.
+    /// cache.
     #[arg(
         long,
         env = "ZOE_CLIENT_QUEUE_SIZE",

@@ -55,9 +55,8 @@ impl ServeOptions {
     }
 
     /// Let at most `messages` invalidations wait for one client. Past it,
-    /// the server closes the connection of the client. The replies of the
-    /// client wait in a queue of the same size. A size of 0 lets 1 message
-    /// wait.
+    /// the server closes the connection of the client. A size of 0 lets 1
+    /// message wait.
     #[must_use]
     pub fn client_queue_size(mut self, messages: usize) -> Self {
         self.queues.client = messages;
