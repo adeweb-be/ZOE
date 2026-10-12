@@ -1,5 +1,6 @@
 //! The read and copy paths of a store: `load_before`, `load_serial`,
-//! `history`, the transaction iterator and the current-record iteration.
+//! `history`, the transaction iterator, the oids that a tid range wrote
+//! and the current-record iteration.
 //!
 //! A record with an empty pickle is a deletion. A load of a deletion
 //! fails with `NotFound`. Each backend read verifies the checksum of every
@@ -12,7 +13,7 @@
 //! record is gone too, and the iterator reads each transaction, its index
 //! keys and its records in one snapshot.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use crate::backend::{Backend, BlobRecord, Record, RecordMeta, TxnMeta};
@@ -459,6 +460,57 @@ impl Store {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
         Transactions::new(Arc::downgrade(&self.backend), start, stop, slice)
+    }
+
+    /// Return each oid that a transaction from `from` to `to`, both
+    /// included, wrote: each oid once, in ascending order. Return `None`
+    /// when more than `limit` transactions of the range wrote a record.
+    ///
+    /// The oids come from the transaction index. The call reads no record
+    /// and no transaction row, so it costs the size of the index keys of
+    /// the range. A transaction that wrote no record has no index key, so
+    /// it does not count. The call reads the index a slice of transactions
+    /// at a time, and each slice is one snapshot. So it holds the oids of
+    /// its result and one slice.
+    ///
+    /// A pack between two slices can remove a record of the range: then
+    /// its oid is left out when no other record of the range names it.
+    pub fn written_oids(&self, from: Tid, to: Tid, limit: usize) -> Result<Option<Vec<Oid>>> {
+        self.written_oids_in_slices(from, to, limit, SLICE)
+    }
+
+    /// Return the oids as `written_oids` does, with slices of at most
+    /// `slice` transactions.
+    pub(crate) fn written_oids_in_slices(
+        &self,
+        from: Tid,
+        to: Tid,
+        limit: usize,
+        slice: usize,
+    ) -> Result<Option<Vec<Oid>>> {
+        let slice = slice.max(1);
+        let mut oids = BTreeSet::new();
+        let mut counted = 0usize;
+        let mut next = (from <= to).then_some(from);
+        while let Some(start) = next {
+            let tids = self.backend.indexed_tids(start, to, slice)?;
+            let (Some(&first), Some(&last)) = (tids.first(), tids.last()) else {
+                break;
+            };
+            counted = counted.saturating_add(tids.len());
+            if counted > limit {
+                return Ok(None);
+            }
+            for written in self.backend.txn_oids(first, last)?.into_values() {
+                oids.extend(written);
+            }
+            next = if tids.len() < slice {
+                None
+            } else {
+                after(last, to)
+            };
+        }
+        Ok(Some(oids.into_iter().collect()))
     }
 
     /// Return the current record of the first oid at or after `next` that
@@ -1284,6 +1336,63 @@ mod tests {
             .collect();
         let corrupt = format!("{:?}", ZoeError::CorruptTxn { tid: Tid(200) });
         assert_eq!(txns, [Ok(Tid(100)), Err(corrupt), Ok(Tid(300))]);
+    }
+
+    /// Return a store with these transactions: 100 writes oids 3 and 1,
+    /// 200 writes oid 1, 300 writes oid 2, 400 writes nothing, and 500
+    /// deletes oid 3.
+    fn written() -> Store {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        restore(
+            &store,
+            100,
+            &[(Oid(3), Some(pickle(1))), (Oid(1), Some(pickle(1)))],
+        );
+        restore(&store, 200, &[(Oid(1), Some(pickle(2)))]);
+        restore(&store, 300, &[(Oid(2), Some(pickle(1)))]);
+        restore(&store, 400, &[]);
+        restore(&store, 500, &[(Oid(3), None)]);
+        store
+    }
+
+    /// The oids that `written_oids` gives with slices of 1 to 4
+    /// transactions. Check that each slice gives the same.
+    fn oids_written(store: &Store, from: u64, to: u64, limit: usize) -> Option<Vec<u64>> {
+        let whole = store.written_oids(Tid(from), Tid(to), limit).unwrap();
+        for slice in 1..=4 {
+            let sliced = store
+                .written_oids_in_slices(Tid(from), Tid(to), limit, slice)
+                .unwrap();
+            assert_eq!(sliced, whole, "slices of {slice}, from {from} to {to}");
+        }
+        whole.map(|oids| oids.into_iter().map(|oid| oid.0).collect())
+    }
+
+    #[test]
+    fn written_oids_gives_each_oid_once_in_ascending_order() {
+        let store = written();
+        assert_eq!(oids_written(&store, 0, u64::MAX, 10), Some(vec![1, 2, 3]));
+        assert_eq!(oids_written(&store, 100, 100, 10), Some(vec![1, 3]));
+        assert_eq!(oids_written(&store, 101, 300, 10), Some(vec![1, 2]));
+        // A deletion is a written oid.
+        assert_eq!(oids_written(&store, 450, 500, 10), Some(vec![3]));
+        // A transaction that wrote nothing gives no oid.
+        assert_eq!(oids_written(&store, 301, 499, 10), Some(vec![]));
+        assert_eq!(oids_written(&store, 501, u64::MAX, 10), Some(vec![]));
+        assert_eq!(oids_written(&store, 300, 200, 10), Some(vec![]));
+    }
+
+    #[test]
+    fn written_oids_gives_none_past_the_limit() {
+        let store = written();
+        // Four transactions wrote records. The one that wrote nothing does
+        // not count.
+        assert_eq!(oids_written(&store, 0, u64::MAX, 4), Some(vec![1, 2, 3]));
+        assert_eq!(oids_written(&store, 0, u64::MAX, 3), None);
+        assert_eq!(oids_written(&store, 101, u64::MAX, 3), Some(vec![1, 2, 3]));
+        assert_eq!(oids_written(&store, 101, u64::MAX, 2), None);
+        assert_eq!(oids_written(&store, 301, 499, 0), Some(vec![]));
+        assert_eq!(oids_written(&store, 300, 300, 0), None);
     }
 
     #[test]

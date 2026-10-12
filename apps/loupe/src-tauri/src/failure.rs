@@ -28,6 +28,8 @@ pub(crate) enum Failure {
     Refused { oid: String, message: String },
     /// A text is not an oid or a tid in ZODB form.
     BadId { text: String },
+    /// A background job stopped, because its folder closed.
+    Stopped,
     /// Another error. `message` is the text of the error, for a report.
     Other { message: String },
 }
@@ -58,6 +60,7 @@ impl From<Error> for Failure {
                 oid: oid_repr(oid),
                 tid: tid_repr(tid),
             },
+            Error::Stopped => Failure::Stopped,
             other => Failure::other(other),
         }
     }
@@ -88,6 +91,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(failure).unwrap(),
             serde_json::json!({"kind": "notClosedCleanly"})
+        );
+        let failure = Failure::from(Error::Stopped);
+        assert_eq!(
+            serde_json::to_value(failure).unwrap(),
+            serde_json::json!({"kind": "stopped"})
         );
     }
 }
