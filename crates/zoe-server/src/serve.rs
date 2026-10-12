@@ -9,10 +9,11 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Runtime;
-use zoe_core::{Store, ZoeError};
+use zoe_core::{Options, Store, ZoeError};
 
 use crate::protocol::{self, NamedStorage};
 
@@ -21,6 +22,7 @@ use crate::protocol::{self, NamedStorage};
 pub struct ServeOptions {
     path: PathBuf,
     listen: SocketAddr,
+    lock_timeout: Option<Duration>,
 }
 
 impl ServeOptions {
@@ -29,6 +31,7 @@ impl ServeOptions {
         Self {
             path: path.as_ref().to_path_buf(),
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            lock_timeout: None,
         }
     }
 
@@ -37,6 +40,24 @@ impl ServeOptions {
     pub fn listen(mut self, addr: SocketAddr) -> Self {
         self.listen = addr;
         self
+    }
+
+    /// Fail a vote that waits longer than `timeout` for the lock of an
+    /// object with `ConflictError`. Without this call, the store keeps its
+    /// default.
+    #[must_use]
+    pub fn lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = Some(timeout);
+        self
+    }
+
+    /// The options of the store.
+    fn store_options(&self) -> Options {
+        let mut options = Options::default();
+        if let Some(timeout) = self.lock_timeout {
+            options.lock_timeout = timeout;
+        }
+        options
     }
 }
 
@@ -89,7 +110,7 @@ impl Server {
             .local_addr()
             .map_err(|error| Error::Listen(options.listen, error))?;
         // This thread is not a thread of the runtime.
-        let store = Store::open(&options.path)
+        let store = Store::open_with(&options.path, options.store_options())
             .map(Arc::new)
             .map_err(|error| Error::Store(options.path.clone(), error))?;
         let storage = NamedStorage::new(protocol::STORAGE_NAME, &options.path, Arc::clone(&store));
