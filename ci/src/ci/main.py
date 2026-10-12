@@ -137,12 +137,7 @@ class Ci:
         """Run the fuzz targets of zoe serve, one hour by default."""
         # The inputs that libFuzzer finds stay in the target cache volume, so
         # the next run starts from them.
-        return await (
-            self.devenv(source)
-            .with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
-            .with_exec(["devenv", "shell", "--", "just", "fuzz", str(seconds)])
-            .stdout()
-        )
+        return await self.recipe(source, "fuzz", (str(seconds),)).stdout()
 
     @function
     def docs(self, source: Source) -> dagger.Directory:
