@@ -983,9 +983,10 @@ impl Session {
     }
 
     /// Pack the store at the tid of the time `time`, as FileStorage
-    /// computes it. The other connections read and commit while the pack
-    /// runs. The later calls of this connection wait for the pack, because
-    /// a connection runs its calls in order.
+    /// computes it, or at the last published tid when that is lower. The
+    /// other connections read and commit while the pack runs. The later
+    /// calls of this connection wait for the pack, because a connection
+    /// runs its calls in order.
     ///
     /// After the pack, the hub sends `info` with the new size to every
     /// client of the storage. The reply goes out after the `info` of this
@@ -1009,13 +1010,16 @@ impl Session {
         };
         let tid = clock::pack_tid(time)
             .ok_or_else(|| Fault::value_error(format!("the pack time {time} has no tid")))?;
+        // The store makes a commit durable before the hub publishes it, and
+        // a client reads only the published commits. A pack after the last
+        // published tid can remove a record that such a read needs.
+        let invalidations = &self.storage.invalidations;
+        let tid = tid.min(invalidations.published());
         self.store
             .pack(tid)
             .map_err(|error| Fault::of_pack(&error))?;
         let info = Value::Map(Vec::from(self.sizes()?));
-        self.storage
-            .invalidations
-            .send_to_all(message::notify("info", vec![info]));
+        invalidations.send_to_all(message::notify("info", vec![info]));
         Ok(Value::Nil)
     }
 }
@@ -2442,6 +2446,31 @@ mod tests {
         assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
     }
 
+    #[test]
+    fn a_restore_transaction_publishes_its_commit_through_the_hub() {
+        let storage = storage("restore-publish", Queues::DEFAULT);
+        let (mut writer, mut own) = connected(&storage);
+        let (_reader, mut others) = connected(&storage);
+        let wanted = storage.store.last_transaction().0 + 10;
+        begin(&mut writer, 1, Some(wanted));
+        let args = vec![
+            p64(1),
+            p64(0),
+            Value::Binary(b"a".to_vec()),
+            Value::Nil,
+            Value::from(1),
+        ];
+        done(send(&mut writer, "restorea", args));
+        assert_eq!(vote_and_finish(&mut writer, 1), Ok(wanted));
+
+        let own = messages(&mut own);
+        let methods: Vec<&str> = own.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, ["info", ".reply"]);
+        assert_eq!(own[1].1, p64(wanted));
+        assert_eq!(messages(&mut others), [invalidation(wanted, &[1])]);
+        assert_eq!(storage.invalidations.published(), Tid(wanted));
+    }
+
     /// The message `info` with the sizes of `storage`.
     fn info_of(storage: &NamedStorage) -> Vec<u8> {
         let size = storage.size().unwrap();
@@ -2480,7 +2509,7 @@ mod tests {
         };
         let register = vec![Value::from("1"), Value::Boolean(false)];
         calls.send(request(1, "register", register)).unwrap();
-        // A time in 2099: the pack packs at the last tid.
+        // A time in 2099: the pack packs at the last published tid.
         let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
         calls.send(request(2, "pack", pack)).unwrap();
         drop(calls);
@@ -2510,6 +2539,46 @@ mod tests {
         assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
         let load = done(call(&mut other, "loadSerial", vec![p64(0), p64(root)]));
         assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+    }
+
+    #[test]
+    fn a_pack_keeps_the_records_that_a_read_of_the_published_commits_needs() {
+        let mut s = registered("pack-published");
+        let root = commit(&mut s, 1, 0, 0, MAPPING).unwrap();
+        // A commit of a new revision of the root is durable, and the hub
+        // does not publish it yet.
+        let mut txn = Txn::begin(Arc::clone(&s.store), b"", b"", b"");
+        txn.store(Oid(0), Tid(root), MAPPING).unwrap();
+        txn.vote().unwrap();
+        let finished = txn.finish_after().unwrap();
+        let next = finished.tid;
+        assert_eq!(s.store.last_transaction(), next);
+        assert_eq!(s.storage.invalidations.published(), Tid(root));
+
+        // A pack at a time after that commit packs at the last published
+        // tid. So it keeps the revision that a current read gives.
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
+        let current = vec![p64(0), p64(u64::MAX)];
+        assert_eq!(
+            done(call(&mut s, "loadBefore", current.clone())),
+            Value::Array(vec![Value::Binary(MAPPING.to_vec()), p64(root), Value::Nil])
+        );
+        assert_eq!(
+            done(call(&mut s, "loadSerial", vec![p64(0), p64(root)])),
+            Value::Binary(MAPPING.to_vec())
+        );
+
+        // After the publication, a read gives the new revision.
+        s.publish(finished, None);
+        assert_eq!(
+            done(call(&mut s, "loadBefore", current)),
+            Value::Array(vec![
+                Value::Binary(MAPPING.to_vec()),
+                p64(next.0),
+                Value::Nil
+            ])
+        );
     }
 
     #[test]
