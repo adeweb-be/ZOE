@@ -1820,12 +1820,16 @@ mod tests {
         const COMMITS: u64 = 25;
         let storage = storage("concurrent", Queues::DEFAULT);
         let (_idle, mut idle) = connected(&storage);
+        let registered = std::sync::Barrier::new(WRITERS as usize);
         let mut queues: Vec<Inbox> = std::thread::scope(|scope| {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|writer| {
-                    let storage = &storage;
+                    let (storage, registered) = (&storage, &registered);
                     scope.spawn(move || {
                         let (mut s, frames) = connected(storage);
+                        // Each session registers before the first commit,
+                        // so each one gets every commit.
+                        registered.wait();
                         for n in 0..COMMITS {
                             let oid = 1 + writer * COMMITS + n;
                             commit(&mut s, n as i64, oid, 0, b"x").unwrap();
@@ -1842,14 +1846,7 @@ mod tests {
         // replies among the invalidations of the others.
         let mut all = None;
         for frames in &mut queues {
-            let tids: Vec<u64> = messages(frames)
-                .into_iter()
-                .filter_map(|(method, args)| match method.as_str() {
-                    ".reply" => Some(u64_of(&args).unwrap()),
-                    "invalidateTransaction" => Some(u64_of(&args.as_array().unwrap()[0]).unwrap()),
-                    _ => None,
-                })
-                .collect();
+            let tids = tids(frames);
             assert_eq!(tids.len() as u64, WRITERS * COMMITS);
             assert!(tids.windows(2).all(|pair| pair[0] < pair[1]), "{tids:?}");
             assert!(all.is_none_or(|all| all == tids));
@@ -1860,6 +1857,72 @@ mod tests {
             .map(|(_, args)| u64_of(&args.as_array().unwrap()[0]).unwrap())
             .collect();
         assert_eq!(Some(seen), all);
+    }
+
+    /// Return the tids of the replies and the invalidations that wait for
+    /// a client, in their order.
+    fn tids(frames: &mut Inbox) -> Vec<u64> {
+        messages(frames)
+            .into_iter()
+            .filter_map(|(method, args)| match method.as_str() {
+                ".reply" => Some(u64_of(&args).unwrap()),
+                "invalidateTransaction" => Some(u64_of(&args.as_array().unwrap()[0]).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_late_session_gets_exactly_the_commits_after_its_registration() {
+        const COMMITS: u64 = 10;
+        let storage = storage("late", Queues::DEFAULT);
+        let (_idle, mut idle) = connected(&storage);
+        let early = std::sync::Barrier::new(2);
+        let (early_frames, late_registered, late_frames) = std::thread::scope(|scope| {
+            let (storage, early) = (&storage, &early);
+            let first = scope.spawn(move || {
+                let (mut s, frames) = connected(storage);
+                for n in 0..COMMITS {
+                    commit(&mut s, n as i64, 1 + n, 0, b"x").unwrap();
+                    if n == 4 {
+                        early.wait();
+                    }
+                }
+                (s, frames)
+            });
+            let late = scope.spawn(move || {
+                // This session registers after 5 commits of the first one.
+                early.wait();
+                let (outbox, frames, _closing) = Outbox::new(1_000, 1_000);
+                let mut s = Session::new(Arc::clone(storage), outbox);
+                let register = vec![Value::from("1"), Value::Boolean(false)];
+                let registered = u64_of(&done(call(&mut s, "register", register))).unwrap();
+                for n in 0..COMMITS {
+                    commit(&mut s, n as i64, 100 + n, 0, b"x").unwrap();
+                }
+                (s, registered, frames)
+            });
+            let (_first, early_frames) = first.join().unwrap();
+            let (_late, registered, late_frames) = late.join().unwrap();
+            (early_frames, registered, late_frames)
+        });
+        let all: Vec<u64> = messages(&mut idle)
+            .into_iter()
+            .map(|(_, args)| u64_of(&args.as_array().unwrap()[0]).unwrap())
+            .collect();
+        assert_eq!(all.len() as u64, 2 * COMMITS);
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]), "{all:?}");
+        // The early session registered before every commit.
+        assert_eq!(tids(&mut { early_frames }), all);
+        // The late one gets each commit after the tid of its registration,
+        // once, in commit order, and no earlier commit.
+        let after: Vec<u64> = all
+            .iter()
+            .copied()
+            .filter(|tid| *tid > late_registered)
+            .collect();
+        assert!(after.len() as u64 <= 2 * COMMITS - 5);
+        assert_eq!(tids(&mut { late_frames }), after);
     }
 
     #[test]
