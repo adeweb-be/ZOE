@@ -11,18 +11,29 @@
 //! store as it was after a transaction. [`Folder::history`] lists the
 //! revisions of an object, and [`Folder::diff`] compares the decoded
 //! states of two revisions.
+//!
+//! The space screen measures the store. [`Folder::space`] gives the space
+//! of each class, the blobs, the largest records and the growth.
+//! [`Folder::path_size`] and [`Folder::path_space`] give the size of a
+//! path and of its items. [`Folder::reclaimable`] gives what a pack would
+//! remove. A long call takes a progress function that can stop it.
 
 mod diff;
 mod path;
+mod space;
 mod state;
 mod text;
 
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use serde::{Serialize, Serializer};
-use zoe_core::{Oid, Store, Tid, ZoeError};
+use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
 
 pub use diff::Change;
+pub use space::{
+    Growth, ITEM_LIMIT, Large, Others, PathItem, PathSpace, Progress, Reclaim, Space, Totals, Walk,
+};
 
 /// The most revisions that [`Folder::history`] gives, newest first.
 pub const HISTORY_LIMIT: usize = 1 << 12;
@@ -76,6 +87,10 @@ pub enum Error {
         /// The tid of the view.
         tid: Tid,
     },
+
+    /// The progress function of a long call stopped it.
+    #[error("the walk stopped before its end")]
+    Stopped,
 }
 
 /// The result type of Loupe.
@@ -246,6 +261,62 @@ impl Folder {
                 after: after.as_ref().map(whole),
             }],
         })
+    }
+
+    /// Return the space of the store as of the last transaction: the
+    /// number of current records and their bytes for each class, the
+    /// current blob files, the `largest` largest current records and what
+    /// each transaction wrote.
+    ///
+    /// The call reads every current record and every transaction. A record
+    /// with a blob record and no blob file fails it with `CorruptBlob`.
+    pub fn space(&self, largest: usize) -> Result<Space> {
+        self.space_with(largest, |_| ControlFlow::Continue(()))
+    }
+
+    /// Return the space of the store as [`Folder::space`] does. Call
+    /// `progress` after each record and each transaction that the call
+    /// reads. When it gives `Break`, the call stops with `Stopped`.
+    pub fn space_with(
+        &self,
+        largest: usize,
+        progress: impl FnMut(Progress) -> ControlFlow<()>,
+    ) -> Result<Space> {
+        space::space(&self.store, largest, progress)
+    }
+
+    /// Return the size of the Plone path `path` as of the last
+    /// transaction: the bytes of the current records of every object that
+    /// the object at `path` reaches through its strong references, itself
+    /// included, each object once.
+    ///
+    /// The references are the ones that [`Object`] gives, so a record that
+    /// does not decode adds its own bytes and no reference. A reference to
+    /// an oid without a current record adds nothing. [`Folder::resolve`]
+    /// gives the form of a path.
+    pub fn path_size(&self, path: &str) -> Result<u64> {
+        space::path_size(self.latest(), path)
+    }
+
+    /// Return the space of the Plone path `path` and of its items as of the
+    /// last transaction. Its `reach` is [`Folder::path_size`], with the
+    /// number of objects. The items and the object itself share it, each
+    /// object once. The module documentation of `space` gives the rules.
+    ///
+    /// Call `progress` after each object and each BTree node that the call
+    /// reads. When it gives `Break`, the call stops with `Stopped`.
+    pub fn path_space(
+        &self,
+        path: &str,
+        progress: impl FnMut(Progress) -> ControlFlow<()>,
+    ) -> Result<PathSpace> {
+        space::path_space(self.latest(), path, progress)
+    }
+
+    /// Return what a pack at `at` would remove: the report of the dry run
+    /// of the core, `Store::pack_dry_run`. The dry run writes nothing.
+    pub fn reclaimable(&self, at: Tid) -> Result<PackReport> {
+        Ok(self.store.pack_dry_run(at)?)
     }
 
     /// Return the view as of the last transaction.
