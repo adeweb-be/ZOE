@@ -419,7 +419,10 @@ mod tests {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let served = Arc::clone(storage);
+        let served = Arc::new(Storages::new(
+            vec![Arc::clone(storage)],
+            Queues::DEFAULT.client,
+        ));
         runtime.spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();

@@ -2086,7 +2086,7 @@ mod tests {
         send(false, "tpc_finish", vec![Value::from(7)]);
         // The connection ends before the session runs the first call.
         drop(calls);
-        run(Arc::clone(&storage), received, replies);
+        run(serving(Arc::clone(&storage)), received, replies);
 
         // The session ran each call, so the finish committed the three oids
         // together, and no lock stays.
