@@ -992,16 +992,14 @@ impl Session {
     /// client of the storage. The reply goes out after the `info` of this
     /// client. It also goes out after the pack when `wait` is false.
     ///
-    /// A read-only connection and a read-only store refuse the pack with
-    /// `ReadOnlyError`.
+    /// A read-only connection packs, as in ZEO: `zeopack` connects
+    /// read-only. A store that the server opened read-only refuses the pack
+    /// with `ReadOnlyError`.
     fn pack(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let time = match args {
             [time] | [time, _] => time,
             _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
         };
-        if self.read_only {
-            return Err(Fault::read_only());
-        }
         let time = match time {
             Value::F64(time) => *time,
             Value::F32(time) => f64::from(*time),
@@ -2582,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_takes_a_time_and_refuses_a_read_only_store() {
+    fn pack_takes_a_time_and_a_read_only_store_refuses_it() {
         let mut s = registered("pack-args");
         for args in [vec![], vec![Value::from("now")]] {
             let fault = failed(call(&mut s, "pack", args));
@@ -2594,28 +2592,52 @@ mod tests {
         let pack = vec![Value::from(1_000_000_000), Value::from(0)];
         assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
 
-        // A read-only connection.
-        let mut s = session("pack-read-only-client");
-        done(call(
-            &mut s,
-            "register",
-            vec![Value::from("1"), Value::Boolean(true)],
-        ));
-        let fault = failed(call(&mut s, "pack", vec![Value::F64(1e9)]));
-        assert_eq!(fault, Fault::read_only());
-
-        // A read-only store.
+        // A store that the server opened read-only refuses the pack, also
+        // for a connection that is not read-only.
         let dir = s.storage.path.clone();
         drop(s);
         let store = Arc::new(Store::open_read_only(&dir).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
-        let mut s = Session::new(storage, outbox());
-        done(call(
-            &mut s,
-            "register",
-            vec![Value::from("1"), Value::Boolean(false)],
-        ));
-        let fault = failed(call(&mut s, "pack", vec![Value::F64(1e9)]));
-        assert_eq!(fault, Fault::read_only());
+        for read_only in [false, true] {
+            let mut s = Session::new(Arc::clone(&storage), outbox());
+            done(call(
+                &mut s,
+                "register",
+                vec![Value::from("1"), Value::Boolean(read_only)],
+            ));
+            let fault = failed(call(&mut s, "pack", vec![Value::F64(1e9)]));
+            assert_eq!(fault, Fault::from(ZoeError::ReadOnly));
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_packs_a_writable_store() {
+        let storage = storage("pack-read-only-client", Queues::DEFAULT);
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+
+        // A read-only connection, as `zeopack` opens it.
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
+        let mut reader = Session::new(Arc::clone(&storage), outbox);
+        let register = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut reader, "register", register)), p64(new));
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut reader, "pack", pack)), Value::Nil);
+        assert_eq!(
+            frames.try_recv().map(|frame| frame.to_vec()),
+            Some(info_of(&storage))
+        );
+
+        // The pack removed the old revision of the root and kept the new one.
+        let fault = failed(call(&mut reader, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
+        let load = done(call(&mut reader, "loadSerial", vec![p64(0), p64(new)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+        // The connection stays read-only for a commit.
+        assert_eq!(
+            failed(call(&mut reader, "new_oids", vec![])),
+            Fault::read_only()
+        );
     }
 }
