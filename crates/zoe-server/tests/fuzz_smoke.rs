@@ -176,7 +176,8 @@ fn mutated_messages_never_stop_the_server() {
         if rng.below(2) == 0 {
             let _ = conn.register("1", false);
         }
-        let input = mutate(&mut rng, &seeds[rng.below(seeds.len())]);
+        let seed = &seeds[rng.below(seeds.len())];
+        let input = mutate(&mut rng, seed);
         let _ = conn.write_frame(&input);
         let _ = conn.closed_within(Duration::from_millis(50));
         drop(conn);
