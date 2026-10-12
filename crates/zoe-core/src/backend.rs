@@ -253,7 +253,9 @@ pub trait Backend: Send + Sync {
 
     /// Return the names of the sequences that have a row, in key order.
     /// One snapshot gives the list. The call reads only the keys, not the
-    /// frames: `sequence_end` reads and checks the row of a name.
+    /// frames: `sequence_end` reads and checks the row of a name. A key
+    /// that does not decode, such as a name that is not UTF-8, fails the
+    /// whole call with an error, not a panic.
     fn sequence_names(&self) -> Result<Vec<String>>;
 }
 

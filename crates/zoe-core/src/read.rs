@@ -559,7 +559,8 @@ impl Store {
     }
 
     /// Return the names of the sequences that have a row, in key order.
-    /// The call reads no row: `sequence_end` reads the row of a name.
+    /// The call reads no row: `sequence_end` reads the row of a name. A
+    /// name that does not decode fails the whole call with an error.
     pub fn sequence_names(&self) -> Result<Vec<String>> {
         self.backend.sequence_names()
     }

@@ -486,9 +486,13 @@ mod tests {
         assert_eq!(report.problems(), 0, "{report:?}");
     }
 
-    #[test]
-    fn a_damaged_sequence_row_is_a_finding() {
-        let dir = std::env::temp_dir().join(format!("zoe-verify-sequence-{}", std::process::id()));
+    /// Verify a store with two sequence rows, after a flip of `bit` in the
+    /// last byte of the name of one of them in the database file.
+    fn verify_with_a_flipped_name(bit: u8) -> Verification {
+        let dir = std::env::temp_dir().join(format!(
+            "zoe-verify-sequence-{bit:#04x}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let name = "verify-marker-sequence";
         {
@@ -496,14 +500,12 @@ mod tests {
             store.sequence(name).next().unwrap();
             store.sequence("intids").next().unwrap();
         }
-        // Flip a bit of the key of the row. The frame then reads under
-        // another name, so it fails its checksum.
         let db = dir.join("zoe.redb");
         let mut bytes = std::fs::read(&db).unwrap();
         let mut flipped = 0;
         for at in 0..bytes.len().saturating_sub(name.len()) {
             if bytes[at..].starts_with(name.as_bytes()) {
-                bytes[at + name.len() - 1] ^= 1;
+                bytes[at + name.len() - 1] ^= bit;
                 flipped += 1;
             }
         }
@@ -514,12 +516,38 @@ mod tests {
         let report = verify(&store, None);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+        report
+    }
+
+    #[test]
+    fn a_damaged_sequence_row_is_a_finding() {
+        // The name stays UTF-8. The frame then reads under another name,
+        // so it fails its checksum.
+        let report = verify_with_a_flipped_name(0x01);
         assert_eq!(report.sequences, 1, "{report:?}");
         assert_eq!(report.checksums.len(), 1, "{report:?}");
         let problem = &report.checksums[0];
         assert_eq!((problem.oid, problem.tid), (None, None));
         assert!(
             problem.error.contains("verify-marker-sequencd"),
+            "{problem:?}"
+        );
+    }
+
+    #[test]
+    fn a_sequence_name_that_is_not_utf8_is_a_finding() {
+        // Bit 0x80 makes the last byte a lead byte without its continuation
+        // bytes. redb panics on such a key, and the backend catches it. The
+        // list of the names fails, so no sequence row counts.
+        let report = verify_with_a_flipped_name(0x80);
+        assert_eq!(report.sequences, 0, "{report:?}");
+        assert_eq!(report.checksums.len(), 1, "{report:?}");
+        let problem = &report.checksums[0];
+        assert_eq!((problem.oid, problem.tid), (None, None));
+        assert!(
+            problem
+                .error
+                .contains("sequence row after \"intids\" does not decode"),
             "{problem:?}"
         );
     }
