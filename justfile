@@ -10,9 +10,13 @@ pythons := "3.12 3.13 3.14 3.14t"
 default:
     @just --list
 
-# Check the format and run clippy and the Python lints.
+# Check the format and run clippy and the Python lints. The fuzz targets of
+# zoe serve are a workspace of their own: check their format, and that their
+# Cargo.lock needs no change, so `just fuzz` builds with --locked.
 check:
     cargo fmt --all --check
+    cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
+    cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src
     ruff format --check python ci/src
@@ -81,6 +85,70 @@ tsan:
     fi
     grep -h '^SUMMARY: ThreadSanitizer' "$tmp"/*
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
+
+# Build the fuzz targets of zoe serve with libFuzzer, then run them one
+# after the other for `seconds` in all. `just fuzz` runs each of the two
+# targets for 30 seconds, and `just fuzz 600 frame` runs only `frame`, for
+# 10 minutes. The targets and their seeds are in crates/zoe-server/fuzz. The
+# build, the inputs that libFuzzer finds and the crash files go to
+# target/fuzz.
+fuzz seconds="60" *targets="frame handshake":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fuzz=crates/zoe-server/fuzz
+    out="${CARGO_TARGET_DIR:-target}/fuzz"
+    # The flags of `cargo fuzz build`, so cargo-fuzz itself is not needed:
+    # the coverage that libFuzzer reads, AddressSanitizer, debug assertions
+    # and the cfg fuzzing. RUSTC_BOOTSTRAP lets the pinned stable toolchain
+    # accept the unstable flags, as in `just tsan`. The explicit target
+    # keeps the flags off the build scripts and the proc macros.
+    export RUSTC_BOOTSTRAP=1
+    export RUSTFLAGS="-Cpasses=sancov-module \
+        -Cllvm-args=-sanitizer-coverage-level=4 \
+        -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+        -Cllvm-args=-sanitizer-coverage-pc-table \
+        -Cllvm-args=-sanitizer-coverage-trace-compares \
+        -Cllvm-args=-sanitizer-coverage-stack-depth \
+        -Cllvm-args=-simplifycfg-branch-fold-threshold=0 \
+        --cfg fuzzing -Zsanitizer=address -Cdebug-assertions -Ccodegen-units=1"
+    triple=x86_64-unknown-linux-gnu
+    cargo build --manifest-path "$fuzz/Cargo.toml" --release --locked \
+        --target "$triple" --target-dir "$out/build" \
+        --config 'profile.release.debug="line-tables-only"'
+    export ASAN_OPTIONS="detect_odr_violation=0"
+    # The handshake target runs a server, which makes a store in TMPDIR.
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    targets=({{ targets }})
+    # A time of 0 has no end for libFuzzer, so each target gets 1 second at
+    # least.
+    each=$(( {{ seconds }} / ${#targets[@]} ))
+    if [ "$each" -lt 1 ]; then each=1; fi
+    for target in "${targets[@]}"; do
+        echo "== $target"
+        mkdir -p "$out/corpus/$target" "$out/artifacts/$target"
+        options=()
+        if [ "$target" = handshake ]; then
+            # The server writes a line to stderr for each connection that it
+            # closes, so its stderr goes away. The message of a panic goes
+            # away too: to see it, run the target on the crash file without
+            # -close_fd_mask, as
+            # `target/fuzz/build/x86_64-unknown-linux-gnu/release/handshake
+            # target/fuzz/artifacts/handshake/crash-...`. The threads of the
+            # server free memory after the end of an input, so libFuzzer
+            # would look for a leak after nearly each input, and run 20
+            # times slower. LeakSanitizer still looks for leaks at the end
+            # of the run.
+            options=(-close_fd_mask=2 -detect_leaks=0)
+        fi
+        # libFuzzer adds the new inputs to the first directory. The seeds
+        # in the repository do not change.
+        TMPDIR="$tmp" "$out/build/$triple/release/$target" \
+            -max_total_time="$each" -timeout=30 \
+            -print_final_stats=1 "${options[@]}" \
+            -artifact_prefix="$out/artifacts/$target/" \
+            "$out/corpus/$target" "$fuzz/corpus/$target"
+    done
 
 # Run the test suites of ZODB in-process against zoe.Storage, on every
 # interpreter. `just test` does not collect them. The ZEO suites against

@@ -127,6 +127,19 @@ class Ci:
         return await self.recipe(source, "tsan", privileged=True).stdout()
 
     @function
+    async def fuzz(
+        self,
+        source: Source,
+        seconds: Annotated[
+            int, Doc("The time of the whole run, split between the targets")
+        ] = 3600,
+    ) -> str:
+        """Run the fuzz targets of zoe serve, one hour by default."""
+        # The inputs that libFuzzer finds stay in the target cache volume, so
+        # the next run starts from them.
+        return await self.recipe(source, "fuzz", (str(seconds),)).stdout()
+
+    @function
     def docs(self, source: Source) -> dagger.Directory:
         """Build the documentation site and return it."""
         # The book goes to target/book, so target must not be a cache volume here.

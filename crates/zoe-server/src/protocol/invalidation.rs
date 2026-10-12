@@ -35,13 +35,17 @@
 //! Every commit of a store passes through the hub of that store exactly
 //! once, and each store has one hub. A commit that bypasses the hub never
 //! publishes its tid, and each later commit waits for it forever.
+//!
+//! `send_to_all` puts a frame that is not a commit, the `info` after a
+//! pack, in the queue of every connection, under the same mutex. So it
+//! takes its place among the frames of the commits.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zoe_core::Tid;
 
-use super::outbox::{Outbox, Place, Pushed};
+use super::outbox::{Frame, Outbox, Place, Pushed};
 
 /// The id of a connection in the hub.
 pub(crate) type ClientId = u64;
@@ -210,11 +214,31 @@ impl Invalidations {
             overflows
         };
         // Write the log line after the release of the mutex.
-        if overflows > 0 {
-            eprintln!(
-                "zoe serve: closing {overflows} connection(s): the client queue of each is full"
-            );
-        }
+        log_overflows(overflows);
+    }
+
+    /// Put `frame` in the hub queue of each connection, and do not wait. The
+    /// frame goes out after the frames of each published commit, and before
+    /// the frames of each later commit. A full queue closes its connection,
+    /// as for a commit.
+    pub(crate) fn send_to_all(&self, frame: Vec<u8>) {
+        let overflows = {
+            let mut state = self.lock();
+            let mut gone = Vec::new();
+            let overflows = state.push_all(&Arc::new(frame), None, &mut gone);
+            for id in gone {
+                state.clients.remove(&id);
+            }
+            overflows
+        };
+        log_overflows(overflows);
+    }
+}
+
+/// Write a log line for the connections that a full queue closed.
+fn log_overflows(overflows: usize) {
+    if overflows > 0 {
+        eprintln!("zoe serve: closing {overflows} connection(s): the client queue of each is full");
     }
 }
 
@@ -246,19 +270,7 @@ impl State {
             }
         };
         if let Some(frame) = invalidation {
-            for (&id, client) in &self.clients {
-                if Some(id) == origin {
-                    continue;
-                }
-                match client.push(Arc::clone(&frame)) {
-                    Pushed::Queued => {}
-                    Pushed::Overflow => {
-                        overflows += 1;
-                        gone.push(id);
-                    }
-                    Pushed::Gone => gone.push(id),
-                }
-            }
+            overflows += self.push_all(&frame, origin, &mut gone);
         }
         for frame in own {
             let pushed = outbox.push(Arc::new(frame));
@@ -274,6 +286,27 @@ impl State {
             self.clients.remove(&id);
         }
         self.published = tid;
+        overflows
+    }
+
+    /// Put `frame` in the hub queue of each connection but `origin`. Add
+    /// each connection that the push closed, or found closed, to `gone`.
+    /// Return the number of queues that were full.
+    fn push_all(&self, frame: &Frame, origin: Option<ClientId>, gone: &mut Vec<ClientId>) -> usize {
+        let mut overflows = 0;
+        for (&id, client) in &self.clients {
+            if Some(id) == origin {
+                continue;
+            }
+            match client.push(Arc::clone(frame)) {
+                Pushed::Queued => {}
+                Pushed::Overflow => {
+                    overflows += 1;
+                    gone.push(id);
+                }
+                Pushed::Gone => gone.push(id),
+            }
+        }
         overflows
     }
 }
@@ -446,6 +479,34 @@ mod tests {
         assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));
         assert_eq!(reader.take(), text(&["load", "inv 5"]));
         assert_eq!(writer.take(), text(&["info 5", "reply 5"]));
+    }
+
+    #[test]
+    fn a_frame_for_all_takes_its_place_among_the_commits() {
+        let hub = Invalidations::new(Tid(0));
+        let (mut writer, mut other) = (Client::new(&hub, 10), Client::new(&hub, 10));
+        let mut full = Client::new(&hub, 1);
+        hub.publish(writer.commit(0, 1));
+        // The commit 3 waits for the commit 2. The frame goes out before
+        // both.
+        hub.publish(writer.commit(2, 3));
+        hub.send_to_all(b"all".to_vec());
+        hub.publish(other.commit(1, 2));
+        assert_eq!(
+            writer.take(),
+            text(&["info 1", "reply 1", "all", "inv 2", "info 3", "reply 3"])
+        );
+        assert_eq!(
+            other.take(),
+            text(&["inv 1", "all", "info 2", "reply 2", "inv 3"])
+        );
+        // A full queue closes its connection, and the connection leaves
+        // the hub.
+        assert!(full.closing.is_closed());
+        assert_eq!(full.take(), text(&["inv 1"]));
+        hub.send_to_all(b"again".to_vec());
+        assert!(full.take().is_empty());
+        assert_eq!(other.take(), text(&["again"]));
     }
 
     #[test]

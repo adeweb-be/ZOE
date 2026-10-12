@@ -20,10 +20,15 @@ mod clock;
 mod extension;
 pub(crate) mod frame;
 mod invalidation;
+mod iteration;
 mod message;
 mod outbox;
 mod session;
 mod status;
+
+/// The entry of the fuzz targets.
+#[cfg(any(test, feature = "fuzz"))]
+pub mod fuzz;
 
 use std::fs;
 use std::io;
@@ -47,14 +52,24 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
 
-/// The most calls that wait for the session of a connection, and the most
-/// replies that wait in its session queue. A full queue makes its sender
-/// wait. So an upload or a download holds a few chunks in memory, whatever
-/// the size of the blob.
+/// The most calls that wait for the session of a connection, decoded, and
+/// the most replies that wait in its session queue. A full queue makes its
+/// sender wait. When the call queue is full, the reader reads no more
+/// bytes, so TCP makes the client wait. So a connection holds at most this
+/// many decoded calls, the call that the reader holds, and the call that
+/// the session runs. An upload or a download holds a few chunks in memory,
+/// whatever the size of the blob. The session runs one call at a time and
+/// needs only the next calls ready: the bytes of a burst wait in the
+/// buffers of TCP.
+///
+/// The writer task empties the queues of the frames without the reader, so
+/// the reader, the session and the writer never wait for each other in a
+/// circle. Only a client that sends calls and reads no reply can stop its
+/// own connection: its replies fill the session queue, then its calls fill
+/// the call queue. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
-/// The name of the storage that the server serves. It is the default of
-/// ZEO.
+/// The name of the storage that `--path` gives. It is the default of ZEO.
 pub(crate) const STORAGE_NAME: &str = "1";
 
 /// The bounds of the queues of a storage.
@@ -125,9 +140,53 @@ impl NamedStorage {
     }
 }
 
+/// The stores that a server serves, each under its own name. All the
+/// connections share it. A connection selects one store with `register`.
+pub(crate) struct Storages {
+    /// The storages, in the order of the configuration. No two have the
+    /// same name.
+    storages: Vec<Arc<NamedStorage>>,
+    /// The most invalidations that wait for one client. A connection gets
+    /// its queues before `register` selects its storage.
+    client_queue: usize,
+}
+
+impl Storages {
+    /// Serve `storages`, whose names must differ. At most `client_queue`
+    /// invalidations wait for one client.
+    pub(crate) fn new(storages: Vec<Arc<NamedStorage>>, client_queue: usize) -> Self {
+        Self {
+            storages,
+            client_queue,
+        }
+    }
+
+    /// Return the storage named `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&Arc<NamedStorage>> {
+        self.storages.iter().find(|storage| storage.name == name)
+    }
+
+    /// Return the reply to `ruok`: the status of each storage. It reads the
+    /// stores.
+    fn ruok(&self) -> String {
+        let statuses: Vec<_> = self
+            .storages
+            .iter()
+            .map(|storage| (storage.name.as_str(), storage.status()))
+            .collect();
+        status::ruok(&statuses)
+    }
+}
+
 /// Serve one client on `stream` until it closes, or until the server
-/// closes the connection.
-pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorage>) {
+/// closes the connection. The client selects one of `storages` with
+/// `register`. A frame longer than `max_frame_size` bytes closes the
+/// connection before the server reserves memory for it.
+pub(crate) async fn serve_connection(
+    stream: TcpStream,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+) {
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
@@ -135,14 +194,11 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
     }
-    match frame::read(&mut reader).await {
+    match frame::read(&mut reader, max_frame_size).await {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
-            // The status reads the store, so it runs on the blocking pool.
-            let reply = tokio::task::spawn_blocking(move || {
-                status::ruok(&[(storage.name.as_str(), storage.status())])
-            })
-            .await;
+            // The status reads the stores, so it runs on the blocking pool.
+            let reply = tokio::task::spawn_blocking(move || storages.ruok()).await;
             if let Ok(reply) = reply {
                 let _ = frame::write(&mut writer, reply.as_bytes()).await;
             }
@@ -153,16 +209,20 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
             eprintln!("zoe serve: {peer}: the client does not speak the protocol M5");
             return;
         }
-        _ => return,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("zoe serve: {peer}: {error}");
+            return;
+        }
     }
 
     let (calls, received) = mpsc::channel(QUEUE);
-    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storage.queues.client);
+    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storages.client_queue);
     let closed = Arc::new(Notify::new());
     let worker = {
         let closed = Arc::clone(&closed);
         tokio::task::spawn_blocking(move || {
-            session::run(storage, received, outbox);
+            session::run(storages, received, outbox);
             closed.notify_one();
         })
     };
@@ -198,7 +258,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
 
     loop {
         let read = tokio::select! {
-            read = frame::read(&mut reader) => read,
+            read = frame::read(&mut reader, max_frame_size) => read,
             () = closed.notified() => break,
             () = closing.wait() => break,
         };
@@ -210,7 +270,11 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
                 break;
             }
         };
-        let call = match message::decode(&bytes) {
+        let decoded = message::decode(&bytes);
+        // The call holds copies of its values. So the bytes of the frame go
+        // before the reader waits for room.
+        drop(bytes);
+        let call = match decoded {
             Ok(call) => call,
             Err(error) => {
                 eprintln!("zoe serve: {peer}: a frame is not a call: {error}");
@@ -268,6 +332,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Store::open(&dir).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
+        let storages = Arc::new(Storages::new(
+            vec![Arc::clone(&storage)],
+            Queues::DEFAULT.client,
+        ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -276,10 +344,10 @@ mod tests {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let served = Arc::clone(&storage);
+        let served = Arc::clone(&storages);
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_connection(stream, served).await;
+            serve_connection(stream, served, crate::serve::DEFAULT_MAX_FRAME_SIZE.get()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();
@@ -330,5 +398,153 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(runtime);
+    }
+
+    /// Return a storage on a new store for the test `name`.
+    fn storage(name: &str) -> Arc<NamedStorage> {
+        let dir = std::env::temp_dir().join(format!("zoe-protocol-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT))
+    }
+
+    /// Serve `storage` on a free port of 127.0.0.1, one task for each
+    /// connection.
+    fn serve(storage: &Arc<NamedStorage>) -> (tokio::runtime::Runtime, std::net::SocketAddr) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::new(Storages::new(
+            vec![Arc::clone(storage)],
+            Queues::DEFAULT.client,
+        ));
+        runtime.spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
+                tokio::spawn(serve_connection(stream, Arc::clone(&served), max));
+            }
+        });
+        (runtime, addr)
+    }
+
+    /// Send a call. The id 0 is a call without a reply.
+    fn send(client: &mut Client, id: i64, method: &str, args: Vec<Value>) {
+        let call = Value::Array(vec![
+            Value::from(id),
+            Value::Boolean(id == 0),
+            Value::from(method),
+            Value::Array(args),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &call).unwrap();
+        write_frame(client, &bytes);
+    }
+
+    /// Connect to `addr`, answer the protocol and register.
+    fn registered(addr: std::net::SocketAddr) -> Client {
+        let mut client = Client::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(read_frame(&mut client), PROTOCOL);
+        write_frame(&mut client, PROTOCOL);
+        send(
+            &mut client,
+            1,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        );
+        read_frame(&mut client);
+        client
+    }
+
+    /// Begin the transaction 7 and store `oid` as a new object.
+    fn begin_and_store(client: &mut Client, oid: u64) {
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(client, 0, "tpc_begin", begin);
+        let data = Value::Binary(b"pickle".to_vec());
+        let store = vec![session::p64(oid), session::p64(0), data, Value::from(7)];
+        send(client, 0, "storea", store);
+    }
+
+    /// Wait until `done` is true. Fail after 30 seconds.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_connection_that_the_hub_closes_aborts_its_transaction() {
+        let storage = storage("close-voted");
+        let (runtime, addr) = serve(&storage);
+        let mut client = registered(addr);
+        begin_and_store(&mut client, 1);
+        send(&mut client, 2, "vote", vec![Value::from(7)]);
+        assert_eq!(
+            read_frame(&mut client),
+            message::reply(Value::from(2), Value::Array(Vec::new()))
+        );
+        assert!(!storage.store.lock_table_is_empty());
+
+        // The hub closes the connection, as on a full hub queue.
+        let (outbox, _inbox, _closing) = Outbox::new(1, 1);
+        storage.invalidations.publish(Commit {
+            previous: Tid(0),
+            tid: Tid(1),
+            origin: None,
+            outbox,
+            own: Vec::new(),
+            others: Others::Close,
+        });
+        let _ = client.read_to_end(&mut Vec::new());
+
+        // The transaction aborts and its locks go.
+        let stats = &storage.stats;
+        wait_until("the locks stay", || {
+            storage.store.lock_table_is_empty() && stats.connections.load(Ordering::Relaxed) == 0
+        });
+        assert_eq!(stats.active_txns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.aborts.load(Ordering::Relaxed), 1);
+        drop(runtime);
+    }
+
+    #[test]
+    fn a_stop_of_the_server_removes_the_upload_files() {
+        let dir = std::env::temp_dir().join(format!("zoe-protocol-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = crate::serve::Server::start(crate::serve::ServeOptions::new(&dir)).unwrap();
+        let chunk = || vec![Value::Binary(vec![7; 1_000])];
+        // One client has an open upload. The other ended its upload, so the
+        // core holds the file.
+        let mut open = registered(server.addr());
+        begin_and_store(&mut open, 1);
+        send(&mut open, 0, "storeBlobStart", vec![]);
+        send(&mut open, 0, "storeBlobChunk", chunk());
+        let mut ended = registered(server.addr());
+        begin_and_store(&mut ended, 2);
+        send(&mut ended, 0, "storeBlobStart", vec![]);
+        send(&mut ended, 0, "storeBlobChunk", chunk());
+        let data = Value::Binary(b"pickle".to_vec());
+        let end = vec![session::p64(2), session::p64(0), data, Value::from(7)];
+        send(&mut ended, 0, "storeBlobEnd", end);
+        for client in [&mut open, &mut ended] {
+            send(client, 2, "ping", vec![]);
+            read_frame(client);
+        }
+        let temporary = dir.join("blobs").join("tmp");
+        let files = || std::fs::read_dir(&temporary).unwrap().count();
+        assert_eq!(files(), 2);
+
+        server.stop();
+        assert_eq!(files(), 0);
     }
 }

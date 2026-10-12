@@ -14,14 +14,15 @@ use rmpv::Value;
 use tokio::sync::mpsc::Receiver;
 use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
 
-use super::NamedStorage;
 use super::blob::{Download, Upload};
 use super::clock;
 use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
+use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::outbox::{Outbox, Place};
 use super::status::Stats;
+use super::{NamedStorage, Storages};
 
 /// The most oids that one `new_oids` call gives, as in ZEO.
 const MAX_NEW_OIDS: u64 = 100;
@@ -108,6 +109,50 @@ impl Fault {
 
     fn storage(text: impl Into<String>) -> Self {
         Self::new("ZODB.POSException.StorageError", text)
+    }
+
+    /// The error of a call that names no iterator `id`: a `KeyError` of the
+    /// id, as ZEO gives it.
+    fn no_iterator(id: &Value) -> Self {
+        Self {
+            class: "builtins.KeyError",
+            args: Value::Array(vec![id.clone()]),
+        }
+    }
+
+    /// The error of a call on the iterator `id` that the iterators refused.
+    fn of_iterator(refused: Refused, id: &Value) -> Self {
+        match refused {
+            Refused::Unknown => Self::no_iterator(id),
+            Refused::OutOfOrder(tid) => Self::new(
+                "builtins.Exception",
+                format!(
+                    "Out-of-order request for record iterator for transaction {:016x}",
+                    tid.0
+                ),
+            ),
+            Refused::Full => Self::storage(format!(
+                "a connection keeps at most {} open iterators; iterator_gc or a new connection frees them",
+                iteration::MAX_OPEN
+            )),
+        }
+    }
+
+    /// Return the exception of ZODB for an error of a pack, as
+    /// `zoe.Storage.pack` raises it. A record that fails its checksum or
+    /// does not decode stops the pack with `StorageSystemError`.
+    fn of_pack(error: &ZoeError) -> Self {
+        match error {
+            ZoeError::CorruptRecord { .. } => Self::new(
+                "ZODB.POSException.StorageSystemError",
+                format!("pack stopped: {error}"),
+            ),
+            ZoeError::Format(text) => Self::new(
+                "ZODB.POSException.StorageSystemError",
+                format!("pack stopped: {text}"),
+            ),
+            _ => Self::of(error),
+        }
     }
 
     /// Tell if the fault is a conflict. The names of the conflict
@@ -274,15 +319,25 @@ pub(crate) struct Session {
     registered: bool,
     read_only: bool,
     open: Option<Open>,
+    iterators: Iterators,
 }
 
 /// Run the calls that arrive on `calls` in order, and put each reply in
-/// `outbox`. Return when `calls` closes, or when the session closes the
-/// connection. A transaction still open aborts.
-pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox: Outbox) {
-    let mut session = Session::new(storage, outbox.clone());
+/// `outbox`. The first `register` that names one of `storages` selects the
+/// storage of the connection. Return when `calls` closes, or when the
+/// session closes the connection. A transaction still open aborts.
+pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
+    let mut session: Option<Session> = None;
     while let Some(call) = calls.blocking_recv() {
-        let outcome = session.call(&call);
+        let outcome = match &mut session {
+            Some(session) => session.call(&call),
+            None => match select(&storages, &call) {
+                Ok(storage) => session
+                    .insert(Session::new(storage, outbox.clone()))
+                    .call(&call),
+                Err(outcome) => outcome,
+            },
+        };
         let reply = match outcome {
             Outcome::Published => None,
             Outcome::Gone => break,
@@ -304,7 +359,8 @@ pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox:
             }
         };
         // A place that the call took gets the reply, or stays empty.
-        let sent = match (session.place.take(), reply) {
+        let place = session.as_mut().and_then(|session| session.place.take());
+        let sent = match (place, reply) {
             (Some(place), reply) => outbox.send_at(place, reply),
             (None, Some(reply)) => outbox.send(reply),
             (None, None) => true,
@@ -312,6 +368,32 @@ pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox:
         if !sent {
             break;
         }
+    }
+}
+
+/// Return the storage that `call` registers with, before the connection
+/// has one. Only `register` can come first, and it must name one of
+/// `storages`. Otherwise, return the outcome of the call: a call before
+/// `register` closes the connection, and an unknown name fails the call,
+/// as in ZEO.
+fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorage>, Outcome> {
+    if call.method != "register" {
+        return Err(Outcome::Close(format!("{} before register", call.method)));
+    }
+    let [name, _] = arity::<2>(&call.args, "register").map_err(Outcome::Failed)?;
+    let name = storage_name(name);
+    storages
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| Outcome::Failed(Fault::value_error(format!("unknown storage: {name}"))))
+}
+
+/// Return the storage name that a client gives to `register`.
+fn storage_name(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.as_str().unwrap_or_default().to_owned(),
+        Value::Binary(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        other => other.to_string(),
     }
 }
 
@@ -328,6 +410,7 @@ impl Session {
             registered: false,
             read_only: false,
             open: None,
+            iterators: Iterators::default(),
         }
     }
 
@@ -399,11 +482,18 @@ impl Session {
             "record_iternext" => self.record_iternext(args),
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
+            "restorea" => self.restorea(args),
             "checkCurrentSerialInTransaction" => self.check_current_serial(args),
             "deleteObject" => self.delete_object(args),
             "vote" => self.vote(args),
             "tpc_finish" => return self.tpc_finish(call),
             "tpc_abort" => self.tpc_abort(args),
+            "iterator_start" => self.iterator_start(args),
+            "iterator_next" => self.iterator_next(args),
+            "iterator_record_start" => self.iterator_record_start(args),
+            "iterator_record_next" => self.iterator_record_next(args),
+            "iterator_gc" => self.iterator_gc(args),
+            "pack" => self.pack(args),
             "storeBlobStart" => self.store_blob_start(args),
             "storeBlobChunk" => self.store_blob_chunk(args),
             "storeBlobEnd" => self.store_blob_end(args),
@@ -415,11 +505,7 @@ impl Session {
 
     fn register(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [storage, read_only] = arity::<2>(args, "register")?;
-        let storage = match storage {
-            Value::String(text) => text.as_str().unwrap_or_default().to_owned(),
-            Value::Binary(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            other => other.to_string(),
-        };
+        let storage = storage_name(storage);
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
@@ -625,9 +711,12 @@ impl Session {
         if self.read_only {
             return Err(Fault::read_only());
         }
+        // A copy gives the status of the copied transaction: " " for a
+        // normal one, "p" for one that a pack of FileStorage changed. The
+        // store keeps no status, as in `zoe.Storage`.
         if args
             .get(5)
-            .is_some_and(|status| status.as_str() != Some(" "))
+            .is_some_and(|status| !matches!(status.as_str(), Some(" " | "p")))
         {
             return Err(Fault::transaction("transaction status is not supported"));
         }
@@ -663,6 +752,26 @@ impl Session {
                 return Err(Fault::type_error("data is not bytes"));
             };
             Ok(txn.store(oid, serial, data)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage a copy of a record in the restore transaction `id`, a
+    /// transaction that `tpc_begin` began with a tid. Nil data copies a
+    /// deletion. As in `zoe.Storage`, the record gets the tid of the
+    /// transaction, not `serial`, and `prev_txn` is not used. In a
+    /// transaction without a tid, the vote fails with
+    /// `StorageTransactionError`.
+    fn restorea(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, _serial, data, _prev_txn, id] = arity::<5>(args, "restorea")?;
+        self.current(id)?.stage(|txn| {
+            let oid = Oid(u64_of(oid)?);
+            let data = match data {
+                Value::Binary(data) => Some(data.as_slice()),
+                Value::Nil => None,
+                _ => return Err(Fault::type_error("data is not bytes or None")),
+            };
+            Ok(txn.restore(oid, data)?)
         });
         Ok(Value::Nil)
     }
@@ -857,6 +966,143 @@ impl Session {
         Ok(Value::Nil)
     }
 
+    /// Start an iterator over the transactions from the tid `start` to the
+    /// tid `stop`, both included. Nil is no bound. Return the id of the
+    /// iterator.
+    fn iterator_start(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [start, stop] = arity::<2>(args, "iterator_start")?;
+        let (start, stop) = (optional_tid(start)?, optional_tid(stop)?);
+        let transactions = self.store.iterator(start, stop)?;
+        let id = self
+            .iterators
+            .start(transactions)
+            .map_err(|refused| Fault::of_iterator(refused, &Value::Nil))?;
+        Ok(Value::from(id))
+    }
+
+    /// Return the next transaction of the iterator `id`, as `[tid, status,
+    /// user, description, extension]`, or nil at its end. The status is
+    /// always `" "`. The extension is the map of the extension bytes that
+    /// the store keeps, because a stock client takes the value of the wire
+    /// as the extension.
+    fn iterator_next(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [id] = arity::<1>(args, "iterator_next")?;
+        let next = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators.next_transaction(iid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?;
+        let txn = match next {
+            None => return Ok(Value::Nil),
+            Some(Err(error)) => return Err(Fault::of(&error)),
+            Some(Ok(txn)) => txn,
+        };
+        let extension = extension::unpickle(&txn.extension).map_err(|why| {
+            Fault::value_error(format!(
+                "the extension of the transaction {:016x}: {why}",
+                txn.tid.0
+            ))
+        })?;
+        Ok(Value::Array(vec![
+            p64(txn.tid.0),
+            Value::from(" "),
+            Value::Binary(txn.user.clone()),
+            Value::Binary(txn.description.clone()),
+            extension,
+        ]))
+    }
+
+    /// Start an iterator over the records of `tid`, the last transaction
+    /// that the transaction iterator `id` gave. Return the id of the record
+    /// iterator.
+    fn iterator_record_start(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [id, tid] = arity::<2>(args, "iterator_record_start")?;
+        let tid = Tid(u64_of(tid)?);
+        let records = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators.start_records(iid, tid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?;
+        Ok(Value::from(records))
+    }
+
+    /// Return the next record of the record iterator `id`, as `[oid, tid,
+    /// data, data_txn]`, or nil at its end. The data of a deletion is nil.
+    /// The store keeps every pickle whole, so `data_txn` is always nil.
+    fn iterator_record_next(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [id] = arity::<1>(args, "iterator_record_next")?;
+        let next = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators.next_record(iid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?;
+        Ok(next.map_or(Value::Nil, |record| {
+            Value::Array(vec![
+                p64(record.oid.0),
+                p64(record.tid.0),
+                record.data.map_or(Value::Nil, Value::Binary),
+                Value::Nil,
+            ])
+        }))
+    }
+
+    /// Remove the iterators that the client dropped. The client lists each
+    /// record iterator that it dropped, also one at its end, which is gone.
+    /// So an id that names no open iterator does nothing, as in ZEO.
+    fn iterator_gc(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [ids] = arity::<1>(args, "iterator_gc")?;
+        let Value::Array(ids) = ids else {
+            return Err(Fault::type_error("the iterator ids are not a list"));
+        };
+        self.iterators.gc(ids.iter().filter_map(Value::as_u64));
+        Ok(Value::Nil)
+    }
+
+    /// Pack the store at the tid of the time `time`, as FileStorage
+    /// computes it, or at the last published tid when that is lower. The
+    /// other connections read and commit while the pack runs. The later
+    /// calls of this connection wait for the pack, because a connection
+    /// runs its calls in order.
+    ///
+    /// After the pack, the hub sends `info` with the new size to every
+    /// client of the storage. The reply goes out after the `info` of this
+    /// client. It also goes out after the pack when `wait` is false. When
+    /// the sizes do not read, no client gets `info`, and the reply is nil,
+    /// because the pack is done.
+    ///
+    /// A read-only connection packs, as in ZEO: `zeopack` connects
+    /// read-only. A store that the server opened read-only refuses the pack
+    /// with `ReadOnlyError`.
+    fn pack(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let time = match args {
+            [time] | [time, _] => time,
+            _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
+        };
+        let time = match time {
+            Value::F64(time) => *time,
+            Value::F32(time) => f64::from(*time),
+            Value::Integer(time) => time.as_f64().unwrap_or(f64::NAN),
+            _ => return Err(Fault::type_error("the pack time is not a number")),
+        };
+        let tid = clock::pack_tid(time)
+            .ok_or_else(|| Fault::value_error(format!("the pack time {time} has no tid")))?;
+        // The store makes a commit durable before the hub publishes it, and
+        // a client reads only the published commits. A pack after the last
+        // published tid can remove a record that such a read needs.
+        let invalidations = &self.storage.invalidations;
+        let tid = tid.min(invalidations.published());
+        self.store
+            .pack(tid)
+            .map_err(|error| Fault::of_pack(&error))?;
+        // `info` gives the sizes of the store. Sizes that do not read leave it
+        // out, as for a commit.
+        if let Ok(sizes) = self.sizes() {
+            let info = message::notify("info", vec![Value::Map(sizes.into())]);
+            invalidations.send_to_all(info);
+        }
+        Ok(Value::Nil)
+    }
+
     /// Open the upload of a blob in the current transaction. A stock client
     /// sends `storea` for the oid first, so a transaction is open.
     ///
@@ -956,7 +1202,7 @@ impl Session {
 impl Drop for Session {
     /// The end of a connection leaves the status: a transaction that is
     /// still open counts as an abort, as in ZEO. The connection leaves the
-    /// invalidations of the storage.
+    /// invalidations of the storage, and its iterators go with the session.
     fn drop(&mut self) {
         let stats = &self.storage.stats;
         if self.open.is_some() {
@@ -1010,6 +1256,14 @@ fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Val
 /// An oid or a tid as the protocol sends it: 8 bytes, big-endian.
 pub(super) fn p64(n: u64) -> Value {
     Value::Binary(n.to_be_bytes().to_vec())
+}
+
+/// A tid, or nil for none.
+fn optional_tid(value: &Value) -> Result<Option<Tid>, Fault> {
+    match value {
+        Value::Nil => Ok(None),
+        tid => Ok(Some(Tid(u64_of(tid)?))),
+    }
 }
 
 /// The number in the 8 big-endian bytes of `value`.
@@ -1070,6 +1324,11 @@ mod tests {
 
     fn session(name: &str) -> Session {
         Session::new(storage(name, Queues::DEFAULT), outbox())
+    }
+
+    /// Return the storages of a server that serves only `storage`.
+    fn serving(storage: Arc<NamedStorage>) -> Arc<Storages> {
+        Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client))
     }
 
     fn call(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
@@ -1190,6 +1449,47 @@ mod tests {
     }
 
     #[test]
+    fn register_selects_the_storage_of_the_connection_by_its_name() {
+        let named = |name: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("zoe-session-select-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Arc::new(Store::open(&dir).unwrap());
+            Arc::new(NamedStorage::new(name, &dir, store, Queues::DEFAULT))
+        };
+        let storages = Storages::new(vec![named("a"), named("b")], Queues::DEFAULT.client);
+        let request = |method: &str, args: Vec<Value>| Call {
+            id: Value::from(1),
+            oneway: false,
+            method: method.into(),
+            args,
+        };
+        let register =
+            |name: &str| request("register", vec![Value::from(name), Value::Boolean(false)]);
+        for name in ["a", "b"] {
+            let storage = select(&storages, &register(name)).ok().unwrap();
+            assert_eq!(storage.name, name);
+        }
+        let by_bytes = request(
+            "register",
+            vec![Value::Binary(b"b".to_vec()), Value::Boolean(false)],
+        );
+        assert_eq!(select(&storages, &by_bytes).ok().unwrap().name, "b");
+        let fault = failed(select(&storages, &register("1")).err().unwrap());
+        assert_eq!(fault.class, "builtins.ValueError");
+        let fault = failed(
+            select(&storages, &request("register", vec![]))
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(fault.class, "builtins.TypeError");
+        assert!(matches!(
+            select(&storages, &request("lastTransaction", vec![])),
+            Err(Outcome::Close(_))
+        ));
+    }
+
+    #[test]
     fn a_read_only_client_gets_no_oid_and_its_vote_fails() {
         let mut s = session("read-only");
         done(call(
@@ -1257,7 +1557,7 @@ mod tests {
             Value::Nil,
             Value::Map(vec![]),
             Value::Nil,
-            Value::from("p"),
+            Value::from("u"),
         ];
         let bad_extension = vec![Value::from(2), Value::Nil, Value::Nil, Value::from(3)];
         let old_tid = vec![
@@ -1703,7 +2003,7 @@ mod tests {
         let (replies, mut sent, _closing) = Outbox::new(1_000, 1_000);
         let session = {
             let storage = Arc::clone(&storage);
-            std::thread::spawn(move || run(storage, received, replies))
+            std::thread::spawn(move || run(serving(storage), received, replies))
         };
         let send = |id: i64, oneway: bool, method: &str, args: Vec<Value>| {
             let call = Call {
@@ -1754,6 +2054,51 @@ mod tests {
         assert_eq!(count(&status, "active_txns"), 0);
         assert_eq!(count(&status, "aborts"), 1);
         assert_eq!(count(&status, "conflicts_resolved"), 0);
+    }
+
+    #[test]
+    fn the_calls_that_wait_at_the_end_of_a_connection_still_run() {
+        let storage = storage("calls-at-end", Queues::DEFAULT);
+        let (calls, received) = tokio::sync::mpsc::channel(16);
+        let (replies, _inbox, _closing) = Outbox::new(16, 16);
+        let send = |oneway: bool, method: &str, args: Vec<Value>| {
+            let call = Call {
+                id: Value::from(1),
+                oneway,
+                method: method.into(),
+                args,
+            };
+            calls.blocking_send(call).unwrap();
+        };
+        let oids = [1, 2, 3];
+        send(
+            false,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        );
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(true, "tpc_begin", begin);
+        for oid in oids {
+            let data = Value::Binary(MAPPING.to_vec());
+            send(true, "storea", vec![p64(oid), p64(0), data, Value::from(7)]);
+        }
+        send(false, "vote", vec![Value::from(7)]);
+        send(false, "tpc_finish", vec![Value::from(7)]);
+        // The connection ends before the session runs the first call.
+        drop(calls);
+        run(serving(Arc::clone(&storage)), received, replies);
+
+        // The session ran each call, so the finish committed the three oids
+        // together, and no lock stays.
+        let tid = storage.invalidations.published();
+        assert_ne!(tid, Tid(0));
+        for oid in oids {
+            assert_eq!(storage.store.load(Oid(oid)).unwrap().1, tid);
+        }
+        assert!(storage.store.lock_table_is_empty());
+        let status = storage.status().to_value();
+        assert_eq!(count(&status, "commits"), 1);
+        assert_eq!(count(&status, "active_txns"), 0);
     }
 
     #[test]
@@ -2725,5 +3070,517 @@ mod tests {
             Fault::from(ZoeError::Protocol("no")).args,
             Value::Array(vec![Value::from("two-phase commit out of order: no")])
         );
+    }
+
+    /// Run `method` with `args` as a call without a reply.
+    fn send(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
+        session.call(&Call {
+            id: Value::from(0),
+            oneway: true,
+            method: method.into(),
+            args,
+        })
+    }
+
+    /// Commit the transaction `id` with the extension `ext`. It stores
+    /// `data` for each `(oid, serial)` of `oids`. Return its tid.
+    fn commit_with(s: &mut Session, id: i64, ext: Value, oids: &[(u64, u64)], data: &[u8]) -> u64 {
+        let id = Value::from(id);
+        let begin = vec![
+            id.clone(),
+            Value::Binary(b"user".to_vec()),
+            Value::Binary(b"description".to_vec()),
+            ext,
+        ];
+        done(call(s, "tpc_begin", begin));
+        for &(oid, serial) in oids {
+            let data = Value::Binary(data.to_vec());
+            done(send(
+                s,
+                "storea",
+                vec![p64(oid), p64(serial), data, id.clone()],
+            ));
+        }
+        done(call(s, "vote", vec![id.clone()]));
+        finish(s, id)
+    }
+
+    /// The items of the array `value`.
+    fn items(value: &Value) -> &[Value] {
+        value.as_array().unwrap()
+    }
+
+    #[test]
+    fn the_iterators_give_transactions_and_records_as_zeo_does() {
+        let mut s = registered("iterators");
+        let ext = Value::Map(vec![(Value::from("note"), Value::from("first"))]);
+        let first = commit_with(&mut s, 1, ext.clone(), &[(1, 0), (2, 0)], MAPPING);
+        let second = {
+            begin(&mut s, 2, None);
+            let delete = vec![p64(2), p64(first), Value::from(2)];
+            done(send(&mut s, "deleteObject", delete));
+            vote_and_finish(&mut s, 2).unwrap()
+        };
+
+        let iid = done(call(&mut s, "iterator_start", vec![Value::Nil, Value::Nil]));
+        assert_eq!(iid, Value::from(0));
+        let txn = done(call(&mut s, "iterator_next", vec![iid.clone()]));
+        assert_eq!(
+            txn,
+            Value::Array(vec![
+                p64(first),
+                Value::from(" "),
+                Value::Binary(b"user".to_vec()),
+                Value::Binary(b"description".to_vec()),
+                ext,
+            ])
+        );
+        let rid = done(call(
+            &mut s,
+            "iterator_record_start",
+            vec![iid.clone(), p64(first)],
+        ));
+        assert_eq!(rid, Value::from(1));
+        for oid in [1, 2] {
+            let record = done(call(&mut s, "iterator_record_next", vec![rid.clone()]));
+            assert_eq!(
+                record,
+                Value::Array(vec![
+                    p64(oid),
+                    p64(first),
+                    Value::Binary(MAPPING.to_vec()),
+                    Value::Nil
+                ])
+            );
+        }
+        assert_eq!(
+            done(call(&mut s, "iterator_record_next", vec![rid.clone()])),
+            Value::Nil
+        );
+        // A record iterator at its end is gone.
+        let fault = failed(call(&mut s, "iterator_record_next", vec![rid.clone()]));
+        assert_eq!(fault, Fault::no_iterator(&rid));
+        assert_eq!(fault.args, Value::Array(vec![Value::from(1)]));
+
+        // An empty extension is an empty map, and a deletion has nil data.
+        let txn = done(call(&mut s, "iterator_next", vec![iid.clone()]));
+        assert_eq!(items(&txn)[0], p64(second));
+        assert_eq!(items(&txn)[4], Value::Map(vec![]));
+        let out_of_order = call(
+            &mut s,
+            "iterator_record_start",
+            vec![iid.clone(), p64(first)],
+        );
+        assert_eq!(failed(out_of_order).class, "builtins.Exception");
+        let rid = done(call(
+            &mut s,
+            "iterator_record_start",
+            vec![iid.clone(), p64(second)],
+        ));
+        assert_eq!(rid, Value::from(2));
+        let record = done(call(&mut s, "iterator_record_next", vec![rid]));
+        assert_eq!(
+            record,
+            Value::Array(vec![p64(2), p64(second), Value::Nil, Value::Nil])
+        );
+        assert_eq!(
+            done(call(&mut s, "iterator_next", vec![iid.clone()])),
+            Value::Nil
+        );
+        let fault = failed(call(&mut s, "iterator_next", vec![iid.clone()]));
+        assert_eq!(fault, Fault::no_iterator(&iid));
+
+        // The bounds of the range are tids, both included.
+        let range = |s: &mut Session, start: Value, stop: Value| {
+            let iid = done(call(s, "iterator_start", vec![start, stop]));
+            std::iter::from_fn(|| {
+                let txn = done(call(s, "iterator_next", vec![iid.clone()]));
+                (!txn.is_nil()).then(|| u64_of(&items(&txn)[0]).unwrap())
+            })
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(range(&mut s, p64(second), Value::Nil), [second]);
+        assert_eq!(range(&mut s, Value::Nil, p64(first)), [first]);
+        let fault = failed(call(
+            &mut s,
+            "iterator_start",
+            vec![Value::from(1), Value::Nil],
+        ));
+        assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn an_extension_that_msgpack_cannot_carry_fails_iterator_next() {
+        let mut s = registered("bad-extension");
+        // A restore transaction with the extension of a class instance.
+        let ext = b"\x80\x03}q\x00X\x01\x00\x00\x00kcdatetime\ndate\nq\x01C\x04\x07\xea\x0a\x0cq\x02\x85Rq\x03s.";
+        let mut txn = Txn::begin(Arc::clone(&s.store), b"", b"", ext);
+        txn.store(Oid(1), Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        let iid = done(call(&mut s, "iterator_start", vec![Value::Nil, Value::Nil]));
+        let fault = failed(call(&mut s, "iterator_next", vec![iid.clone()]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let Value::Array(args) = &fault.args else {
+            panic!("{fault:?}");
+        };
+        assert!(
+            args[0]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{:016x}", tid.0)),
+            "{fault:?}"
+        );
+        // The iterator stays, and it is at its end.
+        assert_eq!(done(call(&mut s, "iterator_next", vec![iid])), Value::Nil);
+    }
+
+    #[test]
+    fn iterator_gc_ignores_the_ids_that_it_does_not_know() {
+        let mut s = registered("iterator-gc");
+        commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let iid = done(call(&mut s, "iterator_start", vec![Value::Nil, Value::Nil]));
+        let other = done(call(&mut s, "iterator_start", vec![Value::Nil, Value::Nil]));
+        // Ids that never existed, an id of no int type, and a known id.
+        let ids = vec![
+            Value::from(5),
+            Value::from(-1),
+            Value::from("x"),
+            iid.clone(),
+            iid.clone(),
+        ];
+        let gc = send(&mut s, "iterator_gc", vec![Value::Array(ids)]);
+        assert!(matches!(gc, Outcome::Done(Value::Nil)), "{gc:?}");
+        assert_eq!(
+            failed(call(&mut s, "iterator_next", vec![iid.clone()])),
+            Fault::no_iterator(&iid)
+        );
+        assert!(!done(call(&mut s, "iterator_next", vec![other])).is_nil());
+        // A gc without a list is an error, so the call without a reply
+        // closes the connection.
+        let gc = send(&mut s, "iterator_gc", vec![Value::from(1)]);
+        assert!(matches!(gc, Outcome::Failed(_)), "{gc:?}");
+    }
+
+    #[test]
+    fn iterator_ids_belong_to_their_connection() {
+        let storage = storage("iterator-ids", Queues::DEFAULT);
+        let (mut s, _frames) = connected(&storage);
+        let (mut other, _other_frames) = connected(&storage);
+        commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let start = vec![Value::Nil, Value::Nil];
+        let iid = done(call(&mut s, "iterator_start", start.clone()));
+        // Each connection counts its own ids from 0.
+        assert_eq!(done(call(&mut other, "iterator_start", start)), iid);
+        send(
+            &mut other,
+            "iterator_gc",
+            vec![Value::Array(vec![iid.clone()])],
+        );
+        assert!(!done(call(&mut s, "iterator_next", vec![iid.clone()])).is_nil());
+        assert_eq!(
+            failed(call(&mut other, "iterator_next", vec![iid.clone()])),
+            Fault::no_iterator(&iid)
+        );
+    }
+
+    #[test]
+    fn a_connection_refuses_an_iterator_over_the_bound() {
+        let mut s = registered("iterator-bound");
+        let start = vec![Value::Nil, Value::Nil];
+        for _ in 0..iteration::MAX_OPEN {
+            done(call(&mut s, "iterator_start", start.clone()));
+        }
+        let fault = failed(call(&mut s, "iterator_start", start.clone()));
+        assert_eq!(fault.class, "ZODB.POSException.StorageError");
+        // An iterator over no transaction ends at its first call. Then the
+        // connection takes a new iterator.
+        assert_eq!(
+            done(call(&mut s, "iterator_next", vec![Value::from(0)])),
+            Value::Nil
+        );
+        assert_eq!(
+            done(call(&mut s, "iterator_start", start)),
+            Value::from(iteration::MAX_OPEN as u64)
+        );
+    }
+
+    #[test]
+    fn restorea_copies_a_record_only_in_a_restore_transaction() {
+        let mut s = registered("restorea");
+        let restore = |s: &mut Session, id: i64, oid: u64, data: Value| {
+            let args = vec![p64(oid), p64(0), data, Value::Nil, Value::from(id)];
+            send(s, "restorea", args)
+        };
+        // A transaction without a tid fails its vote.
+        begin(&mut s, 1, None);
+        let data = Value::Binary(b"a".to_vec());
+        assert!(matches!(
+            restore(&mut s, 1, 1, data.clone()),
+            Outcome::Done(Value::Nil)
+        ));
+        let fault = vote_and_finish(&mut s, 1).unwrap_err();
+        assert_eq!(fault.class, TRANSACTION_ERROR);
+
+        // A restore transaction commits the record under its tid.
+        let wanted = s.store.last_transaction().0 + 10;
+        begin(&mut s, 2, Some(wanted));
+        restore(&mut s, 2, 1, data);
+        assert_eq!(vote_and_finish(&mut s, 2), Ok(wanted));
+        let load = done(call(&mut s, "loadSerial", vec![p64(1), p64(wanted)]));
+        assert_eq!(load, Value::Binary(b"a".to_vec()));
+        let stats = s.storage.status().to_value();
+        assert_eq!(count(&stats, "stores"), 2);
+
+        // A transaction that a pack of FileStorage changed has the status
+        // "p". It copies as any other.
+        let packed = vec![
+            Value::from(4),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            p64(wanted + 1),
+            Value::from("p"),
+        ];
+        done(call(&mut s, "tpc_begin", packed));
+        restore(&mut s, 4, 2, Value::Binary(b"b".to_vec()));
+        assert_eq!(vote_and_finish(&mut s, 4), Ok(wanted + 1));
+
+        // Nil data copies a deletion.
+        begin(&mut s, 3, Some(wanted + 2));
+        restore(&mut s, 3, 1, Value::Nil);
+        assert_eq!(vote_and_finish(&mut s, 3), Ok(wanted + 2));
+        let fault = failed(call(&mut s, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
+
+        // A restorea of a transaction that is not the open one fails, and
+        // so the connection closes.
+        let outcome = restore(&mut s, 9, 1, Value::Nil);
+        assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_restore_transaction_publishes_its_commit_through_the_hub() {
+        let storage = storage("restore-publish", Queues::DEFAULT);
+        let (mut writer, mut own) = connected(&storage);
+        let (_reader, mut others) = connected(&storage);
+        let wanted = storage.store.last_transaction().0 + 10;
+        begin(&mut writer, 1, Some(wanted));
+        let args = vec![
+            p64(1),
+            p64(0),
+            Value::Binary(b"a".to_vec()),
+            Value::Nil,
+            Value::from(1),
+        ];
+        done(send(&mut writer, "restorea", args));
+        assert_eq!(vote_and_finish(&mut writer, 1), Ok(wanted));
+
+        let own = messages(&mut own);
+        let methods: Vec<&str> = own.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, ["info", ".reply"]);
+        assert_eq!(own[1].1, p64(wanted));
+        assert_eq!(messages(&mut others), [invalidation(wanted, &[1])]);
+        assert_eq!(storage.invalidations.published(), Tid(wanted));
+    }
+
+    /// The message `info` with the sizes of `storage`.
+    fn info_of(storage: &NamedStorage) -> Vec<u8> {
+        let size = storage.size().unwrap();
+        message::notify(
+            "info",
+            vec![Value::Map(vec![
+                (Value::from("length"), Value::from(0)),
+                (Value::from("size"), Value::from(size)),
+            ])],
+        )
+    }
+
+    #[test]
+    fn pack_sends_info_through_the_hub_to_every_client_before_its_reply() {
+        let storage = storage("pack-info", Queues::DEFAULT);
+        let (mut other, mut other_frames) = connected(&storage);
+        let (outbox, mut unregistered_frames, _closing) = Outbox::new(10, 10);
+        let _unregistered = Session::new(Arc::clone(&storage), outbox);
+        let root = commit(&mut other, 1, 0, 0, MAPPING).unwrap();
+        let dropped = commit(&mut other, 2, 1, 0, MAPPING).unwrap();
+        // The info and the reply of each commit.
+        assert_eq!(messages(&mut other_frames).len(), 4);
+
+        // The packing client runs as a connection does.
+        let (calls, received) = tokio::sync::mpsc::channel(crate::protocol::QUEUE);
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
+        let worker = std::thread::spawn({
+            let storage = Arc::clone(&storage);
+            move || run(serving(storage), received, outbox)
+        });
+        let request = |id: i64, method: &str, args: Vec<Value>| Call {
+            id: Value::from(id),
+            oneway: false,
+            method: method.into(),
+            args,
+        };
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        calls
+            .blocking_send(request(1, "register", register))
+            .unwrap();
+        // A time in 2099: the pack packs at the last published tid.
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        calls.blocking_send(request(2, "pack", pack)).unwrap();
+        drop(calls);
+        worker.join().unwrap();
+
+        let info = info_of(&storage);
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| frames.try_recv())
+            .map(|frame| frame.to_vec())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                message::reply(Value::from(1), p64(dropped)),
+                info.clone(),
+                message::reply(Value::from(2), Value::Nil),
+            ]
+        );
+        assert_eq!(
+            other_frames.try_recv().map(|frame| frame.to_vec()),
+            Some(info)
+        );
+        assert!(other_frames.try_recv().is_none());
+        assert!(unregistered_frames.try_recv().is_none());
+
+        // The pack removed the object that the root does not reach.
+        let fault = failed(call(&mut other, "loadSerial", vec![p64(1), p64(dropped)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
+        let load = done(call(&mut other, "loadSerial", vec![p64(0), p64(root)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+    }
+
+    #[test]
+    fn a_pack_keeps_the_records_that_a_read_of_the_published_commits_needs() {
+        let mut s = registered("pack-published");
+        let root = commit(&mut s, 1, 0, 0, MAPPING).unwrap();
+        // A commit of a new revision of the root is durable, and the hub
+        // does not publish it yet.
+        let mut txn = Txn::begin(Arc::clone(&s.store), b"", b"", b"");
+        txn.store(Oid(0), Tid(root), MAPPING).unwrap();
+        txn.vote().unwrap();
+        let finished = txn.finish_after().unwrap();
+        let next = finished.tid;
+        assert_eq!(s.store.last_transaction(), next);
+        assert_eq!(s.storage.invalidations.published(), Tid(root));
+
+        // A pack at a time after that commit packs at the last published
+        // tid. So it keeps the revision that a current read gives.
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
+        let current = vec![p64(0), p64(u64::MAX)];
+        assert_eq!(
+            done(call(&mut s, "loadBefore", current.clone())),
+            Value::Array(vec![Value::Binary(MAPPING.to_vec()), p64(root), Value::Nil])
+        );
+        assert_eq!(
+            done(call(&mut s, "loadSerial", vec![p64(0), p64(root)])),
+            Value::Binary(MAPPING.to_vec())
+        );
+
+        // After the publication, a read gives the new revision.
+        s.publish(finished, None);
+        assert_eq!(
+            done(call(&mut s, "loadBefore", current)),
+            Value::Array(vec![
+                Value::Binary(MAPPING.to_vec()),
+                p64(next.0),
+                Value::Nil
+            ])
+        );
+    }
+
+    #[test]
+    fn pack_takes_a_time_and_a_read_only_store_refuses_it() {
+        let mut s = registered("pack-args");
+        for args in [vec![], vec![Value::from("now")]] {
+            let fault = failed(call(&mut s, "pack", args));
+            assert_eq!(fault.class, "builtins.TypeError");
+        }
+        let fault = failed(call(&mut s, "pack", vec![Value::F64(f64::NAN)]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        // An int is a time too.
+        let pack = vec![Value::from(1_000_000_000), Value::from(0)];
+        assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
+
+        // A store that the server opened read-only refuses the pack, also
+        // for a connection that is not read-only.
+        let dir = s.storage.path.clone();
+        drop(s);
+        let store = Arc::new(Store::open_read_only(&dir).unwrap());
+        let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
+        for read_only in [false, true] {
+            let mut s = Session::new(Arc::clone(&storage), outbox());
+            done(call(
+                &mut s,
+                "register",
+                vec![Value::from("1"), Value::Boolean(read_only)],
+            ));
+            let fault = failed(call(&mut s, "pack", vec![Value::F64(1e9)]));
+            assert_eq!(fault, Fault::from(ZoeError::ReadOnly));
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_packs_a_writable_store() {
+        let storage = storage("pack-read-only-client", Queues::DEFAULT);
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+
+        // A read-only connection, as `zeopack` opens it.
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
+        let mut reader = Session::new(Arc::clone(&storage), outbox);
+        let register = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut reader, "register", register)), p64(new));
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut reader, "pack", pack)), Value::Nil);
+        assert_eq!(
+            frames.try_recv().map(|frame| frame.to_vec()),
+            Some(info_of(&storage))
+        );
+
+        // The pack removed the old revision of the root and kept the new one.
+        let fault = failed(call(&mut reader, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
+        let load = done(call(&mut reader, "loadSerial", vec![p64(0), p64(new)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+        // The connection stays read-only for a commit.
+        assert_eq!(
+            failed(call(&mut reader, "new_oids", vec![])),
+            Fault::read_only()
+        );
+    }
+
+    #[test]
+    fn a_pack_whose_sizes_do_not_read_replies_nil_and_sends_no_info() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-session-pack-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        // The sizes come from the directory of the storage. This one does
+        // not exist, so they do not read.
+        let missing = dir.join("missing");
+        let storage = Arc::new(NamedStorage::new("1", &missing, store, Queues::DEFAULT));
+        assert!(storage.size().is_err());
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+        let (mut packer, mut frames) = connected(&storage);
+
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut packer, "pack", pack)), Value::Nil);
+        assert!(frames.try_recv().is_none());
+        // The pack is done.
+        let fault = failed(call(&mut packer, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
+        let load = done(call(&mut packer, "loadSerial", vec![p64(0), p64(new)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
     }
 }
