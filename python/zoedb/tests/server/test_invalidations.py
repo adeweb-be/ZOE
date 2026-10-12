@@ -55,7 +55,8 @@ def test_a_connection_sees_the_commit_of_another_client(path):
 
             def value():
                 tm.begin()
-                return conn.root()["item"]["value"]
+                item = conn.root().get("item")
+                return None if item is None else item["value"]
 
             wait_for(lambda: value() == 1)
 
