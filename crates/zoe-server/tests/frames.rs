@@ -311,9 +311,7 @@ fn a_client_that_reads_while_it_sends_gets_every_reply_when_the_queues_are_full(
     const LOADS: u32 = 300;
     let dir = fresh_dir("pipeline");
     let store = dir.join("store");
-    // A session queue of 2 replies. A commit puts 2 frames in the queue of
-    // the hub of its client, so 2 is the least that lets `other` commit.
-    let server = Server::start(&["--path", s(&store), "--client-queue-size", "2"], &[]);
+    let server = Server::path(&store);
     let mut other = server.client("1");
     let oid = new_oids(&mut other, 1)[0];
     let data = large_record(64 << 10);

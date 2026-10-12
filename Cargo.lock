@@ -1100,6 +1100,7 @@ version = "0.0.0"
 dependencies = [
  "thiserror",
  "zoe-core",
+ "zoe-pickle",
 ]
 
 [[package]]

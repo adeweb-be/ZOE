@@ -723,6 +723,38 @@ impl Backend for RedbBackend {
             })?;
         Ok(Some(end))
     }
+
+    fn sequence_names(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let sequences = match txn.open_table(SEQUENCES) {
+            Ok(sequences) => sequences,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(backend(e)),
+        };
+        let mut names = Vec::new();
+        // redb decodes a `&str` key with `from_utf8(..).unwrap()`. A flipped
+        // bit can make a stored name invalid UTF-8, and then the decode
+        // panics. The catch changes that panic into a corruption error.
+        let scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            for entry in sequences.iter().map_err(backend)? {
+                let (key, _) = entry.map_err(backend)?;
+                names.push(key.value().to_owned());
+            }
+            Ok(())
+        }));
+        match scan {
+            Ok(scanned) => scanned.map(|()| names),
+            Err(_) => {
+                let at = match names.last() {
+                    Some(name) => format!("after {name:?}"),
+                    None => "at the start".to_owned(),
+                };
+                Err(backend(redb::StorageError::Corrupted(format!(
+                    "the key of a sequence row {at} does not decode"
+                ))))
+            }
+        }
+    }
 }
 
 /// One redb write transaction.
@@ -2166,8 +2198,71 @@ mod tests {
 
         let backend = RedbBackend::open(db).unwrap();
         assert_eq!(backend.sequence_end("intids").unwrap(), None);
+        assert!(backend.sequence_names().unwrap().is_empty());
         commit_sequence(&backend, "intids", 101);
         assert_eq!(backend.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(backend.sequence_names().unwrap(), ["intids"]);
+    }
+
+    #[test]
+    fn the_sequence_names_come_in_key_order_without_a_read_of_the_rows() {
+        let backend = empty();
+        assert!(backend.sequence_names().unwrap().is_empty());
+        for name in ["lexicon", "intids", "a name / with é"] {
+            commit_sequence(&backend, name, 101);
+        }
+        let names = ["a name / with é", "intids", "lexicon"];
+        assert_eq!(backend.sequence_names().unwrap(), names);
+
+        // A row that does not pass its checksum is still listed. Only its
+        // read fails.
+        let mut flipped = format::encode_frame(
+            KeySpace::Sequences,
+            b"intids",
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &format::encode_sequence(101),
+        );
+        *flipped.last_mut().unwrap() ^= 1;
+        insert_sequence_frame(&backend, "intids", &flipped);
+        assert_eq!(backend.sequence_names().unwrap(), names);
+        assert!(matches!(
+            backend.sequence_end("intids"),
+            Err(ZoeError::CorruptSequence { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sequence_name_that_is_not_utf8_fails_the_list_without_a_panic() {
+        let vfs = MemVfs::new();
+        let backend = backend_in(&vfs);
+        for name in ["intids", "lexicon"] {
+            commit_sequence(&backend, name, 101);
+        }
+        drop(backend);
+        // Bit 0x80 makes the last byte of the name a lead byte without its
+        // continuation bytes, so the name is not UTF-8.
+        let mut file = file_of(&vfs);
+        let mut flipped = 0;
+        for at in 0..file.len() - b"lexicon".len() {
+            if file[at..].starts_with(b"lexicon") {
+                file[at + 6] ^= 0x80;
+                flipped += 1;
+            }
+        }
+        assert!(flipped > 0, "the name is not in the database file");
+        let damaged = MemVfs::new();
+        let target = damaged.file("db");
+        target.set_len(file.len() as u64).unwrap();
+        target.write(0, &file).unwrap();
+        let db = redb::Builder::new().create_with_backend(target).unwrap();
+        let backend = RedbBackend::open(db).unwrap();
+
+        let error = backend.sequence_names().unwrap_err();
+        assert!(matches!(error, ZoeError::Backend(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("corrupted"), "{text}");
+        assert!(text.contains("after \"intids\""), "{text}");
     }
 
     /// Replace the stored row of the sequence `name` with `frame`.

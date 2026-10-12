@@ -9,6 +9,9 @@
 //! directory that ZODB's FileStorage opens. It writes the file under a
 //! temporary name and renames it at the end, and resumes after the last tid
 //! of the file.
+//!
+//! [`verify`] checks a store without Python: the checksums of its frames,
+//! its blob files, its persistent references and its classes.
 
 use std::path::PathBuf;
 
@@ -18,10 +21,12 @@ mod blobs;
 mod datafs;
 mod filestorage;
 mod to_datafs;
+mod verify;
 mod writer;
 
 pub use datafs::from_datafs;
 pub use to_datafs::to_datafs;
+pub use verify::{BlobProblem, Dangling, FrameProblem, PickleProblem, Verification, verify};
 
 /// The report of a conversion.
 ///

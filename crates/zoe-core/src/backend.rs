@@ -250,6 +250,13 @@ pub trait Backend: Send + Sync {
     /// first value that the store has not reserved. Return `None` when the
     /// sequence has no row.
     fn sequence_end(&self, name: &str) -> Result<Option<u64>>;
+
+    /// Return the names of the sequences that have a row, in key order.
+    /// One snapshot gives the list. The call reads only the keys, not the
+    /// frames: `sequence_end` reads and checks the row of a name. A key
+    /// that does not decode, such as a name that is not UTF-8, fails the
+    /// whole call with an error, not a panic.
+    fn sequence_names(&self) -> Result<Vec<String>>;
 }
 
 /// A version that a commit writes: the oid, the serial of the previous
@@ -443,6 +450,10 @@ mod tests {
 
         fn sequence_end(&self, _: &str) -> Result<Option<u64>> {
             Ok(None)
+        }
+
+        fn sequence_names(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 

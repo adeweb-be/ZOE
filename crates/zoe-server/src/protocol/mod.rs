@@ -6,17 +6,21 @@
 //! thread drives each core transaction, and no core call runs on a thread
 //! of the async runtime.
 //!
-//! The frames for a client wait in two queues: the replies of the session,
-//! and the invalidations with the frames of each commit. Each holds at most
-//! `client-queue-size` frames. The session waits for room for its replies.
-//! The invalidations never wait: a full queue closes the connection. The
-//! writer task sends the frames of both queues in the order in which they
-//! went in.
+//! The calls of a client wait in a queue of `QUEUE` calls. The frames for
+//! the client wait in two queues: the replies of the session, at most
+//! `QUEUE` frames, and the invalidations with the frames of each commit, at
+//! most `client-queue-size` frames. The reader waits for room for the calls,
+//! and the session waits for room for its replies. So an upload or a
+//! download holds a few chunks in memory. The invalidations never wait: a
+//! full queue closes the connection. The writer task sends the frames of
+//! both queues in the order in which they went in.
 
+mod blob;
 mod clock;
 mod extension;
 pub(crate) mod frame;
 mod invalidation;
+mod iteration;
 mod message;
 mod outbox;
 mod session;
@@ -48,18 +52,21 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
 
-/// The most calls that wait for the session of a connection, decoded. A
-/// full queue makes the reader wait, and it reads no more bytes, so TCP
-/// makes the client wait. So a connection holds at most this many decoded
-/// calls, the call that the reader holds, and the call that the session
-/// runs. The session runs one call at a time and needs only the next calls
-/// ready: the bytes of a burst wait in the buffers of TCP.
+/// The most calls that wait for the session of a connection, decoded, and
+/// the most replies that wait in its session queue. A full queue makes its
+/// sender wait. When the call queue is full, the reader reads no more
+/// bytes, so TCP makes the client wait. So a connection holds at most this
+/// many decoded calls, the call that the reader holds, and the call that
+/// the session runs. An upload or a download holds a few chunks in memory,
+/// whatever the size of the blob. The session runs one call at a time and
+/// needs only the next calls ready: the bytes of a burst wait in the
+/// buffers of TCP.
 ///
 /// The writer task empties the queues of the frames without the reader, so
 /// the reader, the session and the writer never wait for each other in a
 /// circle. Only a client that sends calls and reads no reply can stop its
-/// own connection: its replies fill their queue, then its calls fill this
-/// one. A stock client reads its replies while it sends.
+/// own connection: its replies fill the session queue, then its calls fill
+/// the call queue. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
 /// The name of the storage that the server serves. It is the default of
@@ -74,7 +81,7 @@ pub(crate) struct Queues {
     pub(crate) invalidations: usize,
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection. The replies of the session wait in a queue of
-    /// the same size, and the session waits for room there.
+    /// `QUEUE` frames, and the session waits for room there.
     pub(crate) client: usize,
 }
 
@@ -175,8 +182,7 @@ pub(crate) async fn serve_connection(
     }
 
     let (calls, received) = mpsc::channel(QUEUE);
-    let (outbox, mut inbox, mut closing) =
-        Outbox::new(storage.queues.client, storage.queues.client);
+    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storage.queues.client);
     let closed = Arc::new(Notify::new());
     let worker = {
         let closed = Arc::clone(&closed);

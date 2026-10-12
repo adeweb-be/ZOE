@@ -16,6 +16,7 @@ mod convert;
 mod mcp;
 mod pack;
 mod serve;
+mod verify;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -63,6 +64,9 @@ enum Command {
     /// Serve the read-only ops tools of a store to an agent, over MCP on
     /// stdin and stdout.
     Mcp(mcp::McpArgs),
+    /// Check the checksums, the blob files, the references and the classes
+    /// of a store, and change nothing. Exit with 1 on a finding.
+    Verify(verify::VerifyArgs),
 }
 
 /// Why a subcommand failed. The command writes it to stderr and exits with
@@ -139,6 +143,7 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
         Command::Pack(args) => ("pack", pack::run(args, clock, out)),
         Command::Serve(args) => ("serve", serve::run(args, out)),
         Command::Mcp(args) => ("mcp", mcp::run(args)),
+        Command::Verify(args) => ("verify", verify::run(args, out)),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.

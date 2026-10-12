@@ -587,6 +587,31 @@ impl Storage {
             .map_err(|failure| failure.into_py(py))
     }
 
+    /// Stage a deletion of `oid` in `transaction`: a record with an empty
+    /// pickle. This is `deleteObject` of ZODB's `IExternalGC`. `oldserial`
+    /// is the serial that the transaction read. The vote checks it as it
+    /// does for `store`: a stale serial raises `ConflictError`, and the
+    /// vote never resolves it. After the commit, `load` of `oid` raises
+    /// `POSKeyError`, and `loadBefore` still gives the older records until
+    /// a pack removes them. A read-only storage refuses the call.
+    #[pyo3(name = "deleteObject")]
+    fn delete_object(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        oldserial: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let entry = self.entry(py, transaction)?;
+        let oid = Oid(u64_of(oid)?);
+        let serial = serial_of(oldserial)?;
+        py.detach(|| entry.with(|txn| Ok(txn.delete(oid, serial)?)))
+            .map_err(|failure| failure.into_py(py))
+    }
+
     /// Stage a new pickle of `oid` with the blob in the file `blobfilename`.
     /// `serial` is the serial that the transaction read, or `None` for a
     /// new object.

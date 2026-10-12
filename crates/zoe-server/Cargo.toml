@@ -26,6 +26,7 @@ required-features = ["serve"]
 
 [dependencies]
 clap.workspace = true
+serde_json.workspace = true
 zoe-convert.workspace = true
 zoe-core.workspace = true
 rmpv = { workspace = true, optional = true }
