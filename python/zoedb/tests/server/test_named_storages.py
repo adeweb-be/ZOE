@@ -83,7 +83,9 @@ def test_a_database_per_store_like_a_mount_point(server):
     try:
         with main.transaction() as conn:
             other = conn.get_connection("catalog")
-            other.root()["index"] = PersistentMapping(kind="catalog")
+            index = PersistentMapping(kind="catalog")
+            other.add(index)
+            other.root()["index"] = index
             conn.root()["site"] = PersistentMapping(kind="site")
             conn.root()["site"]["index"] = other.root()["index"]
         with main.transaction() as conn:
