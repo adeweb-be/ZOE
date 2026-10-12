@@ -118,8 +118,11 @@ impl Download {
     ///
     /// The reader checks the size and the hash of the blob at the end of
     /// the file. A read that fails returns its error, and
-    /// `receiveBlobStop` does not go out. So the client does not keep the
-    /// file.
+    /// `receiveBlobStop` does not go out. Then the stock client does not
+    /// put the bytes in its blob cache. But it keeps a partial `<blob>.dl`
+    /// file, and its next `receiveBlobStart` for that blob fails an
+    /// assertion. So `sendBlob` checks the whole blob before it sends the
+    /// first chunk.
     pub(crate) fn send(mut self, mut send: impl FnMut(Vec<u8>) -> bool) -> Result<bool, ZoeError> {
         let (oid, tid) = (self.oid, self.tid);
         let ids = || vec![p64(oid.0), p64(tid.0)];
@@ -386,6 +389,25 @@ mod tests {
         assert_eq!(files(&tmp), Vec::<String>::new());
     }
 
+    #[test]
+    fn the_next_open_of_the_store_removes_an_upload_file_that_a_crash_left() {
+        let dir = fresh_dir("crash");
+        let store = Store::open(&dir).unwrap();
+        let tmp = store.blob_temp_dir().unwrap();
+        let mut upload = Upload::create(&tmp).unwrap();
+        upload.write(b"a chunk").unwrap();
+        let path = upload.close().to_path_buf();
+        // A crash runs no drop, so the file stays.
+        std::mem::forget(upload);
+        drop(store);
+        assert!(path.exists(), "the close of the store keeps the file");
+
+        let store = Store::open(&dir).unwrap();
+        assert!(!path.exists(), "the open of the store removes the file");
+        assert_eq!(files(&tmp), Vec::<String>::new());
+        drop(store);
+    }
+
     /// A raw client of the ZEO 6 msgpack protocol.
     struct Client {
         stream: TcpStream,
@@ -443,6 +465,23 @@ mod tests {
             id
         }
 
+        /// Begin the transaction `txn`.
+        fn begin(&mut self, txn: &Value) {
+            let empty = Value::Binary(Vec::new());
+            let begin = vec![txn.clone(), empty.clone(), empty, Value::Map(vec![])];
+            self.send_async("tpc_begin", begin);
+        }
+
+        /// Tell if the server closed the connection. Wait at most
+        /// `TIMEOUT` for the end of the stream.
+        fn is_closed(&mut self) -> bool {
+            let mut byte = [0; 1];
+            match self.stream.read(&mut byte) {
+                Ok(n) => n == 0,
+                Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+            }
+        }
+
         /// Send a call and return the args of its reply, which must not be
         /// an error.
         fn call(&mut self, method: &str, args: Vec<Value>) -> Value {
@@ -458,9 +497,7 @@ mod tests {
         fn commit_blob(&mut self, oid: Oid, blob: &[u8]) -> Tid {
             let txn = Value::from(1);
             let pickle = Value::Binary(b"pickle".to_vec());
-            let empty = Value::Binary(Vec::new());
-            let begin = vec![txn.clone(), empty.clone(), empty, Value::Map(vec![])];
-            self.send_async("tpc_begin", begin);
+            self.begin(&txn);
             let store = vec![p64(oid.0), p64(0), pickle, txn.clone()];
             self.send_async("storea", store.clone());
             self.send_async("storeBlobStart", vec![]);
@@ -514,9 +551,7 @@ mod tests {
         let server = Server::start(ServeOptions::new(&dir)).unwrap();
         let mut client = Client::connect(server.addr());
         let txn = Value::from(1);
-        let empty = Value::Binary(Vec::new());
-        let begin = vec![txn.clone(), empty.clone(), empty, Value::Map(vec![])];
-        client.send_async("tpc_begin", begin);
+        client.begin(&txn);
         let pickle = Value::Binary(b"pickle".to_vec());
         client.send_async("storea", vec![p64(1), p64(0), pickle, txn]);
         client.send_async("storeBlobStart", vec![]);
@@ -530,13 +565,54 @@ mod tests {
         assert_eq!(fs::metadata(file).unwrap().len(), 59_000);
 
         drop(client);
+        wait_for_no_upload(&dir);
+        server.stop();
+        assert_eq!(files(&dir.join("blobs/tmp")), Vec::<String>::new());
+    }
+
+    /// Wait until the blob temporary directory of the store in `dir` has
+    /// no upload file.
+    fn wait_for_no_upload(dir: &Path) {
         let start = Instant::now();
-        while !uploads(&dir).is_empty() {
+        while !uploads(dir).is_empty() {
             assert!(start.elapsed() < TIMEOUT, "the upload file stays");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn an_error_of_a_blob_call_without_a_reply_closes_the_connection() {
+        let dir = fresh_dir("wire-close");
+        let server = Server::start(ServeOptions::new(&dir)).unwrap();
+        let txn = Value::from(1);
+        let chunk = vec![Value::Binary(vec![1; 10])];
+
+        // storeBlobStart without a transaction.
+        let mut client = Client::connect(server.addr());
+        client.send_async("storeBlobStart", vec![]);
+        assert!(client.is_closed(), "storeBlobStart");
+
+        // storeBlobChunk without storeBlobStart.
+        let mut client = Client::connect(server.addr());
+        client.begin(&txn);
+        client.send_async("storeBlobChunk", chunk.clone());
+        assert!(client.is_closed(), "storeBlobChunk");
+
+        // storeBlobEnd of another transaction, during an upload. The end of
+        // the session removes the upload file.
+        let mut client = Client::connect(server.addr());
+        client.begin(&txn);
+        client.send_async("storeBlobStart", vec![]);
+        client.send_async("storeBlobChunk", chunk);
+        let pickle = Value::Binary(b"pickle".to_vec());
+        let end = vec![p64(1), p64(0), pickle, Value::from(2)];
+        client.send_async("storeBlobEnd", end);
+        assert!(client.is_closed(), "storeBlobEnd");
+        wait_for_no_upload(&dir);
+
+        // The server stays up.
+        Client::connect(server.addr()).call("ping", vec![]);
         server.stop();
-        assert_eq!(files(&dir.join("blobs/tmp")), Vec::<String>::new());
     }
 
     /// Return the path of each blob file under `dir`.
