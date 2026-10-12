@@ -114,9 +114,9 @@ pub(super) struct ServeArgs {
     /// connections, commits each tpc_finish that it received and sends its
     /// reply, aborts the other transactions, closes each connection and
     /// closes the stores. Near the end of the time, it closes the
-    /// connections that remain at once. A store that a call still holds at
-    /// the end, such as a running pack, does not close cleanly. The command
-    /// exits with 0.
+    /// connections that remain at once. When a call still runs at the end,
+    /// such as a running pack, the store of that session does not close
+    /// cleanly, and the other stores close. The command exits with 0.
     #[arg(
         long,
         env = "ZOE_SHUTDOWN_TIMEOUT",

@@ -166,6 +166,19 @@ impl Storages {
         self.storages.iter().find(|storage| storage.name == name)
     }
 
+    /// Return the name of each storage whose store stays open when the
+    /// server drops `storages`. A session that runs holds the store of its
+    /// storage. A session that did not register yet holds every store.
+    pub(crate) fn held(storages: &Arc<Self>) -> Vec<&str> {
+        let all = Arc::strong_count(storages) > 1;
+        storages
+            .storages
+            .iter()
+            .filter(|storage| all || Arc::strong_count(&storage.store) > 1)
+            .map(|storage| storage.name.as_str())
+            .collect()
+    }
+
     /// Return the reply to `ruok`: the status of each storage. It reads the
     /// stores.
     fn ruok(&self) -> String {
@@ -495,6 +508,12 @@ mod tests {
 
     /// Connect to `addr`, answer the protocol and register.
     fn registered(addr: std::net::SocketAddr) -> Client {
+        registered_as(addr, "1")
+    }
+
+    /// Connect to `addr`, answer the protocol and register with the
+    /// storage `name`.
+    fn registered_as(addr: std::net::SocketAddr, name: &str) -> Client {
         let mut client = Client::connect(addr).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -505,7 +524,7 @@ mod tests {
             &mut client,
             1,
             "register",
-            vec![Value::from("1"), Value::Boolean(false)],
+            vec![Value::from(name), Value::Boolean(false)],
         );
         read_frame(&mut client);
         client
@@ -675,5 +694,83 @@ mod tests {
             (b"pickle".to_vec(), tid)
         );
         assert!(store.load(zoe_core::Oid(2)).is_err());
+    }
+
+    #[test]
+    fn a_session_past_the_shutdown_timeout_keeps_only_the_store_of_its_storage() {
+        use crate::serve::{ServeOptions, Server, StorageOptions};
+
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-stop-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = ServeOptions::with_storages([
+            StorageOptions::new("a", dir.join("a")),
+            StorageOptions::new("b", dir.join("b")),
+        ])
+        .lock_timeout(Duration::from_secs(60))
+        .shutdown_timeout(Duration::from_millis(400));
+        // The test keeps the store of a, so it can hold a lock there.
+        let mut kept = None;
+        let server = Server::start_with(options, |name, path, options| {
+            let store = Arc::new(Store::open_with(path, options).unwrap());
+            if name == "a" {
+                kept = Some(Arc::clone(&store));
+            }
+            Ok(store)
+        })
+        .unwrap();
+        let a = kept.unwrap();
+        let mut holder = a.tpc_begin(b"", b"", b"").unwrap();
+        holder
+            .store(zoe_core::Oid(1), Tid::ZERO, b"pickle")
+            .unwrap();
+        holder.vote().unwrap();
+        // A session on a votes on the same oid. Its vote waits for the lock
+        // past the shutdown timeout. A session on b ends at the stop.
+        let mut waiter = registered_as(server.addr(), "a");
+        begin_and_store(&mut waiter, 1);
+        send(&mut waiter, 2, "vote", vec![Value::from(7)]);
+        let _idle = registered_as(server.addr(), "b");
+        std::thread::sleep(Duration::from_millis(200));
+
+        server.stop();
+        // The store of b closed cleanly.
+        Store::open_read_only(dir.join("b")).unwrap();
+        // The abort of the holder ends the lock wait, so the session ends,
+        // and the store of a closes too.
+        drop(holder);
+        drop(a);
+        wait_until("the store of a stays open", || {
+            Store::open_read_only(dir.join("a")).is_ok()
+        });
+    }
+
+    #[test]
+    fn the_held_storages_are_those_whose_store_a_session_keeps() {
+        let named = |name: &str| {
+            let storage = storage(&format!("held-{name}"));
+            let store = Arc::clone(&storage.store);
+            Arc::new(NamedStorage::new(
+                name,
+                &storage.path,
+                store,
+                Queues::DEFAULT,
+            ))
+        };
+        let (a, b) = (named("a"), named("b"));
+        let storages = Arc::new(Storages::new(
+            vec![Arc::clone(&a), Arc::clone(&b)],
+            Queues::DEFAULT.client,
+        ));
+        assert!(Storages::held(&storages).is_empty());
+        // A session on a keeps the store of a.
+        let session = Arc::clone(&a.store);
+        assert_eq!(Storages::held(&storages), ["a"]);
+        drop(session);
+        // A session that did not register yet keeps every store.
+        let unregistered = Arc::clone(&storages);
+        assert_eq!(Storages::held(&storages), ["a", "b"]);
+        drop(unregistered);
+        assert!(Storages::held(&storages).is_empty());
     }
 }

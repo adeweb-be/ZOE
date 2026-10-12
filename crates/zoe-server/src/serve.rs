@@ -42,8 +42,8 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The last part of the shutdown timeout, in which a stop closes the
 /// connections that did not end and waits for their sessions. When the
-/// timeout is shorter than twice this part, the last half of the timeout is
-/// used.
+/// timeout is shorter than twice this part, the stop uses the last half of
+/// the timeout.
 const FORCED_CLOSE: Duration = Duration::from_secs(1);
 
 /// The longest shutdown timeout: 2^32 - 1 seconds, about 136 years. A
@@ -158,8 +158,9 @@ impl ServeOptions {
     /// for each connection to end by itself. At the end of the timeout less
     /// 1 second, or less half the timeout when that is shorter, it drops
     /// the connections that remain. Then it waits for their sessions until
-    /// the end of the timeout. A session that still runs then keeps its
-    /// store open: that store does not close cleanly.
+    /// the end of the timeout. A session that still runs then keeps the
+    /// store of that session open: that store does not close cleanly. The
+    /// other stores close.
     #[must_use]
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
@@ -237,6 +238,20 @@ impl Server {
     /// accepts connections. When a store does not open, close the stores
     /// that opened and fail.
     pub fn start(options: ServeOptions) -> Result<Self, Error> {
+        Self::start_with(options, |_, path, store_options| {
+            Store::open_with(path, store_options)
+                .map(Arc::new)
+                .map_err(|error| Error::Store(path.to_path_buf(), error))
+        })
+    }
+
+    /// Start as [`Server::start`] does, but open the store of each storage
+    /// with `open`. It gets the storage name, the store directory and the
+    /// options of the store.
+    pub(crate) fn start_with(
+        options: ServeOptions,
+        mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
+    ) -> Result<Self, Error> {
         options.check_storages()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -256,12 +271,11 @@ impl Server {
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
         for storage in &options.storages {
-            let store = Store::open_with(&storage.path, options.store_options(storage))
-                .map_err(|error| Error::Store(storage.path.clone(), error))?;
+            let store = open(&storage.name, &storage.path, options.store_options(storage))?;
             storages.push(Arc::new(NamedStorage::new(
                 &storage.name,
                 &storage.path,
-                Arc::new(store),
+                store,
                 options.queues,
             )));
         }
@@ -354,13 +368,13 @@ impl Server {
         std::thread::scope(|scope| {
             scope.spawn(move || runtime.shutdown_timeout(rest));
         });
-        // Each session holds the storages while it runs. When no session
-        // runs, this drop closes the stores.
+        // A session that runs holds the store of its storage. This drop
+        // closes every other store.
         if let Some(storages) = self.storages.take() {
-            if Arc::strong_count(&storages) > 1 {
+            for name in Storages::held(&storages) {
                 eprintln!(
                     "zoe serve: a session still runs at the end of the shutdown timeout; \
-                     its store does not close cleanly"
+                     the store of the storage {name} does not close cleanly"
                 );
             }
             drop(storages);
@@ -541,7 +555,14 @@ mod tests {
         server.stop();
         // The connection ends, and the store closes when its last session
         // ends.
-        assert!(matches!(client.read(&mut protocol), Ok(0) | Err(_)));
+        let read = client.read(&mut protocol);
+        assert!(
+            matches!(&read, Ok(0))
+                || read
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionReset),
+            "{read:?}"
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while Store::open_read_only(&dir).is_err() {
             assert!(Instant::now() < deadline, "the store stays open");

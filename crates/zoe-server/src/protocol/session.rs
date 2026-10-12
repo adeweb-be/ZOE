@@ -326,17 +326,26 @@ pub(crate) struct Session {
 /// `outbox`. The first `register` that names one of `storages` selects the
 /// storage of the connection. Return when `calls` closes, or when the
 /// session closes the connection. A transaction still open aborts.
+///
+/// After `register` selects its storage, the session keeps only that
+/// storage. So a session that runs past the shutdown timeout keeps only
+/// its own store open.
 pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
+    let mut storages = Some(storages);
     let mut session: Option<Session> = None;
     while let Some(call) = calls.blocking_recv() {
-        let outcome = match &mut session {
-            Some(session) => session.call(&call),
-            None => match select(&storages, &call) {
-                Ok(storage) => session
-                    .insert(Session::new(storage, outbox.clone()))
-                    .call(&call),
+        let outcome = match (&mut session, &storages) {
+            (Some(session), _) => session.call(&call),
+            (None, Some(all)) => match select(all, &call) {
+                Ok(storage) => {
+                    storages = None;
+                    session
+                        .insert(Session::new(storage, outbox.clone()))
+                        .call(&call)
+                }
                 Err(outcome) => outcome,
             },
+            (None, None) => unreachable!("a session without a storage keeps the storages"),
         };
         let reply = match outcome {
             Outcome::Published => None,
