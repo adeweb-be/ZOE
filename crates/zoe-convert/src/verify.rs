@@ -189,7 +189,8 @@ struct Walk {
     current: Vec<Oid>,
     /// The references to an oid after the oid of the record, which the
     /// walk did not reach yet: the oid that the reference names, then the
-    /// record.
+    /// record. ZODB gives a new object its oid when it pickles the parent,
+    /// so nearly every reference comes here: 24 bytes each.
     ahead: Vec<(Oid, Oid, Tid)>,
     /// The references that the walk found without a current record.
     missing: Vec<Dangling>,

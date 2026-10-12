@@ -71,4 +71,5 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - The references come from `persistent_ids`, with the node budget of the record length. Only `PersistentId::Oid` counts, as for `referencesf`. A reference dangles when its oid has no current record. A pair of a record and a missing oid comes once.
 - A record whose references do not read, or whose reference is not 8 bytes, is a finding in `pickles`. A store error is a finding, never a failure of the call.
 - A walk that stops early does not make a reference dangle: a load of the oid confirms each dangling reference.
+- The memory of `verify` grows with the number of oids and of references, not with the size of the records or of the transaction rows. The walk keeps 8 bytes for each oid with a current record. It keeps about 24 bytes for each reference to a later oid, in the list `ahead`, until the walk ends. ZODB gives a new object its oid when it pickles the parent, so nearly every reference in a store that ZODB builds points to a later oid.
 - A blob record without its record is not checked: no read of the store lists the blob records.
