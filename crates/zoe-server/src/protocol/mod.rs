@@ -26,6 +26,10 @@ mod outbox;
 mod session;
 mod status;
 
+/// The entry of the fuzz targets.
+#[cfg(any(test, feature = "fuzz"))]
+pub mod fuzz;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,10 +52,21 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
 
-/// The most calls that wait for the session of a connection, and the most
-/// replies that wait in its session queue. A full queue makes its sender
-/// wait. So an upload or a download holds a few chunks in memory, whatever
-/// the size of the blob.
+/// The most calls that wait for the session of a connection, decoded, and
+/// the most replies that wait in its session queue. A full queue makes its
+/// sender wait. When the call queue is full, the reader reads no more
+/// bytes, so TCP makes the client wait. So a connection holds at most this
+/// many decoded calls, the call that the reader holds, and the call that
+/// the session runs. An upload or a download holds a few chunks in memory,
+/// whatever the size of the blob. The session runs one call at a time and
+/// needs only the next calls ready: the bytes of a burst wait in the
+/// buffers of TCP.
+///
+/// The writer task empties the queues of the frames without the reader, so
+/// the reader, the session and the writer never wait for each other in a
+/// circle. Only a client that sends calls and reads no reply can stop its
+/// own connection: its replies fill the session queue, then its calls fill
+/// the call queue. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
 /// The name of the storage that the server serves. It is the default of
@@ -127,8 +142,13 @@ impl NamedStorage {
 }
 
 /// Serve one client on `stream` until it closes, or until the server
-/// closes the connection.
-pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorage>) {
+/// closes the connection. A frame longer than `max_frame_size` bytes closes
+/// the connection before the server reserves memory for it.
+pub(crate) async fn serve_connection(
+    stream: TcpStream,
+    storage: Arc<NamedStorage>,
+    max_frame_size: u32,
+) {
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
@@ -136,7 +156,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
     }
-    match frame::read(&mut reader).await {
+    match frame::read(&mut reader, max_frame_size).await {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
             // The status reads the store, so it runs on the blocking pool.
@@ -154,7 +174,11 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
             eprintln!("zoe serve: {peer}: the client does not speak the protocol M5");
             return;
         }
-        _ => return,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("zoe serve: {peer}: {error}");
+            return;
+        }
     }
 
     let (calls, received) = mpsc::channel(QUEUE);
@@ -199,7 +223,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
 
     loop {
         let read = tokio::select! {
-            read = frame::read(&mut reader) => read,
+            read = frame::read(&mut reader, max_frame_size) => read,
             () = closed.notified() => break,
             () = closing.wait() => break,
         };
@@ -211,7 +235,11 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
                 break;
             }
         };
-        let call = match message::decode(&bytes) {
+        let decoded = message::decode(&bytes);
+        // The call holds copies of its values. So the bytes of the frame go
+        // before the reader waits for room.
+        drop(bytes);
+        let call = match decoded {
             Ok(call) => call,
             Err(error) => {
                 eprintln!("zoe serve: {peer}: a frame is not a call: {error}");
@@ -280,7 +308,7 @@ mod tests {
         let served = Arc::clone(&storage);
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_connection(stream, served).await;
+            serve_connection(stream, served, crate::serve::DEFAULT_MAX_FRAME_SIZE.get()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();

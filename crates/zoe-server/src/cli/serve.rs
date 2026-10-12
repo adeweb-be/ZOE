@@ -67,6 +67,20 @@ pub(super) struct ServeArgs {
         value_parser = whole_seconds
     )]
     lock_timeout: Option<Duration>,
+
+    /// The longest frame that a client can send, in bytes. A longer frame
+    /// closes its connection before the server reserves memory for it. A
+    /// storea or restorea frame holds a whole record, so keep this limit
+    /// above the largest record: a copy through the server, as zodbconvert
+    /// does, fails on a record of the source that is longer. The default is
+    /// 268435456 bytes, 256 MiB.
+    #[arg(
+        long,
+        env = "ZOE_MAX_FRAME_SIZE",
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    max_frame_size: Option<u32>,
 }
 
 /// Parse a time in whole seconds, as ZConfig's `time-interval` does: a
@@ -92,6 +106,8 @@ fn whole_seconds(value: &str) -> Result<Duration, String> {
 /// Serve until SIGTERM. Write the line `listening <address>` to `out`.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
+    use std::num::NonZeroU32;
+
     use crate::serve::{ServeOptions, Server};
 
     let mut options = ServeOptions::new(&args.path)
@@ -100,6 +116,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX));
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
+    }
+    if let Some(bytes) = args.max_frame_size.and_then(NonZeroU32::new) {
+        options = options.max_frame_size(bytes);
     }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
     server.serve_until_signal(|addr| {
