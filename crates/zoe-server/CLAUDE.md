@@ -10,6 +10,8 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - `src/cli/mcp.rs`: `zoe mcp`. It calls `zoe-mcp`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/serve.rs`: `zoe_server::serve::{Server, ServeOptions}`, the server as a library. The binary and the Rust tests run it.
 - `src/protocol/`: the frames, the messages, the extension pickle, the session of a connection, the status of a storage and the times that the protocol sends. It compiles only with the feature `serve`.
+- `src/protocol/fuzz.rs`: `zoe_server::fuzz`, the entry of the fuzz targets. It reads bytes as the server reads the bytes of a client. It compiles with the feature `fuzz`, and in the unit tests, so `just check` and `just test` cover it.
+- `fuzz/`: the cargo-fuzz targets `frame` and `handshake`, and their seeds in `fuzz/corpus/`. It is a workspace of its own with its own `Cargo.lock`. `just fuzz` builds and runs the targets.
 
 ## Invariants of the command
 
@@ -33,6 +35,8 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - Core calls run on the blocking pool, never on the async runtime threads. Each connection runs its calls in order on one thread of the pool, so one thread drives each core transaction and the core never answers `WrongThread`.
 - The server announces `M5` and takes only `M5`. A frame is a 4-byte big-endian length, then the bytes. A reply carries the message id of its call, whatever its msgpack type. The id -1 is a heartbeat and gets no reply. An error goes out with the flags 2 and `[class, args]`, with the class names of ZODB's exceptions. An error of a call without a reply closes the connection, as in ZEO.
 - A frame with the id -1 is a heartbeat whatever its other parts: it gets no reply and changes nothing.
+- A frame longer than `--max-frame-size` (`ZOE_MAX_FRAME_SIZE`, 256 MiB by default) closes its connection. The server checks the length before it reserves memory for the frame. The limit applies to the frame of the protocol too. A frame inside the limit reserves at most 1 MiB before its bytes arrive. A `storea` frame holds a whole record, so the limit must stay above the largest record: the default is 16 times the size at which ZODB warns about a large record.
+- The bytes of a client never stop the server: a frame that is too long, cut, not msgpack, not a message or a call before `register` closes only its connection. No input makes the server panic or abort. `tests/fuzz_smoke.rs` checks it in each `just test`, and the targets of `fuzz/` check it in `just fuzz`.
 - The decode of a frame has a depth bound of 128 steps of rmpv, about 60 levels of arrays or maps. A deeper frame closes its connection, and the server stays up. A stock server takes deeper frames, but a ZEO message nests at most about 3 levels, and a transaction extension nests as deep as its dict.
 - `tpc_finish` replies only after the core made the commit durable.
 - A client can send `ruok` in place of `M5`. It needs no `register` and is not a connection of the status. The server sends `M5`, then one JSON payload `{storage id: status}` as Python's `json.dumps` writes it, then closes. The status reads the store on the blocking pool.
@@ -56,3 +60,5 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - `tests/cli.rs` is the acceptance test of the binary and of `cli::main`.
 - `tests/serve.rs` and `python/zoedb/tests/server/test_walking_skeleton.py` are the acceptance tests of `zoe serve`. `tests/wire/mod.rs` is a raw ZEO 6 client and a `zoe serve` process for the Rust tests of the server; it is part of the acceptance tests. The Python tests find the binary through `ZOE_BINARY`, which `just test` sets. `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script.
 - `tests/mcp.rs` is the acceptance test of `zoe mcp`. It compiles only with the feature `serve`.
+- `tests/fuzz_smoke.rs` is the acceptance test of the fuzz smoke: mutated messages, bad handshakes and false lengths against a `zoe serve` process.
+- `just fuzz [seconds] [targets]` builds the targets of `fuzz/` with libFuzzer and AddressSanitizer, with the flags of `cargo fuzz build`, and runs them. It needs no cargo-fuzz. The new inputs and the crash files go to `target/fuzz`, and the seeds in the repository do not change. The Dagger function `fuzz` runs it for an hour.

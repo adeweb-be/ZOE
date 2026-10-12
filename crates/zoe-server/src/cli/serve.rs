@@ -33,6 +33,18 @@ pub(super) struct ServeArgs {
         default_value = "127.0.0.1:8100"
     )]
     listen: SocketAddr,
+
+    /// The longest frame that a client can send, in bytes. A longer frame
+    /// closes its connection before the server reserves memory for it. A
+    /// storea frame holds a whole record, so keep this limit above the
+    /// largest record. The default is 268435456 bytes, 256 MiB.
+    #[arg(
+        long,
+        env = "ZOE_MAX_FRAME_SIZE",
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    max_frame_size: Option<u32>,
 }
 
 /// Serve until SIGTERM. Write the line `listening <address>` to `out`.
@@ -40,7 +52,10 @@ pub(super) struct ServeArgs {
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use crate::serve::{ServeOptions, Server};
 
-    let options = ServeOptions::new(&args.path).listen(args.listen);
+    let mut options = ServeOptions::new(&args.path).listen(args.listen);
+    if let Some(bytes) = args.max_frame_size {
+        options = options.max_frame_size(bytes);
+    }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
     server.serve_until_signal(|addr| {
         writeln!(out, "listening {addr}")?;

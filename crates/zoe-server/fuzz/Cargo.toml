@@ -1,0 +1,42 @@
+# The cargo-fuzz targets of `zoe serve`. `just fuzz` builds them with
+# libFuzzer and runs them. This package is a workspace of its own, so the
+# builds and the lints of the repository do not see it.
+#
+# The seeds in corpus/ are the client streams of the wire traces in
+# docs/spikes/zeo-wire: in corpus/frame, each stream up to 4 KiB; in
+# corpus/handshake, each stream up to the first call after the handshake.
+# A seed is the protocol of the client, then its messages, each one as a
+# frame.
+
+[package]
+name = "zoe-server-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zoe-server = { path = "..", features = ["fuzz"] }
+
+[workspace]
+members = ["."]
+
+# The frame decoder and the message decoder, in the process.
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+# A server on a new store, and one connection over TCP for each input.
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false

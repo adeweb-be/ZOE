@@ -13,6 +13,10 @@ mod message;
 mod session;
 mod status;
 
+/// The entry of the fuzz targets.
+#[cfg(any(test, feature = "fuzz"))]
+pub mod fuzz;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -80,8 +84,13 @@ impl NamedStorage {
 }
 
 /// Serve one client on `stream` until it closes, or until the server
-/// closes the connection.
-pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorage>) {
+/// closes the connection. A frame longer than `max_frame_size` bytes closes
+/// the connection before the server reserves memory for it.
+pub(crate) async fn serve_connection(
+    stream: TcpStream,
+    storage: Arc<NamedStorage>,
+    max_frame_size: u32,
+) {
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
@@ -89,7 +98,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
     }
-    match frame::read(&mut reader).await {
+    match frame::read(&mut reader, max_frame_size).await {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
             // The status reads the store, so it runs on the blocking pool.
@@ -132,7 +141,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
 
     loop {
         let read = tokio::select! {
-            read = frame::read(&mut reader) => read,
+            read = frame::read(&mut reader, max_frame_size) => read,
             () = closed.notified() => break,
         };
         let bytes = match read {

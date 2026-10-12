@@ -16,19 +16,28 @@ use zoe_core::{Store, ZoeError};
 
 use crate::protocol::{self, NamedStorage};
 
+/// The default of `--max-frame-size`: 256 MiB. A `storea` frame holds a
+/// whole record, and the store sets no limit on a record by default. ZODB
+/// warns about a record of more than 16 MiB, and a blob chunk is less than
+/// 64 KiB. So a stock client stays far below this limit.
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = 256 << 20;
+
 /// The settings of a server.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     path: PathBuf,
     listen: SocketAddr,
+    max_frame_size: u32,
 }
 
 impl ServeOptions {
-    /// Serve the store in `path` on a free port of 127.0.0.1.
+    /// Serve the store in `path` on a free port of 127.0.0.1, with frames
+    /// of at most [`DEFAULT_MAX_FRAME_SIZE`] bytes.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 
@@ -36,6 +45,14 @@ impl ServeOptions {
     #[must_use]
     pub fn listen(mut self, addr: SocketAddr) -> Self {
         self.listen = addr;
+        self
+    }
+
+    /// Close a connection that sends a frame longer than `bytes`, before
+    /// the server reserves memory for the frame.
+    #[must_use]
+    pub fn max_frame_size(mut self, bytes: u32) -> Self {
+        self.max_frame_size = bytes;
         self
     }
 }
@@ -93,7 +110,7 @@ impl Server {
             .map(Arc::new)
             .map_err(|error| Error::Store(options.path.clone(), error))?;
         let storage = NamedStorage::new(protocol::STORAGE_NAME, &options.path, Arc::clone(&store));
-        runtime.spawn(accept(listener, Arc::new(storage)));
+        runtime.spawn(accept(listener, Arc::new(storage), options.max_frame_size));
         Ok(Self {
             runtime: Some(runtime),
             store: Some(store),
@@ -174,13 +191,18 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(1024)
 }
 
-/// Accept clients until the runtime stops.
-async fn accept(listener: TcpListener, storage: Arc<NamedStorage>) {
+/// Accept clients until the runtime stops. Each connection takes frames of
+/// at most `max_frame_size` bytes.
+async fn accept(listener: TcpListener, storage: Arc<NamedStorage>, max_frame_size: u32) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(protocol::serve_connection(stream, Arc::clone(&storage)));
+                tokio::spawn(protocol::serve_connection(
+                    stream,
+                    Arc::clone(&storage),
+                    max_frame_size,
+                ));
             }
             Err(error) => {
                 eprintln!("zoe serve: accept failed: {error}");
