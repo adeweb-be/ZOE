@@ -20,6 +20,7 @@ mod clock;
 mod extension;
 pub(crate) mod frame;
 mod invalidation;
+mod iteration;
 mod message;
 mod outbox;
 mod session;
