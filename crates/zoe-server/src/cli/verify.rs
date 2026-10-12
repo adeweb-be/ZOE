@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use zoe_convert::Verification;
 use zoe_core::Store;
 
-use super::{Failure, store_failure};
+use super::{Failure, closed_by_reader, store_failure};
 
 /// The format of the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -62,15 +62,29 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     let written = match args.format {
         Format::Text => write_text(out, path, &report),
         Format::Json => write_json(out, &report),
-    };
-    // A store with a finding fails, also when the report does not go out.
-    match report.problems() {
-        0 => Ok(written?),
-        n => Err(Failure::Message(format!(
-            "{}: {n} findings: the report lists them",
-            path.display()
-        ))),
     }
+    .and_then(|()| out.flush());
+    found(path, report.problems(), written)
+}
+
+/// Return the result of a verification that found `n` findings in the
+/// store `path` and wrote its report with the result `written`.
+///
+/// A store with a finding fails, also when the report does not go out. A
+/// reader that closes stdout, as `head` does, got the start of the report.
+fn found(path: &Path, n: usize, written: io::Result<()>) -> Result<(), Failure> {
+    let (findings, them) = match n {
+        0 => return Ok(written?),
+        1 => ("1 finding".to_owned(), "it"),
+        n => (format!("{n} findings"), "them"),
+    };
+    let path = path.display();
+    Err(Failure::Message(match written {
+        Err(error) if !closed_by_reader(&error) => {
+            format!("{path}: {findings}; cannot write the report: {error}")
+        }
+        _ => format!("{path}: {findings}: the report lists {them}"),
+    }))
 }
 
 /// Read the classes of the file `path`: one `module.name` per line. Blank
@@ -228,6 +242,31 @@ mod tests {
         let dangling = "oid 0x0000000000000063 has no current record";
         assert!(text.contains(dangling), "{text}");
         assert!(text.contains("\n  2  app.Thing\n"), "{text}");
+    }
+
+    #[test]
+    fn the_message_counts_the_findings_and_names_a_write_error() {
+        let path = Path::new("store");
+        let message = |n, written| match found(path, n, written) {
+            Err(Failure::Message(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(message(1, Ok(())), "store: 1 finding: the report lists it");
+        let lists = "store: 2 findings: the report lists them";
+        assert_eq!(message(2, Ok(())), lists);
+        // A reader that closes stdout got the start of the report.
+        let closed = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert_eq!(message(2, Err(closed)), lists);
+        let full = io::Error::from(io::ErrorKind::StorageFull);
+        let text = message(1, Err(full));
+        assert!(
+            text.starts_with("store: 1 finding; cannot write the report: "),
+            "{text}"
+        );
+
+        assert!(found(path, 0, Ok(())).is_ok());
+        let full = io::Error::from(io::ErrorKind::StorageFull);
+        assert!(matches!(found(path, 0, Err(full)), Err(Failure::Report(_))));
     }
 
     #[test]
