@@ -19,11 +19,22 @@
 //! the other clients. The hub holds its mutex while it puts frames in the
 //! queues, never while a frame goes out to the network.
 //!
+//! A `loadBefore` reply shows only the commits that the hub published, and
+//! it takes its place in the order of its connection under the mutex of
+//! the hub, when the hub published no commit since the read. So the reply
+//! comes after the invalidation of each commit that it shows, and before
+//! the invalidation of each later commit.
+//!
 //! `register`, `lastTransaction` and `getInvalidations` read the last
-//! published tid, and `loadBefore` takes its place in the order of its
-//! connection, under the mutex of the hub. So each reply comes after the
-//! invalidation of each commit that it includes, and before the
-//! invalidation of each commit that it does not include.
+//! published tid under the mutex, and their replies take their places
+//! later, outside it. So each of these replies comes after the
+//! invalidation of each commit up to its tid. The invalidation of a later
+//! commit can come before it. A stock client applies only the
+//! invalidations after the tid of these replies, so it accepts that.
+//!
+//! Every commit of a store passes through the hub of that store exactly
+//! once, and each store has one hub. A commit that bypasses the hub never
+//! publishes its tid, and each later commit waits for it forever.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,10 +49,9 @@ pub(crate) type ClientId = u64;
 /// What the other clients of the storage get for one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Others {
-    /// This frame: the `invalidateTransaction` of the commit.
+    /// This frame: the `invalidateTransaction` of the commit. Its list of
+    /// oids is empty for a commit that wrote no oid, as from ZEO.
     Send(Vec<u8>),
-    /// Nothing, because the commit wrote no oid, as in ZEO.
-    Nothing,
     /// A close of their connections, because the oids of the commit are
     /// not known. Each client verifies its cache when it connects again.
     Close,
@@ -159,6 +169,20 @@ impl Invalidations {
         (state.published == seen).then(|| outbox.place())
     }
 
+    /// Run `read` with the last published tid, then take the next place of
+    /// `outbox`, both under the mutex of the hub. So the hub publishes no
+    /// commit between the read and the place. The hub waits for the read,
+    /// so a reader calls this only after `place_since` failed a few times.
+    pub(crate) fn read_placed<T>(
+        &self,
+        outbox: &Outbox,
+        read: impl FnOnce(Tid) -> T,
+    ) -> (T, Place) {
+        let state = self.lock();
+        let value = read(state.published);
+        (value, outbox.place())
+    }
+
     /// Return the publication of `commit`. Dropping the publication
     /// publishes the commit.
     pub(crate) fn prepare(&self, commit: Commit) -> Publication<'_> {
@@ -211,7 +235,6 @@ impl State {
         let mut overflows = 0;
         let invalidation = match others {
             Others::Send(bytes) => Some(Arc::new(bytes)),
-            Others::Nothing => None,
             Others::Close => {
                 for (&id, client) in &self.clients {
                     if Some(id) != origin {
@@ -413,15 +436,16 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_without_oids_gives_the_others_nothing() {
-        let hub = Invalidations::new(Tid(0));
-        let (mut writer, mut other) = (Client::new(&hub, 10), Client::new(&hub, 10));
-        let mut commit = writer.commit(0, 1);
-        commit.others = Others::Nothing;
-        hub.publish(commit);
-        assert!(other.take().is_empty());
-        assert!(!other.closing.is_closed());
-        assert_eq!(writer.take(), text(&["info 1", "reply 1"]));
+    fn a_read_under_the_mutex_takes_its_place_before_a_later_commit() {
+        let hub = Invalidations::new(Tid(4));
+        let mut writer = Client::new(&hub, 10);
+        let mut reader = Client::new(&hub, 10);
+        let (seen, place) = hub.read_placed(&reader.outbox, |published| published);
+        assert_eq!(seen, Tid(4));
+        hub.publish(writer.commit(4, 5));
+        assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));
+        assert_eq!(reader.take(), text(&["load", "inv 5"]));
+        assert_eq!(writer.take(), text(&["info 5", "reply 5"]));
     }
 
     #[test]

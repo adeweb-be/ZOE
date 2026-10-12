@@ -24,6 +24,19 @@ use super::status::Stats;
 /// The most oids that one `new_oids` call gives, as in ZEO.
 const MAX_NEW_OIDS: u64 = 100;
 
+/// The reads of a `loadBefore` that can each meet a publication before
+/// the call reads under the mutex of the hub.
+const LOAD_TRIES: usize = 3;
+
+/// The class of a conflict error of ZODB.
+const CONFLICT_ERROR: &str = "ZODB.POSException.ConflictError";
+
+/// The class of a read conflict error of ZODB.
+const READ_CONFLICT_ERROR: &str = "ZODB.POSException.ReadConflictError";
+
+/// The class of a transaction error of ZODB.
+const TRANSACTION_ERROR: &str = "ZODB.POSException.StorageTransactionError";
+
 /// The text of a conflict error of ZODB.
 const CONFLICT: &str = "database conflict error";
 
@@ -71,7 +84,17 @@ impl Fault {
     }
 
     fn transaction(text: impl Into<String>) -> Self {
-        Self::new("ZODB.POSException.StorageTransactionError", text)
+        Self::new(TRANSACTION_ERROR, text)
+    }
+
+    /// The error of a call for the transaction `given` when `current` is
+    /// the open transaction. The args are `(current or None, given)`, as
+    /// ZEO gives them.
+    fn not_current(current: Option<&Value>, given: &Value) -> Self {
+        Self {
+            class: TRANSACTION_ERROR,
+            args: Value::Array(vec![current.cloned().unwrap_or(Value::Nil), given.clone()]),
+        }
     }
 
     fn read_only() -> Self {
@@ -92,34 +115,68 @@ impl Fault {
         self.class.ends_with("ConflictError")
     }
 
-    /// Return the exception of ZODB for `error`. `serials` are the current
-    /// serial and the serial that the transaction read, for a conflict.
-    fn of(error: &ZoeError, serials: Option<(Tid, Tid)>) -> Self {
-        let conflict = |class, message: &str, oid: Oid| {
-            let serials = serials.map_or(Value::Nil, |(current, read)| {
-                Value::Array(vec![p64(current.0), p64(read.0)])
-            });
-            Self {
-                class,
-                args: Value::Map(vec![
-                    (Value::from("message"), Value::from(message)),
-                    (Value::from("oid"), p64(oid.0)),
-                    (Value::from("class_name"), Value::Nil),
-                    (Value::from("serials"), serials),
-                ]),
-            }
-        };
+    /// A conflict on `oid`, as ZEO sends it: the `__dict__` of the
+    /// exception, with the current serial and the serial that the
+    /// transaction read, and the class of the object.
+    fn conflict(
+        class: &'static str,
+        message: &str,
+        oid: Oid,
+        serials: Option<(Tid, Tid)>,
+        class_name: Option<String>,
+    ) -> Self {
+        let serials = serials.map_or(Value::Nil, |(current, read)| {
+            Value::Array(vec![p64(current.0), p64(read.0)])
+        });
+        Self {
+            class,
+            args: Value::Map(vec![
+                (Value::from("message"), Value::from(message)),
+                (Value::from("oid"), p64(oid.0)),
+                (
+                    Value::from("class_name"),
+                    class_name.map_or(Value::Nil, Value::from),
+                ),
+                (Value::from("serials"), serials),
+            ]),
+        }
+    }
+
+    /// Return the exception of ZODB for an error of the vote of `txn`. A
+    /// conflict carries the serials of the stale oid. A `ConflictError`
+    /// also carries the class of the object that `txn` stored, and a
+    /// `ReadConflictError` has none, as in ZEO.
+    fn of_vote(error: &ZoeError, txn: &Txn<Arc<Store>>) -> Self {
+        match *error {
+            ZoeError::Conflict { oid } => Self::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                oid,
+                txn.conflict_serials(),
+                txn.staged_class_name(oid),
+            ),
+            ZoeError::ReadConflict { oid } => Self::conflict(
+                READ_CONFLICT_ERROR,
+                READ_CONFLICT,
+                oid,
+                txn.conflict_serials(),
+                None,
+            ),
+            _ => Self::of(error),
+        }
+    }
+
+    /// Return the exception of ZODB for `error`.
+    fn of(error: &ZoeError) -> Self {
         let text = error.to_string();
-        match error {
+        match *error {
             ZoeError::NotFound { oid } => Self {
                 class: "ZODB.POSException.POSKeyError",
                 args: Value::Array(vec![p64(oid.0)]),
             },
-            ZoeError::Conflict { oid } => {
-                conflict("ZODB.POSException.ConflictError", CONFLICT, *oid)
-            }
+            ZoeError::Conflict { oid } => Self::conflict(CONFLICT_ERROR, CONFLICT, oid, None, None),
             ZoeError::ReadConflict { oid } => {
-                conflict("ZODB.POSException.ReadConflictError", READ_CONFLICT, *oid)
+                Self::conflict(READ_CONFLICT_ERROR, READ_CONFLICT, oid, None, None)
             }
             ZoeError::ReadOnly => Self::read_only(),
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } | ZoeError::WrongThread => {
@@ -138,7 +195,7 @@ impl Fault {
 
 impl From<ZoeError> for Fault {
     fn from(error: ZoeError) -> Self {
-        Self::of(&error, None)
+        Self::of(&error)
     }
 }
 
@@ -170,10 +227,24 @@ impl From<Result<Value, Fault>> for Outcome {
 struct Open {
     /// The id that the client gave to the transaction.
     id: Value,
-    txn: Txn<Arc<Store>>,
-    /// The first error of a `storea`. The vote fails with it, as ZEO
-    /// reports the errors of its stores at the vote.
-    failed: Option<ZoeError>,
+    /// The core transaction, or the first error of the transaction: an
+    /// error of `tpc_begin` or of a call without a reply. The vote fails
+    /// with that error, as ZEO reports these errors at the vote. The error
+    /// takes the place of the core transaction, so the core transaction
+    /// drops, and that aborts it.
+    txn: Result<Txn<Arc<Store>>, Fault>,
+}
+
+impl Open {
+    /// Run `step` on the core transaction. An error of `step` ends the core
+    /// transaction and fails the vote. After an error, `step` does not run.
+    fn stage(&mut self, step: impl FnOnce(&mut Txn<Arc<Store>>) -> Result<(), Fault>) {
+        if let Ok(txn) = &mut self.txn
+            && let Err(fault) = step(txn)
+        {
+            self.txn = Err(fault);
+        }
+    }
 }
 
 /// The state of one connection.
@@ -316,6 +387,8 @@ impl Session {
             "record_iternext" => self.record_iternext(args),
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
+            "checkCurrentSerialInTransaction" => self.check_current_serial(args),
+            "deleteObject" => self.delete_object(args),
             "vote" => self.vote(args),
             "tpc_finish" => return self.tpc_finish(call),
             "tpc_abort" => self.tpc_abort(args),
@@ -402,30 +475,47 @@ impl Session {
     /// Load the record of an oid before a tid: `[data, serial, next serial
     /// or nil]`, or nil.
     ///
-    /// A stock client keeps a record without a next serial as the current
-    /// one. So the reply goes out before the invalidation of each commit
-    /// that the read did not see: the call takes its place in the order of
-    /// the connection when the hub published no commit since the read
-    /// began. Otherwise it reads again.
+    /// The reply shows the commits that the hub published, and no other:
+    /// the read takes the record before the last published tid plus 1 at
+    /// most, and it gives a next serial only when the hub published it. The
+    /// reply then takes its place in the order of the connection, if the
+    /// hub published no commit during the read. So the reply comes after
+    /// the invalidation of each commit that it shows, and before the
+    /// invalidation of each later commit. A stock client keeps a record
+    /// without a next serial as the current one, and needs this order.
+    ///
+    /// A publication during the read makes the call read again. After
+    /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
     fn load_before(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, tid] = arity::<2>(args, "loadBefore")?;
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
-        let invalidations = &self.storage.invalidations;
-        loop {
-            let seen = invalidations.published();
-            let value = match self.store.load_before(oid, tid)? {
+        let store = &self.store;
+        let read = |published: Tid| -> Result<Value, Fault> {
+            let before = tid.min(Tid(published.0.saturating_add(1)));
+            Ok(match store.load_before(oid, before)? {
                 Some(record) => Value::Array(vec![
                     Value::Binary(record.data),
                     p64(record.serial.0),
-                    record.next.map_or(Value::Nil, |next| p64(next.0)),
+                    record
+                        .next
+                        .filter(|next| *next <= published)
+                        .map_or(Value::Nil, |next| p64(next.0)),
                 ]),
                 None => Value::Nil,
-            };
+            })
+        };
+        let invalidations = &self.storage.invalidations;
+        for _ in 0..LOAD_TRIES {
+            let seen = invalidations.published();
+            let value = read(seen)?;
             if let Some(place) = invalidations.place_since(seen, &self.outbox) {
                 self.place = Some(place);
                 return Ok(value);
             }
         }
+        let (value, place) = invalidations.read_placed(&self.outbox, read);
+        self.place = Some(place);
+        value
     }
 
     fn load_serial(&self, args: &[Value]) -> Result<Value, Fault> {
@@ -486,26 +576,36 @@ impl Session {
         ]))
     }
 
+    /// Begin the transaction of the client. `tpc_begin` has no reply, so
+    /// an error in it fails the vote of the transaction, and the
+    /// connection stays open.
+    ///
+    /// A tid in the args begins a restore transaction, which commits under
+    /// that tid. As in ZEO, a second `tpc_begin` of the open transaction
+    /// does nothing. A `tpc_begin` of another transaction leaves the open
+    /// one as it is: a later call of the other transaction fails, because
+    /// it is not the open one.
     fn tpc_begin(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let Some(id) = args.first() else {
+            return Err(Fault::type_error("tpc_begin takes 4 to 6 arguments"));
+        };
+        if self.open.is_none() {
+            let txn = self.begin(args);
+            self.open = Some(Open {
+                id: id.clone(),
+                txn,
+            });
+        }
+        Ok(Value::Nil)
+    }
+
+    /// Return the core transaction that `args` of `tpc_begin` describe.
+    fn begin(&self, args: &[Value]) -> Result<Txn<Arc<Store>>, Fault> {
         if args.len() < 4 || args.len() > 6 {
             return Err(Fault::type_error("tpc_begin takes 4 to 6 arguments"));
         }
         if self.read_only {
             return Err(Fault::read_only());
-        }
-        let id = &args[0];
-        if let Some(open) = &self.open {
-            if &open.id == id {
-                return Ok(Value::Nil);
-            }
-            return Err(Fault::transaction(
-                "Multiple simultaneous tpc_begin requests from one client.",
-            ));
-        }
-        if args.get(4).is_some_and(|tid| !tid.is_nil()) {
-            return Err(Fault::transaction(
-                "the server does not take restore transactions yet",
-            ));
         }
         if args
             .get(5)
@@ -516,66 +616,86 @@ impl Session {
         let user = text_bytes(&args[1])?;
         let description = text_bytes(&args[2])?;
         let ext = extension::pickle(&args[3]).map_err(Fault::type_error)?;
-        let txn = Txn::begin(Arc::clone(&self.store), &user, &description, &ext);
-        self.open = Some(Open {
-            id: id.clone(),
-            txn,
-            failed: None,
-        });
-        Ok(Value::Nil)
-    }
-
-    /// Return the open transaction with the id `id`.
-    fn current(&mut self, id: &Value, method: &str) -> Result<&mut Open, Fault> {
-        match &mut self.open {
-            Some(open) if &open.id == id => Ok(open),
-            Some(_) => Err(Fault::transaction(format!(
-                "{method}: the transaction is not the current one"
-            ))),
-            None => Err(Fault::transaction(format!(
-                "{method}: no current transaction"
-            ))),
-        }
-    }
-
-    fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, serial, data, id] = arity::<4>(args, "storea")?;
-        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        let Value::Binary(data) = data else {
-            return Err(Fault::type_error("data is not bytes"));
-        };
-        let open = self.current(id, "storea")?;
-        if open.failed.is_none()
-            && let Err(error) = open.txn.store(oid, serial, data)
-        {
-            open.failed = Some(error);
-        }
-        Ok(Value::Nil)
-    }
-
-    fn vote(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [id] = arity::<1>(args, "vote")?;
-        let open = self.current(id, "vote")?;
-        if let Some(error) = open.failed.take() {
-            self.open = None;
-            return Err(error.into());
-        }
-        match open.txn.vote() {
-            Ok(()) => Ok(Value::Array(vec![])),
-            Err(error) => {
-                let fault = Fault::of(&error, open.txn.conflict_serials());
-                // Dropping the transaction aborts it.
-                self.open = None;
-                Err(fault)
+        let store = Arc::clone(&self.store);
+        match args.get(4).filter(|tid| !tid.is_nil()) {
+            None => Ok(Txn::begin(store, &user, &description, &ext)),
+            Some(tid) => {
+                let tid = Tid(u64_of(tid)?);
+                Ok(Txn::begin_restore(store, tid, &user, &description, &ext)?)
             }
         }
     }
 
-    /// Finish the current transaction. The reply goes out with the
+    /// Return the open transaction with the id `id`. Another id fails with
+    /// `StorageTransactionError`, whose args are the id of the open
+    /// transaction, or None, and `id`.
+    fn current(&mut self, id: &Value) -> Result<&mut Open, Fault> {
+        let current = self.open.as_ref().map(|open| &open.id);
+        if current != Some(id) {
+            return Err(Fault::not_current(current, id));
+        }
+        Ok(self.open.as_mut().expect("the open transaction"))
+    }
+
+    fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, id] = arity::<4>(args, "storea")?;
+        self.current(id)?.stage(|txn| {
+            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let Value::Binary(data) = data else {
+                return Err(Fault::type_error("data is not bytes"));
+            };
+            Ok(txn.store(oid, serial, data)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Record that the transaction read `oid` at `serial`. The vote takes
+    /// a shared lock on `oid`, and a stale serial fails the vote with
+    /// `ReadConflictError`.
+    fn check_current_serial(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, id] = arity::<3>(args, "checkCurrentSerialInTransaction")?;
+        self.current(id)?.stage(|txn| {
+            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            Ok(txn.check_current_serial(oid, serial)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage a deletion of `oid`. The vote checks `serial` as it does for
+    /// `storea`.
+    fn delete_object(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, id] = arity::<3>(args, "deleteObject")?;
+        self.current(id)?.stage(|txn| {
+            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            Ok(txn.delete(oid, serial)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Vote. A failed vote ends the transaction, as in ZEO: the core
+    /// transaction drops, which releases its locks. So the `tpc_abort`
+    /// that follows finds no transaction.
+    fn vote(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [id] = arity::<1>(args, "vote")?;
+        let open = self.current(id)?;
+        let voted = match &mut open.txn {
+            Ok(txn) => txn.vote().map_err(|error| Fault::of_vote(&error, txn)),
+            Err(fault) => Err(fault.clone()),
+        };
+        if voted.is_err() {
+            self.open = None;
+        }
+        voted.map(|()| Value::Array(vec![]))
+    }
+
+    /// Commit the transaction. Its reply, the tid, goes out with the
     /// invalidations of the commit. A finish that fails publishes nothing.
+    /// As in ZEO, a finish of a transaction that is not the open one does
+    /// nothing and gives None.
     fn tpc_finish(&mut self, call: &Call) -> Outcome {
         let finished = match self.finish(&call.args) {
-            Ok(finished) => finished,
+            Ok(Some(finished)) => finished,
+            Ok(None) => return Outcome::Done(Value::Nil),
             Err(fault) => return Outcome::Failed(fault),
         };
         let reply = (!call.oneway).then(|| message::reply(call.id.clone(), p64(finished.tid.0)));
@@ -583,16 +703,24 @@ impl Session {
         Outcome::Published
     }
 
-    fn finish(&mut self, args: &[Value]) -> Result<Finished, Fault> {
+    /// Commit the open transaction with the id of `args`. Return `None`
+    /// when no such transaction is open.
+    fn finish(&mut self, args: &[Value]) -> Result<Option<Finished>, Fault> {
         let [id] = arity::<1>(args, "tpc_finish")?;
-        self.current(id, "tpc_finish")?;
-        let open = self.open.take().expect("the current transaction");
+        if !self.open.as_ref().is_some_and(|open| &open.id == id) {
+            return Ok(None);
+        }
+        let open = self.open.take().expect("the open transaction");
+        let Ok(txn) = open.txn else {
+            return Err(Fault::transaction("tpc_finish before vote"));
+        };
         // The core returns only after the commit is durable.
-        Ok(open.txn.finish_after()?)
+        Ok(Some(txn.finish_after()?))
     }
 
     /// Publish a commit of this connection. Every other client gets its
-    /// invalidation. This client gets `info`, then `reply`.
+    /// invalidation, with an empty list for a commit that wrote no oid, as
+    /// from ZEO. This client gets `info`, then `reply`.
     ///
     /// The oids come from the transaction index of the store. When they do
     /// not read, the hub closes the other connections, so each client
@@ -610,7 +738,6 @@ impl Session {
         });
         let tid = finished.tid;
         let others = match self.store.written_oids(tid, tid, usize::MAX) {
-            Ok(Some(oids)) if oids.is_empty() => Others::Nothing,
             Ok(Some(oids)) => Others::Send(message::notify(
                 "invalidateTransaction",
                 vec![
@@ -679,9 +806,9 @@ impl Session {
         let [id] = arity::<1>(args, "tpc_abort")?;
         // As in ZEO, an abort of another transaction does nothing.
         if self.open.as_ref().is_some_and(|open| &open.id == id)
-            && let Some(open) = self.open.take()
+            && let Some(Open { txn: Ok(txn), .. }) = self.open.take()
         {
-            open.txn.abort();
+            txn.abort();
         }
         Ok(Value::Nil)
     }
@@ -749,10 +876,14 @@ fn truth(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use super::super::outbox::Inbox;
+    use super::*;
     use crate::protocol::Queues;
+
+    /// A pickle of a `persistent.mapping.PersistentMapping` record, as ZODB
+    /// writes it: the class pickle, then the state pickle.
+    const MAPPING: &[u8] = b"\x80\x03X\x12\x00\x00\x00persistent.mappingq\x00\
+        X\x11\x00\x00\x00PersistentMappingq\x01\x86q\x02N\x86q\x03.\x80\x03}q\x00.";
 
     /// Return an outbox whose frames go nowhere.
     fn outbox() -> Outbox {
@@ -804,6 +935,52 @@ mod tests {
         u64_of(&done(call(s, "lastTransaction", vec![]))).unwrap()
     }
 
+    /// Begin the transaction `id`, with the tid `tid` for a restore
+    /// transaction.
+    fn begin(s: &mut Session, id: i64, tid: Option<u64>) {
+        let tid = tid.map_or(Value::Nil, p64);
+        let args = vec![
+            Value::from(id),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            tid,
+            Value::from(" "),
+        ];
+        assert_eq!(done(call(s, "tpc_begin", args)), Value::Nil);
+    }
+
+    fn store(s: &mut Session, id: i64, oid: u64, serial: u64, data: &[u8]) {
+        let args = vec![
+            p64(oid),
+            p64(serial),
+            Value::Binary(data.to_vec()),
+            Value::from(id),
+        ];
+        assert_eq!(done(call(s, "storea", args)), Value::Nil);
+    }
+
+    /// Vote and finish the transaction `id`. Return the committed tid, or
+    /// the exception of the vote.
+    fn vote_and_finish(s: &mut Session, id: i64) -> Result<u64, Fault> {
+        match call(s, "vote", vec![Value::from(id)]) {
+            Outcome::Done(_) => Ok(finish(s, Value::from(id))),
+            outcome => Err(failed(outcome)),
+        }
+    }
+
+    /// The value of `key` in the args of a conflict.
+    fn item(fault: &Fault, key: &str) -> Value {
+        let Value::Map(items) = &fault.args else {
+            panic!("the args of a conflict are a map: {fault:?}");
+        };
+        items
+            .iter()
+            .find(|(name, _)| name.as_str() == Some(key))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("no {key} in {fault:?}"))
+    }
+
     #[test]
     fn a_call_before_register_closes_the_connection() {
         let mut s = session("before-register");
@@ -843,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_client_gets_no_oid_and_begins_nothing() {
+    fn a_read_only_client_gets_no_oid_and_its_vote_fails() {
         let mut s = session("read-only");
         done(call(
             &mut s,
@@ -852,18 +1029,16 @@ mod tests {
         ));
         let fault = failed(call(&mut s, "new_oids", vec![]));
         assert_eq!(fault, Fault::read_only());
-        let args = vec![Value::from(1), Value::Nil, Value::Nil, Value::Map(vec![])];
-        assert_eq!(failed(call(&mut s, "tpc_begin", args)), Fault::read_only());
+        begin(&mut s, 1, None);
+        store(&mut s, 1, 1, 0, b"a");
+        let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
+        assert_eq!(fault, Fault::read_only());
+        assert!(s.open.is_none());
     }
 
     #[test]
     fn new_oids_gives_at_most_100_and_at_least_1() {
-        let mut s = session("new-oids");
-        done(call(
-            &mut s,
-            "register",
-            vec![Value::from("1"), Value::Boolean(false)],
-        ));
+        let mut s = registered("new-oids");
         let count = |v: Value| v.as_array().unwrap().len();
         assert_eq!(count(done(call(&mut s, "new_oids", vec![]))), 100);
         assert_eq!(
@@ -878,63 +1053,257 @@ mod tests {
 
     #[test]
     fn a_failed_store_fails_the_vote_and_ends_the_transaction() {
-        let mut s = session("failed-store");
-        done(call(
-            &mut s,
-            "register",
-            vec![Value::from("1"), Value::Boolean(false)],
-        ));
-        let id = Value::from(9);
-        let begin = vec![id.clone(), Value::Nil, Value::Nil, Value::Map(vec![])];
-        done(call(&mut s, "tpc_begin", begin));
-        // An empty pickle is refused by the core.
-        let store = vec![p64(1), p64(0), Value::Binary(vec![]), id.clone()];
-        done(call(&mut s, "storea", store));
-        let fault = failed(call(&mut s, "vote", vec![id.clone()]));
-        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        let mut s = registered("failed-store");
+        begin(&mut s, 9, None);
+        // The core refuses an empty pickle. The calls after it do nothing.
+        store(&mut s, 9, 1, 0, b"");
+        store(&mut s, 9, 2, 0, b"a");
+        let fault = failed(call(&mut s, "vote", vec![Value::from(9)]));
+        assert_eq!(fault.class, TRANSACTION_ERROR);
         assert!(s.open.is_none());
-        let fault = failed(call(&mut s, "tpc_finish", vec![id]));
-        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        // As in ZEO, a finish or an abort of no transaction gives None.
+        assert_eq!(
+            done(call(&mut s, "tpc_finish", vec![Value::from(9)])),
+            Value::Nil
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(9)])),
+            Value::Nil
+        );
+        let load = vec![p64(2), p64(u64::MAX)];
+        assert_eq!(
+            failed(call(&mut s, "loadBefore", load)).class,
+            "ZODB.POSException.POSKeyError"
+        );
     }
 
     #[test]
-    fn a_stale_serial_is_a_conflict_error_with_the_serials() {
-        let mut s = session("conflict");
-        done(call(
-            &mut s,
-            "register",
-            vec![Value::from("1"), Value::Boolean(false)],
-        ));
-        let commit = |s: &mut Session, id: i64, serial: u64| {
-            let id = Value::from(id);
-            done(call(
-                s,
-                "tpc_begin",
-                vec![id.clone(), Value::Nil, Value::Nil, Value::Nil],
-            ));
-            let data = Value::Binary(b"x".to_vec());
-            done(call(
-                s,
-                "storea",
-                vec![p64(0), p64(serial), data, id.clone()],
-            ));
-            match call(s, "vote", vec![id.clone()]) {
-                Outcome::Done(_) => Ok(finish(s, id)),
-                outcome => Err(failed(outcome)),
+    fn an_error_of_tpc_begin_fails_the_vote_and_keeps_the_connection() {
+        let mut s = registered("begin-errors");
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let bad_status = vec![
+            Value::from(2),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            Value::Nil,
+            Value::from("p"),
+        ];
+        let bad_extension = vec![Value::from(2), Value::Nil, Value::Nil, Value::from(3)];
+        let old_tid = vec![
+            Value::from(2),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            p64(first),
+        ];
+        let short_tid = vec![
+            Value::from(2),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            Value::Binary(vec![1]),
+        ];
+        for args in [bad_status, bad_extension, old_tid, short_tid] {
+            assert_eq!(done(call(&mut s, "tpc_begin", args.clone())), Value::Nil);
+            store(&mut s, 2, 1, first, b"b");
+            let fault = failed(call(&mut s, "vote", vec![Value::from(2)]));
+            assert!(
+                [TRANSACTION_ERROR, "builtins.TypeError"].contains(&fault.class),
+                "{args:?}: {fault:?}"
+            );
+            assert_eq!(
+                done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+                Value::Nil
+            );
+        }
+        // Nothing changed, and the session takes the next transaction.
+        assert_eq!(s.store.last_transaction(), Tid(first));
+        commit(&mut s, 3, 1, first, b"c").unwrap();
+    }
+
+    #[test]
+    fn a_call_of_another_transaction_names_both_ids() {
+        let mut s = registered("other-transaction");
+        let fault = failed(call(&mut s, "vote", vec![Value::from(7)]));
+        assert_eq!(fault, Fault::not_current(None, &Value::from(7)));
+        assert_eq!(fault.args, Value::Array(vec![Value::Nil, Value::from(7)]));
+
+        begin(&mut s, 1, None);
+        // A second tpc_begin, of this transaction or of another one, does
+        // nothing.
+        begin(&mut s, 1, None);
+        begin(&mut s, 2, None);
+        let fault = failed(call(&mut s, "vote", vec![Value::from(2)]));
+        assert_eq!(
+            fault.args,
+            Value::Array(vec![Value::from(1), Value::from(2)])
+        );
+        for method in ["storea", "checkCurrentSerialInTransaction", "deleteObject"] {
+            let mut args = vec![p64(1), p64(0), Value::Binary(b"a".to_vec())];
+            if method != "storea" {
+                args.pop();
             }
-        };
-        let first = commit(&mut s, 1, 0).unwrap();
-        let fault = commit(&mut s, 2, 0).unwrap_err();
-        assert_eq!(fault.class, "ZODB.POSException.ConflictError");
-        let Value::Map(items) = fault.args else {
-            panic!("the args of a conflict are a map");
-        };
-        let serials = items
-            .iter()
-            .find(|(key, _)| key.as_str() == Some("serials"))
-            .map(|(_, value)| value.clone())
-            .unwrap();
-        assert_eq!(serials, Value::Array(vec![p64(first), p64(0)]));
+            args.push(Value::from(2));
+            let fault = failed(call(&mut s, method, args));
+            assert_eq!(fault.class, TRANSACTION_ERROR, "{method}");
+        }
+        assert_eq!(
+            done(call(&mut s, "tpc_finish", vec![Value::from(2)])),
+            Value::Nil
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+            Value::Nil
+        );
+        // The transaction 1 is still open.
+        store(&mut s, 1, 1, 0, b"a");
+        vote_and_finish(&mut s, 1).unwrap();
+    }
+
+    #[test]
+    fn a_stale_serial_is_a_conflict_error_with_the_serials_and_the_class() {
+        let mut s = registered("conflict");
+        let first = commit(&mut s, 1, 0, 0, MAPPING).unwrap();
+        let fault = commit(&mut s, 2, 0, 0, MAPPING).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                Oid(0),
+                Some((Tid(first), Tid(0))),
+                Some("persistent.mapping.PersistentMapping".into()),
+            )
+        );
+        assert_eq!(item(&fault, "message"), Value::from(CONFLICT));
+        assert_eq!(
+            item(&fault, "class_name"),
+            Value::from("persistent.mapping.PersistentMapping")
+        );
+        assert_eq!(
+            item(&fault, "serials"),
+            Value::Array(vec![p64(first), p64(0)])
+        );
+        // A pickle whose class does not decode gives no class.
+        let fault = commit(&mut s, 3, 0, 0, b"x").unwrap_err();
+        assert_eq!(item(&fault, "class_name"), Value::Nil);
+        assert_eq!(item(&fault, "oid"), p64(0));
+    }
+
+    #[test]
+    fn a_stale_read_current_serial_is_a_read_conflict_error() {
+        let mut s = registered("read-conflict");
+        let first = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        let second = commit(&mut s, 2, 1, first, MAPPING).unwrap();
+        begin(&mut s, 3, None);
+        let check = vec![p64(1), p64(first), Value::from(3)];
+        assert_eq!(
+            done(call(&mut s, "checkCurrentSerialInTransaction", check)),
+            Value::Nil
+        );
+        store(&mut s, 3, 2, 0, MAPPING);
+        let fault = vote_and_finish(&mut s, 3).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                READ_CONFLICT_ERROR,
+                READ_CONFLICT,
+                Oid(1),
+                Some((Tid(second), Tid(first))),
+                None,
+            )
+        );
+        assert_eq!(item(&fault, "class_name"), Value::Nil);
+        assert!(s.open.is_none());
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(3)])),
+            Value::Nil
+        );
+
+        // A current serial commits.
+        begin(&mut s, 4, None);
+        let check = vec![p64(1), p64(second), Value::from(4)];
+        done(call(&mut s, "checkCurrentSerialInTransaction", check));
+        store(&mut s, 4, 2, 0, MAPPING);
+        vote_and_finish(&mut s, 4).unwrap();
+    }
+
+    #[test]
+    fn delete_object_writes_a_deletion_with_the_serial_check_of_storea() {
+        let mut s = registered("delete");
+        let first = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        // A stale serial is a conflict. A deletion has no class.
+        begin(&mut s, 2, None);
+        let delete = vec![p64(1), p64(0), Value::from(2)];
+        assert_eq!(done(call(&mut s, "deleteObject", delete)), Value::Nil);
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                Oid(1),
+                Some((Tid(first), Tid(0))),
+                None
+            )
+        );
+
+        begin(&mut s, 3, None);
+        let delete = vec![p64(1), p64(first), Value::from(3)];
+        done(call(&mut s, "deleteObject", delete));
+        let deleted = vote_and_finish(&mut s, 3).unwrap();
+        assert!(deleted > first);
+        let load = vec![p64(1), p64(u64::MAX)];
+        let fault = failed(call(&mut s, "loadBefore", load));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
+        // The revision before the deletion still loads.
+        let load = vec![p64(1), p64(deleted)];
+        let loaded = done(call(&mut s, "loadBefore", load));
+        assert_eq!(
+            loaded,
+            Value::Array(vec![
+                Value::Binary(MAPPING.to_vec()),
+                p64(first),
+                p64(deleted)
+            ])
+        );
+        let load = vec![p64(1), p64(first)];
+        let loaded = done(call(&mut s, "loadSerial", load));
+        assert_eq!(loaded, Value::Binary(MAPPING.to_vec()));
+        let load = vec![p64(1), p64(deleted)];
+        let fault = failed(call(&mut s, "loadSerial", load));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
+        // `record_iternext` skips the deleted oid.
+        let fault = failed(call(&mut s, "record_iternext", vec![Value::Nil]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let kept = commit(&mut s, 4, 2, 0, MAPPING).unwrap();
+        let current = done(call(&mut s, "record_iternext", vec![Value::Nil]));
+        assert_eq!(
+            current,
+            Value::Array(vec![
+                p64(2),
+                p64(kept),
+                Value::Binary(MAPPING.to_vec()),
+                Value::Nil
+            ])
+        );
+    }
+
+    #[test]
+    fn tpc_begin_with_a_tid_commits_under_that_tid() {
+        let mut s = registered("restore");
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let wanted = first + 2;
+        begin(&mut s, 2, Some(wanted));
+        store(&mut s, 2, 1, first, b"b");
+        assert_eq!(vote_and_finish(&mut s, 2), Ok(wanted));
+        assert_eq!(s.store.last_transaction(), Tid(wanted));
+        // The serial check of storea holds in a restore transaction.
+        begin(&mut s, 3, Some(wanted + 1));
+        store(&mut s, 3, 1, first, b"c");
+        let fault = vote_and_finish(&mut s, 3).unwrap_err();
+        assert_eq!(fault.class, CONFLICT_ERROR);
     }
 
     fn registered(name: &str) -> Session {
@@ -1300,6 +1669,94 @@ mod tests {
         assert_eq!(messages[1], invalidation(second, &[1]));
     }
 
+    /// Put the reply `value` of the last call of `s` at the place that the
+    /// call took.
+    fn answer(s: &mut Session, value: Value) {
+        let place = s.place.take().expect("the call took a place");
+        assert!(
+            s.outbox
+                .send_at(place, Some(message::reply(Value::from(1), value)))
+        );
+    }
+
+    #[test]
+    fn a_load_shows_only_the_commits_that_the_hub_published() {
+        let storage = storage("load-published", Queues::DEFAULT);
+        let (mut writer, _own) = connected(&storage);
+        let (mut reader, mut frames) = connected(&storage);
+        let first = commit(&mut writer, 1, 1, 0, b"old").unwrap();
+        assert_eq!(messages(&mut frames), [invalidation(first, &[1])]);
+
+        // A commit that the store made visible and the hub did not publish
+        // yet, as while its session reads its oids.
+        let mut txn = storage.store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid(first), b"new").unwrap();
+        txn.vote().unwrap();
+        let hidden = txn.finish_after().unwrap();
+        assert_eq!(hidden.previous, Tid(first));
+
+        // The current record is the published one, with no next serial.
+        let old =
+            |next: Value| Value::Array(vec![Value::Binary(b"old".to_vec()), p64(first), next]);
+        let load = vec![p64(1), p64(u64::MAX)];
+        let current = done(call(&mut reader, "loadBefore", load.clone()));
+        assert_eq!(current, old(Value::Nil));
+        answer(&mut reader, current);
+        // A load before the hidden commit does not name it.
+        let before = vec![p64(1), p64(hidden.tid.0)];
+        let previous = done(call(&mut reader, "loadBefore", before.clone()));
+        assert_eq!(previous, old(Value::Nil));
+        answer(&mut reader, previous);
+
+        // The hub publishes the commit: its invalidation comes after the
+        // replies, and later loads show it.
+        storage.invalidations.publish(Commit {
+            previous: hidden.previous,
+            tid: hidden.tid,
+            origin: None,
+            outbox: outbox(),
+            own: Vec::new(),
+            others: Others::Send(message::notify(
+                "invalidateTransaction",
+                vec![p64(hidden.tid.0), Value::Array(vec![p64(1)])],
+            )),
+        });
+        let current = done(call(&mut reader, "loadBefore", load));
+        let new = Value::Array(vec![
+            Value::Binary(b"new".to_vec()),
+            p64(hidden.tid.0),
+            Value::Nil,
+        ]);
+        assert_eq!(current, new);
+        answer(&mut reader, current);
+        let previous = done(call(&mut reader, "loadBefore", before));
+        assert_eq!(previous, old(p64(hidden.tid.0)));
+        answer(&mut reader, previous);
+        let methods: Vec<String> = messages(&mut frames).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(
+            methods,
+            [
+                ".reply",
+                ".reply",
+                "invalidateTransaction",
+                ".reply",
+                ".reply"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_commit_without_oids_sends_an_empty_invalidation() {
+        let storage = storage("empty-commit", Queues::DEFAULT);
+        let (mut writer, mut own) = connected(&storage);
+        let (_reader, mut others) = connected(&storage);
+        begin(&mut writer, 1, None);
+        let tid = vote_and_finish(&mut writer, 1).unwrap();
+        assert_eq!(messages(&mut others), [invalidation(tid, &[])]);
+        let methods: Vec<String> = messages(&mut own).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(methods, ["info", ".reply"]);
+    }
+
     #[test]
     fn a_finish_that_fails_publishes_nothing_and_blocks_nothing() {
         let storage = storage("failed-finish", Queues::DEFAULT);
@@ -1414,6 +1871,10 @@ mod tests {
         assert_eq!(
             Fault::from(ZoeError::Halted).class,
             "ZODB.POSException.StorageSystemError"
+        );
+        assert_eq!(
+            Fault::from(ZoeError::Protocol("no")).args,
+            Value::Array(vec![Value::from("two-phase commit out of order: no")])
         );
     }
 }
