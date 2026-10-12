@@ -467,21 +467,38 @@ def test_a_deleted_object_keeps_its_older_blob(storage):
         assert file.read() == b"some data"
 
 
-def test_delete_object_with_a_stale_serial_is_a_conflict(storage):
+def test_delete_object_with_a_stale_serial_is_a_conflict(storage, monkeypatch):
+    tried = []
+    resolve = storage.tryToResolveConflict
+
+    def spy(oid, *args):
+        tried.append(oid)
+        return resolve(oid, *args)
+
+    monkeypatch.setattr(storage, "tryToResolveConflict", spy)
     oid = storage.new_oid()
-    first = commit(storage, oid, ZERO, record(1))
-    second = commit(storage, oid, first, record(2))
+    first = commit(storage, oid, ZERO, counter(1))
+    second = commit(storage, oid, first, counter(2))
     txn = TransactionMetaData()
     storage.tpc_begin(txn)
     storage.deleteObject(oid, first, txn)
-    # The vote never resolves a deletion.
+    # The vote never resolves a deletion. It does not even try.
     with pytest.raises(ConflictError) as error:
         storage.tpc_vote(txn)
     storage.tpc_abort(txn)
+    assert tried == []
     assert error.value.oid == oid
     assert error.value.serials == (second, first)
     assert storage._lock_table_is_empty()
-    assert storage.load(oid) == (record(2), second)
+    assert storage.load(oid) == (counter(2), second)
+
+    # A store of the same PCounter with the same stale serial resolves.
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, first, counter(3), "", txn)
+    assert storage.tpc_vote(txn) == [oid]
+    storage.tpc_finish(txn)
+    assert tried == [oid]
 
 
 def test_delete_object_follows_the_transaction_rules_of_store(storage):
