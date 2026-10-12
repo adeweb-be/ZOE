@@ -81,7 +81,9 @@ def test_load_blob_gives_a_file_in_the_client_cache(path, tmp_path):
         try:
             write_blob(db, "blob", b"small blob")
             with db.transaction() as conn:
-                oid, serial = conn.root()["blob"]._p_oid, conn.root()["blob"]._p_serial
+                blob = conn.root()["blob"]
+                blob._p_activate()
+                oid, serial = blob._p_oid, blob._p_serial
         finally:
             db.close()
 
@@ -107,7 +109,9 @@ def test_the_server_keeps_the_blob_in_its_own_blob_directory(path, tmp_path):
         try:
             write_blob(db, "blob", b"kept on the server")
             with db.transaction() as conn:
-                oid, serial = conn.root()["blob"]._p_oid, conn.root()["blob"]._p_serial
+                blob = conn.root()["blob"]
+                blob._p_activate()
+                oid, serial = blob._p_oid, blob._p_serial
         finally:
             db.close()
 
