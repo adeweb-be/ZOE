@@ -198,10 +198,12 @@ pub enum Error {
         reason: &'static str,
     },
 
-    /// The last tid of the dumps is not a tid of the store. So the dumps
-    /// are not dumps of the store, and the backup writes nothing.
+    /// The last tid of the dumps is not a tid of the store. So the store
+    /// does not continue the dumps: they are dumps of another store, or of
+    /// another history of this store. The backup writes nothing.
     #[error(
-        "{}: the dumps do not belong to the store: their last tid {:#018x} is not a tid of the store",
+        "{}: the store does not continue the dumps: their last tid {:#018x} is not a tid of the store; \
+         write a new full dump into a new directory",
         path.display(),
         .last.0
     )]
@@ -210,6 +212,25 @@ pub enum Error {
         path: PathBuf,
         /// The last tid of the dumps.
         last: Tid,
+    },
+
+    /// The store was packed at or after the last tid of the dumps. The
+    /// pack changed history that the dumps hold, so the backup writes
+    /// nothing.
+    #[error(
+        "{}: the store was packed at tid {:#018x}, at or after the last tid {:#018x} of the dumps; \
+         write a new full dump into a new directory",
+        path.display(),
+        .watermark.0,
+        .last.0
+    )]
+    BackupPacked {
+        /// The path of the backup directory.
+        path: PathBuf,
+        /// The last tid of the dumps.
+        last: Tid,
+        /// The pack watermark of the store.
+        watermark: Tid,
     },
 
     /// A read or a write of a file failed.

@@ -118,8 +118,9 @@ impl<'a> Sequence<'a> {
     /// `end` as the stored end, and the write is durable before the call
     /// returns. Otherwise it only skips the reserved values below `end`.
     /// The stored end never decreases. A read-only store fails with
-    /// `ReadOnly`. A failed call leaves the values of the open store as
-    /// they were.
+    /// `ReadOnly`. A failed write can reach the disk all the same, so after
+    /// it the open store forgets its reserved values, and the next call
+    /// reads the stored end.
     pub fn restore_end(&self, end: u64) -> Result<()> {
         self.store.writable()?;
         let mut slot = self.lock();
@@ -129,15 +130,24 @@ impl<'a> Sequence<'a> {
         };
         if block.next < end {
             if block.end < end {
-                let mut write = self.store.backend.begin_write()?;
-                write.put_sequence_end(&self.counter.name, end)?;
-                write.commit()?;
+                if let Err(error) = self.write_end(end) {
+                    *slot = None;
+                    return Err(error);
+                }
                 block.end = end;
             }
             block.next = end;
         }
         *slot = Some(block);
         Ok(())
+    }
+
+    /// Write `end` as the stored end of the name, in a backend write
+    /// transaction of its own.
+    fn write_end(&self, end: u64) -> Result<()> {
+        let mut write = self.store.backend.begin_write()?;
+        write.put_sequence_end(&self.counter.name, end)?;
+        write.commit()
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<Block>> {
@@ -169,9 +179,7 @@ impl<'a> Sequence<'a> {
             return Err(ZoeError::Protocol("no value is left in the sequence"));
         }
         let end = start.saturating_add(BLOCK);
-        let mut write = self.store.backend.begin_write()?;
-        write.put_sequence_end(&self.counter.name, end)?;
-        write.commit()?;
+        self.write_end(end)?;
         Ok(end)
     }
 }

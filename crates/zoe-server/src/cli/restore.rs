@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use zoe_convert::Restored;
+use zoe_core::Tid;
 
 use super::Failure;
 
@@ -49,18 +50,49 @@ fn write_report(
         from.display()
     )?;
     writeln!(out, "  dumps         {}", report.dumps)?;
-    writeln!(out, "  last tid      {:#018x}", report.last_tid.0)?;
+    let (last, time) = (report.last_tid.0, utc(report.last_tid));
+    writeln!(out, "  last tid      {last:#018x} ({time})")?;
     writeln!(out, "  transactions  {}", report.transactions)?;
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
     writeln!(out, "  sequences     {}", report.sequences)
 }
 
+/// Return the time of `tid` in UTC, as `YYYY-MM-DD HH:MM:SS.mmm UTC`.
+///
+/// The high 32 bits of a tid count the minutes since 1900, in a mixed
+/// radix: the year since 1900, then 12 months, 31 days, 24 hours and 60
+/// minutes. The low 32 bits hold the second in units of 60 / 2^32 seconds.
+fn utc(tid: Tid) -> String {
+    let minutes = tid.0 >> 32;
+    let (minute, hours) = (minutes % 60, minutes / 60);
+    let (hour, days) = (hours % 24, hours / 24);
+    let (day, months) = (days % 31 + 1, days / 31);
+    let (month, year) = (months % 12 + 1, months / 12 + 1900);
+    // Round to the millisecond, and stay below the next minute.
+    let millis = ((((tid.0 & 0xffff_ffff) * 60_000) + (1 << 31)) >> 32).min(59_999);
+    let (second, milli) = (millis / 1000, millis % 1000);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milli:03} UTC")
+}
+
 #[cfg(test)]
 mod tests {
-    use zoe_core::Tid;
-
     use super::*;
+
+    #[test]
+    fn the_time_of_a_tid_is_its_utc_time() {
+        // `persistent.timestamp.TimeStamp` gives this tid for 1709186828,
+        // in seconds since 1970.
+        assert_eq!(
+            utc(Tid(0x03f6_db4f_2222_2222)),
+            "2024-02-29 06:07:08.000 UTC"
+        );
+        assert_eq!(utc(Tid(0)), "1900-01-01 00:00:00.000 UTC");
+        assert_eq!(
+            utc(Tid(0x03f6_db4f_ffff_ffff)),
+            "2024-02-29 06:07:59.999 UTC"
+        );
+    }
 
     #[test]
     fn the_report_counts_what_the_restore_wrote() {
@@ -80,7 +112,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("  last tid      0x0000000000000010\n"),
+            text.contains("  last tid      0x0000000000000010 (1900-01-01 00:00:00.000 UTC)\n"),
             "{text}"
         );
         assert!(text.contains("  records       12\n"), "{text}");
