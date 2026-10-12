@@ -4,7 +4,8 @@
 //! The store has no storage-wide commit lock. So `lock_time` is always
 //! nil, `waiting` is always 0, and `timeout-thread-is-alive` is `"stub"`,
 //! the value of a ZEO server without a transaction timeout.
-//! `conflicts_resolved` is always 0, as in ZEO 6's server.
+//! `conflicts_resolved` counts the conflicts that the clients resolved
+//! through the vote. ZEO 6's server keeps it at 0.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,9 @@ pub(crate) struct Stats {
     pub(crate) active_txns: AtomicU64,
     /// The votes that failed with a conflict.
     pub(crate) conflicts: AtomicU64,
+    /// The conflicts that a vote listed and that the second vote then
+    /// passed.
+    pub(crate) conflicts_resolved: AtomicU64,
 }
 
 impl Stats {
@@ -50,12 +54,18 @@ impl Stats {
             aborts: AtomicU64::new(0),
             active_txns: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
+            conflicts_resolved: AtomicU64::new(0),
         }
     }
 
     /// Add 1 to `counter`.
     pub(crate) fn add(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
+        Self::add_n(counter, 1);
+    }
+
+    /// Add `n` to `counter`.
+    pub(crate) fn add_n(counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Subtract 1 from `counter`. A counter at 0 stays at 0.
@@ -76,6 +86,7 @@ impl Stats {
             aborts: get(&self.aborts),
             active_txns: get(&self.active_txns),
             conflicts: get(&self.conflicts),
+            conflicts_resolved: get(&self.conflicts_resolved),
             start: self.start.clone(),
             last_transaction: last,
         }
@@ -92,6 +103,7 @@ pub(crate) struct Status {
     aborts: u64,
     active_txns: u64,
     conflicts: u64,
+    conflicts_resolved: u64,
     start: String,
     last_transaction: Tid,
 }
@@ -115,7 +127,7 @@ impl Status {
             ("active_txns", Item::Int(self.active_txns)),
             ("lock_time", Item::Nil),
             ("conflicts", Item::Int(self.conflicts)),
-            ("conflicts_resolved", Item::Int(0)),
+            ("conflicts_resolved", Item::Int(self.conflicts_resolved)),
             ("start", Item::Text(self.start.clone())),
             ("waiting", Item::Int(0)),
             ("timeout-thread-is-alive", Item::Text("stub".into())),
@@ -220,6 +232,7 @@ mod tests {
             aborts: 0,
             active_txns: 0,
             conflicts: 0,
+            conflicts_resolved: 0,
             start: "<start time placeholder>".into(),
             last_transaction: Tid::ZERO,
         }
