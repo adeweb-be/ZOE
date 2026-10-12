@@ -544,11 +544,12 @@ impl Store {
         self.backend.record_keys(from, limit)
     }
 
-    /// Return every transaction row, in tid order. Each row comes with its
-    /// own result, so a row that does not read does not hide the others.
-    /// The call reads no record.
-    pub fn txn_rows(&self) -> Vec<Result<TxnMeta>> {
-        self.backend.iter_txns(Tid::ZERO, Tid::MAX).collect()
+    /// Iterate over every transaction row, in tid order. Each row comes
+    /// with its own result, so a row that does not read does not hide the
+    /// others. The iterator reads one row at a time, so its memory does not
+    /// grow with the number of rows. It reads no record.
+    pub fn txn_rows(&self) -> impl Iterator<Item = Result<TxnMeta>> + '_ {
+        self.backend.iter_txns(Tid::ZERO, Tid::MAX)
     }
 
     /// Return the blob record that `tid` wrote for `oid`, or `None`. A

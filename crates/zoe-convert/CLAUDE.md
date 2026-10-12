@@ -64,7 +64,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 ## Verify
 
 - `verify` checks a store without Python. It runs no unpickler and changes nothing. The CLI opens the store read-only.
-- It walks every record key in key order, deletions too. Each record frame and each blob record must read and pass its checksum. Each blob file must have the size and the BLAKE3 hash of its blob record. Each transaction row must read.
+- It walks every record key in key order, deletions too. Each record frame and each blob record must read and pass its checksum. Each blob file must have the size and the BLAKE3 hash of its blob record. Each transaction row must read. `Store::txn_rows` gives the rows one at a time, and `verify` only counts them, so it holds one row at a time.
 - `Store::sequence_names` lists the sequence rows, and each must read with `Store::sequence_end` and pass its checksum. A row that does not read is a finding in `checksums`, without an oid and a tid. Its text names the sequence. A listed name whose row the read does not find is a finding too. A name that does not decode, such as a name that is not UTF-8, fails the whole list: one finding in `checksums`, whose text names the name before it, and no sequence row counts.
 - Of each oid, the newest record is the current record. A deletion is not current. An oid whose newest record does not read exists: no reference to it dangles.
 - The class of a current record comes from its class pickle alone, by `decode_class_name`. A class pickle that names no class or does not decode counts as `PackReport::UNKNOWN_CLASS`.
