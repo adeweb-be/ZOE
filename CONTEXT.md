@@ -52,6 +52,10 @@ _Avoid_: tenant, database
 The view of the store as of one tid; a reader sees all of a transaction or none of it.
 _Avoid_: checkpoint
 
+**Transaction index**:
+The key space that lists, for each tid, the oids that its transaction wrote; the iterator and the server read the oids of a transaction from it.
+_Avoid_: oid list, transaction log (that is the rows of the transactions)
+
 ## Commit and conflicts
 
 **Two-phase commit**:
@@ -69,6 +73,10 @@ _Avoid_: commit (alone)
 **Group commit**:
 A batch of concurrent finishes that share one durable write.
 _Avoid_: batch commit
+
+**Restore transaction**:
+A transaction that `tpc_begin` begins with a tid, for a copy or a replica; it commits under that tid, which must come after the last tid of the store.
+_Avoid_: import, replay
 
 **Per-OID lock**:
 A lock that one transaction holds on one oid during a commit; exclusive for a write, shared for a read-current check.
@@ -98,15 +106,37 @@ _Avoid_: dry run (that word belongs to pack)
 The message that tells every other client which oids a committed transaction changed.
 _Avoid_: cache purge, notification
 
+**Published tid**:
+The tid of the last commit whose invalidations went out: in-process when the callback of its `tpc_finish` ran, in the server when the invalidation hub queued them; `lastTransaction` gives it, and the store makes a commit visible before it is published.
+_Avoid_: last tid (the last tid of the store can be ahead of it)
+
 **Sequence**:
 A named counter in the store that gives monotonic values outside the commit locks.
 _Avoid_: counter, autoincrement
+
+## Server
+
+**Invalidation hub**:
+The part of the server, one for each store, that publishes the commits of the store in commit order: it puts the invalidations, and the `info` and the reply of each `tpc_finish`, in the hub queue of each connection, and it never waits.
+_Avoid_: broadcaster, invalidation queue (`invalidation-queue-size` bounds the replay of `getInvalidations`)
+
+**Hub queue**:
+The queue of one connection that holds the frames of the invalidation hub; it holds at most `client-queue-size` frames, and a full one closes the connection, so a slow client never stops a commit.
+_Avoid_: outbox (that word belongs to post-commit delivery), send buffer
+
+**Session queue**:
+The queue of one connection that holds the replies of its session, a few frames (`QUEUE`); the session waits while it is full, so a slow client slows only its own connection.
+_Avoid_: outbox, reply buffer
 
 ## Operations
 
 **Pack**:
 The removal of record versions that no reader can reach, older than a given tid.
 _Avoid_: garbage collection, compaction, vacuum
+
+**Pack watermark**:
+The tid of the last pack, which the first batch of a pack writes in the store; undo never reaches back past it, and a pack at an earlier tid does nothing.
+_Avoid_: pack horizon, low-water mark
 
 **Retention window**:
 The period during which records that a pack removed can still be restored.
