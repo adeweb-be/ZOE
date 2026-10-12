@@ -60,3 +60,16 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - Any difference that the verification finds blocks the rename: the conversion removes the `.new` file, keeps the old file and fails with `Mismatch`. The error names the first difference and lists the differences, with the cap of `Report.problems`. When the conversion wrote nothing, the file stays and the call fails the same way. So a conversion that succeeds leaves a file that matches the store.
 - A difference is a transaction of the store that the file does not have and the reverse, a record, a user, a description or an extension that differs, a blob file that is missing or differs, a transaction that the store does not read, and a file that the reader stops in before its end.
 - The counts of the report describe the store. `Report.problems` lists only the blobs that the store does not read.
+
+## Verify
+
+- `verify` checks a store without Python. It runs no unpickler and changes nothing. The CLI opens the store read-only.
+- It walks every record key in key order, deletions too. Each record frame and each blob record must read and pass its checksum. Each blob file must have the size and the BLAKE3 hash of its blob record. Each transaction row must read. `Store::txn_rows` gives the rows one at a time, and `verify` only counts them, so it holds one row at a time.
+- `Store::sequence_names` lists the sequence rows, and each must read with `Store::sequence_end` and pass its checksum. A row that does not read is a finding in `checksums`, without an oid and a tid. Its text names the sequence. A listed name whose row the read does not find is a finding too. A name that does not decode, such as a name that is not UTF-8, fails the whole list: one finding in `checksums`, whose text names the name before it, and no sequence row counts.
+- Of each oid, the newest record is the current record. A deletion is not current. An oid whose newest record does not read exists: no reference to it dangles.
+- The class of a current record comes from its class pickle alone, by `decode_class_name`. A class pickle that names no class or does not decode counts as `PackReport::UNKNOWN_CLASS`.
+- The references come from `persistent_ids`, with the node budget of the record length. Only `PersistentId::Oid` counts, as for `referencesf`. A reference dangles when its oid has no current record. A pair of a record and a missing oid comes once.
+- A record whose references do not read, or whose reference is not 8 bytes, is a finding in `pickles`. A store error is a finding, never a failure of the call.
+- A walk that stops early does not make a reference dangle: a load of the oid confirms each dangling reference.
+- The memory of `verify` grows with the number of oids and of references, not with the size of the records or of the transaction rows. The walk keeps 8 bytes for each oid with a current record. It keeps about 24 bytes for each reference to a later oid, in the list `ahead`, until the walk ends. ZODB gives a new object its oid when it pickles the parent, so nearly every reference in a store that ZODB builds points to a later oid.
+- A blob record without its record is not checked: no read of the store lists the blob records.
