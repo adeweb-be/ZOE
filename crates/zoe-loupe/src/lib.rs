@@ -119,6 +119,9 @@ pub struct Reference {
     /// A JSON pointer into the state of the object. The value at the
     /// pointer holds the reference: its place when the state shows it,
     /// else a value that holds every place that the state does not show.
+    /// A reference from the class pickle, as an instance of a persistent
+    /// class has, is the exception: the state does not hold it, and it
+    /// points to the root, `""`.
     pub at: String,
 }
 

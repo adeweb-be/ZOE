@@ -28,7 +28,8 @@
 //! The references are the persistent references of the record, strong
 //! ones only, as ZODB's `referencesf` gives them. `zoe_pickle::persistent_ids`
 //! gives the list, so it also holds the references that the state does not
-//! show. A pointer always holds its reference:
+//! show. A pointer holds its reference, except a reference from the class
+//! pickle:
 //!
 //! - A reference that the state shows points to its place. Each place
 //!   serves one reference of its oid. A get never adds a reference: the

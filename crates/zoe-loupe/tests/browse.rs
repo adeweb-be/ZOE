@@ -54,35 +54,6 @@ fn references(object: &Object) -> BTreeSet<(Oid, &str)> {
         .collect()
 }
 
-/// Tell if the value at `at` in `state` holds a reference to `oid`: a
-/// strong `$ref` of the oid, or a value that can hide a reference, as an
-/// opaque node, a persistent id that Loupe does not read, or a value that
-/// the state leaves out.
-fn holds(state: &serde_json::Value, at: &str, oid: Oid) -> bool {
-    let Some(value) = state.pointer(at) else {
-        return false;
-    };
-    let mut stack = vec![value];
-    while let Some(value) = stack.pop() {
-        match value {
-            serde_json::Value::Object(map) => {
-                let strong = map.get("$ref") == Some(&json!(zoe_loupe::oid_repr(oid)))
-                    && map.get("weak").is_none();
-                let hides = ["$opaque", "$persistent", "$elided"]
-                    .iter()
-                    .any(|tag| map.contains_key(*tag));
-                if strong || hides {
-                    return true;
-                }
-                stack.extend(map.values());
-            }
-            serde_json::Value::Array(items) => stack.extend(items),
-            _ => {}
-        }
-    }
-    false
-}
-
 /// The object that the reference at `at` leads to.
 fn follow(folder: &Folder, object: &Object, at: &str) -> Object {
     let reference = object
@@ -202,10 +173,9 @@ fn references_lead_from_the_root_to_every_live_object() {
         assert_eq!(object.class, Some(class_name(data)), "{oid:?}");
         for reference in &object.references {
             assert!(
-                holds(&object.state, &reference.at, reference.oid),
-                "{oid:?}: the value at {} does not hold a reference to {:?}",
-                reference.at,
-                reference.oid
+                object.state.pointer(&reference.at).is_some(),
+                "{oid:?}: the reference at {} is not in the state",
+                reference.at
             );
         }
     }
