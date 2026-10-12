@@ -587,6 +587,8 @@ mod tests {
         write: AtomicBool,
         /// `iter_txns` fails as a whole.
         rows: AtomicBool,
+        /// `indexed_tids` fails.
+        index: AtomicBool,
         /// The commit of a write transaction writes, then fails.
         landed: AtomicBool,
         /// `load_current` gives one record fewer than it got oids.
@@ -715,6 +717,13 @@ mod tests {
 
         fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
             self.inner.txn_oids(from, to)
+        }
+
+        fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>> {
+            if self.faults.index.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.indexed_tids(from, to, limit)
         }
 
         fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
@@ -847,6 +856,68 @@ mod tests {
         faults.rows.store(true, Ordering::Relaxed);
         let txns: Vec<_> = store.iterator(None, None).unwrap().collect();
         assert!(matches!(txns[..], [Err(ZoeError::Backend(_))]), "{txns:?}");
+    }
+
+    /// Commit five transactions of one object. Return their tids.
+    fn five_commits(store: &Store) -> Vec<Tid> {
+        let oid = store.new_oid().unwrap();
+        let mut tids = vec![commit(store, oid, Tid::ZERO, b"a").unwrap()];
+        for data in [b"b", b"c", b"d", b"e"] {
+            let serial = *tids.last().unwrap();
+            tids.push(commit(store, oid, serial, data).unwrap());
+        }
+        tids
+    }
+
+    /// Iterate over every transaction of `store`, with slices of `slice`
+    /// or, for `None`, the slices of `Store::iterator`. The scan of the
+    /// index fails in each call after the iterator gave `before` items.
+    /// Check that the iterator gives the transactions of `tids` before the
+    /// fault, the error once, the transactions after it, then the end.
+    fn one_error_for_a_failed_index_scan(
+        store: &Store,
+        faults: &Faults,
+        tids: &[Tid],
+        slice: Option<usize>,
+        before: usize,
+    ) {
+        faults.index.store(false, Ordering::Relaxed);
+        let mut iterator = match slice {
+            Some(slice) => store.iterator_in_slices(None, None, slice),
+            None => store.iterator(None, None).unwrap(),
+        };
+        let mut given = Vec::new();
+        loop {
+            faults.index.store(given.len() >= before, Ordering::Relaxed);
+            let Some(txn) = iterator.next() else {
+                break;
+            };
+            given.push(txn.map(|txn| txn.tid).map_err(|e| e.to_string()));
+        }
+        assert!(iterator.next().is_none());
+        let mut expected: Vec<_> = tids.iter().map(|&tid| Ok(tid)).collect();
+        expected.insert(before, Err(injected().to_string()));
+        assert_eq!(given, expected, "slices of {slice:?}, fault after {before}");
+    }
+
+    #[test]
+    fn a_failed_index_scan_gives_one_iterator_error_and_the_rest_of_the_range() {
+        let (store, faults) = faulty_store();
+        let tids = five_commits(&store);
+        // The first index scan fails, so the error comes first.
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, None, 0);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 0);
+    }
+
+    #[test]
+    fn a_failed_scan_of_a_later_index_slice_gives_the_rows_around_its_error() {
+        let (store, faults) = faulty_store();
+        let tids = five_commits(&store);
+        // The scan of the second index slice fails, or of a later one.
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 1);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 3);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(2), 2);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(2), 4);
     }
 
     #[test]
