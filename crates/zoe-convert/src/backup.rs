@@ -123,8 +123,8 @@ pub struct BackupCheck {
 /// transactions after the last tid of the dumps, up to the last tid of the
 /// store at the start of the call. The call reads the end of each sequence
 /// after it reads that last tid. So each value of a sequence that a
-/// transaction of the dump holds is below its end in the dump. With no
-/// transaction after the dumps, the call writes nothing.
+/// transaction of the dump holds is below its end in the dump. When the
+/// dumps end at the last tid of the store, the call writes nothing.
 ///
 /// The call creates `dir` when it is missing. It takes a lock on `dir`, so
 /// two backups never write into one directory together. It removes the

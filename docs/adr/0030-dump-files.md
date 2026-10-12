@@ -67,7 +67,7 @@ A reader refuses a file that breaks a rule, a blob whose bytes do not match its 
 1. It creates `DIR` when it is missing, and takes an exclusive `flock` on a descriptor of `DIR` itself. So two backups never write into one directory together, and the lock adds no file. It removes the `.tmp` files that a stopped backup left.
 2. It reads the names and the headers of the dumps, and checks the chain. A dump that does not follow the dump before it fails the backup.
 3. It reads the last tid of the store, then the end of each sequence. A transaction up to the last tid committed after its values were reserved, so each value that it holds is below the end in the dump.
-4. With dumps in `DIR` and no transaction after the last one, it writes nothing. Otherwise the last tid of the dumps must be a tid of the store, else the backup fails: the dumps belong to another store. A transaction that a pack removed passes, when its tid is at or before the pack watermark.
+4. With dumps in `DIR` that end at the last tid of the store, it writes nothing. Otherwise the last tid of the dumps must be a tid of the store, else the backup fails: the dumps belong to another store. A transaction that a pack removed passes, when its tid is at or before the pack watermark.
 5. It writes the dump through the iterator into `<name>.tmp`, syncs it, renames it to its name and syncs `DIR`. A failed backup removes the `.tmp` file.
 
 **`zoe restore --from DIR --path STORE`.** The command:
