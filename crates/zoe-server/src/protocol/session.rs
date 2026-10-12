@@ -16,8 +16,9 @@ use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
 use super::NamedStorage;
 use super::clock;
 use super::extension;
-use super::invalidation::{ClientId, Commit, Others, Outbox};
+use super::invalidation::{ClientId, Commit, Others};
 use super::message::{self, Call};
+use super::outbox::{Outbox, Place};
 use super::status::Stats;
 
 /// The most oids that one `new_oids` call gives, as in ZEO.
@@ -185,6 +186,9 @@ pub(crate) struct Session {
     /// The id of the connection in the invalidations of the storage, from
     /// `register` on.
     client: Option<ClientId>,
+    /// The place in the order of the connection that the current call took
+    /// for its reply, before the reply exists.
+    place: Option<Place>,
     registered: bool,
     read_only: bool,
     open: Option<Open>,
@@ -196,10 +200,11 @@ pub(crate) struct Session {
 pub(crate) fn run(storage: Arc<NamedStorage>, calls: mpsc::Receiver<Call>, outbox: Outbox) {
     let mut session = Session::new(storage, outbox.clone());
     while let Ok(call) = calls.recv() {
-        let reply = match session.call(&call) {
-            Outcome::Published => continue,
-            Outcome::Done(_) if call.oneway => continue,
-            Outcome::Done(value) => message::reply(call.id, value),
+        let outcome = session.call(&call);
+        let reply = match outcome {
+            Outcome::Published => None,
+            Outcome::Done(_) if call.oneway => None,
+            Outcome::Done(value) => Some(message::reply(call.id, value)),
             // A call without a reply has no way to report its error, so
             // the server closes the connection, as ZEO does.
             Outcome::Failed(fault) if call.oneway => {
@@ -209,13 +214,19 @@ pub(crate) fn run(storage: Arc<NamedStorage>, calls: mpsc::Receiver<Call>, outbo
                 );
                 break;
             }
-            Outcome::Failed(fault) => message::error(call.id, fault.class, fault.args),
+            Outcome::Failed(fault) => Some(message::error(call.id, fault.class, fault.args)),
             Outcome::Close(why) => {
                 eprintln!("zoe serve: closing a connection: {why}");
                 break;
             }
         };
-        if !outbox.send(reply) {
+        // A place that the call took gets the reply, or stays empty.
+        let sent = match (session.place.take(), reply) {
+            (Some(place), reply) => outbox.send_at(place, reply),
+            (None, Some(reply)) => outbox.send(reply),
+            (None, None) => true,
+        };
+        if !sent {
             break;
         }
     }
@@ -230,6 +241,7 @@ impl Session {
             storage,
             outbox,
             client: None,
+            place: None,
             registered: false,
             read_only: false,
             open: None,
@@ -387,17 +399,33 @@ impl Session {
         Ok(Value::Array(oids))
     }
 
-    fn load_before(&self, args: &[Value]) -> Result<Value, Fault> {
+    /// Load the record of an oid before a tid: `[data, serial, next serial
+    /// or nil]`, or nil.
+    ///
+    /// A stock client keeps a record without a next serial as the current
+    /// one. So the reply goes out before the invalidation of each commit
+    /// that the read did not see: the call takes its place in the order of
+    /// the connection when the hub published no commit since the read
+    /// began. Otherwise it reads again.
+    fn load_before(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, tid] = arity::<2>(args, "loadBefore")?;
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
-        Ok(match self.store.load_before(oid, tid)? {
-            Some(record) => Value::Array(vec![
-                Value::Binary(record.data),
-                p64(record.serial.0),
-                record.next.map_or(Value::Nil, |next| p64(next.0)),
-            ]),
-            None => Value::Nil,
-        })
+        let invalidations = &self.storage.invalidations;
+        loop {
+            let seen = invalidations.published();
+            let value = match self.store.load_before(oid, tid)? {
+                Some(record) => Value::Array(vec![
+                    Value::Binary(record.data),
+                    p64(record.serial.0),
+                    record.next.map_or(Value::Nil, |next| p64(next.0)),
+                ]),
+                None => Value::Nil,
+            };
+            if let Some(place) = invalidations.place_since(seen, &self.outbox) {
+                self.place = Some(place);
+                return Ok(value);
+            }
+        }
     }
 
     fn load_serial(&self, args: &[Value]) -> Result<Value, Fault> {
@@ -723,14 +751,12 @@ fn truth(value: &Value) -> bool {
 mod tests {
     use super::*;
 
-    use tokio::sync::mpsc as async_mpsc;
-
-    use super::super::invalidation::Frame;
+    use super::super::outbox::Inbox;
     use crate::protocol::Queues;
 
     /// Return an outbox whose frames go nowhere.
     fn outbox() -> Outbox {
-        Outbox::new(1_000).0
+        Outbox::new(1_000, 1_000).0
     }
 
     /// Return a storage on a new store for the test `name`.
@@ -1198,8 +1224,8 @@ mod tests {
 
     /// A registered session of `storage`. Its frames wait in the receiver
     /// for the test.
-    fn connected(storage: &Arc<NamedStorage>) -> (Session, async_mpsc::Receiver<Frame>) {
-        let (outbox, frames, _closing) = Outbox::new(1_000);
+    fn connected(storage: &Arc<NamedStorage>) -> (Session, Inbox) {
+        let (outbox, frames, _closing) = Outbox::new(1_000, 1_000);
         let mut s = Session::new(Arc::clone(storage), outbox);
         done(call(
             &mut s,
@@ -1210,9 +1236,9 @@ mod tests {
     }
 
     /// Take the messages that wait for a client, as `(method, args)`.
-    fn messages(frames: &mut async_mpsc::Receiver<Frame>) -> Vec<(String, Value)> {
+    fn messages(frames: &mut Inbox) -> Vec<(String, Value)> {
         let mut taken = Vec::new();
-        while let Ok(frame) = frames.try_recv() {
+        while let Some(frame) = frames.try_recv() {
             let message = rmpv::decode::read_value(&mut frame.as_slice()).unwrap();
             let Value::Array(parts) = message else {
                 panic!("a message is not an array: {message:?}");
@@ -1252,6 +1278,26 @@ mod tests {
         let second = commit(&mut writer, 2, 2, 0, b"y").unwrap();
         assert_eq!(messages(&mut others), [invalidation(second, &[2])]);
         assert_eq!(messages(&mut late), [invalidation(second, &[2])]);
+    }
+
+    #[test]
+    fn a_load_reply_goes_out_before_the_invalidation_of_a_later_commit() {
+        let storage = storage("load-order", Queues::DEFAULT);
+        let (mut writer, _own) = connected(&storage);
+        let (mut reader, mut frames) = connected(&storage);
+        let first = commit(&mut writer, 1, 1, 0, b"old").unwrap();
+        assert_eq!(messages(&mut frames), [invalidation(first, &[1])]);
+
+        let current = done(call(&mut reader, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(current.as_array().unwrap()[2], Value::Nil);
+        // A commit is published before the reply goes into the queue.
+        let second = commit(&mut writer, 2, 1, first, b"new").unwrap();
+        let place = reader.place.take().expect("loadBefore takes a place");
+        let reply = message::reply(Value::from(1), current);
+        assert!(reader.outbox.send_at(place, Some(reply)));
+        let messages = messages(&mut frames);
+        assert_eq!(messages[0].0, ".reply");
+        assert_eq!(messages[1], invalidation(second, &[1]));
     }
 
     #[test]
@@ -1317,7 +1363,7 @@ mod tests {
         const COMMITS: u64 = 25;
         let storage = storage("concurrent", Queues::DEFAULT);
         let (_idle, mut idle) = connected(&storage);
-        let mut queues: Vec<async_mpsc::Receiver<Frame>> = std::thread::scope(|scope| {
+        let mut queues: Vec<Inbox> = std::thread::scope(|scope| {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|writer| {
                     let storage = &storage;

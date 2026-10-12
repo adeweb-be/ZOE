@@ -6,16 +6,19 @@
 //! thread drives each core transaction, and no core call runs on a thread
 //! of the async runtime.
 //!
-//! The frames for a client wait in the outbox of its connection, which
-//! holds at most `client-queue-size` frames. The session waits for room for
-//! its replies. The invalidations of the storage never wait: a full outbox
-//! closes the connection.
+//! The frames for a client wait in two queues: the replies of the session,
+//! and the invalidations with the frames of each commit. Each holds at most
+//! `client-queue-size` frames. The session waits for room for its replies.
+//! The invalidations never wait: a full queue closes the connection. The
+//! writer task sends the frames of both queues in the order in which they
+//! went in.
 
 mod clock;
 mod extension;
 pub(crate) mod frame;
 mod invalidation;
 mod message;
+mod outbox;
 mod session;
 mod status;
 
@@ -29,7 +32,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use zoe_core::Store;
 
-use invalidation::{Invalidations, Outbox};
+use invalidation::Invalidations;
+use outbox::Outbox;
 use status::Stats;
 
 /// The protocol that the server announces and the only one it takes: ZEO 6
@@ -50,8 +54,9 @@ pub(crate) struct Queues {
     /// The most transactions that `getInvalidations` covers. Past it, the
     /// reply is nil.
     pub(crate) invalidations: usize,
-    /// The most messages that wait for one client. Past it, the server
-    /// closes the connection.
+    /// The most invalidations that wait for one client. Past it, the server
+    /// closes the connection. The replies of the session wait in a queue of
+    /// the same size, and the session waits for room there.
     pub(crate) client: usize,
 }
 
@@ -143,7 +148,8 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
     }
 
     let (calls, received) = mpsc::channel();
-    let (outbox, mut frames, mut closing) = Outbox::new(storage.queues.client);
+    let (outbox, mut inbox, mut closing) =
+        Outbox::new(storage.queues.client, storage.queues.client);
     let closed = Arc::new(Notify::new());
     let worker = {
         let closed = Arc::clone(&closed);
@@ -162,7 +168,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
                 let frame = tokio::select! {
                     biased;
                     () = closing.wait() => break,
-                    frame = frames.recv() => match frame {
+                    frame = inbox.recv() => match frame {
                         Some(frame) => frame,
                         None => break,
                     },
@@ -176,8 +182,8 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
                     break;
                 }
             }
-            // A session that waits for room in the outbox stops.
-            drop(frames);
+            // A session that waits for room in its queue stops.
+            drop(inbox);
             let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
         })
     };
@@ -284,7 +290,7 @@ mod tests {
         assert_eq!(storage.stats.connections.load(Ordering::Relaxed), 1);
 
         // A commit whose oids are unknown closes every other connection.
-        let (outbox, _frames, _closing) = Outbox::new(1);
+        let (outbox, _inbox, _closing) = Outbox::new(1, 1);
         storage.invalidations.publish(Commit {
             previous: Tid(0),
             tid: Tid(1),

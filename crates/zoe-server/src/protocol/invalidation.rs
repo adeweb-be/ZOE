@@ -1,4 +1,4 @@
-//! The invalidations of a storage, and the outbox of each connection.
+//! The invalidations of a storage.
 //!
 //! After each commit, every other client of the storage gets
 //! `invalidateTransaction(tid, oids)`. The client that committed gets
@@ -13,109 +13,27 @@
 //! for it. So no thread waits for the commit of another thread. A finish that
 //! fails gives no tid, and no commit waits for it.
 //!
-//! Each connection has an outbox: a queue of at most `client-queue-size`
-//! frames, which the writer task of the connection sends in order. The hub
-//! never waits for room in an outbox. A frame that does not fit closes the
-//! connection: the client connects again and asks `getInvalidations`. So a
-//! slow or dead client never stops a commit or the other clients. The hub
-//! holds its mutex while it puts frames in the outboxes, never while a
-//! frame goes out to the network.
+//! The hub never waits for room in the queue of a connection: a frame that
+//! does not fit closes the connection, and the client connects again and
+//! asks `getInvalidations`. So a slow or dead client never stops a commit or
+//! the other clients. The hub holds its mutex while it puts frames in the
+//! queues, never while a frame goes out to the network.
+//!
+//! `register`, `lastTransaction` and `getInvalidations` read the last
+//! published tid, and `loadBefore` takes its place in the order of its
+//! connection, under the mutex of the hub. So each reply comes after the
+//! invalidation of each commit that it includes, and before the
+//! invalidation of each commit that it does not include.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::{Semaphore, watch};
 use zoe_core::Tid;
 
-/// The bytes of one message. All the connections that get the message
-/// share them.
-pub(crate) type Frame = Arc<Vec<u8>>;
+use super::outbox::{Outbox, Place, Pushed};
 
 /// The id of a connection in the hub.
 pub(crate) type ClientId = u64;
-
-/// The frames that wait for one connection, and the signal that closes
-/// the connection.
-#[derive(Clone)]
-pub(crate) struct Outbox {
-    frames: mpsc::Sender<Frame>,
-    closing: Arc<watch::Sender<bool>>,
-}
-
-impl Outbox {
-    /// Return an outbox that holds at most `size` frames, the receiver of
-    /// its frames, and the signal of its close. A size of 0 holds 1 frame.
-    /// A size above the bound of tokio holds that bound.
-    pub(crate) fn new(size: usize) -> (Self, mpsc::Receiver<Frame>, Closing) {
-        let (frames, receiver) = mpsc::channel(size.clamp(1, Semaphore::MAX_PERMITS));
-        let (closing, signal) = watch::channel(false);
-        let outbox = Self {
-            frames,
-            closing: Arc::new(closing),
-        };
-        (outbox, receiver, Closing(signal))
-    }
-
-    /// Put a frame of the session in the outbox. Wait while the outbox is
-    /// full. Return false when the connection is closed.
-    ///
-    /// Call this only on a thread that is not a thread of the async
-    /// runtime.
-    pub(crate) fn send(&self, frame: Vec<u8>) -> bool {
-        self.frames.blocking_send(Arc::new(frame)).is_ok()
-    }
-
-    /// Put `frame` in the outbox, and do not wait. When the outbox is full,
-    /// close the connection.
-    fn push(&self, frame: Frame) -> Pushed {
-        match self.frames.try_send(frame) {
-            Ok(()) => Pushed::Queued,
-            Err(TrySendError::Full(_)) => {
-                self.close();
-                Pushed::Overflow
-            }
-            Err(TrySendError::Closed(_)) => Pushed::Gone,
-        }
-    }
-
-    /// Close the connection. Its writer task sends no more frames, and its
-    /// reader stops.
-    pub(crate) fn close(&self) {
-        self.closing.send_replace(true);
-    }
-}
-
-/// What a push into an outbox did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pushed {
-    /// The frame waits in the outbox.
-    Queued,
-    /// The outbox was full. The push closed the connection.
-    Overflow,
-    /// The connection is closed.
-    Gone,
-}
-
-/// The signal that a connection closes.
-#[derive(Clone)]
-pub(crate) struct Closing(watch::Receiver<bool>);
-
-impl Closing {
-    /// Wait until the connection closes. When every outbox of the
-    /// connection drops and none closed it, wait forever.
-    pub(crate) async fn wait(&mut self) {
-        if self.0.wait_for(|closing| *closing).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-
-    /// Tell if the connection is closed.
-    #[cfg(test)]
-    pub(crate) fn is_closed(&self) -> bool {
-        *self.0.borrow()
-    }
-}
 
 /// What the other clients of the storage get for one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +147,18 @@ impl Invalidations {
         self.lock().clients.remove(&id);
     }
 
+    /// Take the next place of `outbox` when the hub published no commit
+    /// after `seen`. Return `None` otherwise.
+    ///
+    /// A reader reads the last published tid, then the store, then takes
+    /// its place here. With a place, its reply goes out before the
+    /// invalidation of each later commit. Without one, a commit came in
+    /// between, and the reader reads again.
+    pub(crate) fn place_since(&self, seen: Tid, outbox: &Outbox) -> Option<Place> {
+        let state = self.lock();
+        (state.published == seen).then(|| outbox.place())
+    }
+
     /// Return the publication of `commit`. Dropping the publication
     /// publishes the commit.
     pub(crate) fn prepare(&self, commit: Commit) -> Publication<'_> {
@@ -329,6 +259,7 @@ impl State {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use super::super::outbox::{Closing, Inbox};
     use super::*;
 
     /// A connection of the tests: its id in the hub, its outbox, the
@@ -336,14 +267,14 @@ mod tests {
     struct Client {
         id: ClientId,
         outbox: Outbox,
-        frames: mpsc::Receiver<Frame>,
+        frames: Inbox,
         closing: Closing,
     }
 
     impl Client {
-        /// Add a connection whose outbox holds `size` frames to `hub`.
+        /// Add a connection whose hub queue holds `size` frames to `hub`.
         fn new(hub: &Invalidations, size: usize) -> Self {
-            let (outbox, frames, closing) = Outbox::new(size);
+            let (outbox, frames, closing) = Outbox::new(10, size);
             let (id, _) = hub.subscribe(outbox.clone());
             Self {
                 id,
@@ -356,7 +287,7 @@ mod tests {
         /// Take the frames that wait, as text.
         fn take(&mut self) -> Vec<String> {
             let mut taken = Vec::new();
-            while let Ok(frame) = self.frames.try_recv() {
+            while let Some(frame) = self.frames.try_recv() {
                 taken.push(String::from_utf8(frame.to_vec()).unwrap());
             }
             taken
@@ -406,14 +337,14 @@ mod tests {
         let hub = Invalidations::new(Tid(5));
         let mut writer = Client::new(&hub, 10);
         hub.publish(writer.commit(5, 6));
-        let (outbox, mut frames, _closing) = Outbox::new(10);
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
         assert_eq!(hub.subscribe(outbox).1, Tid(6));
         hub.publish(writer.commit(6, 7));
         assert_eq!(
             String::from_utf8(frames.try_recv().unwrap().to_vec()).unwrap(),
             "inv 7"
         );
-        assert!(frames.try_recv().is_err());
+        assert!(frames.try_recv().is_none());
 
         // A connection that leaves gets nothing more.
         let mut gone = Client::new(&hub, 10);
@@ -463,15 +394,22 @@ mod tests {
     }
 
     #[test]
-    fn an_outbox_holds_at_least_one_frame_and_at_most_the_bound_of_tokio() {
-        let (outbox, _frames, _closing) = Outbox::new(0);
-        assert_eq!(outbox.push(Arc::new(b"one".to_vec())), Pushed::Queued);
-        assert_eq!(outbox.push(Arc::new(b"two".to_vec())), Pushed::Overflow);
-        let (outbox, frames, _closing) = Outbox::new(usize::MAX);
-        assert_eq!(outbox.push(Arc::new(b"one".to_vec())), Pushed::Queued);
-        drop(frames);
-        assert_eq!(outbox.push(Arc::new(b"two".to_vec())), Pushed::Gone);
-        assert!(!outbox.send(b"three".to_vec()));
+    fn a_reader_takes_its_place_only_when_no_commit_came_after_its_read() {
+        let hub = Invalidations::new(Tid(0));
+        let mut writer = Client::new(&hub, 10);
+        let mut reader = Client::new(&hub, 10);
+        let seen = hub.published();
+        let place = hub.place_since(seen, &reader.outbox).unwrap();
+        // A commit after the place goes out after the reply.
+        hub.publish(writer.commit(0, 1));
+        assert!(reader.take().is_empty());
+        assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));
+        assert_eq!(reader.take(), text(&["load", "inv 1"]));
+        // A commit between the read and the place: the reader reads again.
+        hub.publish(writer.commit(1, 2));
+        assert_eq!(hub.place_since(Tid(1), &reader.outbox), None);
+        assert!(hub.place_since(Tid(2), &reader.outbox).is_some());
+        assert_eq!(writer.take().len(), 4);
     }
 
     #[test]

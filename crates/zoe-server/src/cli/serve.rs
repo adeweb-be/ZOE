@@ -44,9 +44,9 @@ pub(super) struct ServeArgs {
     )]
     invalidation_queue_size: usize,
 
-    /// The most messages that wait for one client. Past it, the server
+    /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection, and the client reconnects and verifies its
-    /// cache.
+    /// cache. The replies of the client wait in a queue of the same size.
     #[arg(
         long,
         env = "ZOE_CLIENT_QUEUE_SIZE",

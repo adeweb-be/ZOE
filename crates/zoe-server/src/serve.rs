@@ -26,8 +26,8 @@ pub struct ServeOptions {
 
 impl ServeOptions {
     /// Serve the store in `path` on a free port of 127.0.0.1. The
-    /// invalidation queue covers 100,000 transactions, and 1,000 messages
-    /// can wait for one client.
+    /// invalidation queue covers 100,000 transactions, and 1,000
+    /// invalidations can wait for one client.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
@@ -51,9 +51,10 @@ impl ServeOptions {
         self
     }
 
-    /// Let at most `messages` messages wait for one client. Past it, the
-    /// server closes the connection of the client. A size of 0 lets 1
-    /// message wait.
+    /// Let at most `messages` invalidations wait for one client. Past it,
+    /// the server closes the connection of the client. The replies of the
+    /// client wait in a queue of the same size. A size of 0 lets 1 message
+    /// wait.
     #[must_use]
     pub fn client_queue_size(mut self, messages: usize) -> Self {
         self.queues.client = messages;
