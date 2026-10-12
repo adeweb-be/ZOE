@@ -11,5 +11,5 @@ use zoe_server::fuzz::read_messages;
 use zoe_server::serve::DEFAULT_MAX_FRAME_SIZE;
 
 fuzz_target!(|data: &[u8]| {
-    read_messages(data, DEFAULT_MAX_FRAME_SIZE);
+    read_messages(data, DEFAULT_MAX_FRAME_SIZE.get());
 });

@@ -10,9 +10,13 @@ pythons := "3.12 3.13 3.14 3.14t"
 default:
     @just --list
 
-# Check the format and run clippy and the Python lints.
+# Check the format and run clippy and the Python lints. The fuzz targets of
+# zoe serve are a workspace of their own: check their format, and that their
+# Cargo.lock needs no change, so `just fuzz` builds with --locked.
 check:
     cargo fmt --all --check
+    cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
+    cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src
     ruff format --check python ci/src
@@ -93,7 +97,6 @@ fuzz seconds="60" *targets="frame handshake":
     set -euo pipefail
     fuzz=crates/zoe-server/fuzz
     out="${CARGO_TARGET_DIR:-target}/fuzz"
-    cargo fmt --manifest-path "$fuzz/Cargo.toml" --check
     # The flags of `cargo fuzz build`, so cargo-fuzz itself is not needed:
     # the coverage that libFuzzer reads, AddressSanitizer, debug assertions
     # and the cfg fuzzing. RUSTC_BOOTSTRAP lets the pinned stable toolchain
@@ -127,10 +130,15 @@ fuzz seconds="60" *targets="frame handshake":
         options=()
         if [ "$target" = handshake ]; then
             # The server writes a line to stderr for each connection that it
-            # closes, so its stderr goes away. Its threads free memory after
-            # the end of an input, so libFuzzer would look for a leak after
-            # nearly each input, and run 20 times slower. LeakSanitizer
-            # still looks for leaks at the end of the run.
+            # closes, so its stderr goes away. The message of a panic goes
+            # away too: to see it, run the target on the crash file without
+            # -close_fd_mask, as
+            # `target/fuzz/build/x86_64-unknown-linux-gnu/release/handshake
+            # target/fuzz/artifacts/handshake/crash-...`. The threads of the
+            # server free memory after the end of an input, so libFuzzer
+            # would look for a leak after nearly each input, and run 20
+            # times slower. LeakSanitizer still looks for leaks at the end
+            # of the run.
             options=(-close_fd_mask=2 -detect_leaks=0)
         fi
         # libFuzzer adds the new inputs to the first directory. The seeds

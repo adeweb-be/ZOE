@@ -3,10 +3,8 @@
 # builds and the lints of the repository do not see it.
 #
 # The seeds in corpus/ are the client streams of the wire traces in
-# docs/spikes/zeo-wire: in corpus/frame, each stream up to 4 KiB; in
-# corpus/handshake, each stream up to the first call after the handshake.
-# A seed is the protocol of the client, then its messages, each one as a
-# frame.
+# docs/spikes/zeo-wire, each one up to 4 KiB: the protocol of the client,
+# then its messages, each one as a frame. corpus/generate.py writes them.
 
 [package]
 name = "zoe-server-fuzz"

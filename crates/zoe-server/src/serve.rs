@@ -7,6 +7,7 @@
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,11 +18,11 @@ use zoe_core::{Options, Store, ZoeError};
 
 use crate::protocol::{self, NamedStorage};
 
-/// The default of `--max-frame-size`: 256 MiB. A `storea` frame holds a
-/// whole record, and the store sets no limit on a record by default. ZODB
-/// warns about a record of more than 16 MiB, and a blob chunk is less than
-/// 64 KiB. So a stock client stays far below this limit.
-pub const DEFAULT_MAX_FRAME_SIZE: u32 = 256 << 20;
+/// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
+/// frame holds a whole record, and the store sets no limit on a record by
+/// default. ZODB warns about a record of more than 16 MiB, and a blob chunk
+/// is less than 64 KiB. So a stock client stays far below this limit.
+pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap();
 
 /// The settings of a server.
 #[derive(Debug, Clone)]
@@ -29,7 +30,7 @@ pub struct ServeOptions {
     path: PathBuf,
     listen: SocketAddr,
     lock_timeout: Option<Duration>,
-    max_frame_size: u32,
+    max_frame_size: NonZeroU32,
 }
 
 impl ServeOptions {
@@ -63,7 +64,7 @@ impl ServeOptions {
     /// Close a connection that sends a frame longer than `bytes`, before
     /// the server reserves memory for the frame.
     #[must_use]
-    pub fn max_frame_size(mut self, bytes: u32) -> Self {
+    pub fn max_frame_size(mut self, bytes: NonZeroU32) -> Self {
         self.max_frame_size = bytes;
         self
     }
@@ -131,7 +132,11 @@ impl Server {
             .map(Arc::new)
             .map_err(|error| Error::Store(options.path.clone(), error))?;
         let storage = NamedStorage::new(protocol::STORAGE_NAME, &options.path, Arc::clone(&store));
-        runtime.spawn(accept(listener, Arc::new(storage), options.max_frame_size));
+        runtime.spawn(accept(
+            listener,
+            Arc::new(storage),
+            options.max_frame_size.get(),
+        ));
         Ok(Self {
             runtime: Some(runtime),
             store: Some(store),

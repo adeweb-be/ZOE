@@ -116,7 +116,11 @@ pub(crate) async fn serve_connection(
             eprintln!("zoe serve: {peer}: the client does not speak the protocol M5");
             return;
         }
-        _ => return,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("zoe serve: {peer}: {error}");
+            return;
+        }
     }
 
     let (calls, received) = mpsc::channel();

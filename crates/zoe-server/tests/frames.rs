@@ -131,3 +131,49 @@ fn the_default_limit_takes_a_record_larger_than_zodb_warns_about() {
     let tid = commit(&mut conn, 1, &[(oid, 0, data.clone())]).unwrap();
     assert!(load(&mut conn, oid).unwrap() == (data, tid));
 }
+
+/// The peak resident memory of the process `pid`, in KiB.
+fn peak_kib(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|kib| kib.parse().ok())
+        .unwrap()
+}
+
+#[test]
+fn a_frame_of_many_small_values_closes_its_connection_and_takes_little_memory() {
+    let dir = fresh_dir("many-values");
+    let mut server = Server::path(&dir.join("store"));
+    let mut other = server.client("1");
+    let before = peak_kib(server.pid());
+
+    // An array of 4 Mi nils: 4 MiB of frame, which rmpv would make into
+    // more than 160 MiB of values.
+    let mut nils = vec![0xdd];
+    nils.extend_from_slice(&(4u32 << 20).to_be_bytes());
+    nils.resize(nils.len() + (4 << 20), 0xc0);
+    // An array of 60,000 arrays of 15 nils: each array announces few
+    // values, and the frame holds 960,001.
+    let mut arrays = vec![0xdd];
+    arrays.extend_from_slice(&60_000u32.to_be_bytes());
+    for _ in 0..60_000 {
+        arrays.push(0x9f);
+        arrays.extend_from_slice(&[0xc0; 15]);
+    }
+    for frame in [nils, arrays] {
+        let mut conn = server.connect();
+        conn.write_frame(&frame).unwrap();
+        assert!(conn.closed_within(TIMEOUT));
+    }
+
+    other.call("lastTransaction", vec![]).unwrap();
+    assert!(server.running());
+    let after = peak_kib(server.pid());
+    assert!(
+        after < before + 32 * 1024,
+        "the peak resident memory grew from {before} KiB to {after} KiB"
+    );
+}
