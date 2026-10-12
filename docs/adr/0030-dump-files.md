@@ -1,6 +1,6 @@
 # 0030. Dump files: a format of ZOE's own, one file per tid range
 
-Status: proposed. The human approves the layout with the pull request that builds `zoe backup` and `zoe restore`.
+Status: accepted. The human approved the layout with the pull request that builds `zoe backup` and `zoe restore`.
 
 ## Context
 
@@ -115,7 +115,7 @@ A difference is a finding, and a dump that does not restore fails the command. A
 
 - A restore reads each dump twice: once to check its hash, once to restore it.
 - A restore commits each transaction with a sync, as every restore transaction does. A non-durable bulk restore is a card of its own.
-- `zoe verify --backup` is as heavy as a restore: it needs free space for a full copy of the store in `TMPDIR`, it syncs each transaction (a measured 1,002 transactions took 19.6 s), and it holds the lock of the store during the whole check. A scratch directory option and a non-durable restore are later cards.
+- `zoe verify --backup` is as heavy as a restore: it needs free space for a full copy of the store in `TMPDIR`, it syncs once for each transaction, and it holds the lock of the store during the whole check. A scratch directory option and a non-durable restore are later cards.
 - The dumps are not compressed. A record that the store keeps compressed goes into the dump as its pickle.
 - A restored store was never packed: its pack watermark is 0, whatever the watermark of its source.
 - A backup with nothing new writes nothing, also when a sequence moved. The values of a sequence that a dumped transaction holds are below the end in the dumps. A value given after the last dump can come again after a restore, as each change after the last dump is lost.
