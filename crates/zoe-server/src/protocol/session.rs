@@ -4,13 +4,14 @@
 //! begins the core transaction and makes every later call of it, so the
 //! core never refuses a call with `WrongThread`.
 
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
 
 use super::NamedStorage;
+use super::blob::{Download, Upload};
 use super::clock;
 use super::extension;
 use super::message::{self, Call};
@@ -142,6 +143,9 @@ impl From<ZoeError> for Fault {
 enum Outcome {
     /// The result of the call.
     Done(Value),
+    /// The blob to send to the client before the reply nil. A reader of a
+    /// blob is large, so the outcome boxes it.
+    Blob(Box<Download>),
     /// The exception of the call.
     Failed(Fault),
     /// The server closes the connection, as ZEO does for a call it does not
@@ -163,9 +167,13 @@ struct Open {
     /// The id that the client gave to the transaction.
     id: Value,
     txn: Txn<Arc<Store>>,
-    /// The first error of a `storea`. The vote fails with it, as ZEO
-    /// reports the errors of its stores at the vote.
+    /// The first error of a `storea` or a `storeBlobEnd`. The vote fails
+    /// with it, as ZEO reports the errors of its stores at the vote.
     failed: Option<ZoeError>,
+    /// The blob that the client uploads, from `storeBlobStart` to
+    /// `storeBlobEnd`. The end of the transaction drops it, and that
+    /// removes its file.
+    upload: Option<Upload>,
 }
 
 /// The state of one connection.
@@ -181,32 +189,44 @@ pub(crate) struct Session {
 /// Run the calls that arrive on `calls` in order, and send each reply to
 /// `replies`. Return when `calls` closes, or when the session closes the
 /// connection. A transaction still open aborts.
-pub(crate) fn run(
-    storage: Arc<NamedStorage>,
-    calls: mpsc::Receiver<Call>,
-    replies: UnboundedSender<Vec<u8>>,
-) {
+///
+/// The thread waits while `replies` is full, so a client that reads slowly
+/// slows down only its own session.
+pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, replies: Sender<Vec<u8>>) {
     let mut session = Session::new(storage);
-    while let Ok(call) = calls.recv() {
-        let reply = match session.call(&call) {
-            Outcome::Done(_) if call.oneway => continue,
-            Outcome::Done(value) => message::reply(call.id, value),
+    let send = |frame| replies.blocking_send(frame).is_ok();
+    while let Some(call) = calls.blocking_recv() {
+        let result = match session.call(&call) {
+            Outcome::Done(value) => Ok(value),
+            // The chunks go out before the reply, so the client has the
+            // file when the reply arrives.
+            Outcome::Blob(download) => match download.send(send) {
+                Ok(true) => Ok(Value::Nil),
+                // The client is gone.
+                Ok(false) => break,
+                Err(error) => Err(Fault::from(error)),
+            },
+            Outcome::Failed(fault) => Err(fault),
+            Outcome::Close(why) => {
+                eprintln!("zoe serve: closing a connection: {why}");
+                break;
+            }
+        };
+        let reply = match result {
+            Ok(_) if call.oneway => continue,
+            Ok(value) => message::reply(call.id, value),
             // A call without a reply has no way to report its error, so
             // the server closes the connection, as ZEO does.
-            Outcome::Failed(fault) if call.oneway => {
+            Err(fault) if call.oneway => {
                 eprintln!(
                     "zoe serve: {} failed: {} {:?}",
                     call.method, fault.class, fault.args
                 );
                 break;
             }
-            Outcome::Failed(fault) => message::error(call.id, fault.class, fault.args),
-            Outcome::Close(why) => {
-                eprintln!("zoe serve: closing a connection: {why}");
-                break;
-            }
+            Err(fault) => message::error(call.id, fault.class, fault.args),
         };
-        if replies.send(reply).is_err() {
+        if !send(reply) {
             break;
         }
     }
@@ -293,6 +313,15 @@ impl Session {
             "vote" => self.vote(args),
             "tpc_finish" => self.tpc_finish(args),
             "tpc_abort" => self.tpc_abort(args),
+            "storeBlobStart" => self.store_blob_start(args),
+            "storeBlobChunk" => self.store_blob_chunk(args),
+            "storeBlobEnd" => self.store_blob_end(args),
+            "sendBlob" => {
+                return match self.send_blob(args) {
+                    Ok(download) => Outcome::Blob(Box::new(download)),
+                    Err(fault) => Outcome::Failed(fault),
+                };
+            }
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
@@ -476,6 +505,7 @@ impl Session {
             id: id.clone(),
             txn,
             failed: None,
+            upload: None,
         });
         Ok(Value::Nil)
     }
@@ -545,6 +575,78 @@ impl Session {
         }
         Ok(Value::Nil)
     }
+
+    /// Open the upload of a blob in the current transaction. A stock client
+    /// sends `storea` for the oid first, so a transaction is open.
+    fn store_blob_start(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        arity::<0>(args, "storeBlobStart")?;
+        let open = self
+            .open
+            .as_mut()
+            .ok_or_else(|| Fault::transaction("storeBlobStart: no current transaction"))?;
+        if open.upload.is_some() {
+            return Err(Fault::value_error("storeBlobStart: an upload is open"));
+        }
+        let dir = self.store.blob_temp_dir()?;
+        let upload = Upload::create(&dir)
+            .map_err(|error| Fault::storage(format!("cannot create an upload file: {error}")))?;
+        open.upload = Some(upload);
+        Ok(Value::Nil)
+    }
+
+    /// Append a chunk to the upload of the current transaction.
+    fn store_blob_chunk(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [chunk] = arity::<1>(args, "storeBlobChunk")?;
+        let Value::Binary(chunk) = chunk else {
+            return Err(Fault::type_error("a chunk is not bytes"));
+        };
+        let upload = self
+            .open
+            .as_mut()
+            .and_then(|open| open.upload.as_mut())
+            .ok_or_else(|| Fault::value_error("storeBlobChunk: no upload is open"))?;
+        upload
+            .write(chunk)
+            .map_err(|error| Fault::storage(format!("cannot write an upload file: {error}")))?;
+        Ok(Value::Nil)
+    }
+
+    /// Stage the uploaded blob with `data` for `oid`. `Txn::store_blob_at`
+    /// takes the file by rename. A stock client sent `storea` for the oid
+    /// before, and this store keeps the pickle and adds the blob.
+    fn store_blob_end(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, id] = arity::<4>(args, "storeBlobEnd")?;
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        let Value::Binary(data) = data else {
+            return Err(Fault::type_error("data is not bytes"));
+        };
+        let open = self.current(id, "storeBlobEnd")?;
+        let mut upload = open
+            .upload
+            .take()
+            .ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
+        if open.failed.is_none()
+            && let Err(error) = open.txn.store_blob_at(oid, serial, data, upload.close())
+        {
+            open.failed = Some(error);
+        }
+        // Dropping the upload removes a file that the core did not take.
+        drop(upload);
+        Ok(Value::Nil)
+    }
+
+    /// Return the blob of `oid` at `serial`, to send in chunks.
+    ///
+    /// The call first reads the whole blob and checks its size and its
+    /// hash. So a blob that does not match its record goes out as an error
+    /// reply, never as a chunk.
+    fn send_blob(&self, args: &[Value]) -> Result<Download, Fault> {
+        let [oid, serial] = arity::<2>(args, "sendBlob")?;
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        self.store.verify_blob(oid, serial)?;
+        let reader = self.store.open_blob(oid, serial)?;
+        Ok(Download::new(oid, serial, reader))
+    }
 }
 
 impl Drop for Session {
@@ -569,7 +671,7 @@ fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Val
 }
 
 /// An oid or a tid as the protocol sends it: 8 bytes, big-endian.
-fn p64(n: u64) -> Value {
+pub(super) fn p64(n: u64) -> Value {
     Value::Binary(n.to_be_bytes().to_vec())
 }
 
@@ -1053,6 +1155,169 @@ mod tests {
                 Value::Nil
             ])
         );
+    }
+
+    /// Return the files under the blob directory of the session, but the
+    /// layout file.
+    fn blob_tree(s: &Session) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.file_name().unwrap() != ".layout" {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&s.storage.path.join("blobs"), &mut found);
+        found
+    }
+
+    /// Begin the transaction `id`, store a pickle for `oid` and open an
+    /// upload with one chunk, as a stock client does.
+    fn upload(s: &mut Session, id: i64, oid: u64, chunk: &[u8]) {
+        let id = Value::from(id);
+        done(call(
+            s,
+            "tpc_begin",
+            vec![id.clone(), Value::Nil, Value::Nil, Value::Map(vec![])],
+        ));
+        let data = Value::Binary(b"pickle".to_vec());
+        done(call(s, "storea", vec![p64(oid), p64(0), data, id]));
+        done(call(s, "storeBlobStart", vec![]));
+        done(call(
+            s,
+            "storeBlobChunk",
+            vec![Value::Binary(chunk.to_vec())],
+        ));
+    }
+
+    fn store_blob_end(s: &mut Session, id: i64, oid: u64, data: &[u8]) -> Outcome {
+        let data = Value::Binary(data.to_vec());
+        call(
+            s,
+            "storeBlobEnd",
+            vec![p64(oid), p64(0), data, Value::from(id)],
+        )
+    }
+
+    #[test]
+    fn an_uploaded_blob_commits_with_the_pickle_of_storea() {
+        let mut s = registered("blob-commit");
+        upload(&mut s, 1, 1, b"the blob");
+        done(store_blob_end(&mut s, 1, 1, b"pickle"));
+        let vote = done(call(&mut s, "vote", vec![Value::from(1)]));
+        assert_eq!(vote, Value::Array(vec![]));
+        let tid = Tid(u64_of(&done(call(&mut s, "tpc_finish", vec![Value::from(1)]))).unwrap());
+        assert_eq!(s.store.load_serial(Oid(1), tid).unwrap(), b"pickle");
+        let path = s.store.blob_path(Oid(1), tid).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the blob");
+        assert_eq!(blob_tree(&s), [path]);
+        // A stock client counts the storea, not the blob.
+        assert_eq!(count(&s.storage.status().to_value(), "stores"), 1);
+    }
+
+    #[test]
+    fn an_aborted_or_dropped_upload_leaves_no_file() {
+        // An abort after storeBlobEnd: the core took the file.
+        let mut s = registered("blob-abort");
+        upload(&mut s, 1, 1, b"the blob");
+        done(store_blob_end(&mut s, 1, 1, b"pickle"));
+        assert_eq!(blob_tree(&s).len(), 1, "the transaction holds the file");
+        done(call(&mut s, "tpc_abort", vec![Value::from(1)]));
+        assert_eq!(blob_tree(&s), Vec::<std::path::PathBuf>::new());
+
+        // An abort before storeBlobEnd: the upload file is still open.
+        upload(&mut s, 2, 1, b"the blob");
+        assert_eq!(blob_tree(&s).len(), 1, "the upload file");
+        done(call(&mut s, "tpc_abort", vec![Value::from(2)]));
+        assert_eq!(blob_tree(&s), Vec::<std::path::PathBuf>::new());
+
+        // The end of the connection, during the upload and after it.
+        upload(&mut s, 3, 1, b"the blob");
+        let storage = Arc::clone(&s.storage);
+        drop(s);
+        let mut s = Session::new(Arc::clone(&storage));
+        assert_eq!(blob_tree(&s), Vec::<std::path::PathBuf>::new());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        upload(&mut s, 4, 1, b"the blob");
+        done(store_blob_end(&mut s, 4, 1, b"pickle"));
+        drop(s);
+        let s = Session::new(storage);
+        assert_eq!(blob_tree(&s), Vec::<std::path::PathBuf>::new());
+    }
+
+    #[test]
+    fn a_blob_that_the_core_refuses_fails_the_vote_and_leaves_no_file() {
+        let mut s = registered("blob-refused");
+        upload(&mut s, 1, 1, b"the blob");
+        // The core refuses an empty pickle, and leaves the file in place.
+        done(store_blob_end(&mut s, 1, 1, b""));
+        assert_eq!(blob_tree(&s), Vec::<std::path::PathBuf>::new());
+        let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
+        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        assert!(s.open.is_none());
+    }
+
+    #[test]
+    fn blob_calls_out_of_order_fail() {
+        let mut s = registered("blob-order");
+        let fault = failed(call(&mut s, "storeBlobStart", vec![]));
+        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        upload(&mut s, 1, 1, b"the blob");
+        let fault = failed(call(&mut s, "storeBlobStart", vec![]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        // A storeBlobEnd of another transaction leaves the upload open.
+        let fault = failed(store_blob_end(&mut s, 2, 1, b"pickle"));
+        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        done(store_blob_end(&mut s, 1, 1, b"pickle"));
+        let fault = failed(store_blob_end(&mut s, 1, 1, b"pickle"));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let chunk = vec![Value::Binary(b"more".to_vec())];
+        let fault = failed(call(&mut s, "storeBlobChunk", chunk));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let fault = failed(call(&mut s, "storeBlobChunk", vec![Value::from("text")]));
+        assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn send_blob_checks_the_blob_before_the_first_chunk() {
+        let mut s = registered("send-blob");
+        upload(&mut s, 1, 1, b"the blob");
+        done(store_blob_end(&mut s, 1, 1, b"pickle"));
+        done(call(&mut s, "vote", vec![Value::from(1)]));
+        let tid = u64_of(&done(call(&mut s, "tpc_finish", vec![Value::from(1)]))).unwrap();
+        let send_blob =
+            |s: &mut Session, oid: u64, tid: u64| call(s, "sendBlob", vec![p64(oid), p64(tid)]);
+        assert!(matches!(send_blob(&mut s, 1, tid), Outcome::Blob(_)));
+
+        // No blob record: a POSKeyError, as in ZEO.
+        let fault = failed(send_blob(&mut s, 1, tid + 1));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(1) }));
+        let fault = failed(send_blob(&mut s, 2, tid));
+        assert_eq!(fault.class, "ZODB.POSException.POSKeyError");
+
+        // A file that does not match its record, then a missing file.
+        let path = s.store.blob_path(Oid(1), Tid(tid)).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::write(&path, b"the blub").unwrap();
+        let corrupt = Fault::from(ZoeError::CorruptBlob {
+            oid: Oid(1),
+            tid: Tid(tid),
+        });
+        assert_eq!(failed(send_blob(&mut s, 1, tid)), corrupt);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(failed(send_blob(&mut s, 1, tid)), corrupt);
+        assert_eq!(corrupt.class, "ZODB.POSException.StorageSystemError");
     }
 
     #[test]

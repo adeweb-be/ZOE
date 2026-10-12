@@ -95,6 +95,17 @@ pub(crate) fn reply(id: Value, result: Value) -> Vec<u8> {
     ]))
 }
 
+/// Encode a call from the server to the client: `[0, true, method, args]`.
+/// It gets no reply.
+pub(crate) fn call_async(method: &str, args: Vec<Value>) -> Vec<u8> {
+    encode(Value::Array(vec![
+        Value::from(0),
+        Value::Boolean(true),
+        Value::from(method),
+        Value::Array(args),
+    ]))
+}
+
 /// Encode the error reply to the call `id`: the exception `class` with
 /// `args`.
 pub(crate) fn error(id: Value, class: &str, args: Value) -> Vec<u8> {
@@ -191,6 +202,18 @@ mod tests {
             assert!(decode(&frame(value)).is_err());
         }
         assert!(decode(b"").is_err());
+    }
+
+    #[test]
+    fn a_call_of_the_server_has_the_id_0_and_the_flags_true() {
+        // receiveBlobStop [oid 4, serial] from the trace of a stock server.
+        let oid = Value::Binary(vec![0, 0, 0, 0, 0, 0, 0, 4]);
+        let serial = Value::Binary(vec![0x04, 0x0c, 0x45, 0x8f, 0xd0, 0xd4, 0xa4, 0x66]);
+        let bytes = call_async("receiveBlobStop", vec![oid, serial]);
+        let mut expected = b"\x94\x00\xc3\xafreceiveBlobStop\x92\xc4\x08".to_vec();
+        expected.extend([0, 0, 0, 0, 0, 0, 0, 4, 0xc4, 0x08]);
+        expected.extend([0x04, 0x0c, 0x45, 0x8f, 0xd0, 0xd4, 0xa4, 0x66]);
+        assert_eq!(bytes, expected);
     }
 
     #[test]

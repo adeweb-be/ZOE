@@ -6,6 +6,7 @@
 //! thread drives each core transaction, and no core call runs on a thread
 //! of the async runtime.
 
+mod blob;
 mod clock;
 mod extension;
 pub(crate) mod frame;
@@ -16,11 +17,11 @@ mod status;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc as async_mpsc};
+use tokio::sync::{Notify, mpsc};
 use zoe_core::Store;
 
 use status::Stats;
@@ -32,6 +33,12 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// The payload that a client sends in place of a protocol to ask for the
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
+
+/// The number of frames that wait between the tasks of a connection and
+/// its session, in each direction. A full queue makes its sender wait. So
+/// an upload or a download holds a few chunks in memory, whatever the size
+/// of the blob.
+const QUEUE: usize = 4;
 
 /// The name of the storage that the server serves. It is the default of
 /// ZEO.
@@ -110,8 +117,8 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
         _ => return,
     }
 
-    let (calls, received) = mpsc::channel();
-    let (send, mut outgoing) = async_mpsc::unbounded_channel::<Vec<u8>>();
+    let (calls, received) = mpsc::channel(QUEUE);
+    let (send, mut outgoing) = mpsc::channel::<Vec<u8>>(QUEUE);
     let closed = Arc::new(Notify::new());
     let worker = {
         let closed = Arc::clone(&closed);
@@ -153,7 +160,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
         if call.is_heartbeat() {
             continue;
         }
-        if calls.send(call).is_err() {
+        if calls.send(call).await.is_err() {
             break;
         }
     }
