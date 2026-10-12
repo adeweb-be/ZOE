@@ -65,9 +65,10 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 
 - `verify` checks a store without Python. It runs no unpickler and changes nothing. The CLI opens the store read-only.
 - It walks every record key in key order, deletions too. Each record frame and each blob record must read and pass its checksum. Each blob file must have the size and the BLAKE3 hash of its blob record. Each transaction row must read.
+- `Store::sequence_names` lists the sequence rows, and each must read with `Store::sequence_end` and pass its checksum. A row that does not read is a finding in `checksums`, without an oid and a tid. Its text names the sequence. A listed name whose row the read does not find is a finding too.
 - Of each oid, the newest record is the current record. A deletion is not current. An oid whose newest record does not read exists: no reference to it dangles.
 - The class of a current record comes from its class pickle alone, by `decode_class_name`. A class pickle that names no class or does not decode counts as `PackReport::UNKNOWN_CLASS`.
 - The references come from `persistent_ids`, with the node budget of the record length. Only `PersistentId::Oid` counts, as for `referencesf`. A reference dangles when its oid has no current record. A pair of a record and a missing oid comes once.
 - A record whose references do not read, or whose reference is not 8 bytes, is a finding in `pickles`. A store error is a finding, never a failure of the call.
 - A walk that stops early does not make a reference dangle: a load of the oid confirms each dangling reference.
-- The sequence rows and a blob record without its record are not checked: no read of the store lists them.
+- A blob record without its record is not checked: no read of the store lists the blob records.

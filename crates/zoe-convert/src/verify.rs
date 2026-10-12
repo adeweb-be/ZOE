@@ -3,10 +3,10 @@
 //! The check walks every record key of the store in key order. It reads
 //! each record, deletions too, and the blob record of each key, so each
 //! frame passes its checksum or gives a finding. It reads and hashes each
-//! blob file. It reads each transaction row. Of each oid, the newest
-//! record is the current record. A current record gives its class, from
-//! the class pickle alone, and its persistent references, from
-//! `zoe_pickle::persistent_ids`. No unpickler runs.
+//! blob file. It reads each transaction row and each sequence row. Of each
+//! oid, the newest record is the current record. A current record gives
+//! its class, from the class pickle alone, and its persistent references,
+//! from `zoe_pickle::persistent_ids`. No unpickler runs.
 //!
 //! A reference is dangling when it names an oid without a current record.
 //! A store error is a finding, never a failure of the call.
@@ -19,16 +19,17 @@ use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
 /// The number of record keys that one read of the walk takes.
 const KEY_CHUNK: usize = 1024;
 
-/// A frame that does not read: a record, a blob record or a transaction
-/// row.
+/// A frame that does not read: a record, a blob record, a transaction row
+/// or a sequence row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameProblem {
-    /// The oid of the record or of the blob record. A transaction row has
-    /// none.
+    /// The oid of the record or of the blob record. A transaction row and
+    /// a sequence row have none.
     pub oid: Option<Oid>,
-    /// The tid of the frame, when the store gives it.
+    /// The tid of the frame, when the store gives it. A sequence row has
+    /// none.
     pub tid: Option<Tid>,
-    /// What is wrong.
+    /// What is wrong. For a sequence row, the text names the sequence.
     pub error: String,
 }
 
@@ -71,6 +72,8 @@ pub struct PickleProblem {
 pub struct Verification {
     /// The transaction rows that read.
     pub transactions: u64,
+    /// The sequence rows that read.
+    pub sequences: u64,
     /// The record keys, deletions too.
     pub records: u64,
     /// The oids with a current record.
@@ -115,6 +118,7 @@ impl Verification {
 pub fn verify(store: &Store, known: Option<&BTreeSet<String>>) -> Verification {
     let mut report = Verification::default();
     rows(store, &mut report);
+    sequences(store, &mut report);
     let mut walk = Walk::default();
     records(store, &mut report, &mut walk);
     dangling(store, &mut report, walk);
@@ -146,6 +150,34 @@ fn rows(store: &Store, report: &mut Verification) {
                 });
             }
         }
+    }
+}
+
+/// Read every sequence row.
+fn sequences(store: &Store, report: &mut Verification) {
+    let names = match store.sequence_names() {
+        Ok(names) => names,
+        Err(error) => {
+            report.checksums.push(frame_problem(None, error));
+            return;
+        }
+    };
+    for name in names {
+        let error = match store.sequence_end(&name) {
+            Ok(Some(_)) => {
+                report.sequences += 1;
+                continue;
+            }
+            // The list names the row, so a read that does not find it
+            // shows a damaged store.
+            Ok(None) => format!("sequence row {name:?}: listed, but the read finds no row"),
+            Err(error) => error.to_string(),
+        };
+        report.checksums.push(FrameProblem {
+            oid: None,
+            tid: None,
+            error,
+        });
     }
 }
 
@@ -442,5 +474,53 @@ mod tests {
         let report = verify(&store, None);
         assert_eq!(report.blobs, 1);
         assert_eq!(report.problems(), 0, "{report:?}");
+    }
+
+    #[test]
+    fn the_sequence_rows_are_read_and_counted() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        store.sequence("intids").next().unwrap();
+        store.sequence("lexicon").next().unwrap();
+        let report = verify(&store, None);
+        assert_eq!(report.sequences, 2);
+        assert_eq!(report.problems(), 0, "{report:?}");
+    }
+
+    #[test]
+    fn a_damaged_sequence_row_is_a_finding() {
+        let dir = std::env::temp_dir().join(format!("zoe-verify-sequence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = "verify-marker-sequence";
+        {
+            let store = Store::open(&dir).unwrap();
+            store.sequence(name).next().unwrap();
+            store.sequence("intids").next().unwrap();
+        }
+        // Flip a bit of the key of the row. The frame then reads under
+        // another name, so it fails its checksum.
+        let db = dir.join("zoe.redb");
+        let mut bytes = std::fs::read(&db).unwrap();
+        let mut flipped = 0;
+        for at in 0..bytes.len().saturating_sub(name.len()) {
+            if bytes[at..].starts_with(name.as_bytes()) {
+                bytes[at + name.len() - 1] ^= 1;
+                flipped += 1;
+            }
+        }
+        assert!(flipped > 0, "the name is not in the database file");
+        std::fs::write(&db, bytes).unwrap();
+
+        let store = Store::open_read_only(&dir).unwrap();
+        let report = verify(&store, None);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.sequences, 1, "{report:?}");
+        assert_eq!(report.checksums.len(), 1, "{report:?}");
+        let problem = &report.checksums[0];
+        assert_eq!((problem.oid, problem.tid), (None, None));
+        assert!(
+            problem.error.contains("verify-marker-sequencd"),
+            "{problem:?}"
+        );
     }
 }

@@ -3,11 +3,12 @@
 ZODB's own storage test suites run first, then the tests of the parts that
 ZODB does not test: the order of the `tpc_finish` callbacks, the read-only
 mode, `close`, `pack`, the conflict resolution, the parallel commits
-without the GIL and the sequences.
+without the GIL, the sequences and `deleteObject`.
 """
 
 import gc
 import io
+import os
 import pickle
 import subprocess
 import sys
@@ -176,6 +177,7 @@ def test_read_only(tmp_path):
             storage.new_oid,
             lambda: storage.tpc_begin(txn),
             lambda: storage.store(ZERO, ZERO, record(1), "", txn),
+            lambda: storage.deleteObject(ZERO, ZERO, txn),
             lambda: storage.sequence("intids").next(),
         ):
             with pytest.raises(ReadOnlyError):
@@ -423,6 +425,90 @@ def test_a_conflict_names_the_class_of_the_object(storage):
         assert error.value.oid == oid
         assert error.value.serials == (second, first)
         assert error.value.class_name == class_name
+
+
+def deleted(storage, oid, serial):
+    """Commit a deletion of oid, read at serial, and return the tid."""
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.deleteObject(oid, serial, txn)
+    storage.tpc_vote(txn)
+    return storage.tpc_finish(txn)
+
+
+def test_delete_object_deletes_the_current_record_only(storage):
+    oid = storage.new_oid()
+    first = commit(storage, oid, ZERO, record(1))
+    tid = deleted(storage, oid, first)
+    assert tid == storage.lastTransaction()
+    with pytest.raises(POSKeyError):
+        storage.load(oid)
+    # The older record stays until a pack removes it.
+    assert storage.loadBefore(oid, tid) == (record(1), first, tid)
+    assert storage.loadSerial(oid, first) == record(1)
+    assert [entry["size"] for entry in storage.history(oid, 10)] == [
+        0,
+        len(record(1)),
+    ]
+
+
+def test_a_deleted_object_keeps_its_older_blob(storage):
+    oid = storage.new_oid()
+    path = os.path.join(storage.temporaryDirectory(), "new.blob")
+    with open(path, "wb") as file:
+        file.write(b"some data")
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.storeBlob(oid, ZERO, record(1), path, "", txn)
+    storage.tpc_vote(txn)
+    first = storage.tpc_finish(txn)
+    deleted(storage, oid, first)
+    with open(storage.loadBlob(oid, first), "rb") as file:
+        assert file.read() == b"some data"
+
+
+def test_delete_object_with_a_stale_serial_is_a_conflict(storage):
+    oid = storage.new_oid()
+    first = commit(storage, oid, ZERO, record(1))
+    second = commit(storage, oid, first, record(2))
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.deleteObject(oid, first, txn)
+    # The vote never resolves a deletion.
+    with pytest.raises(ConflictError) as error:
+        storage.tpc_vote(txn)
+    storage.tpc_abort(txn)
+    assert error.value.oid == oid
+    assert error.value.serials == (second, first)
+    assert storage._lock_table_is_empty()
+    assert storage.load(oid) == (record(2), second)
+
+
+def test_delete_object_follows_the_transaction_rules_of_store(storage):
+    oid = storage.new_oid()
+    first = commit(storage, oid, ZERO, record(1))
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    raised = []
+
+    def delete():
+        try:
+            storage.deleteObject(oid, first, txn)
+        except Exception as error:
+            raised.append(error)
+
+    thread = in_thread(delete)
+    thread.join(TIMEOUT)
+    assert len(raised) == 1 and isinstance(raised[0], zoe.WrongThread)
+
+    with pytest.raises(StorageTransactionError):
+        storage.deleteObject(oid, first, TransactionMetaData())
+    storage.tpc_vote(txn)
+    with pytest.raises(StorageTransactionError):
+        storage.deleteObject(oid, first, txn)
+    storage.tpc_finish(txn)
+    # The refused calls staged nothing.
+    assert storage.load(oid) == (record(1), first)
 
 
 def test_a_callback_cannot_commit_in_its_own_storage(storage):

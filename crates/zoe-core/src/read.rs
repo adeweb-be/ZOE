@@ -506,6 +506,20 @@ impl Store {
         self.backend.load_blob(oid, tid)
     }
 
+    /// Return the names of the sequences that have a row, in key order.
+    /// The call reads no row: `sequence_end` reads the row of a name.
+    pub fn sequence_names(&self) -> Result<Vec<String>> {
+        self.backend.sequence_names()
+    }
+
+    /// Return the end of the row of the sequence `name`: the first value
+    /// that the store has not reserved. Return `None` when the name has no
+    /// row. A row that does not pass its checksum is `CorruptSequence`.
+    /// The call reserves no value, so a read-only store takes it.
+    pub fn sequence_end(&self, name: &str) -> Result<Option<u64>> {
+        self.backend.sequence_end(name)
+    }
+
     /// Return the first oid at or after `from` whose current record is not
     /// a deletion, with that record.
     fn current_at_or_after(&self, mut from: Oid) -> Result<Option<(Oid, Record)>> {
@@ -1283,5 +1297,20 @@ mod tests {
             matches!(history, Err(ZoeError::CorruptTxn { tid: Tid(200) })),
             "{history:?}"
         );
+    }
+
+    #[test]
+    fn the_sequence_rows_list_and_read_without_a_reservation() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        assert!(store.sequence_names().unwrap().is_empty());
+        store.sequence("lexicon").next().unwrap();
+        store.sequence("intids").next().unwrap();
+        assert_eq!(store.sequence_names().unwrap(), ["intids", "lexicon"]);
+        // The first reservation reserves the values 1 to 100.
+        assert_eq!(store.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(store.sequence_end("absent").unwrap(), None);
+        // The read reserved nothing.
+        assert_eq!(store.sequence("intids").next().unwrap(), 2);
+        assert_eq!(store.sequence_end("intids").unwrap(), Some(101));
     }
 }

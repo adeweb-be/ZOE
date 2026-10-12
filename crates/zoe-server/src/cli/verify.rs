@@ -133,6 +133,7 @@ fn hex(n: u64) -> String {
 fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Result<()> {
     writeln!(out, "Verified the store {}", path.display())?;
     writeln!(out, "  transactions     {}", report.transactions)?;
+    writeln!(out, "  sequences        {}", report.sequences)?;
     writeln!(out, "  records          {}", report.records)?;
     writeln!(out, "  objects          {}", report.objects)?;
     writeln!(out, "  blobs            {}", report.blobs)?;
@@ -219,6 +220,7 @@ mod tests {
         write_text(&mut out, Path::new("store"), &report()).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("Findings: 2\n"), "{text}");
+        assert!(text.contains("\n  sequences        0\n"), "{text}");
         assert!(
             text.contains("    tid 0x0000000000000005: corrupt transaction row\n"),
             "{text}"

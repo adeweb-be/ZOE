@@ -723,6 +723,21 @@ impl Backend for RedbBackend {
             })?;
         Ok(Some(end))
     }
+
+    fn sequence_names(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let sequences = match txn.open_table(SEQUENCES) {
+            Ok(sequences) => sequences,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(backend(e)),
+        };
+        let mut names = Vec::new();
+        for entry in sequences.iter().map_err(backend)? {
+            let (key, _) = entry.map_err(backend)?;
+            names.push(key.value().to_owned());
+        }
+        Ok(names)
+    }
 }
 
 /// One redb write transaction.
@@ -2166,8 +2181,38 @@ mod tests {
 
         let backend = RedbBackend::open(db).unwrap();
         assert_eq!(backend.sequence_end("intids").unwrap(), None);
+        assert!(backend.sequence_names().unwrap().is_empty());
         commit_sequence(&backend, "intids", 101);
         assert_eq!(backend.sequence_end("intids").unwrap(), Some(101));
+        assert_eq!(backend.sequence_names().unwrap(), ["intids"]);
+    }
+
+    #[test]
+    fn the_sequence_names_come_in_key_order_without_a_read_of_the_rows() {
+        let backend = empty();
+        assert!(backend.sequence_names().unwrap().is_empty());
+        for name in ["lexicon", "intids", "a name / with é"] {
+            commit_sequence(&backend, name, 101);
+        }
+        let names = ["a name / with é", "intids", "lexicon"];
+        assert_eq!(backend.sequence_names().unwrap(), names);
+
+        // A row that does not pass its checksum is still listed. Only its
+        // read fails.
+        let mut flipped = format::encode_frame(
+            KeySpace::Sequences,
+            b"intids",
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            &format::encode_sequence(101),
+        );
+        *flipped.last_mut().unwrap() ^= 1;
+        insert_sequence_frame(&backend, "intids", &flipped);
+        assert_eq!(backend.sequence_names().unwrap(), names);
+        assert!(matches!(
+            backend.sequence_end("intids"),
+            Err(ZoeError::CorruptSequence { .. })
+        ));
     }
 
     /// Replace the stored row of the sequence `name` with `frame`.
