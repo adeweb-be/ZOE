@@ -13,7 +13,9 @@
 //! changes nothing on disk.
 
 mod convert;
+mod mcp;
 mod pack;
+mod serve;
 mod verify;
 
 use std::ffi::OsString;
@@ -57,6 +59,11 @@ enum Command {
     /// Pack a store as of a number of days ago, or report what that pack
     /// would remove.
     Pack(pack::PackArgs),
+    /// Serve a store with the ZEO 6 msgpack protocol until SIGTERM.
+    Serve(serve::ServeArgs),
+    /// Serve the read-only ops tools of a store to an agent, over MCP on
+    /// stdin and stdout.
+    Mcp(mcp::McpArgs),
     /// Check the checksums, the blob files, the references and the classes
     /// of a store, and change nothing. Exit with 1 on a finding.
     Verify(verify::VerifyArgs),
@@ -105,7 +112,9 @@ fn closed_by_reader(error: &io::Error) -> bool {
 /// function. `zoe pack --days` reads the time of the system clock.
 pub fn main(args: Vec<OsString>) -> i32 {
     match Cli::try_parse_from(args) {
-        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout().lock()),
+        // Each write takes the lock of stdout. `zoe mcp` writes to stdout
+        // from other threads, so the command does not hold the lock.
+        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout()),
         Err(error) => usage(&error),
     }
 }
@@ -132,6 +141,8 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
     let (name, result) = match &cli.command {
         Command::Convert(args) => ("convert", convert::run(args, out)),
         Command::Pack(args) => ("pack", pack::run(args, clock, out)),
+        Command::Serve(args) => ("serve", serve::run(args, out)),
+        Command::Mcp(args) => ("mcp", mcp::run(args)),
         Command::Verify(args) => ("verify", verify::run(args, out)),
     };
     // The console script runs this code in the Python process. Nothing

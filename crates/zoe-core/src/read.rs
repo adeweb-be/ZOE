@@ -12,7 +12,7 @@
 //! record is gone too, and the iterator reads each transaction, its index
 //! keys and its records in one snapshot.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use crate::backend::{Backend, BlobRecord, Record, RecordMeta, TxnMeta};
@@ -84,18 +84,133 @@ pub struct CurrentRecord {
     pub next: Option<Oid>,
 }
 
+/// The number of rows, and of tids of the transaction index, that the
+/// transaction iterator reads in one slice.
+const SLICE: usize = 1024;
+
 /// An iterator over transactions in tid order. Each item holds the
 /// records of its transaction.
 ///
 /// The iterator does not borrow the store, and it can move to another
 /// thread. It does not keep the store open: after the `Store` is dropped,
 /// the next call gives `Closed`, then the iterator ends.
+///
+/// It reads the rows and the tids of the transaction index a slice at a
+/// time, as it goes. So it holds one transaction and one slice of each,
+/// whatever the length of its range. A slice of rows ends only after a row
+/// that reads. So a run of rows that do not read stays in one slice, and
+/// the iterator holds the error of each row of that run.
 pub struct Transactions {
     store: Weak<Opened>,
-    rows: VecDeque<Result<TxnMeta>>,
-    /// The tids that the transaction index gave for the range. The
+    /// The last tid of the range.
+    stop: Tid,
+    /// The most rows, and the most tids of the index, in one slice.
+    slice: usize,
+    /// The slice of rows: the tid of each row that reads, or the error of
+    /// a row that does not.
+    rows: VecDeque<Result<Tid>>,
+    /// The first tid of the next slice of rows. It is `None` when the
+    /// iterator has read every row of the range.
+    next_row: Option<Tid>,
+    /// The last tid that the slices of rows cover. The iterator reads the
+    /// index only up to this tid, so it reads the index of a tid after its
+    /// rows.
+    covered: Option<Tid>,
+    /// The range has a row. Only then does the iterator read the index.
+    any_row: bool,
+    /// The slice of the tids that the transaction index gives. The
     /// iterator uses them to find index keys of a tid that has no row.
-    indexed: BTreeSet<Tid>,
+    indexed: VecDeque<Tid>,
+    /// The first tid of the next slice of the index. It is `None` when
+    /// the iterator reads no more of the index.
+    next_indexed: Option<Tid>,
+    /// The iterator gave a row that does not read. Index keys before the
+    /// next row that reads give no error.
+    unread: bool,
+}
+
+/// Return the tid after `tid` when it is not after `stop`.
+fn after(tid: Tid, stop: Tid) -> Option<Tid> {
+    tid.0.checked_add(1).map(Tid).filter(|&next| next <= stop)
+}
+
+impl Transactions {
+    fn new(store: Weak<Opened>, start: Tid, stop: Tid, slice: usize) -> Self {
+        let first = (start <= stop).then_some(start);
+        Self {
+            store,
+            stop,
+            slice: slice.max(1),
+            rows: VecDeque::new(),
+            next_row: first,
+            covered: None,
+            any_row: false,
+            indexed: VecDeque::new(),
+            next_indexed: first,
+            unread: false,
+        }
+    }
+
+    /// Stop the iterator. The next call gives `None`.
+    fn end(&mut self) {
+        self.rows.clear();
+        self.indexed.clear();
+        self.next_row = None;
+        self.next_indexed = None;
+    }
+
+    fn ended(&self) -> bool {
+        self.rows.is_empty()
+            && self.indexed.is_empty()
+            && self.next_row.is_none()
+            && self.next_indexed.is_none()
+    }
+
+    /// Read the next slice of rows, in one snapshot. The slice ends after
+    /// a row that reads, so the next slice starts after its tid. The error
+    /// of a row that does not read does not always name its tid, and an
+    /// error with a tid can come from a failed scan. So the slice does not
+    /// end after an error.
+    fn read_rows(&mut self, backend: &dyn Backend) {
+        let Some(from) = self.next_row else {
+            return;
+        };
+        self.next_row = None;
+        self.covered = Some(self.stop);
+        for row in backend.iter_txns(from, self.stop) {
+            let row = row.map(|row| row.tid);
+            let last = row.as_ref().ok().copied();
+            self.rows.push_back(row);
+            if let Some(tid) = last
+                && self.rows.len() >= self.slice
+            {
+                self.next_row = after(tid, self.stop);
+                if self.next_row.is_some() {
+                    self.covered = Some(tid);
+                }
+                break;
+            }
+        }
+        self.any_row |= !self.rows.is_empty();
+    }
+
+    /// Read the next slice of the index, in one snapshot, up to the last
+    /// tid that the rows cover.
+    fn read_indexed(&mut self, backend: &dyn Backend) -> Result<()> {
+        let (Some(from), Some(to)) = (self.next_indexed, self.covered) else {
+            return Ok(());
+        };
+        if from > to {
+            return Ok(());
+        }
+        let tids = backend.indexed_tids(from, to, self.slice)?;
+        self.next_indexed = match tids.last() {
+            Some(&last) if tids.len() >= self.slice => after(last, self.stop),
+            _ => after(to, self.stop),
+        };
+        self.indexed.extend(tids);
+        Ok(())
+    }
 }
 
 impl Iterator for Transactions {
@@ -103,49 +218,72 @@ impl Iterator for Transactions {
 
     fn next(&mut self) -> Option<Result<TxnInfo>> {
         loop {
-            if self.rows.is_empty() && self.indexed.is_empty() {
+            if self.ended() {
                 return None;
             }
             // The store stays open until this call returns.
             let Some(store) = self.store.upgrade() else {
-                self.rows.clear();
-                self.indexed.clear();
+                self.end();
                 return Some(Err(ZoeError::Closed));
             };
-            // Index keys of a tid before the next row, or after the last
-            // row, have no row. They come in tid order, as an error.
-            if let Some(&tid) = self.indexed.first() {
-                let no_row = match self.rows.front() {
-                    Some(Ok(row)) => tid < row.tid,
-                    Some(Err(_)) => false,
-                    None => true,
-                };
-                if no_row {
-                    self.indexed.remove(&tid);
-                    return Some(Err(ZoeError::CorruptTxn { tid }));
-                }
+            if self.rows.is_empty() {
+                self.read_rows(&**store);
             }
-            let row = match self.rows.pop_front()? {
-                Ok(row) => row,
-                Err(error) => {
-                    // A row that does not read can own any index keys before
-                    // the next row that reads. Drop them, so that they give
-                    // no second error.
-                    let next = self.rows.iter().find_map(|row| row.as_ref().ok());
-                    match next {
-                        Some(row) => self.indexed = self.indexed.split_off(&row.tid),
-                        None => self.indexed.clear(),
-                    }
+            // A range with no row needs no read of the index.
+            if !self.any_row {
+                self.end();
+                return None;
+            }
+            if self.indexed.is_empty()
+                && let Err(error) = self.read_indexed(&**store)
+            {
+                // The index of the rest of the range does not read. The
+                // rows still give their transactions.
+                self.next_indexed = None;
+                return Some(Err(error));
+            }
+            let indexed = self.indexed.front().copied();
+            match self.rows.pop_front() {
+                // A row that does not read can own any index keys before
+                // the next row that reads. They give no second error.
+                Some(Err(error)) => {
+                    self.unread = true;
                     return Some(Err(error));
                 }
-            };
-            self.indexed.remove(&row.tid);
-            match txn_info(&**store, row.tid) {
-                Ok(Some(txn)) => return Some(Ok(txn)),
-                // A pack removed the transaction after the iterator read
-                // its row.
-                Ok(None) => {}
-                Err(error) => return Some(Err(error)),
+                Some(Ok(tid)) => {
+                    // Index keys of a tid before the row have no row. They
+                    // come in tid order, as an error.
+                    if let Some(first) = indexed
+                        && first < tid
+                    {
+                        self.rows.push_front(Ok(tid));
+                        self.indexed.pop_front();
+                        if self.unread {
+                            continue;
+                        }
+                        return Some(Err(ZoeError::CorruptTxn { tid: first }));
+                    }
+                    self.unread = false;
+                    if indexed == Some(tid) {
+                        self.indexed.pop_front();
+                    }
+                    match txn_info(&**store, tid) {
+                        Ok(Some(txn)) => return Some(Ok(txn)),
+                        // A pack removed the transaction after the iterator
+                        // read its row.
+                        Ok(None) => {}
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                // The rows of the range are all read. Index keys after the
+                // last row have no row.
+                None => match indexed {
+                    Some(first) if !self.unread => {
+                        self.indexed.pop_front();
+                        return Some(Err(ZoeError::CorruptTxn { tid: first }));
+                    }
+                    _ => self.end(),
+                },
             }
         }
     }
@@ -286,9 +424,14 @@ impl Store {
     /// iterator leaves out a transaction that commits after this call.
     ///
     /// The oids of each transaction come from the transaction index. The
-    /// call reads the rows and the index keys of the range, then each
-    /// transaction with its index keys and its records in one snapshot. It
-    /// never reads every record key, so a read of one transaction costs
+    /// iterator reads the rows of the range a slice at a time, then the
+    /// tids of the index that these rows cover, a slice at a time. Then it
+    /// reads each transaction with its index keys and its records in one
+    /// snapshot. Each slice is one snapshot. So the iterator holds one
+    /// transaction and a slice of tids, whatever the length of the range.
+    /// A slice ends only after a row that reads, so a run of rows that do
+    /// not read stays in one slice, with the error of each row.
+    /// It never reads every record key, so a read of one transaction costs
     /// the size of its result. A transaction that a pack removes after
     /// this call is left out.
     ///
@@ -297,26 +440,25 @@ impl Store {
     /// index key without its record gives `CorruptTxn` too. Index keys of a
     /// tid that has no row give `CorruptTxn`, but only when the range has a
     /// row. A row that does not read gives its own error once, and the
-    /// index keys before the next row that reads give no error.
+    /// index keys before the next row that reads give no error. A failed
+    /// scan of the rows gives its error and ends the iterator. A failed
+    /// scan of the index gives its error once, and the iterator then gives
+    /// the transactions of the rest of the range without that check.
     pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
+        Ok(self.iterator_in_slices(start, stop, SLICE))
+    }
+
+    /// Iterate as `iterator` does, with slices of at most `slice` rows and
+    /// `slice` tids of the index.
+    pub(crate) fn iterator_in_slices(
+        &self,
+        start: Option<Tid>,
+        stop: Option<Tid>,
+        slice: usize,
+    ) -> Transactions {
         let start = start.unwrap_or(Tid::ZERO);
         let stop = stop.unwrap_or(Tid::MAX).min(self.last_transaction());
-        let rows: Vec<_> = if start > stop {
-            Vec::new()
-        } else {
-            self.backend.iter_txns(start, stop).collect()
-        };
-        // A range with no row needs no read of the index.
-        let indexed = if rows.is_empty() {
-            BTreeSet::new()
-        } else {
-            self.backend.txn_oids(start, stop)?.into_keys().collect()
-        };
-        Ok(Transactions {
-            store: Arc::downgrade(&self.backend),
-            rows: rows.into(),
-            indexed,
-        })
+        Transactions::new(Arc::downgrade(&self.backend), start, stop, slice)
     }
 
     /// Return the current record of the first oid at or after `next` that
@@ -386,6 +528,7 @@ mod tests {
     use redb::{ReadableTable, TableDefinition};
 
     use super::*;
+    use crate::backend::TxnMeta;
     use crate::format;
     use crate::vfs::MemVfs;
 
@@ -922,6 +1065,160 @@ mod tests {
             })
             .collect();
         assert_eq!(BTreeMap::from_iter(txns), expected);
+    }
+
+    /// The tid of a transaction that the iterator gives, or the text of
+    /// its error.
+    fn tid_or_error(txn: Result<TxnInfo>) -> std::result::Result<Tid, String> {
+        txn.map(|txn| txn.tid).map_err(|e| format!("{e:?}"))
+    }
+
+    /// The tid of each transaction that the iterator gives with slices of
+    /// `slice`, or the text of each error.
+    fn sliced(
+        store: &Store,
+        start: Option<u64>,
+        stop: Option<u64>,
+        slice: usize,
+    ) -> Vec<std::result::Result<Tid, String>> {
+        store
+            .iterator_in_slices(start.map(Tid), stop.map(Tid), slice)
+            .map(tid_or_error)
+            .collect()
+    }
+
+    /// Check that slices of 1 to 4 rows give what one slice gives.
+    fn same_in_every_slice(store: &Store, start: Option<u64>, stop: Option<u64>) {
+        let whole = sliced(store, start, stop, SLICE);
+        for slice in 1..=4 {
+            assert_eq!(
+                sliced(store, start, stop, slice),
+                whole,
+                "slices of {slice}, from {start:?} to {stop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn small_slices_give_every_transaction_in_order() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let tids: Vec<u64> = (1..=10).map(|n| n * 100).collect();
+        for &tid in &tids {
+            restore(&store, tid, &[(Oid(tid), Some(pickle(1)))]);
+        }
+        for slice in 1..=4 {
+            assert_eq!(
+                sliced(&store, None, None, slice),
+                tids.iter().map(|&t| Ok(Tid(t))).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                sliced(&store, Some(250), Some(700), slice),
+                [300, 400, 500, 600, 700].map(|t| Ok(Tid(t)))
+            );
+        }
+    }
+
+    #[test]
+    fn small_slices_give_the_errors_of_one_slice() {
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            for tid in [100, 200, 300, 400, 500, 600] {
+                restore(&store, tid, &[(Oid(1), Some(pickle(1)))]);
+            }
+        }
+        // Index keys without a row at 150, 250, 450 and 550, a second
+        // record at 200, and a row of a newer format at 400.
+        add_record(&vfs, Oid(2), Tid(150));
+        add_record(&vfs, Oid(2), Tid(200));
+        add_record(&vfs, Oid(2), Tid(250));
+        add_record(&vfs, Oid(2), Tid(450));
+        add_record(&vfs, Oid(2), Tid(550));
+        flag_row(&vfs, Tid(400));
+        let store = Store::open_vfs(vfs).unwrap();
+
+        let corrupt = |tid| Err(format!("{:?}", ZoeError::CorruptTxn { tid: Tid(tid) }));
+        let whole = sliced(&store, None, None, SLICE);
+        assert_eq!(
+            whole[..5],
+            [
+                Ok(Tid(100)),
+                corrupt(150),
+                corrupt(200),
+                corrupt(250),
+                Ok(Tid(300)),
+            ]
+        );
+        // The row at 400 gives its own error, and the index key at 450
+        // gives none.
+        assert!(
+            whole[5].as_ref().is_err_and(|e| e.starts_with("Format")),
+            "{whole:?}"
+        );
+        assert_eq!(whole[6..], [Ok(Tid(500)), corrupt(550), Ok(Tid(600))]);
+
+        for (start, stop) in [
+            (None, None),
+            (None, Some(560)),
+            (Some(150), Some(450)),
+            (Some(420), None),
+            (Some(140), Some(160)),
+        ] {
+            same_in_every_slice(&store, start, stop);
+        }
+    }
+
+    /// A pickle of class `m.C` with an empty state. It refers to no
+    /// object.
+    const LEAF: &[u8] = b"\x80\x03cm\nC\nq\x00.\x80\x03}.";
+
+    #[test]
+    fn a_pack_between_two_slices_gives_no_error() {
+        // The root at 100. Then, in turn, a transaction with no record and
+        // a transaction of an object that nothing refers to. The pack
+        // removes each such object with its row, one in each batch. A row
+        // with no record has no index key, so an index read past it can
+        // name the tid of a row that the next batch removes.
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        restore(&store, 100, &[(Oid(0), Some(LEAF.to_vec()))]);
+        let mut written = vec![Tid(100)];
+        for n in 1..=8u8 {
+            let tid = 200 * u64::from(n);
+            restore(&store, tid, &[]);
+            restore(&store, tid + 100, &[(Oid(n.into()), Some(pickle(n)))]);
+            written.extend([Tid(tid), Tid(tid + 100)]);
+        }
+        let last = store.last_transaction();
+
+        // Each call reads a new slice of one row. Each batch of the pack
+        // runs between two calls.
+        let mut iterator = store.iterator_in_slices(None, None, 1);
+        let mut given = Vec::new();
+        let report = store
+            .pack_in_batches(last, 1, || {
+                if let Some(txn) = iterator.next() {
+                    given.push(tid_or_error(txn));
+                }
+            })
+            .unwrap();
+        let during = given.len();
+        given.extend(iterator.map(tid_or_error));
+
+        assert_eq!(report.records, 8, "{report:?}");
+        assert!(during >= 2, "{during} calls during the pack");
+        assert!(given.len() > during, "no call after the pack: {given:?}");
+        let given: Vec<Tid> = given
+            .iter()
+            .map(|txn| txn.clone().unwrap_or_else(|e| panic!("{e} in {given:?}")))
+            .collect();
+        assert!(given.windows(2).all(|pair| pair[0] < pair[1]), "{given:?}");
+        assert!(given.iter().all(|tid| written.contains(tid)), "{given:?}");
+        // The root and the transactions with no record survive the pack.
+        let survivors: Vec<Tid> = (0..=8).map(|n| Tid(100u64.max(200 * n))).collect();
+        assert_eq!(tids(&store, None, None), survivors);
+        for tid in &survivors {
+            assert!(given.contains(tid), "{tid:?} is missing from {given:?}");
+        }
     }
 
     fn is_corrupt<T: std::fmt::Debug>(result: Result<T>, tid: u64) {
