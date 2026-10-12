@@ -229,7 +229,11 @@ pub(crate) async fn serve_connection(
                 break;
             }
         };
-        let call = match message::decode(&bytes) {
+        let decoded = message::decode(&bytes);
+        // The call holds copies of its values. So the bytes of the frame go
+        // before the reader waits for room.
+        drop(bytes);
+        let call = match decoded {
             Ok(call) => call,
             Err(error) => {
                 eprintln!("zoe serve: {peer}: a frame is not a call: {error}");
