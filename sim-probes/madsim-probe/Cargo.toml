@@ -1,0 +1,11 @@
+[package]
+name = "madsim-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+madsim = "0.2.34"
+tokio = { version = "0.2.30", package = "madsim-tokio", features = ["rt", "macros", "time", "sync", "io-util", "net"] }
+
+[workspace]

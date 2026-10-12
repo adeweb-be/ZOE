@@ -1,0 +1,11 @@
+[package]
+name = "turmoil-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+turmoil = "0.7.2"
+tokio = { version = "1.53", features = ["rt", "macros", "time", "sync", "io-util", "net"] }
+
+[workspace]

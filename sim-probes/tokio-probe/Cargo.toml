@@ -1,0 +1,10 @@
+[package]
+name = "tokio-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt", "macros", "time", "sync", "io-util", "net"] }
+
+[workspace]
