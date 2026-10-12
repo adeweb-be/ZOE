@@ -1,3 +1,4 @@
+import tomllib
 from typing import Annotated
 
 import dagger
@@ -21,6 +22,13 @@ extra-substituters = https://devenv.cachix.org
 extra-trusted-public-keys = devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
 """
 
+# The user of the server image: a numeric id that is not root. A runtime
+# can check a numeric id without an /etc/passwd in the image.
+IMAGE_USER = "65532:65532"
+
+# The store directory in the server image. The image user owns it.
+IMAGE_STORE = "/var/lib/zoe"
+
 # Local state that must not go into the container.
 SOURCE_IGNORE = [
     ".git",
@@ -29,6 +37,8 @@ SOURCE_IGNORE = [
     ".direnv",
     "target",
     "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
     "python/.venv*",
     "python/zoedb/src/zoe/*.so",
     "ci/.venv",
@@ -79,6 +89,7 @@ class Ci:
         self,
         source: dagger.Directory,
         name: str,
+        args: tuple[str, ...] = (),
         cache_target: bool = True,
         privileged: bool = False,
     ) -> dagger.Container:
@@ -87,9 +98,14 @@ class Ci:
         if cache_target:
             ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
         return ctr.with_exec(
-            ["devenv", "shell", "--", "just", name],
+            ["devenv", "shell", "--", "just", name, *args],
             insecure_root_capabilities=privileged,
         )
+
+    async def workspace(self, source: dagger.Directory) -> dict:
+        """Return the workspace package table of Cargo.toml."""
+        cargo = tomllib.loads(await source.file("Cargo.toml").contents())
+        return cargo["workspace"]["package"]
 
     @function
     async def check(self, source: Source) -> str:
@@ -179,6 +195,60 @@ class Ci:
         )
 
     @function
-    async def release(self, source: Source) -> str:
-        """Build the release artifacts. Not built yet."""
-        return await self.recipe(source, "release").stdout()
+    def zoe_binary(self, source: Source) -> dagger.File:
+        """Build the static `zoe` binary, with `serve`, for Linux x86-64."""
+        # The recipe copies the binary out of the target cache volume.
+        return self.recipe(source, "release", ("binary", "/dist")).file("/dist/zoe")
+
+    @function
+    async def server_image(self, source: Source) -> dagger.Container:
+        """Build the server image: the static `zoe` binary and nothing else.
+
+        `export` writes the image as an OCI tarball. The address of the image
+        is ghcr.io/adeweb-be/zoe, and its tags are the release versions.
+        """
+        package = await self.workspace(source)
+        # The image starts empty: no shell, no package manager, no
+        # interpreter. The binary needs no C library.
+        return (
+            dag.container(platform=dagger.Platform("linux/amd64"))
+            .with_file("/usr/local/bin/zoe", self.zoe_binary(source), permissions=0o755)
+            .with_directory(IMAGE_STORE, dag.directory(), owner=IMAGE_USER)
+            .with_env_variable("ZOE_PATH", IMAGE_STORE)
+            # The runtime of the container exposes the ports, so the server
+            # listens on all the addresses of the container.
+            .with_env_variable("ZOE_LISTEN", "0.0.0.0:8100")
+            .with_user(IMAGE_USER)
+            .with_entrypoint(["/usr/local/bin/zoe"])
+            .with_default_args(["serve"])
+            .with_exposed_port(8100, description="ZEO")
+            .with_exposed_port(8101, description="admin")
+            .with_label("org.opencontainers.image.version", package["version"])
+            .with_label("org.opencontainers.image.source", package["repository"])
+        )
+
+    @function
+    async def release(
+        self,
+        source: Source,
+        tag: Annotated[
+            str, Doc("The git tag of the release. It must be v and the version.")
+        ] = "",
+    ) -> dagger.Directory:
+        """Build the release artifacts: the static binary and the server image.
+
+        The version bump, the wheels and the Helm chart are not built yet.
+        """
+        version = (await self.workspace(source))["version"]
+        # The tag of the image is the version. So the git tag must name the
+        # version that the build gives to the binary and the image.
+        if tag and tag != f"v{version}":
+            raise ValueError(f"the tag {tag} is not v{version}, the version")
+        image = await self.server_image(source)
+        return (
+            dag.directory()
+            .with_file(
+                f"zoe-{version}-x86_64-unknown-linux-musl", self.zoe_binary(source)
+            )
+            .with_file(f"zoe-{version}-image.tar", image.as_tarball())
+        )
