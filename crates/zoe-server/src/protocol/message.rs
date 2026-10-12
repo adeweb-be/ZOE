@@ -106,6 +106,17 @@ pub(crate) fn error(id: Value, class: &str, args: Value) -> Vec<u8> {
     ]))
 }
 
+/// Encode a call of the server to the client: `method` with `args`. It
+/// has the id 0 and the flags true, and it gets no reply.
+pub(crate) fn notify(method: &str, args: Vec<Value>) -> Vec<u8> {
+    encode(Value::Array(vec![
+        Value::from(0),
+        Value::Boolean(true),
+        Value::from(method),
+        Value::Array(args),
+    ]))
+}
+
 fn encode(value: Value) -> Vec<u8> {
     let mut bytes = Vec::new();
     // A write to a vector never fails.
@@ -191,6 +202,41 @@ mod tests {
             assert!(decode(&frame(value)).is_err());
         }
         assert!(decode(b"").is_err());
+    }
+
+    /// Return the bytes of the hex text `hex`.
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_calls_of_the_server_have_the_bytes_of_a_stock_server() {
+        // `info` and `invalidateTransaction` as `plain.jsonl` of the wire
+        // spike recorded them.
+        let info = notify(
+            "info",
+            vec![Value::Map(vec![
+                (Value::from("length"), Value::from(1)),
+                (Value::from("size"), Value::from(225)),
+            ])],
+        );
+        assert_eq!(
+            info,
+            unhex("9400c3a4696e666f9182a66c656e67746801a473697a65cce1")
+        );
+        let tid = Value::Binary(unhex("040c458fcdb65344"));
+        let oid = Value::Binary(unhex("0000000000000001"));
+        let invalidation = notify("invalidateTransaction", vec![tid, Value::Array(vec![oid])]);
+        assert_eq!(
+            invalidation,
+            unhex(
+                "9400c3b5696e76616c69646174655472616e73616374696f6e92\
+                 c408040c458fcdb6534491c4080000000000000001"
+            )
+        );
     }
 
     #[test]
