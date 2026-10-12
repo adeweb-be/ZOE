@@ -69,8 +69,7 @@ const RUOK: &[u8] = b"ruok";
 /// the call queue. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
-/// The name of the storage that the server serves. It is the default of
-/// ZEO.
+/// The name of the storage that `--path` gives. It is the default of ZEO.
 pub(crate) const STORAGE_NAME: &str = "1";
 
 /// The bounds of the queues of a storage.
@@ -141,12 +140,51 @@ impl NamedStorage {
     }
 }
 
+/// The stores that a server serves, each under its own name. All the
+/// connections share it. A connection selects one store with `register`.
+pub(crate) struct Storages {
+    /// The storages, in the order of the configuration. No two have the
+    /// same name.
+    storages: Vec<Arc<NamedStorage>>,
+    /// The most invalidations that wait for one client. A connection gets
+    /// its queues before `register` selects its storage.
+    client_queue: usize,
+}
+
+impl Storages {
+    /// Serve `storages`, whose names must differ. At most `client_queue`
+    /// invalidations wait for one client.
+    pub(crate) fn new(storages: Vec<Arc<NamedStorage>>, client_queue: usize) -> Self {
+        Self {
+            storages,
+            client_queue,
+        }
+    }
+
+    /// Return the storage named `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&Arc<NamedStorage>> {
+        self.storages.iter().find(|storage| storage.name == name)
+    }
+
+    /// Return the reply to `ruok`: the status of each storage. It reads the
+    /// stores.
+    fn ruok(&self) -> String {
+        let statuses: Vec<_> = self
+            .storages
+            .iter()
+            .map(|storage| (storage.name.as_str(), storage.status()))
+            .collect();
+        status::ruok(&statuses)
+    }
+}
+
 /// Serve one client on `stream` until it closes, or until the server
-/// closes the connection. A frame longer than `max_frame_size` bytes closes
-/// the connection before the server reserves memory for it.
+/// closes the connection. The client selects one of `storages` with
+/// `register`. A frame longer than `max_frame_size` bytes closes the
+/// connection before the server reserves memory for it.
 pub(crate) async fn serve_connection(
     stream: TcpStream,
-    storage: Arc<NamedStorage>,
+    storages: Arc<Storages>,
     max_frame_size: u32,
 ) {
     let peer = stream
@@ -159,11 +197,8 @@ pub(crate) async fn serve_connection(
     match frame::read(&mut reader, max_frame_size).await {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
-            // The status reads the store, so it runs on the blocking pool.
-            let reply = tokio::task::spawn_blocking(move || {
-                status::ruok(&[(storage.name.as_str(), storage.status())])
-            })
-            .await;
+            // The status reads the stores, so it runs on the blocking pool.
+            let reply = tokio::task::spawn_blocking(move || storages.ruok()).await;
             if let Ok(reply) = reply {
                 let _ = frame::write(&mut writer, reply.as_bytes()).await;
             }
@@ -182,12 +217,12 @@ pub(crate) async fn serve_connection(
     }
 
     let (calls, received) = mpsc::channel(QUEUE);
-    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storage.queues.client);
+    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storages.client_queue);
     let closed = Arc::new(Notify::new());
     let worker = {
         let closed = Arc::clone(&closed);
         tokio::task::spawn_blocking(move || {
-            session::run(storage, received, outbox);
+            session::run(storages, received, outbox);
             closed.notify_one();
         })
     };
@@ -297,6 +332,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Store::open(&dir).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
+        let storages = Arc::new(Storages::new(
+            vec![Arc::clone(&storage)],
+            Queues::DEFAULT.client,
+        ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -305,7 +344,7 @@ mod tests {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let served = Arc::clone(&storage);
+        let served = Arc::clone(&storages);
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             serve_connection(stream, served, crate::serve::DEFAULT_MAX_FRAME_SIZE.get()).await;
