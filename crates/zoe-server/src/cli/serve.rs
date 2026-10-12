@@ -35,6 +35,27 @@ pub(super) struct ServeArgs {
     )]
     listen: SocketAddr,
 
+    /// The most transactions that getInvalidations covers. A client that
+    /// reconnects further behind gets nil and verifies its cache.
+    #[arg(
+        long,
+        env = "ZOE_INVALIDATION_QUEUE_SIZE",
+        value_name = "TRANSACTIONS",
+        default_value_t = 100_000
+    )]
+    invalidation_queue_size: usize,
+
+    /// The most invalidations that wait for one client. Past it, the server
+    /// closes the connection, and the client reconnects and verifies its
+    /// cache. The replies of the client wait in a queue of the same size.
+    #[arg(
+        long,
+        env = "ZOE_CLIENT_QUEUE_SIZE",
+        value_name = "MESSAGES",
+        default_value_t = 1_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    client_queue_size: u64,
     /// The longest time that a vote waits for the lock of an object, in
     /// whole seconds, such as 10, 10s or 2m, as the key lock-timeout of the
     /// <zoe> section takes it. A longer wait fails the vote with
@@ -89,7 +110,10 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
 
     use crate::serve::{ServeOptions, Server};
 
-    let mut options = ServeOptions::new(&args.path).listen(args.listen);
+    let mut options = ServeOptions::new(&args.path)
+        .listen(args.listen)
+        .invalidation_queue_size(args.invalidation_queue_size)
+        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX));
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
@@ -114,7 +138,31 @@ pub(super) fn run(_args: &ServeArgs, _out: &mut dyn Write) -> Result<(), Failure
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    use super::super::{Cli, Command};
     use super::*;
+
+    /// Parse `zoe serve --path store` with `args` after it.
+    fn serve(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+        let line = ["zoe", "serve", "--path", "store"].iter().chain(args);
+        match Cli::try_parse_from(line)?.command {
+            Command::Serve(args) => Ok(args),
+            other => panic!("not serve: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_queue_sizes_have_their_defaults_and_a_client_queue_holds_one_message() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.invalidation_queue_size, 100_000);
+        assert_eq!(args.client_queue_size, 1_000);
+        let args = serve(&["--invalidation-queue-size", "0", "--client-queue-size", "1"]).unwrap();
+        assert_eq!(args.invalidation_queue_size, 0);
+        assert_eq!(args.client_queue_size, 1);
+        let error = serve(&["--client-queue-size", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
 
     #[test]
     fn a_lock_timeout_is_in_whole_seconds_as_the_stanza_key_takes_it() {

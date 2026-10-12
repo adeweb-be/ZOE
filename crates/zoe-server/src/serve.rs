@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Runtime;
 use zoe_core::{Options, Store, ZoeError};
 
-use crate::protocol::{self, NamedStorage};
+use crate::protocol::{self, NamedStorage, Queues};
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
 /// frame holds a whole record, and the store sets no limit on a record by
@@ -29,17 +29,21 @@ pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap
 pub struct ServeOptions {
     path: PathBuf,
     listen: SocketAddr,
+    queues: Queues,
     lock_timeout: Option<Duration>,
     max_frame_size: NonZeroU32,
 }
 
 impl ServeOptions {
     /// Serve the store in `path` on a free port of 127.0.0.1, with frames
-    /// of at most [`DEFAULT_MAX_FRAME_SIZE`] bytes.
+    /// of at most [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue
+    /// covers 100,000 transactions, and 1,000 invalidations can wait for
+    /// one client.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            queues: Queues::DEFAULT,
             lock_timeout: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
@@ -49,6 +53,24 @@ impl ServeOptions {
     #[must_use]
     pub fn listen(mut self, addr: SocketAddr) -> Self {
         self.listen = addr;
+        self
+    }
+
+    /// Let `getInvalidations` cover at most `transactions` commits. A
+    /// client that is further behind gets nil and verifies its cache.
+    #[must_use]
+    pub fn invalidation_queue_size(mut self, transactions: usize) -> Self {
+        self.queues.invalidations = transactions;
+        self
+    }
+
+    /// Let at most `messages` invalidations wait for one client. Past it,
+    /// the server closes the connection of the client. The replies of the
+    /// client wait in a queue of the same size. A size of 0 lets 1 message
+    /// wait.
+    #[must_use]
+    pub fn client_queue_size(mut self, messages: usize) -> Self {
+        self.queues.client = messages;
         self
     }
 
@@ -131,7 +153,12 @@ impl Server {
         let store = Store::open_with(&options.path, options.store_options())
             .map(Arc::new)
             .map_err(|error| Error::Store(options.path.clone(), error))?;
-        let storage = NamedStorage::new(protocol::STORAGE_NAME, &options.path, Arc::clone(&store));
+        let storage = NamedStorage::new(
+            protocol::STORAGE_NAME,
+            &options.path,
+            Arc::clone(&store),
+            options.queues,
+        );
         runtime.spawn(accept(
             listener,
             Arc::new(storage),
