@@ -5,7 +5,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 ## Layout
 
 - `src/main.rs`: the binary `zoe`. It only calls `cli::main` and exits with its code.
-- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `verify.rs` holds `zoe verify`.
+- `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`, `verify.rs` holds `zoe verify` and its `--backup`, `backup.rs` holds `zoe backup`, `restore.rs` holds `zoe restore`.
 - `src/cli/serve.rs`: `zoe serve`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/cli/mcp.rs`: `zoe mcp`. It calls `zoe-mcp`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/serve.rs`: `zoe_server::serve::{Server, ServeOptions}`, the server as a library. The binary and the Rust tests run it.
@@ -18,12 +18,12 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - The subcommands and their names follow the naming table of the specification.
 - Every option has a `ZOE_*` environment twin in SCREAMING\_SNAKE: the option name without `--`, in capitals, with `_` for `-`. The help of the option names its twin. An option on the command line wins over its twin.
 - The store is `--path` (`ZOE_PATH`) in every subcommand. The blob directory of a `Data.fs` is `--data-fs-blob-dir` (`ZOE_DATA_FS_BLOB_DIR`).
-- The exit code is 0 on success, 1 on a failure, and 2 on a usage error. A conversion whose report lists a problem fails with 1, and so does the `Mismatch` of `zoe-convert`. `zoe verify` fails with 1 when its report lists a finding.
+- The exit code is 0 on success, 1 on a failure, and 2 on a usage error. A conversion whose report lists a problem fails with 1, and so does the `Mismatch` of `zoe-convert`. `zoe verify` fails with 1 when its report lists a finding, and `zoe verify --backup` when it lists a difference or a dump does not restore. `zoe backup` with nothing new writes nothing and exits with 0.
 - The report goes to stdout. A message goes to stderr, and starts with `zoe <subcommand>:`. The help and the version go to stdout with the code 0. A reader that closes stdout before the end of the report, as `head` does, does not fail the command, because the work is done. A conversion that does not verify still fails.
 - The command parses all its arguments before it opens a file. A usage error changes nothing on disk.
 - `cli::main` flushes stdout before it returns, because the Python process does not flush the stdout of Rust when it ends.
 - `cli::main` does not hold the lock of stdout. `zoe mcp` writes MCP messages to stdout from another thread, and writes no report.
-- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, and `zoe mcp` through Loupe's `Folder`. A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store. Before it opens the store, it checks that the `Data.fs` is a regular file that starts with `FS30`, so a wrong source creates no store.
+- A command that only reads opens the store with `Store::open_read_only`: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, `zoe backup`, and `zoe mcp` through Loupe's `Folder`. `zoe restore` creates a store only in a new or an empty directory, after it checked every dump (ADR 0030). A command that writes to an existing store refuses a directory without `zoe.redb` and creates nothing: `zoe pack`. Only `zoe convert --from-data-fs` creates a store. Before it opens the store, it checks that the `Data.fs` is a regular file that starts with `FS30`, so a wrong source creates no store.
 - `--days N` gives the tid of the time of the clock minus N days of 86,400 seconds, by `zoe_core::timestamp`. The command reads the time only through the `Clock` trait, so a test gives its own time. `cli::main` uses the system clock.
 
 ## Invariants of the server
@@ -77,3 +77,4 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - `tests/cli.rs` is the acceptance test of the binary and of `cli::main`.
 - `tests/serve.rs` and `python/zoedb/tests/server/test_walking_skeleton.py` are the acceptance tests of `zoe serve`. `python/zoedb/tests/server/test_commit_over_zeo.py` is the acceptance test of the commit methods: read-current, `deleteObject`, conflicts, the lock-wait timeout, restore transactions and per-OID locks. `python/zoedb/tests/server/test_conflict_resolution_over_zeo.py` is the acceptance test of the conflicts that a stock client resolves through the vote. `tests/wire/mod.rs` is a raw ZEO 6 client and a `zoe serve` process for the Rust tests of the server; it is part of the acceptance tests. The Python tests find the binary through `ZOE_BINARY`, which `just test` sets. `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script.
 - `tests/mcp.rs` is the acceptance test of `zoe mcp`. It compiles only with the feature `serve`.
+- `tests/backup.rs` is the acceptance test of `zoe backup`, `zoe restore` and `zoe verify --backup`.
