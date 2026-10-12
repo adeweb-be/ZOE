@@ -10,7 +10,7 @@ Other crates talk to a network or to an agent: the Rust client of the ZEO protoc
 
 ## Decision
 
-One crate, `zoe-core`, owns correctness. It is synchronous Rust with no tokio and no Python inside. The in-process storage and the server are thin skins that call it the same way. Async lives in the server skin (`zoe-server`), which runs core calls on a blocking pool, and in the crates that talk to a network or to an agent: `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe. The extension module (`zoe-py`) never links tokio: `cargo tree -p zoe-py -e normal` lists none.
+One crate, `zoe-core`, owns correctness. It is synchronous Rust with no tokio and no Python inside. The in-process storage and the server are thin skins that call it the same way. Async lives in the server skin (`zoe-server`), which runs core calls on a blocking pool, and in the crates that talk to a network or to an agent: `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe. The extension module (`zoe-py`) never links tokio or rmcp: `cargo tree -p zoe-py -e normal` lists neither.
 
 ## Consequences
 
