@@ -95,17 +95,6 @@ pub(crate) fn reply(id: Value, result: Value) -> Vec<u8> {
     ]))
 }
 
-/// Encode a call from the server to the client: `[0, true, method, args]`.
-/// It gets no reply.
-pub(crate) fn call_async(method: &str, args: Vec<Value>) -> Vec<u8> {
-    encode(Value::Array(vec![
-        Value::from(0),
-        Value::Boolean(true),
-        Value::from(method),
-        Value::Array(args),
-    ]))
-}
-
 /// Encode the error reply to the call `id`: the exception `class` with
 /// `args`.
 pub(crate) fn error(id: Value, class: &str, args: Value) -> Vec<u8> {
@@ -114,6 +103,17 @@ pub(crate) fn error(id: Value, class: &str, args: Value) -> Vec<u8> {
         Value::from(ERROR),
         Value::from(".reply"),
         Value::Array(vec![Value::from(class), args]),
+    ]))
+}
+
+/// Encode a call of the server to the client: `method` with `args`. It
+/// has the id 0 and the flags true, and it gets no reply.
+pub(crate) fn notify(method: &str, args: Vec<Value>) -> Vec<u8> {
+    encode(Value::Array(vec![
+        Value::from(0),
+        Value::Boolean(true),
+        Value::from(method),
+        Value::Array(args),
     ]))
 }
 
@@ -204,16 +204,54 @@ mod tests {
         assert!(decode(b"").is_err());
     }
 
+    /// Return the bytes of the hex text `hex`.
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn a_call_of_the_server_has_the_id_0_and_the_flags_true() {
-        // receiveBlobStop [oid 4, serial] from the trace of a stock server.
-        let oid = Value::Binary(vec![0, 0, 0, 0, 0, 0, 0, 4]);
-        let serial = Value::Binary(vec![0x04, 0x0c, 0x45, 0x8f, 0xd0, 0xd4, 0xa4, 0x66]);
-        let bytes = call_async("receiveBlobStop", vec![oid, serial]);
-        let mut expected = b"\x94\x00\xc3\xafreceiveBlobStop\x92\xc4\x08".to_vec();
-        expected.extend([0, 0, 0, 0, 0, 0, 0, 4, 0xc4, 0x08]);
-        expected.extend([0x04, 0x0c, 0x45, 0x8f, 0xd0, 0xd4, 0xa4, 0x66]);
-        assert_eq!(bytes, expected);
+    fn the_calls_of_the_server_have_the_bytes_of_a_stock_server() {
+        // `info` and `invalidateTransaction` as `plain.jsonl` of the wire
+        // spike recorded them.
+        let info = notify(
+            "info",
+            vec![Value::Map(vec![
+                (Value::from("length"), Value::from(1)),
+                (Value::from("size"), Value::from(225)),
+            ])],
+        );
+        assert_eq!(
+            info,
+            unhex("9400c3a4696e666f9182a66c656e67746801a473697a65cce1")
+        );
+        let tid = Value::Binary(unhex("040c458fcdb65344"));
+        let oid = Value::Binary(unhex("0000000000000001"));
+        let invalidation = notify("invalidateTransaction", vec![tid, Value::Array(vec![oid])]);
+        assert_eq!(
+            invalidation,
+            unhex(
+                "9400c3b5696e76616c69646174655472616e73616374696f6e92\
+                 c408040c458fcdb6534491c4080000000000000001"
+            )
+        );
+    }
+
+    #[test]
+    fn receive_blob_stop_has_the_bytes_of_a_stock_server() {
+        // `receiveBlobStop [oid, serial]` as `plain.jsonl` of the wire spike
+        // recorded it.
+        let oid = Value::Binary(unhex("0000000000000004"));
+        let serial = Value::Binary(unhex("040c458fd0d4a466"));
+        assert_eq!(
+            notify("receiveBlobStop", vec![oid, serial]),
+            unhex(
+                "9400c3af72656365697665426c6f6253746f7092\
+                 c4080000000000000004c408040c458fd0d4a466"
+            )
+        );
     }
 
     #[test]

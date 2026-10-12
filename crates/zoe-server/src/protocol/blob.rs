@@ -126,7 +126,7 @@ impl Download {
     pub(crate) fn send(mut self, mut send: impl FnMut(Vec<u8>) -> bool) -> Result<bool, ZoeError> {
         let (oid, tid) = (self.oid, self.tid);
         let ids = || vec![p64(oid.0), p64(tid.0)];
-        if !send(message::call_async("receiveBlobStart", ids())) {
+        if !send(message::notify("receiveBlobStart", ids())) {
             return Ok(false);
         }
         let mut chunk = vec![0; CHUNK];
@@ -136,7 +136,7 @@ impl Download {
             if n > 0 {
                 let mut args = ids();
                 args.push(Value::Binary(chunk[..n].to_vec()));
-                if !send(message::call_async("receiveBlobChunk", args)) {
+                if !send(message::notify("receiveBlobChunk", args)) {
                     return Ok(false);
                 }
             }
@@ -146,7 +146,7 @@ impl Download {
                 break;
             }
         }
-        Ok(send(message::call_async("receiveBlobStop", ids())))
+        Ok(send(message::notify("receiveBlobStop", ids())))
     }
 }
 
@@ -417,7 +417,28 @@ mod tests {
     impl Client {
         /// Connect to `addr`, then register for the storage `1`.
         fn connect(addr: SocketAddr) -> Self {
-            let stream = TcpStream::connect(addr).unwrap();
+            Self::register(TcpStream::connect(addr).unwrap())
+        }
+
+        /// Connect as `connect` does, with a small receive buffer. So the
+        /// server soon waits for this client to read.
+        fn connect_slow(addr: SocketAddr) -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            let stream = runtime.block_on(async {
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket.set_recv_buffer_size(16 * 1024).unwrap();
+                let stream = socket.connect(addr).await.unwrap();
+                stream.into_std().unwrap()
+            });
+            stream.set_nonblocking(false).unwrap();
+            Self::register(stream)
+        }
+
+        /// Do the handshake on `stream`, then register for the storage `1`.
+        fn register(stream: TcpStream) -> Self {
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
             let mut client = Self { stream, next: 1 };
             assert_eq!(client.read_frame(), b"M5");
@@ -483,12 +504,18 @@ mod tests {
         }
 
         /// Send a call and return the args of its reply, which must not be
-        /// an error.
+        /// an error. Skip the calls of the server before the reply, as
+        /// `info` before the reply of `tpc_finish`.
         fn call(&mut self, method: &str, args: Vec<Value>) -> Value {
             let id = self.send(method, args);
-            let (got, flags, name, args) = decode(&self.read_frame());
-            assert_eq!((got, flags, name.as_str()), (id, Value::from(0), ".reply"));
-            args
+            loop {
+                let (got, flags, name, args) = decode(&self.read_frame());
+                if (&got, &flags) == (&Value::from(0), &Value::Boolean(true)) {
+                    continue;
+                }
+                assert_eq!((got, flags, name.as_str()), (id, Value::from(0), ".reply"));
+                return args;
+            }
         }
 
         /// Upload `blob` as the blob of `oid` in a new transaction, in
@@ -613,6 +640,85 @@ mod tests {
         // The server stays up.
         Client::connect(server.addr()).call("ping", vec![]);
         server.stop();
+    }
+
+    #[test]
+    fn a_slow_download_does_not_stop_a_commit_and_gets_its_invalidation() {
+        let dir = fresh_dir("slow-download");
+        // The blob is far larger than the buffers of the sockets and the
+        // queues of the connection. So the session of the reader waits for
+        // room in its queue while the reader does not read.
+        let data: Vec<u8> = (0..256 * CHUNK).map(|i| (i % 241) as u8).collect();
+        let tid = commit_blob(&Store::open(&dir).unwrap(), Oid(1), &data);
+        let server = Server::start(ServeOptions::new(&dir)).unwrap();
+        let mut reader = Client::connect_slow(server.addr());
+        let mut writer = Client::connect(server.addr());
+
+        let id = reader.send("sendBlob", vec![p64(1), p64(tid.0)]);
+        let (_, _, method, _) = decode(&reader.read_frame());
+        assert_eq!(method, "receiveBlobStart");
+        // The reader reads nothing more until the commit ends. A commit
+        // that waits for the reader never ends, and the read of the writer
+        // times out.
+        let committed = writer.commit_blob(Oid(2), b"a small blob");
+
+        let mut got = Vec::new();
+        let mut invalidations = Vec::new();
+        let mut chunks_before_the_invalidation = None;
+        let mut stopped = false;
+        loop {
+            let (got_id, flags, method, args) = decode(&reader.read_frame());
+            match method.as_str() {
+                "receiveBlobChunk" => {
+                    assert!(!stopped, "a chunk after receiveBlobStop");
+                    got.extend_from_slice(bytes(&args.as_array().unwrap()[2]));
+                }
+                "receiveBlobStop" => stopped = true,
+                "invalidateTransaction" => {
+                    chunks_before_the_invalidation.get_or_insert(got.len() / CHUNK);
+                    invalidations.push(args);
+                }
+                ".reply" => {
+                    assert_eq!((got_id, flags, args), (id, Value::from(0), Value::Nil));
+                    break;
+                }
+                other => panic!("an unexpected message: {other}"),
+            }
+        }
+        assert!(stopped);
+        assert!(got == data, "the chunks hold the blob");
+        // The invalidation of the commit with a blob names its oid. It came
+        // during the download, between two chunks.
+        let invalidation = Value::Array(vec![p64(committed.0), Value::Array(vec![p64(2)])]);
+        assert_eq!(invalidations, [invalidation]);
+        let before = chunks_before_the_invalidation.unwrap();
+        assert!(before < 256, "the invalidation came after the last chunk");
+        // The connection of the reader stays open.
+        reader.call("ping", vec![]);
+        server.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_server_stops_during_a_download_that_the_client_does_not_read() {
+        let dir = fresh_dir("stop-download");
+        let tid = commit_blob(&Store::open(&dir).unwrap(), Oid(1), &vec![3; 256 * CHUNK]);
+        let server = Server::start(ServeOptions::new(&dir)).unwrap();
+        let mut reader = Client::connect_slow(server.addr());
+        reader.send("sendBlob", vec![p64(1), p64(tid.0)]);
+        let (_, _, method, _) = decode(&reader.read_frame());
+        assert_eq!(method, "receiveBlobStart");
+        // The session waits for room in its queue. The stop ends it.
+        let (stopped, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.stop();
+            let _ = stopped.send(());
+        });
+        assert!(
+            wait.recv_timeout(TIMEOUT).is_ok(),
+            "the server did not stop"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Return the path of each blob file under `dir`.

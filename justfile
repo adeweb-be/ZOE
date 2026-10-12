@@ -282,6 +282,37 @@ docs:
 ci *functions="check test docs":
     for f in {{ functions }}; do dagger call --mod ci "$f"; done
 
-# Cut a release.
-release:
-    @echo "just release: bumps the versions in lockstep and builds the wheels, the binaries, the image and the Helm chart. Not built yet."
+# Build the release artifacts. `just release` builds the static `zoe`
+# binary and the server image, as an OCI tarball, into target/dist through
+# the Dagger function release. `just release binary DIR` builds the static
+# binary in the shell and copies it to DIR; the Dagger function zoe-binary
+# runs it. `just release test` runs the tests of the Dagger functions
+# against the Dagger engine. The version bump, the wheels and the Helm chart
+# are not built yet.
+release command="dist" dir="target/dist":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ command }}" in
+        dist)
+            dagger call --mod ci release export --path "{{ dir }}"
+            ;;
+        binary)
+            # musl links the binary statically, so it needs no C library
+            # and no dynamic loader on the host.
+            target=x86_64-unknown-linux-musl
+            cargo build --release --locked --target "$target" \
+                -p zoe-server --features serve --bin zoe
+            mkdir -p "{{ dir }}"
+            cp "${CARGO_TARGET_DIR:-target}/$target/release/zoe" "{{ dir }}/zoe"
+            ;;
+        test)
+            # uv installs the Python SDK of the module from ci/sdk, which
+            # dagger develop writes.
+            dagger develop --mod ci
+            uv run --locked --directory ci pytest -q tests
+            ;;
+        *)
+            echo "just release: unknown command {{ command }}. Use dist, binary or test." >&2
+            exit 2
+            ;;
+    esac
