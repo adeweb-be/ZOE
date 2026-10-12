@@ -8,11 +8,16 @@ This module needs the test extra of ZODB.
   `ZODB.tests.util.DB()` open one. A test that names a storage class gets
   that class.
 - `StorageTestCase` is the base class of the storage suites of ZODB.
+- `ZoeServer` runs the `zoe` binary as `zoe serve`, for the tests of the
+  server. `ZOE_BINARY` gives the path of the binary.
 """
 
 import itertools
 import os
+import pathlib
 import shutil
+import signal
+import subprocess
 import tempfile
 
 import transaction
@@ -122,3 +127,95 @@ class StorageTestCase(StorageTestBase.StorageTestBase):
 
     def open(self, read_only=False):
         self._storage = zoe.Storage(self._path, read_only=read_only)
+
+
+class ZoeServer:
+    """A `zoe serve` process for a test.
+
+    It runs `zoe serve --path path --listen 127.0.0.1:0` with the extra
+    arguments `args`, and without `--path` when `path` is None. Only the
+    variables of `env` reach it as `ZOE_*`. As a context manager, it
+    starts the server and kills it at the end.
+    """
+
+    def __init__(self, path=None, args=(), env=None):
+        self.path = path
+        self.args = list(args)
+        self.env = dict(env or {})
+        self.address = None
+        self._process = None
+
+    @staticmethod
+    def _binary():
+        """Return the path of the `zoe` binary.
+
+        `ZOE_BINARY` gives it. Else the debug build of the repository. The
+        console script `zoe` of the wheel has no server.
+        """
+        binary = os.environ.get("ZOE_BINARY")
+        if binary:
+            return binary
+        root = pathlib.Path(__file__).resolve().parents[4]
+        target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
+        return str(target / "debug" / "zoe")
+
+    def start(self):
+        """Start the server. Return once it accepts connections.
+
+        A later start listens on the same port, so a client reconnects.
+        """
+        if self._process is not None:
+            raise RuntimeError("the server runs")
+        listen = "127.0.0.1:0"
+        if self.address is not None:
+            listen = f"{self.address[0]}:{self.address[1]}"
+        command = [self._binary(), "serve"]
+        if self.path is not None:
+            command += ["--path", str(self.path)]
+        command += ["--listen", listen, *self.args]
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
+        environ.update(self.env)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            env=environ,
+            text=True,
+        )
+        for line in process.stdout:
+            if line.startswith("listening "):
+                host, port = line.split()[1].rsplit(":", 1)
+                self.address = (host.strip("[]"), int(port))
+                self._process = process
+                return self
+        code = process.wait()
+        raise RuntimeError(f"zoe serve stopped with {code} before it listened")
+
+    def kill(self):
+        """Kill the server with SIGKILL and wait for it."""
+        process, self._process = self._process, None
+        if process is not None:
+            process.kill()
+            process.wait()
+            process.stdout.close()
+
+    def stop(self, timeout=30):
+        """Send SIGTERM, wait at most `timeout` seconds, return the exit code."""
+        process, self._process = self._process, None
+        if process is None:
+            raise RuntimeError("the server does not run")
+        process.send_signal(signal.SIGTERM)
+        try:
+            return process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc_info):
+        self.kill()
