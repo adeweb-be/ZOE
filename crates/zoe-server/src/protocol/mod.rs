@@ -9,14 +9,16 @@
 mod clock;
 mod extension;
 pub(crate) mod frame;
+mod iteration;
 mod message;
 mod session;
 mod status;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::SystemTime;
 
 use tokio::net::TcpStream;
@@ -46,6 +48,16 @@ pub(crate) struct NamedStorage {
     path: PathBuf,
     store: Arc<Store>,
     stats: Stats,
+    /// The connections that registered, to send `info` to every client.
+    clients: Mutex<Clients>,
+}
+
+/// The queue of the outgoing frames of each registered connection.
+#[derive(Default)]
+struct Clients {
+    /// The id of the next connection.
+    next: u64,
+    queues: BTreeMap<u64, async_mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl NamedStorage {
@@ -57,6 +69,34 @@ impl NamedStorage {
             path: path.to_path_buf(),
             store,
             stats: Stats::new(SystemTime::now()),
+            clients: Mutex::default(),
+        }
+    }
+
+    /// Add a registered connection, with the queue of its outgoing
+    /// frames. Return its id.
+    fn join(&self, queue: async_mpsc::UnboundedSender<Vec<u8>>) -> u64 {
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        let id = clients.next;
+        clients.next += 1;
+        clients.queues.insert(id, queue);
+        id
+    }
+
+    /// Remove the connection `id`.
+    fn leave(&self, id: u64) {
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        clients.queues.remove(&id);
+    }
+
+    /// Put `frame` in the queue of each registered connection. A frame
+    /// that a connection puts in its own queue before a reply goes out
+    /// before that reply.
+    fn broadcast(&self, frame: &[u8]) {
+        let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        for queue in clients.queues.values() {
+            // A connection that closes drops its queue. It needs no frame.
+            let _ = queue.send(frame.to_vec());
         }
     }
 
