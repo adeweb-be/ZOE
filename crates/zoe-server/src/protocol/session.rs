@@ -14,7 +14,6 @@ use rmpv::Value;
 use tokio::sync::mpsc::Receiver;
 use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
 
-use super::NamedStorage;
 use super::blob::{Download, Upload};
 use super::clock;
 use super::extension;
@@ -23,6 +22,7 @@ use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::outbox::{Outbox, Place};
 use super::status::Stats;
+use super::{NamedStorage, Storages};
 
 /// The most oids that one `new_oids` call gives, as in ZEO.
 const MAX_NEW_OIDS: u64 = 100;
@@ -323,12 +323,21 @@ pub(crate) struct Session {
 }
 
 /// Run the calls that arrive on `calls` in order, and put each reply in
-/// `outbox`. Return when `calls` closes, or when the session closes the
-/// connection. A transaction still open aborts.
-pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox: Outbox) {
-    let mut session = Session::new(storage, outbox.clone());
+/// `outbox`. The first `register` that names one of `storages` selects the
+/// storage of the connection. Return when `calls` closes, or when the
+/// session closes the connection. A transaction still open aborts.
+pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
+    let mut session: Option<Session> = None;
     while let Some(call) = calls.blocking_recv() {
-        let outcome = session.call(&call);
+        let outcome = match &mut session {
+            Some(session) => session.call(&call),
+            None => match select(&storages, &call) {
+                Ok(storage) => session
+                    .insert(Session::new(storage, outbox.clone()))
+                    .call(&call),
+                Err(outcome) => outcome,
+            },
+        };
         let reply = match outcome {
             Outcome::Published => None,
             Outcome::Gone => break,
@@ -350,7 +359,8 @@ pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox:
             }
         };
         // A place that the call took gets the reply, or stays empty.
-        let sent = match (session.place.take(), reply) {
+        let place = session.as_mut().and_then(|session| session.place.take());
+        let sent = match (place, reply) {
             (Some(place), reply) => outbox.send_at(place, reply),
             (None, Some(reply)) => outbox.send(reply),
             (None, None) => true,
@@ -358,6 +368,32 @@ pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox:
         if !sent {
             break;
         }
+    }
+}
+
+/// Return the storage that `call` registers with, before the connection
+/// has one. Only `register` can come first, and it must name one of
+/// `storages`. Otherwise, return the outcome of the call: a call before
+/// `register` closes the connection, and an unknown name fails the call,
+/// as in ZEO.
+fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorage>, Outcome> {
+    if call.method != "register" {
+        return Err(Outcome::Close(format!("{} before register", call.method)));
+    }
+    let [name, _] = arity::<2>(&call.args, "register").map_err(Outcome::Failed)?;
+    let name = storage_name(name);
+    storages
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| Outcome::Failed(Fault::value_error(format!("unknown storage: {name}"))))
+}
+
+/// Return the storage name that a client gives to `register`.
+fn storage_name(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.as_str().unwrap_or_default().to_owned(),
+        Value::Binary(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        other => other.to_string(),
     }
 }
 
@@ -469,11 +505,7 @@ impl Session {
 
     fn register(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [storage, read_only] = arity::<2>(args, "register")?;
-        let storage = match storage {
-            Value::String(text) => text.as_str().unwrap_or_default().to_owned(),
-            Value::Binary(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            other => other.to_string(),
-        };
+        let storage = storage_name(storage);
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
@@ -1294,6 +1326,11 @@ mod tests {
         Session::new(storage(name, Queues::DEFAULT), outbox())
     }
 
+    /// Return the storages of a server that serves only `storage`.
+    fn serving(storage: Arc<NamedStorage>) -> Arc<Storages> {
+        Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client))
+    }
+
     fn call(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
         session.call(&Call {
             id: Value::from(1),
@@ -1408,6 +1445,47 @@ mod tests {
         assert!(matches!(
             call(&mut s, "no_such_method", vec![]),
             Outcome::Close(_)
+        ));
+    }
+
+    #[test]
+    fn register_selects_the_storage_of_the_connection_by_its_name() {
+        let named = |name: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("zoe-session-select-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Arc::new(Store::open(&dir).unwrap());
+            Arc::new(NamedStorage::new(name, &dir, store, Queues::DEFAULT))
+        };
+        let storages = Storages::new(vec![named("a"), named("b")], Queues::DEFAULT.client);
+        let request = |method: &str, args: Vec<Value>| Call {
+            id: Value::from(1),
+            oneway: false,
+            method: method.into(),
+            args,
+        };
+        let register =
+            |name: &str| request("register", vec![Value::from(name), Value::Boolean(false)]);
+        for name in ["a", "b"] {
+            let storage = select(&storages, &register(name)).ok().unwrap();
+            assert_eq!(storage.name, name);
+        }
+        let by_bytes = request(
+            "register",
+            vec![Value::Binary(b"b".to_vec()), Value::Boolean(false)],
+        );
+        assert_eq!(select(&storages, &by_bytes).ok().unwrap().name, "b");
+        let fault = failed(select(&storages, &register("1")).err().unwrap());
+        assert_eq!(fault.class, "builtins.ValueError");
+        let fault = failed(
+            select(&storages, &request("register", vec![]))
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(fault.class, "builtins.TypeError");
+        assert!(matches!(
+            select(&storages, &request("lastTransaction", vec![])),
+            Err(Outcome::Close(_))
         ));
     }
 
@@ -1925,7 +2003,7 @@ mod tests {
         let (replies, mut sent, _closing) = Outbox::new(1_000, 1_000);
         let session = {
             let storage = Arc::clone(&storage);
-            std::thread::spawn(move || run(storage, received, replies))
+            std::thread::spawn(move || run(serving(storage), received, replies))
         };
         let send = |id: i64, oneway: bool, method: &str, args: Vec<Value>| {
             let call = Call {
@@ -3334,7 +3412,7 @@ mod tests {
         let (outbox, mut frames, _closing) = Outbox::new(10, 10);
         let worker = std::thread::spawn({
             let storage = Arc::clone(&storage);
-            move || run(storage, received, outbox)
+            move || run(serving(storage), received, outbox)
         });
         let request = |id: i64, method: &str, args: Vec<Value>| Call {
             id: Value::from(id),
