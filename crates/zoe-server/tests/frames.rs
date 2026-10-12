@@ -4,12 +4,20 @@
 //! keeps the connection and its transaction, and sends no reply. A frame
 //! that no client sends, as one nested too deep or one longer than
 //! `--max-frame-size`, closes its connection. The server and its other
-//! connections stay up.
+//! connections stay up. The calls that wait for a session make the reader
+//! wait, and the connection stays open.
 
 mod wire;
 
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use wire::{
-    Server, TIMEOUT, Value, begin, commit, fresh_dir, load, new_oids, p64, record, s, u64_of,
+    MAX, Server, TIMEOUT, Value, begin, bytes_of, commit, fresh_dir, items, load, new_oids, p64,
+    record, s, u64_of,
 };
 
 /// The heartbeat of ZEO 6.2: `[-1, 0, ".reply", nil]`.
@@ -176,4 +184,163 @@ fn a_frame_of_many_small_values_closes_its_connection_and_takes_little_memory() 
         after < before + 32 * 1024,
         "the peak resident memory grew from {before} KiB to {after} KiB"
     );
+}
+
+/// The frame of the call `id` of `method` with `args`.
+fn call_frame(id: u32, method: &str, args: Vec<Value>) -> Vec<u8> {
+    let message = Value::Array(vec![
+        Value::from(id),
+        Value::Boolean(false),
+        Value::from(method),
+        Value::Array(args),
+    ]);
+    let mut payload = Vec::new();
+    rmpv::encode::write_value(&mut payload, &message).unwrap();
+    framed(&payload)
+}
+
+/// `payload` after its 4-byte big-endian length.
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let mut frame = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The frame of the call `id` of `ping` with `chains` arguments. Each
+/// argument is 55 arrays of one element, one in the other, around a nil:
+/// 56 values in 56 bytes, which rmpv makes into about 10 KB. The frame
+/// stays under both bounds of the decode.
+fn costly_ping(id: u32, chains: u16) -> Vec<u8> {
+    let mut payload = vec![0x94, 0xce];
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(&[0xc2, 0xa4, b'p', b'i', b'n', b'g', 0xdc]);
+    payload.extend_from_slice(&chains.to_be_bytes());
+    for _ in 0..chains {
+        payload.extend_from_slice(&[0x91; 55]);
+        payload.push(0xc0);
+    }
+    framed(&payload)
+}
+
+#[test]
+fn the_calls_that_wait_for_a_session_hold_little_memory_and_keep_the_connection() {
+    const PINGS: u32 = 64;
+    let dir = fresh_dir("waiting-session");
+    let store = dir.join("store");
+    let mut server = Server::start(&["--path", s(&store), "--lock-timeout", "120"], &[]);
+    let pid = server.pid();
+
+    // The vote of `a` locks the object, so the vote of `b` waits, and the
+    // session of `b` runs no other call.
+    let mut a = server.client("1");
+    let oid = new_oids(&mut a, 1)[0];
+    let tid = commit(&mut a, 1, &[(oid, 0, record(b"first"))]).unwrap();
+    begin(&mut a, 2);
+    a.send_async(
+        "storea",
+        vec![
+            p64(oid),
+            p64(tid),
+            Value::Binary(record(b"a")),
+            Value::from(2),
+        ],
+    );
+    a.call("vote", vec![Value::from(2)]).unwrap();
+    let mut b = server.client("1");
+    begin(&mut b, 3);
+    b.send_async(
+        "storea",
+        vec![
+            p64(oid),
+            p64(tid),
+            Value::Binary(record(b"b")),
+            Value::from(3),
+        ],
+    );
+    let vote = b.send_call("vote", vec![Value::from(3)]);
+    let before = peak_kib(pid);
+
+    // Each frame costs about 4.4 MB once decoded: without a bound on the
+    // calls that wait, the 64 frames take about 280 MB.
+    let written = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let mut stream = b.stream().try_clone().unwrap();
+        let written = Arc::clone(&written);
+        thread::spawn(move || {
+            for n in 0..PINGS {
+                stream.write_all(&costly_ping(1_000 + n, 446)).unwrap();
+                written.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    // Wait until the writer and the peak memory of the server stay still
+    // for 500 ms: the server reads no more frames.
+    let deadline = Instant::now() + TIMEOUT;
+    let (mut last, mut still) = ((usize::MAX, 0), 0);
+    while still < 5 {
+        assert!(Instant::now() < deadline, "the server did not settle");
+        thread::sleep(Duration::from_millis(100));
+        let now = (written.load(Ordering::SeqCst), peak_kib(pid));
+        still = if now == last { still + 1 } else { 0 };
+        last = now;
+    }
+    let waiting = peak_kib(pid);
+
+    // The abort of `a` frees the session of `b`, which runs every call.
+    a.call("tpc_abort", vec![Value::from(2)]).unwrap();
+    writer.join().unwrap();
+    b.reply_to(&vote).unwrap();
+    for n in 0..PINGS {
+        // `ping` takes no argument: each call gets an error, not a close.
+        assert!(b.reply_to(&Value::from(1_000 + n)).is_err());
+    }
+    b.call("tpc_abort", vec![Value::from(3)]).unwrap();
+    b.call("lastTransaction", vec![]).unwrap();
+    assert!(server.running());
+    let after = peak_kib(pid);
+    for peak in [waiting, after] {
+        assert!(
+            peak < before + 64 * 1024,
+            "the peak resident memory grew from {before} KiB to {peak} KiB"
+        );
+    }
+}
+
+#[test]
+fn a_client_that_reads_while_it_sends_gets_every_reply_when_the_queues_are_full() {
+    const LOADS: u32 = 300;
+    let dir = fresh_dir("pipeline");
+    let store = dir.join("store");
+    // A session queue of 2 replies. A commit puts 2 frames in the queue of
+    // the hub of its client, so 2 is the least that lets `other` commit.
+    let server = Server::start(&["--path", s(&store), "--client-queue-size", "2"], &[]);
+    let mut other = server.client("1");
+    let oid = new_oids(&mut other, 1)[0];
+    let data = large_record(64 << 10);
+    let tid = commit(&mut other, 1, &[(oid, 0, data.clone())]).unwrap();
+
+    // One thread sends the loads, as the loop of a stock client does. The
+    // replies wait 500 ms: they fill the buffers of TCP and the session
+    // queue, so the session waits. Then the calls fill their queue, and
+    // the reader waits.
+    let mut conn = server.client("1");
+    let writer = {
+        let mut stream = conn.stream().try_clone().unwrap();
+        thread::spawn(move || {
+            for n in 0..LOADS {
+                let args = vec![p64(oid), Value::Binary(MAX.to_vec())];
+                stream
+                    .write_all(&call_frame(1_000 + n, "loadBefore", args))
+                    .unwrap();
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(500));
+    for n in 0..LOADS {
+        let reply = items(&conn.reply_to(&Value::from(1_000 + n)).unwrap());
+        assert!(bytes_of(&reply[0]) == data);
+        assert_eq!(u64_of(&reply[1]), tid);
+    }
+    writer.join().unwrap();
+    conn.call("lastTransaction", vec![]).unwrap();
 }

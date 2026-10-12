@@ -8,9 +8,10 @@
 //! commit goes to the invalidations with the reply of its `tpc_finish`, so
 //! the reply and the invalidations reach each client in commit order.
 
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use rmpv::Value;
+use tokio::sync::mpsc::Receiver;
 use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
 
 use super::NamedStorage;
@@ -268,9 +269,9 @@ pub(crate) struct Session {
 /// Run the calls that arrive on `calls` in order, and put each reply in
 /// `outbox`. Return when `calls` closes, or when the session closes the
 /// connection. A transaction still open aborts.
-pub(crate) fn run(storage: Arc<NamedStorage>, calls: mpsc::Receiver<Call>, outbox: Outbox) {
+pub(crate) fn run(storage: Arc<NamedStorage>, mut calls: Receiver<Call>, outbox: Outbox) {
     let mut session = Session::new(storage, outbox.clone());
-    while let Ok(call) = calls.recv() {
+    while let Some(call) = calls.blocking_recv() {
         let outcome = session.call(&call);
         let reply = match outcome {
             Outcome::Published => None,

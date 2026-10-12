@@ -22,8 +22,10 @@ const MAX_DEPTH: usize = 128;
 /// makes a `Value` of 40 bytes for each value, and an array or a map takes
 /// more. So without this bound, a frame of 1-byte values costs about 40
 /// times its size in memory. With it, the values of one frame take at most
-/// about 12 MiB. A message of a stock client has fewer than 20 values: a
-/// record is one `bin` value, whatever its size.
+/// about 16.2 MiB. The worst case is chains of arrays of one element: rmpv
+/// gives each array room for 4 values, so a value takes about 176 bytes. A
+/// message of a stock client has fewer than 20 values: a record is one
+/// `bin` value, whatever its size.
 const MAX_VALUES: usize = 100_000;
 
 /// A call from the client.

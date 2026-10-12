@@ -29,11 +29,11 @@ pub mod fuzz;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::net::TcpStream;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use zoe_core::Store;
 
 use invalidation::Invalidations;
@@ -47,6 +47,20 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// The payload that a client sends in place of a protocol to ask for the
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
+
+/// The most calls that wait for the session of a connection, decoded. A
+/// full queue makes the reader wait, and it reads no more bytes, so TCP
+/// makes the client wait. So a connection holds at most this many decoded
+/// calls, the call that the reader holds, and the call that the session
+/// runs. The session runs one call at a time and needs only the next calls
+/// ready: the bytes of a burst wait in the buffers of TCP.
+///
+/// The writer task empties the queues of the frames without the reader, so
+/// the reader, the session and the writer never wait for each other in a
+/// circle. Only a client that sends calls and reads no reply can stop its
+/// own connection: its replies fill their queue, then its calls fill this
+/// one. A stock client reads its replies while it sends.
+const QUEUE: usize = 4;
 
 /// The name of the storage that the server serves. It is the default of
 /// ZEO.
@@ -160,7 +174,7 @@ pub(crate) async fn serve_connection(
         }
     }
 
-    let (calls, received) = mpsc::channel();
+    let (calls, received) = mpsc::channel(QUEUE);
     let (outbox, mut inbox, mut closing) =
         Outbox::new(storage.queues.client, storage.queues.client);
     let closed = Arc::new(Notify::new());
@@ -225,7 +239,13 @@ pub(crate) async fn serve_connection(
         if call.is_heartbeat() {
             continue;
         }
-        if calls.send(call).is_err() {
+        // The reader waits while `QUEUE` calls wait for the session.
+        let sent = tokio::select! {
+            sent = calls.send(call) => sent.is_ok(),
+            () = closed.notified() => false,
+            () = closing.wait() => false,
+        };
+        if !sent {
             break;
         }
     }
