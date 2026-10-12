@@ -25,7 +25,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | `just loupe` | builds and runs Loupe (not built yet) |
 | `just docs` | builds the documentation site into `target/book` |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
-| `just release` | cuts a release (not built yet) |
+| `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release test` runs the tests of `ci/`. Publishing is not built yet |
 
 `just ci` reproduces a CI result. Do not use it for the edit-test loop.
 

@@ -197,8 +197,12 @@ class Ci:
     @function
     def zoe_binary(self, source: Source) -> dagger.File:
         """Build the static `zoe` binary, with `serve`, for Linux x86-64."""
-        # The recipe copies the binary out of the target cache volume.
-        return self.recipe(source, "release", ("binary", "/dist")).file("/dist/zoe")
+        # The build uses no shared target cache. Cargo finds changed files
+        # by their mtimes, so a cache that another checkout filled can give
+        # objects of other code.
+        return self.recipe(
+            source, "release", ("binary", "/dist"), cache_target=False
+        ).file("/dist/zoe")
 
     @function
     async def server_image(self, source: Source) -> dagger.Container:
