@@ -1,6 +1,6 @@
 # 0026. The transaction index: a `(tid, oid)` key space
 
-Status: proposed. The choice of a key space over an oid list in the `txns` row was made while the human was away. The human confirms it at merge, with the signature change of `Backend::txn_records` below.
+Status: accepted. The human confirmed the choice of a key space over an oid list in the `txns` row, with the signature change of `Backend::txn_records` below.
 
 ## Context
 
