@@ -7,11 +7,11 @@
 //!
 //! The child keeps its copies until `exec` returns in the child.
 //! `Command::spawn` can return before that: it uses `vfork`, and the kernel
-//! wakes the parent before it releases these copies.
+//! wakes the parent before the child releases these copies.
 //!
-//! So each open of a store holds a mutex, and each child holds the same
-//! mutex from its spawn to its end. When `wait` returns, the child holds no
-//! descriptor.
+//! So each open of a store holds a mutex. The thread that spawns a child
+//! holds the same mutex from the spawn to the end of the child. When `wait`
+//! returns, the child holds no descriptor.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -33,7 +33,8 @@ pub fn open(dir: &Path) -> Store {
 }
 
 /// Run `command` to its end and return its output. The caller sets the
-/// standard streams.
+/// standard streams. The mutex stays held until the child ends, so the
+/// child must not wait for another test.
 pub fn output(command: &mut Command) -> Output {
     let _spawn = spawn_lock();
     command.spawn().unwrap().wait_with_output().unwrap()
