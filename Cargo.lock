@@ -1098,6 +1098,7 @@ version = "0.0.0"
 name = "zoe-convert"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "thiserror",
  "zoe-core",
  "zoe-pickle",
