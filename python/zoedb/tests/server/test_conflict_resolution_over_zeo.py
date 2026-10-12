@@ -2,7 +2,8 @@
 
 ZEO 6's own protocol lets the client resolve conflicts: when a vote meets a
 stale serial that it can resolve, the reply of `vote` lists the conflict as
-`{"oid": oid, "serials": (committed, read), "data": committed_pickle}`.
+`{"oid": oid, "serials": (committed, read), "data": stored_pickle}`, where
+`data` is the pickle that the client stored.
 An unmodified `ZEO.ClientStorage` runs `tryToResolveConflict`, stores the
 resolved state over the committed serial with `storea`, and votes again.
 ZEO's server does this when `client-conflict-resolution` is on.
@@ -82,13 +83,14 @@ def test_the_client_resolves_a_counter_through_the_vote(clients):
     base, _ = commit(a, [(oid, ZERO, counter(1))])
     commit(a, [(oid, base, counter(2))])
 
-    # b read the base and adds 1 too: the vote lists the conflict, the
-    # client resolves it, and the commit holds both additions.
-    tid, resolved = commit(b, [(oid, base, counter(2))])
+    # b read the base and adds 4: the vote lists the conflict, the client
+    # resolves it from the pickle that it stored, and the commit holds both
+    # additions. A resolution from the committed pickle would give 3.
+    tid, resolved = commit(b, [(oid, base, counter(5))])
     assert oid in (resolved or [])
     data, serial = b.load(oid)
     assert serial == tid
-    assert value_of(data) == 3
+    assert value_of(data) == 6
 
 
 def test_a_conflict_that_the_class_refuses_is_raised(clients):
