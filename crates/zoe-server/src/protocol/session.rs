@@ -2057,6 +2057,51 @@ mod tests {
     }
 
     #[test]
+    fn the_calls_that_wait_at_the_end_of_a_connection_still_run() {
+        let storage = storage("calls-at-end", Queues::DEFAULT);
+        let (calls, received) = tokio::sync::mpsc::channel(16);
+        let (replies, _inbox, _closing) = Outbox::new(16, 16);
+        let send = |oneway: bool, method: &str, args: Vec<Value>| {
+            let call = Call {
+                id: Value::from(1),
+                oneway,
+                method: method.into(),
+                args,
+            };
+            calls.blocking_send(call).unwrap();
+        };
+        let oids = [1, 2, 3];
+        send(
+            false,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        );
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(true, "tpc_begin", begin);
+        for oid in oids {
+            let data = Value::Binary(MAPPING.to_vec());
+            send(true, "storea", vec![p64(oid), p64(0), data, Value::from(7)]);
+        }
+        send(false, "vote", vec![Value::from(7)]);
+        send(false, "tpc_finish", vec![Value::from(7)]);
+        // The connection ends before the session runs the first call.
+        drop(calls);
+        run(serving(Arc::clone(&storage)), received, replies);
+
+        // The session ran each call, so the finish committed the three oids
+        // together, and no lock stays.
+        let tid = storage.invalidations.published();
+        assert_ne!(tid, Tid(0));
+        for oid in oids {
+            assert_eq!(storage.store.load(Oid(oid)).unwrap().1, tid);
+        }
+        assert!(storage.store.lock_table_is_empty());
+        let status = storage.status().to_value();
+        assert_eq!(count(&status, "commits"), 1);
+        assert_eq!(count(&status, "active_txns"), 0);
+    }
+
+    #[test]
     fn server_status_counts_the_conflicts_that_the_client_resolved() {
         let mut s = registered("resolve-count");
         let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
