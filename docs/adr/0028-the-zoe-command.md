@@ -57,7 +57,7 @@ The twins are `ZOE_PATH`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLO
 - A workspace build, such as `cargo test --workspace`, unifies the features, so there `zoe-py` compiles with `serve`. maturin builds `zoe-py` alone, without it.
 - The console script writes to the file descriptors of the process, not to `sys.stdout` and `sys.stderr`. A Python caller that replaces `sys.stdout` does not capture the report.
 - Ctrl-C stops a conversion or a pack at once. The converters resume after the last copied transaction, and a pack that stops leaves a store that opens without repair (ADR 0025).
-- A store that a crash left open does not open read-only: `zoe convert --to-data-fs` and the dry run fail with `NotClosedCleanly` until a writer opens the store once.
+- A store that a crash left open does not open read-only: `zoe convert --to-data-fs`, the dry run, `zoe verify`, `zoe verify --backup` and `zoe backup` fail with `NotClosedCleanly` until a writer opens the store once.
 
 ## Alternatives
 

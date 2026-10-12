@@ -60,28 +60,41 @@ The rules of a file:
 - The blob is the file of the blob record of `(oid, tid)` in the store: its size and its hash are those of the blob record (ADR 0023).
 - Nothing follows the hash.
 
-A reader refuses a file that breaks a rule, a blob whose bytes do not match its hash, and a file whose hash does not match. Another version byte is not a dump that the build reads.
+A reader refuses a file that breaks a rule, a blob whose bytes do not match its hash, and a file whose hash does not match.
+
+**Versions.** The last byte of the magic is the version of the layout. A change of the layout takes the next version. Every later build reads every earlier version, so a dump never needs a conversion before a restore. A build refuses a version after its own.
 
 **`zoe backup --path STORE --to DIR`.** The command opens the store read-only and writes one dump:
 
 1. It creates `DIR` when it is missing, and takes an exclusive `flock` on a descriptor of `DIR` itself. So two backups never write into one directory together, and the lock adds no file. It removes the `.tmp` files that a stopped backup left.
-2. It reads the names and the headers of the dumps, and checks the chain. A dump that does not follow the dump before it fails the backup.
+2. It reads the names and the headers of the dumps, and checks the chain. A dump that does not follow the dump before it fails the backup: a dump is missing, or two dumps overlap.
 3. It reads the last tid of the store, then the end of each sequence. A transaction up to the last tid committed after its values were reserved, so each value that it holds is below the end in the dump.
-4. With dumps in `DIR` that end at the last tid of the store, it writes nothing. Otherwise the last tid of the dumps must be a tid of the store, else the backup fails: the dumps belong to another store. A transaction that a pack removed passes, when its tid is at or before the pack watermark.
+4. With dumps in `DIR` that end at the last tid of the store, it writes nothing. Otherwise the store must continue the dumps, else the backup fails and writes nothing:
+   - The last tid of the dumps must be a tid of the store. Else the dumps are dumps of another store, or of another history of this store: a store restored from a part of the chain and then changed, for example.
+   - The pack watermark of the store must be before the last tid of the dumps. A pack at or after it changed history that the dumps hold. The watermark does not tell one store from another, so it never excuses a missing transaction.
+
+   The message of both refusals asks for a new full dump in a new directory.
 5. It writes the dump through the iterator into `<name>.tmp`, syncs it, renames it to its name and syncs `DIR`. A failed backup removes the `.tmp` file.
 
 **`zoe restore --from DIR --path STORE`.** The command:
 
-1. refuses a target that holds a store or other files, or that is not a directory: only a new or an empty directory takes a restore;
-2. reads every dump of the chain to its end and checks it, before it writes anything;
+1. refuses a target that holds a store or other files, or that is not a directory: only a new or an empty directory takes a restore. It also refuses an empty directory on another filesystem than its parent, a mount point: the rename of step 6 cannot cross filesystems;
+2. checks the BLAKE3 hash of every dump of the chain, before it writes anything. This pass reads each file as a stream and reads no length in it, so a damaged length allocates nothing. A file whose hash matches but that breaks a rule of the layout fails the restore later, while it builds the store;
 3. creates the work directory `<STORE>.restore` beside the target, and fails when it exists: another restore can be writing into it;
 4. opens a store in the work directory and restores each transaction in order with `tpc_begin_restore` under its own tid, each record with `restore`, and each blob with `restore_blob` after a check of its BLAKE3 hash;
 5. raises each sequence to its end with `Sequence::restore_end`, which writes the end durably and never lowers it, so each sequence restarts at or above its end in the dumps;
-6. closes the store, renames the work directory to the target and syncs the parent.
+6. closes the store, renames the work directory to the target and syncs the parent. Its report gives the last tid of the dumps and its time in UTC.
 
 A restore that fails removes the work directory, so it leaves nothing at the target. A restore that a crash stopped leaves the work directory, never a store at the target.
 
-**`zoe verify --path STORE --backup DIR`.** The command restores the dumps into a scratch directory in the temporary directory (`TMPDIR`), compares them with the store up to the last tid of the dumps, and removes the scratch directory. Each transaction and each record must be the same, with the same blob record. The dumps keep the records that a pack removed: at or before the pack watermark of the store, a record or a transaction that the store lacks is no difference. The end of each sequence in the store must be at or above its end in the dumps. A difference is a finding, and a dump that does not restore fails the command.
+**`zoe verify --path STORE --backup DIR`.** The command restores the dumps into a scratch directory in the temporary directory (`TMPDIR`), compares them with the store up to the last tid of the dumps, and removes the scratch directory:
+
+- Each transaction and each record must be the same, with the same blob record. The dumps keep the records that a pack removed: at or before the pack watermark of the store, a record or a transaction that the store lacks is no difference.
+- A pack watermark at or after the last tid of the dumps is a difference: the pack changed history that the dumps hold, and the backup refuses to continue them.
+- Otherwise, the current record of each oid at the last tid of the dumps must be the same in the store and in the dumps. So a store whose history diverged differs, also where the comparison of the transactions forgives a pack. A record that the store lacks is no difference when its serial is at or before the pack watermark: a pack removed an object that no reader could reach.
+- The end of each sequence in the store must be at or above its end in the dumps.
+
+A difference is a finding, and a dump that does not restore fails the command. A check names its scratch directory with the id of its process, and removes the scratch directories of a check whose process is gone, which a killed check leaves.
 
 ## Why a format of ZOE's own
 
@@ -100,12 +113,18 @@ A restore that fails removes the work directory, so it leaves nothing at the tar
 
 ## Consequences
 
-- A restore reads each dump twice: once to check it, once to restore it.
+- A restore reads each dump twice: once to check its hash, once to restore it.
 - A restore commits each transaction with a sync, as every restore transaction does. A non-durable bulk restore is a card of its own.
-- `zoe verify --backup` needs free space for a restored copy of the store in `TMPDIR`.
+- `zoe verify --backup` is as heavy as a restore: it needs free space for a full copy of the store in `TMPDIR`, it syncs each transaction (a measured 1,002 transactions took 19.6 s), and it holds the lock of the store during the whole check. A scratch directory option and a non-durable restore are later cards.
+- The dumps are not compressed. A record that the store keeps compressed goes into the dump as its pickle.
+- A restored store was never packed: its pack watermark is 0, whatever the watermark of its source.
 - A backup with nothing new writes nothing, also when a sequence moved. The values of a sequence that a dumped transaction holds are below the end in the dumps. A value given after the last dump can come again after a restore, as each change after the last dump is lost.
-- The dumps keep the history that a later pack removes, so a restore gives back records that the store no longer has. A new full dump needs a new directory: `zoe backup` has no option to start one. repozo starts a full backup when it sees a pack; ZOE leaves that to the operator for now.
-- A damaged or missing dump makes the dumps after it useless: the restore stops at it. Start a new directory.
+- The dumps keep the history that a later pack removes, so a restore gives back records that the store no longer has: the same content, with more history. A pack before the last tid of the dumps lets the backups go on. A pack at or after it stops them, and the next backup needs a new directory: `zoe backup` writes one chain per directory and has no option to start a new full dump. repozo starts a full backup when it sees a pack; ZOE does not, because each full dump copies every blob again. An option `--full` with several chains in one directory is a later card.
+- A damaged dump in the middle of the chain makes the dumps after it useless: the restore stops at it. Start a new directory.
+- A missing newest dump is not seen: the restore gives the older state of the dumps that remain, and exits with 0, as repozo does. The report of the restore gives the last tid and its UTC time, so the operator can see the point that the restore reached.
+- A restore to an earlier point takes a prefix of the chain: copy the full dump and the dumps up to that point into another directory, and restore from it.
+- A damaged store stops every backup: a record, a blob record or a blob file that does not read fails the backup, and it writes no dump until the store is repaired.
+- A backup holds one transaction of the iterator in memory, all of its pickles, and a buffer of 64 KiB for a blob. A restore holds one record at a time and a buffer of 64 KiB for a blob; the staging area of the store keeps the pickles of one transaction in memory up to 16 MiB and spills the rest to a file. A blob of 200 MB took 12 MB of memory to back up and to restore.
 - The dumps hold no `next_oid`. The restored store gives new oids above every oid of the dumps, as `finish` raises the next oid, not above an oid that the source gave without a commit.
 - `zoe backup` opens the store read-only, so it takes the lock of the store: it cannot back up a store that a server holds. A backup through the server is a card of its own.
 - A store whose blob directory is outside the store directory needs the option of the blob directory, which the command does not take yet, as for the other commands.
