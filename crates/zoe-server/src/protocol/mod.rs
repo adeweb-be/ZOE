@@ -360,4 +360,149 @@ mod tests {
         }
         drop(runtime);
     }
+
+    /// Return a storage on a new store for the test `name`.
+    fn storage(name: &str) -> Arc<NamedStorage> {
+        let dir = std::env::temp_dir().join(format!("zoe-protocol-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT))
+    }
+
+    /// Serve `storage` on a free port of 127.0.0.1, one task for each
+    /// connection.
+    fn serve(storage: &Arc<NamedStorage>) -> (tokio::runtime::Runtime, std::net::SocketAddr) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::clone(storage);
+        runtime.spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
+                tokio::spawn(serve_connection(stream, Arc::clone(&served), max));
+            }
+        });
+        (runtime, addr)
+    }
+
+    /// Send a call. The id 0 is a call without a reply.
+    fn send(client: &mut Client, id: i64, method: &str, args: Vec<Value>) {
+        let call = Value::Array(vec![
+            Value::from(id),
+            Value::Boolean(id == 0),
+            Value::from(method),
+            Value::Array(args),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &call).unwrap();
+        write_frame(client, &bytes);
+    }
+
+    /// Connect to `addr`, answer the protocol and register.
+    fn registered(addr: std::net::SocketAddr) -> Client {
+        let mut client = Client::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(read_frame(&mut client), PROTOCOL);
+        write_frame(&mut client, PROTOCOL);
+        send(
+            &mut client,
+            1,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        );
+        read_frame(&mut client);
+        client
+    }
+
+    /// Begin the transaction 7 and store `oid` as a new object.
+    fn begin_and_store(client: &mut Client, oid: u64) {
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(client, 0, "tpc_begin", begin);
+        let data = Value::Binary(b"pickle".to_vec());
+        let store = vec![session::p64(oid), session::p64(0), data, Value::from(7)];
+        send(client, 0, "storea", store);
+    }
+
+    /// Wait until `done` is true. Fail after 30 seconds.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_connection_that_the_hub_closes_aborts_its_transaction() {
+        let storage = storage("close-voted");
+        let (runtime, addr) = serve(&storage);
+        let mut client = registered(addr);
+        begin_and_store(&mut client, 1);
+        send(&mut client, 2, "vote", vec![Value::from(7)]);
+        assert_eq!(
+            read_frame(&mut client),
+            message::reply(Value::from(2), Value::Array(Vec::new()))
+        );
+        assert!(!storage.store.lock_table_is_empty());
+
+        // The hub closes the connection, as on a full hub queue.
+        let (outbox, _inbox, _closing) = Outbox::new(1, 1);
+        storage.invalidations.publish(Commit {
+            previous: Tid(0),
+            tid: Tid(1),
+            origin: None,
+            outbox,
+            own: Vec::new(),
+            others: Others::Close,
+        });
+        let _ = client.read_to_end(&mut Vec::new());
+
+        // The transaction aborts and its locks go.
+        let stats = &storage.stats;
+        wait_until("the locks stay", || {
+            storage.store.lock_table_is_empty() && stats.connections.load(Ordering::Relaxed) == 0
+        });
+        assert_eq!(stats.active_txns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.aborts.load(Ordering::Relaxed), 1);
+        drop(runtime);
+    }
+
+    #[test]
+    fn a_stop_of_the_server_removes_the_upload_files() {
+        let dir = std::env::temp_dir().join(format!("zoe-protocol-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = crate::serve::Server::start(crate::serve::ServeOptions::new(&dir)).unwrap();
+        let chunk = || vec![Value::Binary(vec![7; 1_000])];
+        // One client has an open upload. The other ended its upload, so the
+        // core holds the file.
+        let mut open = registered(server.addr());
+        begin_and_store(&mut open, 1);
+        send(&mut open, 0, "storeBlobStart", vec![]);
+        send(&mut open, 0, "storeBlobChunk", chunk());
+        let mut ended = registered(server.addr());
+        begin_and_store(&mut ended, 2);
+        send(&mut ended, 0, "storeBlobStart", vec![]);
+        send(&mut ended, 0, "storeBlobChunk", chunk());
+        let data = Value::Binary(b"pickle".to_vec());
+        let end = vec![session::p64(2), session::p64(0), data, Value::from(7)];
+        send(&mut ended, 0, "storeBlobEnd", end);
+        for client in [&mut open, &mut ended] {
+            send(client, 2, "ping", vec![]);
+            read_frame(client);
+        }
+        let temporary = dir.join("blobs").join("tmp");
+        let files = || std::fs::read_dir(&temporary).unwrap().count();
+        assert_eq!(files(), 2);
+
+        server.stop();
+        assert_eq!(files(), 0);
+    }
 }
