@@ -8,7 +8,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - `src/cli/`: `zoe_server::cli`, the command line. `mod.rs` parses and runs, `convert.rs` holds `zoe convert`, `pack.rs` holds `zoe pack`.
 - `src/cli/serve.rs`: `zoe serve`. Without the feature `serve` it fails with 1 and names the `zoe` binary.
 - `src/serve.rs`: `zoe_server::serve::{Server, ServeOptions}`, the server as a library. The binary and the Rust tests run it.
-- `src/protocol/`: the frames, the messages, the extension pickle, the session of a connection, the status of a storage and the times that the protocol sends. It compiles only with the feature `serve`.
+- `src/protocol/`: the frames, the messages, the extension pickle, the session of a connection, the status of a storage, the times that the protocol sends, and the invalidations of a storage with the outbox of each connection (`invalidation.rs`). It compiles only with the feature `serve`.
 
 ## Invariants of the command
 
@@ -41,8 +41,11 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 - SIGTERM closes the store and exits with 0. `Server::stop` and the drop of a `Server` close it too: they drop the runtime, which waits for the session threads, and then the store.
 - An unmodified `ZEO.ClientStorage` works. A stock client never sees an extension that it did not declare in `register`.
 - Every reply carries the message id of its request. Concurrent requests on one connection are not served yet: each connection runs its calls in order.
-- The invalidation queue of a slow client is bounded (default 1,000 messages). On overflow the server closes that connection.
-- `getInvalidations(tid)` returns `None` when the gap is longer than `invalidation-queue-size`.
+- After each commit, every other registered client of the storage gets `invalidateTransaction(tid, oids)`. The client that committed gets `info {length, size}`, then the reply of its `tpc_finish`, and no invalidation, as from ZEO. The oids come from the transaction index of the store (`Store::written_oids`), each oid once. A commit that wrote no oid sends nothing to the other clients. A commit whose oids do not read closes the other connections, so each client verifies its cache when it reconnects.
+- Each client gets the replies of its own commits and the invalidations in commit order, so the tids that it sees always increase: the cache of a stock client raises an error on a tid that goes back. The hub (`Invalidations`) orders the commits by the `previous` tid of `finish_after`. A commit waits in the hub for the commit before it, and the session that publishes a commit also publishes the commits that wait for it: no thread waits for another commit. A finish that fails gives no tid, so it publishes nothing and no commit waits for it. A commit is published also when its session panics before the publication.
+- `register` and `lastTransaction` give the last published tid, not the last tid of the store. `register` adds the connection to the hub under the same mutex, so the connection gets the invalidation of each later commit and of no earlier one.
+- Each connection has an outbox of at most `--client-queue-size` messages (`ZOE_CLIENT_QUEUE_SIZE`, default 1,000), replies and calls of the server together. The session waits for room for its replies. The hub never waits: when an outbox is full, the server closes that connection, and its writer stops at once. So a slow or dead client never stops a commit or the other clients. The hub holds its mutex while it puts frames in the outboxes, never while a frame goes out to the network.
+- `getInvalidations(tid)` returns `[last published tid, oids]`: each oid that a transaction after `tid` wrote, read from the transaction index of the store, so a restart keeps the answer. It returns nil when more than `--invalidation-queue-size` (`ZOE_INVALIDATION_QUEUE_SIZE`, default 100,000) transactions that wrote records come after `tid`, and when the index does not read. Then the client verifies its cache.
 - Commits on different named storages never wait for each other.
 - A read-only storage refuses `tpc_begin` with `ReadOnlyError`.
 - `storeBlobShared` is accepted only with `shared-blob-dir` on and a path inside the server's blob directory.

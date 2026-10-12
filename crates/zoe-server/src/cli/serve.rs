@@ -33,6 +33,28 @@ pub(super) struct ServeArgs {
         default_value = "127.0.0.1:8100"
     )]
     listen: SocketAddr,
+
+    /// The most transactions that getInvalidations covers. A client that
+    /// reconnects further behind gets nil and verifies its cache.
+    #[arg(
+        long,
+        env = "ZOE_INVALIDATION_QUEUE_SIZE",
+        value_name = "TRANSACTIONS",
+        default_value_t = 100_000
+    )]
+    invalidation_queue_size: usize,
+
+    /// The most messages that wait for one client. Past it, the server
+    /// closes the connection, and the client reconnects and verifies its
+    /// cache.
+    #[arg(
+        long,
+        env = "ZOE_CLIENT_QUEUE_SIZE",
+        value_name = "MESSAGES",
+        default_value_t = 1_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    client_queue_size: u64,
 }
 
 /// Serve until SIGTERM. Write the line `listening <address>` to `out`.
@@ -40,7 +62,10 @@ pub(super) struct ServeArgs {
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use crate::serve::{ServeOptions, Server};
 
-    let options = ServeOptions::new(&args.path).listen(args.listen);
+    let options = ServeOptions::new(&args.path)
+        .listen(args.listen)
+        .invalidation_queue_size(args.invalidation_queue_size)
+        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX));
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
     server.serve_until_signal(|addr| {
         writeln!(out, "listening {addr}")?;
@@ -55,4 +80,33 @@ pub(super) fn run(_args: &ServeArgs, _out: &mut dyn Write) -> Result<(), Failure
     Err(Failure::Message(
         "this build has no server; run the `zoe` binary".to_owned(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::super::{Cli, Command};
+    use super::*;
+
+    /// Parse `zoe serve --path store` with `args` after it.
+    fn serve(args: &[&str]) -> Result<ServeArgs, clap::Error> {
+        let line = ["zoe", "serve", "--path", "store"].iter().chain(args);
+        match Cli::try_parse_from(line)?.command {
+            Command::Serve(args) => Ok(args),
+            other => panic!("not serve: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_queue_sizes_have_their_defaults_and_a_client_queue_holds_one_message() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.invalidation_queue_size, 100_000);
+        assert_eq!(args.client_queue_size, 1_000);
+        let args = serve(&["--invalidation-queue-size", "0", "--client-queue-size", "1"]).unwrap();
+        assert_eq!(args.invalidation_queue_size, 0);
+        assert_eq!(args.client_queue_size, 1);
+        let error = serve(&["--client-queue-size", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
 }

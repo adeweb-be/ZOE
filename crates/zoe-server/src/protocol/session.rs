@@ -3,16 +3,20 @@
 //! The session holds the open transaction of the connection. Its thread
 //! begins the core transaction and makes every later call of it, so the
 //! core never refuses a call with `WrongThread`.
+//!
+//! `register` adds the connection to the invalidations of the storage. A
+//! commit goes to the invalidations with the reply of its `tpc_finish`, so
+//! the reply and the invalidations reach each client in commit order.
 
 use std::sync::{Arc, mpsc};
 
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedSender;
-use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
 
 use super::NamedStorage;
 use super::clock;
 use super::extension;
+use super::invalidation::{ClientId, Commit, Others, Outbox};
 use super::message::{self, Call};
 use super::status::Stats;
 
@@ -142,6 +146,9 @@ impl From<ZoeError> for Fault {
 enum Outcome {
     /// The result of the call.
     Done(Value),
+    /// A `tpc_finish` that committed. Its reply went out with the
+    /// invalidations of the commit.
+    Published,
     /// The exception of the call.
     Failed(Fault),
     /// The server closes the connection, as ZEO does for a call it does not
@@ -173,22 +180,24 @@ pub(crate) struct Session {
     storage: Arc<NamedStorage>,
     /// The store of `storage`.
     store: Arc<Store>,
+    /// The frames that wait for the client.
+    outbox: Outbox,
+    /// The id of the connection in the invalidations of the storage, from
+    /// `register` on.
+    client: Option<ClientId>,
     registered: bool,
     read_only: bool,
     open: Option<Open>,
 }
 
-/// Run the calls that arrive on `calls` in order, and send each reply to
-/// `replies`. Return when `calls` closes, or when the session closes the
+/// Run the calls that arrive on `calls` in order, and put each reply in
+/// `outbox`. Return when `calls` closes, or when the session closes the
 /// connection. A transaction still open aborts.
-pub(crate) fn run(
-    storage: Arc<NamedStorage>,
-    calls: mpsc::Receiver<Call>,
-    replies: UnboundedSender<Vec<u8>>,
-) {
-    let mut session = Session::new(storage);
+pub(crate) fn run(storage: Arc<NamedStorage>, calls: mpsc::Receiver<Call>, outbox: Outbox) {
+    let mut session = Session::new(storage, outbox.clone());
     while let Ok(call) = calls.recv() {
         let reply = match session.call(&call) {
+            Outcome::Published => continue,
             Outcome::Done(_) if call.oneway => continue,
             Outcome::Done(value) => message::reply(call.id, value),
             // A call without a reply has no way to report its error, so
@@ -206,17 +215,21 @@ pub(crate) fn run(
                 break;
             }
         };
-        if replies.send(reply).is_err() {
+        if !outbox.send(reply) {
             break;
         }
     }
 }
 
 impl Session {
-    pub(crate) fn new(storage: Arc<NamedStorage>) -> Self {
+    /// Return the session of a connection to `storage`, whose frames go to
+    /// `outbox`.
+    pub(crate) fn new(storage: Arc<NamedStorage>, outbox: Outbox) -> Self {
         Self {
             store: Arc::clone(&storage.store),
             storage,
+            outbox,
+            client: None,
             registered: false,
             read_only: false,
             open: None,
@@ -271,7 +284,7 @@ impl Session {
         }
         let result = match call.method.as_str() {
             "register" => Err(Fault::value_error("duplicate register() call")),
-            "lastTransaction" => Ok(p64(self.store.last_transaction().0)),
+            "lastTransaction" => Ok(p64(self.storage.invalidations.published().0)),
             "get_info" => arity::<0>(args, "get_info").and_then(|_| self.info()),
             "get_size_info" => arity::<0>(args, "get_size_info")
                 .and_then(|_| self.sizes())
@@ -286,12 +299,13 @@ impl Session {
             "new_oids" => self.new_oids(args),
             "loadBefore" => self.load_before(args),
             "loadSerial" => self.load_serial(args),
+            "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
             "record_iternext" => self.record_iternext(args),
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
             "vote" => self.vote(args),
-            "tpc_finish" => self.tpc_finish(args),
+            "tpc_finish" => return self.tpc_finish(call),
             "tpc_abort" => self.tpc_abort(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
@@ -310,7 +324,10 @@ impl Session {
         }
         self.read_only = truth(read_only);
         self.registered = true;
-        Ok(p64(self.store.last_transaction().0))
+        // The client gets the invalidation of each commit after this tid.
+        let (client, published) = self.storage.invalidations.subscribe(self.outbox.clone());
+        self.client = Some(client);
+        Ok(p64(published.0))
     }
 
     /// The information that a stock client asks for after `register`. The
@@ -526,13 +543,108 @@ impl Session {
         }
     }
 
-    fn tpc_finish(&mut self, args: &[Value]) -> Result<Value, Fault> {
+    /// Finish the current transaction. The reply goes out with the
+    /// invalidations of the commit. A finish that fails publishes nothing.
+    fn tpc_finish(&mut self, call: &Call) -> Outcome {
+        let finished = match self.finish(&call.args) {
+            Ok(finished) => finished,
+            Err(fault) => return Outcome::Failed(fault),
+        };
+        let reply = (!call.oneway).then(|| message::reply(call.id.clone(), p64(finished.tid.0)));
+        self.publish(finished, reply);
+        Outcome::Published
+    }
+
+    fn finish(&mut self, args: &[Value]) -> Result<Finished, Fault> {
         let [id] = arity::<1>(args, "tpc_finish")?;
         self.current(id, "tpc_finish")?;
         let open = self.open.take().expect("the current transaction");
         // The core returns only after the commit is durable.
-        let tid = open.txn.finish()?;
-        Ok(p64(tid.0))
+        Ok(open.txn.finish_after()?)
+    }
+
+    /// Publish a commit of this connection. Every other client gets its
+    /// invalidation. This client gets `info`, then `reply`.
+    ///
+    /// The oids come from the transaction index of the store. When they do
+    /// not read, the hub closes the other connections, so each client
+    /// verifies its cache when it connects again. The hub publishes the
+    /// commit also when a read panics, so later commits never wait for
+    /// this one.
+    fn publish(&self, finished: Finished, reply: Option<Vec<u8>>) {
+        let mut publication = self.storage.invalidations.prepare(Commit {
+            previous: finished.previous,
+            tid: finished.tid,
+            origin: self.client,
+            outbox: self.outbox.clone(),
+            own: reply.into_iter().collect(),
+            others: Others::Close,
+        });
+        let tid = finished.tid;
+        let others = match self.store.written_oids(tid, tid, usize::MAX) {
+            Ok(Some(oids)) if oids.is_empty() => Others::Nothing,
+            Ok(Some(oids)) => Others::Send(message::notify(
+                "invalidateTransaction",
+                vec![
+                    p64(tid.0),
+                    Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
+                ],
+            )),
+            Ok(None) => Others::Close,
+            Err(error) => {
+                eprintln!(
+                    "zoe serve: the oids of the commit {:016x} do not read: {error}",
+                    tid.0
+                );
+                Others::Close
+            }
+        };
+        // `info` gives the sizes of the store, as ZEO sends them before the
+        // reply. Sizes that do not read leave it out.
+        let info = self
+            .sizes()
+            .ok()
+            .map(|sizes| message::notify("info", vec![Value::Map(sizes.into())]));
+        let commit = publication.commit();
+        commit.others = others;
+        if let Some(info) = info {
+            commit.own.insert(0, info);
+        }
+    }
+
+    /// Return the last published tid and every oid that a commit after the
+    /// tid of the call wrote: `[tid, oids]`, each oid once. The oids come
+    /// from the transaction index of the store, so the reply does not
+    /// depend on what this process saw.
+    ///
+    /// Return nil when more than `invalidation-queue-size` transactions
+    /// that wrote records come after the tid, or when the index does not
+    /// read. The client then verifies its cache.
+    fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [tid] = arity::<1>(args, "getInvalidations")?;
+        let tid = u64_of(tid)?;
+        // The connection gets the invalidation of each commit after `last`.
+        let last = self.storage.invalidations.published();
+        let oids = match tid.checked_add(1) {
+            Some(from) => {
+                self.store
+                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
+            }
+            None => Ok(Some(Vec::new())),
+        };
+        Ok(match oids {
+            Ok(Some(oids)) => Value::Array(vec![
+                p64(last.0),
+                Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
+            ]),
+            Ok(None) => Value::Nil,
+            Err(error) => {
+                eprintln!(
+                    "zoe serve: getInvalidations: the transaction index does not read: {error}"
+                );
+                Value::Nil
+            }
+        })
     }
 
     fn tpc_abort(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -549,7 +661,8 @@ impl Session {
 
 impl Drop for Session {
     /// The end of a connection leaves the status: a transaction that is
-    /// still open counts as an abort, as in ZEO.
+    /// still open counts as an abort, as in ZEO. The connection leaves the
+    /// invalidations of the storage.
     fn drop(&mut self) {
         let stats = &self.storage.stats;
         if self.open.is_some() {
@@ -558,6 +671,9 @@ impl Drop for Session {
         }
         if self.registered {
             Stats::sub(&stats.connections);
+        }
+        if let Some(client) = self.client.take() {
+            self.storage.invalidations.unsubscribe(client);
         }
     }
 }
@@ -607,11 +723,26 @@ fn truth(value: &Value) -> bool {
 mod tests {
     use super::*;
 
-    fn session(name: &str) -> Session {
+    use tokio::sync::mpsc as async_mpsc;
+
+    use super::super::invalidation::Frame;
+    use crate::protocol::Queues;
+
+    /// Return an outbox whose frames go nowhere.
+    fn outbox() -> Outbox {
+        Outbox::new(1_000).0
+    }
+
+    /// Return a storage on a new store for the test `name`.
+    fn storage(name: &str, queues: Queues) -> Arc<NamedStorage> {
         let dir = std::env::temp_dir().join(format!("zoe-session-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Store::open(&dir).unwrap());
-        Session::new(Arc::new(NamedStorage::new("1", &dir, store)))
+        Arc::new(NamedStorage::new("1", &dir, store, queues))
+    }
+
+    fn session(name: &str) -> Session {
+        Session::new(storage(name, Queues::DEFAULT), outbox())
     }
 
     fn call(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
@@ -635,6 +766,16 @@ mod tests {
             Outcome::Failed(fault) => fault,
             other => panic!("not failed: {other:?}"),
         }
+    }
+
+    /// Finish the transaction `id`, and return its tid. With no other
+    /// session, the commit is the last published one.
+    fn finish(s: &mut Session, id: Value) -> u64 {
+        match call(s, "tpc_finish", vec![id]) {
+            Outcome::Published => {}
+            other => panic!("not published: {other:?}"),
+        }
+        u64_of(&done(call(s, "lastTransaction", vec![]))).unwrap()
     }
 
     #[test]
@@ -752,7 +893,7 @@ mod tests {
                 vec![p64(0), p64(serial), data, id.clone()],
             ));
             match call(s, "vote", vec![id.clone()]) {
-                Outcome::Done(_) => Ok(u64_of(&done(call(s, "tpc_finish", vec![id]))).unwrap()),
+                Outcome::Done(_) => Ok(finish(s, id)),
                 outcome => Err(failed(outcome)),
             }
         };
@@ -795,7 +936,7 @@ mod tests {
             vec![p64(oid), p64(serial), data, id.clone()],
         ));
         match call(s, "vote", vec![id.clone()]) {
-            Outcome::Done(_) => Ok(u64_of(&done(call(s, "tpc_finish", vec![id]))).unwrap()),
+            Outcome::Done(_) => Ok(finish(s, id)),
             outcome => Err(failed(outcome)),
         }
     }
@@ -943,9 +1084,9 @@ mod tests {
     fn a_closed_session_leaves_the_status() {
         let mut s = registered("closed");
         let storage = Arc::clone(&s.storage);
-        let mut other = Session::new(Arc::clone(&storage));
+        let mut other = Session::new(Arc::clone(&storage), outbox());
         // A session that does not register is not a connection.
-        let _unregistered = Session::new(Arc::clone(&storage));
+        let _unregistered = Session::new(Arc::clone(&storage), outbox());
         done(call(
             &mut other,
             "register",
@@ -1053,6 +1194,169 @@ mod tests {
                 Value::Nil
             ])
         );
+    }
+
+    /// A registered session of `storage`. Its frames wait in the receiver
+    /// for the test.
+    fn connected(storage: &Arc<NamedStorage>) -> (Session, async_mpsc::Receiver<Frame>) {
+        let (outbox, frames, _closing) = Outbox::new(1_000);
+        let mut s = Session::new(Arc::clone(storage), outbox);
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        (s, frames)
+    }
+
+    /// Take the messages that wait for a client, as `(method, args)`.
+    fn messages(frames: &mut async_mpsc::Receiver<Frame>) -> Vec<(String, Value)> {
+        let mut taken = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            let message = rmpv::decode::read_value(&mut frame.as_slice()).unwrap();
+            let Value::Array(parts) = message else {
+                panic!("a message is not an array: {message:?}");
+            };
+            let [_, _, method, args] = <[Value; 4]>::try_from(parts).unwrap();
+            taken.push((method.as_str().unwrap().to_owned(), args));
+        }
+        taken
+    }
+
+    /// The invalidation of the commit `tid` of `oids`.
+    fn invalidation(tid: u64, oids: &[u64]) -> (String, Value) {
+        let oids = oids.iter().map(|oid| p64(*oid)).collect();
+        (
+            "invalidateTransaction".to_owned(),
+            Value::Array(vec![p64(tid), Value::Array(oids)]),
+        )
+    }
+
+    #[test]
+    fn the_other_sessions_get_the_invalidation_and_the_committer_its_reply() {
+        let storage = storage("publish", Queues::DEFAULT);
+        let (mut writer, mut own) = connected(&storage);
+        let (_reader, mut others) = connected(&storage);
+        let first = commit(&mut writer, 1, 1, 0, b"x").unwrap();
+
+        let own = messages(&mut own);
+        let methods: Vec<&str> = own.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, ["info", ".reply"]);
+        let info = &own[0].1.as_array().unwrap()[0];
+        assert_eq!(keys(info), ["length", "size"]);
+        assert_eq!(own[1].1, p64(first));
+        assert_eq!(messages(&mut others), [invalidation(first, &[1])]);
+
+        // The reader registers after the commit: it gets the later commit.
+        let (_late, mut late) = connected(&storage);
+        let second = commit(&mut writer, 2, 2, 0, b"y").unwrap();
+        assert_eq!(messages(&mut others), [invalidation(second, &[2])]);
+        assert_eq!(messages(&mut late), [invalidation(second, &[2])]);
+    }
+
+    #[test]
+    fn a_finish_that_fails_publishes_nothing_and_blocks_nothing() {
+        let storage = storage("failed-finish", Queues::DEFAULT);
+        let (mut writer, mut own) = connected(&storage);
+        let (_reader, mut others) = connected(&storage);
+        let id = Value::from(1);
+        let begin = vec![id.clone(), Value::Nil, Value::Nil, Value::Map(vec![])];
+        done(call(&mut writer, "tpc_begin", begin));
+        let data = Value::Binary(b"x".to_vec());
+        done(call(
+            &mut writer,
+            "storea",
+            vec![p64(1), p64(0), data, id.clone()],
+        ));
+        // A finish before the vote fails in the core.
+        let fault = failed(call(&mut writer, "tpc_finish", vec![id]));
+        assert_eq!(fault.class, "ZODB.POSException.StorageTransactionError");
+        assert!(messages(&mut own).is_empty());
+        assert!(messages(&mut others).is_empty());
+        assert_eq!(storage.invalidations.published(), Tid(0));
+
+        let tid = commit(&mut writer, 2, 1, 0, b"x").unwrap();
+        assert_eq!(messages(&mut others), [invalidation(tid, &[1])]);
+    }
+
+    #[test]
+    fn get_invalidations_covers_the_gap_or_gives_nil() {
+        let queues = Queues {
+            invalidations: 2,
+            client: 1_000,
+        };
+        let mut s = Session::new(storage("get-invalidations", queues), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let second = commit(&mut s, 2, 2, 0, b"b").unwrap();
+        commit(&mut s, 3, 3, 0, b"c").unwrap();
+        let last = commit(&mut s, 4, 1, first, b"d").unwrap();
+        let get = |s: &mut Session, tid: Value| done(call(s, "getInvalidations", vec![tid]));
+
+        // Two commits after `second` wrote the oids 3 and 1.
+        assert_eq!(
+            get(&mut s, p64(second)),
+            Value::Array(vec![p64(last), Value::Array(vec![p64(1), p64(3)])])
+        );
+        // Three commits come after `first`: more than the queue size.
+        assert_eq!(get(&mut s, p64(first)), Value::Nil);
+        let nothing = Value::Array(vec![p64(last), Value::Array(vec![])]);
+        assert_eq!(get(&mut s, p64(last)), nothing);
+        assert_eq!(get(&mut s, p64(u64::MAX)), nothing);
+        let fault = failed(call(&mut s, "getInvalidations", vec![Value::from(1)]));
+        assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn concurrent_commits_reach_each_session_in_commit_order() {
+        const WRITERS: u64 = 4;
+        const COMMITS: u64 = 25;
+        let storage = storage("concurrent", Queues::DEFAULT);
+        let (_idle, mut idle) = connected(&storage);
+        let mut queues: Vec<async_mpsc::Receiver<Frame>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let storage = &storage;
+                    scope.spawn(move || {
+                        let (mut s, frames) = connected(storage);
+                        for n in 0..COMMITS {
+                            let oid = 1 + writer * COMMITS + n;
+                            commit(&mut s, n as i64, oid, 0, b"x").unwrap();
+                        }
+                        // The session stays in the hub until all commit.
+                        (s, frames)
+                    })
+                })
+                .collect();
+            let joined: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            joined.into_iter().map(|(_, frames)| frames).collect()
+        });
+        // Each writer sees every commit once, in commit order: its own
+        // replies among the invalidations of the others.
+        let mut all = None;
+        for frames in &mut queues {
+            let tids: Vec<u64> = messages(frames)
+                .into_iter()
+                .filter_map(|(method, args)| match method.as_str() {
+                    ".reply" => Some(u64_of(&args).unwrap()),
+                    "invalidateTransaction" => Some(u64_of(&args.as_array().unwrap()[0]).unwrap()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tids.len() as u64, WRITERS * COMMITS);
+            assert!(tids.windows(2).all(|pair| pair[0] < pair[1]), "{tids:?}");
+            assert!(all.is_none_or(|all| all == tids));
+            all = Some(tids);
+        }
+        let seen: Vec<u64> = messages(&mut idle)
+            .into_iter()
+            .map(|(_, args)| u64_of(&args.as_array().unwrap()[0]).unwrap())
+            .collect();
+        assert_eq!(Some(seen), all);
     }
 
     #[test]
