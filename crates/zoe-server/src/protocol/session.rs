@@ -4,10 +4,9 @@
 //! begins the core transaction and makes every later call of it, so the
 //! core never refuses a call with `WrongThread`.
 
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedSender;
 use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
 
 use super::NamedStorage;
@@ -178,17 +177,21 @@ pub(crate) struct Session {
     open: Option<Open>,
 }
 
-/// Run the calls that arrive on `calls` in order, and send each reply to
-/// `replies`. Return when `calls` closes, or when the session closes the
-/// connection. A transaction still open aborts.
+/// Run the calls that `calls` gives in order, and give each reply to
+/// `reply`. Return when `calls` ends, when `reply` returns false, or when
+/// the session closes the connection. A transaction still open aborts.
+///
+/// The server gives the receiver of a channel and the sender of its
+/// replies. The simulator gives its own, so it sees when the thread waits
+/// for a call.
 pub(crate) fn run(
     storage: Arc<NamedStorage>,
-    calls: mpsc::Receiver<Call>,
-    replies: UnboundedSender<Vec<u8>>,
+    calls: impl IntoIterator<Item = Call>,
+    mut reply: impl FnMut(Vec<u8>) -> bool,
 ) {
     let mut session = Session::new(storage);
-    while let Ok(call) = calls.recv() {
-        let reply = match session.call(&call) {
+    for call in calls {
+        let bytes = match session.call(&call) {
             Outcome::Done(_) if call.oneway => continue,
             Outcome::Done(value) => message::reply(call.id, value),
             // A call without a reply has no way to report its error, so
@@ -206,7 +209,7 @@ pub(crate) fn run(
                 break;
             }
         };
-        if replies.send(reply).is_err() {
+        if !reply(bytes) {
             break;
         }
     }

@@ -14,3 +14,5 @@ pub mod cli;
 mod protocol;
 #[cfg(feature = "serve")]
 pub mod serve;
+#[cfg(feature = "sim")]
+pub mod sim;

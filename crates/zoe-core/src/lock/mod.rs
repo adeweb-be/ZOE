@@ -20,15 +20,16 @@
 //!
 //! Each lock that a call takes keeps the time when the call took it, on
 //! the store clock. `lock-warn` measures the hold time from it. The
-//! timeout uses the monotonic clock instead, because a `Condvar` wait
-//! cannot run on a simulated clock. The call never reads the store clock
-//! under the mutex.
+//! timeout is measured on the monotonic time of the store clock, and the
+//! call waits on a waiter of the store clock. So a simulator runs the
+//! waits on simulated time. The call never calls the store clock under
+//! the mutex.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
-use crate::clock::Clock;
+use crate::clock::{Clock, Waiter};
 use crate::error::ZoeError;
 use crate::types::Oid;
 
@@ -44,12 +45,17 @@ pub(crate) enum Mode {
 }
 
 /// A request that waits in the queue of an oid.
-#[derive(Debug)]
-struct Waiter {
+struct Queued {
     mode: Mode,
-    /// The thread of the request sleeps on this condition variable. The
-    /// pointer also identifies the request in the queue.
-    wake: Arc<Condvar>,
+    /// The thread of the request waits on this waiter. The pointer also
+    /// identifies the request in the queue.
+    wake: Arc<dyn Waiter>,
+}
+
+impl std::fmt::Debug for Queued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Queued").field("mode", &self.mode).finish()
+    }
 }
 
 /// The lock state of one oid.
@@ -60,7 +66,7 @@ struct Entry {
     /// True when the holder holds the lock in exclusive mode.
     exclusive: bool,
     /// The requests that wait, in arrival order.
-    queue: VecDeque<Waiter>,
+    queue: VecDeque<Queued>,
 }
 
 impl Entry {
@@ -86,12 +92,12 @@ impl Entry {
         {
             if let Some(head) = self.queue.pop_front() {
                 self.take(head.mode);
-                head.wake.notify_one();
+                head.wake.wake();
             }
         }
     }
 
-    fn waits(&self, wake: &Arc<Condvar>) -> bool {
+    fn waits(&self, wake: &Arc<dyn Waiter>) -> bool {
         self.queue
             .iter()
             .any(|waiter| Arc::ptr_eq(&waiter.wake, wake))
@@ -111,7 +117,7 @@ struct Table {
 
 impl Table {
     /// Tell if the request that sleeps on `wake` waits for `oid`.
-    fn waits(&self, oid: Oid, wake: &Arc<Condvar>) -> bool {
+    fn waits(&self, oid: Oid, wake: &Arc<dyn Waiter>) -> bool {
         self.entries
             .get(&oid)
             .is_some_and(|entry| entry.waits(wake))
@@ -119,7 +125,7 @@ impl Table {
 
     /// Remove the request that sleeps on `wake` from the queue of `oid`.
     /// The waiters behind it can then get the lock.
-    fn withdraw(&mut self, oid: Oid, wake: &Arc<Condvar>) {
+    fn withdraw(&mut self, oid: Oid, wake: &Arc<dyn Waiter>) {
         if let Some(entry) = self.entries.get_mut(&oid) {
             entry
                 .queue
@@ -190,6 +196,34 @@ pub(crate) struct Refused {
     pub(crate) released: Vec<Held>,
 }
 
+/// A request in the queue of an oid while its call waits without the
+/// mutex. If the call unwinds, dropping it takes the request out of the
+/// queue, or releases the lock that a grant gave to it.
+struct InQueue<'a> {
+    manager: &'a LockManager,
+    oid: Oid,
+    wake: &'a Arc<dyn Waiter>,
+    armed: bool,
+}
+
+impl Drop for InQueue<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut table = self.manager.table();
+        if table.waits(self.oid, self.wake) {
+            table.withdraw(self.oid, self.wake);
+        } else {
+            let since = SystemTime::UNIX_EPOCH;
+            table.release(&[Held {
+                oid: self.oid,
+                since,
+            }]);
+        }
+    }
+}
+
 impl LockManager {
     fn table(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
@@ -219,42 +253,58 @@ impl LockManager {
                 released: Vec::new(),
             });
         }
-        let start = Instant::now();
+        let deadline = clock.monotonic().saturating_add(timeout);
         let mut since = clock.now();
+        // The call waits for one oid at a time, so one waiter is
+        // sufficient. It comes from the clock, outside the mutex.
+        let wake = clock.waiter();
         let mut locks = Locks {
             manager: self,
             held: Vec::with_capacity(requests.len()),
         };
         let mut table = self.table();
-        // The call waits for one oid at a time, so one condition variable
-        // is sufficient.
-        let mut wake: Option<Arc<Condvar>> = None;
         for &(oid, mode) in requests {
             let entry = table.entries.entry(oid).or_default();
             let free = entry.queue.is_empty() && entry.admits(mode);
             if free {
                 entry.take(mode);
             } else {
-                let wake: &Arc<Condvar> = wake.get_or_insert_default();
-                entry.queue.push_back(Waiter {
+                entry.queue.push_back(Queued {
                     mode,
-                    wake: Arc::clone(wake),
+                    wake: Arc::clone(&wake),
                 });
-                let left = timeout.saturating_sub(start.elapsed());
-                table = wake
-                    .wait_timeout_while(table, left, |table| table.waits(oid, wake))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-                // A grant removes the request from the queue. A request
-                // that is still in the queue has used all its time.
-                if table.waits(oid, wake) {
-                    table.withdraw(oid, wake);
-                    table.release(&locks.held);
-                    return Err(Refused {
-                        error: ZoeError::Conflict { oid },
-                        released: std::mem::take(&mut locks.held),
-                    });
+                // If the clock panics, the guard takes the request out of
+                // the queue, or gives back the lock that it got.
+                let mut queued = InQueue {
+                    manager: self,
+                    oid,
+                    wake: &wake,
+                    armed: true,
+                };
+                loop {
+                    drop(table);
+                    let left = deadline.saturating_sub(clock.monotonic());
+                    if !left.is_zero() {
+                        wake.wait(left);
+                    }
+                    table = self.table();
+                    // A grant removes the request from the queue.
+                    if !table.waits(oid, &wake) {
+                        break;
+                    }
+                    // A request that is still in the queue at its deadline
+                    // has used all its time.
+                    if left.is_zero() {
+                        queued.armed = false;
+                        table.withdraw(oid, &wake);
+                        table.release(&locks.held);
+                        return Err(Refused {
+                            error: ZoeError::Conflict { oid },
+                            released: std::mem::take(&mut locks.held),
+                        });
+                    }
                 }
+                queued.armed = false;
             }
             locks.held.push(Held { oid, since });
             if !free {
@@ -300,6 +350,7 @@ mod tests {
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::{Barrier, mpsc};
     use std::thread;
+    use std::time::Instant;
 
     use super::Mode::{Exclusive, Shared};
     use super::*;

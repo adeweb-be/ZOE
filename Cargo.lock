@@ -676,10 +676,12 @@ name = "zoe-server"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "redb",
  "rmpv",
  "tokio",
  "zoe-convert",
  "zoe-core",
+ "zoe-server",
 ]
 
 [[package]]

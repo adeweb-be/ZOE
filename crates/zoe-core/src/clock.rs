@@ -4,14 +4,67 @@
 //! The core reads the time only through `Clock`, so a test or a simulator
 //! can give its own time.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::Tid;
 
-/// A source of wall-clock time.
+/// A source of wall-clock time, of monotonic time, and of the waits that
+/// a lock request makes.
+///
+/// `monotonic` and `waiter` have defaults that use the operating system.
+/// A simulator gives its own, so a lock wait runs on simulated time.
 pub trait Clock: Send + Sync {
     /// Return the time now.
     fn now(&self) -> SystemTime;
+
+    /// Return the time since a fixed origin. It never goes back. The lock
+    /// timeout is measured on it.
+    fn monotonic(&self) -> Duration {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
+    }
+
+    /// Return a new waiter for one lock request.
+    fn waiter(&self) -> Arc<dyn Waiter> {
+        Arc::new(ThreadWaiter::default())
+    }
+}
+
+/// The wait of one lock request. The thread of the request waits on it,
+/// and the thread that grants the lock wakes it.
+pub trait Waiter: Send + Sync {
+    /// Block the calling thread until a call of `wake`, or until `timeout`
+    /// passes. A `wake` before this call makes it return at once. The call
+    /// can also return early: the caller checks its state again.
+    fn wait(&self, timeout: Duration);
+
+    /// Wake the thread that waits, or make its next wait return at once.
+    fn wake(&self);
+}
+
+/// A waiter on the threads of the operating system.
+#[derive(Debug, Default)]
+struct ThreadWaiter {
+    woken: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Waiter for ThreadWaiter {
+    fn wait(&self, timeout: Duration) {
+        let woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut woken = self
+            .changed
+            .wait_timeout_while(woken, timeout, |woken| !*woken)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        *woken = false;
+    }
+
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_one();
+    }
 }
 
 /// The clock of the operating system.

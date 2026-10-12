@@ -13,6 +13,9 @@ default = ["serve"]
 # The server code. Only this feature may bring in tokio. The extension
 # module turns it off, so it never links tokio.
 serve = ["dep:tokio", "dep:rmpv"]
+# The deterministic simulator `zoe_server::sim`. Only the dev-dependency
+# below turns it on, so only test builds have it.
+sim = ["serve", "dep:redb"]
 
 [[bin]]
 name = "zoe"
@@ -22,11 +25,15 @@ path = "src/main.rs"
 clap.workspace = true
 zoe-convert.workspace = true
 zoe-core.workspace = true
+redb = { workspace = true, optional = true }
 rmpv = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "io-util", "sync", "signal", "macros"] }
 
 [dev-dependencies]
 rmpv.workspace = true
+# This crate with the simulator. Cargo builds dev-dependencies only for
+# tests, examples and benchmarks.
+zoe-server = { workspace = true, features = ["sim"] }
 
 [lints]
 workspace = true

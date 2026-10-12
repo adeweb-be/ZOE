@@ -671,6 +671,33 @@ impl MemVfs {
         });
     }
 
+    /// Return the state that a crash now leaves on disk, as a filesystem
+    /// whose files and directories are all durable, with an empty record.
+    ///
+    /// Every synced operation lands, as in `crash_images`. `lands` gets the
+    /// number of pending operations and returns how many of them land, in
+    /// their recorded order: a crash that keeps the order of the writes.
+    /// The process of this filesystem goes on: the caller drops it.
+    pub fn crash_now(&self, lands: impl FnOnce(usize) -> usize) -> MemVfs {
+        let state = self.lock();
+        let (synced, pending) = split_at_syncs(&state.log);
+        let n = lands(pending.len()).min(pending.len());
+        let mut which: Vec<usize> = synced
+            .into_iter()
+            .chain(pending[..n].iter().copied())
+            .collect();
+        which.sort_unstable();
+        let (files, dirs) = apply(
+            &state.initial,
+            &state.initial_dirs,
+            &state.log,
+            &which,
+            None,
+        );
+        drop(state);
+        MemVfs::with_tree(files, dirs)
+    }
+
     /// Return the states that a crash can leave on disk.
     ///
     /// A crash point comes before the first operation and after each

@@ -9,8 +9,8 @@
 mod clock;
 mod extension;
 pub(crate) mod frame;
-mod message;
-mod session;
+pub(crate) mod message;
+pub(crate) mod session;
 mod status;
 
 use std::fs;
@@ -116,7 +116,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, storage: Arc<NamedStorag
     let worker = {
         let closed = Arc::clone(&closed);
         tokio::task::spawn_blocking(move || {
-            session::run(storage, received, send);
+            session::run(storage, received, |bytes| send.send(bytes).is_ok());
             closed.notify_one();
         })
     };
