@@ -5,8 +5,9 @@ Through an unmodified `ZEO.ClientStorage`:
 - `iterator(start, stop)` gives each transaction of the range with its tid,
   user, description and extension, and each of its records, through
   `iterator_start`, `iterator_next`, `iterator_record_start`,
-  `iterator_record_next` and `iterator_gc`. The extension comes as the
-  bytes that the store keeps, which ZODB unpickles.
+  `iterator_record_next` and `iterator_gc`. The extension comes as a map,
+  as a stock ZEO server sends it, decoded from the bytes that the store
+  keeps.
 - `restore` (`restorea`) copies a transaction under its own tid, so
   `copyTransactionsFrom` and `zodbconvert` copy a FileStorage into the
   server and the server into a FileStorage, with the same tids and pickles.
