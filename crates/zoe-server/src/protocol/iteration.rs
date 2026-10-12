@@ -8,20 +8,24 @@
 //! is gone already: the client lists each record iterator that it dropped,
 //! at its end or not. So `gc` ignores an id that it does not know.
 //!
-//! A transaction iterator of the core holds only a weak reference to the
-//! store. A record iterator shares the transaction that the transaction
-//! iterator gave last.
+//! A transaction iterator keeps the last transaction that it gave, with
+//! all its pickles, for `iterator_record_start`. The iterator of the core
+//! under it holds a slice of tids and only a weak reference to the store.
+//! A record iterator shares the transaction that the transaction iterator
+//! gave last.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use zoe_core::{RecordInfo, Tid, Transactions, TxnInfo, ZoeError};
 
-/// The most iterators that one connection keeps open, of both kinds. A
-/// client that never sends `iterator_gc` cannot grow the memory of the
-/// server without a bound. A stock client sends `iterator_gc` at its next
-/// `tpc_finish` or `tpc_abort`, and a client that reads each iterator to
-/// its end keeps one or two open.
+/// The most iterators that one connection keeps open, of both kinds. So
+/// the iterators of a connection hold at most this number of times the
+/// largest transaction, plus the slices of tids. A stock client sends
+/// `iterator_gc` only at its next `tpc_finish` or `tpc_abort`, so a
+/// read-only stock client never sends it, and only the end of its
+/// connection frees its iterators. A client that reads each iterator to its
+/// end keeps one or two open.
 pub(crate) const MAX_OPEN: usize = 1_000;
 
 /// Why a call on the iterators fails.

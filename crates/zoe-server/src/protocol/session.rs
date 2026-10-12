@@ -130,7 +130,7 @@ impl Fault {
                 ),
             ),
             Refused::Full => Self::storage(format!(
-                "a connection keeps at most {} open iterators; iterator_gc frees them",
+                "a connection keeps at most {} open iterators; iterator_gc or a new connection frees them",
                 iteration::MAX_OPEN
             )),
         }
@@ -1020,7 +1020,9 @@ impl Session {
     ///
     /// After the pack, the hub sends `info` with the new size to every
     /// client of the storage. The reply goes out after the `info` of this
-    /// client. It also goes out after the pack when `wait` is false.
+    /// client. It also goes out after the pack when `wait` is false. When
+    /// the sizes do not read, no client gets `info`, and the reply is nil,
+    /// because the pack is done.
     ///
     /// A read-only connection packs, as in ZEO: `zeopack` connects
     /// read-only. A store that the server opened read-only refuses the pack
@@ -1046,8 +1048,12 @@ impl Session {
         self.store
             .pack(tid)
             .map_err(|error| Fault::of_pack(&error))?;
-        let info = Value::Map(Vec::from(self.sizes()?));
-        invalidations.send_to_all(message::notify("info", vec![info]));
+        // `info` gives the sizes of the store. Sizes that do not read leave it
+        // out, as for a commit.
+        if let Ok(sizes) = self.sizes() {
+            let info = message::notify("info", vec![Value::Map(sizes.into())]);
+            invalidations.send_to_all(info);
+        }
         Ok(Value::Nil)
     }
 }
@@ -3020,5 +3026,31 @@ mod tests {
             failed(call(&mut reader, "new_oids", vec![])),
             Fault::read_only()
         );
+    }
+
+    #[test]
+    fn a_pack_whose_sizes_do_not_read_replies_nil_and_sends_no_info() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-session-pack-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        // The sizes come from the directory of the storage. This one does
+        // not exist, so they do not read.
+        let missing = dir.join("missing");
+        let storage = Arc::new(NamedStorage::new("1", &missing, store, Queues::DEFAULT));
+        assert!(storage.size().is_err());
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+        let (mut packer, mut frames) = connected(&storage);
+
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(done(call(&mut packer, "pack", pack)), Value::Nil);
+        assert!(frames.try_recv().is_none());
+        // The pack is done.
+        let fault = failed(call(&mut packer, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
+        let load = done(call(&mut packer, "loadSerial", vec![p64(0), p64(new)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
     }
 }
