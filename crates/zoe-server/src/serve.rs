@@ -6,28 +6,50 @@
 //! invalidations, so commits on different stores never wait for each
 //! other.
 //!
-//! The binary runs it until SIGTERM. A test runs it in its own process
-//! with [`Server::start`] and [`Server::stop`].
+//! The binary runs it until SIGTERM or SIGINT. A test runs it in its own
+//! process with [`Server::start`] and [`Server::stop`].
+//!
+//! A stop takes at most the shutdown timeout. The server stops accepting
+//! connections, and each connection reads no more calls. Each session runs
+//! the calls that the server already received, so a `tpc_finish` that the
+//! server received commits and gets its reply. Then each session ends and
+//! aborts its open transaction, and each connection sends the frames that
+//! wait and closes. Then the stores close.
 
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
-use crate::protocol::{self, NamedStorage, Queues, Storages};
+use crate::protocol::{self, NamedStorage, Queues, Stopping, Storages};
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
 /// frame holds a whole record, and the store sets no limit on a record by
 /// default. ZODB warns about a record of more than 16 MiB, and a blob chunk
 /// is less than 64 KiB. So a stock client stays far below this limit.
 pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap();
+
+/// The default of `--shutdown-timeout`: 30 seconds.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The last part of the shutdown timeout, in which a stop closes the
+/// connections that did not end and waits for their sessions. When the
+/// timeout is shorter than twice this part, the last half of the timeout is
+/// used.
+const FORCED_CLOSE: Duration = Duration::from_secs(1);
+
+/// The longest shutdown timeout: 2^32 - 1 seconds, about 136 years. A
+/// longer timeout counts as this one, so the deadline of a stop never
+/// overflows the clock.
+const LONGEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4_294_967_295);
 
 /// A store that a server serves under a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +87,7 @@ pub struct ServeOptions {
     queues: Queues,
     lock_timeout: Option<Duration>,
     max_frame_size: NonZeroU32,
+    shutdown_timeout: Duration,
 }
 
 impl ServeOptions {
@@ -72,7 +95,7 @@ impl ServeOptions {
     /// ZEO. Listen on a free port of 127.0.0.1, with frames of at most
     /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
     /// 100,000 transactions, and 1,000 invalidations can wait for one
-    /// client.
+    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`].
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::with_storages([StorageOptions::new(protocol::STORAGE_NAME, path)])
     }
@@ -86,6 +109,7 @@ impl ServeOptions {
             queues: Queues::DEFAULT,
             lock_timeout: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -127,6 +151,18 @@ impl ServeOptions {
     #[must_use]
     pub fn max_frame_size(mut self, bytes: NonZeroU32) -> Self {
         self.max_frame_size = bytes;
+        self
+    }
+
+    /// Let a stop of the server take at most `timeout`. A stop first waits
+    /// for each connection to end by itself. At the end of the timeout less
+    /// 1 second, or less half the timeout when that is shorter, it drops
+    /// the connections that remain. Then it waits for their sessions until
+    /// the end of the timeout. A session that still runs then keeps its
+    /// store open: that store does not close cleanly.
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -189,6 +225,11 @@ pub struct Server {
     runtime: Option<Runtime>,
     storages: Option<Arc<Storages>>,
     addr: SocketAddr,
+    /// The sender of the stop to the accept loop and to each connection.
+    stop_signal: watch::Sender<bool>,
+    /// The accept loop and the connections that run.
+    tasks: Arc<Tasks>,
+    shutdown_timeout: Duration,
 }
 
 impl Server {
@@ -225,15 +266,29 @@ impl Server {
             )));
         }
         let storages = Arc::new(Storages::new(storages, options.queues.client));
-        runtime.spawn(accept(
+        let (stop_signal, stopping) = Stopping::new();
+        let tasks = Arc::new(Tasks::default());
+        // The accept loop counts as a task from now on, so a stop waits for
+        // it.
+        let accepting = tasks.start();
+        let accept = accept(
             listener,
             Arc::clone(&storages),
             options.max_frame_size.get(),
-        ));
+            stopping,
+            Arc::clone(&tasks),
+        );
+        runtime.spawn(async move {
+            accept.await;
+            drop(accepting);
+        });
         Ok(Self {
             runtime: Some(runtime),
             storages: Some(storages),
             addr,
+            stop_signal,
+            tasks,
+            shutdown_timeout: options.shutdown_timeout,
         })
     }
 
@@ -242,9 +297,10 @@ impl Server {
         self.addr
     }
 
-    /// Stop the server: close every connection, abort the open
-    /// transactions and close the store. A commit that is in `finish`
-    /// completes first.
+    /// Stop the server within its shutdown timeout. Accept no more
+    /// connections. Commit each `tpc_finish` that the server received and
+    /// send its reply. Abort the other open transactions, close every
+    /// connection and close the stores.
     pub fn stop(mut self) {
         self.shutdown();
     }
@@ -277,17 +333,38 @@ impl Server {
     }
 
     fn shutdown(&mut self) {
-        // Dropping the runtime drops every connection task. Each session
-        // then ends after its current call, and the drop waits for it.
-        // Tokio refuses that drop on a thread of an async runtime, as in an
-        // async test, so another thread drops it.
-        if let Some(runtime) = self.runtime.take() {
-            std::thread::scope(|scope| {
-                scope.spawn(move || drop(runtime));
-            });
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let timeout = self.shutdown_timeout.min(LONGEST_SHUTDOWN_TIMEOUT);
+        let deadline = Instant::now() + timeout;
+        // The accept loop drops the listener, and each connection reads no
+        // more calls. The sessions run the calls that wait, then end.
+        self.stop_signal.send_replace(true);
+        let forced = timeout - FORCED_CLOSE.min(timeout / 2);
+        if self.tasks.wait(forced) > 0 {
+            eprintln!("zoe serve: the shutdown timeout ends: closing the connections that remain");
         }
-        // The sessions dropped their references, so this closes the stores.
-        drop(self.storages.take());
+        // The stop of the runtime drops the tasks that remain, so their
+        // connections close and their sessions end after the current call.
+        // It waits for the sessions until the deadline, and not longer.
+        // Tokio refuses that wait on a thread of an async runtime, as in an
+        // async test, so another thread waits.
+        let rest = deadline.saturating_duration_since(Instant::now());
+        std::thread::scope(|scope| {
+            scope.spawn(move || runtime.shutdown_timeout(rest));
+        });
+        // Each session holds the storages while it runs. When no session
+        // runs, this drop closes the stores.
+        if let Some(storages) = self.storages.take() {
+            if Arc::strong_count(&storages) > 1 {
+                eprintln!(
+                    "zoe serve: a session still runs at the end of the shutdown timeout; \
+                     its store does not close cleanly"
+                );
+            }
+            drop(storages);
+        }
     }
 }
 
@@ -310,23 +387,86 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(1024)
 }
 
-/// Accept clients until the runtime stops. Each connection takes frames of
-/// at most `max_frame_size` bytes.
-async fn accept(listener: TcpListener, storages: Arc<Storages>, max_frame_size: u32) {
+/// Accept clients until `stopping` tells that the server stops. Then drop
+/// the listener, so the server accepts no more connections. Each connection
+/// takes frames of at most `max_frame_size` bytes, and counts in `tasks`
+/// while it runs.
+async fn accept(
+    listener: TcpListener,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+    mut stopping: Stopping,
+    tasks: Arc<Tasks>,
+) {
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = stopping.wait() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((stream, _)) => {
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(protocol::serve_connection(
+                let running = tasks.start();
+                let connection = protocol::serve_connection(
                     stream,
                     Arc::clone(&storages),
                     max_frame_size,
-                ));
+                    stopping.clone(),
+                );
+                tokio::spawn(async move {
+                    connection.await;
+                    drop(running);
+                });
             }
             Err(error) => {
                 eprintln!("zoe serve: accept failed: {error}");
                 tokio::task::yield_now().await;
             }
+        }
+    }
+}
+
+/// The count of the tasks that serve: the accept loop and one task for
+/// each connection. A stop waits until no task runs.
+#[derive(Default)]
+struct Tasks {
+    running: Mutex<usize>,
+    ended: Condvar,
+}
+
+/// The mark of a task that runs. Its drop counts the end of the task. When
+/// the stop of the runtime drops the task, it drops the mark too.
+struct Running(Arc<Tasks>);
+
+impl Tasks {
+    /// Count a task that starts.
+    fn start(self: &Arc<Self>) -> Running {
+        *self.lock() += 1;
+        Running(Arc::clone(self))
+    }
+
+    /// Wait at most `timeout` until no task runs. Return the number of
+    /// tasks that still run.
+    fn wait(&self, timeout: Duration) -> usize {
+        let (running, _) = self
+            .ended
+            .wait_timeout_while(self.lock(), timeout, |running| *running > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        *running
+    }
+
+    fn lock(&self) -> MutexGuard<'_, usize> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut running = self.0.lock();
+        *running -= 1;
+        if *running == 0 {
+            self.0.ended.notify_all();
         }
     }
 }
@@ -355,6 +495,67 @@ mod tests {
         });
         // The lock of the store is free again.
         Store::open(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_client_that_does_not_answer_the_protocol_does_not_hold_a_stop() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        let dir = fresh_dir("silent");
+        let server = Server::start(ServeOptions::new(&dir)).unwrap();
+        let mut silent = TcpStream::connect(server.addr()).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut protocol = [0u8; 6];
+        silent.read_exact(&mut protocol).unwrap();
+        assert_eq!(&protocol, b"\0\0\0\x02M5");
+
+        let started = Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The server closed the connection and the store.
+        assert_eq!(silent.read(&mut protocol).unwrap(), 0);
+        Store::open_read_only(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stop_with_a_timeout_of_0_closes_the_connections_at_once() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        let dir = fresh_dir("timeout-0");
+        let options = ServeOptions::new(&dir).shutdown_timeout(Duration::ZERO);
+        let server = Server::start(options).unwrap();
+        let mut client = TcpStream::connect(server.addr()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut protocol = [0u8; 6];
+        client.read_exact(&mut protocol).unwrap();
+        server.stop();
+        // The connection ends, and the store closes when its last session
+        // ends.
+        assert!(matches!(client.read(&mut protocol), Ok(0) | Err(_)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Store::open_read_only(&dir).is_err() {
+            assert!(Instant::now() < deadline, "the store stays open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_shutdown_timeout_past_the_clock_counts_as_the_longest() {
+        let dir = fresh_dir("long-timeout");
+        let options = ServeOptions::new(&dir).shutdown_timeout(Duration::MAX);
+        let server = Server::start(options).unwrap();
+        server.stop();
+        Store::open_read_only(&dir).unwrap();
     }
 
     #[test]
