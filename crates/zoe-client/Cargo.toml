@@ -9,6 +9,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+rmpv.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+zoe-core.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+zoe-server = { workspace = true, features = ["serve"] }
 
 [lints]
 workspace = true
