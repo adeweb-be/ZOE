@@ -108,7 +108,7 @@ def test_no_acknowledged_commit_is_lost_through_kills(tmp_path):
             threads = [
                 threading.Thread(
                     target=writer,
-                    args=(server, tmp_path / f"cache-{w}", (run, w), done, outs[w]),
+                    args=(server, tmp_path / f"cache-{w}", f"{run}-{w}", done, outs[w]),
                     daemon=True,
                 )
                 for w in range(WRITERS)
