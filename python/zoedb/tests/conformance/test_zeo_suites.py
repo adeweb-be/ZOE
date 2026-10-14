@@ -10,8 +10,9 @@ The run collects the test suites of ZEO unchanged, from the modules in
 (`supportsUndo()` is false until phase 3), or is in `OUT` with its
 reason, or skips itself, as ZEO's suites do on some platforms. `OUT`
 holds the tests that drive ZEO's own server objects in the test process,
-run `runzeo`, read the logs of ZEO's server, or wrap the storage of the
-server in a Python storage, which a server without Python cannot do. ZOE's
+run `runzeo` or a ZEO 4 server, read the logs of ZEO's server, or run a
+Python storage inside the server, which a server without Python cannot do.
+It also holds the tests that call undo under a name without "undo". ZOE's
 own acceptance tests cover the behaviour of most of them, as `OUT` says.
 
 Before the card of this gate moves to Ready, the planner checks `OUT`
@@ -52,37 +53,47 @@ OUT_MODULES = {
     "ZEO.tests.testZEOOptions": "it tests the options of runzeo",
 }
 
+UNDO = "the storage does not undo: supportsUndo() is false"
+
 # The tests of the collected modules that the run does not run, and why. A
 # name is the class that defines the test and its method, or the name of a
-# doctest.
+# doctest. The name of a doctest file has "_" in place of its last ".".
 OUT = {
-    "zdoptions.test": "it tests the zdaemon options of runzeo",
-    "protocols.test": (
+    "protocols_test": (
         "it starts a ZEO 4 server; zoe serve speaks ZEO 6 msgpack only (ADR 0003)"
     ),
-    "dynamic_server_ports.test": "it runs ZEO's threaded server in the test process",
+    "test_runzeo_msgpack_support": (
+        "it expects runzeo to speak the pickle protocol Z5 by default; "
+        "zoe serve speaks ZEO 6 msgpack only (ADR 0003)"
+    ),
+    "dynamic_server_ports_test": "it runs ZEO's threaded server in the test process",
+    "zeo-fan-out_test": (
+        "it serves a <zeoclient> storage: a ZEO client inside ZEO's server process"
+    ),
     "multiple_storages_invalidation_queue_is_not_insane": (
         OWN_SERVER + "; test_named_storages.py covers it"
     ),
     "getInvalidationsAfterServerRestart": OWN_SERVER
     + "; test_invalidations.py covers it",
+    "SyncTests.test_server_sync": (
+        "it patches ping on ZEO's server object in the test process"
+    ),
     "runzeo_without_configfile": "it runs runzeo",
     "runzeo_logrotate_on_sigusr2": "it runs runzeo",
     "client_labels": "it reads the log lines of ZEO's server",
+    "TimeoutTests.checkTimeout": (
+        "it reads the log lines of ZEO's server; "
+        "TimeoutTests.checkTimeoutAfterVote covers the timeout"
+    ),
     "FileStorageTests.checkInterfaceFromRemoteStorage": (
-        "it expects the interfaces of FileStorage; "
+        "it expects the interfaces of the FileStorage of ZEO's server process; "
         "test_reads_over_zeo.py checks those of ZOE"
     ),
-    "FileStorageHexTests": (
-        "it wraps the storage of the server in hexstorage, a Python storage"
-    ),
-    "FileStorageClientHexTests": "it wraps the storage of the server in hexstorage",
     "FileStorageLoadDelayedTests": (
         "it wraps the storage of the server in a Python storage"
     ),
+    "RecoveryStorage.testRestoreAcrossPack": "it calls undo, and " + UNDO,
 }
-
-UNDO = "the storage does not undo: supportsUndo() is false"
 
 
 def name_of(test):
