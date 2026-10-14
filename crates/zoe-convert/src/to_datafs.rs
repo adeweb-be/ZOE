@@ -10,8 +10,8 @@
 //!
 //! The conversion holds one transaction of the store at a time, and the
 //! offset of the newest record of each oid. The transaction iterator of
-//! the store holds the transaction rows and the record keys of the whole
-//! store.
+//! the store holds one transaction and a slice of tids at a time, whatever
+//! the size of the store.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Read, Write};
