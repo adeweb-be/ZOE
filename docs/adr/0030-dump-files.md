@@ -87,14 +87,14 @@ A reader refuses a file that breaks a rule, a blob whose bytes do not match its 
 
 A restore that fails removes the work directory, so it leaves nothing at the target. A restore that a crash stopped leaves the work directory, never a store at the target.
 
-**`zoe verify --path STORE --backup DIR`.** The command restores the dumps into a scratch directory in the temporary directory (`TMPDIR`), compares them with the store up to the last tid of the dumps, and removes the scratch directory:
+**`zoe verify --path STORE --backup DIR`.** The command restores the dumps into a copy in the scratch directory `--scratch` (`ZOE_SCRATCH`), the temporary directory (`TMPDIR`) by default. It builds the copy with the normal restore before it opens the store, so the store stays free while the copy is built, and a dump that does not restore fails the command before the open. Then it opens the store read-only, compares the copy with the store up to the last tid of the dumps, and removes the copy, also when the check fails. It writes nothing outside the scratch directory. The comparison:
 
 - Each transaction and each record must be the same, with the same blob record. The dumps keep the records that a pack removed: at or before the pack watermark of the store, a record or a transaction that the store lacks is no difference.
 - A pack watermark after the last tid of the dumps is a difference: the pack changed history that the next dump must hold, and the backup refuses to continue the dumps. A pack watermark equal to the last tid of the dumps is no difference.
 - Otherwise, the current record of each oid at the last tid of the dumps must be the same in the store and in the dumps. So a store whose history diverged differs, also where the comparison of the transactions forgives a pack. A record that the store lacks is no difference when its serial is at or before the pack watermark: a pack removed an object that no reader could reach.
 - The end of each sequence in the store must be at or above its end in the dumps.
 
-A difference is a finding, and a dump that does not restore fails the command. A check names its scratch directory with the id of its process, and removes the scratch directories of a check whose process is gone, which a killed check leaves.
+A difference is a finding, and a dump that does not restore fails the command. A check names its copy with the id of its process, and removes the copies in the scratch directory of a check whose process is gone, which a killed check leaves. `--scratch` without `--backup` is a usage error.
 
 ## Why a format of ZOE's own
 
@@ -115,7 +115,7 @@ A difference is a finding, and a dump that does not restore fails the command. A
 
 - A restore reads each dump twice: once to check its hash, once to restore it.
 - A restore commits each transaction with a sync, as every restore transaction does. A non-durable bulk restore is a card of its own.
-- `zoe verify --backup` is as heavy as a restore: it needs free space for a full copy of the store in `TMPDIR`, it syncs once for each transaction, and it holds the lock of the store during the whole check. A scratch directory option and a non-durable restore are later cards.
+- `zoe verify --backup` is as heavy as a restore: it needs free space for a full copy of the store in the scratch directory, and it syncs once for each transaction. It holds the lock of the store only for the comparison. A non-durable restore of the copy is a later card.
 - The dumps are not compressed. A record that the store keeps compressed goes into the dump as its pickle.
 - A restored store was never packed: its pack watermark is 0, whatever the watermark of its source.
 - A backup with nothing new writes nothing, also when a sequence moved. The values of a sequence that a dumped transaction holds are below the end in the dumps. A value given after the last dump can come again after a restore, as each change after the last dump is lost.

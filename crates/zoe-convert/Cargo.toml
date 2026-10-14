@@ -14,5 +14,10 @@ thiserror.workspace = true
 zoe-core.workspace = true
 zoe-pickle.workspace = true
 
+[dev-dependencies]
+# The acceptance test of the batched sync counts the syncs of the database
+# file through a storage backend of redb.
+redb.workspace = true
+
 [lints]
 workspace = true

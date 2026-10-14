@@ -19,7 +19,13 @@
 //!   for the client or run for a long time. A download keeps its slot until
 //!   it ends, and gives back its room after its first frame.
 //! - The other calls run on the read pool: at most `--blocking-threads`
-//!   calls of all the connections run at once.
+//!   calls of all the connections run at once. A call of the read pool
+//!   also takes a turn in the window of its connection (`outbox::Turn`),
+//!   so a client that reads slowly runs one such call at a time.
+//!
+//! A call starts only while at most `outbox::WAITING` bytes of frames of
+//! the session wait for the client. It waits for that, and for its turn,
+//! before it starts, never on a thread of the read pool.
 //!
 //! A connection with no call that runs and no open transaction holds no
 //! thread. The calls reach their tasks and their threads through the
@@ -38,7 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use super::message::Call;
-use super::outbox::{Outbox, Room};
+use super::outbox::{Outbox, Room, Turn};
 use super::session::{self, Reply, Session, Transaction};
 use super::{QUEUE, Stopping, Storages};
 use crate::runtime::{Runtime, block_on};
@@ -157,10 +163,12 @@ impl Drop for Mark {
 }
 
 /// What a call takes before it starts: a slot among the calls of its
-/// connection that run or wait, and room for its reply in the session
-/// queue. The call gives back its slot when it ends.
+/// connection that run or wait, a turn in the window when it runs on the
+/// read pool, and room for its reply in the session queue. The call gives
+/// back its slot and its turn when it ends.
 pub(crate) struct Ticket {
     slot: OwnedSemaphorePermit,
+    turn: Option<Turn>,
     room: Room,
 }
 
@@ -278,7 +286,13 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
 
     let _guard = Guard(lane, ended);
     let mut transaction = Transaction::new(Arc::clone(session));
-    while let Some((call, Ticket { slot: _slot, room })) = lane.next(transaction.is_open()) {
+    while let Some((
+        call,
+        Ticket {
+            slot: _slot, room, ..
+        },
+    )) = lane.next(transaction.is_open())
+    {
         if ended.is_set() {
             lane.stop();
             break;
@@ -299,7 +313,11 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
 /// connection, and put its reply. A panic ends the connection.
 fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended, peer: &str) {
     let _guard = EndOnPanic(ended);
-    let Ticket { slot: _slot, room } = ticket;
+    let Ticket {
+        slot: _slot,
+        turn: _turn,
+        room,
+    } = ticket;
     if ended.is_set() {
         return;
     }
@@ -375,9 +393,12 @@ impl Calls {
         self.ended.clone()
     }
 
-    /// Wait for the ticket of the next call: first a slot, then room for
-    /// its reply. The future holds no borrow of `self`.
-    pub(crate) fn ticket(&self) -> impl Future<Output = Ticket> + Send + 'static {
+    /// Wait for the ticket of `call`: first a slot, then a turn in the
+    /// window for a call of the read pool, or else until at most
+    /// `outbox::WAITING` bytes wait, then room for its reply. The future
+    /// holds no borrow of `self`.
+    pub(crate) fn ticket(&self, call: &Call) -> impl Future<Output = Ticket> + Send + 'static {
+        let reads = self.session.is_some() && session::on_read_pool(&call.method);
         let slots = Arc::clone(&self.slots);
         let outbox = self.outbox.clone();
         async move {
@@ -385,8 +406,14 @@ impl Calls {
                 .acquire_owned()
                 .await
                 .expect("the slots of a connection never close");
+            let turn = if reads {
+                outbox.turn().await
+            } else {
+                outbox.below().await;
+                None
+            };
             let room = outbox.room().await;
-            Ticket { slot, room }
+            Ticket { slot, turn, room }
         }
     }
 
@@ -474,7 +501,9 @@ impl Calls {
         let registered = self
             .pool
             .run(&*self.runtime, move || {
-                let Ticket { slot: _slot, room } = ticket;
+                let Ticket {
+                    slot: _slot, room, ..
+                } = ticket;
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
@@ -503,6 +532,15 @@ impl Calls {
         }
     }
 
+    /// End the lock wait of the vote of the session, and each later one:
+    /// the vote fails at once and releases the locks that it took. The end
+    /// of the connection calls it, except at a stop of the server.
+    pub(crate) fn end_lock_wait(&self) {
+        if let Some(session) = &self.session {
+            session.end_lock_wait();
+        }
+    }
+
     /// Wait until each call that started ends. The thread of the
     /// transaction runs the calls that wait, then ends, and that aborts the
     /// open transaction.
@@ -516,9 +554,13 @@ impl Calls {
 
 impl Drop for Calls {
     /// The thread of the transaction ends also when the task of the
-    /// connection drops before `finish`, as at the stop of the runtime: it
-    /// runs the calls that wait, then ends and aborts the open transaction.
+    /// connection drops before `finish`, as at the stop of the runtime. A
+    /// drop before `finish` ends the lock wait of the session. A drop
+    /// inside `finish`, as at the forced close of a stop, ends no lock
+    /// wait, because `finish` removes the session first. Then the thread
+    /// runs the calls that wait, ends and aborts the open transaction.
     fn drop(&mut self) {
+        self.end_lock_wait();
         self.lane.end();
     }
 }
@@ -569,7 +611,7 @@ mod tests {
     /// Start `calls` on `connection`, each with its ticket.
     async fn start(connection: &mut Calls, calls: Vec<Call>) {
         for call in calls {
-            let ticket = connection.ticket().await;
+            let ticket = connection.ticket(&call).await;
             connection.start(call, ticket).await;
         }
     }
@@ -632,14 +674,15 @@ mod tests {
             tokio::time::timeout(limit, connection.quiet())
                 .await
                 .unwrap();
-            let held = connection.ticket().await;
+            let ping = call(1, "ping", Vec::new());
+            let held = connection.ticket(&ping).await;
             // A quiet that stops early gives back the slots that it took.
             let early = tokio::time::timeout(Duration::from_millis(50), connection.quiet()).await;
             assert!(early.is_err());
             let mut others = Vec::new();
             for _ in 1..QUEUE {
                 others.push(
-                    tokio::time::timeout(limit, connection.ticket())
+                    tokio::time::timeout(limit, connection.ticket(&ping))
                         .await
                         .unwrap(),
                 );
@@ -651,6 +694,85 @@ mod tests {
             assert!(!quiet.is_finished());
             drop(held);
             tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    /// Return a registered connection to `storages` whose frames go to
+    /// `outbox`.
+    async fn registered(storages: Arc<Storages>, outbox: Outbox) -> Calls {
+        let mut connection = Calls::new(
+            storages,
+            outbox,
+            Arc::new(Tokio),
+            "test".into(),
+            Stopping::new().1,
+        );
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        start(&mut connection, vec![call(1, "register", register)]).await;
+        assert!(connection.session.is_some());
+        connection
+    }
+
+    #[test]
+    fn quiet_waits_for_a_call_that_waits_for_its_turn() {
+        let (storages, _store) = storages("quiet-turn");
+        // The test reads no frame, so the window stays at one call.
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = registered(storages, outbox).await;
+            let limit = Duration::from_secs(30);
+            let load = call(2, "loadBefore", Vec::new());
+            let first = tokio::time::timeout(limit, connection.ticket(&load))
+                .await
+                .unwrap();
+            assert!(first.turn.is_some());
+            // The second load holds a slot and waits for its turn.
+            let waiting = tokio::spawn(connection.ticket(&load));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished());
+            let quiet = tokio::spawn(connection.quiet());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // The first load ends. The second takes its turn and runs.
+            drop(first);
+            let second = tokio::time::timeout(limit, waiting).await.unwrap().unwrap();
+            assert!(second.turn.is_some());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // No call runs, whatever the window: the connection is quiet.
+            drop(second);
+            tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn the_ticket_of_a_connection_whose_writer_is_gone_ends() {
+        use crate::protocol::outbox::WAITING;
+
+        let (storages, _store) = storages("writer-gone");
+        let (outbox, inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = registered(storages, outbox).await;
+            let limit = Duration::from_secs(30);
+            let load = call(2, "loadBefore", Vec::new());
+            let first = tokio::time::timeout(limit, connection.ticket(&load))
+                .await
+                .unwrap();
+            // The client resets, so the writer stops. Then the load puts a
+            // large reply, which can stay counted.
+            drop(inbox);
+            let Ticket { slot, turn, room } = first;
+            let _ = room.put(Some(vec![0; 2 * WAITING]));
+            drop((slot, turn));
+            // The next call does not wait for the count: its ticket ends,
+            // and the reader stops on it.
+            for method in ["loadBefore", "lastTransaction", "tpc_abort"] {
+                let next = call(3, method, Vec::new());
+                let ticket = tokio::time::timeout(limit, connection.ticket(&next))
+                    .await
+                    .unwrap();
+                assert!(ticket.is_closed(), "{method}");
+            }
         });
     }
 
@@ -691,6 +813,46 @@ mod tests {
             connection.finish().await;
         });
         assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn the_end_of_the_connection_ends_the_lock_wait_of_its_vote() {
+        let (storages, store) = storages("lock-wait-ends");
+        // Another transaction holds the lock of oid 2 for the whole test.
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(zoe_core::Oid(2), Tid::ZERO, b"held").unwrap();
+        holder.vote().unwrap();
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        let ended = runtime().block_on(async {
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
+            let register = vec![Value::from("1"), Value::Boolean(false)];
+            // The vote takes the lock of oid 1 and waits for oid 2, longer
+            // than the test when nothing ends the wait.
+            let calls = vec![
+                call(1, "register", register),
+                begin(7),
+                storea(1, 7),
+                storea(2, 7),
+                call(2, "vote", vec![Value::from(7)]),
+            ];
+            start(&mut connection, calls).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let started = Instant::now();
+            connection.end_lock_wait();
+            connection.finish().await;
+            started.elapsed()
+        });
+        assert!(ended < Duration::from_secs(5), "the end took {ended:?}");
+        // Only the holder holds a lock.
+        holder.abort();
+        assert!(store.lock_table_is_empty());
+        assert_eq!(store.last_transaction(), Tid::ZERO);
     }
 
     #[test]
