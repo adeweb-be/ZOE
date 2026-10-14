@@ -10,6 +10,9 @@
 //! feature, for `zoe serve` and for `zoe mcp`, so the extension module
 //! never links it. It has no Python inside.
 //!
+//! With `ZOE_OTLP_ENDPOINT` set, `zoe serve` exports its spans over OTLP
+//! (`telemetry`).
+//!
 //! The feature `fuzz` adds the module `fuzz`, the entry of the fuzz
 //! targets in `fuzz/`.
 
@@ -26,5 +29,7 @@ mod runtime;
 pub mod serve;
 #[cfg(feature = "sim")]
 pub mod sim;
+#[cfg(feature = "serve")]
+mod telemetry;
 #[cfg(feature = "serve")]
 mod tls;

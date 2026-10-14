@@ -22,6 +22,11 @@
 //!
 //! The queue mutex is held with no other lock. The leader takes the commit
 //! sequencer after it releases the queue mutex.
+//!
+//! The write of a batch and its sync run in a `tracing` span `fsync`, with
+//! the field `commits`, the number of members that have a tid. The span
+//! is a child of the span of the leader's finish. A batch of deferred
+//! restores commits without a sync, so it has no span `fsync`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -194,7 +199,14 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             .all(|(member, finished)| member.deferred || finished.is_err());
         // The sequencer stays empty if the write below fails.
         *sequencer = None;
-        match write(store, &mut members, deferred) {
+        // Only a batch that syncs gets the span `fsync`.
+        let span = if deferred {
+            tracing::Span::none()
+        } else {
+            let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
+            tracing::info_span!("fsync", commits)
+        };
+        match span.in_scope(|| write(store, &mut members, deferred)) {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this

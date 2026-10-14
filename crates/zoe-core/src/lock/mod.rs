@@ -32,6 +32,10 @@
 //! stays: each later wait on the same `LockCancel` fails at once. A
 //! cancel takes no mutex of the lock manager, and wakes the waiter
 //! without it.
+//!
+//! Each wait for the lock of an oid runs in a `tracing` span `lock_wait`,
+//! with the field `oid`. The call opens and closes it without the mutex.
+//! The span ends at the grant, the timeout or the cancel.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -384,6 +388,8 @@ impl LockManager {
         // The call waits for one oid at a time, so one waiter is
         // sufficient.
         let mut wake: Option<Arc<dyn Waiter>> = None;
+        // The span of the wait for the oid that the call waits for.
+        let mut waited: Option<tracing::span::EnteredSpan> = None;
         // A cancel wakes the waiter while this guard lives.
         let mut _watch: Option<Watch<'_>> = None;
         let cancelled = || cancel.is_some_and(LockCancel::is_cancelled);
@@ -430,6 +436,9 @@ impl LockManager {
                 };
                 loop {
                     drop(table);
+                    if waited.is_none() {
+                        waited = Some(tracing::info_span!("lock_wait", oid = oid.0).entered());
+                    }
                     let left = deadline.saturating_sub(clock.monotonic());
                     if !left.is_zero() {
                         wake.wait(left);
@@ -464,6 +473,7 @@ impl LockManager {
                 // clock panics, `locks` drops and releases this lock too.
                 drop(table);
                 since = clock.now();
+                drop(waited.take());
                 table = self.table();
                 if let Some(last) = locks.held.last_mut() {
                     last.since = since;

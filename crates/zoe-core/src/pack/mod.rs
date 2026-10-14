@@ -45,6 +45,10 @@
 //! So each batch stays one backend write, whole or absent, and a later
 //! pack at the same tid removes what the stopped pack left.
 //!
+//! Each batch runs in a `tracing` span `pack_batch`, with the field
+//! `records`, the number of records that it removes. The span changes
+//! nothing of what the batch removes.
+//!
 //! A dry run (`Store::pack_dry_run`) runs the mark and the selection of a
 //! pack. It adds each selected record to the report and removes nothing.
 //! It writes nothing. With no commit between them, the report of the dry
@@ -140,6 +144,11 @@ impl PackState {
     }
 }
 
+/// Return the span of one batch of a pack that removes `records` records.
+fn batch_span(records: usize) -> tracing::Span {
+    tracing::info_span!("pack_batch", records)
+}
+
 /// Lock `mutex`. A panic of another thread does not hide the state.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -233,11 +242,11 @@ impl Store {
             let removals = pack.plan(batch.max(1))?;
             if removals.is_empty() {
                 if pack.watermark.is_some() {
-                    pack.remove(Vec::new())?;
+                    batch_span(0).in_scope(|| pack.remove(Vec::new()))?;
                 }
                 break;
             }
-            pack.remove(removals)?;
+            batch_span(removals.len()).in_scope(|| pack.remove(removals))?;
             if stop() {
                 return Err(ZoeError::Closed);
             }
