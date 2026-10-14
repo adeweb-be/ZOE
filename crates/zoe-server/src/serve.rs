@@ -104,6 +104,8 @@ pub struct ServeOptions {
     admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
+    lock_warn: Option<Duration>,
+    transaction_warn: Option<Duration>,
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
     idle_timeout: Duration,
@@ -130,6 +132,8 @@ impl ServeOptions {
             admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
+            lock_warn: None,
+            transaction_warn: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -144,8 +148,8 @@ impl ServeOptions {
         self
     }
 
-    /// Open the admin port on `addr`: an HTTP port with `/healthz` and
-    /// `/readyz`. A port of 0 takes a free port. Without this call, the
+    /// Open the admin port on `addr`: an HTTP port with `/healthz`,
+    /// `/readyz` and `/metrics`. A port of 0 takes a free port. Without this call, the
     /// server opens no admin port.
     #[must_use]
     pub fn admin_listen(mut self, addr: SocketAddr) -> Self {
@@ -176,6 +180,24 @@ impl ServeOptions {
     #[must_use]
     pub fn lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = Some(timeout);
+        self
+    }
+
+    /// Log each lock held longer than `threshold`, with its oid, its client
+    /// and its storage, when the lock is released. Without this call, the
+    /// server logs no lock.
+    #[must_use]
+    pub fn lock_warn(mut self, threshold: Duration) -> Self {
+        self.lock_warn = Some(threshold);
+        self
+    }
+
+    /// Log each transaction open longer than `threshold`, with its client
+    /// and its storage, when it ends. Without this call, the server logs
+    /// no transaction.
+    #[must_use]
+    pub fn transaction_warn(mut self, threshold: Duration) -> Self {
+        self.transaction_warn = Some(threshold);
         self
     }
 
@@ -232,6 +254,8 @@ impl ServeOptions {
         if let Some(timeout) = self.lock_timeout {
             options.lock_timeout = timeout;
         }
+        options.lock_warn = self.lock_warn;
+        options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);
         options
     }
@@ -369,6 +393,7 @@ impl Server {
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
             storages.push(Arc::new(named.read_only(read_only)));
         }
+        health.measured(storages.iter().map(|storage| storage.exported()).collect());
         let storages = Arc::new(Storages::new(storages, options.queues.client));
         let tasks = Arc::new(Tasks::default());
         // The accept loop counts as a task from now on, so a stop waits for
@@ -456,7 +481,7 @@ impl Server {
         self.stop_signal.send_replace(true);
         let forced = timeout - FORCED_CLOSE.min(timeout / 2);
         if self.tasks.wait(forced) > 0 {
-            eprintln!("zoe serve: the shutdown timeout ends: closing the connections that remain");
+            tracing::warn!("the shutdown timeout ends: closing the connections that remain");
         }
         // The stop of the runtime drops the tasks that remain, so their
         // connections close and their sessions end after the current call.
@@ -471,9 +496,10 @@ impl Server {
         // closes every other store.
         if let Some(storages) = self.storages.take() {
             for name in Storages::held(&storages) {
-                eprintln!(
-                    "zoe serve: a session still runs at the end of the shutdown timeout; \
-                     the store of the storage {name} does not close cleanly"
+                tracing::warn!(
+                    storage = name,
+                    "a session still runs at the end of the shutdown timeout: \
+                     the store of the storage does not close cleanly"
                 );
             }
             drop(storages);
@@ -545,7 +571,7 @@ async fn accept(
                 });
             }
             Err(error) => {
-                eprintln!("zoe serve: accept failed: {error}");
+                tracing::warn!("accept failed: {error}");
                 tokio::task::yield_now().await;
             }
         }
