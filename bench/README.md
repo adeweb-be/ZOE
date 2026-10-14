@@ -1,6 +1,6 @@
 # Benchmarks
 
-This directory holds the reference baseline: a harness that runs [zodbshootout](https://pypi.org/project/zodbshootout/) against FileStorage, ZEO 6 and RelStorage on PostgreSQL, and the JSON schema of its results. The same harness measures ZOE in-process, the storage `zoe`, through the `<zoe>` stanza. `zoe-bench` (contention and server saturation) and the criterion microbenchmarks live in `crates/`.
+This directory holds the reference baseline: a harness that runs [zodbshootout](https://pypi.org/project/zodbshootout/) against FileStorage, ZEO 6 and RelStorage on PostgreSQL, and the JSON schema of its results. The same harness measures ZOE in-process, the storage `zoe`, through the `<zoe>` stanza, and ZOE server, the storage `zoe-server`: a stock ZEO client, through the `<zeoclient>` section, of `zoe serve`. `zoe-bench` (contention and server saturation) and the criterion microbenchmarks live in `crates/`.
 
 ## Run it
 
@@ -13,6 +13,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench run --storage zeo --quick` | one storage only |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
+| `just bench gate DIR` | the gate report: `zoe-server` against `zeo` in each cell of a results tree (see [The gate](#the-gate)) |
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -28,6 +29,7 @@ Other settings:
 - `ZOE_BENCH_COMMIT`: the commit to record. The default is `git rev-parse HEAD`.
 - `UV_PYTHON`: the interpreter, `3.13` by default. Each interpreter gets its own environment under `target/bench/`.
 - `--workdir`: where the storages write their files, `target/bench/work` by default. Keep it on the disk under test, not on a tmpfs.
+- `ZOE_BINARY`: the `zoe` binary of the storage `zoe-server`. Without it, the harness takes `target/release/zoe` of the repository (under `CARGO_TARGET_DIR` when it is set), and cargo builds it when it is missing. `just bench run` and `just bench test` build it in release first, so it is never stale.
 
 ## What it measures
 
@@ -39,15 +41,29 @@ zodbshootout runs five scenarios: `add`, `update`, `read_cold`, `read_warm` (zod
 | full | threads at concurrency 1, 4, 16 and 64; processes at 4, 16 and 64; objects of 1 KB and 100 KB | 20 (2 processes × 10) |
 
 - In the threads mode, one process runs the workers as threads that share one `DB`, as in one Zope process. In the processes mode, each worker is a process with its own `DB`, as in several Zope processes.
-- FileStorage and `zoe` run only in the threads mode: only one process can open a FileStorage file or a ZOE store.
+- FileStorage and `zoe` run only in the threads mode: only one process can open a FileStorage file or a ZOE store. ZEO, RelStorage and `zoe-server` run in every cell.
 - A sample is the time for the slowest worker to do one transaction. A result reports the mean, the median and the 99th percentile of these times. `ops_per_second` is objects per second for all workers together: concurrency × 100 ÷ mean.
 - Every storage runs with its default settings. The `<zoe>` stanza sets only `path`. RelStorage keeps history, like FileStorage and ZEO. The ZEO server is a separate process on the same machine.
+- `zoe-server` runs `zoe serve --path <cell>/store --listen 127.0.0.1:0` in the work directory of each cell, a separate process on the same machine, as the ZEO server. No `ZOE_*` variable of the environment reaches it, so it runs with its default settings. The client is the `<zeoclient>` section of ZEO with its default settings, as for `zeo`. The result records the version of the server as `zoe` in `software`.
 
 The corpus is synthetic: zodbshootout generates its own objects. Results are numbers, never data.
 
 ## Results
 
 Each run of one storage gives one JSON document that validates against [`schema/results.schema.json`](schema/results.schema.json). The document names the storage, the machine (CPU, logical CPUs, memory, kernel, the disk that holds the storage files), the Python build (version, free-threaded or not), the versions of every package and server, the commit, and one entry per scenario and cell. It holds no host name, user name or path.
+
+## The gate
+
+The phase 2 gate is "at least 3× ZEO on zodbshootout" (N4). `python -m shootout gate`, or `just bench gate DIR`, reads the results tree DIR in the layout below and turns the gate into a pass or a fail per cell:
+
+```sh
+just bench gate --storage zoe-server --baseline zeo --ratio 3 target/bench/results
+```
+
+- For each machine, Python build and set (quick or full), it keeps the last result of each storage, by the start of the run. So it compares one machine, one Python build and the same cells, and never a quick run with a full run.
+- For each scenario and cell of the baseline, it prints `ops_per_second` of both storages and their ratio.
+- It exits with 0 when every ratio is at least `--ratio`. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline.
+- `--storage zoe-server --baseline zeo --ratio 3` are the defaults. The phase 2 gate counts only the full set of the reference machine.
 
 ## The results repository
 
