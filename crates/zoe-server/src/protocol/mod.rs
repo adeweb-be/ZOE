@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
 
@@ -85,7 +85,9 @@ const QUEUE: usize = 4;
 
 /// The longest time that a connection reads and drops bytes at a stop,
 /// after its writer sent its last frame and shut down its side, when it
-/// cannot read the send queue of its socket. A stock client closes its
+/// cannot read the send queue of its socket. It is also the longest time
+/// that a connection reads and drops bytes after the bytes of the client
+/// ended it (see `drain`). A stock client closes its
 /// side when it reads the end of the connection, and that ends the wait
 /// sooner. The wait keeps the socket open while the client can still
 /// send. So a byte that the client sends in that time causes no reset,
@@ -93,11 +95,13 @@ const QUEUE: usize = 4;
 const LINGER: Duration = Duration::from_millis(500);
 
 /// The pause between two reads of the send queue of a socket while the
-/// connection waits at a stop for the queue to become empty.
+/// connection waits at a stop for the queue to become empty. A client
+/// whose bytes ended the connection is quiet when it sends nothing for
+/// this time.
 const DRAIN_PAUSE: Duration = Duration::from_millis(50);
 
 /// The size of the buffer into which a connection reads the bytes that it
-/// drops at a stop.
+/// drops.
 const DROPPED: usize = 8 * 1024;
 
 /// The name of the storage that `--path` gives. It is the default of ZEO.
@@ -107,8 +111,12 @@ pub(crate) const STORAGE_NAME: &str = "1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Queues {
     /// The most transactions that `getInvalidations` covers. Past it, the
-    /// reply is nil.
+    /// reply is nil, except for a tid younger than `invalidation_age`.
     pub(crate) invalidations: usize,
+    /// The age under which `getInvalidations` covers every transaction
+    /// after a tid, past `invalidations`, as the key `invalidation-age` of
+    /// ZEO. Zero turns it off.
+    pub(crate) invalidation_age: Duration,
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection. The replies of the calls wait in a queue of
     /// `QUEUE` frames, and each call takes its room before it starts.
@@ -116,10 +124,11 @@ pub(crate) struct Queues {
 }
 
 impl Queues {
-    /// The bounds of a server that gets no option: 100,000 transactions
-    /// and 1,000 messages.
+    /// The bounds of a server that gets no option: 100,000 transactions,
+    /// no invalidation age and 1,000 messages.
     pub(crate) const DEFAULT: Self = Self {
         invalidations: 100_000,
+        invalidation_age: Duration::ZERO,
         client: 1_000,
     };
 }
@@ -143,6 +152,9 @@ pub(crate) struct NamedStorage {
     /// True when the clients share the blob directory of the store, so
     /// that `storeBlobShared` is accepted.
     shared_blob_dir: bool,
+    /// True when the server closes a connection that stays silent, so
+    /// that an open transaction cannot hold its locks forever.
+    timeout: bool,
 }
 
 impl NamedStorage {
@@ -162,6 +174,7 @@ impl NamedStorage {
             queues,
             read_only: false,
             shared_blob_dir: false,
+            timeout: false,
         }
     }
 
@@ -187,6 +200,14 @@ impl NamedStorage {
         self
     }
 
+    /// Mark that the server closes a connection that stays silent when
+    /// `timeout` is true. The status then gives `timeout-thread-is-alive`
+    /// true, as a ZEO server with a transaction timeout does.
+    pub(crate) fn timeout(mut self, timeout: bool) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Return what the admin port reads for the metrics of the storage.
     pub(crate) fn exported(&self) -> Exported {
         Exported {
@@ -199,7 +220,8 @@ impl NamedStorage {
 
     /// Return the status of the storage. It reads the store.
     fn status(&self) -> status::Status {
-        self.stats.status(self.store.last_transaction())
+        self.stats
+            .status(self.store.last_transaction(), self.timeout)
     }
 
     /// Return the size of the files in the store directory, in bytes, as
@@ -362,6 +384,43 @@ pub(crate) async fn serve_connection(
     serve_stream(reader, writer, connection, storages, stopping).await;
 }
 
+/// Serve one client on `stream`, a connection on the unix domain socket at
+/// `path`, as `serve_connection` does. The label of the client is
+/// `unix_peer`.
+pub(crate) async fn serve_unix_connection(
+    stream: UnixStream,
+    path: Arc<Path>,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+    idle_timeout: Option<Duration>,
+    stopping: Stopping,
+) {
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let peer = unix_peer(&path, pid);
+    let socket = Some(stream.as_raw_fd());
+    let (reader, writer) = stream.into_split();
+    let connection = Connection {
+        peer,
+        runtime: Arc::new(Tokio),
+        max_frame_size,
+        idle_timeout,
+        read_only: false,
+        socket,
+    };
+    serve_stream(reader, writer, connection, storages, stopping).await;
+}
+
+/// Return the label of a client on the unix domain socket at `path`, as
+/// the log lines name it in place of an address: the path as the options
+/// give it, then the process id of the client, `pid`. The kernel gives the
+/// process id (`SO_PEERCRED`). Without it, the label is the path only.
+fn unix_peer(path: &Path, pid: Option<i32>) -> String {
+    match pid {
+        Some(pid) => format!("{} pid {pid}", path.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// The settings of one connection.
 pub(crate) struct Connection {
     /// The client, as the messages of the log name it.
@@ -377,9 +436,10 @@ pub(crate) struct Connection {
     /// True when the client may register read-only only, as the holder of
     /// a certificate of the read-only client CA.
     pub(crate) read_only: bool,
-    /// The descriptor of the TCP socket under the stream, or `None` for a
-    /// stream without a socket. The reader of the stream holds the socket
-    /// open. The close at a stop reads the send queue of this socket.
+    /// The descriptor of the TCP or unix domain socket under the stream,
+    /// or `None` for a stream without a socket. The reader of the stream
+    /// holds the socket open. The close at a stop reads the send queue of
+    /// this socket.
     pub(crate) socket: Option<RawFd>,
 }
 
@@ -487,6 +547,9 @@ pub(crate) async fn serve_stream(
     // A stop lets a vote that waits for a lock go on waiting: the other
     // sessions abort their transactions, and a finish that arrived commits.
     let mut stopped = false;
+    // True when the bytes of the client end the connection: a frame that
+    // is not a call, or a call that ends the connection.
+    let mut refused = false;
     loop {
         // An end of the connection or a stop wins over a frame that waits.
         // A frame that arrived wins over the idle timeout. The idle time
@@ -496,7 +559,10 @@ pub(crate) async fn serve_stream(
         let quiet = calls.quiet();
         let read = tokio::select! {
             biased;
-            () = ended.wait() => break,
+            () = ended.wait() => {
+                refused = true;
+                break;
+            }
             () = closing.wait() => break,
             () = stopping.wait() => {
                 stopped = true;
@@ -531,9 +597,20 @@ pub(crate) async fn serve_stream(
             Ok(call) => call,
             Err(error) => {
                 tracing::warn!(client = peer.as_str(), "a frame is not a call: {error}");
+                refused = true;
                 break;
             }
         };
+        // `register` ended before the reader read this frame. So the
+        // session tells if the connection declared `trace_context`.
+        if call.context.is_some() && !calls.traces() {
+            tracing::warn!(
+                client = peer.as_str(),
+                "a frame is not a call: it has a trace context, and the connection did not declare trace_context"
+            );
+            refused = true;
+            break;
+        }
         if call.is_heartbeat() {
             continue;
         }
@@ -543,7 +620,10 @@ pub(crate) async fn serve_stream(
         let ticket = tokio::select! {
             biased;
             ticket = calls.ticket(&call) => ticket,
-            () = ended.wait() => break,
+            () = ended.wait() => {
+                refused = true;
+                break;
+            }
             () = closing.wait() => break,
         };
         if ticket.is_closed() {
@@ -555,6 +635,9 @@ pub(crate) async fn serve_stream(
     // gone client holds no lock.
     if !stopped {
         calls.end_lock_wait();
+    }
+    if refused {
+        drain(&mut reader, &*runtime, &mut closing).await;
     }
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.
@@ -578,6 +661,35 @@ pub(crate) async fn serve_stream(
     }
 }
 
+/// Read and drop the bytes of the client after its bytes ended the
+/// connection, until the client sends nothing for `DRAIN_PAUSE`, until it
+/// closes its side, or for `LINGER` at most. The connection closes only
+/// after that. So the calls that the client sent before it saw the end
+/// arrive before the close, and the close is not a reset. A reset makes a
+/// write of the client fail, and the asyncio of CPython 3.12 then can lose
+/// the next connection of the client. When the hub closed the connection,
+/// the writer stopped at once, and no wait follows.
+async fn drain(
+    reader: &mut (impl AsyncRead + Unpin),
+    runtime: &dyn Runtime,
+    closing: &mut Closing,
+) {
+    let mut dropped = vec![0u8; DROPPED];
+    let mut deadline = runtime.sleep(LINGER);
+    loop {
+        tokio::select! {
+            biased;
+            () = closing.wait() => return,
+            () = &mut deadline => return,
+            () = runtime.sleep(DRAIN_PAUSE) => return,
+            read = reader.read(&mut dropped) => match read {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            },
+        }
+    }
+}
+
 /// Wait for `finished` at a stop of the server. Then keep the connection
 /// open until the send queue of `socket` is empty, so that a late byte of
 /// the client causes no reset.
@@ -593,8 +705,9 @@ pub(crate) async fn serve_stream(
 /// and shut down its side. Then the reader drops bytes until the send
 /// queue of `socket` is empty. The queue holds the bytes that the client
 /// did not acknowledge, the FIN included. When it is empty, the client
-/// has every frame and the FIN, and a reset deletes nothing of them. The
-/// connection reads the queue at once, then after each pause of
+/// has every frame and the FIN, and a reset deletes nothing of them. On a
+/// unix domain socket, the queue holds the bytes that the client did not
+/// read. The connection reads the queue at once, then after each pause of
 /// `DRAIN_PAUSE`. The check of the queue comes before the drop of the
 /// bytes, so a client that sends without end does not delay the close.
 /// Without a socket, or when a read of the queue fails, the reader drops
@@ -689,6 +802,15 @@ mod tests {
     /// Return a signal that never tells a stop: its sender is gone.
     fn never_stops() -> Stopping {
         Stopping::new().1
+    }
+
+    #[test]
+    fn a_client_on_a_unix_domain_socket_is_the_path_and_its_process_id() {
+        assert_eq!(
+            unix_peer(Path::new("./zeo.sock"), Some(42)),
+            "./zeo.sock pid 42"
+        );
+        assert_eq!(unix_peer(Path::new("/run/zeo.sock"), None), "/run/zeo.sock");
     }
 
     #[test]
@@ -849,6 +971,52 @@ mod tests {
         let data = Value::Binary(b"pickle".to_vec());
         let store = vec![session::p64(oid), session::p64(0), data, Value::from(7)];
         send(client, 0, "storea", store);
+    }
+
+    /// Encode a call. The id 0 is a call without a reply.
+    fn call_bytes(id: i64, method: &str, args: Vec<Value>) -> Vec<u8> {
+        let call = Value::Array(vec![
+            Value::from(id),
+            Value::Boolean(id == 0),
+            Value::from(method),
+            Value::Array(args),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &call).unwrap();
+        bytes
+    }
+
+    /// Send the frame `first`, then the calls of a transaction and more
+    /// bytes, in one write, as a client sends a burst before it sees the
+    /// end of the connection. The client gets the end of the connection,
+    /// not a reset, and no reply.
+    fn burst_ends_without_a_reset(name: &str, first: &[u8]) {
+        let storage = storage(name);
+        let (runtime, addr) = serve(&storage);
+        let mut client = registered(addr);
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        let mut burst = frame::encode(first).unwrap();
+        burst.extend(frame::encode(&call_bytes(0, "tpc_begin", begin)).unwrap());
+        burst.extend(frame::encode(&call_bytes(2, "vote", vec![Value::from(7)])).unwrap());
+        burst.extend([7; 100_000]);
+        client.write_all(&burst).unwrap();
+        let mut replies = Vec::new();
+        let read = client.read_to_end(&mut replies);
+        assert!(read.is_ok(), "{read:?}");
+        assert!(replies.is_empty(), "{} bytes after the end", replies.len());
+        drop(client);
+        drop(runtime);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_call_ends_without_a_reset() {
+        burst_ends_without_a_reset("not-a-call", b"salty");
+    }
+
+    #[test]
+    fn an_unknown_method_ends_without_a_reset() {
+        let unknown = call_bytes(0, "foo", vec![]);
+        burst_ends_without_a_reset("unknown-method", &unknown);
     }
 
     /// Wait until `done` is true. Fail after 30 seconds.

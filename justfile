@@ -155,13 +155,15 @@ fuzz seconds="60" *targets="frame handshake":
 # Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
 # suites against zoe serve, on every interpreter. `just test` does not
 # collect them. The test forker of ZEO starts the `zoe` binary of the debug
-# build.
-conformance:
+# build. `just conformance PYTHONS TESTS` runs only the given interpreters
+# and pytest arguments, for example
+# `just conformance 3.13 zoedb/tests/conformance/test_zeo_suites.py`.
+conformance only=pythons *tests="zoedb/tests/conformance":
     cargo build --locked -p zoe-server --bin zoe
     export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
-    for py in {{ pythons }}; do \
+    for py in {{ only }}; do \
         echo "== CPython $py"; \
-        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
+        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q {{ tests }}; \
     done
 
 # Run the process kill loop against `zoe serve` for `runs` rounds, on
@@ -481,15 +483,18 @@ plone scenario="zoe" command="start" *args:
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set,
 # `just bench test` runs the tests of the harness and `just bench gate DIR`
-# compares zoe serve with ZEO cell by cell. `run` and `test` build `zoe` in
-# release for the storage zoe-server, unless ZOE_BINARY names a binary.
-# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
-# in release, start `zoe serve` on a new store in
-# target/bench/work/zoe-bench, run `zoe-bench load` or `zoe-bench saturate`
-# with its default settings and the options that follow, and write the
-# JSON result to stdout and to
-# target/bench/zoe-bench/<command>-<started>.json. The criterion
-# benchmarks are not built yet.
+# compares zoe serve with ZEO cell by cell, at parity by default and with
+# read_hot left out. `run` runs each value of zodbshootout on a fresh store
+# under target/bench/work, removes the store when the value ends, and fails
+# a cell before it starts when that disk has less free space than one value
+# needs. `run` and `test` build `zoe` in release for the storage
+# zoe-server, unless ZOE_BINARY names a binary. `just bench load` and
+# `just bench saturate` build `zoe` and `zoe-bench` in release, start
+# `zoe serve` on a new store in target/bench/work/zoe-bench, run
+# `zoe-bench load` or `zoe-bench saturate` with its default settings and the
+# options that follow, and write the JSON result to stdout and to
+# target/bench/zoe-bench/<command>-<started>.json. The criterion benchmarks
+# are not built yet.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail

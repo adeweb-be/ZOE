@@ -189,6 +189,15 @@ pub trait Backend: Send + Sync {
     /// A store that was never packed gives `Tid::ZERO`.
     fn pack_watermark(&self) -> Result<Tid>;
 
+    /// Return the object count of the store, `object_count` in `meta`:
+    /// the number of distinct oids that have at least one record, a
+    /// deletion included. The value is the count of the last write that
+    /// changed records. A store without a count gives `None`. This default
+    /// gives `None`, so a backend that keeps no count needs no change.
+    fn object_count(&self) -> Option<u64> {
+        None
+    }
+
     /// Return the keys of the records of the oids from `from` up, in key
     /// order. The list stops after the first oid that brings it to `limit`
     /// keys or more, so it holds all the keys of each oid in it. One
@@ -230,6 +239,19 @@ pub trait Backend: Send + Sync {
         let _ = bytes;
         Err(ZoeError::Backend(
             format!("no test hook to write {key:?}").into(),
+        ))
+    }
+
+    /// Store `value` in the row `key` of `meta`, or remove the row when
+    /// `value` is `None`, with no check, in a write transaction of its own.
+    /// The open state of the backend does not change. Only the test hook
+    /// `testing` calls it. A backend without the hook gives a `Backend`
+    /// error.
+    #[cfg(feature = "testing")]
+    fn write_meta_stored(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
+        let _ = value;
+        Err(ZoeError::Backend(
+            format!("no test hook to write the meta row {key:?}").into(),
         ))
     }
 
