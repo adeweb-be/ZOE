@@ -143,7 +143,7 @@ pub enum ZoeError {
 
     /// The store is closed. A transaction iterator or a blob file outlived
     /// its store. `Store::pack_until` also gives it when its stop ends the
-    /// pack between two batches, because the store closes.
+    /// pack between two batches.
     #[error("the store is closed")]
     Closed,
 

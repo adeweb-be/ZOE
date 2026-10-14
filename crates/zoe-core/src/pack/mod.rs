@@ -195,7 +195,8 @@ impl Store {
     /// Pack the store at `at`, as `pack` does, and stop between two
     /// batches when `stop` returns true. `stop` runs after each batch,
     /// as `between` of `pack_in_batches` runs. It does not run during the
-    /// mark, so a stop waits for the mark and for the batch that runs.
+    /// mark, so a stop during the mark waits for the mark and the first
+    /// batch. At most one batch runs after the stop.
     ///
     /// A stopped pack ends with `Closed` and removes no more records. Each
     /// batch is one backend write, so the store keeps the records of the
