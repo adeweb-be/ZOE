@@ -603,6 +603,7 @@ impl Session {
             "storeBlobStart" => self.store_blob_start(args),
             "storeBlobChunk" => self.store_blob_chunk(args),
             "storeBlobEnd" => self.store_blob_end(args),
+            "storeBlobShared" => self.store_blob_shared(args),
             "sendBlob" => return self.send_blob(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
@@ -1315,6 +1316,40 @@ impl Session {
                 return Err(Fault::type_error("data is not bytes"));
             };
             Ok(txn.store_blob_at(oid, serial, data, upload.close())?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage the blob in the file `filename` of the directory of `oid` with
+    /// `data`, for a client that shares the blob directory of the store.
+    /// `Txn::store_blob_shared` takes the file by rename. `filename` must
+    /// be a name that ends in `.tmp` or `.tmp-`, never a path.
+    ///
+    /// The call has no reply. Without `--shared-blob-dir`, a name that the
+    /// core refuses, and each other error of the stage fail the vote, as an
+    /// error of `storea` does. Then the file stays in its place.
+    fn store_blob_shared(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, filename, id] = arity::<5>(args, "storeBlobShared")?;
+        let shared = self.storage.shared_blob_dir;
+        self.current(id)?.stage(|txn| {
+            if !shared {
+                return Err(Fault::storage(
+                    "storeBlobShared needs zoe serve --shared-blob-dir \
+                     (ZOE_SHARED_BLOB_DIR): this server does not share its blob \
+                     directory with its clients",
+                ));
+            }
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
+            let Value::Binary(data) = data else {
+                return Err(Fault::type_error("data is not bytes"));
+            };
+            let name = match filename {
+                Value::String(text) => text.as_str(),
+                Value::Binary(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            }
+            .ok_or_else(|| Fault::type_error("the blob file name is not a str"))?;
+            Ok(txn.store_blob_shared(oid, serial, data, name)?)
         });
         Ok(Value::Nil)
     }
@@ -3403,6 +3438,108 @@ mod tests {
         assert_eq!(blob_tree(&s.storage), none);
         let fault = failed(call(&mut s, "vote", vec![Value::from(2)]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    /// Return a storage whose clients share its blob directory, with the
+    /// layout file in place, as `Server::start` makes it.
+    fn shared_storage(name: &str) -> Arc<NamedStorage> {
+        let storage = storage(name, Queues::DEFAULT);
+        storage.store.blob_temp_dir().unwrap();
+        let storage = Arc::into_inner(storage).unwrap();
+        Arc::new(storage.shared_blob_dir(true))
+    }
+
+    /// Write `bytes` into the file `name` of the directory of `oid`, as a
+    /// client that shares the blob directory does. Return its path.
+    fn shared_file(
+        storage: &NamedStorage,
+        oid: u64,
+        name: &str,
+        bytes: &[u8],
+    ) -> std::path::PathBuf {
+        // The directory of the oid in ZODB's BushyLayout.
+        let mut dir = storage.path.join("blobs");
+        for byte in oid.to_be_bytes() {
+            dir.push(format!("0x{byte:02x}"));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Send `storeBlobShared` for `oid` in the transaction `id`, with the
+    /// file name `name`.
+    fn store_blob_shared(s: &mut Session, id: i64, oid: u64, name: Value) -> Outcome {
+        let data = Value::Binary(b"pickle".to_vec());
+        call(
+            s,
+            "storeBlobShared",
+            vec![p64(oid), p64(0), data, name, Value::from(id)],
+        )
+    }
+
+    #[test]
+    fn a_shared_blob_commits_by_its_name() {
+        let storage = shared_storage("blob-shared");
+        let (mut s, _frames) = connected(&storage);
+        let file = shared_file(&storage, 1, "0x00abc.tmp-", b"the blob");
+        begin(&mut s, 1, None);
+        store(&mut s, 1, 1, 0, b"pickle");
+        done(store_blob_shared(&mut s, 1, 1, Value::from("0x00abc.tmp-")));
+        // The transaction took the file by rename.
+        assert!(!file.exists());
+        let tid = Tid(vote_and_finish(&mut s, 1).unwrap());
+        assert_eq!(s.store.load_serial(Oid(1), tid).unwrap(), b"pickle");
+        let path = s.store.blob_path(Oid(1), tid).unwrap();
+        assert_eq!(path.parent(), file.parent());
+        assert_eq!(std::fs::read(&path).unwrap(), b"the blob");
+        assert_eq!(blob_tree(&s.storage), [path]);
+        // A stock client counts the storea, not the blob.
+        assert_eq!(count(&s.storage.status().to_value(), "stores"), 1);
+    }
+
+    #[test]
+    fn a_shared_blob_without_the_option_fails_the_vote_and_names_it() {
+        let mut s = registered("blob-shared-off");
+        let file = shared_file(&s.storage, 1, "client.tmp-", b"the blob");
+        begin(&mut s, 1, None);
+        store(&mut s, 1, 1, 0, b"pickle");
+        done(store_blob_shared(&mut s, 1, 1, Value::from("client.tmp-")));
+        let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
+        assert_eq!(fault.class, "ZODB.POSException.StorageError");
+        assert!(format!("{:?}", fault.args).contains("--shared-blob-dir"));
+        assert!(s.open.is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"the blob");
+    }
+
+    #[test]
+    fn a_bad_shared_name_fails_the_vote_and_leaves_the_file() {
+        let storage = shared_storage("blob-shared-bad");
+        let (mut s, _frames) = connected(&storage);
+        let file = shared_file(&storage, 1, "client.tmp-", b"the blob");
+        let names = [
+            (Value::from("../client.tmp-"), TRANSACTION_ERROR),
+            (Value::from("client"), TRANSACTION_ERROR),
+            (Value::from(7), "builtins.TypeError"),
+            (Value::Binary(vec![0xff]), "builtins.TypeError"),
+        ];
+        for (id, (name, class)) in (1..).zip(names) {
+            begin(&mut s, id, None);
+            store(&mut s, id, 1, 0, b"pickle");
+            done(store_blob_shared(&mut s, id, 1, name));
+            let fault = failed(call(&mut s, "vote", vec![Value::from(id)]));
+            assert_eq!(fault.class, class);
+            assert_eq!(std::fs::read(&file).unwrap(), b"the blob");
+        }
+        // A name in bytes is a name too.
+        begin(&mut s, 9, None);
+        store(&mut s, 9, 1, 0, b"pickle");
+        let name = Value::Binary(b"client.tmp-".to_vec());
+        done(store_blob_shared(&mut s, 9, 1, name));
+        assert!(!file.exists());
+        done(call(&mut s, "tpc_abort", vec![Value::from(9)]));
+        assert_eq!(blob_tree(&s.storage), Vec::<std::path::PathBuf>::new());
     }
 
     #[test]

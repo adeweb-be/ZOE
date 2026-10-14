@@ -177,6 +177,15 @@ mod tests {
     }
 
     #[test]
+    fn blob_dir_and_shared_blob_dir_are_keys_of_the_file() {
+        let config = parse_with("blob-dir = \"b\"\nshared-blob-dir = true\n", &[]).unwrap();
+        assert_eq!(args(&config), ["--blob-dir=b", "--shared-blob-dir=true"]);
+        let given = ["--blob-dir", "a", "--shared-blob-dir=false"];
+        let config = parse_with("blob-dir = \"b\"\nshared-blob-dir = true\n", &given).unwrap();
+        assert!(config.args.is_empty());
+    }
+
+    #[test]
     fn an_option_of_the_command_line_wins_over_its_key() {
         let config = parse_with(
             "listen = \"192.0.2.1:1\"\nlock-timeout = \"2m\"\n",
