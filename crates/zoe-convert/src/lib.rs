@@ -214,11 +214,11 @@ pub enum Error {
         last: Tid,
     },
 
-    /// The store was packed at or after the last tid of the dumps. The
-    /// pack changed history that the dumps hold, so the backup writes
+    /// The store was packed after the last tid of the dumps. The pack
+    /// changed history that the next dump must hold, so the backup writes
     /// nothing.
     #[error(
-        "{}: the store was packed at tid {:#018x}, at or after the last tid {:#018x} of the dumps; \
+        "{}: the store was packed at tid {:#018x}, after the last tid {:#018x} of the dumps; \
          write a new full dump into a new directory",
         path.display(),
         .watermark.0,
