@@ -9,6 +9,7 @@ network.
 import functools
 import http.server
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -20,9 +21,15 @@ ZEO_ADDRESS = ("127.0.0.1", 8100)
 
 
 def zoe_serve_processes():
-    """Return the pids of the `zoe serve` processes of this user."""
+    """Return the pids of the `zoe serve` processes on the store of the
+    scenario.
+
+    The pattern names the store, so the servers of other worktrees and of
+    other tests do not match.
+    """
+    pattern = f"zoe serve --path {re.escape(str(STORE))}( |$)"
     result = subprocess.run(
-        ["pgrep", "-u", str(os.getuid()), "-f", "zoe serve"],
+        ["pgrep", "-u", str(os.getuid()), "-f", pattern],
         capture_output=True,
         text=True,
         check=False,
@@ -43,14 +50,15 @@ def check(env=None):
 
 
 def test_a_busy_zeo_port_fails_the_check_and_leaves_no_server():
-    before = zoe_serve_processes()
     with socket.socket() as busy:
+        # A connection of an earlier check can leave the port in TIME_WAIT.
+        busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         busy.bind(ZEO_ADDRESS)
         busy.listen()
         result = check()
     assert result.returncode != 0, result.stdout[-5000:]
     assert "zoe serve does not listen" in result.stderr
-    assert zoe_serve_processes() <= before
+    assert not zoe_serve_processes()
 
 
 def test_a_failed_read_of_the_site_stops_the_server():
@@ -60,7 +68,6 @@ def test_a_failed_read_of_the_site_stops_the_server():
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler, directory=str(REPO / "plone" / "tests")
     )
-    before = zoe_serve_processes()
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as web:
         thread = threading.Thread(target=web.serve_forever, daemon=True)
         thread.start()
@@ -71,4 +78,4 @@ def test_a_failed_read_of_the_site_stops_the_server():
     assert result.returncode != 0, result.stdout[-5000:]
     assert "gives the status 404" in result.stderr
     assert (STORE / "zoe.redb").exists()
-    assert zoe_serve_processes() <= before
+    assert not zoe_serve_processes()
