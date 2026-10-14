@@ -5,7 +5,7 @@
 
 mod wire;
 
-use wire::{Server, ZOE, commit, fresh_dir, load, new_oids, open_store, record, s};
+use wire::{Server, commit, fresh_dir, load, new_oids, open_store, record, s};
 
 #[test]
 fn the_twin_wins_over_the_file() {
@@ -91,34 +91,4 @@ fn the_twin_and_the_key_of_read_only_make_every_store_read_only() {
         assert_eq!(fault.class, "ZODB.POSException.ReadOnlyError", "{args:?}");
         conn.register("1", true).unwrap();
     }
-}
-
-#[test]
-fn a_read_only_store_with_a_blob_directory_is_a_usage_error() {
-    let dir = fresh_dir("config-read-only-blob-dir");
-    let store = dir.join("store");
-    drop(open_store(&store));
-    let config = dir.join("zoe.toml");
-    let table = format!(
-        "[storages.a]\npath = \"{}\"\nblob-dir = \"{}\"\n",
-        s(&store),
-        s(&dir.join("blobs"))
-    );
-    for (text, flag) in [
-        (format!("{table}read-only = true\n"), None),
-        (table.clone(), Some("--read-only")),
-    ] {
-        std::fs::write(&config, text).unwrap();
-        let mut command = std::process::Command::new(ZOE);
-        command.args(["serve", "--config", s(&config), "--listen", "127.0.0.1:0"]);
-        command.args(flag).env_remove("ZOE_READ_ONLY");
-        let output = {
-            let _spawn = wire::spawn_lock();
-            command.output().unwrap()
-        };
-        assert_eq!(output.status.code(), Some(2), "{flag:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("takes no blob directory"), "{stderr}");
-    }
-    assert!(!dir.join("blobs").exists());
 }

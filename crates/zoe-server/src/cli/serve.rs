@@ -145,8 +145,8 @@ pub(super) struct ServeArgs {
 
     /// Serve every store for reads only. The server opens each store
     /// read-only: it changes no byte of the store, and holds its lock, so
-    /// no writer opens the store meanwhile. The store must exist and must
-    /// keep its blob files in blobs in the store directory. A client that
+    /// no writer opens the store meanwhile. The store must exist, and a
+    /// store with blobs must get its blob directory. A client that
     /// registers to write gets ReadOnlyError; a client with
     /// read_only_fallback then registers read-only. A transaction fails at
     /// its vote, and new_oids and pack fail, with ReadOnlyError. The key
@@ -284,8 +284,7 @@ fn usage_error(message: String) -> clap::Error {
 
 /// Return the stores to serve: the store of `--path` under the storage
 /// name 1, then the stores of `--storage`, then the stores of the file,
-/// `file`. Fail when there is no store, when a name comes twice, or when
-/// a read-only store has a blob directory.
+/// `file`. Fail when there is no store, or when a name comes twice.
 #[cfg(feature = "serve")]
 fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String> {
     let path = args.path.iter().map(|path| Storage {
@@ -307,9 +306,6 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
     for (n, storage) in storages.iter().enumerate() {
         if storages[..n].iter().any(|other| other.name == storage.name) {
             return Err(format!("the storage name {} comes twice", storage.name));
-        }
-        if (args.read_only || storage.read_only) && storage.blob_dir.is_some() {
-            return Err(crate::serve::read_only_blob_dir(&storage.name));
         }
     }
     Ok(storages)

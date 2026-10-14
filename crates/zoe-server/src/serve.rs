@@ -85,10 +85,9 @@ impl StorageOptions {
     }
 
     /// Serve the store for reads only, when `read_only` is true. The server
-    /// opens the existing store with `Store::open_read_only`: it changes no
-    /// byte of the store and holds its lock. A read-only store keeps its
-    /// blob files in `blobs` in the store directory, so it takes no blob
-    /// directory.
+    /// opens the existing store with `Store::open_read_only_with`: it
+    /// changes no byte of the store and holds its lock. A store with blobs
+    /// must get its blob directory, or the start fails.
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -225,8 +224,8 @@ impl ServeOptions {
         options
     }
 
-    /// Check that one storage at least is given, that no name comes twice,
-    /// and that no read-only storage has a blob directory.
+    /// Check that one storage at least is given, and that no name comes
+    /// twice.
     fn check_storages(&self) -> Result<(), Error> {
         if self.storages.is_empty() {
             return Err(Error::Storages("no storage to serve".to_owned()));
@@ -238,20 +237,9 @@ impl ServeOptions {
                     storage.name
                 )));
             }
-            if self.is_read_only(storage) && storage.blob_dir.is_some() {
-                return Err(Error::Storages(read_only_blob_dir(&storage.name)));
-            }
         }
         Ok(())
     }
-}
-
-/// The error of the read-only storage `name` that has a blob directory.
-pub(crate) fn read_only_blob_dir(name: &str) -> String {
-    format!(
-        "the storage {name} is read-only, and a read-only store keeps its blob files \
-         in blobs in the store directory: it takes no blob directory"
-    )
 }
 
 /// Why a server did not start.
@@ -332,9 +320,7 @@ impl Server {
         for storage in &options.storages {
             let read_only = options.is_read_only(storage);
             let store = if read_only {
-                Store::open_read_only(&storage.path)
-                    .map(Arc::new)
-                    .map_err(|error| Error::Store(storage.path.clone(), error))?
+                open_read_only(&storage.path, options.store_options(storage))?
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
@@ -449,6 +435,16 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Open the store in `path` read-only with `options`. A read-only open does
+/// not check the blob directory, so this call checks it, as `zoe verify`
+/// does: a store with blobs whose blob directory has no layout file fails,
+/// and the error names that directory.
+fn open_read_only(path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+    Store::open_read_only_with(path, options)
+        .and_then(|store| store.check_blob_dir().map(|()| Arc::new(store)))
+        .map_err(|error| Error::Store(path.to_path_buf(), error))
 }
 
 /// Listen on `addr`. The socket takes SO_REUSEADDR, so a restarted server
@@ -720,24 +716,18 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_store_must_exist_and_takes_no_blob_directory() {
+    fn a_read_only_store_must_exist_and_its_open_creates_nothing() {
         let dir = fresh_dir("read-only-start");
-        let missing = Server::start(ServeOptions::new(&dir).read_only(true)).err();
-        assert!(matches!(missing, Some(Error::Store(..))), "{missing:?}");
-        assert!(!dir.exists());
         for options in [
+            ServeOptions::new(&dir).read_only(true),
             ServeOptions::with_storages([StorageOptions::new("a", &dir)
                 .blob_dir(dir.join("blobs"))
                 .read_only(true)]),
-            ServeOptions::with_storages([
-                StorageOptions::new("a", &dir).blob_dir(dir.join("blobs"))
-            ])
-            .read_only(true),
         ] {
-            let error = Server::start(options).err();
-            assert!(matches!(error, Some(Error::Storages(_))), "{error:?}");
+            let missing = Server::start(options).err();
+            assert!(matches!(missing, Some(Error::Store(..))), "{missing:?}");
+            assert!(!dir.exists());
         }
-        assert!(!dir.exists());
     }
 
     #[test]
