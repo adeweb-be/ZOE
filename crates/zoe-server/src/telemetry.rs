@@ -4,9 +4,12 @@
 //! types. When `ZOE_OTLP_ENDPOINT` is set, `zoe serve` adds a layer that
 //! makes OpenTelemetry spans of the spans of the zoe crates, and a batch
 //! exporter that sends them over OTLP. The protocol comes from
-//! `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, or else from
 //! `OTEL_EXPORTER_OTLP_PROTOCOL`: `grpc`, `http/protobuf` (the default) or
-//! `http/json`. Without `ZOE_OTLP_ENDPOINT`, no exporter starts.
+//! `http/json`. The exporter sets the endpoint and the protocol itself, so
+//! the signal variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+//! `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`), which a host process or a CI can
+//! set for its own collector, change neither. Without `ZOE_OTLP_ENDPOINT`,
+//! no exporter starts.
 //!
 //! Each call of a session runs in a span `request`, which the traces name
 //! after the method of the call (`otel.name`). `request` puts the name of
@@ -55,16 +58,16 @@ pub(crate) struct Telemetry {
 }
 
 impl Telemetry {
-    /// Start the exporter that `ZOE_OTLP_ENDPOINT` and the protocol
-    /// variables configure. Return `None` without `ZOE_OTLP_ENDPOINT`.
+    /// Start the exporter that `ZOE_OTLP_ENDPOINT` and
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` configure. Return `None` without `ZOE_OTLP_ENDPOINT`.
     pub(crate) fn start() -> Result<Option<Self>, String> {
         let Some(endpoint) = std::env::var(ENDPOINT).ok().filter(|e| !e.is_empty()) else {
             return Ok(None);
         };
         // An empty variable counts as no variable.
-        let read = |name| std::env::var(name).ok().filter(|p: &String| !p.is_empty());
-        let name = read(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-            .or_else(|| read(opentelemetry_otlp::OTEL_EXPORTER_OTLP_PROTOCOL));
+        let name = std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_PROTOCOL)
+            .ok()
+            .filter(|p| !p.is_empty());
         let protocol = protocol(name.as_deref())?;
         let failed = |error: opentelemetry_otlp::ExporterBuildError| format!("{ENDPOINT}: {error}");
         let (exporter, runtime) = if protocol == Protocol::Grpc {
