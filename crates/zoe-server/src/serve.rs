@@ -15,7 +15,10 @@
 //! server received commits and gets its reply. A running pack stops between
 //! two of its batches. Then the open transaction of
 //! each connection aborts, and each connection sends the frames that wait
-//! and closes. Then the stores close.
+//! and shuts down its side. Each connection reads and drops the bytes that
+//! its client sends after the stop, so its close is not a reset. It closes
+//! when the client closes, or a short time after its last frame. Then the
+//! stores close.
 
 use std::fmt;
 use std::io;
@@ -526,7 +529,8 @@ impl Server {
         let timeout = self.shutdown_timeout.min(LONGEST_SHUTDOWN_TIMEOUT);
         let deadline = Instant::now() + timeout;
         // The accept loop drops the listener, and each connection reads no
-        // more calls. The sessions run the calls that wait, then end.
+        // more calls. The sessions run the calls that wait, then end. Each
+        // connection drops the bytes that arrive until it closes.
         self.stop_signal.send_replace(true);
         let forced = timeout - FORCED_CLOSE.min(timeout / 2);
         if self.tasks.wait(forced) > 0 {
