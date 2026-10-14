@@ -150,29 +150,66 @@ fuzz seconds="60" *targets="frame handshake":
             "$out/corpus/$target" "$fuzz/corpus/$target"
     done
 
-# Run the test suites of ZODB in-process against zoe.Storage, on every
-# interpreter. `just test` does not collect them. The ZEO suites against
-# zoe serve are not built yet.
+# Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
+# suites against zoe serve, on every interpreter. `just test` does not
+# collect them. The test forker of ZEO starts the `zoe` binary of the debug
+# build.
 conformance:
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
     done
 
+# Run the process kill loop against `zoe serve` for `runs` rounds, on
+# CPython 3.13. Each round kills the server with SIGKILL while several
+# writers commit objects and blobs, restarts it, stops it cleanly, runs
+# `zoe verify` and loads every acknowledged commit. `just test` does not
+# collect it. Without a seed, the recipe takes a random one. It prints the
+# seed. The traceback of a failure shows its local variables, so it gives
+# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
+# the order of the threads. The store and the blob caches go to TMPDIR:
+# 10,000 rounds need about 3 GB there.
+crash runs="200" seed="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{ seed }}"
+    if [ -z "$seed" ]; then
+        seed=$(( (RANDOM << 15) | RANDOM ))
+    fi
+    # The server is the `zoe` binary of this build.
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+    export ZOE_KILL_LOOP_RUNS="{{ runs }}" ZOE_KILL_LOOP_SEED="$seed"
+    echo "just crash: {{ runs }} rounds, seed $seed"
+    status=0
+    UV_PROJECT_ENVIRONMENT=.venv-3.13 uv run --locked --directory python --python 3.13 \
+        pytest -q --showlocals zoedb/tests/crash || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
+    fi
+    exit "$status"
+
 # Build the Plone instance of a scenario under plone/ with buildout, and run
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
-# site over HTTP. The other scenarios are filestorage, zeo and zeoclient; the
-# instances of zeo and zeoclient need their server. The build goes to
-# target/plone. ZOE_PLONE_ADMIN gives the admin user as user:password.
-# Without it, the recipe makes a random password once, in target/plone/admin.
-# The instance listens on 127.0.0.1, on the port ZOE_PLONE_PORT or 8080.
+# site over HTTP. The other scenarios are filestorage, zeo, zeoclient and
+# zeoclient-mount. The instances of zeo, zeoclient and zeoclient-mount need
+# their server. `just plone zeoclient check` builds the `zoe` binary,
+# starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
+# end. `just plone zeoclient-mount check` starts one `zoe serve` with the
+# two named storages main and content, and puts the site in the mount
+# point /content. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# admin user as user:password. Without it, the recipe makes a random
+# password once, in target/plone/admin. The instance listens on 127.0.0.1,
+# on the port ZOE_PLONE_PORT or 8080.
 plone scenario="zoe" command="start":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
-        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe or zeoclient." >&2
+        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient or zeoclient-mount." >&2
         exit 2
     fi
     target="{{ justfile_directory() }}/target/plone"
@@ -256,15 +293,81 @@ plone scenario="zoe" command="start":
             # A new mark in the title of the site tells that read_site.py
             # reads this instance, and not another process on the port.
             mark="mark-$RANDOM$RANDOM"
+            # At the exit, stop the instance, then the server, also when a
+            # step fails. SIGTERM makes zoe serve close its store cleanly.
+            pid=""
+            server=""
+            stop() {
+                if [ -n "$pid" ]; then
+                    kill "$pid" 2>/dev/null || true
+                    wait "$pid" || true
+                fi
+                if [ -n "$server" ]; then
+                    kill -TERM "$server" 2>/dev/null || true
+                    wait "$server" || true
+                fi
+            }
+            trap stop EXIT
+            # The instance gives the site from its root, or from the mount
+            # point /content of zeoclient-mount.
+            folder=""
+            case "{{ scenario }}" in
+                zeoclient)
+                    # zoe serve serves the store of the scenario under the
+                    # storage name 1, the default of ZEO.
+                    stores=(--path "$target/zeoclient/var/zoe")
+                    ;;
+                zeoclient-mount)
+                    # One zoe serve serves the two databases of the
+                    # instance: main at / and content at /content.
+                    stores=(--storage "main=$target/zeoclient-mount/var/main"
+                        --storage "content=$target/zeoclient-mount/var/content")
+                    folder=/content
+                    ;;
+                *)
+                    stores=()
+                    ;;
+            esac
+            if [ "${#stores[@]}" -gt 0 ]; then
+                # The instance is a ZEO client of zoe serve. The server is
+                # the `zoe` binary of this build. It listens on the
+                # zeo-address of zeoclient.cfg.
+                cargo build --locked -p zoe-server --bin zoe
+                zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+                log="$target/{{ scenario }}/var/log/zoe-serve.log"
+                # The server gets no ZOE_* variable of the caller, so only
+                # the options here apply. The admin password does not go
+                # to the server.
+                (
+                    for name in "${!ZOE_@}"; do
+                        unset "$name"
+                    done
+                    exec "$zoe" serve "${stores[@]}" --listen 127.0.0.1:8100
+                ) </dev/null >"$log" 2>&1 &
+                server=$!
+                # zoe serve writes `listening <address>` once it accepts
+                # connections. Stop when the server exits or does not
+                # listen, before a ZEO client waits for it.
+                tries=0
+                until grep -q '^listening ' "$log"; do
+                    tries=$((tries + 1))
+                    if ! kill -0 "$server" 2>/dev/null || [ "$tries" -gt 300 ]; then
+                        cat "$log" >&2
+                        echo "just plone: zoe serve does not listen, see $log" >&2
+                        exit 1
+                    fi
+                    sleep 0.1
+                done
+                echo "just plone: zoe serve listens on 127.0.0.1:8100, its log is $log"
+            fi
             "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py "$mark"
+            "$instance" run plone/create_site.py "$mark" ${folder:+"$folder"}
             "$instance" console &
             pid=$!
-            trap 'kill "$pid" 2>/dev/null || true; wait "$pid" || true' EXIT
             # Wait for the instance, then read the page of the site, which
             # holds the title with the mark. Only the admin user can read
             # the management page of the site.
-            site="http://127.0.0.1:$port/Plone"
+            site="http://127.0.0.1:$port$folder/Plone"
             python3.13 plone/read_site.py "$site" "Check site $mark"
             python3.13 plone/read_site.py "$site/manage_main" portal_catalog
             ;;
@@ -276,11 +379,51 @@ plone scenario="zoe" command="start":
 
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set and
-# `just bench test` runs the tests of the harness. zoe-bench and the
-# criterion benchmarks are not built yet.
+# `just bench test` runs the tests of the harness. `just bench load` and
+# `just bench saturate` build `zoe` and `zoe-bench` in release, start
+# `zoe serve` on a new store in target/bench/work/zoe-bench, run
+# `zoe-bench load` or `zoe-bench saturate` with its default settings and
+# the options that follow, and write the JSON result to stdout and to
+# target/bench/zoe-bench/<command>-<started>.json. The criterion
+# benchmarks are not built yet.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
+    set -- {{ args }}
+    if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
+        command="$1"
+        shift
+        cargo build --release --locked -p zoe-server --bin zoe -p zoe-bench --bin zoe-bench
+        bin="${CARGO_TARGET_DIR:-target}/release"
+        work="target/bench/work/zoe-bench"
+        out="target/bench/zoe-bench"
+        rm -rf "$work"
+        mkdir -p "$work" "$out"
+        # `zoe serve` writes `listening <address>` once it accepts
+        # connections. The port 0 takes a free port.
+        "$bin/zoe" serve --path "$work/store" --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.log" &
+        pid=$!
+        trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        for _ in $(seq 100); do
+            grep -q '^listening ' "$work/serve.out" && break
+            kill -0 "$pid" 2>/dev/null || { cat "$work/serve.log" >&2; exit 1; }
+            sleep 0.1
+        done
+        addr="$(sed -n 's/^listening //p' "$work/serve.out")"
+        [ -n "$addr" ] || { echo "just bench: zoe serve does not listen" >&2; exit 1; }
+        result="$out/$command-$(date -u +%Y%m%dT%H%M%SZ).json"
+        # Write to a temporary file, and move it on success only. So a
+        # failed run leaves no result.
+        partial="$(mktemp "$out/.$command.XXXXXX")"
+        trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
+            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
+        # mktemp creates the file with the mode 0600.
+        chmod 0644 "$partial"
+        mv "$partial" "$result"
+        cat "$result"
+        exit 0
+    fi
     export UV_PYTHON="${UV_PYTHON:-3.13}"
     export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
     # The RelStorage wheel links libstdc++, which the Nix interpreters do not

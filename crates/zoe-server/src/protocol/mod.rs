@@ -7,6 +7,8 @@
 //! calls that read on the read pool. No core call runs on a thread of the
 //! async runtime. A connection with no call that runs and no open
 //! transaction holds no thread.
+//! The connection reaches its tasks, its threads and the time through a
+//! `Runtime`, so the simulator runs the same code.
 //!
 //! Each call takes room for its reply in the session queue of its
 //! connection before it starts: at most `QUEUE` frames. The reader waits
@@ -23,6 +25,7 @@ pub(crate) mod frame;
 mod invalidation;
 mod iteration;
 mod message;
+pub(crate) mod metrics;
 mod outbox;
 mod pipeline;
 mod session;
@@ -38,11 +41,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
 
+use crate::runtime::{Runtime, Tokio};
+
 use invalidation::Invalidations;
+use metrics::{Exported, Metrics};
 use outbox::Outbox;
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
@@ -103,23 +110,56 @@ pub(crate) struct NamedStorage {
     /// The directory of the store.
     path: PathBuf,
     store: Arc<Store>,
-    stats: Stats,
+    stats: Arc<Stats>,
+    /// The metrics that the status of ZEO does not keep.
+    metrics: Arc<Metrics>,
     /// The publication of the commits to the connections.
-    invalidations: Invalidations,
+    invalidations: Arc<Invalidations>,
     queues: Queues,
+    /// True when the server opened the store for reads only.
+    read_only: bool,
 }
 
 impl NamedStorage {
     /// Serve `store`, in the directory `path`, under the name `name`, with
-    /// the bounds `queues`. The status starts now.
+    /// the bounds `queues`. The status starts now. The store reports its
+    /// sync batches and its lock waits to the metrics of the storage.
     pub(crate) fn new(name: &str, path: &Path, store: Arc<Store>, queues: Queues) -> Self {
+        let metrics = Arc::new(Metrics::default());
+        store.set_observer(metrics.clone());
         Self {
             name: name.to_owned(),
             path: path.to_path_buf(),
-            invalidations: Invalidations::new(store.last_transaction()),
+            invalidations: Arc::new(Invalidations::new(store.last_transaction())),
             store,
-            stats: Stats::new(SystemTime::now()),
+            stats: Arc::new(Stats::new(SystemTime::now())),
+            metrics,
             queues,
+            read_only: false,
+        }
+    }
+
+    /// Start the status at `start`, in place of the time of `new`.
+    #[cfg(feature = "sim")]
+    pub(crate) fn started_at(mut self, start: SystemTime) -> Self {
+        self.stats = Arc::new(Stats::new(start));
+        self
+    }
+
+    /// Mark the storage read-only when `read_only` is true. Its store must
+    /// then be open for reads only. A `register` that asks to write fails.
+    pub(crate) fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Return what the admin port reads for the metrics of the storage.
+    pub(crate) fn exported(&self) -> Exported {
+        Exported {
+            name: self.name.clone(),
+            stats: Arc::clone(&self.stats),
+            metrics: Arc::clone(&self.metrics),
+            hub: Arc::clone(&self.invalidations),
         }
     }
 
@@ -151,16 +191,26 @@ pub(crate) struct Storages {
     /// The most invalidations that wait for one client. A connection gets
     /// its queues before `register` selects its storage.
     client_queue: usize,
+    /// The read pool of all the connections.
+    pool: Pool,
 }
 
 impl Storages {
     /// Serve `storages`, whose names must differ. At most `client_queue`
-    /// invalidations wait for one client.
+    /// invalidations wait for one client. The read pool has as many
+    /// threads as the machine has cores.
     pub(crate) fn new(storages: Vec<Arc<NamedStorage>>, client_queue: usize) -> Self {
         Self {
             storages,
             client_queue,
+            pool: Pool::new(Pool::cores()),
         }
+    }
+
+    /// Run the calls that read on `pool`.
+    pub(crate) fn with_pool(mut self, pool: Pool) -> Self {
+        self.pool = pool;
+        self
     }
 
     /// Return the storage named `name`.
@@ -213,10 +263,10 @@ impl Stopping {
     }
 }
 
-/// Wait for `timeout`, or forever when it is `None`.
-async fn idle(timeout: Option<Duration>) {
+/// Wait for `timeout` on `runtime`, or forever when it is `None`.
+async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
     match timeout {
-        Some(timeout) => tokio::time::sleep(timeout).await,
+        Some(timeout) => runtime.sleep(timeout).await,
         None => std::future::pending().await,
     }
 }
@@ -225,7 +275,7 @@ async fn idle(timeout: Option<Duration>) {
 /// the connection, or until `stopping` tells that the server stops. The
 /// client selects one of `storages` with `register`. A frame longer than
 /// `max_frame_size` bytes closes the connection before the server reserves
-/// memory for it. The calls that read run on `pool`.
+/// memory for it. The calls that read run on the read pool of `storages`.
 ///
 /// The server closes the connection when the client sends no frame for
 /// `idle_timeout`: no protocol after the accept, or no frame after the last
@@ -244,24 +294,61 @@ async fn idle(timeout: Option<Duration>) {
 pub(crate) async fn serve_connection(
     stream: TcpStream,
     storages: Arc<Storages>,
-    pool: Pool,
     max_frame_size: u32,
     idle_timeout: Option<Duration>,
-    mut stopping: Stopping,
+    stopping: Stopping,
 ) {
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let connection = Connection {
+        peer,
+        runtime: Arc::new(Tokio),
+        max_frame_size,
+        idle_timeout,
+    };
+    serve_stream(reader, writer, connection, storages, stopping).await;
+}
+
+/// The settings of one connection.
+pub(crate) struct Connection {
+    /// The client, as the messages of the log name it.
+    pub(crate) peer: String,
+    /// The tasks, the threads of the calls and the timers of the
+    /// connection.
+    pub(crate) runtime: Arc<dyn Runtime>,
+    /// The longest frame that the connection takes.
+    pub(crate) max_frame_size: u32,
+    /// The longest time without a frame, or `None` for no limit.
+    pub(crate) idle_timeout: Option<Duration>,
+}
+
+/// Serve one client on the two halves of its stream, as
+/// `serve_connection` does, on the runtime of `connection`.
+pub(crate) async fn serve_stream(
+    mut reader: impl AsyncRead + Unpin + Send,
+    mut writer: impl AsyncWrite + Unpin + Send + 'static,
+    connection: Connection,
+    storages: Arc<Storages>,
+    mut stopping: Stopping,
+) {
+    let Connection {
+        peer,
+        runtime,
+        max_frame_size,
+        idle_timeout,
+    } = connection;
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
     }
     // A client that does not answer the protocol does not hold a stop.
     let protocol = tokio::select! {
-        protocol = frame::read(&mut reader, max_frame_size) => protocol,
+        biased;
         () = stopping.wait() => return,
-        () = idle(idle_timeout) => {
-            eprintln!("zoe serve: {peer}: no protocol within the idle timeout: closing the connection");
+        protocol = frame::read(&mut reader, max_frame_size) => protocol,
+        () = idle(&*runtime, idle_timeout) => {
+            tracing::info!(client = peer.as_str(), "no protocol within the idle timeout: closing the connection");
             return;
         }
     };
@@ -269,7 +356,8 @@ pub(crate) async fn serve_connection(
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
             // The status reads the stores, so it runs on the read pool.
-            let reply = pool.run(move || storages.ruok()).await;
+            let pool = storages.pool.clone();
+            let reply = pool.run(&*runtime, move || storages.ruok()).await;
             if let Some(reply) = reply {
                 let _ = frame::write(&mut writer, reply.as_bytes()).await;
             }
@@ -277,22 +365,34 @@ pub(crate) async fn serve_connection(
             return;
         }
         Ok(Some(_)) => {
-            eprintln!("zoe serve: {peer}: the client does not speak the protocol M5");
+            tracing::warn!(
+                client = peer.as_str(),
+                "the client does not speak the protocol M5"
+            );
             return;
         }
         Ok(None) => return,
         Err(error) => {
-            eprintln!("zoe serve: {peer}: {error}");
+            tracing::warn!(client = peer.as_str(), "{error}");
             return;
         }
     }
 
     let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storages.client_queue);
-    let mut calls = Calls::new(storages, outbox.clone(), pool);
+    let mut calls = Calls::new(
+        storages,
+        outbox.clone(),
+        Arc::clone(&runtime),
+        peer.clone(),
+    );
     let ended = calls.ended();
-    let writing = {
+    // The receiver gets an error when the task of the writer ends, also
+    // when the runtime drops it before it runs.
+    let (writer_alive, writer_ended) = oneshot::channel::<()>();
+    {
         let mut closing = closing.clone();
-        tokio::spawn(async move {
+        runtime.spawn(Box::pin(async move {
+            let _alive = writer_alive;
             // The writer stops at once when the server closes the
             // connection. Otherwise it sends every frame, until each call
             // ends.
@@ -317,8 +417,8 @@ pub(crate) async fn serve_connection(
             // A call that waits for room in the session queue stops.
             drop(inbox);
             let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-        })
-    };
+        }));
+    }
 
     loop {
         // An end of the connection or a stop wins over a frame that waits.
@@ -330,8 +430,8 @@ pub(crate) async fn serve_connection(
             () = closing.wait() => break,
             () = stopping.wait() => break,
             read = frame::read(&mut reader, max_frame_size) => read,
-            () = idle(idle_timeout) => {
-                eprintln!("zoe serve: {peer}: no frame within the idle timeout: closing the connection");
+            () = idle(&*runtime, idle_timeout) => {
+                tracing::info!(client = peer.as_str(), "no frame within the idle timeout: closing the connection");
                 // The writer stops at once. So a call that waits for room
                 // in the session queue stops too, and the transaction
                 // aborts, also when the client reads nothing.
@@ -343,7 +443,7 @@ pub(crate) async fn serve_connection(
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
             Err(error) => {
-                eprintln!("zoe serve: {peer}: {error}");
+                tracing::warn!(client = peer.as_str(), "{error}");
                 break;
             }
         };
@@ -354,7 +454,7 @@ pub(crate) async fn serve_connection(
         let call = match decoded {
             Ok(call) => call,
             Err(error) => {
-                eprintln!("zoe serve: {peer}: a frame is not a call: {error}");
+                tracing::warn!(client = peer.as_str(), "a frame is not a call: {error}");
                 break;
             }
         };
@@ -364,6 +464,7 @@ pub(crate) async fn serve_connection(
         // The reader waits while `QUEUE` calls run or wait, and while the
         // session queue is full.
         let ticket = tokio::select! {
+            biased;
             ticket = calls.ticket() => ticket,
             () = ended.wait() => break,
             () = closing.wait() => break,
@@ -377,7 +478,7 @@ pub(crate) async fn serve_connection(
     // of the calls and of the session.
     drop(outbox);
     calls.finish().await;
-    let _ = writing.await;
+    let _ = writer_ended.await;
 }
 
 #[cfg(test)]
@@ -410,11 +511,6 @@ mod tests {
         Stopping::new().1
     }
 
-    /// Return a read pool of 2 threads.
-    fn pool() -> Pool {
-        Pool::new(std::num::NonZeroUsize::new(2).unwrap())
-    }
-
     #[test]
     fn a_connection_that_the_hub_closes_ends_with_its_session() {
         let dir = std::env::temp_dir().join(format!("zoe-protocol-close-{}", std::process::id()));
@@ -437,7 +533,7 @@ mod tests {
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
-            serve_connection(stream, served, pool(), max, None, never_stops()).await;
+            serve_connection(stream, served, max, None, never_stops()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();
@@ -520,7 +616,6 @@ mod tests {
                 tokio::spawn(serve_connection(
                     stream,
                     Arc::clone(&served),
-                    pool(),
                     max,
                     None,
                     never_stops(),

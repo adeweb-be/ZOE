@@ -22,14 +22,13 @@
 //! The writer waits for that frame. A place that gets no frame holds no
 //! frame, and the writer skips it.
 
-use std::future::Future;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll, Wake, Waker};
 
 use tokio::sync::mpsc::{self, OwnedPermit, error::TrySendError};
 use tokio::sync::{Semaphore, oneshot, watch};
+
+use crate::runtime::block_on;
 
 /// The bytes of one message. All the connections that get the message
 /// share them.
@@ -169,6 +168,11 @@ impl Outbox {
         }
     }
 
+    /// Return the number of frames that wait in the hub queue.
+    pub(crate) fn hub_len(&self) -> usize {
+        self.hub.max_capacity() - self.hub.capacity()
+    }
+
     /// Close the connection. Its writer task sends no more frames, and its
     /// reader stops.
     pub(crate) fn close(&self) {
@@ -255,29 +259,6 @@ impl Place {
     }
 }
 
-/// Run `future` to its end on this thread. The thread must not be a thread
-/// of the async runtime.
-fn block_on<F: Future>(future: F) -> F::Output {
-    /// Wake the thread that waits.
-    struct Unpark(std::thread::Thread);
-
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-            return output;
-        }
-        std::thread::park();
-    }
-}
-
 /// The receiving side of the queues of a connection. The writer task takes
 /// the frames of both queues in the order of their places.
 pub(crate) struct Inbox {
@@ -326,6 +307,7 @@ impl Inbox {
                     }
                 }
                 Step::Read { session, hub } => tokio::select! {
+                    biased;
                     placed = self.session.recv(), if session => match placed {
                         Some(placed) => self.from_session = Some(placed),
                         None => self.session_open = false,

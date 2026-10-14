@@ -10,7 +10,8 @@
 //! can go out in another order than their calls.
 //!
 //! - `register` runs first, alone. The reader gives no other call before
-//!   it ends.
+//!   it ends. The same holds for `set_client_label`, so each call that
+//!   comes after it logs with the label.
 //! - The calls of the transaction run in order on one thread, from
 //!   `tpc_begin` to the end of the transaction (`Lane`). A vote that waits
 //!   for a lock stops only the calls of the transaction behind it.
@@ -21,23 +22,30 @@
 //!   calls of all the connections run at once.
 //!
 //! A connection with no call that runs and no open transaction holds no
-//! thread.
+//! thread. The calls reach their tasks and their threads through the
+//! `Runtime` of the connection, and a thread waits only through
+//! `runtime::block_on`, so the simulator runs the same code.
+//!
+//! Each call runs in a `connection` span of its own, with the client and
+//! the storage that the session has when the call starts. The thread of
+//! the transaction drops the transaction in such a span too.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinSet;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use super::message::Call;
 use super::outbox::{Outbox, Room};
 use super::session::{self, Reply, Session, Transaction};
 use super::{QUEUE, Storages};
+use crate::runtime::{Runtime, block_on};
 
 /// The read pool: the threads that run the calls that read. At most its
-/// number of threads run these calls at once, on threads of the blocking
-/// pool of tokio. All the connections share it.
+/// number of threads run these calls at once, on blocking threads of the
+/// runtime. All the connections share it.
 #[derive(Clone)]
 pub(crate) struct Pool(Arc<Semaphore>);
 
@@ -49,27 +57,35 @@ impl Pool {
         )))
     }
 
-    /// Run `work` on a thread of the pool, when one is free. Return `None`
-    /// when `work` panics.
+    /// The number of cores of the machine, or 1 when it is not known.
+    pub(crate) fn cores() -> NonZeroUsize {
+        std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Run `work` on a blocking thread of `runtime`, when a thread of the
+    /// pool is free. Return `None` when `work` panics, or when the runtime
+    /// drops it.
     pub(crate) async fn run<T: Send + 'static>(
         &self,
+        runtime: &dyn Runtime,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
         let permit = Arc::clone(&self.0).acquire_owned().await.ok()?;
+        let (sender, output) = oneshot::channel();
         // The thread keeps its permit until `work` ends, also when this
         // future drops.
-        tokio::task::spawn_blocking(move || {
+        runtime.spawn_blocking(Box::new(move || {
             let _permit = permit;
-            work()
-        })
-        .await
-        .ok()
+            let _ = sender.send(work());
+        }));
+        output.await.ok()
     }
 }
 
 /// The signal that a call ended the connection: the client is gone, a
-/// call closes the connection, or a call without a reply failed. Then the
-/// reader reads no more calls, and no call that waits starts.
+/// call closes the connection, a call without a reply failed, or a call
+/// panicked. Then the reader reads no more calls, and no call that waits
+/// starts.
 #[derive(Clone)]
 pub(crate) struct Ended(Arc<watch::Sender<bool>>);
 
@@ -96,6 +112,50 @@ impl Ended {
     }
 }
 
+/// End the connection when the thread panics.
+struct EndOnPanic<'a>(&'a Ended);
+
+impl Drop for EndOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.end();
+        }
+    }
+}
+
+/// The count of the tasks and the threads of the calls of a connection
+/// that did not end.
+#[derive(Clone)]
+struct Running(Arc<watch::Sender<usize>>);
+
+/// The mark of one task or thread that runs. Its drop counts its end, also
+/// when the runtime drops the task before it runs.
+struct Mark(Arc<watch::Sender<usize>>);
+
+impl Running {
+    fn new() -> Self {
+        Self(Arc::new(watch::channel(0).0))
+    }
+
+    /// Count a task or a thread that starts.
+    fn start(&self) -> Mark {
+        self.0.send_modify(|running| *running += 1);
+        Mark(Arc::clone(&self.0))
+    }
+
+    /// Wait until each task and thread ended.
+    async fn wait(&self) {
+        let mut running = self.0.subscribe();
+        let _ = running.wait_for(|running| *running == 0).await;
+    }
+}
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
+    }
+}
+
 /// What a call takes before it starts: a slot among the calls of its
 /// connection that run or wait, and room for its reply in the session
 /// queue. The call gives back its slot when it ends.
@@ -111,22 +171,12 @@ impl Ticket {
     }
 }
 
-/// End the connection when the thread panics.
-struct EndOnPanic<'a>(&'a Ended);
-
-impl Drop for EndOnPanic<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.end();
-        }
-    }
-}
-
 /// The calls of the transaction of a connection that wait for its thread.
 struct Lane {
     state: Mutex<LaneState>,
-    /// A call arrived, or the connection ends.
-    ready: Condvar,
+    /// A call arrived, or the connection ends. The thread of the lane is
+    /// the only one that waits for it.
+    ready: Notify,
 }
 
 struct LaneState {
@@ -147,7 +197,7 @@ impl Lane {
                 running: false,
                 ended: false,
             }),
-            ready: Condvar::new(),
+            ready: Notify::new(),
         }
     }
 
@@ -158,39 +208,43 @@ impl Lane {
     /// Add a call. Return true when no thread runs the calls: the caller
     /// starts one. After the end, drop the call.
     fn push(&self, call: Call, ticket: Ticket) -> bool {
-        let mut state = self.lock();
-        if state.ended {
-            return false;
-        }
-        state.calls.push_back((call, ticket));
+        let start = {
+            let mut state = self.lock();
+            if state.ended {
+                return false;
+            }
+            state.calls.push_back((call, ticket));
+            !std::mem::replace(&mut state.running, true)
+        };
         self.ready.notify_one();
-        !std::mem::replace(&mut state.running, true)
+        start
     }
 
     /// Return the next call. Wait for it while a transaction is open
     /// (`open`). Return `None` when no call waits and no transaction is
     /// open, or at the end: then the thread ends.
     fn next(&self, open: bool) -> Option<(Call, Ticket)> {
-        let mut state = self.lock();
         loop {
-            if let Some(next) = state.calls.pop_front() {
-                return Some(next);
+            {
+                let mut state = self.lock();
+                if let Some(next) = state.calls.pop_front() {
+                    return Some(next);
+                }
+                if !open || state.ended {
+                    state.running = false;
+                    return None;
+                }
             }
-            if !open || state.ended {
-                state.running = false;
-                return None;
-            }
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            // A notice that comes after the check and before the wait is
+            // kept, so the wait ends at once.
+            block_on(self.ready.notified());
         }
     }
 
     /// The reader gives no more calls.
     fn end(&self) {
         self.lock().ended = true;
-        self.ready.notify_all();
+        self.ready.notify_one();
     }
 
     /// Drop the calls that wait, and run no more calls.
@@ -207,8 +261,9 @@ impl Lane {
 
 /// Run the calls of the transaction of `session` that wait in `lane`, in
 /// order, until no transaction is open and no call waits. The drop of the
-/// state at the end aborts a transaction that is still open.
-fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended) {
+/// state at the end aborts a transaction that is still open, in the span
+/// of the connection, so its log lines name the client and the storage.
+fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
     /// The end of the thread on a panic: the connection ends.
     struct Guard<'a>(&'a Lane, &'a Ended);
 
@@ -228,6 +283,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended) {
             lane.stop();
             break;
         }
+        let _entered = session.span(peer).entered();
         let outcome = transaction.call(&call);
         if !Reply::new(room).send(&call, outcome, session.outbox()) {
             lane.stop();
@@ -235,16 +291,19 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended) {
             break;
         }
     }
+    let _entered = session.span(peer).entered();
+    drop(transaction);
 }
 
-/// Run a call that is not a call of the transaction, and put its reply.
-/// A panic ends the connection.
-fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended) {
+/// Run a call that is not a call of the transaction, in the span of the
+/// connection, and put its reply. A panic ends the connection.
+fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended, peer: &str) {
     let _guard = EndOnPanic(ended);
     let Ticket { slot: _slot, room } = ticket;
     if ended.is_set() {
         return;
     }
+    let _entered = session.span(peer).entered();
     let mut reply = Reply::new(room);
     let outcome = session.call(call, &mut reply);
     if !reply.send(call, outcome, session.outbox()) {
@@ -260,26 +319,38 @@ pub(crate) struct Calls {
     session: Option<Arc<Session>>,
     outbox: Outbox,
     pool: Pool,
+    /// The tasks and the threads of the calls.
+    runtime: Arc<dyn Runtime>,
+    /// The client, as the log lines name it until it gives a label.
+    peer: Arc<str>,
     lane: Arc<Lane>,
     /// The slots of the calls that run or wait.
     slots: Arc<Semaphore>,
-    /// The calls that run, and the thread of the transaction.
-    running: JoinSet<()>,
+    /// The tasks and the threads of the calls that did not end.
+    running: Running,
     ended: Ended,
 }
 
 impl Calls {
     /// The calls of a connection to one of `storages`, whose frames go to
-    /// `outbox`. The calls that read run on `pool`.
-    pub(crate) fn new(storages: Arc<Storages>, outbox: Outbox, pool: Pool) -> Self {
+    /// `outbox`. The calls run on `runtime`, and the calls that read on the
+    /// read pool of `storages`. `peer` names the client in the log lines.
+    pub(crate) fn new(
+        storages: Arc<Storages>,
+        outbox: Outbox,
+        runtime: Arc<dyn Runtime>,
+        peer: String,
+    ) -> Self {
         Self {
+            pool: storages.pool.clone(),
             storages: Some(storages),
             session: None,
             outbox,
-            pool,
+            runtime,
+            peer: peer.into(),
             lane: Arc::new(Lane::new()),
             slots: Arc::new(Semaphore::new(QUEUE)),
-            running: JoinSet::new(),
+            running: Running::new(),
             ended: Ended::new(),
         }
     }
@@ -306,32 +377,53 @@ impl Calls {
 
     /// Start `call`, which took `ticket`. Wait only for `register`.
     pub(crate) async fn start(&mut self, call: Call, ticket: Ticket) {
-        while self.running.try_join_next().is_some() {}
         let Some(session) = self.session.clone() else {
             self.register(call, ticket).await;
             return;
         };
         let ended = self.ended.clone();
+        let peer = Arc::clone(&self.peer);
+        if call.method == "set_client_label" {
+            // The calls that start after the label log with it, and so
+            // does the end of the transaction.
+            let ran = self
+                .pool
+                .run(&*self.runtime, move || {
+                    run_call(&session, &call, ticket, &ended, &peer);
+                })
+                .await;
+            if ran.is_none() {
+                self.ended.end();
+            }
+            return;
+        }
+        let mark = self.running.start();
         if session::in_transaction(&call.method) {
             if self.lane.push(call, ticket) {
                 let lane = Arc::clone(&self.lane);
-                self.running
-                    .spawn_blocking(move || run_lane(&session, &lane, &ended));
+                self.runtime.spawn_blocking(Box::new(move || {
+                    let _mark = mark;
+                    run_lane(&session, &lane, &ended, &peer);
+                }));
             }
         } else if session::runs_long(&call.method) {
-            self.running
-                .spawn_blocking(move || run_call(&session, &call, ticket, &ended));
+            self.runtime.spawn_blocking(Box::new(move || {
+                let _mark = mark;
+                run_call(&session, &call, ticket, &ended, &peer);
+            }));
         } else {
             let pool = self.pool.clone();
-            self.running.spawn(async move {
+            let runtime = Arc::clone(&self.runtime);
+            self.runtime.spawn(Box::pin(async move {
+                let _mark = mark;
                 let work = {
                     let ended = ended.clone();
-                    move || run_call(&session, &call, ticket, &ended)
+                    move || run_call(&session, &call, ticket, &ended, &peer)
                 };
-                if pool.run(work).await.is_none() {
+                if pool.run(&*runtime, work).await.is_none() {
                     ended.end();
                 }
-            });
+            }));
         }
     }
 
@@ -345,19 +437,22 @@ impl Calls {
         };
         let outbox = self.outbox.clone();
         let ended = self.ended.clone();
+        let peer = Arc::clone(&self.peer);
         let registered = self
             .pool
-            .run(move || {
+            .run(&*self.runtime, move || {
                 let Ticket { slot: _slot, room } = ticket;
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
                         let session = Session::new(storage, outbox.clone());
+                        let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
                     }
                     Err(outcome) => (outcome, None),
                 };
+                let _entered = tracing::info_span!("connection", client = &*peer).entered();
                 if !reply.send(&call, outcome, &outbox) {
                     ended.end();
                 }
@@ -381,7 +476,7 @@ impl Calls {
         self.lane.end();
         self.storages = None;
         self.session = None;
-        while self.running.join_next().await.is_some() {}
+        self.running.wait().await;
     }
 }
 
@@ -404,6 +499,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::session::p64;
+    use crate::runtime::Tokio;
     use crate::protocol::{NamedStorage, Queues};
 
     /// Return the storages of a new store for the test `name`.
@@ -412,7 +508,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Store::open(&dir).unwrap());
         let storage = NamedStorage::new("1", &dir, Arc::clone(&store), Queues::DEFAULT);
-        let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client);
+        let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client)
+            .with_pool(Pool::new(NonZeroUsize::MIN));
         (Arc::new(storages), store)
     }
 
@@ -465,11 +562,11 @@ mod tests {
         let running = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
         runtime().block_on(async {
-            let mut tasks = JoinSet::new();
+            let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..6 {
                 let (pool, running, most) = (pool.clone(), running.clone(), most.clone());
                 tasks.spawn(async move {
-                    pool.run(move || {
+                    pool.run(&Tokio, move || {
                         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(50));
@@ -488,9 +585,8 @@ mod tests {
     fn the_thread_of_a_transaction_ends_with_the_transaction() {
         let (storages, store) = storages("lane-ends");
         let (outbox, _inbox, _closing) = Outbox::new(100, 100);
-        let pool = Pool::new(NonZeroUsize::new(1).unwrap());
         runtime().block_on(async {
-            let mut connection = Calls::new(storages, outbox.clone(), pool);
+            let mut connection = Calls::new(storages, outbox.clone(), Arc::new(Tokio), "test".into());
             let register = vec![Value::from("1"), Value::Boolean(false)];
             start(&mut connection, vec![call(1, "register", register)]).await;
             for (txn, oid) in [(7, 1), (8, 2)] {
@@ -522,9 +618,8 @@ mod tests {
     fn a_failed_call_without_a_reply_stops_the_calls_behind_it() {
         let (storages, store) = storages("lane-stops");
         let (outbox, _inbox, _closing) = Outbox::new(100, 100);
-        let pool = Pool::new(NonZeroUsize::new(1).unwrap());
         runtime().block_on(async {
-            let mut connection = Calls::new(storages, outbox.clone(), pool);
+            let mut connection = Calls::new(storages, outbox.clone(), Arc::new(Tokio), "test".into());
             let ended = connection.ended();
             let register = vec![Value::from("1"), Value::Boolean(false)];
             // The store names another transaction, so it closes the

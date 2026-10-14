@@ -1,3 +1,4 @@
+import random
 import tomllib
 from typing import Annotated
 
@@ -149,7 +150,7 @@ class Ci:
 
     @function
     async def conformance(self, source: Source) -> str:
-        """Run the ZODB conformance suites in-process. The ZEO suites are not built."""
+        """Run the ZODB suites in-process and the ZEO suites against zoe serve."""
         return await self.recipe(source, "conformance").stdout()
 
     @function
@@ -193,19 +194,26 @@ class Ci:
             .directory("/results")
         )
 
-    @function
-    async def crash(self, source: Source) -> str:
-        """Run the crash-consistency harness. Not built yet."""
-        return (
-            await self.devenv(source)
-            .with_exec(
-                [
-                    "echo",
-                    "crash: runs the Vfs simulation, the kill loop and the power-loss emulation. Not built yet.",
-                ]
-            )
-            .stdout()
-        )
+    @function(cache="never")
+    async def crash(
+        self,
+        source: Source,
+        runs: Annotated[int, Doc("The rounds of the kill loop")] = 10_000,
+        seed: Annotated[
+            int | None, Doc("The seed of the kill loop. The default is a random seed")
+        ] = None,
+    ) -> str:
+        """Run the process kill loop against zoe serve, 10,000 rounds by default.
+
+        The output gives the seed. The traceback of a failure shows the
+        round. 10,000 rounds need about 3 GB in TMPDIR. The simulated kill
+        loop and the power-loss emulation are not built yet.
+        """
+        # The cache policy "never" makes each call run this body. A new seed
+        # for each call also gives a new exec, so the exec cache misses too.
+        if seed is None:
+            seed = random.randrange(1 << 30)
+        return await self.recipe(source, "crash", (str(runs), str(seed))).stdout()
 
     @function
     def zoe_binary(self, source: Source) -> dagger.File:

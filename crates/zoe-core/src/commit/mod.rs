@@ -39,6 +39,7 @@
 //! them, and logs itself when it ends, if it was slow.
 
 mod group;
+mod observer;
 mod staging;
 
 use std::borrow::Cow;
@@ -57,6 +58,7 @@ use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -565,10 +567,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        match store
+        // A store without an observer does not read the clock. The wait is
+        // measured on the monotonic time of the store clock, as the lock
+        // timeout is, so a simulator gives it on simulated time.
+        let started = store.observer().map(|_| store.clock.monotonic());
+        let acquired = store
             .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock)
-        {
+            .acquire(&requests, store.lock_timeout, &*store.clock);
+        if let (Some(observer), Some(started)) = (store.observer(), started) {
+            observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
+        }
+        match acquired {
             Ok(locks) => {
                 self.locks = Some(locks.keep());
                 Ok(())

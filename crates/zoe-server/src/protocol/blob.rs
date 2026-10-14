@@ -437,6 +437,18 @@ mod tests {
             Self::register(stream)
         }
 
+        /// Connect, do the handshake, then register read-only for the
+        /// storage `1`.
+        fn connect_read_only(addr: SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut client = Self { stream, next: 1 };
+            assert_eq!(client.read_frame(), b"M5");
+            client.write_frame(b"M5");
+            client.call("register", vec![Value::from("1"), Value::Boolean(true)]);
+            client
+        }
+
         /// Do the handshake on `stream`, then register for the storage `1`.
         fn register(stream: TcpStream) -> Self {
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -595,6 +607,48 @@ mod tests {
         assert_eq!(blob, "the bytes of the blob");
         assert!(blobs.is_dir());
         assert!(!path.join("blobs").exists());
+    }
+
+    #[test]
+    fn a_read_only_storage_serves_the_blobs_of_its_blob_directory() {
+        let dir = fresh_dir("read-only-blob-dir");
+        let (path, blobs) = (dir.join("store"), dir.join("blobs-elsewhere"));
+        let options = zoe_core::Options {
+            blob_dir: Some(blobs.clone()),
+            ..zoe_core::Options::default()
+        };
+        let data = b"the bytes of the blob";
+        let tid = commit_blob(&Store::open_with(&path, options).unwrap(), Oid(1), data);
+
+        // Without its blob directory, the store does not start. The error
+        // names the directory that has no layout file.
+        let wrong = StorageOptions::new("1", &path).read_only(true);
+        let error = Server::start(ServeOptions::with_storages([wrong]))
+            .err()
+            .expect("a wrong blob directory fails the start");
+        let named = path.join("blobs").display().to_string();
+        assert!(error.to_string().contains(&named), "{error}");
+
+        let storage = StorageOptions::new("1", &path)
+            .blob_dir(&blobs)
+            .read_only(true);
+        let server = Server::start(ServeOptions::with_storages([storage])).unwrap();
+        let mut client = Client::connect_read_only(server.addr());
+        let id = client.send("sendBlob", vec![p64(1), p64(tid.0)]);
+        let mut frames = Vec::new();
+        loop {
+            let frame = client.read_frame();
+            let (got, flags, method, args) = decode(&frame);
+            if method == ".reply" {
+                assert_eq!((got, flags, args), (id, Value::from(0), Value::Nil));
+                break;
+            }
+            frames.push(frame);
+        }
+        assert_eq!(check_download(&frames, Oid(1), tid, data), [data.len()]);
+        server.stop();
+        assert!(!path.join("blobs").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
