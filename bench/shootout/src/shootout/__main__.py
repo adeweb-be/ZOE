@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jsonschema
 
-from shootout import run
+from shootout import gate, run
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
@@ -56,10 +56,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     index_cmd.add_argument("root", type=Path)
 
+    gate_cmd = commands.add_parser(
+        "gate",
+        help="compare the last results of a storage and a baseline, cell by cell",
+    )
+    gate_cmd.add_argument(
+        "--storage",
+        default="zoe-server",
+        help="the storage under test (default: %(default)s)",
+    )
+    gate_cmd.add_argument(
+        "--baseline", default="zeo", help="the baseline (default: %(default)s)"
+    )
+    gate_cmd.add_argument(
+        "--ratio",
+        type=_ratio,
+        default=3.0,
+        help="the smallest ratio of ops/s in each cell (default: %(default)s)",
+    )
+    gate_cmd.add_argument("root", type=Path, help="the root of a results tree")
+
     args = parser.parse_args(argv)
     if args.command == "index":
         print(write_index(args.root))
         return 0
+    if args.command == "gate":
+        return gate.report(
+            args.root, args.storage, args.baseline, args.ratio, sys.stdout
+        )
 
     storages = args.storage or [
         s for s in STORAGES if args.dsn or not STORAGES[s].needs_dsn
@@ -87,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
         print(path, flush=True)
     write_index(args.output)
     return 0
+
+
+def _ratio(text: str) -> float:
+    value = float(text)
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"the ratio must be positive: {text}")
+    return value
 
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>10} {:>9} {:>9}"
