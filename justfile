@@ -150,10 +150,13 @@ fuzz seconds="60" *targets="frame handshake":
             "$out/corpus/$target" "$fuzz/corpus/$target"
     done
 
-# Run the test suites of ZODB in-process against zoe.Storage, on every
-# interpreter. `just test` does not collect them. The ZEO suites against
-# zoe serve are not built yet.
+# Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
+# suites against zoe serve, on every interpreter. `just test` does not
+# collect them. The test forker of ZEO starts the `zoe` binary of the debug
+# build.
 conformance:
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \

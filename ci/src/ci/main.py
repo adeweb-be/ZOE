@@ -149,7 +149,7 @@ class Ci:
 
     @function
     async def conformance(self, source: Source) -> str:
-        """Run the ZODB conformance suites in-process. The ZEO suites are not built."""
+        """Run the ZODB suites in-process and the ZEO suites against zoe serve."""
         return await self.recipe(source, "conformance").stdout()
 
     @function
