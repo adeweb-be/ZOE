@@ -257,6 +257,45 @@ pub(super) struct ServeArgs {
     )]
     shared_blob_dir: bool,
 
+    /// The certificate chain of the server, as PEM, leaf first. With
+    /// --tls-key, the ZEO port speaks TLS, so a ZEO client connects with
+    /// its ssl option. A client that does not speak TLS gets no reply. A
+    /// failed handshake closes only its connection. The admin port stays
+    /// plain HTTP. The server reads the files at its start only.
+    #[arg(long, env = "ZOE_TLS_CERT", value_name = "FILE", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// The private key of --tls-cert, as PEM.
+    #[arg(long, env = "ZOE_TLS_KEY", value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// The CA certificates of the clients, as PEM. The server then requires
+    /// a client certificate that chains to one of them, as the key
+    /// authenticate of the <ssl> section of ZEO does, and refuses the
+    /// handshake of another client. Needs --tls-cert.
+    #[arg(
+        long,
+        env = "ZOE_TLS_CLIENT_CA",
+        value_name = "FILE",
+        requires = "tls_cert"
+    )]
+    tls_client_ca: Option<PathBuf>,
+
+    /// The CA certificates of the read-only clients, as PEM. The server
+    /// also accepts a client certificate that chains to one of them, and
+    /// its holder registers read-only only: a register to write gets
+    /// ReadOnlyError, and a client with read_only_fallback then registers
+    /// read-only. A certificate that chains to --tls-client-ca registers
+    /// as the client asks. With this option, a client certificate is
+    /// necessary. Needs --tls-cert.
+    #[arg(
+        long,
+        env = "ZOE_TLS_READ_ONLY_CLIENT_CA",
+        value_name = "FILE",
+        requires = "tls_cert"
+    )]
+    tls_read_only_client_ca: Option<PathBuf>,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
@@ -427,7 +466,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
 
-    use crate::serve::{ServeOptions, Server, StorageOptions};
+    use crate::serve::{ServeOptions, Server, StorageOptions, TlsOptions};
 
     let storages = args.storages.iter().map(|storage| {
         let options =
@@ -463,6 +502,16 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     }
     if let Some(threads) = args.blocking_threads {
         options = options.blocking_threads(threads);
+    }
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        let mut tls = TlsOptions::new(cert, key);
+        if let Some(ca) = &args.tls_client_ca {
+            tls = tls.client_ca(ca);
+        }
+        if let Some(ca) = &args.tls_read_only_client_ca {
+            tls = tls.read_only_client_ca(ca);
+        }
+        options = options.tls(tls);
     }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
     if let Some(admin) = server.admin_addr() {
@@ -514,7 +563,7 @@ mod tests {
     fn serve(args: &[&str]) -> Result<ServeArgs, clap::Error> {
         let line = ["zoe", "serve", "--path", "store"].iter().chain(args);
         match Cli::try_parse_from(line)?.command {
-            Command::Serve(args) => Ok(args),
+            Command::Serve(args) => Ok(*args),
             other => panic!("not serve: {other:?}"),
         }
     }
@@ -604,6 +653,40 @@ mod tests {
         assert!(!serve(&["--shared-blob-dir=false"]).unwrap().shared_blob_dir);
         let error = serve(&["--shared-blob-dir=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn tls_needs_a_certificate_and_its_key() {
+        let args = serve(&[]).unwrap();
+        assert_eq!((args.tls_cert, args.tls_key), (None, None));
+        let args = serve(&[
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "k.pem",
+            "--tls-client-ca",
+            "rw.pem",
+            "--tls-read-only-client-ca",
+            "ro.pem",
+        ])
+        .unwrap();
+        assert_eq!(args.tls_cert, Some(PathBuf::from("c.pem")));
+        assert_eq!(args.tls_key, Some(PathBuf::from("k.pem")));
+        assert_eq!(args.tls_client_ca, Some(PathBuf::from("rw.pem")));
+        assert_eq!(args.tls_read_only_client_ca, Some(PathBuf::from("ro.pem")));
+        for line in [
+            &["--tls-cert", "c.pem"][..],
+            &["--tls-key", "k.pem"],
+            &["--tls-client-ca", "rw.pem"],
+            &["--tls-read-only-client-ca", "ro.pem"],
+        ] {
+            let error = serve(line).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{line:?}"
+            );
+        }
     }
 
     #[cfg(feature = "serve")]

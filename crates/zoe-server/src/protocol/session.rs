@@ -434,6 +434,9 @@ pub(crate) struct Session {
     /// The stop of the server. A pack stops between two batches when the
     /// server stops.
     stopping: Stopping,
+    /// True when the client may register read-only only, as the holder of
+    /// a certificate of the read-only client CA.
+    read_only_client: bool,
 }
 
 /// The open transaction of one connection. One thread holds it and runs
@@ -483,7 +486,14 @@ impl Session {
             iterators: Mutex::new(Iterators::default()),
             label: Mutex::new(None),
             stopping,
+            read_only_client: false,
         }
+    }
+
+    /// Let the client register read-only only, when `read_only` is true.
+    pub(crate) fn read_only_client(mut self, read_only: bool) -> Self {
+        self.read_only_client = read_only;
+        self
     }
 
     /// Return the label that the client gave, if any.
@@ -610,10 +620,11 @@ impl Session {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
         // A client that asks to write a read-only storage gets
-        // `ReadOnlyError`, as from ZEO. The connection stays open, so a
-        // client with `read_only_fallback` registers again read-only.
+        // `ReadOnlyError`, as from ZEO. So does a read-only client. The
+        // connection stays open, so a client with `read_only_fallback`
+        // registers again read-only.
         let read_only = truth(read_only);
-        if !read_only && self.storage.read_only {
+        if !read_only && (self.storage.read_only || self.read_only_client) {
             return Err(Fault::read_only());
         }
         // The client gets the invalidation of each commit after this tid.
@@ -1662,7 +1673,12 @@ mod tests {
 
         /// A connection whose pack stops when `stopping` tells it.
         fn stopping(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
-            let session = Arc::new(Session::new(storage, outbox, stopping));
+            Self::of(Session::new(storage, outbox, stopping))
+        }
+
+        /// The connection of `session`.
+        fn of(session: Session) -> Self {
+            let session = Arc::new(session);
             Self {
                 txn: Transaction::new(Arc::clone(&session)),
                 session,
@@ -4392,6 +4408,28 @@ mod tests {
         for (method, args) in [("new_oids", vec![]), ("pack", vec![Value::F64(1e9)])] {
             assert_eq!(failed(call(&mut s, method, args)), Fault::read_only());
         }
+    }
+
+    #[test]
+    fn a_read_only_client_registers_read_only_only_on_a_writable_storage() {
+        let storage = storage("register-read-only-client", Queues::DEFAULT);
+        let session = Session::new(Arc::clone(&storage), outbox(), never_stops());
+        let mut s = Client::of(session.read_only_client(true));
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(failed(call(&mut s, "register", write)), Fault::read_only());
+        // The connection stays open, and the client registers again.
+        let read = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut s, "register", read)), p64(0));
+        assert_eq!(failed(call(&mut s, "new_oids", vec![])), Fault::read_only());
+
+        // Another client of the same storage writes.
+        let mut writer = Client::new(storage, outbox());
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(done(call(&mut writer, "register", write)), p64(0));
+        assert!(matches!(
+            call(&mut writer, "new_oids", vec![]),
+            Outcome::Done(_)
+        ));
     }
 
     #[test]
