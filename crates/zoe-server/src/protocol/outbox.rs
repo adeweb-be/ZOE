@@ -135,6 +135,11 @@ impl Outbox {
         }
     }
 
+    /// Return the number of frames that wait in the hub queue.
+    pub(crate) fn hub_len(&self) -> usize {
+        self.hub.max_capacity() - self.hub.capacity()
+    }
+
     /// Close the connection. Its writer task sends no more frames, and its
     /// reader stops.
     pub(crate) fn close(&self) {

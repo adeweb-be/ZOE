@@ -66,7 +66,8 @@ pub(super) struct ServeArgs {
     /// The address of the admin port, as HOST:PORT: an HTTP port for the
     /// probes. GET /healthz gives 200 while every store is open. GET
     /// /readyz gives 200 when every store is open and ready, and 503
-    /// before and from a stop on. The port does not speak ZEO. A port of 0
+    /// before and from a stop on. GET /metrics gives the metrics in the
+    /// Prometheus text format. The port does not speak ZEO. A port of 0
     /// takes a free port. Without it, the server opens no admin port.
     #[arg(long, env = "ZOE_ADMIN_LISTEN", value_name = "HOST:PORT")]
     admin_listen: Option<SocketAddr>,
@@ -103,6 +104,41 @@ pub(super) struct ServeArgs {
         value_parser = whole_seconds
     )]
     lock_timeout: Option<Duration>,
+
+    /// Log each lock held longer than this, in whole seconds, such as 5,
+    /// 5s or 1m, when the lock is released: at the finish, the abort or the
+    /// end of the connection. The log line gives the oid, the client and
+    /// the storage. 0 or no value logs no lock.
+    #[arg(
+        long,
+        env = "ZOE_LOCK_WARN",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    lock_warn: Option<Duration>,
+
+    /// Log each transaction open longer than this, in whole seconds, such
+    /// as 30, 30s or 1m, when it ends. The log line gives the client and
+    /// the storage. 0 or no value logs no transaction.
+    #[arg(
+        long,
+        env = "ZOE_TRANSACTION_WARN",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    transaction_warn: Option<Duration>,
+
+    /// The format of the log lines on stderr: text, or json for one JSON
+    /// object on each line. Each log line of a connection gives its client
+    /// (the label of set_client_label, or the address) and its storage.
+    #[arg(
+        long,
+        env = "ZOE_LOG_FORMAT",
+        value_name = "FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
 
     /// The longest frame that a client can send, in bytes. A longer frame
     /// closes its connection before the server reserves memory for it. A
@@ -178,6 +214,15 @@ pub(super) struct ServeArgs {
     /// [`configure`] sets them.
     #[arg(skip)]
     storages: Vec<Storage>,
+}
+
+/// The format of the log lines of `zoe serve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum LogFormat {
+    /// One line of text for each event.
+    Text,
+    /// One JSON object on each line.
+    Json,
 }
 
 /// A store that the server serves under a storage name.
@@ -347,6 +392,13 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
+    if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
+        options = options.lock_warn(threshold);
+    }
+    if let Some(threshold) = args.transaction_warn.filter(|t| !t.is_zero()) {
+        options = options.transaction_warn(threshold);
+    }
+    init_logs(args.log_format);
     if let Some(addr) = args.admin_listen {
         options = options.admin_listen(addr);
     }
@@ -362,6 +414,26 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         out.flush()
     })?;
     Ok(())
+}
+
+/// Send the log lines of the process to stderr, in `format`, from the
+/// level INFO on. A JSON line holds the fields of the event and of its
+/// spans. A process that has a subscriber already keeps it.
+#[cfg(feature = "serve")]
+fn init_logs(format: LogFormat) {
+    use tracing::Level;
+
+    let builder = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(Level::INFO);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .try_init(),
+    };
 }
 
 /// Fail: this build has no server.
@@ -423,6 +495,27 @@ mod tests {
         assert_eq!(args.idle_timeout, Duration::ZERO);
         let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_logs_are_text_by_default_and_the_warnings_are_off() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.log_format, LogFormat::Text);
+        assert_eq!((args.lock_warn, args.transaction_warn), (None, None));
+        let args = serve(&[
+            "--log-format",
+            "json",
+            "--lock-warn",
+            "5",
+            "--transaction-warn",
+            "1m",
+        ])
+        .unwrap();
+        assert_eq!(args.log_format, LogFormat::Json);
+        assert_eq!(args.lock_warn, Some(Duration::from_secs(5)));
+        assert_eq!(args.transaction_warn, Some(Duration::from_secs(60)));
+        let error = serve(&["--log-format", "xml"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]
