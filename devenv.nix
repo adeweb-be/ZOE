@@ -29,6 +29,11 @@ let
     };
     cargoHash = "sha256-MThAcU+U8PyBGauh3dy7ZRvRX9INmOEeghIlQEGLAPs=";
   };
+
+  # The C compiler of the musl target. The C code of zstd-sys and blake3
+  # compiles against the musl headers, not against the glibc headers of
+  # the shell.
+  musl-cc = pkgs.pkgsCross.musl64.stdenv.cc;
 in
 {
   languages.rust = {
@@ -37,6 +42,8 @@ in
     version = "1.99.0";
     # `just tsan` rebuilds the standard library from rust-src.
     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-src" ];
+    # `just release binary` builds the static `zoe` binary for musl.
+    targets = [ "x86_64-unknown-linux-musl" ];
   };
 
   packages = [
@@ -64,6 +71,11 @@ in
     # uv uses the interpreters above and never downloads one.
     UV_PYTHON_DOWNLOADS = "never";
     UV_PYTHON_PREFERENCE = "only-system";
+
+    # The static `zoe` binary: cc compiles its C code and links it with
+    # the musl toolchain.
+    CC_x86_64_unknown_linux_musl = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
   };
 
   # Loupe, the Tauri app, and its end-to-end tests. Enter the profile with

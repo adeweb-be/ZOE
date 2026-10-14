@@ -1,13 +1,14 @@
 //! The transaction coordinator: the two-phase commit state machine.
 //!
-//! `store` stages records and makes nothing visible.
-//! `check_current_serial` adds an oid to the read-current set. `vote` takes
-//! the per-OID locks in ascending oid order over the write and read-current
-//! sets together, then detects conflicts before any disk write. `finish`
-//! allocates the tid and writes the records, the transaction row and the
-//! meta update in one backend write transaction, durable before it returns.
-//! `finish` and `abort` release the locks. Dropping a transaction aborts
-//! it.
+//! `store` stages records and makes nothing visible. `delete` stages a
+//! deletion, a record with an empty pickle, with the serial check of
+//! `store`. `check_current_serial` adds an oid to the read-current set.
+//! `vote` takes the per-OID locks in ascending oid order over the write
+//! and read-current sets together, then detects conflicts before any disk
+//! write. `finish` allocates the tid and writes the records, the
+//! transaction row and the meta update in one backend write transaction,
+//! durable before it returns. `finish` and `abort` release the locks.
+//! Dropping a transaction aborts it.
 //!
 //! `vote_resolving` lets the caller resolve conflicts with the locks held.
 //! It returns the stale written oids with their committed records, and
@@ -16,9 +17,9 @@
 //! again with the locks that the first vote took.
 //!
 //! The thread that begins a transaction drives it: `store`, the blob
-//! stores, `restore`, the blob restores, `check_current_serial`, `vote` and
-//! `vote_resolving` from another thread fail with `WrongThread`. `finish`
-//! and `abort` work from any thread.
+//! stores, `delete`, `restore`, the blob restores, `check_current_serial`,
+//! `vote` and `vote_resolving` from another thread fail with
+//! `WrongThread`. `finish` and `abort` work from any thread.
 //!
 //! `store_blob` stages a record with a synced blob file. `store_blob_at`
 //! takes the blob file by its path in the blob temporary directory, by
@@ -38,6 +39,7 @@
 //! them, and logs itself when it ends, if it was slow.
 
 mod group;
+mod observer;
 mod staging;
 
 use std::borrow::Cow;
@@ -45,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::thread::{self, ThreadId};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
@@ -56,6 +58,7 @@ use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -223,6 +226,31 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(())
     }
 
+    /// Stage a deletion of `oid`: a record with an empty pickle. `serial`
+    /// is the serial that the client read. This is `deleteObject` of ZODB.
+    ///
+    /// The vote checks `serial` as it does for `store`: a stale serial
+    /// fails the vote with `Conflict`. `vote_resolving` never resolves a
+    /// deletion. A restore transaction takes `delete` too, with the same
+    /// check.
+    ///
+    /// The deletion replaces a pickle that the transaction staged for
+    /// `oid`, and drops the staged blob of `oid`: a deleted object has no
+    /// blob. After a vote, `delete` fails with `Protocol`.
+    pub fn delete(&mut self, oid: Oid, serial: Tid) -> Result<()> {
+        self.check_thread()?;
+        if self.locked() {
+            return Err(ZoeError::Protocol("delete after vote"));
+        }
+        check_oid(oid)?;
+        let stored_bytes = self.check_size(oid, &[])?;
+        let area = &self.store.backend.staging;
+        self.staged.put(area, oid, serial, &[], false)?;
+        self.stored_bytes = stored_bytes;
+        self.blobs.remove(&oid);
+        Ok(())
+    }
+
     /// Check that `store` or `store_blob` can stage `data` for `oid`. A
     /// refused call changes nothing.
     fn check_store(&self, oid: Oid, data: &[u8]) -> Result<()> {
@@ -285,6 +313,23 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// with `Io`.
     pub fn staged(&self, oid: Oid) -> Result<Option<(Tid, Cow<'_, [u8]>)>> {
         self.staged.get(oid)
+    }
+
+    /// Return the class of the pickle that the transaction staged for
+    /// `oid`, as `module.name`. `zoe_pickle` reads it from the class
+    /// pickle and never unpickles. This is the `class_name` of a ZODB
+    /// `ConflictError`.
+    ///
+    /// Return `None` when the transaction did not stage `oid` or staged a
+    /// deletion, when the class pickle does not decode or names no class,
+    /// and when a spilled pickle does not read.
+    pub fn staged_class_name(&self, oid: Oid) -> Option<String> {
+        let (_, pickle) = self.staged(oid).ok()??;
+        if pickle.is_empty() {
+            return None;
+        }
+        let (module, name) = zoe_pickle::decode_class_name(&pickle).ok()??;
+        Some(format!("{module}.{name}"))
     }
 
     /// Return the bytes of the staged pickles that the transaction keeps in
@@ -522,10 +567,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        match store
+        // A store without an observer does not read the clock.
+        let started = store.observer().map(|_| Instant::now());
+        let acquired = store
             .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock)
-        {
+            .acquire(&requests, store.lock_timeout, &*store.clock);
+        if let (Some(observer), Some(started)) = (store.observer(), started) {
+            observer.locks_acquired(started.elapsed());
+        }
+        match acquired {
             Ok(locks) => {
                 self.locks = Some(locks.keep());
                 Ok(())
@@ -605,10 +655,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     continue;
                 }
                 match record {
+                    // A deletion has an empty pickle and is never
+                    // resolved.
                     Some(record)
                         if resolve
                             && !staged.restored
                             && staged.serial != Tid::ZERO
+                            && staged.pickle_len() != 0
                             && !record.data.is_empty() =>
                     {
                         conflicts.push((oid, record));
@@ -2013,5 +2066,154 @@ mod tests {
         txn.store(Oid(2), Tid::ZERO, b"g").unwrap();
         txn.abort();
         assert!(!spills(&vfs));
+    }
+
+    /// A pickle of a `persistent.mapping.PersistentMapping` record, as ZODB
+    /// writes it: the class pickle, then the state pickle.
+    const MAPPING: &[u8] = b"\x80\x03X\x12\x00\x00\x00persistent.mappingq\x00\
+        X\x11\x00\x00\x00PersistentMappingq\x01\x86q\x02N\x86q\x03.\x80\x03}q\x00.";
+
+    #[test]
+    fn delete_writes_a_deletion_with_the_serial_check_of_store() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (kept, gone) = (Oid(1), Oid(2));
+        let first = commit_all(&store, &[(kept, Tid::ZERO, b"k"), (gone, Tid::ZERO, b"g")]);
+
+        // A stale serial fails the vote with the serials of a conflict.
+        let mut stale = store.tpc_begin(b"", b"", b"").unwrap();
+        stale.delete(gone, Tid::ZERO).unwrap();
+        assert!(matches!(stale.vote(), Err(ZoeError::Conflict { oid }) if oid == gone));
+        assert_eq!(stale.conflict_serials(), Some((first, Tid::ZERO)));
+        assert!(store.lock_table_is_empty());
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.delete(gone, first).unwrap();
+        assert_eq!(
+            txn.staged(gone).unwrap(),
+            Some((first, Cow::Borrowed(&b""[..])))
+        );
+        txn.vote().unwrap();
+        let deleted = txn.finish().unwrap();
+
+        // The deletion is a record with an empty payload after `first`.
+        assert!(matches!(store.load(gone), Err(ZoeError::NotFound { .. })));
+        let record = store.backend.load_before(gone, Tid::MAX).unwrap().unwrap();
+        assert_eq!((record.tid, record.prev), (deleted, first));
+        assert!(record.data.is_empty());
+        let before = store.load_before(gone, deleted).unwrap().unwrap();
+        assert_eq!((before.data, before.serial), (b"g".to_vec(), first));
+        let sizes: Vec<_> = store
+            .history(gone, 10)
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.tid, entry.size))
+            .collect();
+        assert_eq!(sizes, vec![(deleted, 0), (first, 1)]);
+        let current = store.record_iternext(None).unwrap().unwrap();
+        assert_eq!((current.oid, current.next), (kept, None));
+        assert_eq!(store.load(kept).unwrap(), (b"k".to_vec(), first));
+
+        // A store after the deletion reads the serial of the deletion.
+        let again = commit(&store, gone, deleted, b"h");
+        assert_eq!(store.load(gone).unwrap(), (b"h".to_vec(), again));
+    }
+
+    #[test]
+    fn delete_in_a_restore_transaction_checks_the_serial() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let first = commit(&store, Oid(1), Tid::ZERO, b"a");
+        let mut stale = store
+            .tpc_begin_restore(Tid(first.0 + 1), b"", b"", b"")
+            .unwrap();
+        stale.delete(Oid(1), Tid::ZERO).unwrap();
+        assert!(matches!(stale.vote(), Err(ZoeError::Conflict { .. })));
+        drop(stale);
+
+        let tid = Tid(first.0 + 2);
+        let mut txn = store.tpc_begin_restore(tid, b"", b"", b"").unwrap();
+        txn.delete(Oid(1), first).unwrap();
+        txn.vote().unwrap();
+        assert_eq!(txn.finish().unwrap(), tid);
+        assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
+    }
+
+    #[test]
+    fn a_deletion_replaces_a_staged_pickle_and_drops_its_blob() {
+        let store = open_with(Options {
+            max_transaction_size: Some(4),
+            ..Options::default()
+        });
+        let first = commit(&store, Oid(1), Tid::ZERO, b"a");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let mut file = store.new_blob_file().unwrap();
+        file.write_all(b"blob").unwrap();
+        txn.store_blob(Oid(1), first, b"abcd", file).unwrap();
+        txn.delete(Oid(1), first).unwrap();
+        // The deleted pickle no longer counts toward the transaction size.
+        txn.store(Oid(2), Tid::ZERO, b"efgh").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        assert!(matches!(store.load(Oid(1)), Err(ZoeError::NotFound { .. })));
+        assert!(store.open_blob(Oid(1), tid).is_err());
+        assert_eq!(store.load(Oid(2)).unwrap(), (b"efgh".to_vec(), tid));
+    }
+
+    #[test]
+    fn a_deletion_is_never_resolved() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let first = commit(&store, Oid(1), Tid::ZERO, b"a");
+        let second = commit(&store, Oid(1), first, b"b");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.delete(Oid(1), first).unwrap();
+        let error = txn.vote_resolving();
+        assert!(
+            matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })),
+            "{error:?}"
+        );
+        assert_eq!(txn.conflict_serials(), Some((second, first)));
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn delete_is_refused_out_of_order_from_another_thread_and_on_the_reserved_oid() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let first = commit(&store, Oid(1), Tid::ZERO, b"a");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let reserved = txn.delete(Oid(u64::MAX), Tid::ZERO);
+        assert!(
+            matches!(reserved, Err(ZoeError::Protocol(_))),
+            "{reserved:?}"
+        );
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let refused = txn.delete(Oid(1), first);
+                assert!(matches!(refused, Err(ZoeError::WrongThread)), "{refused:?}");
+            });
+        });
+        // The refused calls staged nothing.
+        assert_eq!(txn.staged(Oid(1)).unwrap(), None);
+        txn.store(Oid(2), Tid::ZERO, b"b").unwrap();
+        txn.vote().unwrap();
+        let after = txn.delete(Oid(1), first);
+        assert!(matches!(after, Err(ZoeError::Protocol(_))), "{after:?}");
+        txn.finish().unwrap();
+        assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), first));
+    }
+
+    #[test]
+    fn staged_class_name_reads_the_class_pickle() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, MAPPING).unwrap();
+        txn.store(Oid(2), Tid::ZERO, b"not a pickle").unwrap();
+        txn.delete(Oid(3), Tid::ZERO).unwrap();
+        assert_eq!(
+            txn.staged_class_name(Oid(1)).as_deref(),
+            Some("persistent.mapping.PersistentMapping")
+        );
+        for oid in [Oid(2), Oid(3), Oid(4)] {
+            assert_eq!(txn.staged_class_name(oid), None, "{oid:?}");
+        }
     }
 }
