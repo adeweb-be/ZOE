@@ -7,7 +7,7 @@
 #
 # Options: --type (default c6id.4xlarge), --hours (the hours of the
 # estimate, default 1), --commit (default HEAD, which must be on GitHub),
-# --main-rev (default origin/main), --out (default
+# --main-rev (default: the commit of main that the branch merged last), --out (default
 # bench/poc/ZOE-150/results/aws), --ssh-cidr (the only source of SSH;
 # default: the public address of this machine, /32).
 #
@@ -26,7 +26,7 @@ type=c6id.4xlarge
 hours=1
 dry=0
 commit=""
-main_rev=origin/main
+main_rev=""
 out="$repo_root/bench/poc/ZOE-150/results/aws"
 cidr=""
 while [ $# -gt 0 ]; do
@@ -78,8 +78,8 @@ echo "estimate: $spot_price USD/h x $hours h = $estimate USD (spot), plus the ro
 [ "$dry" = 1 ] && exit 0
 
 commit=$(git -C "$repo_root" rev-parse "${commit:-HEAD}")
-main_rev=$(git -C "$repo_root" rev-parse "$main_rev")
 git -C "$repo_root" fetch -q origin
+main_rev=$(git -C "$repo_root" rev-parse "${main_rev:-$(git -C "$repo_root" merge-base "$commit" origin/main)}")
 git -C "$repo_root" branch -r --contains "$commit" | grep -q . \
   || { echo "commit $commit is not on GitHub: push it first" >&2; exit 1; }
 
