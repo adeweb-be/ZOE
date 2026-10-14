@@ -20,6 +20,10 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 - The repository holds only the synthetic conflict sample, never a real log.
 - The schedule of a client depends only on `--seed`, the index of the client and the settings, never on the time. A retry runs the same transaction again and takes nothing from the generator.
 - A vote that fails with a conflict counts as a conflict, and the next attempt of the transaction counts as a retry. Each retry counts. A transaction ends committed or read-only; after `MAX_ATTEMPTS` attempts the run fails instead of a hang.
-- `saturate` measures the read path: its `--write-ratio` is 0 by default. `load` writes in 10 % of its transactions by default. A unit test in `src/main.rs` checks both defaults.
+- `saturate` measures the read path: its `--write-ratio` is 0 by default. `load` writes in 10 % of its transactions by default. A unit test in `src/main.rs` checks the defaults.
+- The default `--zipf` is 0.8. `--zipf 1.0` is the hot-spot case: the hottest object is in almost every transaction, and contention is high.
+- Each step of `saturate` runs for `--warmup-seconds` (0.2 by default) that do not count, then for `--step-seconds` (1.0 by default). `--transactions` limits the transactions of a client in a step after the warm-up. The schedule repeats with the seed; the number of transactions of a timed step depends on the time.
+- The default `--p99-ceiling` of `saturate` equals the number of N3 (0.3 ms). A run on the small default store is not an N3 verdict: N3 is a cache miss on a 10 GB store.
+- `machine.name` is a slug of `ZOE_BENCH_MACHINE`, or a slug of the CPU model.
 - The lock wait is the time of the vote, because the server takes the locks of the oids at the vote.
 - zoe-bench uses `zoe-client` and does not change its API. tokio is allowed in this crate.

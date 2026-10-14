@@ -11,7 +11,8 @@ use serde::Serialize;
 /// it, without the disk: the disk of the store is on the server side.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Machine {
-    /// A stable name: `ZOE_BENCH_MACHINE`, or else a slug of the CPU model.
+    /// A stable name: a slug of `ZOE_BENCH_MACHINE`, or else a slug of the
+    /// CPU model.
     pub name: String,
     /// The CPU model.
     pub cpu: String,
@@ -36,8 +37,8 @@ impl Machine {
             .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
         let name = std::env::var("ZOE_BENCH_MACHINE")
             .ok()
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| slug(&cpu));
+            .filter(|name| !name.trim().is_empty())
+            .map_or_else(|| slug(&cpu), |name| slug(&name));
         Machine {
             name,
             logical_cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
@@ -189,8 +190,12 @@ mod tests {
     #[test]
     fn the_description_names_no_host_user_or_path() {
         let machine = serde_json::to_string(&Machine::describe()).unwrap();
-        for name in ["HOSTNAME", "USER", "HOME", "PWD"] {
-            if let Ok(value) = std::env::var(name)
+        // The shell does not export HOSTNAME. The kernel gives the host
+        // name. Skip it when the file does not read.
+        let host = read("/proc/sys/kernel/hostname");
+        let names = ["USER", "HOME", "PWD"].map(|name| (name, std::env::var(name).ok()));
+        for (name, value) in names.into_iter().chain([("the host name", host)]) {
+            if let Some(value) = value
                 && value.len() > 2
             {
                 assert!(!machine.contains(&value), "the description names {name}");

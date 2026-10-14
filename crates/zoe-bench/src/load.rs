@@ -11,7 +11,8 @@
 //! transaction again: a retry. Each retry counts.
 //!
 //! `saturate` runs the same workload with 1, 2, 4 and more clients, until
-//! the p99 of `loadBefore` passes a ceiling.
+//! the p99 of `loadBefore` passes a ceiling. Each step first runs for a
+//! warm-up time that does not count, then for a set time.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,8 +67,6 @@ pub struct Workload {
     pub pipeline: usize,
     /// The number of objects that the run creates first.
     pub objects: usize,
-    /// The number of transactions of each client.
-    pub transactions: usize,
     /// The number of objects that each transaction reads.
     pub txn_size: usize,
     /// The probability that a transaction writes back its objects.
@@ -92,6 +91,8 @@ impl Workload {
 pub struct LoadSettings {
     /// The number of clients, each with its own connection.
     pub clients: usize,
+    /// The number of transactions of each client.
+    pub transactions: usize,
     /// The workload of each client.
     #[serde(flatten)]
     pub workload: Workload,
@@ -104,6 +105,14 @@ pub struct SaturateSettings {
     pub max_clients: usize,
     /// The ceiling of the p99 of `loadBefore`, in seconds.
     pub p99_ceiling_seconds: f64,
+    /// The time at the start of each step that does not count, in seconds.
+    pub warmup_seconds: f64,
+    /// The time of each step after the warm-up, in seconds.
+    pub step_seconds: f64,
+    /// The most transactions of each client in a step after the warm-up,
+    /// or `None` for no limit. A step ends at the end of its time or at
+    /// this limit, the first of the two.
+    pub transactions: Option<usize>,
     /// The workload of each client.
     #[serde(flatten)]
     pub workload: Workload,
@@ -210,7 +219,8 @@ pub async fn load(
 ) -> Result<Report<LoadSettings, Measure>, Error> {
     let run = Run::now();
     let oids = setup(addr, &settings.workload).await?;
-    let measure = measure(addr, &settings.workload, &oids, settings.clients).await?;
+    let plan = Plan::Count(settings.transactions);
+    let measure = measure(addr, &settings.workload, &oids, settings.clients, plan).await?;
     Ok(Report::new("load", run, settings, measure))
 }
 
@@ -226,9 +236,15 @@ pub async fn saturate(
         loads_per_second_under_ceiling: None,
         clients_under_ceiling: None,
     };
+    let plan = Plan::Timed {
+        warmup: Duration::from_secs_f64(settings.warmup_seconds),
+        duration: Duration::from_secs_f64(settings.step_seconds),
+        cap: settings.transactions,
+    };
     for clients in steps(settings.max_clients) {
-        let measure = measure(addr, &settings.workload, &oids, clients).await?;
-        let under = measure.load_p99_seconds <= settings.p99_ceiling_seconds;
+        let measure = measure(addr, &settings.workload, &oids, clients, plan).await?;
+        // A step without a load has no p99, so it is not under the ceiling.
+        let under = measure.loads > 0 && measure.load_p99_seconds <= settings.p99_ceiling_seconds;
         if under {
             saturation.loads_per_second_under_ceiling = Some(measure.loads_per_second);
             saturation.clients_under_ceiling = Some(clients);
@@ -269,12 +285,41 @@ async fn setup(addr: SocketAddr, workload: &Workload) -> Result<Vec<Oid>, Error>
     Ok(oids)
 }
 
+/// How long the clients of a measure run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Plan {
+    /// Each client runs this number of transactions, and each one counts.
+    Count(usize),
+    /// Each client runs transactions until `warmup` plus `duration` ends.
+    /// Only the transactions that start after `warmup` count. A client
+    /// also stops after `cap` transactions that count.
+    Timed {
+        /// The time that does not count.
+        warmup: Duration,
+        /// The time that counts.
+        duration: Duration,
+        /// The most transactions that count, for each client.
+        cap: Option<usize>,
+    },
+}
+
+/// The times of a `Plan::Timed` measure.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    /// The transactions that start at or after this time count.
+    counts_from: Instant,
+    /// No transaction starts at or after this time.
+    end: Instant,
+    cap: Option<usize>,
+}
+
 /// Run the workload with `clients` clients, and return its numbers.
 async fn measure(
     addr: SocketAddr,
     workload: &Workload,
     oids: &[Oid],
     clients: usize,
+    plan: Plan,
 ) -> Result<Measure, Error> {
     let oids: Arc<[Oid]> = oids.into();
     let zipf = Zipf::new(oids.len(), workload.zipf);
@@ -284,6 +329,22 @@ async fn measure(
     }
 
     let start = Instant::now();
+    let (count, window) = match plan {
+        Plan::Count(count) => (count, None),
+        Plan::Timed {
+            warmup,
+            duration,
+            cap,
+        } => {
+            let counts_from = start + warmup;
+            let window = Window {
+                counts_from,
+                end: counts_from + duration,
+                cap,
+            };
+            (0, Some(window))
+        }
+    };
     let tasks: Vec<_> = connections
         .into_iter()
         .enumerate()
@@ -299,7 +360,8 @@ async fn measure(
                 client,
                 oids: oids.clone(),
                 schedule,
-                transactions: workload.transactions,
+                count,
+                window,
                 pipeline: workload.pipeline,
                 value: Value::new(index as u64),
             };
@@ -318,7 +380,8 @@ async fn measure(
             Err(e) => failure = failure.or(Some(e)),
         }
     }
-    let elapsed = start.elapsed();
+    // The time counts from the end of the warm-up.
+    let elapsed = Instant::now().saturating_duration_since(window.map_or(start, |w| w.counts_from));
     // Close the connections after the measure, so the time of a close
     // does not count.
     for client in done {
@@ -397,7 +460,9 @@ struct ClientTask {
     client: Client,
     oids: Arc<[Oid]>,
     schedule: Schedule,
-    transactions: usize,
+    /// The number of transactions without a window.
+    count: usize,
+    window: Option<Window>,
     pipeline: usize,
     value: Value,
 }
@@ -407,11 +472,22 @@ impl ClientTask {
     /// its connection.
     async fn run(mut self) -> Result<(Tally, Client), Error> {
         let mut tally = Tally::default();
-        for _ in 0..self.transactions {
+        // The numbers of the warm-up. They do not count.
+        let mut warmup = Tally::default();
+        loop {
+            let now = Instant::now();
+            let counts = match self.window {
+                None if tally.transactions >= self.count as u64 => break,
+                None => true,
+                Some(w) if now >= w.end => break,
+                Some(w) if w.cap.is_some_and(|cap| tally.transactions >= cap as u64) => break,
+                Some(w) => now >= w.counts_from,
+            };
             let step = self.schedule.next_step();
             let oids: Vec<Oid> = step.ranks.iter().map(|&rank| self.oids[rank]).collect();
-            self.transaction(&oids, step.write, &mut tally).await?;
-            tally.transactions += 1;
+            let into = if counts { &mut tally } else { &mut warmup };
+            self.transaction(&oids, step.write, into).await?;
+            into.transactions += 1;
         }
         Ok((tally, self.client))
     }
@@ -603,7 +679,6 @@ mod tests {
             storage: "1".into(),
             pipeline: 1,
             objects: 10,
-            transactions: 1,
             txn_size: 1,
             write_ratio: 0.5,
             zipf: 1.0,
@@ -622,6 +697,7 @@ mod tests {
 
         let settings = LoadSettings {
             clients: 2,
+            transactions: 1,
             workload: sample_workload(),
         };
         let report = Report::new("load", Run::now(), settings, sample_measure());
@@ -637,6 +713,9 @@ mod tests {
         let settings = SaturateSettings {
             max_clients: 2,
             p99_ceiling_seconds: 0.01,
+            warmup_seconds: 0.2,
+            step_seconds: 1.0,
+            transactions: None,
             workload: sample_workload(),
         };
         let saturation = Saturation {

@@ -359,8 +359,13 @@ bench *args="run":
         addr="$(sed -n 's/^listening //p' "$work/serve.out")"
         [ -n "$addr" ] || { echo "just bench: zoe serve does not listen" >&2; exit 1; }
         result="$out/$command-$(date -u +%Y%m%dT%H%M%SZ).json"
+        # Write to a temporary file, and move it on success only. So a
+        # failed run leaves no result.
+        partial="$(mktemp "$out/.$command.XXXXXX")"
+        trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
         ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
-            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$result"
+            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
+        mv "$partial" "$result"
         cat "$result"
         exit 0
     fi

@@ -125,9 +125,9 @@
       ],
       "properties": {
         "name": {
-          "description": "ZOE_BENCH_MACHINE, or a slug of the CPU model.",
+          "description": "A slug of ZOE_BENCH_MACHINE, or a slug of the CPU model.",
           "type": "string",
-          "minLength": 1
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
         },
         "cpu": {
           "description": "The CPU model.",
@@ -189,7 +189,6 @@
         "storage",
         "pipeline",
         "objects",
-        "transactions",
         "txn_size",
         "write_ratio",
         "zipf",
@@ -211,11 +210,6 @@
           "type": "integer",
           "minimum": 1
         },
-        "transactions": {
-          "description": "The number of transactions of each client.",
-          "type": "integer",
-          "minimum": 1
-        },
         "txn_size": {
           "description": "The number of different objects that each transaction reads.",
           "type": "integer",
@@ -228,7 +222,7 @@
           "maximum": 1
         },
         "zipf": {
-          "description": "The exponent of the Zipf law that picks the objects. 0 is uniform.",
+          "description": "The exponent of the Zipf law that picks the objects. 0 is uniform; 1.0 is the hot-spot case.",
           "type": "number",
           "minimum": 0
         },
@@ -252,11 +246,17 @@
         }
       ],
       "required": [
-        "clients"
+        "clients",
+        "transactions"
       ],
       "properties": {
         "clients": {
           "description": "The number of clients, each with its own connection.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "transactions": {
+          "description": "The number of transactions of each client.",
           "type": "integer",
           "minimum": 1
         }
@@ -272,7 +272,10 @@
       ],
       "required": [
         "max_clients",
-        "p99_ceiling_seconds"
+        "p99_ceiling_seconds",
+        "warmup_seconds",
+        "step_seconds",
+        "transactions"
       ],
       "properties": {
         "max_clients": {
@@ -281,9 +284,27 @@
           "minimum": 1
         },
         "p99_ceiling_seconds": {
-          "description": "The ceiling of the p99 of loadBefore, in seconds.",
+          "description": "The ceiling of the p99 of loadBefore, in seconds. The default is the number of N3, but a run on a small store is not an N3 verdict: N3 is a cache miss on a 10 GB store.",
           "type": "number",
           "exclusiveMinimum": 0
+        },
+        "warmup_seconds": {
+          "description": "The time at the start of each step that does not count.",
+          "type": "number",
+          "minimum": 0
+        },
+        "step_seconds": {
+          "description": "The time of each step after the warm-up.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "transactions": {
+          "description": "The most transactions of each client in a step after the warm-up, or null for no limit. A step ends at the end of its time or at this limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       },
       "unevaluatedProperties": false
@@ -310,7 +331,7 @@
       ],
       "properties": {
         "transactions": {
-          "description": "The transactions of all clients. Each one commits or only reads.",
+          "description": "The transactions of all clients that count: each one commits or only reads. The warm-up of a saturate step does not count.",
           "type": "integer",
           "minimum": 0
         },
@@ -348,7 +369,7 @@
           "minimum": 0
         },
         "elapsed_seconds": {
-          "description": "The time from the start of the clients to the end of the last one.",
+          "description": "The time from the start of the clients, or from the end of the warm-up of a saturate step, to the end of the last client.",
           "type": "number",
           "minimum": 0
         },
