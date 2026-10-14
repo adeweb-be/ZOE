@@ -3,5 +3,6 @@
     <key name="server" required="yes" />
     <key name="name" default="zoeclientx" />
     <key name="pool" datatype="integer" default="1" />
+    <key name="rule" datatype="boolean" default="off" />
   </sectiontype>
 </component>

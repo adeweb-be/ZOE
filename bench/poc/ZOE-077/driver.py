@@ -220,6 +220,8 @@ def main():
                    help="the timer slack of zodbshootout; ZEO.ClientStorage sleeps 1 µs after each reply")
     p.add_argument("--client-pool", type=int, default=1,
                    help="the connections of one zoeclientx storage; each transaction takes one")
+    p.add_argument("--client-rule", action="store_true",
+                   help="zoeclientx: deliver the invalidations and the commits of the pool in tid order")
     p.add_argument("--client", choices=["zeo", "zoeclientx"], default="zeo",
                    help="ZEO.ClientStorage, or the zoe-client storage of rustclient/")
     p.add_argument("--results", default=str(ROOT / "results.jsonl"))
@@ -244,7 +246,8 @@ def main():
         elif args.client == "zoeclientx":
             # The storage of rustclient/: zoe-client through PyO3.
             conf.write_text(f"%import zoeclientx\n<zodb bench>\n  <zoeclientx>\n    server {addr}\n"
-                            f"    pool {args.client_pool}\n  </zoeclientx>\n</zodb>\n")
+                            f"    pool {args.client_pool}\n    rule {'on' if args.client_rule else 'off'}\n"
+                            "  </zoeclientx>\n</zodb>\n")
         else:
             conf.write_text(f"<zodb bench>\n  <zeoclient>\n    server {addr}\n  </zeoclient>\n</zodb>\n")
         cmd = [*args.client_wrap.split(), sys.executable, "-m", "zodbshootout", "--processes", str(args.processes),
@@ -297,7 +300,7 @@ def main():
     suite = pyperf.BenchmarkSuite.load(str(wd / "pyperf.json"))
     result = {"label": args.label, "server": args.server, "client": args.client,
               "history_free": args.history_free,
-              "timerslack_ns": args.client_timerslack_ns, "pool": args.client_pool, "mode": args.mode,
+              "timerslack_ns": args.client_timerslack_ns, "pool": args.client_pool, "rule": args.client_rule, "mode": args.mode,
               "c": args.concurrency, "size": args.size, "env": args.env,
               "server_cpu_s": round(c1 - c0, 2), "wall_s": round(t1 - t0, 1)}
     for b in suite.get_benchmarks():

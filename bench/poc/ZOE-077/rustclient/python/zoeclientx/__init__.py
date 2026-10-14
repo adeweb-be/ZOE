@@ -1,14 +1,31 @@
-"""A ZODB storage on zoe-client, for the ZOE-077 POC. Not for merge.
+"""A ZODB storage on zoe-client, for the ZOE-077 and ZOE-151 POCs. Not for merge.
 
 It has no client cache, no blobs, no undo and no conflict resolution. It is
-enough for zodbshootout: `%import zoeclientx`, then a `<zoeclientx>` section
-with `server HOST:PORT`.
+enough for zodbshootout and for the race tests of ZODB: `%import
+zoeclientx`, then a `<zoeclientx>` section with `server HOST:PORT`.
 
-With `pool N`, the storage opens N connections. Each transaction takes a
-free connection, so N transactions of one process can commit at the same
-time. The first connection reads the invalidations. The POC does not order
-the invalidations of the other connections against the commits of this
-process: a real client needs that.
+With `pool N`, each transaction takes a free connection among N, so N
+transactions of one process can commit at the same time.
+
+`rule off` (the default) is the pool of ZOE-077: the first connection reads
+the invalidations and also commits. It skips a tid of the pool after a wait
+of 5 ms, and it does not order the invalidations against the commits of the
+other connections.
+
+`rule on` is the candidate rule of ZOE-151:
+
+- One connection, the listener, only reads the invalidations. The N
+  connections of the pool commit. A pool of N opens N + 1 connections.
+- The listener delivers each tid in the order of its stream. The server
+  sends it the invalidations of every commit of the pool too, in tid order.
+- A tid of another client goes to the DB as `invalidate(tid, oids)`.
+- A tid of the pool never goes to the DB as an invalidation. The listener
+  runs the `func(tid)` of its `tpc_finish` instead, so the order is that of
+  the stream.
+- `lastTransaction()` moves to a tid only after the listener delivered it.
+- While a finish of the pool waits for its reply, the listener holds a tid
+  that it does not know: the tid can be the one of that finish.
+- `tpc_finish` returns only after the listener delivered its tid.
 """
 
 import queue
@@ -24,27 +41,45 @@ from ._zoeclientx import ZClient
 
 
 class ZoeClientStorage:
-    def __init__(self, server, name="zoeclientx", pool=1):
+    def __init__(self, server, name="zoeclientx", pool=1, rule=False):
         self._server = server
         self._name = name
+        self._rule = bool(rule)
+        # The first connection reads the invalidations. With the rule, it
+        # does not commit.
         self._client = ZClient(server)
-        self._clients = [self._client] + [ZClient(server) for _ in range(pool - 1)]
+        if self._rule:
+            self._committers = [ZClient(server) for _ in range(pool)]
+            self._clients = [self._client] + self._committers
+        else:
+            self._clients = [self._client] + [ZClient(server) for _ in range(pool - 1)]
+            self._committers = self._clients
         self._free = queue.SimpleQueue()
-        for client in self._clients:
+        for client in self._committers:
             self._free.put(client)
         self._ltid = max(c.last_transaction() for c in self._clients)
-        # The tids of the commits of this process on the other connections
-        # of the pool. The first connection gets their invalidations too.
+        # Without the rule: the tids of the commits of this process on the
+        # other connections of the pool.
         self._own = set()
         self._own_cond = threading.Condition()
         self._ltid_lock = threading.Lock()
+        # With the rule: the finishes that wait for their reply, the
+        # callbacks of the finishes that wait for the listener, and the
+        # errors of the callbacks.
+        self._cv = threading.Condition()
+        self._inflight = 0
+        self._pending = {}
+        self._errors = {}
         self._db = None
         self._txns = {}
         self._oids = []
         self._oid_lock = threading.Lock()
         self._closed = threading.Event()
-        self._thread = threading.Thread(target=self._invalidations, daemon=True, name="zoeclientx")
+        target = self._listen if self._rule else self._invalidations
+        self._thread = threading.Thread(target=target, daemon=True, name="zoeclientx")
         self._thread.start()
+
+    # Without the rule: the POC of ZOE-077.
 
     def _invalidations(self):
         while not self._closed.is_set():
@@ -75,6 +110,56 @@ class ZoeClientStorage:
         with self._ltid_lock:
             if tid > self._ltid:
                 self._ltid = tid
+
+    # With the rule.
+
+    def _listen(self):
+        while not self._closed.is_set():
+            got = self._client.next_invalidation(0.2)
+            if got is None:
+                continue
+            tid, oids = got
+            with self._cv:
+                # Hold the tid while a finish of the pool waits for its
+                # reply: the tid can be the one of that finish.
+                self._cv.wait_for(lambda: tid in self._pending or self._inflight == 0)
+                func = self._pending.pop(tid, None)
+            try:
+                if func is not None:
+                    func(tid)
+                elif self._db is not None:
+                    self._db.invalidate(tid, oids)
+            except BaseException as error:  # noqa: BLE001 - give it to the finish
+                with self._cv:
+                    self._errors[tid] = error
+            with self._cv:
+                if tid > self._ltid:
+                    self._ltid = tid
+                self._cv.notify_all()
+
+    def _finish_in_order(self, client, txn, func):
+        with self._cv:
+            self._inflight += 1
+        try:
+            tid = txn.finish()
+        except BaseException:
+            with self._cv:
+                self._inflight -= 1
+                self._cv.notify_all()
+            raise
+        finally:
+            self._free.put(client)
+        with self._cv:
+            self._pending[tid] = func
+            self._inflight -= 1
+            self._cv.notify_all()
+            self._cv.wait_for(lambda: self._ltid >= tid)
+            error = self._errors.pop(tid, None)
+        if error is not None:
+            raise error
+        return tid
+
+    # The storage API.
 
     def registerDB(self, db):
         self._db = db
@@ -138,6 +223,8 @@ class ZoeClientStorage:
 
     def tpc_finish(self, transaction, func=lambda tid: None):
         client, txn = self._txns.pop(id(transaction))
+        if self._rule:
+            return self._finish_in_order(client, txn, func)
         try:
             tid = txn.finish()
         finally:
@@ -167,4 +254,5 @@ class ZoeClientStorage:
 
 class StorageConfig(BaseConfig):
     def open(self, database_name="unnamed", databases=None):
-        return ZoeClientStorage(self.config.server, self.config.name, self.config.pool)
+        c = self.config
+        return ZoeClientStorage(c.server, c.name, c.pool, c.rule)
