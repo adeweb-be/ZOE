@@ -26,6 +26,7 @@ mod invalidation;
 mod iteration;
 mod message;
 pub(crate) mod metrics;
+mod negotiation;
 mod outbox;
 mod pipeline;
 mod session;
