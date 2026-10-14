@@ -162,10 +162,12 @@ conformance:
 # Run the process kill loop against `zoe serve` for `runs` rounds, on
 # CPython 3.13. Each round kills the server with SIGKILL while several
 # writers commit objects and blobs, restarts it, stops it cleanly, runs
-# `zoe verify` and loads every acknowledged commit and blob. `just test`
-# does not collect it. Without a seed, the recipe takes a random one. It
-# prints the seed, and a failure names its round, so `just crash RUNS SEED`
-# reproduces the failure. The store and the blob caches go to TMPDIR.
+# `zoe verify` and loads every acknowledged commit. `just test` does not
+# collect it. Without a seed, the recipe takes a random one. It prints the
+# seed. The traceback of a failure shows its local variables, so it gives
+# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
+# the order of the threads. The store and the blob caches go to TMPDIR:
+# 10,000 rounds need about 3 GB there.
 crash runs="200" seed="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -180,7 +182,7 @@ crash runs="200" seed="":
     echo "just crash: {{ runs }} rounds, seed $seed"
     status=0
     UV_PROJECT_ENVIRONMENT=.venv-3.13 uv run --locked --directory python --python 3.13 \
-        pytest -q zoedb/tests/crash || status=$?
+        pytest -q --showlocals zoedb/tests/crash || status=$?
     if [ "$status" -ne 0 ]; then
         echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
     fi
