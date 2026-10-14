@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::StorageBackend;
 use redb::backends::FileBackend;
-use zoe_convert::from_datafs;
+use zoe_convert::{ProblemKind, from_datafs};
 use zoe_core::vfs::{DirLock, MemVfs, OsVfs, Vfs, WriteFile};
 use zoe_core::{Oid, Store, SystemClock, Tid};
 
@@ -328,7 +328,11 @@ fn a_crash_loses_only_the_open_batch_and_the_conversion_resumes() {
     // same store as a conversion in one run: the verification compares
     // every transaction of the file with the store.
     let report = from_datafs(&data_fs, Some(&blob_dir), &store).unwrap();
-    assert!(report.problems.is_empty(), "{report:?}");
+    // The verification checks the size of each blob file through
+    // `std::fs`, which does not see a `MemVfs`. So it reports the two
+    // blobs as unreadable, and nothing else. The reads below check them.
+    assert_eq!(report.problem_count(), 2, "{report:?}");
+    assert_eq!(report.count(ProblemKind::UnreadableBlob), 2, "{report:?}");
     assert_eq!(report.transactions, COUNT);
     assert_eq!(report.copied, COUNT - durable - 1);
     assert_eq!(store.last_transaction(), *tids.last().unwrap());
