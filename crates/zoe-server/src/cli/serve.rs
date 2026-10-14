@@ -8,8 +8,9 @@
 //! file of `--config`.
 //!
 //! The command writes the line `listening <address>` to stdout once it
-//! accepts connections, so a port of 0 gives a free port. The logs go to
-//! stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
+//! accepts connections, so a port of 0 gives a free port. With
+//! `--admin-listen`, it writes the line `admin <address>` before it. The
+//! logs go to stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
 //! the command closes the connections and the stores, and exits with 0.
 //!
 //! The console script of the wheel has no server: its extension never
@@ -61,6 +62,14 @@ pub(super) struct ServeArgs {
         default_value = "127.0.0.1:8100"
     )]
     listen: SocketAddr,
+
+    /// The address of the admin port, as HOST:PORT: an HTTP port for the
+    /// probes. GET /healthz gives 200 while every store is open. GET
+    /// /readyz gives 200 when every store is open and ready, and 503
+    /// before and from a stop on. The port does not speak ZEO. A port of 0
+    /// takes a free port. Without it, the server opens no admin port.
+    #[arg(long, env = "ZOE_ADMIN_LISTEN", value_name = "HOST:PORT")]
+    admin_listen: Option<SocketAddr>,
 
     /// The most transactions that getInvalidations covers. A client that
     /// reconnects further behind gets nil and verifies its cache.
@@ -126,6 +135,44 @@ pub(super) struct ServeArgs {
     )]
     shutdown_timeout: Duration,
 
+    /// The longest time that a connection sends no frame, in whole seconds,
+    /// such as 300, 300s or 5m. A heartbeat is a frame, and a stock client
+    /// sends one every 60 seconds. The server closes a connection that is
+    /// idle for longer: its open transaction aborts and its locks go, as
+    /// when the client closes. So a client that stalls during a commit, or
+    /// a host that dies, holds its locks at most this long. The time while
+    /// the server reads no calls of the connection, because 4 calls wait,
+    /// does not count. 0 closes no idle connection.
+    #[arg(
+        long,
+        env = "ZOE_IDLE_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = whole_seconds
+    )]
+    idle_timeout: Duration,
+
+    /// Serve every store for reads only. The server opens each store
+    /// read-only: it changes no byte of the store, and holds its lock, so
+    /// no writer opens the store meanwhile. The store must exist, and a
+    /// store with blobs must get its blob directory. A client that
+    /// registers to write gets ReadOnlyError; a client with
+    /// read_only_fallback then registers read-only. A transaction fails at
+    /// its vote, and new_oids and pack fail, with ReadOnlyError. The key
+    /// read-only of a [storages.NAME] table makes one store read-only.
+    #[arg(
+        long,
+        env = "ZOE_READ_ONLY",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    read_only: bool,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
@@ -141,6 +188,8 @@ pub(super) struct Storage {
     /// The directory of the blob files. `None` is `blobs` in the store
     /// directory.
     pub(super) blob_dir: Option<PathBuf>,
+    /// True when the server serves the store for reads only.
+    pub(super) read_only: bool,
 }
 
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
@@ -151,6 +200,7 @@ fn named_storage(value: &str) -> Result<Storage, String> {
             name: name.to_owned(),
             path: PathBuf::from(path),
             blob_dir: None,
+            read_only: false,
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
@@ -250,6 +300,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
         name: crate::protocol::STORAGE_NAME.to_owned(),
         path: path.clone(),
         blob_dir: None,
+        read_only: false,
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())
@@ -270,7 +321,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 }
 
 /// Serve until SIGTERM or SIGINT, then stop. Write the line
-/// `listening <address>` to `out`.
+/// `admin <address>` when the server has an admin port, then the line
+/// `listening <address>`, to `out`.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -278,7 +330,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     use crate::serve::{ServeOptions, Server, StorageOptions};
 
     let storages = args.storages.iter().map(|storage| {
-        let options = StorageOptions::new(&storage.name, &storage.path);
+        let options =
+            StorageOptions::new(&storage.name, &storage.path).read_only(storage.read_only);
         match &storage.blob_dir {
             Some(dir) => options.blob_dir(dir),
             None => options,
@@ -288,14 +341,22 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .listen(args.listen)
         .invalidation_queue_size(args.invalidation_queue_size)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
-        .shutdown_timeout(args.shutdown_timeout);
+        .shutdown_timeout(args.shutdown_timeout)
+        .idle_timeout(args.idle_timeout)
+        .read_only(args.read_only);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
+    }
+    if let Some(addr) = args.admin_listen {
+        options = options.admin_listen(addr);
     }
     if let Some(bytes) = args.max_frame_size.and_then(NonZeroU32::new) {
         options = options.max_frame_size(bytes);
     }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
+    if let Some(admin) = server.admin_addr() {
+        writeln!(out, "admin {admin}")?;
+    }
     server.serve_until_signal(|addr| {
         writeln!(out, "listening {addr}")?;
         out.flush()
@@ -350,6 +411,27 @@ mod tests {
         let args = serve(&["--shutdown-timeout", "0"]).unwrap();
         assert_eq!(args.shutdown_timeout, Duration::ZERO);
         let error = serve(&["--shutdown-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_idle_timeout_is_300_seconds_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().idle_timeout, Duration::from_secs(300));
+        let args = serve(&["--idle-timeout", "2m"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::from_secs(120));
+        let args = serve(&["--idle-timeout", "0"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::ZERO);
+        let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn read_only_is_false_by_default_and_takes_a_boolean() {
+        assert!(!serve(&[]).unwrap().read_only);
+        assert!(serve(&["--read-only"]).unwrap().read_only);
+        assert!(serve(&["--read-only=true"]).unwrap().read_only);
+        assert!(!serve(&["--read-only=false"]).unwrap().read_only);
+        let error = serve(&["--read-only=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

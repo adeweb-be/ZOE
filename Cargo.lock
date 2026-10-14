@@ -1136,8 +1136,15 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zoe-bench"
 version = "0.0.0"
 dependencies = [
+ "clap",
+ "futures",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "zoe-client",
+ "zoe-core",
+ "zoe-server",
 ]
 
 [[package]]
@@ -1147,6 +1154,14 @@ version = "0.0.0"
 [[package]]
 name = "zoe-client"
 version = "0.0.0"
+dependencies = [
+ "futures",
+ "rmpv",
+ "thiserror",
+ "tokio",
+ "zoe-core",
+ "zoe-server",
+]
 
 [[package]]
 name = "zoe-convert"

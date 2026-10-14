@@ -29,6 +29,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
+use crate::admin::{self, Health, StoreHealth};
 use crate::protocol::{self, NamedStorage, Queues, Stopping, Storages};
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
@@ -39,6 +40,10 @@ pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap
 
 /// The default of `--shutdown-timeout`: 30 seconds.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default of `--idle-timeout`: 300 seconds. A stock client sends a
+/// heartbeat every 60 seconds, so it keeps its connection.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The last part of the shutdown timeout, in which a stop closes the
 /// connections that did not end and waits for their sessions. When the
@@ -57,6 +62,7 @@ pub struct StorageOptions {
     name: String,
     path: PathBuf,
     blob_dir: Option<PathBuf>,
+    read_only: bool,
 }
 
 impl StorageOptions {
@@ -67,6 +73,7 @@ impl StorageOptions {
             name: name.into(),
             path: path.as_ref().to_path_buf(),
             blob_dir: None,
+            read_only: false,
         }
     }
 
@@ -77,6 +84,16 @@ impl StorageOptions {
         self.blob_dir = Some(dir.as_ref().to_path_buf());
         self
     }
+
+    /// Serve the store for reads only, when `read_only` is true. The server
+    /// opens the existing store with `Store::open_read_only_with`: it
+    /// changes no byte of the store and holds its lock. A store with blobs
+    /// must get its blob directory, or the start fails.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
 }
 
 /// The settings of a server.
@@ -84,10 +101,13 @@ impl StorageOptions {
 pub struct ServeOptions {
     storages: Vec<StorageOptions>,
     listen: SocketAddr,
+    admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
+    idle_timeout: Duration,
+    read_only: bool,
 }
 
 impl ServeOptions {
@@ -95,7 +115,8 @@ impl ServeOptions {
     /// ZEO. Listen on a free port of 127.0.0.1, with frames of at most
     /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
     /// 100,000 transactions, and 1,000 invalidations can wait for one
-    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`].
+    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
+    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`] closes.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::with_storages([StorageOptions::new(protocol::STORAGE_NAME, path)])
     }
@@ -106,10 +127,13 @@ impl ServeOptions {
         Self {
             storages: storages.into_iter().collect(),
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            read_only: false,
         }
     }
 
@@ -117,6 +141,15 @@ impl ServeOptions {
     #[must_use]
     pub fn listen(mut self, addr: SocketAddr) -> Self {
         self.listen = addr;
+        self
+    }
+
+    /// Open the admin port on `addr`: an HTTP port with `/healthz` and
+    /// `/readyz`. A port of 0 takes a free port. Without this call, the
+    /// server opens no admin port.
+    #[must_use]
+    pub fn admin_listen(mut self, addr: SocketAddr) -> Self {
+        self.admin_listen = Some(addr);
         self
     }
 
@@ -167,6 +200,32 @@ impl ServeOptions {
         self
     }
 
+    /// Close a connection that sends no frame for `timeout`. The time counts
+    /// from the last frame that the server read, a heartbeat included, and
+    /// from the accept for the protocol of the client. The time while the
+    /// call queue of the connection is full does not count. The close stops
+    /// the writer at once, as a close of the hub does. The session runs the
+    /// calls that arrived, up to the first reply that it cannot queue, then
+    /// aborts its open transaction. A timeout of 0 closes no connection.
+    #[must_use]
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Serve every store for reads only, when `read_only` is true, as
+    /// [`StorageOptions::read_only`] does for one store.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Tell if the server serves the store of `storage` for reads only.
+    fn is_read_only(&self, storage: &StorageOptions) -> bool {
+        self.read_only || storage.read_only
+    }
+
     /// The options of the store of `storage`.
     fn store_options(&self, storage: &StorageOptions) -> Options {
         let mut options = Options::default();
@@ -202,6 +261,8 @@ pub enum Error {
     Storages(String),
     /// The server cannot listen on the address.
     Listen(SocketAddr, io::Error),
+    /// The server cannot listen on the address of the admin port.
+    AdminListen(SocketAddr, io::Error),
     /// The store does not open.
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
@@ -213,6 +274,9 @@ impl fmt::Display for Error {
         match self {
             Self::Storages(message) => f.write_str(message),
             Self::Listen(addr, error) => write!(f, "cannot listen on {addr}: {error}"),
+            Self::AdminListen(addr, error) => {
+                write!(f, "cannot listen on the admin address {addr}: {error}")
+            }
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
         }
@@ -226,6 +290,8 @@ pub struct Server {
     runtime: Option<Runtime>,
     storages: Option<Arc<Storages>>,
     addr: SocketAddr,
+    /// The address of the admin port, when the server has one.
+    admin: Option<SocketAddr>,
     /// The sender of the stop to the accept loop and to each connection.
     stop_signal: watch::Sender<bool>,
     /// The accept loop and the connections that run.
@@ -246,8 +312,8 @@ impl Server {
     }
 
     /// Start as [`Server::start`] does, but open the store of each storage
-    /// with `open`. It gets the storage name, the store directory and the
-    /// options of the store.
+    /// that is not read-only with `open`. It gets the storage name, the
+    /// store directory and the options of the store.
     pub(crate) fn start_with(
         options: ServeOptions,
         mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
@@ -267,20 +333,43 @@ impl Server {
         let addr = listener
             .local_addr()
             .map_err(|error| Error::Listen(options.listen, error))?;
+        let (stop_signal, stopping) = Stopping::new();
+        // The admin port answers from now on, 503 until the stores are
+        // open. It is not a task of the stop: it stays open until the
+        // runtime stops.
+        let health = Health::new(stop_signal.subscribe());
+        let admin = match options.admin_listen {
+            Some(admin_listen) => {
+                let _enter = runtime.enter();
+                let listener =
+                    bind(admin_listen).map_err(|error| Error::AdminListen(admin_listen, error))?;
+                let admin = listener
+                    .local_addr()
+                    .map_err(|error| Error::AdminListen(admin_listen, error))?;
+                runtime.spawn(admin::serve(listener, Arc::clone(&health)));
+                Some(admin)
+            }
+            None => None,
+        };
         // This thread is not a thread of the runtime. Each store has its
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
+        let mut stores = Vec::with_capacity(options.storages.len());
         for storage in &options.storages {
-            let store = open(&storage.name, &storage.path, options.store_options(storage))?;
-            storages.push(Arc::new(NamedStorage::new(
-                &storage.name,
-                &storage.path,
-                store,
-                options.queues,
-            )));
+            let read_only = options.is_read_only(storage);
+            let store = if read_only {
+                open_read_only(&storage.path, options.store_options(storage))?
+            } else {
+                open(&storage.name, &storage.path, options.store_options(storage))?
+            };
+            stores.push(StoreHealth {
+                name: storage.name.clone(),
+                no_stale_locks: store.lock_table_is_empty(),
+            });
+            let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
+            storages.push(Arc::new(named.read_only(read_only)));
         }
         let storages = Arc::new(Storages::new(storages, options.queues.client));
-        let (stop_signal, stopping) = Stopping::new();
         let tasks = Arc::new(Tasks::default());
         // The accept loop counts as a task from now on, so a stop waits for
         // it.
@@ -289,6 +378,7 @@ impl Server {
             listener,
             Arc::clone(&storages),
             options.max_frame_size.get(),
+            (!options.idle_timeout.is_zero()).then_some(options.idle_timeout),
             stopping,
             Arc::clone(&tasks),
         );
@@ -296,10 +386,13 @@ impl Server {
             accept.await;
             drop(accepting);
         });
+        // Each open loaded the last tid of its store.
+        health.opened(stores);
         Ok(Self {
             runtime: Some(runtime),
             storages: Some(storages),
             addr,
+            admin,
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
@@ -309,6 +402,11 @@ impl Server {
     /// The address that the server listens on.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The address of the admin port, when the server has one.
+    pub fn admin_addr(&self) -> Option<SocketAddr> {
+        self.admin
     }
 
     /// Stop the server within its shutdown timeout. Accept no more
@@ -388,6 +486,16 @@ impl Drop for Server {
     }
 }
 
+/// Open the store in `path` read-only with `options`. A read-only open does
+/// not check the blob directory, so this call checks it, as `zoe verify`
+/// does: a store with blobs whose blob directory has no layout file fails,
+/// and the error names that directory.
+fn open_read_only(path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+    Store::open_read_only_with(path, options)
+        .and_then(|store| store.check_blob_dir().map(|()| Arc::new(store)))
+        .map_err(|error| Error::Store(path.to_path_buf(), error))
+}
+
 /// Listen on `addr`. The socket takes SO_REUSEADDR, so a restarted server
 /// binds the same port at once.
 fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
@@ -403,12 +511,13 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// Accept clients until `stopping` tells that the server stops. Then drop
 /// the listener, so the server accepts no more connections. Each connection
-/// takes frames of at most `max_frame_size` bytes, and counts in `tasks`
-/// while it runs.
+/// takes frames of at most `max_frame_size` bytes, closes after
+/// `idle_timeout` without a frame, and counts in `tasks` while it runs.
 async fn accept(
     listener: TcpListener,
     storages: Arc<Storages>,
     max_frame_size: u32,
+    idle_timeout: Option<Duration>,
     mut stopping: Stopping,
     tasks: Arc<Tasks>,
 ) {
@@ -426,6 +535,7 @@ async fn accept(
                     stream,
                     Arc::clone(&storages),
                     max_frame_size,
+                    idle_timeout,
                     stopping.clone(),
                 );
                 tokio::spawn(async move {
@@ -509,6 +619,58 @@ mod tests {
         });
         // The lock of the store is free again.
         Store::open(&dir).unwrap();
+    }
+
+    /// Send `GET path` to the admin port `addr`. Return the status.
+    fn admin_get(addr: SocketAddr, path: &str) -> io::Result<u16> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: zoe\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response[9..12].parse().unwrap())
+    }
+
+    #[test]
+    fn the_admin_port_is_not_ready_from_the_stop_on_and_closes_at_its_end() {
+        let dir = fresh_dir("admin-stop");
+        let options = ServeOptions::new(&dir)
+            .admin_listen(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .shutdown_timeout(Duration::from_secs(30));
+        let server = Server::start(options).unwrap();
+        let admin = server.admin_addr().unwrap();
+        assert_eq!(admin_get(admin, "/readyz").unwrap(), 200);
+
+        // A task that runs holds the stop. The admin port is not one.
+        let holding = server.tasks.start();
+        let stop = std::thread::spawn(move || server.stop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while admin_get(admin, "/readyz").unwrap() != 503 {
+            assert!(Instant::now() < deadline, "/readyz stays 200 in the stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The stores are open until the end of the stop.
+        assert_eq!(admin_get(admin, "/healthz").unwrap(), 200);
+        assert!(!stop.is_finished());
+
+        drop(holding);
+        stop.join().unwrap();
+        assert!(admin_get(admin, "/healthz").is_err());
+        Store::open_read_only(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_that_cannot_open_its_admin_port_creates_no_store() {
+        let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dir = fresh_dir("admin-taken");
+        let options = ServeOptions::new(&dir).admin_listen(taken.local_addr().unwrap());
+        let error = Server::start(options).err().unwrap();
+        assert!(matches!(error, Error::AdminListen(..)), "{error}");
+        assert!(error.to_string().contains("admin address"), "{error}");
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -652,6 +814,36 @@ mod tests {
         let catalog = reply.find(r#"}, "catalog": {"connections": 0, "#);
         assert!(matches!((main, catalog), (Some(0), Some(_))), "{reply}");
         server.stop();
+    }
+
+    #[test]
+    fn a_read_only_store_must_exist_and_its_open_creates_nothing() {
+        let dir = fresh_dir("read-only-start");
+        for options in [
+            ServeOptions::new(&dir).read_only(true),
+            ServeOptions::with_storages([StorageOptions::new("a", &dir)
+                .blob_dir(dir.join("blobs"))
+                .read_only(true)]),
+        ] {
+            let missing = Server::start(options).err();
+            assert!(matches!(missing, Some(Error::Store(..))), "{missing:?}");
+            assert!(!dir.exists());
+        }
+    }
+
+    #[test]
+    fn a_read_only_server_holds_the_lock_of_the_store() {
+        let dir = fresh_dir("read-only-lock");
+        drop(Store::open(&dir).unwrap());
+        let server = Server::start(ServeOptions::with_storages([StorageOptions::new(
+            "a", &dir,
+        )
+        .read_only(true)]))
+        .unwrap();
+        let writer = Store::open(&dir).err();
+        assert!(matches!(writer, Some(ZoeError::Locked)), "{writer:?}");
+        server.stop();
+        drop(Store::open(&dir).unwrap());
     }
 
     #[test]
