@@ -24,7 +24,9 @@ other connections.
   the stream.
 - `lastTransaction()` moves to a tid only after the listener delivered it.
 - While a finish of the pool waits for its reply, the listener holds a tid
-  that it does not know: the tid can be the one of that finish.
+  that it does not know: the tid can be the one of that finish. It holds
+  the tid only until the finishes that were sent before the tid arrived
+  have their replies. A finish sent later cannot commit an earlier tid.
 - `tpc_finish` returns only after the listener delivered its tid.
 """
 
@@ -63,11 +65,12 @@ class ZoeClientStorage:
         self._own = set()
         self._own_cond = threading.Condition()
         self._ltid_lock = threading.Lock()
-        # With the rule: the finishes that wait for their reply, the
-        # callbacks of the finishes that wait for the listener, and the
-        # errors of the callbacks.
+        # With the rule: the number of finishes sent, the numbers of the
+        # finishes that wait for their reply, the callbacks of the finishes
+        # that wait for the listener, and the errors of the callbacks.
         self._cv = threading.Condition()
-        self._inflight = 0
+        self._sent = 0
+        self._unreplied = set()
         self._pending = {}
         self._errors = {}
         self._db = None
@@ -120,9 +123,14 @@ class ZoeClientStorage:
                 continue
             tid, oids = got
             with self._cv:
-                # Hold the tid while a finish of the pool waits for its
-                # reply: the tid can be the one of that finish.
-                self._cv.wait_for(lambda: tid in self._pending or self._inflight == 0)
+                # Hold the tid while a finish of the pool that was sent
+                # before it arrived waits for its reply: the tid can be the
+                # one of that finish. A later finish commits a later tid.
+                horizon = self._sent
+                self._cv.wait_for(
+                    lambda: tid in self._pending
+                    or not any(n <= horizon for n in self._unreplied)
+                )
                 func = self._pending.pop(tid, None)
             try:
                 if func is not None:
@@ -139,19 +147,21 @@ class ZoeClientStorage:
 
     def _finish_in_order(self, client, txn, func):
         with self._cv:
-            self._inflight += 1
+            self._sent += 1
+            number = self._sent
+            self._unreplied.add(number)
         try:
             tid = txn.finish()
         except BaseException:
             with self._cv:
-                self._inflight -= 1
+                self._unreplied.discard(number)
                 self._cv.notify_all()
             raise
         finally:
             self._free.put(client)
         with self._cv:
             self._pending[tid] = func
-            self._inflight -= 1
+            self._unreplied.discard(number)
             self._cv.notify_all()
             self._cv.wait_for(lambda: self._ltid >= tid)
             error = self._errors.pop(tid, None)
