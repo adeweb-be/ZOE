@@ -7,16 +7,15 @@
 //!
 //! - `--scratch SCRATCH` (`ZOE_SCRATCH`) names the directory of the copy.
 //!   The command then puts nothing in the temporary directory (`TMPDIR`).
-//!   Without `--scratch`, the copy goes to the temporary directory, as
-//!   before. `--scratch` without `--backup` is a usage error.
+//!   Without `--scratch`, the copy goes to the temporary directory.
+//!   `--scratch` without `--backup` is a usage error.
 //! - The command restores the dumps before it opens the store, so the
 //!   store stays free while the copy is built. A dump that does not
 //!   restore fails the command before the open: the message names the
 //!   dump, also when another process holds the store.
-//! - The copy is a store that the command removes at the end, so it is
-//!   built with the restore that does not sync each transaction. This test
-//!   does not measure that: the claims of the card give the time of the
-//!   check before and after.
+//! - The copy is a store that the command removes at the end, also when
+//!   the check fails. It is built with the normal durable restore, as
+//!   `zoe restore` builds a store.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
