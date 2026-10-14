@@ -81,7 +81,8 @@ enum Access {
 
 impl Tls {
     /// Read the files of `options`. Fail with a message that names the
-    /// file that does not read, holds no PEM item or does not fit.
+    /// file that does not read, holds no PEM item or does not fit. The
+    /// message of an error of the ring provider names the provider.
     pub(crate) fn load(options: &TlsOptions) -> Result<Self, String> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let certs = certificates(&options.cert)?;
@@ -89,30 +90,26 @@ impl Tls {
             .map_err(|error| format!("{}: {error}", options.key.display()))?;
         let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
-            .map_err(|error| error.to_string())?;
-        let writers = options.client_ca.as_deref().map(roots).transpose()?;
-        let readers = options
-            .read_only_client_ca
-            .as_deref()
-            .map(roots)
-            .transpose()?;
+            .map_err(|error| format!("the ring provider: {error}"))?;
+        let writers = options.client_ca.as_deref().map(ca).transpose()?;
+        let readers = options.read_only_client_ca.as_deref().map(ca).transpose()?;
         let (builder, access) = match (writers, readers) {
             (None, None) => (builder.with_no_client_auth(), Access::AsAsked),
-            (Some(writers), None) => (
-                builder.with_client_cert_verifier(verifier(writers, &provider)?),
+            (Some((writers, path)), None) => (
+                builder.with_client_cert_verifier(verifier(writers, &provider, path)?),
                 Access::AsAsked,
             ),
-            (writers, Some(mut all)) => {
+            (writers, Some((mut all, path))) => {
                 // The handshake accepts a certificate of either CA.
                 let access = match writers {
                     None => Access::ReadOnly,
-                    Some(writers) => {
+                    Some((writers, path)) => {
                         all.roots.extend(writers.roots.iter().cloned());
-                        Access::Writers(verifier(writers, &provider)?)
+                        Access::Writers(verifier(writers, &provider, path)?)
                     }
                 };
                 (
-                    builder.with_client_cert_verifier(verifier(all, &provider)?),
+                    builder.with_client_cert_verifier(verifier(all, &provider, path)?),
                     access,
                 )
             }
@@ -175,15 +172,21 @@ fn roots(path: &Path) -> Result<RootCertStore, String> {
     Ok(roots)
 }
 
+/// Read the client CA file `path`: its trust anchors and its path.
+fn ca(path: &Path) -> Result<(RootCertStore, &Path), String> {
+    Ok((roots(path)?, path))
+}
+
 /// Return the verifier that requires a client certificate that chains to
-/// one of `roots`.
+/// one of `roots`. An error names the CA file `path`.
 fn verifier(
     roots: RootCertStore,
     provider: &Arc<CryptoProvider>,
+    path: &Path,
 ) -> Result<Arc<dyn ClientCertVerifier>, String> {
     WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
         .build()
-        .map_err(|error| format!("a client CA: {error}"))
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]

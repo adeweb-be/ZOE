@@ -1112,6 +1112,12 @@ impl Session {
     /// with `StorageError`. It does not stop during the mark. The store
     /// keeps what the pack did not remove, and the next pack removes it.
     fn pack(&self, args: &[Value]) -> Result<Value, Fault> {
+        // A pack deletes data. A read-only client may not pack. A
+        // connection that registered read-only by its own choice packs, as
+        // `zeopack` needs.
+        if self.read_only_client {
+            return Err(Fault::read_only());
+        }
         let time = match args {
             [time] | [time, _] => time,
             _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
@@ -4085,6 +4091,28 @@ mod tests {
             failed(call(&mut reader, "new_oids", vec![])),
             Fault::read_only()
         );
+    }
+
+    #[test]
+    fn a_read_only_client_does_not_pack() {
+        let storage = storage("pack-read-only-certificate", Queues::DEFAULT);
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+
+        // A client with a certificate of the read-only client CA.
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
+        let session = Session::new(Arc::clone(&storage), outbox, never_stops());
+        let mut reader = Client::of(session.read_only_client(true));
+        let register = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut reader, "register", register)), p64(new));
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(failed(call(&mut reader, "pack", pack)), Fault::read_only());
+        assert!(frames.try_recv().is_none());
+
+        // The store keeps the old revision of the root.
+        let load = done(call(&mut reader, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
     }
 
     #[test]
