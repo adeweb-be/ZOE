@@ -40,6 +40,10 @@ pub const DEFAULT_MAX_FRAME_SIZE: NonZeroU32 = NonZeroU32::new(256 << 20).unwrap
 /// The default of `--shutdown-timeout`: 30 seconds.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default of `--idle-timeout`: 300 seconds. A stock client sends a
+/// heartbeat every 60 seconds, so it keeps its connection.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The last part of the shutdown timeout, in which a stop closes the
 /// connections that did not end and waits for their sessions. When the
 /// timeout is shorter than twice this part, the stop uses the last half of
@@ -88,6 +92,7 @@ pub struct ServeOptions {
     lock_timeout: Option<Duration>,
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl ServeOptions {
@@ -95,7 +100,8 @@ impl ServeOptions {
     /// ZEO. Listen on a free port of 127.0.0.1, with frames of at most
     /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
     /// 100,000 transactions, and 1,000 invalidations can wait for one
-    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`].
+    /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
+    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`] closes.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::with_storages([StorageOptions::new(protocol::STORAGE_NAME, path)])
     }
@@ -110,6 +116,7 @@ impl ServeOptions {
             lock_timeout: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -164,6 +171,19 @@ impl ServeOptions {
     #[must_use]
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Close a connection that sends no frame for `timeout`. The time counts
+    /// from the last frame that the server read, a heartbeat included, and
+    /// from the accept for the protocol of the client. The time while the
+    /// call queue of the connection is full does not count. The close stops
+    /// the writer at once, as a close of the hub does. The session runs the
+    /// calls that arrived, up to the first reply that it cannot queue, then
+    /// aborts its open transaction. A timeout of 0 closes no connection.
+    #[must_use]
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 
@@ -289,6 +309,7 @@ impl Server {
             listener,
             Arc::clone(&storages),
             options.max_frame_size.get(),
+            (!options.idle_timeout.is_zero()).then_some(options.idle_timeout),
             stopping,
             Arc::clone(&tasks),
         );
@@ -403,12 +424,13 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// Accept clients until `stopping` tells that the server stops. Then drop
 /// the listener, so the server accepts no more connections. Each connection
-/// takes frames of at most `max_frame_size` bytes, and counts in `tasks`
-/// while it runs.
+/// takes frames of at most `max_frame_size` bytes, closes after
+/// `idle_timeout` without a frame, and counts in `tasks` while it runs.
 async fn accept(
     listener: TcpListener,
     storages: Arc<Storages>,
     max_frame_size: u32,
+    idle_timeout: Option<Duration>,
     mut stopping: Stopping,
     tasks: Arc<Tasks>,
 ) {
@@ -426,6 +448,7 @@ async fn accept(
                     stream,
                     Arc::clone(&storages),
                     max_frame_size,
+                    idle_timeout,
                     stopping.clone(),
                 );
                 tokio::spawn(async move {
