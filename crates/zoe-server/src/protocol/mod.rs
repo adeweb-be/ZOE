@@ -34,7 +34,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, watch};
@@ -211,11 +211,26 @@ impl Stopping {
     }
 }
 
+/// Wait for `timeout`, or forever when it is `None`.
+async fn idle(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Serve one client on `stream` until it closes, until the server closes
 /// the connection, or until `stopping` tells that the server stops. The
 /// client selects one of `storages` with `register`. A frame longer than
 /// `max_frame_size` bytes closes the connection before the server reserves
 /// memory for it.
+///
+/// The server closes the connection when the client sends no frame for
+/// `idle_timeout`: no protocol after the accept, or no frame after the last
+/// frame. The time while the reader waits for room in the call queue does
+/// not count, because the client cannot send then. This close is an end of
+/// the connection, as a close of the client is. `None` closes no idle
+/// connection.
 ///
 /// At a stop, the reader reads no more frames. The session runs the calls
 /// that the reader already decoded, so a `tpc_finish` that the server
@@ -226,6 +241,7 @@ pub(crate) async fn serve_connection(
     stream: TcpStream,
     storages: Arc<Storages>,
     max_frame_size: u32,
+    idle_timeout: Option<Duration>,
     mut stopping: Stopping,
 ) {
     let peer = stream
@@ -239,6 +255,10 @@ pub(crate) async fn serve_connection(
     let protocol = tokio::select! {
         protocol = frame::read(&mut reader, max_frame_size) => protocol,
         () = stopping.wait() => return,
+        () = idle(idle_timeout) => {
+            eprintln!("zoe serve: {peer}: no protocol within the idle timeout: closing the connection");
+            return;
+        }
     };
     match protocol {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
@@ -304,12 +324,18 @@ pub(crate) async fn serve_connection(
 
     loop {
         // An end of the connection or a stop wins over a frame that waits.
+        // A frame that arrived wins over the idle timeout. The idle time
+        // starts again for each frame, after the call queue took the call.
         let read = tokio::select! {
             biased;
             () = closed.notified() => break,
             () = closing.wait() => break,
             () = stopping.wait() => break,
             read = frame::read(&mut reader, max_frame_size) => read,
+            () = idle(idle_timeout) => {
+                eprintln!("zoe serve: {peer}: no frame within the idle timeout: closing the connection");
+                break;
+            }
         };
         let bytes = match read {
             Ok(Some(bytes)) => bytes,
@@ -402,7 +428,7 @@ mod tests {
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
-            serve_connection(stream, served, max, never_stops()).await;
+            serve_connection(stream, served, max, None, never_stops()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();
@@ -486,6 +512,7 @@ mod tests {
                     stream,
                     Arc::clone(&served),
                     max,
+                    None,
                     never_stops(),
                 ));
             }
@@ -743,6 +770,52 @@ mod tests {
         wait_until("the store of a stays open", || {
             Store::open_read_only(dir.join("a")).is_ok()
         });
+    }
+
+    #[test]
+    fn the_idle_time_does_not_count_while_the_call_queue_is_full() {
+        use crate::serve::{ServeOptions, Server};
+
+        let dir = std::env::temp_dir().join(format!("zoe-protocol-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = ServeOptions::new(&dir)
+            .lock_timeout(Duration::from_secs(60))
+            .idle_timeout(Duration::from_millis(300));
+        // The test keeps the store, so it can hold a lock there.
+        let mut kept = None;
+        let server = Server::start_with(options, |_, path, options| {
+            let store = Arc::new(Store::open_with(path, options).unwrap());
+            kept = Some(Arc::clone(&store));
+            Ok(store)
+        })
+        .unwrap();
+        let store = kept.unwrap();
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder
+            .store(zoe_core::Oid(1), Tid::ZERO, b"pickle")
+            .unwrap();
+        holder.vote().unwrap();
+        // The vote of the client waits for the lock. Its next calls fill the
+        // call queue, and the reader waits for room.
+        let mut client = registered(server.addr());
+        begin_and_store(&mut client, 1);
+        send(&mut client, 2, "vote", vec![Value::from(7)]);
+        std::thread::sleep(Duration::from_millis(100));
+        for id in 3..=3 + QUEUE as i64 {
+            send(&mut client, id, "ping", vec![]);
+        }
+        // The client sends nothing for more than three times the timeout.
+        // The connection stays open, because the reader waits for room.
+        std::thread::sleep(Duration::from_secs(1));
+        drop(holder);
+        let frames = read_until_closed(&mut client);
+        let methods: Vec<&str> = frames.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, [".reply"; 2 + QUEUE], "{frames:?}");
+        assert_eq!(frames[0].1, Value::Array(Vec::new()));
+        // Then the idle connection closes, and its transaction aborts.
+        wait_until("the locks stay", || store.lock_table_is_empty());
+        drop(store);
+        server.stop();
     }
 
     #[test]

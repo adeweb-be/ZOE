@@ -126,6 +126,23 @@ pub(super) struct ServeArgs {
     )]
     shutdown_timeout: Duration,
 
+    /// The longest time that a connection sends no frame, in whole seconds,
+    /// such as 300, 300s or 5m. A heartbeat is a frame, and a stock client
+    /// sends one every 60 seconds. The server closes a connection that is
+    /// idle for longer: its open transaction aborts and its locks go, as
+    /// when the client closes. So a client that stalls during a commit, or
+    /// a host that dies, holds its locks at most this long. The time while
+    /// the server reads no calls of the connection, because 4 calls wait,
+    /// does not count. 0 closes no idle connection.
+    #[arg(
+        long,
+        env = "ZOE_IDLE_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = whole_seconds
+    )]
+    idle_timeout: Duration,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
@@ -288,7 +305,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .listen(args.listen)
         .invalidation_queue_size(args.invalidation_queue_size)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
-        .shutdown_timeout(args.shutdown_timeout);
+        .shutdown_timeout(args.shutdown_timeout)
+        .idle_timeout(args.idle_timeout);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
@@ -350,6 +368,17 @@ mod tests {
         let args = serve(&["--shutdown-timeout", "0"]).unwrap();
         assert_eq!(args.shutdown_timeout, Duration::ZERO);
         let error = serve(&["--shutdown-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_idle_timeout_is_300_seconds_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().idle_timeout, Duration::from_secs(300));
+        let args = serve(&["--idle-timeout", "2m"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::from_secs(120));
+        let args = serve(&["--idle-timeout", "0"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::ZERO);
+        let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
