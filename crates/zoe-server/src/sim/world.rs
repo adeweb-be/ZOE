@@ -332,6 +332,15 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Return the state if no other thread holds it.
+    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, State>> {
+        match self.state.try_lock() {
+            Ok(state) => Some(state),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Return the time now.
     pub(crate) fn now(&self) -> Duration {
         self.lock().now

@@ -48,6 +48,11 @@ use world::{Baton, NetFault, Owner, Resume, Shared, Task, TaskWaker, Timer, Wait
 /// simulator or a livelock of the code that it runs.
 const MAX_STEPS: u64 = 50_000_000;
 
+/// The longest real time that the driver waits for a thread to give the
+/// baton back. A thread that takes longer is stuck, and the run fails with
+/// the end of its trace.
+const BATON_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The longest one-way delay of a frame when `Faults::delay` is `None`.
 const DEFAULT_DELAY: Duration = Duration::from_millis(2);
 
@@ -468,7 +473,13 @@ impl Driver {
             .resume
             .send(how)
             .expect("the thread waits for the baton");
-        let (from, why) = self.yields.recv().expect("the thread gives the baton back");
+        let Ok((from, why)) = self.yields.recv_timeout(BATON_TIMEOUT) else {
+            panic!(
+                "a thread does not give the baton back within {} s:\n{}",
+                BATON_TIMEOUT.as_secs(),
+                self.tail()
+            );
+        };
         assert_eq!(from, id, "only one thread runs at a time");
         let mut state = self.shared.lock();
         match why {
@@ -660,9 +671,12 @@ impl Driver {
         state.now = state.now.max(next);
     }
 
-    /// Return the end of the trace, for a failure.
+    /// Return the end of the trace, for a failure. A thread that is stuck
+    /// can hold the state, so the call does not wait for it.
     fn tail(&self) -> String {
-        let state = self.shared.lock();
+        let Some(state) = self.shared.try_lock() else {
+            return "(a stuck thread holds the state of the run)".to_owned();
+        };
         let start = state.trace.len().saturating_sub(40);
         state.trace[start..].join("\n")
     }
@@ -676,10 +690,15 @@ impl Drop for Driver {
         let mut state = self.shared.lock();
         state.spawned.clear();
         drop(state);
+        // After a failure, a thread can be stuck: the drop does not wait
+        // for it.
+        let failed = std::thread::panicking();
         for (_, baton) in std::mem::take(&mut self.batons) {
             let _ = baton.resume.send(Resume::Killed);
             drop(baton.resume);
-            let _ = baton.join.join();
+            if !failed {
+                let _ = baton.join.join();
+            }
         }
     }
 }
