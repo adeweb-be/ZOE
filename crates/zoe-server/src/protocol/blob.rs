@@ -655,12 +655,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_server_stops_during_a_download_that_the_client_does_not_read() {
-        let dir = fresh_dir("stop-download");
+    /// Stop a server during a download that the client does not read, in
+    /// a directory named after `name`. Check that the server stops within
+    /// its shutdown timeout and that the store then opens read-only.
+    fn stop_during_a_download(name: &str) {
+        let dir = fresh_dir(name);
         let tid = commit_blob(&Store::open(&dir).unwrap(), Oid(1), &vec![3; 256 * CHUNK]);
         let timeout = Duration::from_secs(2);
         let server = Server::start(ServeOptions::new(&dir).shutdown_timeout(timeout)).unwrap();
+        let stop_times = server.stop_times();
         let mut reader = Client::connect_slow(server.addr());
         reader.send("sendBlob", vec![p64(1), p64(tid.0)]);
         let (_, _, method, _) = decode(&reader.read_frame());
@@ -668,7 +671,6 @@ mod tests {
         // The session waits for room in its queue. The stop waits for the
         // client until the forced close, which ends the session.
         let (stopped, wait) = std::sync::mpsc::channel();
-        let started = Instant::now();
         std::thread::spawn(move || {
             server.stop();
             let _ = stopped.send(());
@@ -677,11 +679,21 @@ mod tests {
             wait.recv_timeout(TIMEOUT).is_ok(),
             "the server did not stop"
         );
-        assert!(started.elapsed() <= timeout, "{:?}", started.elapsed());
+        // The shutdown timeout bounds the time from the start of the stop
+        // to the end of its wait for the sessions. That time does not
+        // include the spawn of the thread above or the close of the stores.
+        let times = stop_times.get().expect("the stop sets its times");
+        let waited = times.waited - times.start;
+        assert!(waited <= timeout, "{waited:?}");
         // The session ended before the stop closed the store.
         Store::open_read_only(&dir).unwrap();
         drop(reader);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_server_stops_during_a_download_that_the_client_does_not_read() {
+        stop_during_a_download("stop-download");
     }
 
     /// The scenario of the test above, with its checks, runs five times
