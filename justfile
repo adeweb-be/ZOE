@@ -169,11 +169,17 @@ conformance:
 # starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
 # end. `just plone zeoclient-mount check` starts one `zoe serve` with the
 # two named storages main and content, and puts the site in the mount
-# point /content. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# point /content. `just plone zoe suites` runs the test suites of
+# Products.CMFPlone, plone.app.contenttypes and plone.restapi with the
+# `bin/test` of the scenario, on the layer of zoe.plone.testing; the options
+# that follow go to `bin/test`. `just plone zeoclient suites` runs them
+# against a `zoe serve` on a new store, which it starts and stops, and
+# `just plone filestorage suites` runs them on the stock storages of
+# plone.testing. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
 # admin user as user:password. Without it, the recipe makes a random
 # password once, in target/plone/admin. The instance listens on 127.0.0.1,
 # on the port ZOE_PLONE_PORT or 8080.
-plone scenario="zoe" command="start":
+plone scenario="zoe" command="start" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
@@ -239,14 +245,79 @@ plone scenario="zoe" command="start":
     # configuration. zope2instance makes the log directory only when it
     # writes zope.conf, and the zoe scenario writes its own zope.conf.
     mkdir -p "$target/extends" "$target/{{ scenario }}/var/log"
+    # The suites need the part `test` of base.cfg, the test script. The
+    # suites run on the stock storages of plone.testing, on zoe.Storage or
+    # on a ZEO client of zoe serve.
+    parts=()
+    if [ "{{ command }}" = suites ]; then
+        case "{{ scenario }}" in
+            filestorage | zoe | zeoclient)
+                ;;
+            *)
+                echo "just plone: the suites run on filestorage, zoe or zeoclient." >&2
+                exit 2
+                ;;
+        esac
+        parts=("buildout:parts+=test")
+    fi
     # -N installs only what is missing. The user has an empty password, so
     # zope2instance writes no inituser file; set_admin.py gives the password
     # in the instance. Only this user reads the record of buildout.
     "$venv/bin/buildout" -N -c "plone/{{ scenario }}.cfg" \
         "buildout:extends-cache=$target/extends" \
         "instance:user=$user:" \
-        "instance:http-address=127.0.0.1:$port"
+        "instance:http-address=127.0.0.1:$port" \
+        "${parts[@]}"
     chmod 600 "$target/{{ scenario }}/.installed.cfg"
+    # At the exit, stop the instance, then the server, also when a step
+    # fails. SIGTERM makes zoe serve close its store cleanly.
+    pid=""
+    server=""
+    stop() {
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" || true
+        fi
+        if [ -n "$server" ]; then
+            kill -TERM "$server" 2>/dev/null || true
+            wait "$server" || true
+        fi
+    }
+    trap stop EXIT
+    # Start `zoe serve` in the background with the options that follow the
+    # log file, and wait until it listens. Then `server` is its pid and
+    # `address` the address that it listens on. The server is the `zoe`
+    # binary of this build.
+    serve() {
+        local log="$1" tries=0
+        shift
+        cargo build --locked -p zoe-server --bin zoe
+        zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+        # The server gets no ZOE_* variable of the caller, so only the
+        # options here apply. The admin password does not go to the
+        # server.
+        (
+            for name in "${!ZOE_@}"; do
+                unset "$name"
+            done
+            exec "$zoe" serve "$@"
+        ) </dev/null >"$log" 2>&1 &
+        server=$!
+        # zoe serve writes `listening <address>` once it accepts
+        # connections. Stop when the server exits or does not listen,
+        # before a ZEO client waits for it.
+        until grep -q '^listening ' "$log"; do
+            tries=$((tries + 1))
+            if ! kill -0 "$server" 2>/dev/null || [ "$tries" -gt 300 ]; then
+                cat "$log" >&2
+                echo "just plone: zoe serve does not listen, see $log" >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
+        address="$(sed -n 's/^listening //p' "$log" | head -n 1)"
+        echo "just plone: zoe serve listens on $address, its log is $log"
+    }
     case "{{ command }}" in
         build)
             ;;
@@ -261,21 +332,6 @@ plone scenario="zoe" command="start":
             # A new mark in the title of the site tells that read_site.py
             # reads this instance, and not another process on the port.
             mark="mark-$RANDOM$RANDOM"
-            # At the exit, stop the instance, then the server, also when a
-            # step fails. SIGTERM makes zoe serve close its store cleanly.
-            pid=""
-            server=""
-            stop() {
-                if [ -n "$pid" ]; then
-                    kill "$pid" 2>/dev/null || true
-                    wait "$pid" || true
-                fi
-                if [ -n "$server" ]; then
-                    kill -TERM "$server" 2>/dev/null || true
-                    wait "$server" || true
-                fi
-            }
-            trap stop EXIT
             # The instance gives the site from its root, or from the mount
             # point /content of zeoclient-mount.
             folder=""
@@ -297,36 +353,10 @@ plone scenario="zoe" command="start":
                     ;;
             esac
             if [ "${#stores[@]}" -gt 0 ]; then
-                # The instance is a ZEO client of zoe serve. The server is
-                # the `zoe` binary of this build. It listens on the
-                # zeo-address of zeoclient.cfg.
-                cargo build --locked -p zoe-server --bin zoe
-                zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
-                log="$target/{{ scenario }}/var/log/zoe-serve.log"
-                # The server gets no ZOE_* variable of the caller, so only
-                # the options here apply. The admin password does not go
-                # to the server.
-                (
-                    for name in "${!ZOE_@}"; do
-                        unset "$name"
-                    done
-                    exec "$zoe" serve "${stores[@]}" --listen 127.0.0.1:8100
-                ) </dev/null >"$log" 2>&1 &
-                server=$!
-                # zoe serve writes `listening <address>` once it accepts
-                # connections. Stop when the server exits or does not
-                # listen, before a ZEO client waits for it.
-                tries=0
-                until grep -q '^listening ' "$log"; do
-                    tries=$((tries + 1))
-                    if ! kill -0 "$server" 2>/dev/null || [ "$tries" -gt 300 ]; then
-                        cat "$log" >&2
-                        echo "just plone: zoe serve does not listen, see $log" >&2
-                        exit 1
-                    fi
-                    sleep 0.1
-                done
-                echo "just plone: zoe serve listens on 127.0.0.1:8100, its log is $log"
+                # The instance is a ZEO client of zoe serve. It listens on
+                # the zeo-address of zeoclient.cfg.
+                serve "$target/{{ scenario }}/var/log/zoe-serve.log" \
+                    "${stores[@]}" --listen 127.0.0.1:8100
             fi
             "$instance" run plone/set_admin.py
             "$instance" run plone/create_site.py "$mark" ${folder:+"$folder"}
@@ -339,8 +369,25 @@ plone scenario="zoe" command="start":
             python3.13 plone/read_site.py "$site" "Check site $mark"
             python3.13 plone/read_site.py "$site/manage_main" portal_catalog
             ;;
+        suites)
+            # bin/test runs the suites unchanged. In the zoe and zeoclient
+            # scenarios, its initialization installs the layer of
+            # zoe.plone.testing, which gives plone.testing its base storage.
+            if [ "{{ scenario }}" = zeoclient ]; then
+                # A new store for each run. The layer reads the address of
+                # the server from ZOE_PLONE_ZEO_ADDRESS.
+                store="$target/zeoclient/var/suites"
+                rm -rf "$store"
+                serve "$target/zeoclient/var/log/zoe-serve-suites.log" \
+                    --path "$store" --listen 127.0.0.1:0
+                export ZOE_PLONE_ZEO_ADDRESS="$address"
+            fi
+            set -- {{ args }}
+            "$target/{{ scenario }}/bin/test" -s Products.CMFPlone \
+                -s plone.app.contenttypes -s plone.restapi "$@"
+            ;;
         *)
-            echo "just plone: unknown command {{ command }}. Use start, build or check." >&2
+            echo "just plone: unknown command {{ command }}. Use start, build, check or suites." >&2
             exit 2
             ;;
     esac
