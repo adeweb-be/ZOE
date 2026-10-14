@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = ["serve"]
 # The server code and `zoe mcp`. Only this feature may bring in tokio. The
-# extension module turns it off, so it never links tokio.
+# extension module turns it off, so it never links the server or rmcp.
 serve = [
     "dep:tokio",
     "dep:libc",

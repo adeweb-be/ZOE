@@ -31,6 +31,9 @@ const ERROR: i64 = 2;
 /// The class of the conflict error of ZODB.
 const CONFLICT: &str = "ZODB.POSException.ConflictError";
 
+/// The class of the read conflict error of ZODB.
+const READ_CONFLICT: &str = "ZODB.POSException.ReadConflictError";
+
 /// Read one frame from `reader`. Return `None` at the end of the stream
 /// before a frame starts. An end inside a frame fails with `UnexpectedEof`.
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
@@ -155,7 +158,10 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Message, Error> {
 }
 
 /// Return the error of an error reply, whose args are `[class, value]`. A
-/// `ConflictError` with an oid is `Error::Conflict`.
+/// `ConflictError` with an oid is `Error::Conflict`, and a
+/// `ReadConflictError` with an oid is `Error::ReadConflict`. The message
+/// of another error is empty without an argument, the text of its one
+/// argument, or else the value.
 fn server_error(args: Value) -> Error {
     let (class, value) = match args {
         Value::Array(items) if items.len() == 2 => {
@@ -172,10 +178,19 @@ fn server_error(args: Value) -> Error {
     {
         return conflict;
     }
-    Error::Server {
-        class,
-        message: value.to_string(),
+    if class == READ_CONFLICT
+        && let Some(Error::Conflict { oid, serials }) = conflict(&value)
+    {
+        return Error::ReadConflict { oid, serials };
     }
+    let message = match &value {
+        Value::Array(items) if items.is_empty() => String::new(),
+        Value::Array(items) if items.len() == 1 && items[0].as_str().is_some() => {
+            items[0].as_str().unwrap_or_default().to_owned()
+        }
+        value => value.to_string(),
+    };
+    Error::Server { class, message }
 }
 
 /// Return `Error::Conflict` from a map with the keys `oid` and `serials`,
@@ -338,6 +353,68 @@ mod tests {
                 result: Err(Error::Conflict { serials: None, .. }),
                 ..
             } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_conflict_error_gives_its_oid_and_serials() {
+        let value = Value::Map(vec![
+            ("message".into(), "database read conflict error".into()),
+            ("oid".into(), bin8(5)),
+            ("class_name".into(), Value::Nil),
+            ("serials".into(), Value::Array(vec![bin8(3), bin8(2)])),
+        ]);
+        let bytes = encode(Value::Array(vec![
+            1.into(),
+            2.into(),
+            ".reply".into(),
+            Value::Array(vec![READ_CONFLICT.into(), value]),
+        ]));
+        match decode(&bytes).unwrap() {
+            Message::Reply {
+                result: Err(Error::ReadConflict { oid, serials }),
+                ..
+            } => {
+                assert_eq!(oid, Oid(5));
+                assert_eq!(serials, Some((Tid(3), Tid(2))));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_message_of_an_error_is_the_text_of_its_arguments() {
+        let reply = |args: Value| {
+            encode(Value::Array(vec![
+                1.into(),
+                2.into(),
+                ".reply".into(),
+                Value::Array(vec!["builtins.TypeError".into(), args]),
+            ]))
+        };
+        match decode(&reply(Value::Array(vec!["bad args".into()]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { class, message }),
+                ..
+            } => {
+                assert_eq!(class, "builtins.TypeError");
+                assert_eq!(message, "bad args");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(&reply(Value::Array(vec![1.into(), 2.into()]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { message, .. }),
+                ..
+            } => assert_eq!(message, "[1, 2]"),
+            other => panic!("{other:?}"),
+        }
+        match decode(&reply(Value::Array(vec![]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { message, .. }),
+                ..
+            } => assert_eq!(message, ""),
             other => panic!("{other:?}"),
         }
     }

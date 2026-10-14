@@ -148,7 +148,7 @@ class ZoeClient(BaseConfig):
     """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
 
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
-    and `wait-timeout` as `wait_timeout`.
+    `wait-timeout` as `wait_timeout` and `native` as `native`.
     """
 
     def open(self):
@@ -179,5 +179,6 @@ class ZoeClient(BaseConfig):
             password=config.password,
             realm=config.realm,
             wait_timeout=config.wait_timeout,
+            native=config.native,
             **options,
         )

@@ -19,8 +19,9 @@
 //! signal during the start stops the server when the start ends, so a
 //! store that the start creates is complete and closes cleanly.
 //!
-//! The console script of the wheel has no server: its extension never
-//! links tokio. There, the command fails with 1 and names the `zoe` binary.
+//! The console script of the wheel has no server: its extension is built
+//! without the feature `serve`. There, the command fails with 1 and names
+//! the `zoe` binary.
 
 use std::io::Write;
 use std::net::SocketAddr;

@@ -2443,7 +2443,10 @@ name = "zoe-py"
 version = "0.0.0"
 dependencies = [
  "pyo3",
+ "rmpv",
  "signal-hook",
+ "tokio",
+ "zoe-client",
  "zoe-core",
  "zoe-server",
 ]

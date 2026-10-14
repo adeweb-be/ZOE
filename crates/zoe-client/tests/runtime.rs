@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use zoe_client::runtime::{BoxFuture, Stream};
-use zoe_client::{Client, Error, Runtime, Tokio};
+use zoe_client::{Client, Error, Options, Runtime, Tokio};
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
 
@@ -523,4 +523,176 @@ async fn a_blob_commits_against_the_server() {
     assert!(got == blob, "the store holds the blob");
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The options of a client that declares `sequences`.
+fn declaring() -> Options {
+    Options {
+        read_only: false,
+        extensions: vec!["sequences".to_owned()],
+    }
+}
+
+#[tokio::test]
+async fn open_declares_the_extensions_and_reads_get_info() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.send_raw(b"M5").await;
+        assert_eq!(peer.recv_raw().await, b"M5");
+        let (id, _, method, args) = peer.recv().await;
+        assert_eq!(method, "register");
+        let declared = Value::Array(vec!["sequences".into()]);
+        assert_eq!(args, Value::Array(vec!["1".into(), false.into(), declared]));
+        peer.reply(id, bin8(4)).await;
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "get_info");
+        let info = Value::Map(vec![
+            ("length".into(), 2.into()),
+            ("extensions".into(), Value::Array(vec!["sequences".into()])),
+        ]);
+        peer.reply(id, info).await;
+        let (id, _, method, args) = peer.recv().await;
+        assert_eq!(method, "sequence_next");
+        assert_eq!(args, Value::Array(vec!["a".into()]));
+        peer.reply(id, 1.into()).await;
+        peer
+    });
+    let client = Client::open(runtime, addr(), "1", &declaring())
+        .await
+        .unwrap();
+    assert_eq!(client.last_transaction(), Tid(4));
+    assert_eq!(client.extensions(), ["sequences".to_owned()]);
+    assert!(client.info().is_map());
+    assert!(client.is_connected());
+    assert_eq!(client.sequence_next("a").await.unwrap(), 1);
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn open_registers_again_with_two_arguments_after_a_type_error() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.send_raw(b"M5").await;
+        assert_eq!(peer.recv_raw().await, b"M5");
+        // A stock server refuses the third argument.
+        let (id, _, method, args) = peer.recv().await;
+        assert_eq!(method, "register");
+        assert_eq!(args.as_array().unwrap().len(), 3);
+        let error = Value::Array(vec![
+            "builtins.TypeError".into(),
+            Value::Array(vec!["register() takes 3 positional arguments".into()]),
+        ]);
+        peer.send(Value::Array(vec![id, 2.into(), ".reply".into(), error]))
+            .await;
+        let (id, _, method, args) = peer.recv().await;
+        assert_eq!(method, "register");
+        assert_eq!(args, Value::Array(vec!["1".into(), false.into()]));
+        peer.reply(id, bin8(3)).await;
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "get_info");
+        peer.reply(id, Value::Map(vec![("length".into(), 0.into())]))
+            .await;
+        peer
+    });
+    let client = Client::open(runtime, addr(), "1", &declaring())
+        .await
+        .unwrap();
+    assert_eq!(client.last_transaction(), Tid(3));
+    assert!(client.extensions().is_empty());
+    // The server accepted no extension, so the call sends nothing.
+    let next = client.sequence_next("a").await;
+    assert!(matches!(next, Err(Error::Unsupported(_))), "{next:?}");
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_stale_read_fails_the_vote_with_a_read_conflict() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        let (_, _, method, args) = peer.recv().await;
+        assert_eq!(method, "tpc_begin");
+        let txn = args.as_array().unwrap()[0].clone();
+        let (_, flags, method, args) = peer.recv().await;
+        assert_eq!(flags, Value::from(true));
+        assert_eq!(method, "checkCurrentSerialInTransaction");
+        assert_eq!(args, Value::Array(vec![bin8(5), bin8(2), txn.clone()]));
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "vote");
+        let conflict = Value::Map(vec![
+            ("oid".into(), bin8(5)),
+            ("serials".into(), Value::Array(vec![bin8(3), bin8(2)])),
+        ]);
+        let error = Value::Array(vec!["ZODB.POSException.ReadConflictError".into(), conflict]);
+        peer.send(Value::Array(vec![id, 2.into(), ".reply".into(), error]))
+            .await;
+        let (id, _, method, args) = peer.recv().await;
+        assert_eq!(method, "tpc_abort");
+        assert_eq!(args, Value::Array(vec![txn]));
+        peer.reply(id, Value::Nil).await;
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    txn.check_current_serial(Oid(5), Tid(2)).await.unwrap();
+    match txn.vote().await {
+        Err(Error::ReadConflict { oid, serials }) => {
+            assert_eq!(oid, Oid(5));
+            assert_eq!(serials, Some((Tid(3), Tid(2))));
+        }
+        other => panic!("not a read conflict: {other:?}"),
+    }
+    drop(txn);
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_vote_gives_the_oids_that_the_server_resolved() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        let (_, _, method, _) = peer.recv().await;
+        assert_eq!(method, "tpc_begin");
+        let (_, _, method, _) = peer.recv().await;
+        assert_eq!(method, "storea");
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "vote");
+        peer.reply(id, Value::Array(vec![bin8(5)])).await;
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "tpc_finish");
+        peer.reply(id, bin8(9)).await;
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    txn.store(Oid(5), Tid(2), b"p").await.unwrap();
+    assert_eq!(txn.vote_resolved().await.unwrap(), vec![Oid(5)]);
+    assert_eq!(txn.finish().await.unwrap(), Tid(9));
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn disconnect_fails_the_later_calls() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut invalidations = client.invalidations();
+    assert!(matches!(invalidations.try_recv(), Ok(None)));
+    client.disconnect();
+    let next = tokio::time::timeout(TIMEOUT, invalidations.recv())
+        .await
+        .unwrap();
+    assert!(matches!(next, Err(Error::Disconnected)), "{next:?}");
+    assert!(!client.is_connected());
+    assert!(matches!(client.new_oids(1).await, Err(Error::Disconnected)));
+    assert!(matches!(invalidations.try_recv(), Err(Error::Disconnected)));
+    let _peer = server.await.unwrap();
+    client.close().await;
 }
