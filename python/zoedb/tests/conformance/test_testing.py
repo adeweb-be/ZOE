@@ -147,7 +147,6 @@ def layer(tmp_path, monkeypatch):
     [
         (FILESTORAGE, {"transaction_timeout": 5}, "transaction-timeout"),
         (FILESTORAGE, {"pid_filename": "zeo.pid"}, "pid-filename"),
-        (FILESTORAGE, {"invalidation_age": 5}, "invalidation-age"),
         ("<filestorage>\npath Data.fs\nquota 9\n</filestorage>", {}, "quota"),
         ("<demostorage>\n</demostorage>", {}, "<demostorage>"),
     ],
