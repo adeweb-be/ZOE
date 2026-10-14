@@ -3,10 +3,15 @@
 //! that their votes meet on locks and conflicts.
 //!
 //! A client reads the current serial of each oid with `loadBefore`, then
-//! stores, votes and finishes. A conflict aborts and tries again. A lost
-//! connection connects again, as `ZEO.ClientStorage` does. A `tpc_finish`
-//! whose reply does not arrive has an unknown outcome, and the client does
-//! not count it.
+//! stores, votes and finishes. With blobs, a transaction can also store a
+//! blob to an oid of the blob oids, as `ZEO.ClientStorage` uploads it. A
+//! conflict aborts and tries again. A lost connection connects again, as
+//! `ZEO.ClientStorage` does. A `tpc_finish` whose reply does not arrive has
+//! an unknown outcome, and the client does not count it.
+//!
+//! A client tells the driver when its commit reaches a phase where a
+//! planned crash can come: staged before the vote, locked after the vote,
+//! and acknowledged after the reply of `tpc_finish`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,11 +22,25 @@ use zoe_core::{Oid, Tid};
 
 use super::rng::Rng;
 use super::server::SimRuntime;
-use super::world::{Acked, Shared, sleep};
+use super::world::{Acked, Shared, phase, sleep};
 use crate::protocol::STORAGE_NAME;
 
 /// The oids that the clients share.
 const OIDS: u64 = 6;
+
+/// The oids of the blobs, after the other oids. An oid holds blobs or
+/// other records, never both, as in ZODB.
+const BLOB_OIDS: u64 = 3;
+
+/// The chance that a transaction stores a blob, when the run has blobs.
+const BLOB_CHANCE: f64 = 0.3;
+
+/// The largest blob. A blob of more than `BLOB_CHUNK` bytes goes up in two
+/// chunks.
+const MAX_BLOB: u64 = 70_000;
+
+/// The pickle of a `ZODB.blob.Blob`.
+const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
 /// The tries of one transaction.
 const TRIES: usize = 8;
@@ -51,6 +70,8 @@ pub(crate) struct SimClient {
     /// The time that the client stalls after its first vote, with its
     /// locks.
     pub(crate) stall: Option<Duration>,
+    /// The client also commits blobs.
+    pub(crate) blobs: bool,
 }
 
 impl SimClient {
@@ -123,7 +144,8 @@ impl SimClient {
         }
     }
 
-    /// Record a commit that the server acknowledged.
+    /// Record a commit that the server acknowledged. It reached the phase
+    /// `acknowledged`.
     fn acknowledge(&self, acked: Acked) {
         let mut state = self.shared.lock();
         state.trace(format!("c{} commits tid {:016x}", self.id, acked.tid));
@@ -132,6 +154,19 @@ impl SimClient {
             *known = (*known).max(acked.tid);
         }
         state.acked.push(acked);
+        drop(state);
+        self.reach(phase::ACKNOWLEDGED);
+    }
+
+    /// Tell the driver that a commit of the client reached `phase`. When a
+    /// planned crash comes there, the driver crashes the server after this
+    /// step of the client.
+    fn reach(&self, phase: &'static str) {
+        let mut state = self.shared.lock();
+        if state.crash_at(phase) {
+            state.trace(format!("c{} reaches the phase {phase}", self.id));
+            state.crash_now = Some(phase);
+        }
     }
 
     /// Load the current serial of `oid`. Count a stale read: a serial
@@ -183,6 +218,18 @@ impl SimClient {
             let value = format!("c{} t{t} a{attempt} oid {oid}", self.id);
             records.push((oid, serial, record(value.as_bytes())));
         }
+        let mut blob = None;
+        if self.blobs && self.rng.chance(BLOB_CHANCE) {
+            let oid = OIDS + 1 + self.rng.below(BLOB_OIDS);
+            let size = self.rng.below(MAX_BLOB + 1) as usize;
+            let serial = match self.serial(client, oid).await {
+                Ok(serial) => serial,
+                Err(outcome) => return outcome,
+            };
+            let value = format!("c{} t{t} a{attempt} blob {oid} ", self.id);
+            let bytes: Vec<u8> = value.bytes().cycle().take(size).collect();
+            blob = Some((oid, serial, bytes));
+        }
         let lost = |error: Error| match error {
             Error::Disconnected => Outcome::Lost { in_finish: false },
             _ => Outcome::Retry,
@@ -197,24 +244,40 @@ impl SimClient {
                 return lost(error);
             }
         }
+        if let Some((oid, serial, bytes)) = &blob
+            && let Err(error) = txn.store_blob(Oid(*oid), *serial, BLOB_PICKLE, bytes).await
+        {
+            return lost(error);
+        }
+        self.reach(phase::STAGED);
         if let Err(error) = txn.vote().await {
             if let Error::Conflict { oid, .. } = &error {
                 self.trace(&format!("conflicts on oid {}", oid.0));
             }
             return lost(error);
         }
+        self.reach(phase::LOCKED);
         if let Some(stall) = self.stall.take() {
             self.trace(&format!("stalls {} s and keeps its locks", stall.as_secs()));
             sleep(&self.shared, stall).await;
         }
         match txn.finish().await {
-            Ok(tid) => Outcome::Acked(Acked {
-                tid: tid.0,
-                records: records
+            Ok(tid) => {
+                let mut stored: Vec<(u64, Vec<u8>)> = records
                     .into_iter()
                     .map(|(oid, _, data)| (oid, data))
-                    .collect(),
-            }),
+                    .collect();
+                let mut blobs = Vec::new();
+                if let Some((oid, _, bytes)) = blob {
+                    stored.push((oid, BLOB_PICKLE.to_vec()));
+                    blobs.push((oid, bytes));
+                }
+                Outcome::Acked(Acked {
+                    tid: tid.0,
+                    records: stored,
+                    blobs,
+                })
+            }
             Err(Error::Disconnected) => Outcome::Lost { in_finish: true },
             Err(_) => Outcome::Retry,
         }
