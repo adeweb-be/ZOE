@@ -215,10 +215,9 @@ impl Storage {
         options.blob_dir = blob_dir;
         let (store, last, path) = py
             .detach(|| {
-                // A read-only storage creates no directory. It opens the
-                // store for writes all the same, because the core has no
-                // read-only open yet. When the core gets one, a read-only
-                // storage uses it.
+                // A read-only storage creates no directory. It does not use
+                // the read-only open of the core: it opens the store for
+                // writes and takes the exclusive lock.
                 if read_only {
                     let blob_parent = match &options.blob_dir {
                         Some(blob_dir) => {
@@ -395,8 +394,8 @@ impl Storage {
     /// `zoe.storage.Storage.iterator` makes the records of ZODB.
     ///
     /// The iterator stops at the last tid at the time of this call. It
-    /// holds the rows of the range, and the records of one transaction at
-    /// a time.
+    /// holds one transaction and a slice of tids at a time, whatever the
+    /// length of the range.
     #[pyo3(name = "_iterator", signature = (start = None, stop = None))]
     fn iterator(
         &self,
@@ -584,6 +583,31 @@ impl Storage {
         let entry = self.entry(py, transaction)?;
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         py.detach(|| entry.with(|txn| Ok(txn.check_current_serial(oid, serial)?)))
+            .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage a deletion of `oid` in `transaction`: a record with an empty
+    /// pickle. This is `deleteObject` of ZODB's `IExternalGC`. `oldserial`
+    /// is the serial that the transaction read. The vote checks it as it
+    /// does for `store`: a stale serial raises `ConflictError`, and the
+    /// vote never resolves it. After the commit, `load` of `oid` raises
+    /// `POSKeyError`, and `loadBefore` still gives the older records until
+    /// a pack removes them. A read-only storage refuses the call.
+    #[pyo3(name = "deleteObject")]
+    fn delete_object(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        oldserial: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let entry = self.entry(py, transaction)?;
+        let oid = Oid(u64_of(oid)?);
+        let serial = serial_of(oldserial)?;
+        py.detach(|| entry.with(|txn| Ok(txn.delete(oid, serial)?)))
             .map_err(|failure| failure.into_py(py))
     }
 

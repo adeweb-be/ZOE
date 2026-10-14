@@ -61,7 +61,8 @@ pub enum ZoeError {
     },
 
     /// Another transaction changed the object since the serial that this
-    /// transaction read, or held its lock past the lock timeout.
+    /// transaction read, or held its lock past the lock timeout, or a
+    /// `LockCancel` ended the wait for its lock.
     /// `Txn::conflict_serials` gives the serials of a stale serial.
     #[error("conflict: oid {oid:?}")]
     Conflict {
@@ -142,7 +143,8 @@ pub enum ZoeError {
     NotClosedCleanly,
 
     /// The store is closed. A transaction iterator or a blob file outlived
-    /// its store.
+    /// its store. `Store::pack_until` also gives it when its stop ends the
+    /// pack between two batches.
     #[error("the store is closed")]
     Closed,
 

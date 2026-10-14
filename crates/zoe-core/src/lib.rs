@@ -30,11 +30,12 @@ pub use backend::{
     TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
-pub use clock::{Clock, SystemClock, timestamp};
-pub use commit::{Finished, Txn};
+pub use clock::{Clock, SystemClock, Waiter, timestamp};
+pub use commit::{Finished, Observer, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
+pub use lock::LockCancel;
 pub use pack::{ClassTotals, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use sequence::Sequence;

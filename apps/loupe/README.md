@@ -2,13 +2,23 @@
 
 Loupe is the desktop inspector and editor for ZOE stores and servers: a Tauri 2 application with a React and TypeScript window, built with Vite. Its Rust side is the `zoe-loupe` crate.
 
-Loupe v0 has folder mode, the object browser and time travel. It opens a store folder read-only and holds the lock of the store, so a running instance and Loupe never share a store. It shows the root, follows references and resolves Plone paths. For each object it shows the class, the oid, the serial, the size, the decoded state, the outbound references and the history. It never writes to the folder.
+Loupe has folder mode, the object browser, time travel and the space screen. It opens a store folder read-only and holds the lock of the store, so a running instance and Loupe never share a store. It shows the root, follows references and resolves Plone paths. For each object it shows the class, the oid, the serial, the size, the decoded state, the outbound references and the history. It never writes to the folder.
 
 Time travel has three parts:
 
 - The "as of" field in the folder bar takes a tid in ZODB form. The tree and the pane then show each object as it was after the last transaction at or before that tid. An empty field shows the last transaction.
 - The history of an object lists its revisions, newest first: the tid, the user, the description and the size of each. The button of a row sets the "as of" field to its tid.
 - The diff view compares the decoded states of two revisions, which the operator picks in the "From" and "To" columns of the history. Each change shows its JSON pointer and the value before and after it.
+
+The space screen measures the store as of its last transaction. The "as of" field does not apply to it. The buttons in the folder bar switch between the object browser and the space screen. The space screen starts its walks the first time it shows for an open folder, and it keeps its results while the operator goes back to the browser. It shows:
+
+- the size per path: a treemap of the items of a path, from the Zope application down. The size of a path is the bytes of every object that it reaches through its references, itself included, each object once. Each item owns the objects that it reaches first, so the cells add up to the size of the path. A click on an item opens its path, and the path above the treemap goes back up.
+- the size per class: the current records of each class, their bytes and their share, and the current blob files.
+- the 10 largest objects. A click on an oid shows the object in the browser.
+- the growth: a timeline of the bytes that the transactions wrote, added up over time.
+- what a pack would reclaim: the dry run of the core, at a tid or at the last transaction, by class.
+
+Each walk is a background job of the Rust side. The screen shows its progress while it runs.
 
 ## Recipes
 
@@ -29,10 +39,14 @@ Outside the profile, the recipe stops and prints this command. The recipes run `
 
 | Path | Holds |
 | --- | --- |
-| `src/App.tsx` | the window: the folder bar with the "as of" field, the object tree and the object pane |
+| `src/App.tsx` | the window: the folder bar with the "as of" field and the screen buttons, the object browser and the space screen |
 | `src/ObjectTree.tsx` | the virtualised tree: the root, and below each object its outbound references |
 | `src/ObjectPane.tsx` | the path bar and the facts, the state, the references and the history of one object |
 | `src/History.tsx` | the history of one object and the diff view |
+| `src/Space.tsx` | the space screen: paths, classes, blobs, largest objects, growth and the pack dry run |
+| `src/Treemap.tsx` | the treemap of the items of a path, laid out with d3 |
+| `src/Timeline.tsx` | the timeline of the growth, with d3 scales and shapes |
+| `src/size.ts` | byte counts in binary units, the time of a tid, and the width of an element |
 | `src/format.ts` | the text of a state: JSON, with bytes as bytes literals, up to a limit |
 | `src/api.ts` | the IPC calls, their types and the UI strings of their errors |
 | `src/i18n/` | the translation catalog: `en.json` holds every UI string, and `t()` reads it |
@@ -56,6 +70,9 @@ Oids and tids are strings in ZODB form, as `ZODB.utils.oid_repr` writes them: `0
 | `history` | `oid` | the revisions of the object, newest first |
 | `set_as_of` | `tid`, a tid or null | null. It sets the "as of" switch: a tid, or null for the last transaction. |
 | `diff` | `oid`, `tidA`, `tidB` | the changes from the state as of `tidA` to the state as of `tidB` |
+| `space` | `largest` | the space of the store as of its last transaction. A background job. |
+| `path_space` | `path` | the space of the Plone path and of its items, as of the last transaction. A background job. |
+| `reclaimable` | `tid`, a tid or null | what a pack at the tid, or at the last transaction, would remove. A background job. |
 
 `root`, `object` and `resolve` read as of the tid of the switch. The switch includes its own tid, and every read of one call uses that tid. `open_folder` sets the switch to null.
 
@@ -65,9 +82,17 @@ An object is `{ oid, serial, class, size, state, references, error }`. `state` i
 
 A revision is `{ tid, user, description, size }`. A deletion has size 0. `history` gives at most 4096 revisions, `HISTORY_LIMIT` of `zoe-loupe`.
 
+A space is `{ by_class, blobs, largest, growth }`. `by_class` maps each class to `{ count, bytes }`: the current records of the class. The key `<unknown>` holds the records whose class pickle gives no name. `blobs` is `{ count, bytes }` for the current blob files. `largest` lists the largest current records, biggest first, as `{ oid, class, size }`. `growth` lists each transaction in tid order as `{ tid, bytes }`: the bytes of the records that it wrote.
+
+A path space is `{ path, oid, class, reach, own, items, others }`. `reach` is `{ count, bytes }` for every object that the object reaches, itself included, each once. Each item is `{ name, oid, class, reach }`, where `reach` holds the objects that the item owns. `own` holds the object and the objects that no item owns. `items` holds at most 256 items, biggest first; `others` is `{ count, reach }` for the rest. `own`, the items and `others` add up to `reach`.
+
+A reclaim is `{ tid, records, bytes, objects, blobs, blob_bytes, by_class }`: the report of the pack dry run of the core, at `tid`, the lower of the tid of the call and the last transaction. `by_class` maps each class to `{ count, bytes }` of the records that the pack would remove.
+
+A background job runs in a thread of the blocking pool, so the window and the other commands go on. While it runs, the Rust side sends `job-progress` events, at most ten each second: `{ job, walk, done }`, where `job` is `space`, `pathSpace` or `reclaimable`, `walk` is `records`, `transactions` or `objects`, and `done` counts the items read. `open_folder` stops the jobs of the folder that is open, and waits until they end, so that the store lock goes. A stopped job fails with `stopped`. The pack dry run has no steps: it sends no event, it cannot stop, and `open_folder` waits for its end.
+
 A change is `{ path, before, after }`. `path` is a JSON pointer into the two states, and `""` is the whole state. A side that does not have the value has no field. The diff compares the decoded trees, not the bytes: key order, memo puts and opcode width are not changes, and a reference compares by oid. The module documentation of `crates/zoe-loupe/src/diff.rs` gives the rules and the limits. A value that the state cuts can change in a part that does not show; then the two sides of the change look the same, and the view says so. The comparisons of one diff also have a work budget. Past it, each pair that the diff did not compare is a change: the diff can show a change that is not one, but it never misses a change. A deletion has no state: against a deletion, the diff is one change of the whole state without a value on the side of the deletion.
 
-A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notClosedCleanly`, `noRecord`, `noRecordAsOf`, `noObject`, `refused`, `badId` and `other`. `noRecordAsOf` has the oid and the tid of the view: a later transaction creates the object. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
+A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notClosedCleanly`, `noRecord`, `noRecordAsOf`, `noObject`, `refused`, `badId`, `stopped` and `other`. `noRecordAsOf` has the oid and the tid of the view: a later transaction creates the object. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
 
 The pane shows the start of a large state, and a button shows all of it.
 
@@ -79,6 +104,6 @@ The tests use WebdriverIO, `tauri-driver` and WebKitWebDriver. The `loupe` profi
 
 Each run writes the fixture store of the `zoe-loupe` tests into a new temporary directory: the spec runs the test `the_fixture_store_opens` with `ZOE_LOUPE_FIXTURE` set to that directory.
 
-## Not in v0
+## Not built yet
 
-Server mode, the live tail, space, operations, editing, undo, inbound references and catalog paths.
+Server mode, the live tail, the space screen in server mode, operations, editing, undo, inbound references and catalog paths.

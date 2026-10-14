@@ -131,3 +131,32 @@ fn a_reader_that_closes_stdout_does_not_fail_the_command() {
     assert_exit(&output, 0, "help with a closed stdout");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_frame_limit_out_of_range_is_a_usage_error() {
+    let dir = fresh_dir("frame-limit");
+    let store = dir.join("zoe");
+    let path = store.to_str().unwrap();
+    for (option, twin) in [
+        (Some("0"), None),
+        (Some("4294967296"), None),
+        (Some("16MiB"), None),
+        (None, Some("0")),
+    ] {
+        let mut args = vec!["serve", "--path", path, "--listen", "127.0.0.1:0"];
+        args.extend(option.iter().flat_map(|value| ["--max-frame-size", value]));
+        let env: Vec<_> = twin
+            .iter()
+            .map(|value| ("ZOE_MAX_FRAME_SIZE", *value))
+            .collect();
+        let output = run(&args, &env);
+        assert_exit(&output, 2, &format!("{option:?} {twin:?}"));
+        assert!(!store.exists(), "a usage error created the store");
+    }
+    let help = run(&["serve", "--help"], &[]);
+    assert_exit(&help, 0, "serve --help");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--max-frame-size"), "{help}");
+    assert!(help.contains("ZOE_MAX_FRAME_SIZE"), "{help}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

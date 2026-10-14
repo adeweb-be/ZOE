@@ -9,19 +9,32 @@
 //! directory that ZODB's FileStorage opens. It writes the file under a
 //! temporary name and renames it at the end, and resumes after the last tid
 //! of the file.
+//!
+//! [`verify`] checks a store without Python: the checksums of its frames,
+//! its blob files, its persistent references and its classes.
+//!
+//! [`backup`] writes a dump of a store into a backup directory: a full
+//! dump the first time, then the transactions after the last dump, with
+//! their blobs and the ends of the sequences. [`restore`] rebuilds the
+//! store from the dumps, and [`verify_backup`] compares them with a store.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use zoe_core::{Tid, ZoeError};
 
+mod backup;
 mod blobs;
 mod datafs;
 mod filestorage;
 mod to_datafs;
+mod verify;
 mod writer;
 
+pub use backup::{Backup, BackupCheck, Restored, backup, restore, verify_backup};
 pub use datafs::from_datafs;
 pub use to_datafs::to_datafs;
+pub use verify::{BlobProblem, Dangling, FrameProblem, PickleProblem, Verification, verify};
 
 /// The report of a conversion.
 ///
@@ -47,6 +60,97 @@ pub struct Report {
     /// transactions, records and blobs follow, and a last line counts the
     /// others.
     pub problems: Vec<String>,
+    /// The count of the problems of each kind, with no cap. A kind without
+    /// a problem has no entry.
+    counts: BTreeMap<ProblemKind, u64>,
+}
+
+impl Report {
+    /// Return an empty report: no transaction and no problem.
+    pub(crate) fn empty() -> Self {
+        Self {
+            transactions: 0,
+            copied: 0,
+            records: 0,
+            blobs: 0,
+            last_tid: Tid::ZERO,
+            problems: Vec::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    /// Return the number of problems of the kind `kind`. The count has no
+    /// cap.
+    pub fn count(&self, kind: ProblemKind) -> u64 {
+        self.counts.get(&kind).copied().unwrap_or(0)
+    }
+
+    /// Return the number of problems. This is the sum of the counts of the
+    /// kinds, not the number of lines in `problems`.
+    pub fn problem_count(&self) -> u64 {
+        self.counts.values().sum()
+    }
+
+    /// Return each kind that has a problem, with its count, in the order of
+    /// `ProblemKind`.
+    pub fn counts(&self) -> impl Iterator<Item = (ProblemKind, u64)> + '_ {
+        self.counts.iter().map(|(&kind, &count)| (kind, count))
+    }
+}
+
+/// The kind of a problem in the report of a conversion. Each problem has
+/// exactly one kind.
+///
+/// The source is the side that the conversion reads, and the target is
+/// the side that it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProblemKind {
+    /// The read of the `Data.fs` stopped before the end of the file.
+    Stopped,
+    /// The `Data.fs` has blob records, and no blob directory was given.
+    /// This is one problem, whatever the number of blob records.
+    NoBlobDirectory,
+    /// One side has a transaction that the other side does not have.
+    MissingTransaction,
+    /// The user, the description or the extension of a transaction
+    /// differs.
+    MetadataDiffers,
+    /// One side of a transaction has a record of an oid that the other
+    /// side does not have.
+    MissingRecord,
+    /// A pickle of the store differs from the pickle in the file.
+    RecordDiffers,
+    /// The blob directory has no blob file for a blob record.
+    MissingBlobFile,
+    /// The store has no blob for a blob record of the source.
+    MissingBlob,
+    /// A blob of the store and its blob file have different sizes or
+    /// different bytes.
+    BlobDiffers,
+    /// The store does not read a blob, or its blob file.
+    UnreadableBlob,
+    /// The transaction iterator of the store failed.
+    UnreadableStore,
+}
+
+impl ProblemKind {
+    /// Return the name of the problems of this kind, in the plural, for a
+    /// line of a report.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "stops before the end of the file",
+            Self::NoBlobDirectory => "no blob directory",
+            Self::MissingTransaction => "missing transactions",
+            Self::MetadataDiffers => "users, descriptions or extensions that differ",
+            Self::MissingRecord => "missing records",
+            Self::RecordDiffers => "records that differ",
+            Self::MissingBlobFile => "missing blob files",
+            Self::MissingBlob => "blobs that the store does not have",
+            Self::BlobDiffers => "blobs that differ",
+            Self::UnreadableBlob => "blobs that the store does not read",
+            Self::UnreadableStore => "failed reads of the store",
+        }
+    }
 }
 
 /// An error that stops a conversion.
@@ -143,10 +247,11 @@ pub enum Error {
     },
 
     /// Another process holds the lock of the `Data.fs`, for example a
-    /// FileStorage that has the file open for writing.
+    /// FileStorage that has the file open for writing. Or another backup
+    /// holds the lock of the backup directory.
     #[error("{}: another process holds the lock", path.display())]
     Locked {
-        /// The path of the lock file.
+        /// The path of the lock file, or of the backup directory.
         path: PathBuf,
     },
 
@@ -156,6 +261,68 @@ pub enum Error {
     NotBushy {
         /// The path of the blob directory.
         path: PathBuf,
+    },
+
+    /// A dump file is damaged, or does not follow the dump before it in
+    /// its backup directory.
+    #[error("{}: {reason}", path.display())]
+    Dump {
+        /// The path of the dump file.
+        path: PathBuf,
+        /// What is wrong.
+        reason: String,
+    },
+
+    /// The backup directory holds no dump.
+    #[error("{}: no dump", path.display())]
+    NoDump {
+        /// The path of the backup directory.
+        path: PathBuf,
+    },
+
+    /// The target of a restore holds a store or other files, or is not a
+    /// directory. The restore writes nothing.
+    #[error("{}: {reason}", path.display())]
+    Target {
+        /// The path of the target.
+        path: PathBuf,
+        /// What is wrong.
+        reason: &'static str,
+    },
+
+    /// The last tid of the dumps is not a tid of the store. So the store
+    /// does not continue the dumps: they are dumps of another store, or of
+    /// another history of this store. The backup writes nothing.
+    #[error(
+        "{}: the store does not continue the dumps: their last tid {:#018x} is not a tid of the store; \
+         write a new full dump into a new directory",
+        path.display(),
+        .last.0
+    )]
+    BackupDiverged {
+        /// The path of the backup directory.
+        path: PathBuf,
+        /// The last tid of the dumps.
+        last: Tid,
+    },
+
+    /// The store was packed after the last tid of the dumps. The pack
+    /// changed history that the next dump must hold, so the backup writes
+    /// nothing.
+    #[error(
+        "{}: the store was packed at tid {:#018x}, after the last tid {:#018x} of the dumps; \
+         write a new full dump into a new directory",
+        path.display(),
+        .watermark.0,
+        .last.0
+    )]
+    BackupPacked {
+        /// The path of the backup directory.
+        path: PathBuf,
+        /// The last tid of the dumps.
+        last: Tid,
+        /// The pack watermark of the store.
+        watermark: Tid,
     },
 
     /// A read or a write of a file failed.

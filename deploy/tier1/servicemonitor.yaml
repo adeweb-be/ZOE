@@ -1,0 +1,20 @@
+# Prometheus scrapes /metrics on the admin port. The ServiceMonitor needs
+# the CRDs of the Prometheus Operator. Add the labels that the
+# serviceMonitorSelector of your Prometheus selects.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: zoe
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: admin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zoe
+      app.kubernetes.io/component: admin
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s

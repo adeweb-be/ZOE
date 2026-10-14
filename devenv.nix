@@ -29,6 +29,19 @@ let
     };
     cargoHash = "sha256-MThAcU+U8PyBGauh3dy7ZRvRX9INmOEeghIlQEGLAPs=";
   };
+
+  # The C compiler of the musl target. The C code of zstd-sys and blake3
+  # compiles against the musl headers, not against the glibc headers of
+  # the shell.
+  musl-cc = pkgs.pkgsCross.musl64.stdenv.cc;
+
+  # Put only setpriv on PATH. The other tools of util-linux, such as mount
+  # and su, must not hide the tools of the host. CI runs the conformance
+  # suites through setpriv.
+  setpriv = pkgs.runCommand "zoe-setpriv" { } ''
+    mkdir -p $out/bin
+    ln -s ${pkgs.lib.getExe' pkgs.util-linuxMinimal "setpriv"} $out/bin/setpriv
+  '';
 in
 {
   languages.rust = {
@@ -37,6 +50,8 @@ in
     version = "1.99.0";
     # `just tsan` rebuilds the standard library from rust-src.
     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-src" ];
+    # `just release binary` builds the static `zoe` binary for musl.
+    targets = [ "x86_64-unknown-linux-musl" ];
   };
 
   packages = [
@@ -48,6 +63,7 @@ in
     pkgs.nodejs_24
     pkgs.git
     dagger
+    setpriv
 
     # Libraries that the Plone instances need when buildout builds an
     # egg from source.
@@ -64,6 +80,24 @@ in
     # uv uses the interpreters above and never downloads one.
     UV_PYTHON_DOWNLOADS = "never";
     UV_PYTHON_PREFERENCE = "only-system";
+
+    # The static `zoe` binary: cc compiles its C code and links it with
+    # the musl toolchain.
+    CC_x86_64_unknown_linux_musl = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
+
+    # The Plone suites switch to Latin-1 locales. The interpreters find
+    # every locale in this archive.
+    LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+  };
+
+  # Heap profiles for the memory spikes. Enter the profile with
+  # `devenv --profile profiling shell`. The default shell and CI do not
+  # fetch it, because heaptrack brings Qt.
+  profiles.profiling.module = {
+    packages = [
+      pkgs.heaptrack
+    ];
   };
 
   # Loupe, the Tauri app, and its end-to-end tests. Enter the profile with
