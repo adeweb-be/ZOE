@@ -324,7 +324,10 @@ async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
 ///
 /// At a stop, the reader reads no more calls. The calls that the reader
 /// already started run, so a `tpc_finish` that the server received commits
-/// and gets its reply. A pack that runs stops between two of its batches.
+/// and gets its reply. A vote that waits for a lock goes on waiting, while
+/// the other connections abort their transactions. Each other end of the
+/// connection ends the lock wait of its vote at once, so a gone client
+/// holds no lock. A pack that runs stops between two of its batches.
 /// Then the transaction ends, and that aborts it if it is still open. The
 /// writer sends the frames that wait, and shuts down its side of the
 /// connection. The bytes that the client sends after the stop are read and
@@ -467,6 +470,8 @@ pub(crate) async fn serve_stream(
         }));
     }
 
+    // A stop lets a vote that waits for a lock go on waiting: the other
+    // sessions abort their transactions, and a finish that arrived commits.
     let mut stopped = false;
     loop {
         // An end of the connection or a stop wins over a frame that waits.
@@ -531,6 +536,11 @@ pub(crate) async fn serve_stream(
             break;
         }
         calls.start(call, ticket).await;
+    }
+    // Any other end of the connection ends the lock wait of its vote, so a
+    // gone client holds no lock.
+    if !stopped {
+        calls.end_lock_wait();
     }
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.

@@ -61,7 +61,8 @@ pub enum ZoeError {
     },
 
     /// Another transaction changed the object since the serial that this
-    /// transaction read, or held its lock past the lock timeout.
+    /// transaction read, or held its lock past the lock timeout, or a
+    /// `LockCancel` ended the wait for its lock.
     /// `Txn::conflict_serials` gives the serials of a stale serial.
     #[error("conflict: oid {oid:?}")]
     Conflict {

@@ -15,6 +15,7 @@
 //! directory to the target at the end. So a restore that fails leaves
 //! nothing at the target.
 
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
@@ -244,32 +245,47 @@ pub fn restore(dir: &Path, target: &Path) -> Result<Restored, Error> {
 }
 
 /// Restore the dumps of the backup directory `dir` into a new directory in
-/// `scratch`, compare them with `store`, and remove that directory.
+/// `scratch`, open the store with `open`, compare the two, and remove that
+/// directory.
 ///
-/// The comparison covers the transactions of `store` up to the last tid of
-/// the dumps, so a commit after the last dump is no difference. Each
+/// The call builds the copy before it calls `open`. So the store stays
+/// free while the copy is built, and a dump that does not restore fails
+/// the call before the open. The copy is a throwaway store: the call
+/// builds it with [`restore`] and removes it at the end, also when the
+/// call fails. The call writes nothing outside `scratch`. It drops the
+/// store of `open` before it returns.
+///
+/// The comparison covers the transactions of the store up to the last tid
+/// of the dumps, so a commit after the last dump is no difference. Each
 /// transaction and each record must be the same, with the same blob record:
 /// the size and the BLAKE3 hash of its blob. A pack removes records at or
 /// before its tid, and the dumps keep them. So at or before the pack
-/// watermark of `store`, a record or a transaction that `store` lacks is
-/// no difference. A pack after the last tid of the dumps is a difference:
-/// it changed history that the next dump must hold. A pack at that tid is
-/// no difference. The current record of each oid at the last tid of the
-/// dumps must be the same too, so a store whose history diverged differs,
-/// unless a pack removed that record. In `store`, the end of each sequence
-/// of the dumps must be at or above its end in the dumps.
+/// watermark of the store, a record or a transaction that the store lacks
+/// is no difference. A pack after the last tid of the dumps is a
+/// difference: it changed history that the next dump must hold. A pack at
+/// that tid is no difference. The current record of each oid at the last
+/// tid of the dumps must be the same too, so a store whose history
+/// diverged differs, unless a pack removed that record. In the store, the
+/// end of each sequence of the dumps must be at or above its end in the
+/// dumps.
 ///
-/// A dump that does not restore fails the call with its error. The call
+/// A dump that does not restore fails the call with its error, and an
+/// open that fails fails the call with the error of `open`. The call
 /// first removes the directories in `scratch` that a check in a process
 /// that is gone left.
-pub fn verify_backup(store: &Store, dir: &Path, scratch: &Path) -> Result<BackupCheck, Error> {
+pub fn verify_backup<S: Borrow<Store>, E: From<Error>>(
+    dir: &Path,
+    scratch: &Path,
+    open: impl FnOnce() -> Result<S, E>,
+) -> Result<BackupCheck, E> {
     static CHECKS: AtomicU64 = AtomicU64::new(0);
     remove_stale_checks(scratch);
     let n = CHECKS.fetch_add(1, Ordering::Relaxed);
     let copy = scratch.join(format!("{CHECK_PREFIX}{}-{n}", std::process::id()));
-    let checked = restore(dir, &copy).and_then(|restored| {
-        let opened = Store::open_read_only(&copy)?;
-        let differences = compare(store, &opened, restored.last_tid)?;
+    let checked = restore(dir, &copy).map_err(E::from).and_then(|restored| {
+        let opened = Store::open_read_only(&copy).map_err(|e| E::from(Error::from(e)))?;
+        let store = open()?;
+        let differences = compare(store.borrow(), &opened, restored.last_tid).map_err(E::from)?;
         Ok(BackupCheck {
             restored,
             differences,
@@ -278,7 +294,7 @@ pub fn verify_backup(store: &Store, dir: &Path, scratch: &Path) -> Result<Backup
     match fs::remove_dir_all(&copy) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) if checked.is_ok() => return Err(io_error(&copy, error)),
+        Err(error) if checked.is_ok() => return Err(io_error(&copy, error).into()),
         Err(_) => {}
     }
     checked
@@ -1367,6 +1383,12 @@ mod tests {
     use super::*;
     use crate::filestorage::tests::test_dir;
 
+    /// Compare the dumps in `dumps` with `store`, through a copy in
+    /// `scratch`.
+    fn check_dumps(store: &Store, dumps: &Path, scratch: &Path) -> Result<BackupCheck, Error> {
+        verify_backup(dumps, scratch, || Ok::<_, Error>(store))
+    }
+
     /// The record of a blob.
     const BLOB_RECORD: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
@@ -1767,7 +1789,7 @@ mod tests {
 
         // A commit after the dumps is no difference.
         commit(&store, 300, &[W::Data(1, b"after")]);
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences, Vec::<String>::new());
         assert_eq!(
             (check.restored.transactions, check.restored.last_tid),
@@ -1781,7 +1803,7 @@ mod tests {
         let other = Store::open(dir.join("other")).unwrap();
         commit(&other, 100, &[W::Data(1, b"ONE"), W::Data(2, b"two")]);
         commit(&other, 150, &[W::Data(5, b"five")]);
-        let check = verify_backup(&other, &dumps, &scratch).unwrap();
+        let check = check_dumps(&other, &dumps, &scratch).unwrap();
         let text = check.differences.join("\n");
         assert!(
             text.contains("oid 0x0000000000000001 at 0x0000000000000064: the record differs"),
@@ -1818,11 +1840,14 @@ mod tests {
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0x01;
         fs::write(&file, &bytes).unwrap();
-        let store = Store::open(&source).unwrap();
-        let error = verify_backup(&store, &dumps, &scratch).unwrap_err();
+        // The check restores the dumps before it opens the store, so it
+        // fails before the open.
+        let error = verify_backup(&dumps, &scratch, || -> Result<Store, Error> {
+            panic!("the check opened the store")
+        })
+        .unwrap_err();
         assert!(matches!(error, Error::Dump { .. }), "{error}");
         assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
-        drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1844,14 +1869,14 @@ mod tests {
         backup(&store, &dumps).unwrap();
         store.pack(Tid(250)).unwrap();
         assert!(store.load_serial(Oid(1), Tid(200)).is_err());
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences, Vec::<String>::new());
 
         // A pack before the last tid of the dumps lets the backups go on.
         commit(&store, 500, &[W::Data(0, &pickle(b"root again"))]);
         let written = backup(&store, &dumps).unwrap();
         assert_eq!((written.after, written.transactions), (Tid(400), 1));
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences, Vec::<String>::new());
         assert_eq!((check.restored.dumps, check.restored.transactions), (2, 5));
 
@@ -1860,12 +1885,12 @@ mod tests {
         store.pack(Tid(500)).unwrap();
         assert!(store.load_serial(Oid(0), Tid(100)).is_err());
         assert!(store.load_serial(Oid(2), Tid(400)).is_err());
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences, Vec::<String>::new());
         commit(&store, 600, &[W::Data(0, &pickle(b"root once more"))]);
         let written = backup(&store, &dumps).unwrap();
         assert_eq!((written.after, written.transactions), (Tid(500), 1));
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences, Vec::<String>::new());
         assert_eq!((check.restored.dumps, check.restored.transactions), (3, 6));
 
@@ -1881,7 +1906,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(dump_files(&dumps).len(), 3);
-        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        let check = check_dumps(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences.len(), 1, "{:?}", check.differences);
         assert!(check.differences[0].starts_with(
             "the store was packed at tid 0x00000000000002bc, after the last tid 0x0000000000000258"
@@ -1918,7 +1943,7 @@ mod tests {
         }
         let error = backup(&rolled, &dumps).unwrap_err();
         assert!(matches!(error, Error::BackupDiverged { .. }), "{error}");
-        let check = verify_backup(&rolled, &dumps, &scratch).unwrap();
+        let check = check_dumps(&rolled, &dumps, &scratch).unwrap();
         let text = check.differences.join("\n");
         assert!(
             text.contains("the store lacks transaction 0x00000000000000c8"),
@@ -1931,7 +1956,7 @@ mod tests {
         rolled.pack(Tid(500)).unwrap();
         let error = backup(&rolled, &dumps).unwrap_err();
         assert!(matches!(error, Error::BackupDiverged { .. }), "{error}");
-        let check = verify_backup(&rolled, &dumps, &scratch).unwrap();
+        let check = check_dumps(&rolled, &dumps, &scratch).unwrap();
         let text = check.differences.join("\n");
         assert!(text.starts_with("the store was packed at tid"), "{text}");
         assert_eq!(dump_files(&dumps).len(), 2);
@@ -1952,9 +1977,26 @@ mod tests {
         for path in [&gone, &mine, &other] {
             fs::create_dir_all(path.join("inside")).unwrap();
         }
-        verify_backup(&store, &dumps, &scratch).unwrap();
+        check_dumps(&store, &dumps, &scratch).unwrap();
         assert!(!gone.exists());
         assert!(mine.exists() && other.exists());
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_that_fails_fails_the_check_and_removes_the_copy() {
+        let dir = test_dir("backup-open");
+        let (source, dumps, scratch) = (dir.join("source"), dir.join("dumps"), dir.join("scratch"));
+        let store = sample(&source);
+        backup(&store, &dumps).unwrap();
+        // The copy is already built when the open fails.
+        let error = verify_backup(&dumps, &scratch, || {
+            Err::<Store, _>(Error::Store(ZoeError::Locked))
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::Store(_)), "{error}");
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
         drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
