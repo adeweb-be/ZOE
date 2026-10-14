@@ -10,7 +10,7 @@ ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use un
 
 **Goals**
 
-1. Drop-in for Plone 6: the only configuration change is the storage stanza in `zope.conf` (`<zoe>` or a `<zeoclient>` pointed at the Rust server). No change to application code, `persistent`, `BTrees` or `transaction`.
+1. Drop-in for Plone 6: the only configuration change is the storage stanza in `zope.conf` (`<zoe>` or a `<zeoclient>` pointed at the Rust server). No change to application code, `persistent`, `BTrees` or `transaction`. A `<zeoclient>` against `zoe serve` needs the `msgpack` package, because the server speaks only the msgpack protocol `M5` (F2); `zoedb[plone]` installs it.
 2. Fastest measured Plone storage: beats `FileStorage`, ZEO and RelStorage on Postgres on the same `zodbshootout` harness, cold, warm and hot.
 3. Async where it pays: the server is fully asynchronous (tokio), handles pipelined requests per connection, and exposes an async storage interface for future async clients. The ZODB object model stays synchronous.
 4. ACID by construction: atomic two-phase commit, durable on `tpc_finish` (fsync or replicated acknowledgement), snapshot isolation through MVCC keyed by `(oid, tid)`, and crash recovery without a repair step.
