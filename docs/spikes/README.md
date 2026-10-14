@@ -4,6 +4,7 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 
 | Finding | Question |
 | --- | --- |
+| [convert-memory.md](convert-memory.md) | What holds the memory of `zoe convert --from-data-fs` above the page cache of redb on a source of several million records, and does it grow with the records? |
 | [deterministic-simulation.md](deterministic-simulation.md) | How do the server and its clients run in one process on a simulated network and clock with seeded schedules, and should the simulator use turmoil, madsim or an executor of our own? |
 | [free-threading-upstream.md](free-threading-upstream.md) | Can persistent, BTrees and zodbpickle declare that they need no GIL, and what must change first? |
 | [pickle-round-trip.md](pickle-round-trip.md) | Can zoe-pickle decode a ZODB record into a tree and encode it back to the same bytes, and which constructs must stay opaque? |
