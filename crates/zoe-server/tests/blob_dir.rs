@@ -254,10 +254,20 @@ fn a_missing_blob_directory_fails_with_a_message_that_names_it() {
     // nothing.
     let nowhere = empty.join("not-here").join("blobs");
     let output = zoe(
-        &["verify", "--path", s(&corpus.dir), "--blob-dir", s(&nowhere)],
+        &[
+            "verify",
+            "--path",
+            s(&corpus.dir),
+            "--blob-dir",
+            s(&nowhere),
+        ],
         &[],
     );
-    assert_exit(&output, 1, "verify with a blob directory that has no parent");
+    assert_exit(
+        &output,
+        1,
+        "verify with a blob directory that has no parent",
+    );
     assert!(!empty.join("not-here").exists());
 
     assert_eq!(files(&corpus.dir), before, "verify changed the store");
@@ -340,8 +350,16 @@ fn convert_to_a_data_fs_reads_the_blobs_from_the_blob_directory_that_it_gets() {
     // Without the blob directory of the store: refused, and nothing
     // written.
     let output = zoe(&to, &[]);
-    assert_exit(&output, 1, "convert without the blob directory of the store");
-    assert!(stderr(&output).contains("--blob-dir"), "{}", stderr(&output));
+    assert_exit(
+        &output,
+        1,
+        "convert without the blob directory of the store",
+    );
+    assert!(
+        stderr(&output).contains("--blob-dir"),
+        "{}",
+        stderr(&output)
+    );
     assert!(!data_fs.exists());
     assert!(!data_fs_blobs.exists());
 

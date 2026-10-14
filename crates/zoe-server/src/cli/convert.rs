@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Args};
 use zoe_convert::Report;
-use zoe_core::Store;
+use zoe_core::{Options, Store};
 
-use super::{Failure, store_failure};
+use super::{Failure, open_with_blobs, store_failure};
 
 /// The first bytes of a FileStorage file.
 const MAGIC: &[u8] = b"FS30";
@@ -29,6 +29,16 @@ pub(super) struct ConvertArgs {
     /// The directory of the store.
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: PathBuf,
+
+    /// The blob directory of the store, the key blob-dir of the <zoe>
+    /// section. The default is blobs in the store directory.
+    ///
+    /// The store does not record its blob directory. With --from-data-fs,
+    /// the blobs of the store go there. With --to-data-fs, a store with
+    /// blobs whose blob directory has no layout file fails the command
+    /// before it writes anything.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
 
     /// Copy the transactions of this Data.fs into the store.
     ///
@@ -59,10 +69,13 @@ pub(super) struct ConvertArgs {
 
 /// Run `zoe convert` and write its report to `out`.
 pub(super) fn run(args: &ConvertArgs, out: &mut dyn Write) -> Result<(), Failure> {
-    let blob_dir = args.data_fs_blob_dir.as_deref();
-    match (&args.from_data_fs, &args.to_data_fs, blob_dir) {
-        (Some(data_fs), None, _) => from_data_fs(data_fs, blob_dir, &args.path, out),
-        (None, Some(data_fs), Some(blob_dir)) => to_data_fs(&args.path, data_fs, blob_dir, out),
+    let (path, blob_dir) = (&args.path, args.blob_dir.as_deref());
+    let data_fs_blobs = args.data_fs_blob_dir.as_deref();
+    match (&args.from_data_fs, &args.to_data_fs, data_fs_blobs) {
+        (Some(data_fs), None, _) => from_data_fs(data_fs, data_fs_blobs, path, blob_dir, out),
+        (None, Some(data_fs), Some(data_fs_blobs)) => {
+            to_data_fs(path, blob_dir, data_fs, data_fs_blobs, out)
+        }
         // The parser refuses these cases. This arm keeps the match whole.
         _ => Err(Failure::Message(
             "give --from-data-fs, or --to-data-fs with --data-fs-blob-dir".to_owned(),
@@ -70,18 +83,25 @@ pub(super) fn run(args: &ConvertArgs, out: &mut dyn Write) -> Result<(), Failure
     }
 }
 
-/// Convert the `Data.fs` `data_fs` into the store in `path`.
+/// Convert the `Data.fs` `data_fs`, with its blob files in
+/// `data_fs_blobs`, into the store in `path`, with its blob files in
+/// `blob_dir` (`blobs` in `path` when `None`).
 fn from_data_fs(
     data_fs: &Path,
-    blob_dir: Option<&Path>,
+    data_fs_blobs: Option<&Path>,
     path: &Path,
+    blob_dir: Option<&Path>,
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     // The open of the store creates it. Check the file first, so that a
     // wrong file creates no store.
     check_data_fs(data_fs)?;
-    let store = Store::open(path).map_err(|e| store_failure(path, e))?;
-    let report = zoe_convert::from_datafs(data_fs, blob_dir, &store)
+    let options = Options {
+        blob_dir: blob_dir.map(Path::to_path_buf),
+        ..Options::default()
+    };
+    let store = Store::open_with(path, options).map_err(|e| store_failure(path, e))?;
+    let report = zoe_convert::from_datafs(data_fs, data_fs_blobs, &store)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("{} into the store {}", data_fs.display(), path.display());
     // A conversion that does not verify fails, also when the report does
@@ -114,19 +134,21 @@ fn check_data_fs(data_fs: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Convert the store in `path` into the `Data.fs` `data_fs` and the blob
-/// directory `blob_dir`.
+/// Convert the store in `path`, with its blob files in `blob_dir`, into
+/// the `Data.fs` `data_fs` and the blob directory `data_fs_blobs`.
 fn to_data_fs(
     path: &Path,
+    blob_dir: Option<&Path>,
     data_fs: &Path,
-    blob_dir: &Path,
+    data_fs_blobs: &Path,
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     // The conversion only reads the store. A read-only open changes no
-    // byte of it, and fails on a directory without a store.
-    let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
-    let report =
-        zoe_convert::to_datafs(&store, data_fs, blob_dir).map_err(|e| convert_failure(path, e))?;
+    // byte of it, and fails on a directory without a store. A wrong blob
+    // directory fails here, before the conversion writes anything.
+    let store = open_with_blobs(path, blob_dir)?;
+    let report = zoe_convert::to_datafs(&store, data_fs, data_fs_blobs)
+        .map_err(|e| convert_failure(path, e))?;
     let title = format!("the store {} into {}", path.display(), data_fs.display());
     // A conversion that does not verify fails, also when the report does
     // not go out.
