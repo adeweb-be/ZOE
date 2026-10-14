@@ -1,7 +1,8 @@
-// The window of Loupe: the folder bar with the "as of" switch, the object
-// tree and the object pane.
+// The window of Loupe: the folder bar with the "as of" switch and the
+// screens. The object browser shows the object tree and the object pane.
+// The space screen measures the store.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   describe,
@@ -17,6 +18,10 @@ import {
 import { t } from "./i18n";
 import { ObjectPane } from "./ObjectPane";
 import { ObjectTree } from "./ObjectTree";
+import { SpaceScreen } from "./Space";
+
+/** A screen of the window. */
+type Screen = "browser" | "space";
 
 export function App() {
   const [folderPath, setFolderPath] = useState("");
@@ -42,6 +47,17 @@ export function App() {
   // The number of the last move of the switch. A root that comes after a
   // newer move is too late, and the window drops it.
   const latestMove = useRef(0);
+  const [screen, setScreen] = useState<Screen>("browser");
+  // The open that the space screen measures. The screen walks the store
+  // only once the operator shows it, and it stays mounted afterwards, so
+  // that a move between the screens keeps its results.
+  const [spaceOpen, setSpaceOpen] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (screen === "space") {
+      setSpaceOpen(opens);
+    }
+  }, [screen, opens]);
 
   /** Run an IPC call. Show its error, unless a newer request started. */
   const run = async (call: (current: () => boolean) => Promise<void>) => {
@@ -125,6 +141,12 @@ export function App() {
         setCurrent(found);
       }
     });
+
+  /** Show the object `oid` in the object browser. */
+  const showInBrowser = (oid: string) => {
+    setScreen("browser");
+    void show(oid);
+  };
 
   const go = (path: string) =>
     run(async (current) => {
@@ -257,14 +279,40 @@ export function App() {
             </span>
           </div>
         )}
+        {folder && (
+          <nav className="screens" role="tablist" aria-label={t("screen.label")}>
+            {(["browser", "space"] as const).map((name) => (
+              <button
+                key={name}
+                type="button"
+                role="tab"
+                data-testid={`screen-${name}`}
+                aria-selected={screen === name}
+                onClick={() => setScreen(name)}
+              >
+                {t(name === "browser" ? "screen.browser" : "screen.space")}
+              </button>
+            ))}
+          </nav>
+        )}
       </header>
       {error && (
         <p className="error" role="alert">
           {t("error.shown", { message: error })}
         </p>
       )}
+      {folder && spaceOpen === opens && (
+        <div className="screen" hidden={screen !== "space"}>
+          <SpaceScreen
+            key={opens}
+            lastTid={folder.lastTid}
+            onShow={showInBrowser}
+            onError={(failure) => setError(describe(failure))}
+          />
+        </div>
+      )}
       {folder ? (
-        <main>
+        <main hidden={screen !== "browser"}>
           {rootObject ? (
             <ObjectTree
               key={views}

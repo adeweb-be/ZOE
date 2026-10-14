@@ -4,14 +4,77 @@
 //! The core reads the time only through `Clock`, so a test or a simulator
 //! can give its own time.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::Tid;
 
-/// A source of wall-clock time.
+/// A source of wall-clock time, of monotonic time, and of the waits of the
+/// lock requests.
+///
+/// `monotonic` and `waiter` have defaults that use the operating system. A
+/// simulator gives its own, so a lock wait runs on simulated time.
 pub trait Clock: Send + Sync {
     /// Return the time now.
     fn now(&self) -> SystemTime;
+
+    /// Return the time since a fixed origin. It never goes back. The lock
+    /// timeout is measured on it.
+    fn monotonic(&self) -> Duration {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
+    }
+
+    /// Return a new waiter for one lock request.
+    fn waiter(&self) -> Arc<dyn Waiter> {
+        Arc::new(ThreadWaiter::default())
+    }
+}
+
+/// The wait of one thread. The thread waits on it, and another thread
+/// wakes it.
+///
+/// A wake has permit semantics: a `wake` before the `wait` makes that
+/// `wait` return at once, so no wake is lost.
+pub trait Waiter: Send + Sync {
+    /// Block the calling thread until a call of `wake`, or until `timeout`
+    /// passes. A `wake` before this call makes it return at once. The call
+    /// can also return early, so the caller checks its state again.
+    fn wait(&self, timeout: Duration);
+
+    /// Wake the thread that waits, or make its next wait return at once.
+    ///
+    /// It must not panic: the lock manager also calls it while the drop of
+    /// a transaction unwinds a panic, and a second panic aborts the
+    /// process. A waiter that misses its wake sees its lock at the end of
+    /// its wait.
+    fn wake(&self);
+}
+
+/// A waiter on the threads of the operating system: a flag, a mutex and a
+/// condition variable.
+#[derive(Debug, Default)]
+struct ThreadWaiter {
+    woken: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Waiter for ThreadWaiter {
+    fn wait(&self, timeout: Duration) {
+        let woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
+        // A timeout past the range of the clock waits without a limit.
+        let mut woken = self
+            .changed
+            .wait_timeout_while(woken, timeout, |woken| !*woken)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        *woken = false;
+    }
+
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_one();
+    }
 }
 
 /// The clock of the operating system.
@@ -120,5 +183,39 @@ mod tests {
     #[test]
     fn a_time_before_1970_gives_the_tid_of_1970() {
         assert_eq!(timestamp(UNIX_EPOCH - Duration::from_secs(60)), at(0, 0));
+    }
+
+    #[test]
+    fn a_wake_before_the_wait_is_not_lost() {
+        let waiter = SystemClock.waiter();
+        waiter.wake();
+        let start = Instant::now();
+        waiter.wait(Duration::from_secs(60));
+        assert!(start.elapsed() < Duration::from_secs(30));
+        // The wake was used: the next wait lasts its timeout.
+        let start = Instant::now();
+        waiter.wait(Duration::from_millis(20));
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_wake_from_another_thread_ends_a_wait_without_a_limit() {
+        let waiter = SystemClock.waiter();
+        let waking = {
+            let waiter = Arc::clone(&waiter);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                waiter.wake();
+            })
+        };
+        waiter.wait(Duration::MAX);
+        waking.join().unwrap();
+    }
+
+    #[test]
+    fn the_monotonic_time_never_goes_back() {
+        let first = SystemClock.monotonic();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(SystemClock.monotonic() > first);
     }
 }
