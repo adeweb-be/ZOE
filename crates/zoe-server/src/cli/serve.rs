@@ -18,6 +18,7 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -195,6 +196,19 @@ pub(super) struct ServeArgs {
         value_parser = whole_seconds
     )]
     idle_timeout: Duration,
+
+    /// The number of threads that run the calls that read, such as
+    /// loadBefore, for all the connections together. The default is the
+    /// number of cores. A transaction, a download and a pack each run on a
+    /// thread outside this pool, so a vote that waits for a lock never
+    /// stops the loads.
+    #[arg(
+        long,
+        env = "ZOE_BLOCKING_THREADS",
+        value_name = "THREADS",
+        value_parser = clap::value_parser!(NonZeroUsize)
+    )]
+    blocking_threads: Option<NonZeroUsize>,
 
     /// Serve every store for reads only. The server opens each store
     /// read-only: it changes no byte of the store, and holds its lock, so
@@ -447,6 +461,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(bytes) = args.max_frame_size.and_then(NonZeroU32::new) {
         options = options.max_frame_size(bytes);
     }
+    if let Some(threads) = args.blocking_threads {
+        options = options.blocking_threads(threads);
+    }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
     if let Some(admin) = server.admin_addr() {
         writeln!(out, "admin {admin}")?;
@@ -536,6 +553,15 @@ mod tests {
         let args = serve(&["--idle-timeout", "0"]).unwrap();
         assert_eq!(args.idle_timeout, Duration::ZERO);
         let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_blocking_threads_are_the_cores_by_default_and_never_0() {
+        assert_eq!(serve(&[]).unwrap().blocking_threads, None);
+        let args = serve(&["--blocking-threads", "1"]).unwrap();
+        assert_eq!(args.blocking_threads, NonZeroUsize::new(1));
+        let error = serve(&["--blocking-threads", "0"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

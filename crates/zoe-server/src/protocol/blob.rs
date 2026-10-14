@@ -662,9 +662,9 @@ mod tests {
         client.send_async("storea", vec![p64(1), p64(0), pickle, txn]);
         client.send_async("storeBlobStart", vec![]);
         client.send_async("storeBlobChunk", vec![Value::Binary(vec![1; 59_000])]);
-        // The session runs the calls of a connection in order. So after the
-        // reply to ping, the upload file holds the chunk.
-        client.call("ping", vec![]);
+        // The calls of a transaction run in order. So after the reply to an
+        // abort of another transaction, the upload file holds the chunk.
+        client.call("tpc_abort", vec![Value::from(99)]);
         let names = uploads(&dir);
         assert_eq!(names.len(), 1, "{names:?}");
         let file = dir.join("blobs/tmp").join(&names[0]);

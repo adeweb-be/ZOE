@@ -38,7 +38,7 @@ use std::time::Duration;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Clock, Oid, Options, Store, Tid};
 
-use crate::protocol::{NamedStorage, Queues, STORAGE_NAME, Storages};
+use crate::protocol::{NamedStorage, Pool, Queues, STORAGE_NAME, Storages};
 use client::SimClient;
 use disk::{SimClock, SimVfs};
 use rng::Rng;
@@ -59,6 +59,10 @@ const DEFAULT_DELAY: Duration = Duration::from_millis(2);
 /// The directory of the store, as the status of the server names it. It
 /// does not exist, so the server sends no sizes.
 const STORE_PATH: &str = "/nonexistent/zoe-sim";
+
+/// The threads of the read pool of the simulated server. A fixed number
+/// keeps a run the same on every machine.
+const SIM_POOL: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4).unwrap();
 
 /// The faults that a run injects.
 #[derive(Clone, Debug)]
@@ -310,7 +314,8 @@ impl Driver {
                     Queues::DEFAULT,
                 )
                 .started_at(start);
-                let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client);
+                let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client)
+                    .with_pool(Pool::new(SIM_POOL));
                 state.server.storages = Some(Arc::new(storages));
                 state.server.up = true;
                 state.trace(format!("server {why}"));
