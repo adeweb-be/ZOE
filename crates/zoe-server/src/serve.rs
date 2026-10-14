@@ -361,6 +361,21 @@ pub struct Server {
     /// The accept loop and the connections that run.
     tasks: Arc<Tasks>,
     shutdown_timeout: Duration,
+    /// The times of the stop. The stop sets them once.
+    #[cfg(test)]
+    stop_times: Arc<std::sync::OnceLock<StopTimes>>,
+}
+
+/// The times of a stop that the shutdown timeout bounds. The tests of the
+/// crate read them.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StopTimes {
+    /// The start of the stop, before the stop signal.
+    pub(crate) start: Instant,
+    /// The end of the wait for the sessions, before the close of the
+    /// stores.
+    pub(crate) waited: Instant,
 }
 
 impl Server {
@@ -473,6 +488,8 @@ impl Server {
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
+            #[cfg(test)]
+            stop_times: Arc::default(),
         })
     }
 
@@ -492,6 +509,12 @@ impl Server {
     /// connection and close the stores.
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// Return the cell that the stop fills with its times.
+    #[cfg(test)]
+    pub(crate) fn stop_times(&self) -> Arc<std::sync::OnceLock<StopTimes>> {
+        Arc::clone(&self.stop_times)
     }
 
     /// Call `ready` with the address, then serve until SIGTERM or SIGINT.
@@ -527,7 +550,8 @@ impl Server {
             return;
         };
         let timeout = self.shutdown_timeout.min(LONGEST_SHUTDOWN_TIMEOUT);
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         // The accept loop drops the listener, and each connection reads no
         // more calls. The sessions run the calls that wait, then end.
         self.stop_signal.send_replace(true);
@@ -543,6 +567,11 @@ impl Server {
         let rest = deadline.saturating_duration_since(Instant::now());
         std::thread::scope(|scope| {
             scope.spawn(move || runtime.shutdown_timeout(rest));
+        });
+        #[cfg(test)]
+        let _ = self.stop_times.set(StopTimes {
+            start,
+            waited: Instant::now(),
         });
         // A session that runs holds the store of its storage. This drop
         // closes every other store.

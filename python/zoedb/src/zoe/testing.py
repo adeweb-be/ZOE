@@ -10,12 +10,15 @@ This module needs the test extra of ZODB.
 - `StorageTestCase` is the base class of the storage suites of ZODB.
 - `ZoeServer` runs the `zoe` binary as `zoe serve`, for the tests of the
   server. `ZoeServer.binary()` gives the path of the binary, from
-  `ZOE_BINARY` or the debug build of the repository.
+  `ZOE_BINARY` or the debug build of the repository. The kernel kills the
+  server when the thread that started it ends, so a test process that
+  dies leaves no server. Linux only.
 - `ZEO_LAYER` is a layer of zope.testrunner. Between its `setUp` and its
   `tearDown`, the test forker of ZEO starts `zoe serve` in place of a ZEO
   server. It needs ZEO.
 """
 
+import ctypes
 import io
 import itertools
 import json
@@ -147,6 +150,12 @@ class ZoeServer:
     arguments `args`, and without `--path` when `path` is None. Only the
     variables of `env` reach it as `ZOE_*`. As a context manager, it
     starts the server and kills it at the end.
+
+    The server never outlives the process that started it. The kernel
+    sends SIGKILL to the server when its parent ends (`PR_SET_PDEATHSIG`
+    of Linux). The signal follows the thread that started the server, not
+    the process: a server started from a thread ends when that thread
+    ends.
     """
 
     def __init__(self, path=None, args=(), env=None):
@@ -194,6 +203,7 @@ class ZoeServer:
             stdout=subprocess.PIPE,
             env=environ,
             text=True,
+            preexec_fn=_die_with_parent(),
         )
         # The kill closes stdout, so the read below ends.
         expired = threading.Event()
@@ -254,6 +264,38 @@ class ZoeServer:
 
     def __exit__(self, *exc_info):
         self.kill()
+
+
+# The option of prctl(2) that sets the parent-death signal.
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent():
+    """Return the function that `subprocess` runs in the child.
+
+    The function asks the kernel to send SIGKILL to the child when its
+    parent ends. Then it checks that the parent is still the process that
+    started the child. When the parent ended during the fork, the function
+    fails, and the child does not run the server.
+
+    The function runs between the fork and the exec, where other threads
+    can hold locks. So this function looks up `prctl` before the fork, and
+    the child does no other work.
+    """
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = (ctypes.c_int, ctypes.c_ulong)
+    prctl.restype = ctypes.c_int
+    option, kill = _PR_SET_PDEATHSIG, int(signal.SIGKILL)
+    parent = os.getpid()
+    getppid = os.getppid
+
+    def die_with_parent():
+        if prctl(option, kill) != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+        if getppid() != parent:
+            raise RuntimeError("the process that started zoe serve ended")
+
+    return die_with_parent
 
 
 def _no_option(what):
