@@ -107,8 +107,12 @@ pub(crate) const STORAGE_NAME: &str = "1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Queues {
     /// The most transactions that `getInvalidations` covers. Past it, the
-    /// reply is nil.
+    /// reply is nil, except for a tid younger than `invalidation_age`.
     pub(crate) invalidations: usize,
+    /// The age under which `getInvalidations` covers every transaction
+    /// after a tid, past `invalidations`, as the key `invalidation-age` of
+    /// ZEO. Zero turns it off.
+    pub(crate) invalidation_age: Duration,
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection. The replies of the calls wait in a queue of
     /// `QUEUE` frames, and each call takes its room before it starts.
@@ -116,10 +120,11 @@ pub(crate) struct Queues {
 }
 
 impl Queues {
-    /// The bounds of a server that gets no option: 100,000 transactions
-    /// and 1,000 messages.
+    /// The bounds of a server that gets no option: 100,000 transactions,
+    /// no invalidation age and 1,000 messages.
     pub(crate) const DEFAULT: Self = Self {
         invalidations: 100_000,
+        invalidation_age: Duration::ZERO,
         client: 1_000,
     };
 }

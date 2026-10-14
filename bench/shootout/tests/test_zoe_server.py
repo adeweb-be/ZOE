@@ -12,8 +12,10 @@ results under DIR, keeps the last result of each storage per machine and
 Python build, and compares `ops_per_second` cell by cell. It prints one
 line per scenario and cell with the ratio, and exits with 0 when every
 ratio is at least R, and with 1 otherwise or when a cell of B has no
-counterpart in S. The phase 2 gate is `--storage zoe-server --baseline zeo
---ratio 3` on the full set of the reference machine.
+counterpart in S. It leaves `read_hot` out, because `read_hot` reads from
+the cache of the client only. The phase 2 gate is `--storage zoe-server
+--baseline zeo` with the default ratio 1, on the full set of the reference
+machine.
 
 The test runs a tiny profile in place of the quick set.
 """

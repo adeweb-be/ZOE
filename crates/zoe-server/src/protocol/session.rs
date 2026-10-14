@@ -19,7 +19,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use rmpv::Value;
 use zoe_core::{BlobFile, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
@@ -1014,17 +1014,27 @@ impl Session {
     ///
     /// Return nil when more than `invalidation-queue-size` transactions
     /// that wrote records come after the tid, or when the index does not
-    /// read. The client then verifies its cache.
+    /// read. The client then verifies its cache. A tid younger than
+    /// `invalidation-age` gets every transaction after it, whatever their
+    /// number. The index reads in slices, each a snapshot, so a commit
+    /// never waits for the read.
     fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
         let [tid] = arity::<1>(args, "getInvalidations")?;
         let tid = u64_of(tid)?;
         // The connection gets the invalidation of each commit after `last`.
         let last = self.storage.invalidations.published();
+        let queues = self.storage.queues;
+        // The clock is read only when the age is on, so a server without
+        // the age reads no wall clock here.
+        let limit = if !queues.invalidation_age.is_zero()
+            && clock::younger_than(Tid(tid), queues.invalidation_age, SystemTime::now())
+        {
+            usize::MAX
+        } else {
+            queues.invalidations
+        };
         let oids = match tid.checked_add(1) {
-            Some(from) => {
-                self.store
-                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
-            }
+            Some(from) => self.store.written_oids(Tid(from), last, limit),
             None => Ok(Some(Vec::new())),
         };
         Ok(match oids {
@@ -3291,7 +3301,7 @@ mod tests {
     fn get_invalidations_covers_the_gap_or_gives_nil() {
         let queues = Queues {
             invalidations: 2,
-            client: 1_000,
+            ..Queues::DEFAULT
         };
         let mut s = Client::new(storage("get-invalidations", queues), outbox());
         done(call(
@@ -3317,6 +3327,35 @@ mod tests {
         assert_eq!(get(&mut s, p64(u64::MAX)), nothing);
         let fault = failed(call(&mut s, "getInvalidations", vec![Value::from(1)]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn get_invalidations_covers_a_young_tid_past_the_queue_size() {
+        let queues = Queues {
+            invalidations: 2,
+            invalidation_age: std::time::Duration::from_secs(3_600),
+            ..Queues::DEFAULT
+        };
+        let mut s = Client::new(storage("invalidation-age", queues), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let second = commit(&mut s, 2, 2, 0, b"b").unwrap();
+        commit(&mut s, 3, 3, 0, b"c").unwrap();
+        commit(&mut s, 4, 2, second, b"d").unwrap();
+        let last = commit(&mut s, 5, 1, first, b"e").unwrap();
+        let get = |s: &mut Client, tid: Value| done(call(s, "getInvalidations", vec![tid]));
+
+        // Four commits come after `first`, and each oid comes once.
+        assert_eq!(
+            get(&mut s, p64(first)),
+            Value::Array(vec![p64(last), Value::Array(vec![p64(1), p64(2), p64(3)])])
+        );
+        // The tid 0 is from 1900: older than the age.
+        assert_eq!(get(&mut s, p64(0)), Value::Nil);
     }
 
     #[test]

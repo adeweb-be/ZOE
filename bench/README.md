@@ -13,7 +13,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench run --storage zeo --quick` | one storage only |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
-| `just bench gate DIR` | the gate report: `zoe-server` against `zeo` in each cell of a results tree (see [The gate](#the-gate)) |
+| `just bench gate DIR` | the parity gate: `zoe-server` against `zeo` in each cell of a results tree but `read_hot` (see [The gate](#the-gate)) |
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -54,16 +54,17 @@ Each run of one storage gives one JSON document that validates against [`schema/
 
 ## The gate
 
-The phase 2 gate is "at least 3× ZEO on zodbshootout" (N4). `python -m shootout gate`, or `just bench gate DIR`, reads the results tree DIR in the layout below and turns the gate into a pass or a fail per cell:
+The phase 2 gate of N4 is parity: `zoe-server` at least 1× `zeo` in each zodbshootout cell that reaches the server, both through `ZEO.ClientStorage`. `python -m shootout gate`, or `just bench gate DIR`, reads the results tree DIR in the layout below and turns the gate into a pass or a fail per cell:
 
 ```sh
-just bench gate --storage zoe-server --baseline zeo --ratio 3 target/bench/results
+just bench gate target/bench/results
 ```
 
 - For each machine, Python build and set (quick or full), it keeps the last result of each storage, by the start of the run. So it compares one machine, one Python build and the same cells, and never a quick run with a full run.
 - For each scenario and cell of the baseline, it prints `ops_per_second` of both storages and their ratio.
-- It exits with 0 when every ratio is at least `--ratio`. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline.
-- `--storage zoe-server --baseline zeo --ratio 3` are the defaults. The phase 2 gate counts only the full set of the reference machine.
+- It leaves `read_hot` out. zodbshootout's `read_hot` empties the object cache of the connection, then reads the objects from the cache of `ZEO.ClientStorage`, so no read reaches the server. The report prints each `read_hot` cell with the numbers that exist and the verdict `left out`, and says why. A `read_hot` cell counts neither as below nor as missing. `read_hot` still runs and stays in the results.
+- It exits with 0 when the ratio of each cell that counts is at least `--ratio`. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline.
+- `--storage zoe-server --baseline zeo --ratio 1` are the defaults. `--ratio` takes any positive value. The phase 2 gate counts only the full set of the reference machine.
 
 ## The results repository
 

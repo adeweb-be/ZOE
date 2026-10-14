@@ -481,7 +481,8 @@ plone scenario="zoe" command="start" *args:
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set,
 # `just bench test` runs the tests of the harness and `just bench gate DIR`
-# compares zoe serve with ZEO cell by cell. `run` and `test` build `zoe` in
+# compares zoe serve with ZEO cell by cell, at parity by default and with
+# read_hot left out. `run` and `test` build `zoe` in
 # release for the storage zoe-server, unless ZOE_BINARY names a binary.
 # `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
 # in release, start `zoe serve` on a new store in
