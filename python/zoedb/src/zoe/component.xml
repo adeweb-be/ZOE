@@ -70,7 +70,9 @@
       ZEO's clientstorage. The native client reads the files itself. ZEO's
       client gets the context that ZEO makes from them. A configuration
       that imports zoe and ZEO together has two section types named ssl,
-      and ZConfig refuses it.
+      and ZConfig refuses it. In such a configuration, use a zoeclient
+      section with native false and this ssl section in place of ZEO's
+      clientstorage: it opens ZEO's client with the same TLS.
     </description>
     <key name="certificate" datatype="existing-dirpath" required="yes">
       <description>

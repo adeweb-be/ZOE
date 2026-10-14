@@ -274,10 +274,12 @@ impl Client {
     /// writable, or when `wait` passes. The client closes each other
     /// connection, so it holds one connection at the end.
     ///
-    /// When no server opens, the open fails with the first error that is
-    /// not of the connection, else with the last error of a connection.
-    /// When `wait` passes first, it fails with that error too, or with
-    /// `Error::Io` of the kind `TimedOut` when no attempt failed yet. The
+    /// When no server opens, the open fails with the most specific error:
+    /// the first error that is not of the connection, else the last error
+    /// of a TLS handshake or of a bad stream (`InvalidData`), else the last
+    /// error of a connection. When `wait` passes first, it fails with that
+    /// error too, or with `Error::Io` of the kind `TimedOut` when no attempt
+    /// failed yet. The
     /// attempts run in the task of the caller and through `runtime`, in the
     /// order of `endpoints`.
     pub async fn open_first(
@@ -328,7 +330,7 @@ impl Client {
                 // their connections.
                 Some(Ok(client)) => return Ok(client),
                 Some(Err(error)) => {
-                    if failure.as_ref().is_none_or(is_of_the_connection) {
+                    if failure.as_ref().is_none_or(|kept| keeps(&error, kept)) {
                         failure = Some(error);
                     }
                 }
@@ -1019,6 +1021,25 @@ fn is_of_the_connection(error: &Error) -> bool {
     matches!(error, Error::Io(_) | Error::Disconnected)
 }
 
+/// Return how specific `error` is. An error of the server or of the
+/// protocol tells the most. A failed TLS handshake or a bad stream
+/// (`InvalidData`) comes next. A refused, lost or closed connection tells
+/// the least.
+fn specificity(error: &Error) -> u8 {
+    match error {
+        Error::Io(error) if error.kind() == io::ErrorKind::InvalidData => 1,
+        error if is_of_the_connection(error) => 0,
+        _ => 2,
+    }
+}
+
+/// Tell if `Client::open_first` keeps the new error `error` in place of
+/// `kept`: a more specific error, or a later error of the connection.
+fn keeps(error: &Error, kept: &Error) -> bool {
+    let (new, old) = (specificity(error), specificity(kept));
+    new > old || (new == old && new < 2)
+}
+
 /// Return the names of the key `extensions` of the map `info` that the
 /// client declared in `declared`, in the order of the server.
 fn accepted(info: &Value, declared: &[String]) -> Vec<String> {
@@ -1127,6 +1148,27 @@ mod tests {
         };
         assert!(!is_of_the_connection(&server));
         assert!(!is_of_the_connection(&Error::Protocol("M4".into())));
+    }
+
+    #[test]
+    fn the_open_keeps_the_most_specific_error() {
+        let refused = || Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let handshake = || Error::Io(io::Error::new(io::ErrorKind::InvalidData, "UnknownIssuer"));
+        let server = || Error::Server {
+            class: "builtins.ValueError".into(),
+            message: String::new(),
+        };
+        // A TLS error is not lost behind a later refused connection.
+        assert!(!keeps(&refused(), &handshake()));
+        assert!(keeps(&handshake(), &refused()));
+        // An error of the server stays over every error of a connection.
+        assert!(!keeps(&handshake(), &server()));
+        assert!(keeps(&server(), &handshake()));
+        // The first error of a server stays, and a later error of a
+        // connection of the same rank replaces an earlier one.
+        assert!(!keeps(&server(), &server()));
+        assert!(keeps(&refused(), &Error::Disconnected));
+        assert!(keeps(&handshake(), &handshake()));
     }
 
     #[test]
