@@ -4,9 +4,9 @@
 Python build and set (quick or full), it keeps the last result of each
 storage. It then divides the `ops_per_second` of the storage by the one of
 the baseline in each scenario and cell of the baseline. The gate passes
-when every ratio is at least the ratio of the gate. A cell of the baseline
-without a counterpart in the storage fails the gate, and so does a tree
-without a result of the baseline.
+when every ratio that counts is at least the ratio of the gate. A cell of
+the baseline without a counterpart in the storage fails the gate, and so
+does a tree without a result of the baseline.
 
 The gate leaves out the scenarios of `LEFT_OUT`, because no read of these
 scenarios reaches the server. The report prints their cells with the
