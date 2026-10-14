@@ -132,9 +132,11 @@ impl StorageOptions {
     }
 
     /// Serve the store for reads only, when `read_only` is true. The server
-    /// opens the existing store with `Store::open_read_only_with`: it
-    /// changes no byte of the store and holds its lock. A store with blobs
-    /// must get its blob directory, or the start fails.
+    /// opens the existing store with `Store::open_read_only_repairing`: it
+    /// changes no byte of a store that was closed cleanly, and holds its
+    /// lock. It repairs a store that a writer left open, and logs a
+    /// warning. A store with blobs must get its blob directory, or the
+    /// start fails.
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -559,7 +561,7 @@ impl Server {
         for storage in &options.storages {
             let read_only = options.is_read_only(storage);
             let store = if read_only {
-                open_read_only(&storage.path, options.store_options(storage))?
+                open_read_only(&storage.name, &storage.path, options.store_options(storage))?
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
@@ -780,14 +782,27 @@ impl Signals {
     }
 }
 
-/// Open the store in `path` read-only with `options`. A read-only open does
+/// Open the store of the storage `name` in `path` read-only with
+/// `options`.
+///
+/// The open repairs a store that a writer left open (ADR 0032), and logs
+/// one WARN line that names the storage and holds `repaired the store`. A
+/// failed repair fails the start with `RepairFailed`. A read-only open does
 /// not check the blob directory, so this call checks it, as `zoe verify`
 /// does: a store with blobs whose blob directory has no layout file fails,
 /// and the error names that directory.
-fn open_read_only(path: &Path, options: Options) -> Result<Arc<Store>, Error> {
-    Store::open_read_only_with(path, options)
-        .and_then(|store| store.check_blob_dir().map(|()| Arc::new(store)))
-        .map_err(|error| Error::Store(path.to_path_buf(), error))
+fn open_read_only(name: &str, path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+    let failed = |error| Error::Store(path.to_path_buf(), error);
+    let store = Store::open_read_only_repairing(path, options).map_err(failed)?;
+    if store.repaired() {
+        tracing::warn!(
+            storage = name,
+            "{}: the store was not closed cleanly: repaired the store",
+            path.display()
+        );
+    }
+    store.check_blob_dir().map_err(failed)?;
+    Ok(Arc::new(store))
 }
 
 /// The listening socket of the ZEO port.

@@ -131,7 +131,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 | `WrongThread` | `zoe.WrongThread` |
 | `Protocol`, `LockOrder` | `StorageTransactionError` |
 | `Halted`, `CorruptRecord`, `CorruptBlob`, `CorruptTxn`, `CorruptSequence`, `Backend` | `StorageSystemError` |
-| `Locked`, `Closed`, `Format`, `ReadOnly`, `NotClosedCleanly`, `MissingBlobDir`, `NotBlobDir` | `StorageError` |
+| `Locked`, `Closed`, `Format`, `ReadOnly`, `NotClosedCleanly`, `RepairFailed`, `MissingBlobDir`, `NotBlobDir` | `StorageError` |
 | `Io` | `OSError` |
 
 A pack maps two errors in its own way. Each stops the pack and raises `StorageSystemError`, whose text starts with "pack stopped" and gives the text of the core:
