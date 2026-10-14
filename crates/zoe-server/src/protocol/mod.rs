@@ -463,9 +463,9 @@ pub(crate) async fn serve_stream(
                 idle(&*runtime, idle_timeout).await;
             } => {
                 tracing::info!(client = peer.as_str(), "no frame within the idle timeout: closing the connection");
-                // The writer stops at once. So a call that waits for room
-                // in the session queue stops too, and the transaction
-                // aborts, also when the client reads nothing.
+                // No call runs now. The writer stops at once, also when it
+                // waits for a client that reads nothing. Then the
+                // transaction aborts.
                 outbox.close();
                 break;
             }

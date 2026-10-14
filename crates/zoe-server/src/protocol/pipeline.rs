@@ -605,6 +605,45 @@ mod tests {
     }
 
     #[test]
+    fn quiet_waits_until_each_ticket_is_given_back() {
+        let (storages, _store) = storages("quiet");
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = Calls::new(
+                storages,
+                outbox,
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
+            let limit = Duration::from_secs(30);
+            // No call runs, so the connection is quiet at once.
+            tokio::time::timeout(limit, connection.quiet())
+                .await
+                .unwrap();
+            let held = connection.ticket().await;
+            // A quiet that stops early gives back the slots that it took.
+            let early = tokio::time::timeout(Duration::from_millis(50), connection.quiet()).await;
+            assert!(early.is_err());
+            let mut others = Vec::new();
+            for _ in 1..QUEUE {
+                others.push(
+                    tokio::time::timeout(limit, connection.ticket())
+                        .await
+                        .unwrap(),
+                );
+            }
+            drop(others);
+            // The connection is quiet when the last ticket goes.
+            let quiet = tokio::spawn(connection.quiet());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            drop(held);
+            tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
     fn the_thread_of_a_transaction_ends_with_the_transaction() {
         let (storages, store) = storages("lane-ends");
         let (outbox, _inbox, _closing) = Outbox::new(100, 100);
