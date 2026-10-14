@@ -353,11 +353,51 @@ plone scenario="zoe" command="start":
 
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set and
-# `just bench test` runs the tests of the harness. zoe-bench and the
-# criterion benchmarks are not built yet.
+# `just bench test` runs the tests of the harness. `just bench load` and
+# `just bench saturate` build `zoe` and `zoe-bench` in release, start
+# `zoe serve` on a new store in target/bench/work/zoe-bench, run
+# `zoe-bench load` or `zoe-bench saturate` with its default settings and
+# the options that follow, and write the JSON result to stdout and to
+# target/bench/zoe-bench/<command>-<started>.json. The criterion
+# benchmarks are not built yet.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
+    set -- {{ args }}
+    if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
+        command="$1"
+        shift
+        cargo build --release --locked -p zoe-server --bin zoe -p zoe-bench --bin zoe-bench
+        bin="${CARGO_TARGET_DIR:-target}/release"
+        work="target/bench/work/zoe-bench"
+        out="target/bench/zoe-bench"
+        rm -rf "$work"
+        mkdir -p "$work" "$out"
+        # `zoe serve` writes `listening <address>` once it accepts
+        # connections. The port 0 takes a free port.
+        "$bin/zoe" serve --path "$work/store" --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.log" &
+        pid=$!
+        trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        for _ in $(seq 100); do
+            grep -q '^listening ' "$work/serve.out" && break
+            kill -0 "$pid" 2>/dev/null || { cat "$work/serve.log" >&2; exit 1; }
+            sleep 0.1
+        done
+        addr="$(sed -n 's/^listening //p' "$work/serve.out")"
+        [ -n "$addr" ] || { echo "just bench: zoe serve does not listen" >&2; exit 1; }
+        result="$out/$command-$(date -u +%Y%m%dT%H%M%SZ).json"
+        # Write to a temporary file, and move it on success only. So a
+        # failed run leaves no result.
+        partial="$(mktemp "$out/.$command.XXXXXX")"
+        trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
+            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
+        # mktemp creates the file with the mode 0600.
+        chmod 0644 "$partial"
+        mv "$partial" "$result"
+        cat "$result"
+        exit 0
+    fi
     export UV_PYTHON="${UV_PYTHON:-3.13}"
     export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
     # The RelStorage wheel links libstdc++, which the Nix interpreters do not
