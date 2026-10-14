@@ -38,7 +38,7 @@ The `zoe` command: the binary `zoe`, its subcommands, and the `zoe serve` proces
 
 ## Invariants of the server
 
-- This crate uses tokio only under the feature `serve`: the server code, and `zoe-mcp` for `zoe mcp`. The feature is on by default. `zoe-py` depends on this crate without it, so the extension never links tokio or rmcp: `cargo tree -p zoe-py -e normal` must list neither.
+- This crate uses tokio only under the feature `serve`: the server code, and `zoe-mcp` for `zoe mcp`. The feature is on by default. `zoe-py` depends on this crate without it, so the extension never links the server or rmcp: `cargo tree -p zoe-py -e normal` must not list rmcp. The extension links tokio only through `zoe-client`, for the native client (ADR 0035).
 - The server has no Python inside and needs no Plone eggs. It ships as one static binary.
 - The connection code (`protocol::serve_stream` and what it calls) reaches its tasks, its blocking threads and the time only through `runtime::Runtime`: never `tokio::spawn`, `tokio::task::spawn_blocking`, `tokio::time` or `tokio::net` there. A blocking thread waits for a channel only through `runtime::block_on`, never with `blocking_recv` or `blocking_send`. `Tokio` is the runtime of production, and the simulator gives its own. The accept loop, the stop and the admin port in `serve.rs` and `admin.rs` stay on tokio.
 - Every `select!` is `biased;`. By default `select!` polls a random branch first, from a generator that no seed fixes outside a tokio runtime, so the simulator could not run it in one order.

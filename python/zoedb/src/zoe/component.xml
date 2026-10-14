@@ -69,14 +69,25 @@
     <description>
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
-      the same values, and wait-timeout. It declares the ZOE extensions to
-      the server, and works as a zeoclient against a stock ZEO server.
+      the same values, wait-timeout and native. It declares the ZOE
+      extensions to the server, and works as a zeoclient against a stock
+      ZEO server.
     </description>
     <key name="wait-timeout" datatype="integer" default="30">
       <description>
         The longest wait for a connection to the server, in seconds, at the
         open and after a disconnection. A longer wait raises
         ClientDisconnected. The default is 30.
+      </description>
+    </key>
+    <key name="native" datatype="boolean" default="false">
+      <description>
+        If true, the client runs on the native client, built on the Rust
+        crate zoe-client, and not on the asyncio client of ZEO. It has one
+        TCP address, one connection and no cache, no blob and no reconnect
+        yet: a key of these features with a value other than its default
+        fails the open. Against a stock ZEO server, it needs msgpack true
+        on the server. The default is false.
       </description>
     </key>
   </sectiontype>
