@@ -1,19 +1,21 @@
-//! The send queue of a TCP socket.
+//! The send queue of a TCP or unix domain socket.
 
 use std::io;
 use std::os::fd::RawFd;
 
-/// Return the count of bytes in the send queue of the TCP socket `fd`:
-/// the bytes that the kernel did not send yet and the bytes that the peer
-/// did not acknowledge yet. The FIN counts too. Linux gives this count
-/// for the ioctl `SIOCOUTQ`, which has the value of `TIOCOUTQ`. The count
-/// is 0 when the peer acknowledged every byte and the FIN. `fd` must be
-/// the descriptor of a TCP socket that the caller holds open.
+/// Return the count of bytes in the send queue of the socket `fd`. For a
+/// TCP socket, these are the bytes that the kernel did not send yet and
+/// the bytes that the peer did not acknowledge yet. The FIN counts too.
+/// For a unix domain socket, it is the memory of the buffers that the peer
+/// did not read yet. Linux gives this count for the ioctl `SIOCOUTQ`, which has
+/// the value of `TIOCOUTQ`. The count is 0 when the peer has every byte
+/// and, on TCP, the FIN. `fd` must be the descriptor of a TCP or unix
+/// domain socket that the caller holds open.
 #[allow(unsafe_code)]
 pub(crate) fn unacked(fd: RawFd) -> io::Result<usize> {
     let mut count: libc::c_int = 0;
-    // SAFETY: The caller holds the TCP stream of `fd` open for the whole
-    // call, so `fd` is a live TCP socket. For a TCP socket, the ioctl
+    // SAFETY: The caller holds the stream of `fd` open for the whole call,
+    // so `fd` is a live TCP or unix domain socket. For both, the ioctl
     // `TIOCOUTQ` writes one `c_int` through its third argument and reads
     // no other memory. The pointer points to `count`, a local `c_int` that
     // lives until the call returns.
@@ -38,6 +40,20 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         assert_eq!(unacked(server.as_raw_fd()).unwrap(), 0);
         assert_eq!(unacked(client.as_raw_fd()).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_unix_socket_counts_the_bytes_that_its_peer_did_not_read() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        assert_eq!(unacked(server.as_raw_fd()).unwrap(), 0);
+        server.write_all(b"frame").unwrap();
+        assert!(unacked(server.as_raw_fd()).unwrap() > 0);
+        let mut read = [0u8; 5];
+        client.read_exact(&mut read).unwrap();
+        assert_eq!(unacked(server.as_raw_fd()).unwrap(), 0);
     }
 
     #[test]

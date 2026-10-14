@@ -23,6 +23,7 @@ import importlib
 import io
 import itertools
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -153,6 +154,10 @@ class ZoeServer:
     lines to stderr. With `log`, they go to the end of the file `log`. As
     a context manager, it starts the server and kills it at the end.
 
+    `address` is `(host, port)`, or the path of a unix domain socket as a
+    string. An address that is set before the start is the `--listen` of
+    the server.
+
     The server never outlives the process that started it. The kernel
     sends SIGKILL to the server when its parent ends (`PR_SET_PDEATHSIG`
     of Linux). The signal follows the thread that started the server, not
@@ -185,14 +190,16 @@ class ZoeServer:
     def start(self, timeout=None):
         """Start the server. Return once it accepts connections.
 
-        A later start listens on the same port, so a client reconnects.
-        A server that does not listen within `timeout` seconds is killed,
-        and the start fails.
+        A later start listens on the same address, so a client
+        reconnects. A server that does not listen within `timeout` seconds
+        is killed, and the start fails.
         """
         if self._process is not None:
             raise RuntimeError("the server runs")
         listen = "127.0.0.1:0"
-        if self.address is not None:
+        if isinstance(self.address, str):
+            listen = self.address
+        elif self.address is not None:
             listen = f"{self.address[0]}:{self.address[1]}"
         command = [self.binary(), "serve"]
         if self.path is not None:
@@ -229,8 +236,7 @@ class ZoeServer:
         try:
             for line in process.stdout:
                 if line.startswith("listening "):
-                    host, port = line.split()[1].rsplit(":", 1)
-                    address = (host.strip("[]"), int(port))
+                    address = _listening(line.removeprefix("listening "))
                     break
         finally:
             if timer is not None:
@@ -313,15 +319,34 @@ def _no_option(what):
     return ValueError(f"zoe serve has no option for {what}")
 
 
-def _address(value):
-    """Return the address `(host, port)` of the ZEO key `address`.
+def _listening(value):
+    """Return the address of the line `listening ADDRESS` of `zoe serve`.
 
-    An empty host is 127.0.0.1. A host name becomes its IPv4 address,
-    because `zoe serve --listen` takes an IP address.
+    An address with a `/` is the path of a unix domain socket, and stays a
+    string. Another address becomes `(host, port)`.
     """
+    value = value.rstrip("\n")
+    if "/" in value:
+        return value
+    host, port = value.rsplit(":", 1)
+    return host.strip("[]"), int(port)
+
+
+def _address(value):
+    """Return the address of the ZEO key `address`.
+
+    A value with a `/` is the path of a unix domain socket, as for ZEO. It
+    stays a string, and `zoe serve --listen` takes it as it is, so a
+    relative path is relative to the current directory. Another value
+    becomes `(host, port)`. An empty host is 127.0.0.1. A host name
+    becomes its IPv4 address, because `zoe serve --listen` takes an IP
+    address.
+    """
+    if "/" in value:
+        return value
     host, colon, port = value.rpartition(":")
-    if not colon or "/" in value:
-        raise _no_option(f"address {value}: zoe serve listens on TCP only")
+    if not colon:
+        raise _no_option(f"address {value}: give HOST:PORT, or a path with a /")
     host = host.strip("[]") or "127.0.0.1"
     try:
         socket.inet_pton(socket.AF_INET6 if ":" in host else socket.AF_INET, host)
@@ -359,6 +384,11 @@ def _zeo_options(section):
             # loses its connection, as with ZEO. The timeout also closes an
             # idle connection without a transaction.
             args.append(f"--idle-timeout={int(value)}")
+        elif key == "invalidation-age":
+            # ZEO takes a float. zoe serve takes whole seconds, so round up.
+            # A negative age replays nothing in ZEO, as 0 does here.
+            seconds = max(0, math.ceil(float(value)))
+            args += ["--invalidation-age", str(seconds)]
         elif key == "client-conflict-resolution":
             # zoe serve has no such option. It resolves the simple
             # conflicts itself and sends the others to the client in the
