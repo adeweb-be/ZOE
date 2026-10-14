@@ -20,9 +20,12 @@ pub(crate) struct Extension {
     pub(crate) methods: &'static [&'static str],
 }
 
-/// The extensions that the server serves. It serves none yet, so each
-/// declaration gives an empty list back.
-pub(crate) const SERVED: &[Extension] = &[];
+/// The extensions that the server serves. `sequences` adds
+/// `sequence_next(name)`, the next value of a sequence of the store (F29).
+pub(crate) const SERVED: &[Extension] = &[Extension {
+    name: "sequences",
+    methods: &["sequence_next"],
+}];
 
 /// Return the names of the declaration `value`, the third argument of
 /// `register`. A value that is not a list of strings is an error.
@@ -113,6 +116,7 @@ mod tests {
         );
         assert!(accept(&["unknown"], TEST_SERVED).is_empty());
         assert!(accept(&["first"], SERVED).is_empty());
+        assert_eq!(accept(&["unknown", "sequences"], SERVED), ["sequences"]);
     }
 
     #[test]
@@ -122,6 +126,13 @@ mod tests {
         assert!(refused("first_call", Some(&["second"]), TEST_SERVED).is_some());
         assert!(refused("first_call", Some(&["first"]), TEST_SERVED).is_none());
         assert!(refused("second_other_call", Some(&["second"]), TEST_SERVED).is_none());
+    }
+
+    #[test]
+    fn sequence_next_needs_the_declaration_of_sequences() {
+        assert!(refused("sequence_next", None, SERVED).is_some());
+        assert!(refused("sequence_next", Some(&[]), SERVED).is_some());
+        assert!(refused("sequence_next", Some(&["sequences"]), SERVED).is_none());
     }
 
     #[test]
