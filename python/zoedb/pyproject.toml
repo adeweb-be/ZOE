@@ -22,7 +22,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-plone = ["Products.CMFPlone>=6.1"]
+# zoe serve speaks only the msgpack protocol M5 of ZEO. A stock ZEO client
+# needs msgpack for it.
+plone = ["Products.CMFPlone>=6.1", "msgpack>=1"]
 # zoe:// URIs through zodburi, which needs ZEO.
 uri = ["zodburi>=3"]
 
@@ -30,6 +32,13 @@ uri = ["zodburi>=3"]
 # zodburi.
 [project.entry-points."zodburi.resolvers"]
 zoe = "zoe.config:resolve_uri"
+
+# Plone loads the configure.zcml of zoe.plone through plone.autoinclude.
+# The group z3c.autoinclude.plugin would import a module named after the
+# project, zoedb, which does not exist; this group names the module.
+[project.entry-points."plone.autoinclude.plugin"]
+target = "plone"
+module = "zoe.plone"
 
 [project.scripts]
 # The `zoe` command. It runs the code of the `zoe` binary.

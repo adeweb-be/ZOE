@@ -13,16 +13,28 @@
 //! order. The leader publishes the last tid of the batch after the whole
 //! batch is visible to readers.
 //!
+//! A batch whose members are all deferred restores commits without a
+//! sync. It is visible at once, and the next durable commit makes it
+//! durable. Each deferred member keeps its intent file in `blobs/tmp/`
+//! until then, so a crash before it leaves no blob file of a lost commit.
+//! A batch with another member commits with a sync, which also makes every
+//! earlier deferred commit durable.
+//!
 //! The queue mutex is held with no other lock. The leader takes the commit
 //! sequencer after it releases the queue mutex.
+//!
+//! The write of a batch and its sync run in a `tracing` span `fsync`, with
+//! the field `commits`, the number of members that have a tid. The span
+//! is a child of the span of the leader's finish. A batch of deferred
+//! restores commits without a sync, so it has no span `fsync`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use super::staging::Staging;
-use super::{Finished, check_restore_tid, next_tid};
+use super::{Finished, Observer, check_restore_tid, next_tid};
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::blob::PendingBlob;
 use crate::clock::timestamp;
@@ -35,6 +47,8 @@ pub(super) struct Member {
     /// The tid of a restore transaction. A normal transaction gets its tid
     /// in the batch.
     pub(super) tid: Option<Tid>,
+    /// True for a restore transaction whose finish commits without a sync.
+    pub(super) deferred: bool,
     pub(super) staged: Staging,
     pub(super) blobs: BTreeMap<Oid, PendingBlob>,
     pub(super) user: Vec<u8>,
@@ -66,6 +80,9 @@ pub(crate) struct GroupCommit {
     queue: Mutex<Queue>,
     /// Signals the end of a batch.
     changed: Condvar,
+    /// The observer of the store. A leader tells it the size of each
+    /// batch that it made durable.
+    pub(super) observer: OnceLock<Arc<dyn Observer>>,
 }
 
 impl GroupCommit {
@@ -148,7 +165,8 @@ impl Drop for Lead<'_> {
 /// Each member gets its tid in batch order. A tid that fails its check
 /// fails only its member, with `Protocol`. The other members go in one
 /// backend write transaction. An error of that write fails each of them,
-/// and the store halts.
+/// and the store halts. The write commits without a sync when each of
+/// these members is a deferred restore.
 fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
     let mut sequencer = store.lock_sequencer();
     let Some(start) = *sequencer else {
@@ -159,6 +177,8 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
     };
     let now = timestamp(store.clock.now());
     let mut last = start;
+    // The number of commits that the sync of the batch made durable.
+    let mut synced = 0;
     let mut members: Vec<(Member, Result<Finished>)> = batch
         .into_iter()
         .map(|(_, member)| {
@@ -174,12 +194,34 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
         })
         .collect();
     if last != start {
+        let deferred = members
+            .iter()
+            .all(|(member, finished)| member.deferred || finished.is_err());
         // The sequencer stays empty if the write below fails.
         *sequencer = None;
-        match write(store, &mut members) {
+        // Only a batch that syncs gets the span `fsync`.
+        let span = if deferred {
+            tracing::Span::none()
+        } else {
+            let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
+            tracing::info_span!("fsync", commits)
+        };
+        match span.in_scope(|| write(store, &mut members, deferred)) {
             Ok(intents) => {
-                for intent in intents {
-                    store.blobs().finished(intent);
+                if deferred {
+                    // A crash before the next durable commit loses this
+                    // batch. The intent files let the next open remove
+                    // its blob files.
+                    for intent in intents {
+                        store.blobs().keep(intent);
+                    }
+                } else {
+                    for intent in intents {
+                        store.blobs().finished(intent);
+                    }
+                    // The sync of this batch covers the deferred commits
+                    // before it.
+                    store.blobs().release_kept();
                 }
                 for (member, finished) in &members {
                     if let Ok(finished) = finished {
@@ -190,11 +232,19 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
                     }
                 }
                 *sequencer = Some(last);
+                if !deferred {
+                    synced = members.iter().filter(|(_, f)| f.is_ok()).count();
+                }
             }
             Err(error) => fail(&mut members, error),
         }
     }
     drop(sequencer);
+    if synced > 0
+        && let Some(observer) = store.observer()
+    {
+        observer.batch_synced(synced);
+    }
     members
         .into_iter()
         .map(|(member, finished)| (Some(member), finished))
@@ -202,9 +252,13 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
 }
 
 /// Place the blobs of the members that have a tid, then write these
-/// members in one backend write transaction and commit it. Return the
-/// intent files of the blobs.
-fn write(store: &Store, members: &mut [(Member, Result<Finished>)]) -> Result<Vec<Option<String>>> {
+/// members in one backend write transaction and commit it, without a sync
+/// when `deferred` is true. Return the intent files of the blobs.
+fn write(
+    store: &Store,
+    members: &mut [(Member, Result<Finished>)],
+    deferred: bool,
+) -> Result<Vec<Option<String>>> {
     let mut intents = Vec::new();
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
@@ -235,7 +289,11 @@ fn write(store: &Store, members: &mut [(Member, Result<Finished>)]) -> Result<Ve
             status: TxnStatus::Committed,
         })?;
     }
-    write.commit()?;
+    if deferred {
+        write.commit_deferred()?;
+    } else {
+        write.commit()?;
+    }
     Ok(intents)
 }
 
@@ -520,6 +578,75 @@ mod tests {
         txn.restore(oid, Some(data)).unwrap();
         txn.vote().unwrap();
         txn
+    }
+
+    /// Begin a deferred restore at `tid` that restores `data` for `oid`,
+    /// and vote.
+    fn deferred<'s>(store: &'s Store, tid: Tid, oid: Oid, data: &[u8]) -> Txn<&'s Store> {
+        let mut txn = store
+            .tpc_begin_restore_deferred(tid, b"", b"", b"")
+            .unwrap();
+        txn.restore(oid, Some(data)).unwrap();
+        txn.vote().unwrap();
+        txn
+    }
+
+    /// An observer that keeps the size of each synced batch.
+    #[derive(Default)]
+    struct Batches(std::sync::Mutex<Vec<usize>>);
+
+    impl Observer for Batches {
+        fn batch_synced(&self, commits: usize) {
+            self.0.lock().unwrap().push(commits);
+        }
+    }
+
+    #[test]
+    fn a_batch_of_deferred_restores_does_not_sync() {
+        let vfs = Counting::default();
+        let store = Store::open_in(vfs.clone(), crate::clock::SystemClock).unwrap();
+        let batches = Arc::new(Batches::default());
+        assert!(store.set_observer(batches.clone()));
+        let before = vfs.syncs();
+        for n in 1..=10 {
+            deferred(&store, Tid(n), Oid(n), b"pickle")
+                .finish()
+                .unwrap();
+        }
+        assert_eq!(vfs.syncs(), before);
+        assert_eq!(store.last_transaction(), Tid(10));
+        assert_eq!(store.load(Oid(10)).unwrap(), (b"pickle".to_vec(), Tid(10)));
+        // A batch without a sync and `Store::sync` call no observer method.
+        store.sync().unwrap();
+        assert!(vfs.syncs() > before);
+        assert!(batches.0.lock().unwrap().is_empty());
+        assert_eq!(store.last_transaction(), Tid(10));
+    }
+
+    #[test]
+    fn a_batch_with_a_durable_member_makes_its_deferred_members_durable() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        // The restore tid is far after the clock, so the normal commit
+        // after it gets a later tid.
+        let tid = timestamp(std::time::SystemTime::now() + Duration::from_secs(3600));
+        // The first restore commits in a batch of its own, without a sync.
+        // The second one shares its batch with a normal commit.
+        let txns = vec![
+            deferred(&store, Tid(5), Oid(100), b"alone"),
+            deferred(&store, tid, Oid(101), b"shared"),
+            voted(&store, store.new_oid().unwrap(), b"durable"),
+        ];
+        let finished = finish_in_two_batches(&store, txns, || {});
+        let last = finished[2].as_ref().unwrap().tid;
+        assert!(last > tid);
+
+        let image = vfs.crash_now(|_| 0);
+        let reopened = Store::open_vfs(image).unwrap();
+        assert_eq!(reopened.last_transaction(), last);
+        assert_eq!(reopened.load(Oid(100)).unwrap().1, Tid(5));
+        assert_eq!(reopened.load(Oid(101)).unwrap().1, tid);
+        drop(store);
     }
 
     #[test]

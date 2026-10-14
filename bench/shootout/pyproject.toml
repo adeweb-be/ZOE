@@ -19,6 +19,9 @@ dependencies = [
     "six",
     "ZODB>=6",
     "ZEO>=6",
+    # zoe serve speaks only the msgpack protocol M5 of ZEO. The ZEO client of
+    # the storage zoe-server needs msgpack for it.
+    "msgpack>=1",
     "RelStorage>=4.1",
     # The binary wheel needs no libpq headers to install.
     "psycopg2-binary>=2.9",
@@ -47,7 +50,7 @@ persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c5495
 # The fork of zodbpickle that the workspace in python/ uses.
 zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
 # The fork of BTrees that the workspace in python/ uses.
-BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "f7dfacc28befc038263390fa448df0b8e772f2f0" }
 
 [tool.uv.build-backend]
 module-name = "shootout"
@@ -62,6 +65,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-# The acceptance test is planner output, and the builder does not edit it.
-# It sorts shootout with the third-party imports.
+# The acceptance tests are planner output, and the builder does not edit
+# them. They sort shootout with the third-party imports.
 "tests/test_baseline.py" = ["I001"]
+"tests/test_zoe_server.py" = ["I001"]

@@ -100,6 +100,11 @@ pub struct Options {
     /// same one. A writer open refuses a store with blob records whose
     /// blob directory has no layout file, with `MissingBlobDir`.
     pub blob_dir: Option<PathBuf>,
+    /// The most bytes that the page cache of the database holds: the pages
+    /// that reads keep, and the pages that a write buffers before it goes
+    /// to the file. `None`, the default, keeps the default of redb, 1 GiB.
+    /// This is `cache-size` in the configuration.
+    pub cache_size: Option<usize>,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -118,6 +123,7 @@ impl Default for Options {
             lock_warn: None,
             transaction_warn: None,
             blob_dir: None,
+            cache_size: None,
             _more: (),
         }
     }
@@ -247,7 +253,7 @@ impl Store {
     }
 
     /// Open the store as `open_full` does. `cache_size` sets the page cache
-    /// of the database in bytes. `None` keeps the default of redb.
+    /// of the database in bytes. `None` keeps `options.cache_size`.
     fn open_cached<V: Vfs>(
         vfs: V,
         clock: impl Clock + 'static,
@@ -283,7 +289,7 @@ impl Store {
         vfs.sync_dir()?;
 
         let mut builder = redb::Builder::new();
-        if let Some(bytes) = cache_size {
+        if let Some(bytes) = cache_size.or(options.cache_size) {
             builder.set_cache_size(bytes);
         }
         let db = builder
@@ -307,16 +313,48 @@ impl Store {
     /// crash left open fails with `NotClosedCleanly`: a writer open
     /// rebuilds the free-space map of its database.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with(dir, Options::default())
+    }
+
+    /// Open the existing store in the directory `dir` for reads only, with
+    /// `options`, as `open_read_only` does.
+    ///
+    /// With `options.blob_dir`, the store reads its blob files in that
+    /// directory. The call changes no byte and creates nothing in the blob
+    /// directory or in the directory that holds it, and neither need exist.
+    /// The path must end in a name that is UTF-8, and an existing entry
+    /// there must be a directory. As `open_read_only`, the call does not
+    /// check that the blob directory is the one of the store:
+    /// `check_blob_dir` does.
+    pub fn open_read_only_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        let relocated = match options.blob_dir.as_deref().map(blob_location) {
+            Some(location) => {
+                let (parent, name) = location?;
+                let parent: Box<dyn blob::BlobDir> = Box::new(blob::ReadOnlyDir::new(parent));
+                Some((parent, name))
+            }
+            None => None,
+        };
         let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
-        let db = redb::Builder::new()
+        let mut builder = redb::Builder::new();
+        if let Some(bytes) = options.cache_size {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder
             .open_read_only(dir.path(DATABASE))
             .map_err(|e| match e {
                 redb::DatabaseError::RepairAborted => ZoeError::NotClosedCleanly,
                 e => ZoeError::Backend(Box::new(e)),
             })?;
         let backend = RedbBackend::open_read_only(db)?;
-        let options = Options::default();
-        Self::assemble(backend, dir, Box::new(SystemClock), options, true, None)
+        Self::assemble(
+            backend,
+            dir,
+            Box::new(SystemClock),
+            options,
+            true,
+            relocated,
+        )
     }
 
     /// Make a store from an open backend and the directory that holds its
@@ -428,6 +466,46 @@ impl Store {
         Txn::begin_restore(self, tid, user, description, extension)
     }
 
+    /// Begin a restore transaction that borrows the store, as
+    /// `tpc_begin_restore` does, whose finish commits without a sync of
+    /// the database file. `Txn::begin_restore_deferred` tells what the
+    /// finish does. `sync` makes the commit durable.
+    pub fn tpc_begin_restore_deferred(
+        &self,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<&Self>> {
+        self.writable()?;
+        Txn::begin_restore_deferred(self, tid, user, description, extension)
+    }
+
+    /// Make every commit before this call durable.
+    ///
+    /// The call runs the barrier `Backend::sync` under the commit
+    /// sequencer: one backend write transaction of its own, committed with
+    /// a sync. It writes no record, no transaction row and
+    /// no last tid, so the last tid does not change. Then it removes the
+    /// intent files that the deferred commits kept in `blobs/tmp/`.
+    ///
+    /// A read-only store fails with `ReadOnly`, and a halted store with
+    /// `Halted`. Another error leaves the store halted, as a failed
+    /// `finish` does.
+    pub fn sync(&self) -> Result<()> {
+        self.writable()?;
+        let mut sequencer = self.lock_sequencer();
+        let Some(last) = *sequencer else {
+            return Err(ZoeError::Halted);
+        };
+        // The sequencer stays empty if the commit below fails.
+        *sequencer = None;
+        self.backend.sync()?;
+        *sequencer = Some(last);
+        self.blobs().release_kept();
+        Ok(())
+    }
+
     /// Return the current pickle of `oid` and its serial.
     pub fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid)> {
         match self.backend.load_before(oid, Tid::MAX)? {
@@ -465,9 +543,15 @@ impl Store {
         self.backend.remove_record_for_test(oid, tid)
     }
 
-    /// Tell if no transaction holds or waits for a lock. A test of a skin
-    /// uses it to show that every lock is released.
-    #[doc(hidden)]
+    /// Tell if no transaction holds or waits for a lock. The method changes
+    /// nothing.
+    ///
+    /// The lock table of a store that the process just opened is empty, so
+    /// it holds no stale entry. For this reason, the readiness of
+    /// `zoe serve` reads the method once after the open of each store. A
+    /// running transaction holds locks, and these locks are not stale. The
+    /// lock table lives in the memory of one process, so the method tells
+    /// nothing about other processes.
     pub fn lock_table_is_empty(&self) -> bool {
         self.locks.is_empty()
     }
@@ -530,6 +614,24 @@ impl Store {
         Ok(self.blobs().path(oid, tid))
     }
 
+    /// Fail with `MissingBlobDir` when the store has blob records and its
+    /// blob directory has no layout file. Then the blob directory of the
+    /// open is not the one of the store: the option is missing or wrong, or
+    /// the directory is not mounted. The call changes nothing.
+    ///
+    /// A writer open makes this check itself. A read-only open does not, so
+    /// a reader that needs the blob files calls it.
+    pub fn check_blob_dir(&self) -> Result<()> {
+        self.blobs().check_present(&**self.backend)
+    }
+
+    /// Tell if the blob file that `tid` wrote for `oid` exists. This reads
+    /// no byte of the file. A missing blob record is `NotFound`.
+    pub fn has_blob_file(&self, oid: Oid, tid: Tid) -> Result<bool> {
+        self.blob_record(oid, tid)?;
+        self.blobs().has_file(oid, tid)
+    }
+
     /// Return the blob store.
     pub(crate) fn blobs(&self) -> &BlobStore {
         &self.backend.blobs
@@ -587,6 +689,8 @@ mod tests {
         write: AtomicBool,
         /// `iter_txns` fails as a whole.
         rows: AtomicBool,
+        /// `indexed_tids` fails.
+        index: AtomicBool,
         /// The commit of a write transaction writes, then fails.
         landed: AtomicBool,
         /// `load_current` gives one record fewer than it got oids.
@@ -717,6 +821,13 @@ mod tests {
             self.inner.txn_oids(from, to)
         }
 
+        fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>> {
+            if self.faults.index.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.indexed_tids(from, to, limit)
+        }
+
         fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
             self.inner.current_from(from)
         }
@@ -738,6 +849,9 @@ mod tests {
         }
 
         fn sync(&self) -> Result<()> {
+            if self.faults.write.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
             self.inner.sync()
         }
 
@@ -746,6 +860,13 @@ mod tests {
                 return Err(injected());
             }
             self.inner.sequence_end(name)
+        }
+
+        fn sequence_names(&self) -> Result<Vec<String>> {
+            if self.faults.load.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
+            self.inner.sequence_names()
         }
     }
 
@@ -849,6 +970,68 @@ mod tests {
         assert!(matches!(txns[..], [Err(ZoeError::Backend(_))]), "{txns:?}");
     }
 
+    /// Commit five transactions of one object. Return their tids.
+    fn five_commits(store: &Store) -> Vec<Tid> {
+        let oid = store.new_oid().unwrap();
+        let mut tids = vec![commit(store, oid, Tid::ZERO, b"a").unwrap()];
+        for data in [b"b", b"c", b"d", b"e"] {
+            let serial = *tids.last().unwrap();
+            tids.push(commit(store, oid, serial, data).unwrap());
+        }
+        tids
+    }
+
+    /// Iterate over every transaction of `store`, with slices of `slice`
+    /// or, for `None`, the slices of `Store::iterator`. The scan of the
+    /// index fails in each call after the iterator gave `before` items.
+    /// Check that the iterator gives the transactions of `tids` before the
+    /// fault, the error once, the transactions after it, then the end.
+    fn one_error_for_a_failed_index_scan(
+        store: &Store,
+        faults: &Faults,
+        tids: &[Tid],
+        slice: Option<usize>,
+        before: usize,
+    ) {
+        faults.index.store(false, Ordering::Relaxed);
+        let mut iterator = match slice {
+            Some(slice) => store.iterator_in_slices(None, None, slice),
+            None => store.iterator(None, None).unwrap(),
+        };
+        let mut given = Vec::new();
+        loop {
+            faults.index.store(given.len() >= before, Ordering::Relaxed);
+            let Some(txn) = iterator.next() else {
+                break;
+            };
+            given.push(txn.map(|txn| txn.tid).map_err(|e| e.to_string()));
+        }
+        assert!(iterator.next().is_none());
+        let mut expected: Vec<_> = tids.iter().map(|&tid| Ok(tid)).collect();
+        expected.insert(before, Err(injected().to_string()));
+        assert_eq!(given, expected, "slices of {slice:?}, fault after {before}");
+    }
+
+    #[test]
+    fn a_failed_index_scan_gives_one_iterator_error_and_the_rest_of_the_range() {
+        let (store, faults) = faulty_store();
+        let tids = five_commits(&store);
+        // The first index scan fails, so the error comes first.
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, None, 0);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 0);
+    }
+
+    #[test]
+    fn a_failed_scan_of_a_later_index_slice_gives_the_rows_around_its_error() {
+        let (store, faults) = faulty_store();
+        let tids = five_commits(&store);
+        // The scan of the second index slice fails, or of a later one.
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 1);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(1), 3);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(2), 2);
+        one_error_for_a_failed_index_scan(&store, &faults, &tids, Some(2), 4);
+    }
+
     #[test]
     fn a_failed_finish_halts_the_store() {
         let (store, faults) = faulty_store();
@@ -865,6 +1048,21 @@ mod tests {
         assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
         assert!(store.locks.is_empty());
         assert!(matches!(store.load(oid), Err(ZoeError::NotFound { .. })));
+    }
+
+    #[test]
+    fn a_failed_sync_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(matches!(store.sync(), Err(ZoeError::Backend(_))));
+        faults.write.store(false, Ordering::Relaxed);
+
+        assert!(matches!(store.sync(), Err(ZoeError::Halted)));
+        let error = commit(&store, oid, first, b"b");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert_eq!(store.last_transaction(), first);
     }
 
     #[test]
@@ -1216,6 +1414,11 @@ mod tests {
             Err(ZoeError::ReadOnly)
         ));
         assert!(matches!(
+            store.tpc_begin_restore_deferred(Tid(tid.0 + 1), b"", b"", b""),
+            Err(ZoeError::ReadOnly)
+        ));
+        assert!(matches!(store.sync(), Err(ZoeError::ReadOnly)));
+        assert!(matches!(
             store.sequence("intids").next(),
             Err(ZoeError::ReadOnly)
         ));
@@ -1308,5 +1511,112 @@ mod tests {
         let _reader = Store::open_read_only(&dir).unwrap();
         assert!(dir.join(LOCK).is_file());
         assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
+    }
+
+    /// Return every entry under `dir`, by path: the bytes of a file, `None`
+    /// for a directory.
+    fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                    entries.insert(path, None);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    entries.insert(path, Some(bytes));
+                }
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn a_read_only_open_reads_a_blob_directory_elsewhere_and_creates_nothing() {
+        let root = fresh_dir("read-only-blob-dir");
+        let (dir, blobs) = (root.join("store"), root.join("blobs-elsewhere"));
+        let with = |blob_dir: &Path| Options {
+            blob_dir: Some(blob_dir.to_path_buf()),
+            ..Options::default()
+        };
+        let (oid, tid) = {
+            let store = Store::open_with(&dir, with(&blobs)).unwrap();
+            let mut file = store.new_blob_file().unwrap();
+            io::Write::write_all(&mut file, b"bytes").unwrap();
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store_blob(Oid(1), Tid::ZERO, b"a", file).unwrap();
+            txn.vote().unwrap();
+            (Oid(1), txn.finish().unwrap())
+        };
+        let before = tree(&root);
+
+        let store = Store::open_read_only_with(&dir, with(&blobs)).unwrap();
+        store.check_blob_dir().unwrap();
+        store.verify_blob(oid, tid).unwrap();
+        assert!(store.has_blob_file(oid, tid).unwrap());
+        assert!(store.blob_path(oid, tid).unwrap().starts_with(&blobs));
+        assert!(matches!(store.new_blob_file(), Err(ZoeError::ReadOnly)));
+        drop(store);
+
+        // The default blob directory, an empty one and one whose parent
+        // does not exist are not the blob directory of the store.
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let before = {
+            let mut before = before;
+            before.insert(empty.clone(), None);
+            before
+        };
+        let wrong = [
+            None,
+            Some(empty.clone()),
+            Some(root.join("no").join("blobs")),
+        ];
+        for blob_dir in wrong {
+            let expected = blob_dir.clone().unwrap_or_else(|| dir.join("blobs"));
+            let options = Options {
+                blob_dir,
+                ..Options::default()
+            };
+            let store = Store::open_read_only_with(&dir, options).unwrap();
+            match store.check_blob_dir() {
+                Err(ZoeError::MissingBlobDir { path }) => assert_eq!(path, expected),
+                other => panic!("{other:?}"),
+            }
+            assert!(!store.has_blob_file(oid, tid).unwrap());
+        }
+        assert_eq!(tree(&root), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_cache_size_bounds_the_page_cache_of_the_database() {
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(Oid(1), Tid::ZERO, &[7; 4096]).unwrap();
+            txn.vote().unwrap();
+            txn.finish().unwrap();
+        }
+        // Return the bytes that a second load of the same record reads
+        // from the file, after an open with `cache_size`.
+        let second_load = |cache_size| {
+            let options = Options {
+                cache_size,
+                ..Options::default()
+            };
+            let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+            store.load(Oid(1)).unwrap();
+            let before = vfs.bytes_read();
+            store.load(Oid(1)).unwrap();
+            vfs.bytes_read() - before
+        };
+        assert_eq!(Options::default().cache_size, None);
+        assert_eq!(second_load(None), 0);
+        assert_eq!(second_load(Some(1 << 20)), 0);
+        assert!(second_load(Some(0)) > 0);
     }
 }

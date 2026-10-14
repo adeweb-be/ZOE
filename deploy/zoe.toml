@@ -1,0 +1,23 @@
+# An example of the configuration file of zoe serve on a host, for the
+# systemd unit and the supervisor program. Install it as /etc/zoe/zoe.toml.
+# The keys are the options of zoe serve without `--`. An option on the
+# command line and its ZOE_* variable win over a key of this file.
+
+# The store of the storage name 1, the default of ZEO. Its blobs go to
+# /var/lib/zoe/blobs. Add stores with [storages.NAME] tables.
+path = "/var/lib/zoe"
+
+# The ZEO port. Put it on the private address of the host that the ZEO
+# clients reach.
+listen = "127.0.0.1:8100"
+
+# The admin port: /healthz, /readyz and /metrics. Put it on a private
+# address, never on a public one.
+admin-listen = "127.0.0.1:8101"
+
+# The stop on SIGTERM ends at this timeout. TimeoutStopSec of the systemd
+# unit and stopwaitsecs of the supervisor program are above it.
+shutdown-timeout = "30s"
+
+# One JSON object for each log line on stderr.
+log-format = "json"

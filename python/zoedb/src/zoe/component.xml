@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 
-<!-- The <zoe> section. "%import zoe" loads this file. -->
+<!-- The <zoe> and <zoeclient> sections. "%import zoe" loads this file. -->
 
 <component prefix="zoe.config">
 
@@ -53,6 +53,197 @@
         directory. The default is false.
       </description>
     </key>
+  </sectiontype>
+
+  <sectiontype name="zoeclient" extends="zeoclient" datatype=".ZoeClient"
+               implements="ZODB.storage">
+    <description>
+      A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
+      ZEO.ClientStorage. It takes every key of the zeoclient section, with
+      the same values, and wait-timeout. It declares the ZOE extensions to
+      the server, and works as a zeoclient against a stock ZEO server.
+    </description>
+    <key name="wait-timeout" datatype="integer" default="30">
+      <description>
+        The longest wait for a connection to the server, in seconds, at the
+        open and after a disconnection. A longer wait raises
+        ClientDisconnected. The default is 30.
+      </description>
+    </key>
+  </sectiontype>
+
+  <sectiontype name="storage">
+    <description>
+      A store that zoe serve serves under the name of the section, such as
+      main for "&lt;storage main&gt;": a [storages.NAME] table of the
+      configuration file of zoe serve.
+    </description>
+    <key name="path" datatype="string" required="yes">
+      <description>
+        The directory of the store. The server creates it when it is
+        missing, except for a read-only store. A leading ~ is the home
+        directory.
+      </description>
+    </key>
+    <key name="blob-dir" datatype="string">
+      <description>
+        The directory of the blob files. The default is the blobs
+        directory in path. A leading ~ is the home directory.
+      </description>
+    </key>
+    <key name="read-only" datatype="boolean" default="false">
+      <description>
+        If true, the server serves this store for reads only.
+      </description>
+    </key>
+  </sectiontype>
+
+  <sectiontype name="zoe-server">
+    <description>
+      The settings of zoe serve. "python -m zoe.serve -C FILE" reads this
+      section and runs the zoe binary with them. The keys other than
+      binary are the options of zoe serve without "--", as in its
+      configuration file, and take the syntax of the option. Each option
+      has an environment variable, its twin. The twin gives the value only
+      when the section does not set the key. An empty value counts as not
+      set.
+    </description>
+    <key name="binary" datatype="string">
+      <description>
+        The zoe binary to run. The default is ZOE_BINARY, else the zoe
+        binary on the PATH.
+      </description>
+    </key>
+    <key name="path" datatype="string">
+      <description>
+        The directory of the store of the storage name 1. A leading ~ is
+        the home directory.
+      </description>
+    </key>
+    <key name="blob-dir" datatype="string">
+      <description>
+        The directory of the blob files of the store of path. The default
+        is the blobs directory in path. A leading ~ is the home directory.
+      </description>
+    </key>
+    <key name="listen" datatype="string">
+      <description>
+        The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
+        port. The default is 127.0.0.1:8100.
+      </description>
+    </key>
+    <key name="admin-listen" datatype="string">
+      <description>
+        The address of the admin port, as HOST:PORT. Without it, the server
+        opens no admin port.
+      </description>
+    </key>
+    <key name="invalidation-queue-size" datatype="string">
+      <description>
+        The most transactions that getInvalidations covers.
+      </description>
+    </key>
+    <key name="client-queue-size" datatype="string">
+      <description>
+        The most invalidations that wait for one client.
+      </description>
+    </key>
+    <key name="cache-size" datatype="string">
+      <description>
+        The most bytes that the page cache of each store holds, such as
+        512MB or 1GB. The default is 1GB.
+      </description>
+    </key>
+    <key name="lock-timeout" datatype="string">
+      <description>
+        The longest time that a vote waits for the lock of an object, in
+        whole seconds, such as 10s or 2m.
+      </description>
+    </key>
+    <key name="max-frame-size" datatype="string">
+      <description>
+        The longest frame that a client can send, in bytes.
+      </description>
+    </key>
+    <key name="shutdown-timeout" datatype="string">
+      <description>
+        The longest time that a stop on SIGTERM takes, in whole seconds.
+      </description>
+    </key>
+    <key name="idle-timeout" datatype="string">
+      <description>
+        The longest time that a connection sends no frame, in whole
+        seconds. 0 closes no idle connection.
+      </description>
+    </key>
+    <key name="blocking-threads" datatype="string">
+      <description>
+        The number of threads that run the calls that read, for all the
+        connections together. The default is the number of cores.
+      </description>
+    </key>
+    <key name="lock-warn" datatype="string">
+      <description>
+        Log each lock held longer than this, in whole seconds. 0 logs no
+        lock.
+      </description>
+    </key>
+    <key name="transaction-warn" datatype="string">
+      <description>
+        Log each transaction open longer than this, in whole seconds. 0
+        logs no transaction.
+      </description>
+    </key>
+    <key name="log-format" datatype="string">
+      <description>
+        The format of the log lines on stderr: text, or json for one JSON
+        object on each line.
+      </description>
+    </key>
+    <key name="read-only" datatype="string">
+      <description>
+        If true, the server serves every store for reads only. The default
+        is false.
+      </description>
+    </key>
+    <key name="shared-blob-dir" datatype="string">
+      <description>
+        If true, the server shares the blob directory of each store with
+        its clients, and accepts storeBlobShared. The clients have the
+        trust of the user of the server, as with ZEO. The default is false.
+      </description>
+    </key>
+    <key name="tls-cert" datatype="string">
+      <description>
+        The certificate chain of the server, as PEM. With tls-key, the ZEO
+        port speaks TLS. A leading ~ is the home directory.
+      </description>
+    </key>
+    <key name="tls-key" datatype="string">
+      <description>
+        The private key of tls-cert, as PEM. A leading ~ is the home
+        directory.
+      </description>
+    </key>
+    <key name="tls-client-ca" datatype="string">
+      <description>
+        The CA certificates of the clients, as PEM. The server then requires
+        a client certificate that chains to one of them. A leading ~ is the
+        home directory.
+      </description>
+    </key>
+    <key name="tls-read-only-client-ca" datatype="string">
+      <description>
+        The CA certificates of the read-only clients, as PEM. The holder of
+        a certificate that chains to one of them registers read-only only.
+        A leading ~ is the home directory.
+      </description>
+    </key>
+    <multisection type="storage" name="+" attribute="storages">
+      <description>
+        The named stores. The name of each section is its storage name.
+      </description>
+    </multisection>
   </sectiontype>
 
 </component>
