@@ -528,8 +528,8 @@ async fn a_blob_commits_against_the_server() {
 /// The options of a client that declares `sequences`.
 fn declaring() -> Options {
     Options {
-        read_only: false,
         extensions: vec!["sequences".to_owned()],
+        ..Options::default()
     }
 }
 
@@ -726,8 +726,8 @@ const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-
 /// The options of a client that declares `trace_context`.
 fn tracing() -> Options {
     Options {
-        read_only: false,
         extensions: vec!["trace_context".to_owned()],
+        ..Options::default()
     }
 }
 

@@ -19,8 +19,8 @@ This module needs the test extra of ZODB.
 - `native_client(address, **kw)` opens a `zoe.zeo.ClientStorage` with the
   native client inside. It needs ZEO.
 - `NATIVE_LAYER` is a layer of zope.testrunner. Between its `setUp` and its
-  `tearDown`, `ZEO.ClientStorage.ClientStorage` opens the native client.
-  It needs ZEO.
+  `tearDown`, `ZEO.ClientStorage.ClientStorage` and the `<zoeclient>`
+  section open the native client. It needs ZEO.
 """
 
 import ctypes
@@ -837,15 +837,17 @@ def native_client(address, **kw):
 
 
 class NativeLayer:
-    """A layer that makes `ZEO.ClientStorage.ClientStorage` open the native
-    client.
+    """A layer that makes `ZEO.ClientStorage.ClientStorage` and the
+    `<zoeclient>` section open the native client.
 
     `setUp` puts the class of the native client in place of the class of
     ZEO in each loaded module that binds it under the name `ClientStorage`:
     `ZEO.ClientStorage` itself, and a test module that imported the class
     at its own import. `ZEO.client`, `ZEO.DB` and the `<zeoclient>` section
     of ZODB read the attribute of `ZEO.ClientStorage` when they run, so they
-    open the native client too. `tearDown` puts back the class of ZEO.
+    open the native client too. The `<zoeclient>` section opens the native
+    client whatever its key `native`. `tearDown` puts back the class of ZEO
+    and the open of `<zoeclient>`.
 
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
@@ -861,19 +863,25 @@ class NativeLayer:
     def setUp(self):
         import ZEO.ClientStorage
 
+        import zoe.config
         import zoe.zeo
 
         original = ZEO.ClientStorage.ClientStorage
         native = zoe.zeo._NativeClientStorage
         for module in list(sys.modules.values()):
             if getattr(module, "__dict__", {}).get("ClientStorage") is original:
-                self._patches.append((module, original))
-                module.ClientStorage = native
+                self._patch(module, "ClientStorage", native)
+        section = zoe.config.ZoeClient
+        self._patch(section, "open", lambda client: client._open_client(native=True))
+
+    def _patch(self, target, name, value):
+        self._patches.append((target, name, getattr(target, name)))
+        setattr(target, name, value)
 
     def tearDown(self):
         while self._patches:
-            module, original = self._patches.pop()
-            module.ClientStorage = original
+            target, name, original = self._patches.pop()
+            setattr(target, name, original)
 
 
 NATIVE_LAYER = NativeLayer("NATIVE_LAYER")

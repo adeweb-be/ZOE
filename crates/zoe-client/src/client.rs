@@ -13,11 +13,14 @@
 //! runs inside `traced` carries its W3C traceparent.
 
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 
 use rmpv::Value;
@@ -26,6 +29,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use zoe_core::{Oid, Tid};
 
 use crate::Error;
+use crate::endpoint::{Address, Endpoint};
 use crate::protocol::{self, Message, bin8, get, p64};
 use crate::runtime::{Runtime, Stream, Tokio};
 
@@ -79,7 +83,14 @@ pub struct Client {
     info: Value,
     /// The extensions that the server accepted at `Client::open`.
     extensions: Vec<String>,
+    /// `true` when the client registered read-only.
+    read_only: bool,
+    /// The address of the server.
+    address: Address,
 }
+
+/// One attempt of `Client::open_first` to open a client.
+type Attempt<'a> = Pin<Box<dyn Future<Output = Result<Client, Error>> + Send + 'a>>;
 
 /// What `Client::open` declares to the server in `register`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -87,6 +98,10 @@ pub struct Options {
     /// Register read-only. The server then refuses each write of the
     /// connection with `ReadOnlyError`.
     pub read_only: bool,
+    /// When `read_only` is false and the server refuses the register with
+    /// `ReadOnlyError`, register again read-only on the same connection,
+    /// as the `read_only_fallback` of `ZEO.ClientStorage`.
+    pub read_only_fallback: bool,
     /// The extensions that the client declares in a third argument of
     /// `register`. With none, `register` has two arguments.
     pub extensions: Vec<String>,
@@ -202,7 +217,7 @@ impl Client {
         addr: SocketAddr,
         storage: &str,
     ) -> Result<Client, Error> {
-        let client = Client::handshake(runtime, addr).await?;
+        let client = Client::handshake(runtime, &Endpoint::new(addr)).await?;
         let reply = client
             .inner
             .call("register", vec![storage.into(), false.into()])
@@ -226,10 +241,26 @@ impl Client {
         storage: &str,
         options: &Options,
     ) -> Result<Client, Error> {
-        let mut client = Client::handshake(runtime, addr).await?;
+        Client::open_endpoint(runtime, &Endpoint::new(addr), storage, options).await
+    }
+
+    /// Connect to the ZEO 6 server of `endpoint` through `runtime`, and
+    /// open the client as `Client::open` does.
+    ///
+    /// With `options.read_only_fallback`, a server that refuses a writable
+    /// register with `ReadOnlyError` gets a second `register`, read-only,
+    /// on the same connection. `Client::read_only` then tells it.
+    pub async fn open_endpoint(
+        runtime: Arc<dyn Runtime>,
+        endpoint: &Endpoint,
+        storage: &str,
+        options: &Options,
+    ) -> Result<Client, Error> {
+        let mut client = Client::handshake(runtime, endpoint).await?;
         let mut declare = !options.extensions.is_empty();
+        let mut read_only = options.read_only;
         let reply = loop {
-            let mut args = vec![storage.into(), options.read_only.into()];
+            let mut args = vec![storage.into(), read_only.into()];
             if declare {
                 let names = options.extensions.iter();
                 args.push(Value::Array(
@@ -240,9 +271,15 @@ impl Client {
                 Err(Error::Server { class, .. }) if declare && is_type_error(&class) => {
                     declare = false;
                 }
+                Err(Error::Server { class, .. })
+                    if !read_only && options.read_only_fallback && is_read_only_error(&class) =>
+                {
+                    read_only = true;
+                }
                 reply => break reply?,
             }
         };
+        client.read_only = read_only;
         client.registered(reply).await?;
         let info = client.inner.call("get_info", vec![]).await?;
         client.extensions = accepted(&info, &options.extensions);
@@ -252,10 +289,91 @@ impl Client {
         Ok(client)
     }
 
-    /// Open the stream to `addr`, agree on the protocol and start the
+    /// Open a client to one server of `endpoints`, as `ZEO.ClientStorage`
+    /// does with a list of addresses.
+    ///
+    /// The client connects to all of them at once and keeps the first that
+    /// opens as `options` asks. With `options.read_only_fallback`, a server
+    /// that registers only read-only comes after a writable one: the client
+    /// keeps the first read-only server only when no other server can open
+    /// writable, or when `wait` passes. The client closes each other
+    /// connection, so it holds one connection at the end.
+    ///
+    /// When no server opens, the open fails with the first error that is
+    /// not of the connection, else with the last error of a connection.
+    /// When `wait` passes first, it fails with that error too, or with
+    /// `Error::Io` of the kind `TimedOut` when no attempt failed yet. The
+    /// attempts run in the task of the caller and through `runtime`, in the
+    /// order of `endpoints`.
+    pub async fn open_first(
+        runtime: Arc<dyn Runtime>,
+        endpoints: &[Endpoint],
+        storage: &str,
+        options: &Options,
+        wait: Duration,
+    ) -> Result<Client, Error> {
+        if endpoints.is_empty() {
+            return Err(Error::Invalid("no address to connect to".into()));
+        }
+        let mut attempts: Vec<Option<Attempt<'_>>> = endpoints
+            .iter()
+            .map(|endpoint| {
+                let attempt = Client::open_endpoint(runtime.clone(), endpoint, storage, options);
+                Some(Box::pin(attempt) as Attempt<'_>)
+            })
+            .collect();
+        let mut timeout = runtime.sleep(wait);
+        let mut fallback: Option<Client> = None;
+        let mut failure: Option<Error> = None;
+        loop {
+            // The attempts come first, in their order, then the timeout.
+            let next = poll_fn(|cx| {
+                for slot in &mut attempts {
+                    if let Some(attempt) = slot
+                        && let Poll::Ready(result) = attempt.as_mut().poll(cx)
+                    {
+                        *slot = None;
+                        return Poll::Ready(Some(result));
+                    }
+                }
+                if attempts.iter().all(Option::is_none) {
+                    return Poll::Ready(None);
+                }
+                timeout.as_mut().poll(cx).map(|()| None)
+            })
+            .await;
+            match next {
+                Some(Ok(client)) if client.read_only && !options.read_only => {
+                    // A read-only fallback waits for a writable server.
+                    if fallback.is_none() {
+                        fallback = Some(client);
+                    }
+                }
+                // The drop of the other attempts and of a fallback closes
+                // their connections.
+                Some(Ok(client)) => return Ok(client),
+                Some(Err(error)) => {
+                    if failure.as_ref().is_none_or(is_of_the_connection) {
+                        failure = Some(error);
+                    }
+                }
+                None => break,
+            }
+        }
+        match (fallback, failure) {
+            (Some(client), _) => Ok(client),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err(Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no server opened within {wait:?}"),
+            ))),
+        }
+    }
+
+    /// Open the stream to `endpoint`, agree on the protocol and start the
     /// tasks of the connection.
-    async fn handshake(runtime: Arc<dyn Runtime>, addr: SocketAddr) -> Result<Client, Error> {
-        let mut stream = runtime.connect(addr).await?;
+    async fn handshake(runtime: Arc<dyn Runtime>, endpoint: &Endpoint) -> Result<Client, Error> {
+        let mut stream = endpoint.connect(runtime.as_ref()).await?;
         match protocol::read_frame(&mut stream).await? {
             Some(theirs) if theirs == protocol::PROTOCOL => {}
             Some(theirs) => {
@@ -267,7 +385,7 @@ impl Client {
             None => return Err(Error::Disconnected),
         }
         protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
-        Ok(Client::start(runtime, stream))
+        Ok(Client::start(runtime, stream, endpoint.address().clone()))
     }
 
     /// Take the last tid from the reply of `register`. A nil reply asks
@@ -283,7 +401,7 @@ impl Client {
     }
 
     /// Start the tasks of the connection on `stream`.
-    fn start(runtime: Arc<dyn Runtime>, stream: Box<dyn Stream>) -> Client {
+    fn start(runtime: Arc<dyn Runtime>, stream: Box<dyn Stream>, address: Address) -> Client {
         let (outgoing, frames) = mpsc::channel(OUTGOING);
         let (closing, _) = watch::channel(false);
         let (invalidations, _) = broadcast::channel(INVALIDATIONS);
@@ -317,6 +435,8 @@ impl Client {
             tasks,
             info: Value::Nil,
             extensions: Vec::new(),
+            read_only: false,
+            address,
         }
     }
 
@@ -330,6 +450,17 @@ impl Client {
     /// Return the extensions that the server accepted at `Client::open`.
     pub fn extensions(&self) -> &[String] {
         &self.extensions
+    }
+
+    /// Return the address of the server.
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    /// Tell if the client registered read-only: as `Options::read_only`
+    /// asked, or after a read-only fallback.
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Tell if the connection is open: no call failed yet with
@@ -914,6 +1045,18 @@ fn is_type_error(class: &str) -> bool {
     class.rsplit('.').next() == Some("TypeError")
 }
 
+/// Tell if the exception class `class` is a `ReadOnlyError`, of any
+/// module.
+fn is_read_only_error(class: &str) -> bool {
+    class.rsplit('.').next() == Some("ReadOnlyError")
+}
+
+/// Tell if `error` is an error of the connection, which a later attempt
+/// can avoid: the stream failed or closed.
+fn is_of_the_connection(error: &Error) -> bool {
+    matches!(error, Error::Io(_) | Error::Disconnected)
+}
+
 /// Return the names of the key `extensions` of the map `info` that the
 /// client declared in `declared`, in the order of the server.
 fn accepted(info: &Value, declared: &[String]) -> Vec<String> {
@@ -1001,6 +1144,27 @@ mod tests {
         assert!(is_type_error("exceptions.TypeError"));
         assert!(!is_type_error("builtins.ValueError"));
         assert!(!is_type_error("ZODB.POSException.NotTypeError"));
+    }
+
+    #[test]
+    fn a_read_only_error_of_any_module_is_a_read_only_error() {
+        assert!(is_read_only_error("ZODB.POSException.ReadOnlyError"));
+        assert!(is_read_only_error("ReadOnlyError"));
+        assert!(!is_read_only_error("ZODB.POSException.ConflictError"));
+        assert!(!is_read_only_error("ZODB.POSException.NotReadOnlyError"));
+    }
+
+    #[test]
+    fn only_a_failed_or_closed_stream_is_an_error_of_the_connection() {
+        let refused = Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(is_of_the_connection(&refused));
+        assert!(is_of_the_connection(&Error::Disconnected));
+        let server = Error::Server {
+            class: "builtins.ValueError".into(),
+            message: "unknown storage: 2".into(),
+        };
+        assert!(!is_of_the_connection(&server));
+        assert!(!is_of_the_connection(&Error::Protocol("M4".into())));
     }
 
     #[test]
