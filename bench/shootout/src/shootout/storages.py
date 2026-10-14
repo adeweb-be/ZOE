@@ -1,6 +1,8 @@
 """The storages under test, as ZConfig sections for zodbshootout.
 
-Every storage runs with its default settings.
+Every storage runs with its default settings. `zconfig` starts a server on
+a new store when the storage needs one. `empty_database` empties the
+database of relstorage, which keeps its data outside the work directory.
 """
 
 import contextlib
@@ -54,18 +56,7 @@ def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
                 storage.name, "<zeoclient>", f"server 127.0.0.1:{port}", "</zeoclient>"
             )
     elif storage.name == "relstorage":
-        if not dsn:
-            raise ValueError("relstorage needs a PostgreSQL DSN")
-        # ZConfig reads "$" as the start of a substitution.
-        dsn = dsn.replace("$", "$$")
-        yield "%import relstorage\n" + _section(
-            storage.name,
-            "<relstorage>",
-            "<postgresql>",
-            f"dsn {dsn}",
-            "</postgresql>",
-            "</relstorage>",
-        )
+        yield "%import relstorage\n" + _section(storage.name, *_relstorage(dsn))
     elif storage.name == "zoe":
         yield "%import zoe\n" + _section(
             storage.name, "<zoe>", f"path {workdir / 'store'}", "</zoe>"
@@ -77,6 +68,24 @@ def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
             )
     else:
         raise ValueError(f"unknown storage {storage.name!r}")
+
+
+def empty_database(storage: Storage, dsn: str | None) -> None:
+    """Remove every object and transaction from the database of relstorage.
+
+    RelStorage's zap_all truncates its tables. The other storages keep their
+    data in the work directory, so the function does nothing for them.
+    """
+    if storage.name != "relstorage":
+        return
+    import ZODB.config
+
+    text = "%import relstorage\n" + "".join(f"{line}\n" for line in _relstorage(dsn))
+    relstorage = ZODB.config.storageFromString(text)
+    try:
+        relstorage.zap_all()
+    finally:
+        relstorage.close()
 
 
 def server_versions(storage: Storage, dsn: str | None) -> dict[str, str]:
@@ -94,6 +103,21 @@ def server_versions(storage: Storage, dsn: str | None) -> dict[str, str]:
     with contextlib.closing(psycopg2.connect(dsn)) as conn:
         major, minor = divmod(conn.server_version, 10000)
     return {"PostgreSQL": f"{major}.{minor}"}
+
+
+def _relstorage(dsn: str | None) -> tuple[str, ...]:
+    """Return the lines of the RelStorage section on PostgreSQL."""
+    if not dsn:
+        raise ValueError("relstorage needs a PostgreSQL DSN")
+    # ZConfig reads "$" as the start of a substitution.
+    dsn = dsn.replace("$", "$$")
+    return (
+        "<relstorage>",
+        "<postgresql>",
+        f"dsn {dsn}",
+        "</postgresql>",
+        "</relstorage>",
+    )
 
 
 def _section(name: str, *lines: str) -> str:

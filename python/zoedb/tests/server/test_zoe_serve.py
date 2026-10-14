@@ -56,7 +56,7 @@ def test_the_keys_are_the_options_of_zoe_serve():
     keys = {key for key, info in server if not info.issection()}
     assert keys == {"binary", *serve.KEYS}
     storage = {key for key, _ in schema.gettype("storage")}
-    assert storage == {"path", "blob-dir", "read-only"}
+    assert storage == {"path", "blob-dir", "read-only", "pack-gc"}
 
 
 def test_the_section_becomes_the_configuration_file(tmp_path):
@@ -91,6 +91,25 @@ def test_the_section_becomes_the_configuration_file(tmp_path):
             "archive": {"path": "/var/zoe/archive", "read-only": True},
         },
     }
+
+
+def test_pack_gc_false_goes_to_the_file_and_to_its_table(tmp_path):
+    found = section(
+        tmp_path,
+        "pack-gc off",
+        "<storage kept>",
+        "  path /var/zoe/kept",
+        "  pack-gc false",
+        "</storage>",
+        "<storage main>",
+        "  path /var/zoe/main",
+        "</storage>",
+    )
+    config = tomllib.loads(serve.toml(found))
+    assert config["pack-gc"] is False
+    assert config["storages"]["kept"]["pack-gc"] is False
+    # The key is true by default, so the table of main does not give it.
+    assert "pack-gc" not in config["storages"]["main"]
 
 
 def test_an_empty_key_counts_as_not_set(tmp_path):
