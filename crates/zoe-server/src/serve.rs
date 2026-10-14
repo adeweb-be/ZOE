@@ -121,7 +121,8 @@ impl ServeOptions {
     /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
     /// 100,000 transactions, and 1,000 invalidations can wait for one
     /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
-    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`] closes.
+    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`], while
+    /// no call of the connection runs, closes.
     /// The calls that read run on as many threads as the machine has
     /// cores.
     pub fn new(path: impl AsRef<Path>) -> Self {
@@ -229,10 +230,12 @@ impl ServeOptions {
         self
     }
 
-    /// Close a connection that sends no frame for `timeout`. The time counts
-    /// from the last frame that the server read, a heartbeat included, and
-    /// from the accept for the protocol of the client. The time while 4
-    /// calls of the connection run or wait does not count. The close stops
+    /// Close a connection that sends no frame for `timeout` while no call
+    /// of the connection runs. The time counts from the accept for the
+    /// protocol of the client. Then it counts from the later of two times:
+    /// the last frame that the server read, a heartbeat included, and the
+    /// end of the last call of the connection. A call runs until it puts
+    /// its reply, and a download until it ends. The close stops
     /// the writer at once, as a close of the hub does. The calls that
     /// arrived run, up to the first reply that cannot be queued, then the
     /// open transaction aborts. A timeout of 0 closes no connection.
@@ -358,6 +361,21 @@ pub struct Server {
     /// The accept loop and the connections that run.
     tasks: Arc<Tasks>,
     shutdown_timeout: Duration,
+    /// The times of the stop. The stop sets them once.
+    #[cfg(test)]
+    stop_times: Arc<std::sync::OnceLock<StopTimes>>,
+}
+
+/// The times of a stop that the shutdown timeout bounds. The tests of the
+/// crate read them.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StopTimes {
+    /// The start of the stop, before the stop signal.
+    pub(crate) start: Instant,
+    /// The end of the wait for the sessions, before the close of the
+    /// stores.
+    pub(crate) waited: Instant,
 }
 
 impl Server {
@@ -470,6 +488,8 @@ impl Server {
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
+            #[cfg(test)]
+            stop_times: Arc::default(),
         })
     }
 
@@ -489,6 +509,12 @@ impl Server {
     /// connection and close the stores.
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// Return the cell that the stop fills with its times.
+    #[cfg(test)]
+    pub(crate) fn stop_times(&self) -> Arc<std::sync::OnceLock<StopTimes>> {
+        Arc::clone(&self.stop_times)
     }
 
     /// Call `ready` with the address, then serve until SIGTERM or SIGINT.
@@ -524,7 +550,8 @@ impl Server {
             return;
         };
         let timeout = self.shutdown_timeout.min(LONGEST_SHUTDOWN_TIMEOUT);
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         // The accept loop drops the listener, and each connection reads no
         // more calls. The sessions run the calls that wait, then end.
         self.stop_signal.send_replace(true);
@@ -540,6 +567,11 @@ impl Server {
         let rest = deadline.saturating_duration_since(Instant::now());
         std::thread::scope(|scope| {
             scope.spawn(move || runtime.shutdown_timeout(rest));
+        });
+        #[cfg(test)]
+        let _ = self.stop_times.set(StopTimes {
+            start,
+            waited: Instant::now(),
         });
         // A session that runs holds the store of its storage. This drop
         // closes every other store.
@@ -588,7 +620,8 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 /// Accept clients until `stopping` tells that the server stops. Then drop
 /// the listener, so the server accepts no more connections. Each connection
 /// takes frames of at most
-/// `max_frame_size` bytes, closes after `idle_timeout` without a frame, and
+/// `max_frame_size` bytes, closes after `idle_timeout` without a frame and
+/// without a call that runs, and
 /// counts in `tasks` while it runs.
 async fn accept(
     listener: TcpListener,

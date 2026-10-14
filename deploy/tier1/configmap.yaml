@@ -1,0 +1,25 @@
+# The configuration file of zoe serve. The StatefulSet mounts it at
+# /etc/zoe and gives its path in ZOE_CONFIG.
+#
+# The image sets ZOE_PATH=/var/lib/zoe and ZOE_LISTEN=0.0.0.0:8100. The
+# volume of the store mounts at /var/lib/zoe. An environment variable wins
+# over a key of this file, so this file holds only the other settings.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zoe
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+data:
+  zoe.toml: |
+    # The admin port: /healthz, /readyz and /metrics. Only the pod network
+    # reaches it. Never put it on a public address.
+    admin-listen = "0.0.0.0:8101"
+
+    # The stop on SIGTERM ends at this timeout. The StatefulSet gives the
+    # pod a terminationGracePeriodSeconds above it.
+    shutdown-timeout = "30s"
+
+    # One JSON object for each log line on stderr.
+    log-format = "json"
