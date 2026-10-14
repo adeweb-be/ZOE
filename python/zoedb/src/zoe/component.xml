@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 
-<!-- The <zoe> section. "%import zoe" loads this file. -->
+<!-- The <zoe> and <zoeclient> sections. "%import zoe" loads this file. -->
 
 <component prefix="zoe.config">
 
@@ -51,6 +51,23 @@
       <description>
         If true, the storage refuses writes and does not create a missing
         directory. The default is false.
+      </description>
+    </key>
+  </sectiontype>
+
+  <sectiontype name="zoeclient" extends="zeoclient" datatype=".ZoeClient"
+               implements="ZODB.storage">
+    <description>
+      A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
+      ZEO.ClientStorage. It takes every key of the zeoclient section, with
+      the same values, and wait-timeout. It declares the ZOE extensions to
+      the server, and works as a zeoclient against a stock ZEO server.
+    </description>
+    <key name="wait-timeout" datatype="integer" default="30">
+      <description>
+        The longest wait for a connection to the server, in seconds, at the
+        open and after a disconnection. A longer wait raises
+        ClientDisconnected. The default is 30.
       </description>
     </key>
   </sectiontype>
@@ -131,6 +148,12 @@
         The most invalidations that wait for one client.
       </description>
     </key>
+    <key name="cache-size" datatype="string">
+      <description>
+        The most bytes that the page cache of each store holds, such as
+        512MB or 1GB. The default is 1GB.
+      </description>
+    </key>
     <key name="lock-timeout" datatype="string">
       <description>
         The longest time that a vote waits for the lock of an object, in
@@ -188,6 +211,32 @@
         If true, the server shares the blob directory of each store with
         its clients, and accepts storeBlobShared. The clients have the
         trust of the user of the server, as with ZEO. The default is false.
+      </description>
+    </key>
+    <key name="tls-cert" datatype="string">
+      <description>
+        The certificate chain of the server, as PEM. With tls-key, the ZEO
+        port speaks TLS. A leading ~ is the home directory.
+      </description>
+    </key>
+    <key name="tls-key" datatype="string">
+      <description>
+        The private key of tls-cert, as PEM. A leading ~ is the home
+        directory.
+      </description>
+    </key>
+    <key name="tls-client-ca" datatype="string">
+      <description>
+        The CA certificates of the clients, as PEM. The server then requires
+        a client certificate that chains to one of them. A leading ~ is the
+        home directory.
+      </description>
+    </key>
+    <key name="tls-read-only-client-ca" datatype="string">
+      <description>
+        The CA certificates of the read-only clients, as PEM. The holder of
+        a certificate that chains to one of them registers read-only only.
+        A leading ~ is the home directory.
       </description>
     </key>
     <multisection type="storage" name="+" attribute="storages">

@@ -328,6 +328,8 @@ pub(crate) struct Calls {
     peer: Arc<str>,
     /// The stop of the server, for the pack of the session.
     stopping: Stopping,
+    /// True when the client may register read-only only.
+    read_only: bool,
     lane: Arc<Lane>,
     /// The slots of the calls that run or wait.
     slots: Arc<Semaphore>,
@@ -357,11 +359,18 @@ impl Calls {
             runtime,
             peer: peer.into(),
             stopping,
+            read_only: false,
             lane: Arc::new(Lane::new()),
             slots: Arc::new(Semaphore::new(QUEUE)),
             running: Running::new(),
             ended: Ended::new(),
         }
+    }
+
+    /// Let the client register read-only only, when `read_only` is true.
+    pub(crate) fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// The signal that a call ended the connection.
@@ -464,6 +473,7 @@ impl Calls {
         let ended = self.ended.clone();
         let peer = Arc::clone(&self.peer);
         let stopping = self.stopping.clone();
+        let read_only = self.read_only;
         let registered = self
             .pool
             .run(&*self.runtime, move || {
@@ -471,7 +481,8 @@ impl Calls {
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
-                        let session = Session::new(storage, outbox.clone(), stopping);
+                        let session = Session::new(storage, outbox.clone(), stopping)
+                            .read_only_client(read_only);
                         let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let _request = session.request(&call).entered();
                         let outcome = session.call(&call, &mut reply);

@@ -1,8 +1,13 @@
 """The `<zoe>` section of ZConfig and the `zoe://` URI of zodburi.
 
-`%import zoe` loads `component.xml`, which declares the `<zoe>` section. The
-`<zodb>` and `<zodb_db>` sections take it as their storage. The `zoe` entry
-point of `zodburi.resolvers` names `resolve_uri`.
+`%import zoe` loads `component.xml`, which declares the `<zoe>` section and
+the `<zoeclient>` section. The `<zodb>` and `<zodb_db>` sections take either
+as their storage. The `zoe` entry point of `zodburi.resolvers` names
+`resolve_uri`.
+
+`<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
+`<zeoclient>`, with the same values, and `wait-timeout`. It has no
+environment twins, as `<zeoclient>` has none.
 
 The keys are in kebab-case. The query of the URI takes the same keys with
 the same values. Each key has an environment variable, its twin: `ZOE_` and
@@ -135,3 +140,42 @@ def resolve_uri(uri):
         else:
             rest[name] = text
     return lambda: open_storage(settings), rest
+
+
+class ZoeClient(BaseConfig):
+    """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
+
+    It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
+    and `wait-timeout` as `wait_timeout`.
+    """
+
+    def open(self):
+        from zoe.zeo import ClientStorage
+
+        config = self.config
+        options = {}
+        for name in ("blob_cache_size", "blob_cache_size_check", "client_label"):
+            value = getattr(config, name)
+            if value is not None:
+                options[name] = value
+        return ClientStorage(
+            [server.address for server in config.server],
+            blob_dir=config.blob_dir,
+            shared_blob_dir=config.shared_blob_dir,
+            storage=config.storage,
+            cache_size=config.cache_size,
+            name=config.name,
+            client=config.client,
+            var=config.var,
+            min_disconnect_poll=config.min_disconnect_poll,
+            max_disconnect_poll=config.max_disconnect_poll,
+            wait=config.wait,
+            read_only=config.read_only,
+            read_only_fallback=config.read_only_fallback,
+            drop_cache_rather_verify=config.drop_cache_rather_verify,
+            username=config.username,
+            password=config.password,
+            realm=config.realm,
+            wait_timeout=config.wait_timeout,
+            **options,
+        )

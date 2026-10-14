@@ -31,3 +31,5 @@ pub mod serve;
 pub mod sim;
 #[cfg(feature = "serve")]
 mod telemetry;
+#[cfg(feature = "serve")]
+mod tls;

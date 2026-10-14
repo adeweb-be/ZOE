@@ -439,6 +439,9 @@ pub(crate) struct Session {
     /// The stop of the server. A pack stops between two batches when the
     /// server stops.
     stopping: Stopping,
+    /// True when the client may register read-only only, as the holder of
+    /// a certificate of the read-only client CA.
+    read_only_client: bool,
 }
 
 /// The open transaction of one connection. One thread holds it and runs
@@ -499,7 +502,14 @@ impl Session {
             iterators: Mutex::new(Iterators::default()),
             label: Mutex::new(None),
             stopping,
+            read_only_client: false,
         }
+    }
+
+    /// Let the client register read-only only, when `read_only` is true.
+    pub(crate) fn read_only_client(mut self, read_only: bool) -> Self {
+        self.read_only_client = read_only;
+        self
     }
 
     /// Return the label that the client gave, if any.
@@ -634,9 +644,27 @@ impl Session {
             "iterator_gc" => self.iterator_gc(args),
             "pack" => self.pack(args),
             "sendBlob" => return self.send_blob(args, reply),
+            "sequence_next" => self.sequence_next(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
+    }
+
+    /// Return the next value of the sequence `name` of the store (F29),
+    /// for a connection that declared the extension `sequences`. The value
+    /// is not part of a transaction: an abort does not give it back. A
+    /// read-only connection fails with `ReadOnlyError`, as `zoe.Storage`
+    /// does. Every 100 values of a name, the call waits for one write of
+    /// the backend.
+    fn sequence_next(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [name] = arity::<1>(args, "sequence_next")?;
+        let name = name
+            .as_str()
+            .ok_or_else(|| Fault::type_error("the name of a sequence is not a str"))?;
+        if self.read_only() {
+            return Err(Fault::read_only());
+        }
+        Ok(Value::from(self.store.sequence(name).next()?))
     }
 
     /// Register the connection with its storage. A ZOE client declares the
@@ -655,10 +683,11 @@ impl Session {
             })
             .transpose()?;
         // A client that asks to write a read-only storage gets
-        // `ReadOnlyError`, as from ZEO. The connection stays open, so a
-        // client with `read_only_fallback` registers again read-only.
+        // `ReadOnlyError`, as from ZEO. So does a read-only client. The
+        // connection stays open, so a client with `read_only_fallback`
+        // registers again read-only.
         let read_only = truth(read_only);
-        if !read_only && self.storage.read_only {
+        if !read_only && (self.storage.read_only || self.read_only_client) {
             return Err(Fault::read_only());
         }
         // The client gets the invalidation of each commit after this tid.
@@ -1109,6 +1138,12 @@ impl Session {
     /// with `StorageError`. It does not stop during the mark. The store
     /// keeps what the pack did not remove, and the next pack removes it.
     fn pack(&self, args: &[Value]) -> Result<Value, Fault> {
+        // A pack deletes data. A read-only client may not pack. A
+        // connection that registered read-only by its own choice packs, as
+        // `zeopack` needs.
+        if self.read_only_client {
+            return Err(Fault::read_only());
+        }
         let time = match args {
             [time] | [time, _] => time,
             _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
@@ -1727,7 +1762,12 @@ mod tests {
 
         /// A connection whose pack stops when `stopping` tells it.
         fn stopping(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
-            let session = Arc::new(Session::new(storage, outbox, stopping));
+            Self::of(Session::new(storage, outbox, stopping))
+        }
+
+        /// The connection of `session`.
+        fn of(session: Session) -> Self {
+            let session = Arc::new(session);
             Self {
                 txn: Transaction::new(Arc::clone(&session)),
                 session,
@@ -2768,6 +2808,86 @@ mod tests {
             failed(call(&mut s, "register", again)).class,
             "builtins.ValueError"
         );
+    }
+
+    /// Return a session registered with the declaration `declaration`.
+    fn declaring(name: &str, read_only: bool, declaration: &[&str]) -> Client {
+        let mut s = session(name);
+        let names = declaration.iter().map(|name| Value::from(*name)).collect();
+        let args = vec![
+            Value::from("1"),
+            Value::Boolean(read_only),
+            Value::Array(names),
+        ];
+        done(call(&mut s, "register", args));
+        s
+    }
+
+    fn sequence_next(name: Value) -> Call {
+        Call {
+            id: Value::from(1),
+            oneway: false,
+            method: "sequence_next".into(),
+            args: vec![name],
+        }
+    }
+
+    #[test]
+    fn sequence_next_gives_the_values_of_each_name_from_one() {
+        let mut s = declaring("sequence-next", false, &["sequences"]);
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(
+            get(&info, "extensions"),
+            &Value::Array(vec![Value::from("sequences")])
+        );
+        let values: Vec<_> = (0..150)
+            .map(|_| done(s.call(&sequence_next(Value::from("intids")))))
+            .collect();
+        let expected: Vec<_> = (1..=150_u64).map(Value::from).collect();
+        assert_eq!(values, expected);
+        assert_eq!(
+            done(s.call(&sequence_next(Value::from("lexicon")))),
+            Value::from(1)
+        );
+        let fault = failed(s.call(&sequence_next(Value::Binary(b"intids".to_vec()))));
+        assert_eq!(fault.class, "builtins.TypeError");
+        let fault = failed(call(&mut s, "sequence_next", vec![]));
+        assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn sequence_next_is_outside_the_transaction() {
+        let mut s = declaring("sequence-abort", false, &["sequences"]);
+        begin(&mut s, 7, None);
+        let next = sequence_next(Value::from("intids"));
+        assert_eq!(done(s.call(&next)), Value::from(1));
+        done(call(&mut s, "tpc_abort", vec![Value::from(7)]));
+        assert_eq!(done(s.call(&next)), Value::from(2));
+    }
+
+    #[test]
+    fn a_read_only_connection_takes_no_value() {
+        let mut s = declaring("sequence-read-only", true, &["sequences"]);
+        let fault = failed(s.call(&sequence_next(Value::from("intids"))));
+        assert_eq!(fault, Fault::read_only());
+    }
+
+    #[test]
+    fn sequence_next_needs_the_declaration_in_both_dispatches() {
+        let next = sequence_next(Value::from("intids"));
+        for mut s in [
+            registered("sequence-stock"),
+            declaring("sequence-none", false, &[]),
+            declaring("sequence-other", false, &["unknown"]),
+        ] {
+            let mut reply = Reply::new(s.session.outbox.blocking_room());
+            let fault = failed(s.session.call(&next, &mut reply));
+            assert_eq!(fault.class, "builtins.ValueError");
+            assert_eq!(failed(s.txn.call(&next)).class, "builtins.ValueError");
+            // The connection stays open, and the store gave no value.
+            assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
+            assert_eq!(s.store.sequence("intids").next().unwrap(), 1);
+        }
     }
 
     #[test]
@@ -4086,6 +4206,28 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_client_does_not_pack() {
+        let storage = storage("pack-read-only-certificate", Queues::DEFAULT);
+        let (mut writer, _frames) = connected(&storage);
+        let old = commit(&mut writer, 1, 0, 0, MAPPING).unwrap();
+        let new = commit(&mut writer, 2, 0, old, MAPPING).unwrap();
+
+        // A client with a certificate of the read-only client CA.
+        let (outbox, mut frames, _closing) = Outbox::new(10, 10);
+        let session = Session::new(Arc::clone(&storage), outbox, never_stops());
+        let mut reader = Client::of(session.read_only_client(true));
+        let register = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut reader, "register", register)), p64(new));
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        assert_eq!(failed(call(&mut reader, "pack", pack)), Fault::read_only());
+        assert!(frames.try_recv().is_none());
+
+        // The store keeps the old revision of the root.
+        let load = done(call(&mut reader, "loadSerial", vec![p64(0), p64(old)]));
+        assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+    }
+
+    #[test]
     fn a_pack_whose_sizes_do_not_read_replies_nil_and_sends_no_info() {
         let dir =
             std::env::temp_dir().join(format!("zoe-session-pack-sizes-{}", std::process::id()));
@@ -4491,6 +4633,28 @@ mod tests {
         for (method, args) in [("new_oids", vec![]), ("pack", vec![Value::F64(1e9)])] {
             assert_eq!(failed(call(&mut s, method, args)), Fault::read_only());
         }
+    }
+
+    #[test]
+    fn a_read_only_client_registers_read_only_only_on_a_writable_storage() {
+        let storage = storage("register-read-only-client", Queues::DEFAULT);
+        let session = Session::new(Arc::clone(&storage), outbox(), never_stops());
+        let mut s = Client::of(session.read_only_client(true));
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(failed(call(&mut s, "register", write)), Fault::read_only());
+        // The connection stays open, and the client registers again.
+        let read = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut s, "register", read)), p64(0));
+        assert_eq!(failed(call(&mut s, "new_oids", vec![])), Fault::read_only());
+
+        // Another client of the same storage writes.
+        let mut writer = Client::new(storage, outbox());
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(done(call(&mut writer, "register", write)), p64(0));
+        assert!(matches!(
+            call(&mut writer, "new_oids", vec![]),
+            Outcome::Done(_)
+        ));
     }
 
     #[test]
