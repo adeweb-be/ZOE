@@ -33,3 +33,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0027](0027-blob-directory.md) | The blob directory is an option of the core |
 | [0028](0028-the-zoe-command.md) | The zoe command: one binary in zoe-server, one code path for the console script |
 | [0029](0029-key-space-in-the-checksum.md) | The frame checksum covers the key space |
+| [0030](0030-dump-files.md) | Dump files: a format of ZOE's own, one file per tid range |

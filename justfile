@@ -10,9 +10,13 @@ pythons := "3.12 3.13 3.14 3.14t"
 default:
     @just --list
 
-# Check the format and run clippy and the Python lints.
+# Check the format and run clippy and the Python lints. The fuzz targets of
+# zoe serve are a workspace of their own: check their format, and that their
+# Cargo.lock needs no change, so `just fuzz` builds with --locked.
 check:
     cargo fmt --all --check
+    cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
+    cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
     ruff check python ci/src
     ruff format --check python ci/src
@@ -24,6 +28,8 @@ test:
     # change what a damaged database file does. The harness prints its
     # counts.
     cargo test --release --locked -p zoe-core --test bit_flip_harness -- --show-output
+    # The tests of the server run the `zoe` binary that cargo test built.
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
@@ -80,29 +86,136 @@ tsan:
     grep -h '^SUMMARY: ThreadSanitizer' "$tmp"/*
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
 
-# Run the test suites of ZODB in-process against zoe.Storage, on every
-# interpreter. `just test` does not collect them. The ZEO suites against
-# zoe serve are not built yet.
+# Build the fuzz targets of zoe serve with libFuzzer, then run them one
+# after the other for `seconds` in all. `just fuzz` runs each of the two
+# targets for 30 seconds, and `just fuzz 600 frame` runs only `frame`, for
+# 10 minutes. The targets and their seeds are in crates/zoe-server/fuzz. The
+# build, the inputs that libFuzzer finds and the crash files go to
+# target/fuzz.
+fuzz seconds="60" *targets="frame handshake":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fuzz=crates/zoe-server/fuzz
+    out="${CARGO_TARGET_DIR:-target}/fuzz"
+    # The flags of `cargo fuzz build`, so cargo-fuzz itself is not needed:
+    # the coverage that libFuzzer reads, AddressSanitizer, debug assertions
+    # and the cfg fuzzing. RUSTC_BOOTSTRAP lets the pinned stable toolchain
+    # accept the unstable flags, as in `just tsan`. The explicit target
+    # keeps the flags off the build scripts and the proc macros.
+    export RUSTC_BOOTSTRAP=1
+    export RUSTFLAGS="-Cpasses=sancov-module \
+        -Cllvm-args=-sanitizer-coverage-level=4 \
+        -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+        -Cllvm-args=-sanitizer-coverage-pc-table \
+        -Cllvm-args=-sanitizer-coverage-trace-compares \
+        -Cllvm-args=-sanitizer-coverage-stack-depth \
+        -Cllvm-args=-simplifycfg-branch-fold-threshold=0 \
+        --cfg fuzzing -Zsanitizer=address -Cdebug-assertions -Ccodegen-units=1"
+    triple=x86_64-unknown-linux-gnu
+    cargo build --manifest-path "$fuzz/Cargo.toml" --release --locked \
+        --target "$triple" --target-dir "$out/build" \
+        --config 'profile.release.debug="line-tables-only"'
+    export ASAN_OPTIONS="detect_odr_violation=0"
+    # The handshake target runs a server, which makes a store in TMPDIR.
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    targets=({{ targets }})
+    # A time of 0 has no end for libFuzzer, so each target gets 1 second at
+    # least.
+    each=$(( {{ seconds }} / ${#targets[@]} ))
+    if [ "$each" -lt 1 ]; then each=1; fi
+    for target in "${targets[@]}"; do
+        echo "== $target"
+        mkdir -p "$out/corpus/$target" "$out/artifacts/$target"
+        options=()
+        if [ "$target" = handshake ]; then
+            # The server writes a line to stderr for each connection that it
+            # closes, so its stderr goes away. The message of a panic goes
+            # away too: to see it, run the target on the crash file without
+            # -close_fd_mask, as
+            # `target/fuzz/build/x86_64-unknown-linux-gnu/release/handshake
+            # target/fuzz/artifacts/handshake/crash-...`. The threads of the
+            # server free memory after the end of an input, so libFuzzer
+            # would look for a leak after nearly each input, and run 20
+            # times slower. LeakSanitizer still looks for leaks at the end
+            # of the run.
+            options=(-close_fd_mask=2 -detect_leaks=0)
+        fi
+        # libFuzzer adds the new inputs to the first directory. The seeds
+        # in the repository do not change.
+        TMPDIR="$tmp" "$out/build/$triple/release/$target" \
+            -max_total_time="$each" -timeout=30 \
+            -print_final_stats=1 "${options[@]}" \
+            -artifact_prefix="$out/artifacts/$target/" \
+            "$out/corpus/$target" "$fuzz/corpus/$target"
+    done
+
+# Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
+# suites against zoe serve, on every interpreter. `just test` does not
+# collect them. The test forker of ZEO starts the `zoe` binary of the debug
+# build.
 conformance:
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
     done
 
+# Run the process kill loop against `zoe serve` for `runs` rounds, on
+# CPython 3.13. Each round kills the server with SIGKILL while several
+# writers commit objects and blobs, restarts it, stops it cleanly, runs
+# `zoe verify` and loads every acknowledged commit. `just test` does not
+# collect it. Without a seed, the recipe takes a random one. It prints the
+# seed. The traceback of a failure shows its local variables, so it gives
+# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
+# the order of the threads. The store and the blob caches go to TMPDIR:
+# 10,000 rounds need about 3 GB there.
+crash runs="200" seed="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{ seed }}"
+    if [ -z "$seed" ]; then
+        seed=$(( (RANDOM << 15) | RANDOM ))
+    fi
+    # The server is the `zoe` binary of this build.
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+    export ZOE_KILL_LOOP_RUNS="{{ runs }}" ZOE_KILL_LOOP_SEED="$seed"
+    echo "just crash: {{ runs }} rounds, seed $seed"
+    status=0
+    UV_PROJECT_ENVIRONMENT=.venv-3.13 uv run --locked --directory python --python 3.13 \
+        pytest -q --showlocals zoedb/tests/crash || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
+    fi
+    exit "$status"
+
 # Build the Plone instance of a scenario under plone/ with buildout, and run
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
-# site over HTTP. The other scenarios are filestorage, zeo and zeoclient; the
-# instances of zeo and zeoclient need their server. The build goes to
-# target/plone. ZOE_PLONE_ADMIN gives the admin user as user:password.
-# Without it, the recipe makes a random password once, in target/plone/admin.
-# The instance listens on 127.0.0.1, on the port ZOE_PLONE_PORT or 8080.
-plone scenario="zoe" command="start":
+# site over HTTP. The other scenarios are filestorage, zeo, zeoclient and
+# zeoclient-mount. The instances of zeo, zeoclient and zeoclient-mount need
+# their server. `just plone zeoclient check` builds the `zoe` binary,
+# starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
+# end. `just plone zeoclient-mount check` starts one `zoe serve` with the
+# two named storages main and content, and puts the site in the mount
+# point /content. `just plone zoe suites` runs the test suites of
+# Products.CMFPlone, plone.app.contenttypes and plone.restapi with the
+# `bin/test` of the scenario, on the layer of zoe.plone.testing; the options
+# that follow go to `bin/test`. `just plone zeoclient suites` runs them
+# against a `zoe serve` on a new store, which it starts and stops, and
+# `just plone filestorage suites` runs them on the stock storages of
+# plone.testing. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# admin user as user:password. Without it, the recipe makes a random
+# password once, in target/plone/admin. The instance listens on 127.0.0.1,
+# on the port ZOE_PLONE_PORT or 8080.
+plone scenario="zoe" command="start" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
-        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe or zeoclient." >&2
+        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient or zeoclient-mount." >&2
         exit 2
     fi
     target="{{ justfile_directory() }}/target/plone"
@@ -164,14 +277,79 @@ plone scenario="zoe" command="start":
     # configuration. zope2instance makes the log directory only when it
     # writes zope.conf, and the zoe scenario writes its own zope.conf.
     mkdir -p "$target/extends" "$target/{{ scenario }}/var/log"
+    # The suites need the part `test` of base.cfg, the test script. The
+    # suites run on the stock storages of plone.testing, on zoe.Storage or
+    # on a ZEO client of zoe serve.
+    parts=()
+    if [ "{{ command }}" = suites ]; then
+        case "{{ scenario }}" in
+            filestorage | zoe | zeoclient)
+                ;;
+            *)
+                echo "just plone: the suites run on filestorage, zoe or zeoclient." >&2
+                exit 2
+                ;;
+        esac
+        parts=("buildout:parts+=test")
+    fi
     # -N installs only what is missing. The user has an empty password, so
     # zope2instance writes no inituser file; set_admin.py gives the password
     # in the instance. Only this user reads the record of buildout.
     "$venv/bin/buildout" -N -c "plone/{{ scenario }}.cfg" \
         "buildout:extends-cache=$target/extends" \
         "instance:user=$user:" \
-        "instance:http-address=127.0.0.1:$port"
+        "instance:http-address=127.0.0.1:$port" \
+        "${parts[@]}"
     chmod 600 "$target/{{ scenario }}/.installed.cfg"
+    # At the exit, stop the instance, then the server, also when a step
+    # fails. SIGTERM makes zoe serve close its store cleanly.
+    pid=""
+    server=""
+    stop() {
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" || true
+        fi
+        if [ -n "$server" ]; then
+            kill -TERM "$server" 2>/dev/null || true
+            wait "$server" || true
+        fi
+    }
+    trap stop EXIT
+    # Start `zoe serve` in the background with the options that follow the
+    # log file, and wait until it listens. Then `server` is its pid and
+    # `address` the address that it listens on. The server is the `zoe`
+    # binary of this build.
+    serve() {
+        local log="$1" tries=0
+        shift
+        cargo build --locked -p zoe-server --bin zoe
+        zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+        # The server gets no ZOE_* variable of the caller, so only the
+        # options here apply. The admin password does not go to the
+        # server.
+        (
+            for name in "${!ZOE_@}"; do
+                unset "$name"
+            done
+            exec "$zoe" serve "$@"
+        ) </dev/null >"$log" 2>&1 &
+        server=$!
+        # zoe serve writes `listening <address>` once it accepts
+        # connections. Stop when the server exits or does not listen,
+        # before a ZEO client waits for it.
+        until grep -q '^listening ' "$log"; do
+            tries=$((tries + 1))
+            if ! kill -0 "$server" 2>/dev/null || [ "$tries" -gt 300 ]; then
+                cat "$log" >&2
+                echo "just plone: zoe serve does not listen, see $log" >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
+        address="$(sed -n 's/^listening //p' "$log" | head -n 1)"
+        echo "just plone: zoe serve listens on $address, its log is $log"
+    }
     case "{{ command }}" in
         build)
             ;;
@@ -186,31 +364,113 @@ plone scenario="zoe" command="start":
             # A new mark in the title of the site tells that read_site.py
             # reads this instance, and not another process on the port.
             mark="mark-$RANDOM$RANDOM"
+            # The instance gives the site from its root, or from the mount
+            # point /content of zeoclient-mount.
+            folder=""
+            case "{{ scenario }}" in
+                zeoclient)
+                    # zoe serve serves the store of the scenario under the
+                    # storage name 1, the default of ZEO.
+                    stores=(--path "$target/zeoclient/var/zoe")
+                    ;;
+                zeoclient-mount)
+                    # One zoe serve serves the two databases of the
+                    # instance: main at / and content at /content.
+                    stores=(--storage "main=$target/zeoclient-mount/var/main"
+                        --storage "content=$target/zeoclient-mount/var/content")
+                    folder=/content
+                    ;;
+                *)
+                    stores=()
+                    ;;
+            esac
+            if [ "${#stores[@]}" -gt 0 ]; then
+                # The instance is a ZEO client of zoe serve. It listens on
+                # the zeo-address of zeoclient.cfg.
+                serve "$target/{{ scenario }}/var/log/zoe-serve.log" \
+                    "${stores[@]}" --listen 127.0.0.1:8100
+            fi
             "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py "$mark"
+            "$instance" run plone/create_site.py "$mark" ${folder:+"$folder"}
             "$instance" console &
             pid=$!
-            trap 'kill "$pid" 2>/dev/null || true; wait "$pid" || true' EXIT
             # Wait for the instance, then read the page of the site, which
             # holds the title with the mark. Only the admin user can read
             # the management page of the site.
-            site="http://127.0.0.1:$port/Plone"
+            site="http://127.0.0.1:$port$folder/Plone"
             python3.13 plone/read_site.py "$site" "Check site $mark"
             python3.13 plone/read_site.py "$site/manage_main" portal_catalog
             ;;
+        suites)
+            # bin/test runs the suites unchanged. In the zoe and zeoclient
+            # scenarios, its initialization installs the layer of
+            # zoe.plone.testing, which gives plone.testing its base storage.
+            if [ "{{ scenario }}" = zeoclient ]; then
+                # A new store for each run. The layer reads the address of
+                # the server from ZOE_PLONE_ZEO_ADDRESS.
+                store="$target/zeoclient/var/suites"
+                rm -rf "$store"
+                serve "$target/zeoclient/var/log/zoe-serve-suites.log" \
+                    --path "$store" --listen 127.0.0.1:0
+                export ZOE_PLONE_ZEO_ADDRESS="$address"
+            fi
+            set -- {{ args }}
+            "$target/{{ scenario }}/bin/test" -s Products.CMFPlone \
+                -s plone.app.contenttypes -s plone.restapi "$@"
+            ;;
         *)
-            echo "just plone: unknown command {{ command }}. Use start, build or check." >&2
+            echo "just plone: unknown command {{ command }}. Use start, build, check or suites." >&2
             exit 2
             ;;
     esac
 
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set and
-# `just bench test` runs the tests of the harness. zoe-bench and the
-# criterion benchmarks are not built yet.
+# `just bench test` runs the tests of the harness. `just bench load` and
+# `just bench saturate` build `zoe` and `zoe-bench` in release, start
+# `zoe serve` on a new store in target/bench/work/zoe-bench, run
+# `zoe-bench load` or `zoe-bench saturate` with its default settings and
+# the options that follow, and write the JSON result to stdout and to
+# target/bench/zoe-bench/<command>-<started>.json. The criterion
+# benchmarks are not built yet.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
+    set -- {{ args }}
+    if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
+        command="$1"
+        shift
+        cargo build --release --locked -p zoe-server --bin zoe -p zoe-bench --bin zoe-bench
+        bin="${CARGO_TARGET_DIR:-target}/release"
+        work="target/bench/work/zoe-bench"
+        out="target/bench/zoe-bench"
+        rm -rf "$work"
+        mkdir -p "$work" "$out"
+        # `zoe serve` writes `listening <address>` once it accepts
+        # connections. The port 0 takes a free port.
+        "$bin/zoe" serve --path "$work/store" --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.log" &
+        pid=$!
+        trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        for _ in $(seq 100); do
+            grep -q '^listening ' "$work/serve.out" && break
+            kill -0 "$pid" 2>/dev/null || { cat "$work/serve.log" >&2; exit 1; }
+            sleep 0.1
+        done
+        addr="$(sed -n 's/^listening //p' "$work/serve.out")"
+        [ -n "$addr" ] || { echo "just bench: zoe serve does not listen" >&2; exit 1; }
+        result="$out/$command-$(date -u +%Y%m%dT%H%M%SZ).json"
+        # Write to a temporary file, and move it on success only. So a
+        # failed run leaves no result.
+        partial="$(mktemp "$out/.$command.XXXXXX")"
+        trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+        ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
+            "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
+        # mktemp creates the file with the mode 0600.
+        chmod 0644 "$partial"
+        mv "$partial" "$result"
+        cat "$result"
+        exit 0
+    fi
     export UV_PYTHON="${UV_PYTHON:-3.13}"
     export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/venv-$UV_PYTHON"
     # The RelStorage wheel links libstdc++, which the Nix interpreters do not
@@ -280,6 +540,37 @@ docs:
 ci *functions="check test docs":
     for f in {{ functions }}; do dagger call --mod ci "$f"; done
 
-# Cut a release.
-release:
-    @echo "just release: bumps the versions in lockstep and builds the wheels, the binaries, the image and the Helm chart. Not built yet."
+# Build the release artifacts. `just release` builds the static `zoe`
+# binary and the server image, as an OCI tarball, into target/dist through
+# the Dagger function release. `just release binary DIR` builds the static
+# binary in the shell and copies it to DIR; the Dagger function zoe-binary
+# runs it. `just release test` runs the tests of the Dagger functions
+# against the Dagger engine. The version bump, the wheels and the Helm chart
+# are not built yet.
+release command="dist" dir="target/dist":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ command }}" in
+        dist)
+            dagger call --mod ci release export --path "{{ dir }}"
+            ;;
+        binary)
+            # musl links the binary statically, so it needs no C library
+            # and no dynamic loader on the host.
+            target=x86_64-unknown-linux-musl
+            cargo build --release --locked --target "$target" \
+                -p zoe-server --features serve --bin zoe
+            mkdir -p "{{ dir }}"
+            cp "${CARGO_TARGET_DIR:-target}/$target/release/zoe" "{{ dir }}/zoe"
+            ;;
+        test)
+            # uv installs the Python SDK of the module from ci/sdk, which
+            # dagger develop writes.
+            dagger develop --mod ci
+            uv run --locked --directory ci pytest -q tests
+            ;;
+        *)
+            echo "just release: unknown command {{ command }}. Use dist, binary or test." >&2
+            exit 2
+            ;;
+    esac
