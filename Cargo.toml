@@ -37,6 +37,8 @@ rmpv = "1.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The handlers of SIGTERM and SIGHUP of the extension module (zoe-py).
+signal-hook = { version = "0.4.5", default-features = false, features = ["iterator"] }
 thiserror = "2"
 # The configuration file of `zoe serve`.
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }

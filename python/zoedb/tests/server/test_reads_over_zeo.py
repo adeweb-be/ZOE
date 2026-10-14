@@ -3,7 +3,7 @@
 An unmodified `ZEO.ClientStorage` gets from `zoe serve`:
 
 - `get_info` at registration: `length`, `size`, `name`, `supportsUndo`
-  (false until phase 3), `supports_record_iternext` and `interfaces`, the
+  (false until phase 4), `supports_record_iternext` and `interfaces`, the
   storage interfaces that the store provides;
 - `get_size_info`, `server_status` with the keys of ZEO's own server, the
   `ruok` status protocol, `ping` and `set_client_label`;
