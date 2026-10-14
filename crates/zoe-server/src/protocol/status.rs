@@ -2,8 +2,10 @@
 //! JSON reply of `ruok`, with the keys of ZEO 6's server.
 //!
 //! The store has no storage-wide commit lock. So `lock_time` is always
-//! nil, `waiting` is always 0, and `timeout-thread-is-alive` is `"stub"`,
-//! the value of a ZEO server without a transaction timeout.
+//! nil and `waiting` is always 0. `timeout-thread-is-alive` is true when
+//! the server closes a silent connection (`--idle-timeout`), as for a ZEO
+//! server with a transaction timeout. Otherwise it is `"stub"`, the value
+//! of a ZEO server without a transaction timeout.
 //! `conflicts_resolved` counts the conflicts that the clients resolved
 //! through the vote. ZEO 6's server keeps it at 0.
 
@@ -76,7 +78,8 @@ impl Stats {
     }
 
     /// Return the status now. `last` is the last tid of the store.
-    pub(crate) fn status(&self, last: Tid) -> Status {
+    /// `timeout` is true when the server closes a silent connection.
+    pub(crate) fn status(&self, last: Tid, timeout: bool) -> Status {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         Status {
             connections: get(&self.connections),
@@ -88,6 +91,7 @@ impl Stats {
             conflicts: get(&self.conflicts),
             conflicts_resolved: get(&self.conflicts_resolved),
             start: self.start.clone(),
+            timeout,
             last_transaction: last,
         }
     }
@@ -105,6 +109,7 @@ pub(crate) struct Status {
     conflicts: u64,
     conflicts_resolved: u64,
     start: String,
+    timeout: bool,
     last_transaction: Tid,
 }
 
@@ -112,6 +117,7 @@ pub(crate) struct Status {
 enum Item {
     Int(u64),
     Nil,
+    True,
     Text(String),
 }
 
@@ -130,7 +136,14 @@ impl Status {
             ("conflicts_resolved", Item::Int(self.conflicts_resolved)),
             ("start", Item::Text(self.start.clone())),
             ("waiting", Item::Int(0)),
-            ("timeout-thread-is-alive", Item::Text("stub".into())),
+            (
+                "timeout-thread-is-alive",
+                if self.timeout {
+                    Item::True
+                } else {
+                    Item::Text("stub".into())
+                },
+            ),
             (
                 "last-transaction",
                 Item::Text(format!("{:016x}", self.last_transaction.0)),
@@ -147,6 +160,7 @@ impl Status {
                     let value = match item {
                         Item::Int(n) => Value::from(n),
                         Item::Nil => Value::Nil,
+                        Item::True => Value::Boolean(true),
                         Item::Text(text) => Value::from(text),
                     };
                     (Value::from(key), value)
@@ -170,6 +184,7 @@ impl Status {
                     let _ = write!(out, "{n}");
                 }
                 Item::Nil => out.push_str("null"),
+                Item::True => out.push_str("true"),
                 Item::Text(text) => write_json_text(out, &text),
             }
         }
@@ -234,6 +249,7 @@ mod tests {
             conflicts: 0,
             conflicts_resolved: 0,
             start: "<start time placeholder>".into(),
+            timeout: false,
             last_transaction: Tid::ZERO,
         }
     }
@@ -277,6 +293,23 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_gives_true_as_zeo_gives_it() {
+        let status = Status {
+            timeout: true,
+            ..recorded(1)
+        };
+        let Value::Map(items) = status.to_value() else {
+            panic!("a status is a map");
+        };
+        assert!(items.contains(&(
+            Value::from("timeout-thread-is-alive"),
+            Value::Boolean(true)
+        )));
+        let json = ruok(&[("1", status)]);
+        assert!(json.contains(r#""timeout-thread-is-alive": true, "#), "{json}");
+    }
+
+    #[test]
     fn a_json_text_is_ascii_as_python_writes_it() {
         let mut out = String::new();
         write_json_text(&mut out, "a\"b\\c\nd\u{1}é😀");
@@ -290,7 +323,7 @@ mod tests {
         Stats::add(&stats.connections);
         Stats::sub(&stats.connections);
         Stats::sub(&stats.connections);
-        let status = stats.status(Tid(0x0123_4567_89ab_cdef));
+        let status = stats.status(Tid(0x0123_4567_89ab_cdef), false);
         assert_eq!(status.commits, 1);
         assert_eq!(status.connections, 0);
         assert_eq!(status.start, "Thu Jan  1 00:00:00 1970");

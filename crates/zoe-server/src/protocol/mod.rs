@@ -148,6 +148,9 @@ pub(crate) struct NamedStorage {
     /// True when the clients share the blob directory of the store, so
     /// that `storeBlobShared` is accepted.
     shared_blob_dir: bool,
+    /// True when the server closes a connection that stays silent, so
+    /// that an open transaction cannot hold its locks forever.
+    timeout: bool,
 }
 
 impl NamedStorage {
@@ -167,6 +170,7 @@ impl NamedStorage {
             queues,
             read_only: false,
             shared_blob_dir: false,
+            timeout: false,
         }
     }
 
@@ -192,6 +196,14 @@ impl NamedStorage {
         self
     }
 
+    /// Mark that the server closes a connection that stays silent when
+    /// `timeout` is true. The status then gives `timeout-thread-is-alive`
+    /// true, as a ZEO server with a transaction timeout does.
+    pub(crate) fn timeout(mut self, timeout: bool) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Return what the admin port reads for the metrics of the storage.
     pub(crate) fn exported(&self) -> Exported {
         Exported {
@@ -204,7 +216,8 @@ impl NamedStorage {
 
     /// Return the status of the storage. It reads the store.
     fn status(&self) -> status::Status {
-        self.stats.status(self.store.last_transaction())
+        self.stats
+            .status(self.store.last_transaction(), self.timeout)
     }
 
     /// Return the size of the files in the store directory, in bytes, as
