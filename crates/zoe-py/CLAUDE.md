@@ -8,7 +8,8 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
-- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` section of ZConfig and the `zoe://` URI of zodburi.
+- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` and `<zoe-server>` sections of ZConfig and the `zoe://` URI of zodburi.
+- `python/zoedb/src/zoe/serve.py`: `python -m zoe.serve`, which runs the `zoe` binary with the `<zoe-server>` section.
 - `src/cli.rs`: `zoe._zoe.main`, the `zoe` command of the console script.
 - `python/zoedb/src/zoe/__main__.py`: `zoe.__main__.main`, the entry point of the console script `zoe` and of `python -m zoe`.
 - `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage`, `IBlobStorage`, `IStorageIteration`, `IStorageCurrentRecordIteration`, `IStorageRestoreable` and `IBlobStorageRestoreable`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `iterator`, `copyTransactionsFrom`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
@@ -79,6 +80,18 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `zoe.config` imports ZODB and ZConfig. `import zoe` does not import `zoe.config`. ZConfig and zodburi import it when they need it.
 - `just plone zoe` builds a Plone instance from `plone/zoe.cfg`, whose `zope.conf` has the `<zoe>` stanza alone, and `just plone zoe check` creates a Plone site on it. No command line and no file of the build holds the admin password: see `plone/README.md`.
 
+## The `<zoe-server>` section and `zoe.serve`
+
+- `component.xml` also declares the `<zoe-server>` section and its `<storage NAME>` subsections. `python -m zoe.serve -C FILE` reads the section with the schema `zoe.serve.SCHEMA` and runs `zoe serve` with it. ADR 0028 records this.
+- The keys of the section are `binary` and `zoe.serve.KEYS`, the top-level keys of the configuration file of `zoe serve`. A unit test compares `KEYS` with the options of `zoe serve --help`. So an option that the server adds must also go into `KEYS` and `component.xml`. The keys are strings: `zoe serve` checks their values, except `read-only`, which `zoe.serve` converts with ZConfig's boolean. An empty value counts as not set.
+- A `<storage NAME>` subsection is a `[storages.NAME]` table, with `path` (required), `blob-dir` and `read-only` (a ZConfig boolean, false by default). ZConfig gives the name in lower case and refuses a name that comes twice.
+- A leading `~` in `path` and `blob-dir` is the home directory.
+- The section wins over the twins: the environment of the server has no twin of a key that the section sets. The other variables, the twins of the keys that it does not set included, reach the server.
+- The wheel ships no server. The binary is the key `binary`, else `ZOE_BINARY`, else the first `zoe` on the PATH that is not a script, so the console script `zoe` of the wheel is skipped. A name with `/` is a path, and a leading `~` is the home directory.
+- `zoe.serve` writes the TOML file into a `memfd_create` file without `CLOEXEC`, and `execve`s `BINARY serve --config /proc/self/fd/N`. So no Python stays in the process of the server, a SIGTERM reaches the server, and no value of the section is in the arguments of the process. The memory file stays open in the server.
+- An error in the file exits with 2 before the exec, and a missing binary with 1. `zoe serve` refuses a bad value with 2 too.
+- `zoe.testing.ZoeServer.binary()` gives the binary of the tests: `ZOE_BINARY`, else the debug build of the repository.
+
 ## Errors
 
 | Core error | Python exception |
@@ -108,6 +121,7 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 - `python/zoedb/tests/acceptance/test_pack.py` is the acceptance test of pack. It also runs ZODB's `PackableStorage` suites.
 - `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script `zoe`.
 - `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
+- `python/zoedb/tests/server/test_zoe_server_section.py` is the acceptance test of the `<zoe-server>` section and `zoe.serve`. `python/zoedb/tests/server/test_zoe_serve.py` holds their unit tests.
 - `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.
