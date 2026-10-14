@@ -20,6 +20,7 @@ zoe-pickle = { path = "crates/zoe-pickle" }
 zoe-server = { path = "crates/zoe-server", default-features = false }
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
+futures = { version = "0.3.34", default-features = false, features = ["alloc"] }
 libc = "0.2"
 pyo3 = "0.29"
 redb = "4.3"
@@ -32,6 +33,7 @@ thiserror = "2"
 # The configuration file of `zoe serve`.
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 # Never in zoe-core, and never linked by the extension module (zoe-py).
+# Only zoe-server, zoe-client, zoe-bench, zoe-mcp and Loupe's server mode use it.
 tokio = { version = "1.53", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

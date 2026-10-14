@@ -22,22 +22,22 @@ Three places can hold the binary: a `[[bin]]` in `zoe-server`, a thin binary cra
 
 **`--path` everywhere.** The store is `--path` in every subcommand, with the twin `ZOE_PATH`, as in `zoe serve --path`.
 
-**`--data-fs-blob-dir` for the blob directory of a `Data.fs`.** The blob directory of the store belongs to the store and to `zoe serve`. The blob directory of the `Data.fs` gets its own name, `--data-fs-blob-dir` with the twin `ZOE_DATA_FS_BLOB_DIR`.
+**`--data-fs-blob-dir` for the blob directory of a `Data.fs`, `--blob-dir` for the one of the store.** The blob directory of the store belongs to the store and to `zoe serve`. It is `--blob-dir` with the twin `ZOE_BLOB_DIR`, the twin of the key `blob-dir` of the `<zoe>` section, and `<path>/blobs` by default. The blob directory of the `Data.fs` gets its own name, `--data-fs-blob-dir` with the twin `ZOE_DATA_FS_BLOB_DIR`. The store does not record its blob directory (ADR 0027), so `zoe verify` and `zoe convert --to-data-fs` refuse a store with blob records whose blob directory has no layout file: they fail with 1 before they walk the store, write nothing, and name the blob directory and `--blob-dir`. `zoe convert --from-data-fs` puts the blobs of the store into `--blob-dir`.
 
 **The command line.**
 
 ```
-zoe convert --from-data-fs FILE [--data-fs-blob-dir DIR] --path STORE
-zoe convert --to-data-fs FILE --data-fs-blob-dir DIR --path STORE
+zoe convert --from-data-fs FILE [--data-fs-blob-dir DIR] --path STORE [--blob-dir DIR]
+zoe convert --to-data-fs FILE --data-fs-blob-dir DIR --path STORE [--blob-dir DIR]
 zoe pack --path STORE --days N [--dry-run]
 zoe mcp --path STORE
-zoe verify --path STORE [--format text|json] [--classes FILE]
-zoe verify --path STORE --backup DIR [--format text|json]
+zoe verify --path STORE [--blob-dir DIR] [--format text|json] [--classes FILE]
+zoe verify --path STORE [--blob-dir DIR] --backup DIR [--format text|json]
 zoe backup --path STORE --to DIR
 zoe restore --from DIR --path STORE
 ```
 
-The twins are `ZOE_PATH`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLOB_DIR`, `ZOE_DAYS`, `ZOE_DRY_RUN`, `ZOE_FORMAT`, `ZOE_CLASSES`, `ZOE_BACKUP`, `ZOE_TO` and `ZOE_FROM`. clap reads them, and the help of each option names its twin. An option on the command line wins over its twin. `ZOE_DRY_RUN` takes `true` or `false`, and the other words that clap reads as a boolean. `--dry-run` alone means true, and `--dry-run=false` turns off a dry run that the twin asks for. A conversion takes exactly one direction: two directions are a usage error, also when one of them comes from a twin. `--backup` and `--classes` together are a usage error too.
+The twins are `ZOE_PATH`, `ZOE_BLOB_DIR`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, `ZOE_DATA_FS_BLOB_DIR`, `ZOE_DAYS`, `ZOE_DRY_RUN`, `ZOE_FORMAT`, `ZOE_CLASSES`, `ZOE_BACKUP`, `ZOE_TO` and `ZOE_FROM`. clap reads them, and the help of each option names its twin. An option on the command line wins over its twin. `ZOE_DRY_RUN` takes `true` or `false`, and the other words that clap reads as a boolean. `--dry-run` alone means true, and `--dry-run=false` turns off a dry run that the twin asks for. A conversion takes exactly one direction: two directions are a usage error, also when one of them comes from a twin. `--backup` and `--classes` together are a usage error too.
 
 **`zoe mcp`.** `zoe mcp --path STORE` serves the read-only ops tools of the store to an agent, over MCP on stdin and stdout (F20). `zoe-mcp` holds the server, and the tools call Loupe's functions. stdout carries only MCP messages, so the command writes no report. It ends with 0 when the client closes stdin, also before the `initialize` request. A request before `initialize` gets a reply, and the session waits for `initialize`. It ends with 1 when the store does not open, or when the first message is a notification. `cli::main` does not hold the lock of stdout, because the MCP transport writes to stdout from another thread.
 

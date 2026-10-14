@@ -29,7 +29,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use zoe_core::{Clock, SystemClock, ZoeError};
+use zoe_core::{Clock, Options, Store, SystemClock, ZoeError};
 
 /// The exit code of a command that succeeds.
 pub const SUCCESS: i32 = 0;
@@ -109,6 +109,40 @@ impl From<io::Error> for Failure {
 /// Return the failure of the store in `path`.
 fn store_failure(path: &Path, error: ZoeError) -> Failure {
     Failure::Message(format!("{}: {error}", path.display()))
+}
+
+/// Open the store in `path` read-only, with its blob files in `blob_dir`
+/// (`blobs` in `path` when `None`), for a command that reads the blob
+/// files. The open changes no byte and creates nothing.
+///
+/// A store with blob records whose blob directory has no layout file
+/// fails: that directory is not the one of the store (ADR 0027). The
+/// message names the blob directory and `--blob-dir`.
+fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failure> {
+    let options = Options {
+        blob_dir: blob_dir.map(Path::to_path_buf),
+        ..Options::default()
+    };
+    let store = Store::open_read_only_with(path, options).map_err(|e| store_failure(path, e))?;
+    store
+        .check_blob_dir()
+        .map_err(|e| blob_dir_failure(path, e))?;
+    Ok(store)
+}
+
+/// Return the failure of the store in `path`, for a command that takes
+/// `--blob-dir`. The message of `MissingBlobDir` names the blob directory
+/// and `--blob-dir`.
+fn blob_dir_failure(path: &Path, error: ZoeError) -> Failure {
+    match error {
+        ZoeError::MissingBlobDir { path: blobs } => Failure::Message(format!(
+            "{}: the store has blobs, but the blob directory {} has no layout file: \
+             give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+            path.display(),
+            blobs.display()
+        )),
+        e => store_failure(path, e),
+    }
 }
 
 /// Tell if `error` comes from a reader that closed its end of the output,
@@ -236,6 +270,21 @@ mod tests {
     #[test]
     fn the_command_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_wrong_blob_directory_names_the_option() {
+        let blobs = PathBuf::from("elsewhere");
+        let error = ZoeError::MissingBlobDir { path: blobs };
+        let Failure::Message(message) = blob_dir_failure(Path::new("store"), error) else {
+            panic!("not a message");
+        };
+        assert!(message.starts_with("store: "), "{message}");
+        assert!(message.contains(" elsewhere "), "{message}");
+        assert!(message.contains("--blob-dir (ZOE_BLOB_DIR)"), "{message}");
+
+        let other = blob_dir_failure(Path::new("store"), ZoeError::ReadOnly);
+        assert!(matches!(other, Failure::Message(m) if !m.contains("--blob-dir")));
     }
 
     #[test]

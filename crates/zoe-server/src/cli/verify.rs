@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 use zoe_convert::{BackupCheck, Verification};
-use zoe_core::Store;
 
-use super::{Failure, closed_by_reader, store_failure};
+use super::{Failure, closed_by_reader, open_with_blobs};
 
 /// The format of the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -32,6 +31,15 @@ pub(super) struct VerifyArgs {
     /// The directory of the store.
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: PathBuf,
+
+    /// The blob directory of the store, the key blob-dir of the <zoe>
+    /// section. The default is blobs in the store directory.
+    ///
+    /// The store does not record its blob directory. A store with blobs
+    /// whose blob directory has no layout file fails the command before
+    /// the check.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
 
     /// The format of the report.
     #[arg(
@@ -74,8 +82,9 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     let known = args.classes.as_deref().map(read_classes).transpose()?;
     let path = &args.path;
     // A read-only open changes no byte of the store, and fails on a
-    // directory without a store.
-    let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
+    // directory without a store. A wrong blob directory fails here, so the
+    // report does not list each blob.
+    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
     let report = zoe_convert::verify(&store, known.as_ref());
     drop(store);
     let written = match args.format {
@@ -90,7 +99,7 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
 /// report to `out`.
 fn run_backup(args: &VerifyArgs, dumps: &Path, out: &mut dyn Write) -> Result<(), Failure> {
     let path = &args.path;
-    let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
+    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
     let check = zoe_convert::verify_backup(&store, dumps, &std::env::temp_dir())
         .map_err(|error| Failure::Message(error.to_string()))?;
     drop(store);
