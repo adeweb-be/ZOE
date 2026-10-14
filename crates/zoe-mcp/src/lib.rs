@@ -1,15 +1,15 @@
 //! The MCP server for ops and content agents. Specification: "AI-native:
 //! MCP server and retrieval".
 //!
-//! [`serve_stdio`] opens a store folder for reads only and speaks MCP on
-//! stdin and stdout, with the `rmcp` SDK. It offers the read-only ops
-//! tools `object_get`, `history`, `diff`, `references`, `space`, `verify`
-//! and `explain_conflict`, and the prompts `explain_transaction`,
-//! `why_conflict` and `summarise_changes`. The tools are the functions of
-//! Loupe with an agent face: most call `zoe-loupe` and give its JSON.
-//! `verify` calls `zoe_convert::verify`, and `explain_conflict` reads the
-//! transactions with the iterator of the core. Each prompt carries the
-//! data that its tools give.
+//! [`serve_stdio`] opens a store folder for reads only, with the blob
+//! directory of the store, and speaks MCP on stdin and stdout, with the
+//! `rmcp` SDK. It offers the read-only ops tools `object_get`, `history`,
+//! `diff`, `references`, `space`, `verify` and `explain_conflict`, and the
+//! prompts `explain_transaction`, `why_conflict` and `summarise_changes`.
+//! The tools are the functions of Loupe with an agent face: most call
+//! `zoe-loupe` and give its JSON. `verify` calls `zoe_convert::verify`,
+//! and `explain_conflict` reads the transactions with the iterator of the
+//! core. Each prompt carries the data that its tools give.
 //!
 //! The server runs as the ops principal of the local operator: the user
 //! who starts the process. That principal has the read-only role. So the
@@ -62,11 +62,15 @@ fn open_failure(path: &Path, error: &zoe_loupe::Error) -> String {
 /// read-only ops tools over MCP on stdin and stdout. Return when the
 /// client closes stdin, also before the `initialize` request.
 ///
+/// `blob_dir` is the blob directory of the store. The store does not
+/// record it. With `None`, it is `blobs` in the folder. The open creates
+/// nothing.
+///
 /// The server holds the lock of the store while it runs. So a running
 /// instance and the server never share a store. The server writes only
 /// MCP messages to stdout.
-pub fn serve_stdio(path: &Path) -> Result<(), Error> {
-    let folder = Folder::open(path).map_err(|source| Error::Open {
+pub fn serve_stdio(path: &Path, blob_dir: Option<&Path>) -> Result<(), Error> {
+    let folder = Folder::open_with_blob_dir(path, blob_dir).map_err(|source| Error::Open {
         path: path.to_owned(),
         source,
     })?;
@@ -107,7 +111,7 @@ mod tests {
     #[test]
     fn a_folder_without_a_store_does_not_open() {
         let missing = std::env::temp_dir().join(format!("zoe-mcp-none-{}", std::process::id()));
-        let error = serve_stdio(&missing).err();
+        let error = serve_stdio(&missing, None).err();
         assert!(
             matches!(
                 error,

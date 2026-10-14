@@ -10,8 +10,8 @@
 //!
 //! The conversion holds one transaction of the store at a time, and the
 //! offset of the newest record of each oid. The transaction iterator of
-//! the store holds the transaction rows and the record keys of the whole
-//! store.
+//! the store holds one transaction and a slice of tids at a time, whatever
+//! the size of the store.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Read, Write};
@@ -24,7 +24,7 @@ use crate::blobs::{BlobDir, LAYOUT_FILE, Layout};
 use crate::datafs::{BLOB_SAMPLE_STRIDE, Problems, check_blob, compare_txn, stop_problem};
 use crate::filestorage::{DataRecord, Reader, TxnHeader, hex};
 use crate::writer::{Writer, tail};
-use crate::{Error, Report};
+use crate::{Error, ProblemKind, Report};
 
 /// The suffix of the temporary file beside the `Data.fs`.
 const TEMP_SUFFIX: &str = ".new";
@@ -324,14 +324,7 @@ fn verify(
     store: &Store,
     last: Tid,
 ) -> Result<(Report, Vec<String>), Error> {
-    let mut report = Report {
-        transactions: 0,
-        copied: 0,
-        records: 0,
-        blobs: 0,
-        last_tid: Tid::ZERO,
-        problems: Vec::new(),
-    };
+    let mut report = Report::empty();
     let mut unread = Problems::default();
     let mut differences = Problems::default();
     let mut reader = Reader::open(path)?;
@@ -340,7 +333,10 @@ fn verify(
         let txn = match txn {
             Ok(txn) => txn,
             Err(error) => {
-                differences.push(format!("the store does not read: {error}"));
+                differences.add(
+                    ProblemKind::UnreadableStore,
+                    format!("the store does not read: {error}"),
+                );
                 continue;
             }
         };
@@ -351,7 +347,7 @@ fn verify(
         while let Some((header, _)) = &next
             && header.tid < txn.tid
         {
-            differences.push(not_in_store(header.tid));
+            differences.add(ProblemKind::MissingTransaction, not_in_store(header.tid));
             next = read_txn(&mut reader)?;
         }
         match &next {
@@ -359,7 +355,10 @@ fn verify(
                 compare_txn(header, records, &txn, &mut differences);
                 next = read_txn(&mut reader)?;
             }
-            _ => differences.push(format!("the Data.fs lacks transaction {}", hex(txn.tid.0))),
+            _ => differences.add(
+                ProblemKind::MissingTransaction,
+                format!("the Data.fs lacks transaction {}", hex(txn.tid.0)),
+            ),
         }
 
         for record in txn.records.iter().filter(|record| record.data.is_some()) {
@@ -369,7 +368,10 @@ fn verify(
                 Ok(_) => {}
                 Err(ZoeError::NotFound { .. }) => continue,
                 Err(error) => {
-                    unread.push(format!("{at}: the store does not read the blob: {error}"));
+                    unread.add(
+                        ProblemKind::UnreadableBlob,
+                        format!("{at}: the store does not read the blob: {error}"),
+                    );
                     continue;
                 }
             }
@@ -380,31 +382,35 @@ fn verify(
                 Ok(meta) => meta.len(),
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     match store.verify_blob(oid, tid) {
-                        Err(error) => {
-                            unread.push(format!("{at}: the store does not read the blob: {error}"))
-                        }
-                        Ok(()) => differences.push(format!(
-                            "{at}: the blob directory has no blob file {}",
-                            copy.display()
-                        )),
+                        Err(error) => unread.add(
+                            ProblemKind::UnreadableBlob,
+                            format!("{at}: the store does not read the blob: {error}"),
+                        ),
+                        Ok(()) => differences.add(
+                            ProblemKind::MissingBlobFile,
+                            format!(
+                                "{at}: the blob directory has no blob file {}",
+                                copy.display()
+                            ),
+                        ),
                     }
                     continue;
                 }
                 Err(error) => return Err(io_error(&copy, error)),
             };
-            if let Some(problem) = check_blob(store, oid, tid, &copy, size, sample)? {
-                differences.push(format!("{at}: {problem}"));
+            if let Some((kind, problem)) = check_blob(store, oid, tid, &copy, size, sample)? {
+                differences.add(kind, format!("{at}: {problem}"));
             }
         }
     }
     while let Some((header, _)) = next {
-        differences.push(not_in_store(header.tid));
+        differences.add(ProblemKind::MissingTransaction, not_in_store(header.tid));
         next = read_txn(&mut reader)?;
     }
     if let Some(problem) = reader.end().and_then(stop_problem) {
-        differences.summary(problem);
+        differences.add_summary(ProblemKind::Stopped, problem);
     }
-    report.problems = unread.finish();
+    unread.finish_into(&mut report);
     Ok((report, differences.finish()))
 }
 
@@ -781,6 +787,8 @@ mod tests {
                 report.problems[0].starts_with(&format!("{at}: the store does not read the blob")),
                 "{report:?}"
             );
+            assert_eq!(report.count(ProblemKind::UnreadableBlob), 1);
+            assert_eq!(report.problem_count(), 1);
             assert_eq!(report.blobs, 2);
         }
         let blobs = BlobDir::open(&dir.join("blobs")).unwrap();
