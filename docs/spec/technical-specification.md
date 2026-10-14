@@ -621,7 +621,7 @@ The same wheel and binary cover a laptop, a single server and a Kubernetes clust
 - `readinessProbe` on `/readyz`, `livenessProbe` on `/healthz`, `terminationGracePeriodSeconds` above `shutdown-timeout`.
 - A `Service` on the ZEO port and a second on the admin port; a `ServiceMonitor` for Prometheus.
 - `PodDisruptionBudget` with `maxUnavailable: 0` so a node drain waits for a manual window until Tier 2 exists.
-- Backups: a `CronJob` running `zoe backup --to s3://…` (incremental, by tid range, through the iterator) and `zoe verify`.
+- Backups: a `CronJob` running `zoe backup --to s3://…` (incremental, by tid range, through the iterator) and `zoe verify`. Built so far: `zoe backup --to DIR` writes dumps into a local directory, and `zoe verify --backup DIR` checks them (see "`zoe backup` and `zoe restore`: dumps"). Both open the store read-only and take its lock, so they cannot run on a store that a running instance or a server holds. A backup through the server is a card of its own.
 
 **Tier 2 mechanics.** The follower streams transactions from the leader's log (`iterator_start` from its own last tid, kept open) and applies them with `restore`; it is read-only to clients. Leader election: both pods renew a `coordination.k8s.io/Lease`; the holder serves writes. On lease loss the old leader closes client connections; clients reconnect through the Service, which selects by the `zoe/role=leader` label that a sidecar sets from the lease. Promotion requires the follower to be at the leader's last acknowledged tid; a leader acknowledges a commit only after the follower confirmed it when `replication acks=1` is set, which also replaces fsync on slow cloud disks.
 
