@@ -19,6 +19,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A hung step fails the job after this time.
+    timeout-minutes: 30
     env:
       # Nix fetches the github: inputs through the GitHub API with this token.
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,6 +39,8 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # A hung step fails the job after this time.
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
