@@ -1,0 +1,119 @@
+# One zoe serve as a StatefulSet with one replica and one volume for the
+# store and its blobs. Tier 1 has one writer: a reschedule stops the
+# server for some seconds.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zoe
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  # The new pod starts only after the old pod stopped. So two servers
+  # never open the same store.
+  podManagementPolicy: OrderedReady
+  serviceName: zoe-admin
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zoe
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zoe
+        app.kubernetes.io/component: server
+    spec:
+      # The stop on SIGTERM takes at most shutdown-timeout (30 seconds in
+      # the ConfigMap). The grace period must be above it. Else the kubelet
+      # sends SIGKILL before the stores close.
+      terminationGracePeriodSeconds: 45
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # The image user must write to the volume of the store.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: zoe
+          # Set the tag to a release version.
+          image: ghcr.io/adeweb-be/zoe:latest
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          env:
+            - name: ZOE_CONFIG
+              value: /etc/zoe/zoe.toml
+          ports:
+            - name: zeo
+              containerPort: 8100
+              protocol: TCP
+            - name: admin
+              containerPort: 8101
+              protocol: TCP
+          # /healthz gives 503 while the stores open. An open can take long,
+          # for example when it rebuilds the free-space map after a stop
+          # that was not clean. The startup probe waits up to one hour for
+          # the open. The liveness probe starts only after it.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 360
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /readyz gives 503 until the stores are ready, and from SIGTERM
+          # on. Then the Service sends no new client to the pod.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/zoe
+            - name: config
+              mountPath: /etc/zoe
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: zoe
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: zoe
+          app.kubernetes.io/component: server
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Use an SSD class. The fsync latency of the class sets the write
+        # throughput, so benchmark the class before you choose it. Set the
+        # name of a class of the cluster.
+        storageClassName: ssd
+        resources:
+          requests:
+            storage: 20Gi
