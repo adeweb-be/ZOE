@@ -1030,29 +1030,35 @@ impl Session {
         let records = id
             .as_u64()
             .ok_or(Refused::Unknown)
-            .and_then(|iid| self.iterators.start_records(iid, tid))
-            .map_err(|refused| Fault::of_iterator(refused, id))?;
+            .and_then(|iid| self.iterators.start_records(&self.store, iid, tid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?
+            .map_err(|error| Fault::of(&error))?;
         Ok(Value::from(records))
     }
 
     /// Return the next record of the record iterator `id`, as `[oid, tid,
     /// data, data_txn]`, or nil at its end. The data of a deletion is nil.
-    /// The store keeps every pickle whole, so `data_txn` is always nil.
+    /// The store keeps every pickle whole, so `data_txn` is always nil. The
+    /// iterator reads the record now, and leaves out a record that a pack
+    /// removed after the iterator started.
     fn iterator_record_next(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [id] = arity::<1>(args, "iterator_record_next")?;
         let next = id
             .as_u64()
             .ok_or(Refused::Unknown)
-            .and_then(|iid| self.iterators.next_record(iid))
+            .and_then(|iid| self.iterators.next_record(&self.store, iid))
             .map_err(|refused| Fault::of_iterator(refused, id))?;
-        Ok(next.map_or(Value::Nil, |record| {
-            Value::Array(vec![
-                p64(record.oid.0),
-                p64(record.tid.0),
-                record.data.map_or(Value::Nil, Value::Binary),
-                Value::Nil,
-            ])
-        }))
+        let record = match next {
+            None => return Ok(Value::Nil),
+            Some(Err(error)) => return Err(Fault::of(&error)),
+            Some(Ok(record)) => record,
+        };
+        Ok(Value::Array(vec![
+            p64(record.oid.0),
+            p64(record.tid.0),
+            record.data.map_or(Value::Nil, Value::Binary),
+            Value::Nil,
+        ]))
     }
 
     /// Remove the iterators that the client dropped. The client lists each
