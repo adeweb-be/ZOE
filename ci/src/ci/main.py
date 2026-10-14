@@ -10,6 +10,9 @@ NIX_IMAGE = "nixos/nix:2.35.2"
 # The PostgreSQL of the RelStorage baseline.
 POSTGRES_IMAGE = "postgres:17.10-alpine"
 
+# The DSN of that PostgreSQL for the harness of bench/shootout.
+BENCH_PG_DSN = "host=postgres dbname=zoe_bench user=postgres"
+
 # The devenv release that reads devenv.yaml and devenv.lock. Keep it equal
 # to require_version in devenv.yaml.
 DEVENV = "github:cachix/devenv/v2.4.0"
@@ -137,6 +140,21 @@ class Ci:
         cargo = tomllib.loads(await source.file("Cargo.toml").contents())
         return cargo["workspace"]["package"]
 
+    def with_postgres(self, ctr: dagger.Container) -> dagger.Container:
+        """Bind PostgreSQL as the service postgres and set ZOE_BENCH_PG_DSN."""
+        postgres = (
+            dag.container()
+            .from_(POSTGRES_IMAGE)
+            # The service is reachable only inside this pipeline.
+            .with_env_variable("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_env_variable("POSTGRES_DB", "zoe_bench")
+            .with_exposed_port(5432)
+            .as_service()
+        )
+        return ctr.with_service_binding("postgres", postgres).with_env_variable(
+            "ZOE_BENCH_PG_DSN", BENCH_PG_DSN
+        )
+
     @function
     async def check(self, source: Source) -> str:
         """Check the format and run clippy and the Python lints."""
@@ -145,9 +163,21 @@ class Ci:
 
     @function
     async def test(self, source: Source) -> str:
-        """Run the Rust tests and the Python tests on every interpreter."""
+        """Run the Rust tests, the Python tests and the harness tests.
+
+        The Python tests run on every interpreter. The harness tests are the
+        tests of bench/shootout. They use PostgreSQL for RelStorage.
+        """
         ctr = await self.recipe(source, "test")
-        return await ctr.stdout()
+        # The harness tests run the `zoe` binary of the debug build that
+        # `just test` makes. They check the results, not the speed. With
+        # ZOE_BINARY set, `just bench test` builds no release binary.
+        bench = (
+            self.with_postgres(ctr)
+            .with_env_variable("ZOE_BINARY", "/src/target/debug/zoe")
+            .with_exec(["devenv", "shell", "--", "just", "bench", "test"])
+        )
+        return await ctr.stdout() + await bench.stdout()
 
     @function
     async def tsan(self, source: Source) -> str:
@@ -211,23 +241,11 @@ class Ci:
 
         Return the results tree, in the layout of the results repository.
         """
-        postgres = (
-            dag.container()
-            .from_(POSTGRES_IMAGE)
-            # The service is reachable only inside this pipeline.
-            .with_env_variable("POSTGRES_HOST_AUTH_METHOD", "trust")
-            .with_env_variable("POSTGRES_DB", "zoe_bench")
-            .with_exposed_port(5432)
-            .as_service()
-        )
         run = ["devenv", "shell", "--", "just", "bench", "run", "--output", "/results"]
         ctr = await self.devenv(source)
+        ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
         return (
-            ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
-            .with_service_binding("postgres", postgres)
-            .with_env_variable(
-                "ZOE_BENCH_PG_DSN", "host=postgres dbname=zoe_bench user=postgres"
-            )
+            self.with_postgres(ctr)
             .with_env_variable("ZOE_BENCH_COMMIT", commit)
             .with_exec(["devenv", "shell", "--", "just", "bench", "test"])
             .with_exec(run + (["--quick"] if quick else []))
