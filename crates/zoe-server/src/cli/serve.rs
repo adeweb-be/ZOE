@@ -106,8 +106,9 @@ pub(super) struct ServeArgs {
     lock_timeout: Option<Duration>,
 
     /// Log each lock held longer than this, in whole seconds, such as 5,
-    /// 5s or 1m, when the vote that took it ends. The log line gives the
-    /// oid, the client and the storage. 0 or no value logs no lock.
+    /// 5s or 1m, when the lock is released: at the finish, the abort or the
+    /// end of the connection. The log line gives the oid, the client and
+    /// the storage. 0 or no value logs no lock.
     #[arg(
         long,
         env = "ZOE_LOCK_WARN",

@@ -13,15 +13,16 @@
 //!   calls, and the `tpc_finish` calls that ended a transaction.
 //! - `zoe_fsync_batch_size`: the commits that one sync made durable.
 //! - `zoe_lock_wait_seconds`: the time of each vote to take its locks.
-//! - `zoe_conflicts_resolved_total{path}`: the conflicts that a second vote
-//!   passed after the client resolved them (`python`). The server resolves
-//!   no conflict, so `native` stays 0.
-//! - `zoe_conflicts_raised_total`: the votes that failed with a conflict,
-//!   and the transactions that ended between the two votes, so that the
-//!   client raised `ConflictError`.
+//! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that a
+//!   second vote passed after the client resolved them (`python`). The
+//!   server resolves no conflict, so `native` stays 0.
+//! - `zoe_conflicts_raised_total`: the transactions that raised a
+//!   conflict: a vote that failed with a conflict, or a transaction that
+//!   ended between the two votes, so that the client raised
+//!   `ConflictError`.
 //! - `zoe_clients_connected`: the connections that registered.
-//! - `zoe_invalidation_queue_depth`: the most frames that wait in the hub
-//!   queue of one connection of the storage.
+//! - `zoe_invalidation_queue_depth`: the frames that wait in the deepest
+//!   hub queue among the connections of the storage.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -187,44 +188,44 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         &mut out,
         "zoe_loads_total",
         "counter",
-        "The loadBefore calls.",
+        "The number of loadBefore calls.",
         &|s| get(&s.stats.loads),
     );
     histogram(
         &mut out,
         "zoe_load_latency_seconds",
-        "The time of each loadBefore call.",
+        "The time of each loadBefore call, in seconds.",
         &|m| &m.load_latency,
     );
     scalar(
         &mut out,
         "zoe_commits_total",
         "counter",
-        "The commits that tpc_finish made.",
+        "The number of commits that tpc_finish made.",
         &|s| get(&s.metrics.commits),
     );
     histogram(
         &mut out,
         "zoe_vote_latency_seconds",
-        "The time of each vote call, its lock wait included.",
+        "The time of each vote call, its lock wait included, in seconds.",
         &|m| &m.vote_latency,
     );
     histogram(
         &mut out,
         "zoe_finish_latency_seconds",
-        "The time of each tpc_finish call that ended a transaction.",
+        "The time of each tpc_finish call that ended a transaction, until the commit is durable and published, in seconds.",
         &|m| &m.finish_latency,
     );
     histogram(
         &mut out,
         "zoe_fsync_batch_size",
-        "The commits that one sync made durable.",
+        "The number of commits that one sync made durable, in commits.",
         &|m| &m.fsync_batch_size,
     );
     histogram(
         &mut out,
         "zoe_lock_wait_seconds",
-        "The time of each vote to take its locks.",
+        "The time of each vote to take its locks, a wait past the lock timeout included, in seconds.",
         &|m| &m.lock_wait,
     );
     let name = "zoe_conflicts_resolved_total";
@@ -232,7 +233,7 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         &mut out,
         name,
         "counter",
-        "The conflicts that a second vote passed: native on the server, python in the client.",
+        "The number of conflicting oids that a second vote passed after their resolution: native on the server, python in the client.",
     );
     for (storage, labels) in &storages {
         let python = get(&storage.stats.conflicts_resolved);
@@ -243,21 +244,21 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         &mut out,
         "zoe_conflicts_raised_total",
         "counter",
-        "The votes that failed with a conflict, and the transactions that ended between the two votes.",
+        "The number of transactions that raised a conflict: a vote that failed with a conflict, or an end between the two votes.",
         &|s| get(&s.metrics.conflicts_raised),
     );
     scalar(
         &mut out,
         "zoe_clients_connected",
         "gauge",
-        "The connections that registered.",
+        "The number of connections that registered.",
         &|s| get(&s.stats.connections),
     );
     scalar(
         &mut out,
         "zoe_invalidation_queue_depth",
         "gauge",
-        "The most frames that wait in the hub queue of one connection.",
+        "The frames that wait in the deepest hub queue among the connections of the storage.",
         &|s| s.hub.deepest_queue() as u64,
     );
     out
@@ -338,6 +339,29 @@ mod tests {
         assert!(
             text.contains("zoe_invalidation_queue_depth{storage=\"1\"} 0\n"),
             "{text}"
+        );
+        // Each help text gives the unit of its metric.
+        let help = |name: &str| {
+            let head = format!("# HELP {name} ");
+            text.lines()
+                .find_map(|line| line.strip_prefix(head.as_str()))
+                .unwrap_or_else(|| panic!("no help for {name}"))
+                .to_owned()
+        };
+        for name in [
+            "zoe_load_latency_seconds",
+            "zoe_vote_latency_seconds",
+            "zoe_finish_latency_seconds",
+            "zoe_lock_wait_seconds",
+        ] {
+            assert!(help(name).ends_with("in seconds."), "{name}");
+        }
+        assert!(help("zoe_fsync_batch_size").contains("in commits"));
+        assert!(help("zoe_conflicts_resolved_total").contains("oids"));
+        assert!(help("zoe_conflicts_raised_total").contains("transactions"));
+        assert!(
+            help("zoe_invalidation_queue_depth")
+                .contains("the deepest hub queue among the connections of the storage")
         );
         // Each sample line is a name, its labels and a number.
         for line in text.lines().filter(|line| !line.starts_with('#')) {

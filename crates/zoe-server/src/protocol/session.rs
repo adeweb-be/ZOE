@@ -372,18 +372,22 @@ pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Ou
             Outcome::Done(value) => Some(message::reply(call.id, value)),
             // A call without a reply has no way to report its error, so
             // the server closes the connection, as ZEO does.
+            // The text that a client sends goes only into fields, never
+            // into the message. The text format quotes and escapes a
+            // field of text, so a line feed in it cannot add a log line.
             Outcome::Failed(fault) if call.oneway => {
+                let args = fault.args.to_string();
                 tracing::warn!(
-                    method = call.method,
+                    method = call.method.as_str(),
                     class = fault.class,
-                    args = %fault.args,
+                    args = args.as_str(),
                     "a call without a reply failed: closing the connection"
                 );
                 break;
             }
             Outcome::Failed(fault) => Some(message::error(call.id, fault.class, fault.args)),
             Outcome::Close(why) => {
-                tracing::warn!("closing the connection: {why}");
+                tracing::warn!(reason = why.as_str(), "closing the connection");
                 break;
             }
         };
@@ -557,7 +561,8 @@ impl Session {
             "ping" => arity::<0>(args, "ping").map(|_| Value::Nil),
             // ZEO puts the label in its log lines, and so does the server.
             "set_client_label" => arity::<1>(args, "set_client_label").map(|[label]| {
-                self.label = Some(client_label(label));
+                // An empty label gives the address of the peer back.
+                self.label = Some(client_label(label)).filter(|label| !label.trim().is_empty());
                 Value::Nil
             }),
             "new_oids" => self.new_oids(args),
@@ -1379,7 +1384,7 @@ fn add(counter: &AtomicU64) {
 
 /// Return the label of a client for the log lines: its text, with each
 /// control character replaced by a space, and at most `MAX_LABEL`
-/// characters. So a label cannot add a line to a text log.
+/// characters.
 fn client_label(value: &Value) -> String {
     let text = storage_name(value);
     text.chars()
@@ -2415,6 +2420,9 @@ mod tests {
         let mut s = registered("label");
         done(call(&mut s, "set_client_label", vec![Value::from("web-1")]));
         assert_eq!(s.label.as_deref(), Some("web-1"));
+        // An empty label gives the address of the peer back.
+        done(call(&mut s, "set_client_label", vec![Value::from(" ")]));
+        assert_eq!(s.label, None);
     }
 
     fn registered(name: &str) -> Session {

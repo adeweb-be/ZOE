@@ -11,7 +11,9 @@ use std::time::Duration;
 use crate::store::Store;
 
 /// What a store tells its observer. The calls come from the threads that
-/// commit, so a method must be fast and must not block.
+/// commit, so a method must be fast and must not block. A method must not
+/// panic: the leader of a batch calls `batch_synced` before it gives the
+/// members of the batch their outcomes and wakes the waiting finishes.
 pub trait Observer: Send + Sync {
     /// One backend commit, with one sync, made `commits` commits durable.
     /// The leader of the batch calls it after it released the commit
