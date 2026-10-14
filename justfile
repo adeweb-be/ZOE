@@ -163,15 +163,21 @@ conformance:
     done
 
 # Run the process kill loop against `zoe serve` for `runs` rounds, on
-# CPython 3.13. Each round kills the server with SIGKILL while several
-# writers commit objects and blobs, restarts it, stops it cleanly, runs
-# `zoe verify` and loads every acknowledged commit. `just test` does not
-# collect it. Without a seed, the recipe takes a random one. It prints the
-# seed. The traceback of a failure shows its local variables, so it gives
-# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
-# the order of the threads. The store and the blob caches go to TMPDIR:
-# 10,000 rounds need about 3 GB there.
-crash runs="200" seed="":
+# CPython 3.13, then the kill loop under the simulator for `seeds` seeds.
+# Each round of the process kill loop kills the server with SIGKILL while
+# several writers commit objects and blobs, restarts it, stops it cleanly,
+# runs `zoe verify` and loads every acknowledged commit. Without a seed, the
+# recipe takes a random one. It prints the seed. The traceback of a failure
+# shows its local variables, so it gives the round. `just crash RUNS SEED`
+# repeats the kill times of a run, but not the order of the threads. The
+# store and the blob caches go to TMPDIR: 10,000 rounds need about 3 GB
+# there. The simulated kill loop (`tests/simulated_kill_loop.rs` of
+# zoe-server, in release) crashes the simulated server with a power loss
+# at each phase of a commit. A failing seed prints `ZOE_SIM_SEED=<seed>`,
+# and `ZOE_SIM_SEED` runs that seed alone. `just test` runs the simulated
+# kill loop with its default seeds, and does not collect the process kill
+# loop.
+crash runs="200" seed="" seeds="200":
     #!/usr/bin/env bash
     set -euo pipefail
     seed="{{ seed }}"
@@ -188,6 +194,15 @@ crash runs="200" seed="":
         pytest -q --showlocals zoedb/tests/crash || status=$?
     if [ "$status" -ne 0 ]; then
         echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
+    fi
+    echo "just crash: the simulated kill loop, {{ seeds }} seeds"
+    simulated=0
+    ZOE_SIM_SEEDS="{{ seeds }}" cargo test --release --locked -p zoe-server \
+        --test simulated_kill_loop || simulated=$?
+    if [ "$simulated" -ne 0 ]; then
+        echo "just crash: the simulated kill loop failed. Run the seed that it names with:" \
+            "ZOE_SIM_SEED=<seed> cargo test --release -p zoe-server --test simulated_kill_loop" >&2
+        status=$simulated
     fi
     exit "$status"
 
@@ -425,12 +440,15 @@ plone scenario="zoe" command="start" *args:
     esac
 
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
-# target/bench/results, `just bench run --quick` runs the quick set and
-# `just bench test` runs the tests of the harness. `just bench load` and
-# `just bench saturate` build `zoe` and `zoe-bench` in release, start
-# `zoe serve` on a new store in target/bench/work/zoe-bench, run
-# `zoe-bench load` or `zoe-bench saturate` with its default settings and
-# the options that follow, and write the JSON result to stdout and to
+# target/bench/results, `just bench run --quick` runs the quick set,
+# `just bench test` runs the tests of the harness and `just bench gate DIR`
+# compares zoe serve with ZEO cell by cell. `run` and `test` build `zoe` in
+# release for the storage zoe-server, unless ZOE_BINARY names a binary.
+# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
+# in release, start `zoe serve` on a new store in
+# target/bench/work/zoe-bench, run `zoe-bench load` or `zoe-bench saturate`
+# with its default settings and the options that follow, and write the
+# JSON result to stdout and to
 # target/bench/zoe-bench/<command>-<started>.json. The criterion
 # benchmarks are not built yet.
 bench *args="run":
@@ -480,6 +498,11 @@ bench *args="run":
         export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
     shootout=(uv run --locked --project bench/shootout)
+    if { [ "${1:-}" = run ] || [ "${1:-}" = test ]; } && [ -z "${ZOE_BINARY:-}" ]; then
+        cargo build --release --locked -p zoe-server --bin zoe
+        ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
+        export ZOE_BINARY
+    fi
     if [ "{{ args }}" = test ]; then
         exec "${shootout[@]}" pytest -q bench/shootout/tests
     fi

@@ -436,3 +436,91 @@ async fn the_heartbeat_keeps_an_idle_connection() {
     silent.close().await;
     server.stop();
 }
+
+#[tokio::test]
+async fn a_blob_goes_out_as_a_stock_client_sends_it() {
+    let (runtime, mut peer) = scripted(1);
+    let blob: Vec<u8> = (0..2 * zoe_client::BLOB_CHUNK + 7)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let expected = blob.clone();
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        let (_, _, method, args) = peer.recv().await;
+        assert_eq!(method, "tpc_begin");
+        let txn = args.as_array().unwrap()[0].clone();
+        let store = Value::Array(vec![bin8(7), bin8(0), b"pickle".as_slice().into(), txn]);
+        let mut methods = Vec::new();
+        let mut got = Vec::new();
+        loop {
+            let (id, flags, method, args) = peer.recv().await;
+            // No call of the upload has a reply.
+            assert_eq!((id, flags), (Value::from(0), Value::from(true)), "{method}");
+            match method.as_str() {
+                "storea" | "storeBlobEnd" => assert_eq!(args, store, "{method}"),
+                "storeBlobStart" => assert_eq!(args, Value::Array(vec![])),
+                "storeBlobChunk" => {
+                    let chunk = args.as_array().unwrap()[0].as_slice().unwrap();
+                    assert!(chunk.len() <= zoe_client::BLOB_CHUNK);
+                    got.extend_from_slice(chunk);
+                }
+                other => panic!("an unexpected call: {other}"),
+            }
+            methods.push(method.clone());
+            if method == "storeBlobEnd" {
+                break;
+            }
+        }
+        assert_eq!(
+            methods,
+            [
+                "storea",
+                "storeBlobStart",
+                "storeBlobChunk",
+                "storeBlobChunk",
+                "storeBlobChunk",
+                "storeBlobEnd"
+            ]
+        );
+        assert!(got == expected, "the chunks hold the blob");
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    txn.store_blob(Oid(7), Tid(0), b"pickle", &blob)
+        .await
+        .unwrap();
+    let _peer = tokio::time::timeout(TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(txn);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_commits_against_the_server() {
+    let dir = std::env::temp_dir().join(format!("zoe-client-blob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("store");
+    let server = Server::start(ServeOptions::new(&path)).unwrap();
+    let blob: Vec<u8> = (0..zoe_client::BLOB_CHUNK + 3)
+        .map(|i| (i % 241) as u8)
+        .collect();
+    let pickle = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+    let client = Client::connect(server.addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    txn.store_blob(Oid(1), Tid(0), pickle, &blob).await.unwrap();
+    txn.vote().await.unwrap();
+    let tid = txn.finish().await.unwrap();
+    client.close().await;
+    server.stop();
+
+    let store = zoe_core::Store::open_read_only(&path).unwrap();
+    assert_eq!(store.load_serial(Oid(1), tid).unwrap(), pickle);
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut store.open_blob(Oid(1), tid).unwrap(), &mut got).unwrap();
+    assert!(got == blob, "the store holds the blob");
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}

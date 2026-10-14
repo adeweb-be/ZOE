@@ -2,19 +2,17 @@
 //!
 //! A client without a shared blob directory sends a blob with
 //! `storeBlobStart`, one `storeBlobChunk` per chunk, and `storeBlobEnd`. The
-//! server writes the chunks into one upload file in the blob temporary
-//! directory of the core. `storeBlobEnd` stages the file with
-//! `Txn::store_blob_at`, which takes it by rename.
+//! server writes the chunks into one blob file of the core
+//! (`Store::new_blob_file`), through the `Vfs` of the store. `storeBlobEnd`
+//! stages the file with `Txn::store_blob`. The session holds the file, so
+//! this module only sends blobs.
 //!
 //! A client gets a blob with `sendBlob`. The server sends
 //! `receiveBlobStart`, one `receiveBlobChunk` per chunk of 64 KiB and
 //! `receiveBlobStop`, then the reply. The client needs the file before the
 //! reply, so this order is part of the protocol.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Read};
 
 use rmpv::Value;
 use zoe_core::{BlobReader, Oid, Tid, ZoeError};
@@ -25,69 +23,6 @@ use super::session::p64;
 /// The size of a chunk that `sendBlob` sends. The stock client takes a
 /// chunk of any size.
 pub(crate) const CHUNK: usize = 64 * 1024;
-
-/// The number of the next upload file of the process.
-static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(0);
-
-/// A blob that a client uploads: a file in the blob temporary directory of
-/// the core.
-///
-/// Dropping an upload removes its file. After the core took the file by
-/// rename, the path names no file, and the removal does nothing.
-pub(crate) struct Upload {
-    path: PathBuf,
-    /// The open file. `None` after `close`.
-    file: Option<File>,
-}
-
-impl Upload {
-    /// Create a new, empty upload file in `dir`, the blob temporary
-    /// directory of the core.
-    ///
-    /// The name is `upload-<n>`. The core never makes such a name, so
-    /// `Txn::store_blob_at` takes the file. The file is always a new file,
-    /// never an old file or a symbolic link. A crash leaves the file in
-    /// `dir`, and the next open of the store removes it.
-    pub(crate) fn create(dir: &Path) -> io::Result<Self> {
-        loop {
-            let n = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!("upload-{n}"));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        file: Some(file),
-                    });
-                }
-                // Another program made this name. Try the next one.
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// Append `chunk` to the file.
-    pub(crate) fn write(&mut self, chunk: &[u8]) -> io::Result<()> {
-        match &mut self.file {
-            Some(file) => file.write_all(chunk),
-            None => Err(io::Error::other("the upload file is closed")),
-        }
-    }
-
-    /// Close the file and return its path.
-    pub(crate) fn close(&mut self) -> &Path {
-        self.file = None;
-        &self.path
-    }
-}
-
-impl Drop for Upload {
-    fn drop(&mut self) {
-        self.file = None;
-        // The core leaves in its place a file that it refuses.
-        let _ = fs::remove_file(&self.path);
-    }
-}
 
 /// A blob that `sendBlob` sends to the client.
 pub(crate) struct Download {
@@ -178,8 +113,11 @@ fn read_error(oid: Oid, tid: Tid, error: io::Error) -> ZoeError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Write;
     use std::net::{SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use zoe_core::Store;
@@ -347,67 +285,6 @@ mod tests {
         names
     }
 
-    #[test]
-    fn each_upload_has_a_new_file_and_dropping_it_removes_the_file() {
-        let dir = fresh_dir("upload");
-        fs::create_dir_all(&dir).unwrap();
-        let mut first = Upload::create(&dir).unwrap();
-        let mut second = Upload::create(&dir).unwrap();
-        first.write(b"one").unwrap();
-        second.write(b"two").unwrap();
-        assert_eq!(files(&dir).len(), 2);
-        let path = first.close().to_path_buf();
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("upload-"), "{name}");
-        assert_eq!(fs::read(&path).unwrap(), b"one");
-        assert!(first.write(b"more").is_err(), "a closed upload");
-        drop(first);
-        drop(second);
-        assert_eq!(files(&dir), Vec::<String>::new());
-    }
-
-    #[test]
-    fn the_core_takes_an_upload_file_by_rename() {
-        let dir = fresh_dir("take");
-        let store = Store::open(&dir).unwrap();
-        let tmp = store.blob_temp_dir().unwrap();
-        let mut upload = Upload::create(&tmp).unwrap();
-        upload.write(b"uploaded").unwrap();
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        txn.store_blob_at(Oid(1), Tid::ZERO, b"pickle", upload.close())
-            .unwrap();
-        drop(upload);
-        txn.vote().unwrap();
-        let tid = txn.finish().unwrap();
-        let mut got = Vec::new();
-        store
-            .open_blob(Oid(1), tid)
-            .unwrap()
-            .read_to_end(&mut got)
-            .unwrap();
-        assert_eq!(got, b"uploaded");
-        assert_eq!(files(&tmp), Vec::<String>::new());
-    }
-
-    #[test]
-    fn the_next_open_of_the_store_removes_an_upload_file_that_a_crash_left() {
-        let dir = fresh_dir("crash");
-        let store = Store::open(&dir).unwrap();
-        let tmp = store.blob_temp_dir().unwrap();
-        let mut upload = Upload::create(&tmp).unwrap();
-        upload.write(b"a chunk").unwrap();
-        let path = upload.close().to_path_buf();
-        // A crash runs no drop, so the file stays.
-        std::mem::forget(upload);
-        drop(store);
-        assert!(path.exists(), "the close of the store keeps the file");
-
-        let store = Store::open(&dir).unwrap();
-        assert!(!path.exists(), "the open of the store removes the file");
-        assert_eq!(files(&tmp), Vec::<String>::new());
-        drop(store);
-    }
-
     /// A raw client of the ZEO 6 msgpack protocol.
     struct Client {
         stream: TcpStream,
@@ -550,11 +427,11 @@ mod tests {
         }
     }
 
-    /// Return the upload files in the blob temporary directory of the store
-    /// in `dir`.
+    /// Return the temporary blob files in the blob temporary directory of
+    /// the store in `dir`: the upload files.
     fn uploads(dir: &Path) -> Vec<String> {
         let mut names = files(&dir.join("blobs/tmp"));
-        names.retain(|name| name.starts_with("upload-"));
+        names.retain(|name| name.ends_with(".tmp"));
         names
     }
 
