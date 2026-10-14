@@ -39,12 +39,14 @@
 //! them, and logs itself when it ends, if it was slow.
 
 mod group;
+mod observer;
 mod staging;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::{self, ThreadId};
 use std::time::SystemTime;
 
@@ -57,6 +59,7 @@ use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -388,6 +391,39 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.stage_blob(oid, serial, data, false, stored_bytes, blob)
     }
 
+    /// Stage a new version of `oid` with the blob in the file `name` of the
+    /// directory of `oid` in the blob directory, as `store_blob_at` does,
+    /// with the same checks. This is the `storeBlobShared` of ZEO: a client
+    /// that shares the blob directory writes the file there, and gives its
+    /// name.
+    ///
+    /// `name` is a name, not a path: it has no `/`, and it ends in `.tmp` or
+    /// `.tmp-`. Another name is refused with `Protocol`. The call syncs the
+    /// levels of the oid directory and the file, then takes the file by
+    /// rename, as `store_blob_at` does. A refused call leaves the file in
+    /// its place, and a file that the transaction took belongs to it.
+    pub fn store_blob_shared(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        name: &str,
+    ) -> Result<()> {
+        self.check_store(oid, data)?;
+        let stored_bytes = self.check_size(oid, data)?;
+        self.store.writable()?;
+        let blob =
+            self.store
+                .blobs()
+                .take_shared(Arc::downgrade(&self.store.backend), oid, name)?;
+        if !self.is_restore() {
+            self.store
+                .guardrails
+                .check(SizeLimit::Blob, oid, blob.record().size)?;
+        }
+        self.stage_blob(oid, serial, data, false, stored_bytes, blob)
+    }
+
     /// Stage `data` for `oid` with `serial`, and the blob `blob`.
     /// `stored_bytes` is the size of the staged pickles with `data`, as
     /// `check_size` gives it. A stage that fails drops `blob`, which
@@ -565,10 +601,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        match store
+        // A store without an observer does not read the clock. The wait is
+        // measured on the monotonic time of the store clock, as the lock
+        // timeout is, so a simulator gives it on simulated time.
+        let started = store.observer().map(|_| store.clock.monotonic());
+        let acquired = store
             .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock)
-        {
+            .acquire(&requests, store.lock_timeout, &*store.clock);
+        if let (Some(observer), Some(started)) = (store.observer(), started) {
+            observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
+        }
+        match acquired {
             Ok(locks) => {
                 self.locks = Some(locks.keep());
                 Ok(())

@@ -183,7 +183,7 @@ The skeleton of ZOE-087 already has this shape, and the prototype confirms it:
 ## Not tested
 
 - The real `serve_connection` and `accept` under the simulator: the prototype mirrors them.
-- `zoe-client`, which is not built yet: the prototype has raw clients.
+- `zoe-client`, which did not exist at the time of the spike: the prototype has raw clients.
 - Batches of two or more finishes, a sync that takes simulated time, and the follower wait of group commit under the simulator.
 - Crash images with reordered or torn writes: the prototype lands a prefix of the pending writes.
 - Blobs, pack, invalidations, `getInvalidations`, stale reads, read-only mode and named storages.

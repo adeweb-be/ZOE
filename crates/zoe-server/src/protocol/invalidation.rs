@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zoe_core::Tid;
 
-use super::outbox::{Frame, Outbox, Place, Pushed};
+use super::outbox::{Frame, Outbox, Place, Pushed, Room};
 
 /// The id of a connection in the hub.
 pub(crate) type ClientId = u64;
@@ -109,7 +109,9 @@ pub(crate) struct Invalidations {
     state: Mutex<State>,
 }
 
-/// The state of the hub. Its mutex is held with no other lock.
+/// The state of the hub. Under its mutex, only a `loadBefore` place takes
+/// another lock: the lock of the outbox of its connection, which no holder
+/// keeps while it waits for the hub.
 struct State {
     /// The tid of the last published commit.
     published: Tid,
@@ -156,35 +158,48 @@ impl Invalidations {
         (id, state.published)
     }
 
+    /// Return the most frames that wait in the hub queue of one
+    /// connection.
+    pub(crate) fn deepest_queue(&self) -> usize {
+        let state = self.lock();
+        state
+            .clients
+            .values()
+            .map(Outbox::hub_len)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Remove the connection `id`.
     pub(crate) fn unsubscribe(&self, id: ClientId) {
         self.lock().clients.remove(&id);
     }
 
-    /// Take the next place of `outbox` when the hub published no commit
-    /// after `seen`. Return `None` otherwise.
+    /// Take the next place with `room` when the hub published no commit
+    /// after `seen`. Otherwise, give the room back.
     ///
     /// A reader reads the last published tid, then the store, then takes
     /// its place here. With a place, its reply goes out before the
     /// invalidation of each later commit. Without one, a commit came in
     /// between, and the reader reads again.
-    pub(crate) fn place_since(&self, seen: Tid, outbox: &Outbox) -> Option<Place> {
+    pub(crate) fn place_since(&self, seen: Tid, room: Room) -> Result<Place, Room> {
         let state = self.lock();
-        (state.published == seen).then(|| outbox.place())
+        if state.published == seen {
+            Ok(room.place())
+        } else {
+            Err(room)
+        }
     }
 
-    /// Run `read` with the last published tid, then take the next place of
-    /// `outbox`, both under the mutex of the hub. So the hub publishes no
-    /// commit between the read and the place. The hub waits for the read,
-    /// so a reader calls this only after `place_since` failed a few times.
-    pub(crate) fn read_placed<T>(
-        &self,
-        outbox: &Outbox,
-        read: impl FnOnce(Tid) -> T,
-    ) -> (T, Place) {
+    /// Run `read` with the last published tid, then take the next place
+    /// with `room`, both under the mutex of the hub. So the hub publishes
+    /// no commit between the read and the place. The hub waits for the
+    /// read, so a reader calls this only after `place_since` failed a few
+    /// times.
+    pub(crate) fn read_placed<T>(&self, room: Room, read: impl FnOnce(Tid) -> T) -> (T, Place) {
         let state = self.lock();
         let value = read(state.published);
-        (value, outbox.place())
+        (value, room.place())
     }
 
     /// Return the publication of `commit`. Dropping the publication
@@ -238,7 +253,10 @@ impl Invalidations {
 /// Write a log line for the connections that a full queue closed.
 fn log_overflows(overflows: usize) {
     if overflows > 0 {
-        eprintln!("zoe serve: closing {overflows} connection(s): the client queue of each is full");
+        tracing::warn!(
+            connections = overflows,
+            "closing connections: the client queue of each is full"
+        );
     }
 }
 
@@ -411,6 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn the_deepest_queue_is_the_longest_hub_queue_of_one_connection() {
+        let hub = Invalidations::new(Tid(0));
+        assert_eq!(hub.deepest_queue(), 0);
+        let mut a = Client::new(&hub, 10);
+        let _b = Client::new(&hub, 10);
+        hub.publish(a.commit(0, 1));
+        hub.send_to_all(b"info".to_vec());
+        // The committer holds `info`, its reply and the frame for all. The
+        // other connection holds the invalidation and the frame for all.
+        assert_eq!(hub.deepest_queue(), 3);
+        assert_eq!(a.take().len(), 3);
+        assert_eq!(hub.deepest_queue(), 2);
+    }
+
+    #[test]
     fn a_full_outbox_closes_its_connection_and_stops_no_one() {
         let hub = Invalidations::new(Tid(0));
         let mut writer = Client::new(&hub, 100);
@@ -455,7 +488,9 @@ mod tests {
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
         let seen = hub.published();
-        let place = hub.place_since(seen, &reader.outbox).unwrap();
+        let place = hub
+            .place_since(seen, reader.outbox.blocking_room())
+            .unwrap();
         // A commit after the place goes out after the reply.
         hub.publish(writer.commit(0, 1));
         assert!(reader.take().is_empty());
@@ -463,8 +498,11 @@ mod tests {
         assert_eq!(reader.take(), text(&["load", "inv 1"]));
         // A commit between the read and the place: the reader reads again.
         hub.publish(writer.commit(1, 2));
-        assert_eq!(hub.place_since(Tid(1), &reader.outbox), None);
-        assert!(hub.place_since(Tid(2), &reader.outbox).is_some());
+        let room = hub
+            .place_since(Tid(1), reader.outbox.blocking_room())
+            .unwrap_err();
+        let place = hub.place_since(Tid(2), room).unwrap();
+        assert!(place.fill(None));
         assert_eq!(writer.take().len(), 4);
     }
 
@@ -473,7 +511,7 @@ mod tests {
         let hub = Invalidations::new(Tid(4));
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
-        let (seen, place) = hub.read_placed(&reader.outbox, |published| published);
+        let (seen, place) = hub.read_placed(reader.outbox.blocking_room(), |published| published);
         assert_eq!(seen, Tid(4));
         hub.publish(writer.commit(4, 5));
         assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));

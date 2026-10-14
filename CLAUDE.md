@@ -47,7 +47,9 @@ A pull request that touches a red zone needs the human's approval. `CODEOWNERS` 
 - `crates/zoe-core/src/pack/`: pack, because it deletes data.
 - `.github/` (the workflows and `CODEOWNERS`) and `loops/` (the role briefs). Only a human changes these.
 
-Everything else, `ci/` and `devenv.nix` included, merges on the reviewer's approval with the acceptance test, the crash simulation and TSan green.
+Everything else, `ci/` and `devenv.nix` included, merges on the reviewer's approval with the acceptance test and the crash simulation green.
+
+TSan is a phase gate. `just tsan` runs once on `main` at the end of a phase, not for each card or pull request. A race that it reports becomes a card.
 
 ## Stop and ask
 
@@ -71,7 +73,7 @@ Then write `docs/handoffs/<card>.md`: the state, what you tried, what failed, th
 
 Definition of Ready: a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, no dependency on an unmerged card.
 
-Definition of Done: acceptance test green; unit tests added; TSan and the pull-request harness tier green; benchmark numbers posted and inside the regression gate; claims and evidence list what was tested and what was not; reviewer approval; human approval for a red zone; the specification or an ADR updated when behaviour changed.
+Definition of Done: acceptance test green; unit tests added; the pull-request harness tier green; benchmark numbers posted and inside the regression gate; claims and evidence list what was tested and what was not; reviewer approval; human approval for a red zone; the specification or an ADR updated when behaviour changed.
 
 ## Rules
 
