@@ -91,9 +91,9 @@ in
     LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
   };
 
-  # Heap profiles for the memory spikes on the reference machine. Enter the
-  # profile with `devenv --profile profiling shell`. The default shell and
-  # CI do not fetch it, because heaptrack brings Qt.
+  # Heap profiles for the memory spikes. Enter the profile with
+  # `devenv --profile profiling shell`. The default shell and CI do not
+  # fetch it, because heaptrack brings Qt.
   profiles.profiling.module = {
     packages = [
       pkgs.heaptrack
