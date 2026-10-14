@@ -871,17 +871,18 @@ impl Session {
         Ok(Value::Map(items))
     }
 
-    /// The items `length` and `size` of the store. The length is 0, as
-    /// `len(zoe.Storage)` is: the store keeps no object count, and
-    /// `IStorage` asks only for an approximate length. The size is the
-    /// size of the files in the store directory.
+    /// The items `length` and `size` of the store. The length is the object
+    /// count of the store, as `len(zoe.Storage)` gives it. A read-only
+    /// store of format 1 has no count, and its length is 0. The size is
+    /// the size of the files in the store directory.
     fn sizes(&self) -> Result<[(Value, Value); 2], Fault> {
         let size = self
             .storage
             .size()
             .map_err(|error| Fault::storage(format!("the size of the store: {error}")))?;
+        let length = self.store.object_count().unwrap_or(0);
         Ok([
-            (Value::from("length"), Value::from(0)),
+            (Value::from("length"), Value::from(length)),
             (Value::from("size"), Value::from(size)),
         ])
     }
@@ -2871,6 +2872,25 @@ mod tests {
         assert_eq!(get(&sizes, "size"), get(&info, "size"));
         let fault = failed(call(&mut s, "get_info", vec![Value::Nil]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    /// The `length` of `get_size_info`.
+    fn length(s: &mut Client) -> u64 {
+        count(&done(call(s, "get_size_info", vec![])), "length")
+    }
+
+    #[test]
+    fn the_length_is_the_object_count_of_the_store() {
+        let mut s = registered("length");
+        assert_eq!(length(&mut s), 0);
+        let first = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        commit(&mut s, 2, 2, 0, MAPPING).unwrap();
+        assert_eq!(length(&mut s), 2);
+        // A new revision is no new object.
+        commit(&mut s, 3, 1, first, MAPPING).unwrap();
+        assert_eq!(length(&mut s), 2);
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(get(&info, "length"), &Value::from(2));
     }
 
     #[test]

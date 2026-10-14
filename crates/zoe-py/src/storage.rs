@@ -422,10 +422,16 @@ impl Storage {
         Ok(py.detach(|| directory_size(Path::new(&self.path)))?)
     }
 
-    /// Return 0. IStorage asks only for an approximate length, and the
-    /// store keeps no object count.
-    fn __len__(&self) -> usize {
-        0
+    /// Return the object count of the store: the oids that have a record,
+    /// a deletion included, as the `len()` of FileStorage. A closed
+    /// storage gives 0, so that the truth value of a storage never raises.
+    fn __len__(&self, py: Python<'_>) -> usize {
+        let Ok(store) = self.opened(py) else {
+            return 0;
+        };
+        // The reference drops without the GIL, as in every other call.
+        let count = py.detach(move || store.object_count());
+        usize::try_from(count.unwrap_or(0)).unwrap_or(usize::MAX)
     }
 
     #[pyo3(name = "isReadOnly")]

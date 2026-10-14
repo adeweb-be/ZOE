@@ -236,6 +236,8 @@ fn to_json(report: &Verification) -> Value {
         "pickles": pickles,
         "classes": report.classes,
         "unknown_classes": report.unknown_classes,
+        "object_count": report.object_count,
+        "count": report.count.map(|c| json!({"stored": c.stored, "counted": c.counted})),
     })
 }
 
@@ -258,6 +260,13 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "  records          {}", report.records)?;
     writeln!(out, "  objects          {}", report.objects)?;
     writeln!(out, "  blobs            {}", report.blobs)?;
+    match report.object_count {
+        Some(count) => writeln!(out, "  object count     {count}")?,
+        None => writeln!(
+            out,
+            "  object count     none: the store has no count yet (ZOE format 1)"
+        )?,
+    }
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
     for p in &report.checksums {
@@ -287,6 +296,18 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "  unknown classes  {}", report.unknown_classes.len())?;
     for class in &report.unknown_classes {
         writeln!(out, "    {class}")?;
+    }
+    writeln!(
+        out,
+        "  count mismatch   {}",
+        usize::from(report.count.is_some())
+    )?;
+    if let Some(c) = report.count {
+        writeln!(
+            out,
+            "    the store counts {} objects, and {} oids have records",
+            c.stored, c.counted
+        )?;
     }
     writeln!(out, "Classes: {}", report.classes.len())?;
     let width = report
@@ -349,6 +370,46 @@ mod tests {
         let dangling = "oid 0x0000000000000063 has no current record";
         assert!(text.contains(dangling), "{text}");
         assert!(text.contains("\n  2  app.Thing\n"), "{text}");
+    }
+
+    #[test]
+    fn the_text_gives_the_object_count_and_a_count_that_differs() {
+        let text = |report: &Verification| {
+            let mut out = Vec::new();
+            write_text(&mut out, Path::new("store"), report).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        // A store of format 1 has no count: one line, and no finding.
+        let format_1 = text(&Verification::default());
+        assert!(
+            format_1.contains("\n  object count     none: the store has no count yet"),
+            "{format_1}"
+        );
+        assert!(format_1.contains("Findings: 0\n"), "{format_1}");
+
+        let differs = Verification {
+            object_count: Some(3),
+            count: Some(zoe_convert::CountProblem {
+                stored: 3,
+                counted: 2,
+            }),
+            ..Verification::default()
+        };
+        let report = text(&differs);
+        assert!(report.contains("\n  object count     3\n"), "{report}");
+        assert!(report.contains("Findings: 1\n"), "{report}");
+        assert!(report.contains("\n  count mismatch   1\n"), "{report}");
+        assert!(
+            report.contains("    the store counts 3 objects, and 2 oids have records\n"),
+            "{report}"
+        );
+        let json = to_json(&differs);
+        assert_eq!(json["object_count"], 3);
+        assert_eq!(json["count"]["counted"], 2);
+        assert_eq!(
+            to_json(&Verification::default())["object_count"],
+            Value::Null
+        );
     }
 
     #[test]
