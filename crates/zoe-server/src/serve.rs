@@ -61,6 +61,7 @@ pub struct StorageOptions {
     name: String,
     path: PathBuf,
     blob_dir: Option<PathBuf>,
+    read_only: bool,
 }
 
 impl StorageOptions {
@@ -71,6 +72,7 @@ impl StorageOptions {
             name: name.into(),
             path: path.as_ref().to_path_buf(),
             blob_dir: None,
+            read_only: false,
         }
     }
 
@@ -79,6 +81,17 @@ impl StorageOptions {
     #[must_use]
     pub fn blob_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.blob_dir = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Serve the store for reads only, when `read_only` is true. The server
+    /// opens the existing store with `Store::open_read_only`: it changes no
+    /// byte of the store and holds its lock. A read-only store keeps its
+    /// blob files in `blobs` in the store directory, so it takes no blob
+    /// directory.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 }
@@ -93,6 +106,7 @@ pub struct ServeOptions {
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
     idle_timeout: Duration,
+    read_only: bool,
 }
 
 impl ServeOptions {
@@ -117,6 +131,7 @@ impl ServeOptions {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            read_only: false,
         }
     }
 
@@ -187,6 +202,19 @@ impl ServeOptions {
         self
     }
 
+    /// Serve every store for reads only, when `read_only` is true, as
+    /// [`StorageOptions::read_only`] does for one store.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Tell if the server serves the store of `storage` for reads only.
+    fn is_read_only(&self, storage: &StorageOptions) -> bool {
+        self.read_only || storage.read_only
+    }
+
     /// The options of the store of `storage`.
     fn store_options(&self, storage: &StorageOptions) -> Options {
         let mut options = Options::default();
@@ -197,8 +225,8 @@ impl ServeOptions {
         options
     }
 
-    /// Check that one storage at least is given, and that no name comes
-    /// twice.
+    /// Check that one storage at least is given, that no name comes twice,
+    /// and that no read-only storage has a blob directory.
     fn check_storages(&self) -> Result<(), Error> {
         if self.storages.is_empty() {
             return Err(Error::Storages("no storage to serve".to_owned()));
@@ -210,9 +238,20 @@ impl ServeOptions {
                     storage.name
                 )));
             }
+            if self.is_read_only(storage) && storage.blob_dir.is_some() {
+                return Err(Error::Storages(read_only_blob_dir(&storage.name)));
+            }
         }
         Ok(())
     }
+}
+
+/// The error of the read-only storage `name` that has a blob directory.
+pub(crate) fn read_only_blob_dir(name: &str) -> String {
+    format!(
+        "the storage {name} is read-only, and a read-only store keeps its blob files \
+         in blobs in the store directory: it takes no blob directory"
+    )
 }
 
 /// Why a server did not start.
@@ -266,8 +305,8 @@ impl Server {
     }
 
     /// Start as [`Server::start`] does, but open the store of each storage
-    /// with `open`. It gets the storage name, the store directory and the
-    /// options of the store.
+    /// that is not read-only with `open`. It gets the storage name, the
+    /// store directory and the options of the store.
     pub(crate) fn start_with(
         options: ServeOptions,
         mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
@@ -291,13 +330,16 @@ impl Server {
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
         for storage in &options.storages {
-            let store = open(&storage.name, &storage.path, options.store_options(storage))?;
-            storages.push(Arc::new(NamedStorage::new(
-                &storage.name,
-                &storage.path,
-                store,
-                options.queues,
-            )));
+            let read_only = options.is_read_only(storage);
+            let store = if read_only {
+                Store::open_read_only(&storage.path)
+                    .map(Arc::new)
+                    .map_err(|error| Error::Store(storage.path.clone(), error))?
+            } else {
+                open(&storage.name, &storage.path, options.store_options(storage))?
+            };
+            let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
+            storages.push(Arc::new(named.read_only(read_only)));
         }
         let storages = Arc::new(Storages::new(storages, options.queues.client));
         let (stop_signal, stopping) = Stopping::new();
@@ -675,6 +717,42 @@ mod tests {
         let catalog = reply.find(r#"}, "catalog": {"connections": 0, "#);
         assert!(matches!((main, catalog), (Some(0), Some(_))), "{reply}");
         server.stop();
+    }
+
+    #[test]
+    fn a_read_only_store_must_exist_and_takes_no_blob_directory() {
+        let dir = fresh_dir("read-only-start");
+        let missing = Server::start(ServeOptions::new(&dir).read_only(true)).err();
+        assert!(matches!(missing, Some(Error::Store(..))), "{missing:?}");
+        assert!(!dir.exists());
+        for options in [
+            ServeOptions::with_storages([StorageOptions::new("a", &dir)
+                .blob_dir(dir.join("blobs"))
+                .read_only(true)]),
+            ServeOptions::with_storages([
+                StorageOptions::new("a", &dir).blob_dir(dir.join("blobs"))
+            ])
+            .read_only(true),
+        ] {
+            let error = Server::start(options).err();
+            assert!(matches!(error, Some(Error::Storages(_))), "{error:?}");
+        }
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_read_only_server_holds_the_lock_of_the_store() {
+        let dir = fresh_dir("read-only-lock");
+        drop(Store::open(&dir).unwrap());
+        let server = Server::start(ServeOptions::with_storages([StorageOptions::new(
+            "a", &dir,
+        )
+        .read_only(true)]))
+        .unwrap();
+        let writer = Store::open(&dir).err();
+        assert!(matches!(writer, Some(ZoeError::Locked)), "{writer:?}");
+        server.stop();
+        drop(Store::open(&dir).unwrap());
     }
 
     #[test]
