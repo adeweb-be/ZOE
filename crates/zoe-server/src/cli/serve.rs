@@ -184,10 +184,11 @@ pub(super) struct ServeArgs {
     /// such as 300, 300s or 5m. A heartbeat is a frame, and a stock client
     /// sends one every 60 seconds. The server closes a connection that is
     /// idle for longer: its open transaction aborts and its locks go, as
-    /// when the client closes. So a client that stalls during a commit, or
-    /// a host that dies, holds its locks at most this long. The time while
-    /// the server reads no calls of the connection, because 4 calls wait,
-    /// does not count. 0 closes no idle connection.
+    /// when the client closes. The time while a call of the connection
+    /// runs does not count: a client that waits for its reply is not idle.
+    /// So a client that stalls between two calls, or a host that dies while
+    /// no call runs, holds its locks at most this long. While a call runs,
+    /// the time starts at the end of the call. 0 closes no idle connection.
     #[arg(
         long,
         env = "ZOE_IDLE_TIMEOUT",
