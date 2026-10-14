@@ -28,8 +28,7 @@ const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
 const ROOT: Oid = Oid(0);
 
 fn fresh_dir(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("zoe-backup-pack-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zoe-backup-pack-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -120,7 +119,12 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
     let dir = fresh_dir("chain");
     let (source, dumps, scratch) = (dir.join("source"), dir.join("dumps"), dir.join("scratch"));
     std::fs::create_dir_all(&scratch).unwrap();
-    let backup = || zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &scratch);
+    let backup = || {
+        zoe(
+            &["backup", "--path", s(&source), "--to", s(&dumps)],
+            &scratch,
+        )
+    };
     let verify = || {
         zoe(
             &[
@@ -185,7 +189,11 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
         commit(&store, &[(ROOT, dumped, record(b"3"))])
     };
     let output = backup();
-    assert_exit(&output, 0, "incremental dump after a pack at the last dumped tid");
+    assert_exit(
+        &output,
+        0,
+        "incremental dump after a pack at the last dumped tid",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("(incremental)"), "{stdout}");
     assert_eq!(entries(&dumps).len(), 2, "{:?}", entries(&dumps));
