@@ -234,6 +234,8 @@ pub enum Error {
     Storages(String),
     /// The server cannot listen on the address.
     Listen(SocketAddr, io::Error),
+    /// The server cannot listen on the address of the admin port.
+    AdminListen(SocketAddr, io::Error),
     /// The store does not open.
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
@@ -245,6 +247,9 @@ impl fmt::Display for Error {
         match self {
             Self::Storages(message) => f.write_str(message),
             Self::Listen(addr, error) => write!(f, "cannot listen on {addr}: {error}"),
+            Self::AdminListen(addr, error) => {
+                write!(f, "cannot listen on the admin address {addr}: {error}")
+            }
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
         }
@@ -310,10 +315,10 @@ impl Server {
             Some(admin_listen) => {
                 let _enter = runtime.enter();
                 let listener =
-                    bind(admin_listen).map_err(|error| Error::Listen(admin_listen, error))?;
+                    bind(admin_listen).map_err(|error| Error::AdminListen(admin_listen, error))?;
                 let admin = listener
                     .local_addr()
-                    .map_err(|error| Error::Listen(admin_listen, error))?;
+                    .map_err(|error| Error::AdminListen(admin_listen, error))?;
                 runtime.spawn(admin::serve(listener, Arc::clone(&health)));
                 Some(admin)
             }
@@ -625,7 +630,8 @@ mod tests {
         let dir = fresh_dir("admin-taken");
         let options = ServeOptions::new(&dir).admin_listen(taken.local_addr().unwrap());
         let error = Server::start(options).err().unwrap();
-        assert!(matches!(error, Error::Listen(..)), "{error}");
+        assert!(matches!(error, Error::AdminListen(..)), "{error}");
+        assert!(error.to_string().contains("admin address"), "{error}");
         assert!(!dir.exists());
     }
 
