@@ -53,13 +53,24 @@ KEYS = (
     "log-format",
     "read-only",
     "shared-blob-dir",
+    "tls-cert",
+    "tls-key",
+    "tls-client-ca",
+    "tls-read-only-client-ca",
 )
 
 # The keys whose value is a boolean.
 BOOLEANS = ("read-only", "shared-blob-dir")
 
 # The keys whose leading ~ is the home directory.
-PATHS = ("path", "blob-dir")
+PATHS = (
+    "path",
+    "blob-dir",
+    "tls-cert",
+    "tls-key",
+    "tls-client-ca",
+    "tls-read-only-client-ca",
+)
 
 SCHEMA = """
 <schema>

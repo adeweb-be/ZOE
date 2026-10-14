@@ -66,7 +66,7 @@ enum Command {
     Pack(pack::PackArgs),
     /// Serve stores with the ZEO 6 msgpack protocol until SIGTERM, each
     /// under its own storage name.
-    Serve(serve::ServeArgs),
+    Serve(Box<serve::ServeArgs>),
     /// Serve the read-only ops tools of a store to an agent, over MCP on
     /// stdin and stdout.
     Mcp(mcp::McpArgs),

@@ -9,6 +9,11 @@
 //! The binary runs it until SIGTERM or SIGINT. A test runs it in its own
 //! process with [`Server::start`] and [`Server::stop`].
 //!
+//! With [`TlsOptions`], the ZEO port speaks TLS. A client CA makes a client
+//! certificate necessary, and the holder of a certificate of the read-only
+//! client CA registers read-only only. A failed handshake closes only its
+//! connection.
+//!
 //! A stop takes at most the shutdown timeout. The server stops accepting
 //! connections, and each connection reads no more calls. The calls that
 //! the server already received run, so a `tpc_finish` that the
@@ -34,7 +39,10 @@ use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
-use crate::protocol::{self, NamedStorage, Pool, Queues, Stopping, Storages};
+use crate::protocol::{self, Connection, NamedStorage, Pool, Queues, Stopping, Storages};
+use crate::runtime::Tokio;
+use crate::tls::Tls;
+pub use crate::tls::TlsOptions;
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
 /// frame holds a whole record, and the store sets no limit on a record by
@@ -117,6 +125,7 @@ pub struct ServeOptions {
     blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
     shared_blob_dir: bool,
+    tls: Option<TlsOptions>,
 }
 
 impl ServeOptions {
@@ -151,6 +160,7 @@ impl ServeOptions {
             blocking_threads: None,
             read_only: false,
             shared_blob_dir: false,
+            tls: None,
         }
     }
 
@@ -297,6 +307,15 @@ impl ServeOptions {
         self
     }
 
+    /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
+    /// reads them before it listens, so a file that does not read creates
+    /// no store. Without this call, the ZEO port speaks plain TCP.
+    #[must_use]
+    pub fn tls(mut self, tls: TlsOptions) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Tell if the server serves the store of `storage` for reads only.
     fn is_read_only(&self, storage: &StorageOptions) -> bool {
         self.read_only || storage.read_only
@@ -346,6 +365,8 @@ pub enum Error {
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
     Runtime(io::Error),
+    /// A file of TLS does not read or does not fit.
+    Tls(String),
 }
 
 impl fmt::Display for Error {
@@ -358,6 +379,7 @@ impl fmt::Display for Error {
             }
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
+            Self::Tls(message) => write!(f, "TLS: {message}"),
         }
     }
 }
@@ -433,6 +455,14 @@ impl Server {
         options: ServeOptions,
         mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
     ) -> Result<Self, Error> {
+        // A file of TLS that does not read changes nothing on disk.
+        let tls = options
+            .tls
+            .as_ref()
+            .map(Tls::load)
+            .transpose()
+            .map_err(Error::Tls)?
+            .map(Arc::new);
         // Listen first: a server that cannot listen changes nothing on
         // disk.
         let listener = {
@@ -503,6 +533,7 @@ impl Server {
             (!options.idle_timeout.is_zero()).then_some(options.idle_timeout),
             stopping,
             Arc::clone(&tasks),
+            tls,
         );
         runtime.spawn(async move {
             accept.await;
@@ -695,7 +726,8 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 /// takes frames of at most
 /// `max_frame_size` bytes, closes after `idle_timeout` without a frame and
 /// without a call that runs, and
-/// counts in `tasks` while it runs.
+/// counts in `tasks` while it runs. With `tls`, each connection starts with
+/// the TLS handshake.
 async fn accept(
     listener: TcpListener,
     storages: Arc<Storages>,
@@ -703,6 +735,7 @@ async fn accept(
     idle_timeout: Option<Duration>,
     mut stopping: Stopping,
     tasks: Arc<Tasks>,
+    tls: Option<Arc<Tls>>,
 ) {
     loop {
         let accepted = tokio::select! {
@@ -711,9 +744,25 @@ async fn accept(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 let running = tasks.start();
+                if let Some(tls) = &tls {
+                    let connection = serve_tls(
+                        stream,
+                        peer.to_string(),
+                        Arc::clone(tls),
+                        Arc::clone(&storages),
+                        max_frame_size,
+                        idle_timeout,
+                        stopping.clone(),
+                    );
+                    tokio::spawn(async move {
+                        connection.await;
+                        drop(running);
+                    });
+                    continue;
+                }
                 let connection = protocol::serve_connection(
                     stream,
                     Arc::clone(&storages),
@@ -732,6 +781,52 @@ async fn accept(
             }
         }
     }
+}
+
+/// Run the TLS handshake of `tls` on `stream`, then serve the client
+/// `peer` as `protocol::serve_connection` does. The handshake must end
+/// within `idle_timeout`, as the protocol of a plain client must. A stop
+/// ends it at once. A failed handshake closes only this connection.
+async fn serve_tls(
+    stream: tokio::net::TcpStream,
+    peer: String,
+    tls: Arc<Tls>,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+    idle_timeout: Option<Duration>,
+    mut stopping: Stopping,
+) {
+    let idle = async {
+        match idle_timeout {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    };
+    let handshake = tokio::select! {
+        biased;
+        () = stopping.wait() => return,
+        handshake = tls.accept(stream) => handshake,
+        () = idle => {
+            tracing::info!(client = peer.as_str(), "no TLS handshake within the idle timeout: closing the connection");
+            return;
+        }
+    };
+    let (stream, read_only) = match handshake {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            tracing::warn!(client = peer.as_str(), "the TLS handshake failed: {error}");
+            return;
+        }
+    };
+    let (reader, writer) = tokio::io::split(stream);
+    let connection = Connection {
+        peer,
+        runtime: Arc::new(Tokio),
+        max_frame_size,
+        idle_timeout,
+        read_only,
+    };
+    protocol::serve_stream(reader, writer, connection, storages, stopping).await;
 }
 
 /// The count of the tasks that serve: the accept loop and one task for
@@ -1057,6 +1152,18 @@ mod tests {
         assert!(matches!(writer, Some(ZoeError::Locked)), "{writer:?}");
         server.stop();
         drop(Store::open(&dir).unwrap());
+    }
+
+    #[test]
+    fn a_server_whose_tls_files_do_not_read_creates_no_store() {
+        let dir = fresh_dir("no-tls");
+        let tls = TlsOptions::new(dir.join("missing.pem"), dir.join("missing.key"));
+        let error = Server::start(ServeOptions::new(&dir).tls(tls))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Tls(_)), "{error}");
+        assert!(error.to_string().contains("missing.pem"), "{error}");
+        assert!(!dir.exists());
     }
 
     #[test]

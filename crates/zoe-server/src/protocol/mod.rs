@@ -345,6 +345,7 @@ pub(crate) async fn serve_connection(
         runtime: Arc::new(Tokio),
         max_frame_size,
         idle_timeout,
+        read_only: false,
     };
     serve_stream(reader, writer, connection, storages, stopping).await;
 }
@@ -361,6 +362,9 @@ pub(crate) struct Connection {
     /// The longest time without a frame and without a call that runs, or
     /// `None` for no limit.
     pub(crate) idle_timeout: Option<Duration>,
+    /// True when the client may register read-only only, as the holder of
+    /// a certificate of the read-only client CA.
+    pub(crate) read_only: bool,
 }
 
 /// Serve one client on the two halves of its stream, as
@@ -377,6 +381,7 @@ pub(crate) async fn serve_stream(
         runtime,
         max_frame_size,
         idle_timeout,
+        read_only,
     } = connection;
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
@@ -424,7 +429,8 @@ pub(crate) async fn serve_stream(
         Arc::clone(&runtime),
         peer.clone(),
         stopping.clone(),
-    );
+    )
+    .read_only(read_only);
     let ended = calls.ended();
     // The receiver gets an error when the task of the writer ends, also
     // when the runtime drops it before it runs.
