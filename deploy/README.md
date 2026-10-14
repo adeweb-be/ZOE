@@ -1,6 +1,6 @@
 # Deployment
 
-This directory holds the files that run `zoe serve`: the Tier 1 manifests for Kubernetes, the units for a host, and the Grafana dashboard of the metrics. `just deploy check` checks them. The Helm chart comes in phase 4.
+This directory holds the files that run `zoe serve`: the Tier 1 manifests for Kubernetes, the units for a host, and the Grafana dashboard of the metrics. `just deploy check` checks them. The Helm chart comes in phase 5.
 
 | Path | Holds |
 | --- | --- |
