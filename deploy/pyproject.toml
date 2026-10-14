@@ -1,0 +1,28 @@
+# The test environment of the deployment files. It is not a package that
+# the project ships, so it is not a member of the uv workspace in python/.
+# `just deploy check` runs its tests.
+[project]
+name = "zoe-deploy"
+version = "0.0.0"
+description = "Checks the deployment files of ZOE."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "pyyaml>=6",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
