@@ -1,0 +1,52 @@
+{
+ "lscpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz\nCPU family:                              6\nModel:                                   106\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                6\nBogoMIPS:                                5799.95\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves wbnoinvd ida arat avx512vbmi pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq rdpid md_clear flush_l1d arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                10 MiB (8 instances)\nL3 cache:                                54 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Unknown: Dependent on hypervisor status\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT Host state unknown\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+ "kernel": "7.0.0-1014-aws",
+ "mem_gib": 30.8,
+ "findmnt": "TARGET    SOURCE       FSTYPE OPTIONS\n/mnt/nvme /dev/nvme1n1 ext4   rw,noatime\n",
+ "lsblk": "NAME         ROTA MODEL                              SIZE TYPE MOUNTPOINT\nloop0           0                                   28.4M loop /snap/amazon-ssm-agent/13349\nloop1           0                                     74M loop /snap/core22/2955\nloop2           0                                   44.7M loop /snap/snapd/28254\nnvme0n1         0 Amazon Elastic Block Store          40G disk \n\u251c\u2500nvme0n1p1     0                                     39G part /\n\u251c\u2500nvme0n1p14    0                                      4M part \n\u251c\u2500nvme0n1p15    0                                    106M part /boot/efi\n\u2514\u2500nvme0n1p16    0                                    913M part /boot\nnvme1n1         0 Amazon EC2 NVMe Instance Storage 884.8G disk /mnt/nvme\n",
+ "disk_free": 884763971584,
+ "server_cpus": "0-3",
+ "client_cpus": "4-15",
+ "pool": 16,
+ "pythons": {
+  "3.13": "3.13.15",
+  "3.14t": "3.14.7t"
+ },
+ "binaries": "zoe-main zoe 0.0.0 8be3c9943102982a\nzoe-proto zoe 0.0.0 3d57c04dcea532d3 49113ee86e1c\n",
+ "commit": "49113ee86e1c9f6be51170e53b9729598974e6ea",
+ "cpu": {
+  "governor": [
+   ""
+  ],
+  "epp": [
+   ""
+  ],
+  "driver": "",
+  "no_turbo": "",
+  "mhz_mean": 0,
+  "mhz_by_cpu": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "loadavg": [
+   "6.39",
+   "3.88",
+   "1.61"
+  ]
+ },
+ "idle_cores": 0.0
+}

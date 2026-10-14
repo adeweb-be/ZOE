@@ -1,0 +1,12 @@
+fdatasync    4 KiB sequential median   0.13 ms  p90   0.14 ms
+fdatasync   64 KiB sequential median   0.18 ms  p90   0.20 ms
+fdatasync  288 KiB sequential median   0.32 ms  p90   0.35 ms
+fdatasync  288 KiB scattered  median   1.12 ms  p90   1.16 ms
+fdatasync  800 KiB sequential median   0.71 ms  p90   0.83 ms
+fdatasync  800 KiB scattered  median   2.64 ms  p90   2.72 ms
+fsync        4 KiB sequential median   0.14 ms  p90   0.15 ms
+fsync       64 KiB sequential median   0.20 ms  p90   0.21 ms
+fsync      288 KiB sequential median   0.37 ms  p90   0.42 ms
+fsync      288 KiB scattered  median   1.08 ms  p90   1.12 ms
+fsync      800 KiB sequential median   0.83 ms  p90   0.91 ms
+fsync      800 KiB scattered  median   2.35 ms  p90   2.52 ms

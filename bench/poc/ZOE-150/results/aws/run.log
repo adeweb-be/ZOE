@@ -1,0 +1,382 @@
+[22:49:06] pythons {'3.13': '3.13.15', '3.14t': '3.14.7t'}; 0 runs already in /mnt/nvme/zoe/bench/poc/ZOE-150/results/run.jsonl
+[22:49:06] == machine
+[22:49:11] machine.json written; idle load 0.0 cores
+[22:49:11] == machine took 5 s
+[22:49:11] == fsync
+[22:49:11] fsync:
+fdatasync    4 KiB sequential median   0.13 ms  p90   0.14 ms
+fdatasync   64 KiB sequential median   0.18 ms  p90   0.20 ms
+fdatasync  288 KiB sequential median   0.32 ms  p90   0.35 ms
+fdatasync  288 KiB scattered  median   1.12 ms  p90   1.16 ms
+fdatasync  800 KiB sequential median   0.71 ms  p90   0.83 ms
+fdatasync  800 KiB scattered  median   2.64 ms  p90   2.72 ms
+fsync        4 KiB sequential median   0.14 ms  p90   0.15 ms
+fsync       64 KiB sequential median   0.20 ms  p90   0.21 ms
+fsync      288 KiB sequential median   0.37 ms  p90   0.42 ms
+fsync      288 KiB scattered  median   1.08 ms  p90   1.12 ms
+fsync      800 KiB sequential median   0.83 ms  p90   0.91 ms
+fsync      800 KiB scattered  median   2.35 ms  p90   2.52 ms
+
+[22:49:11] == fsync took 0 s
+[22:49:11] == gil
+[22:49:12] gil 3.13.15: {"python": "3.13.15", "free_threaded_build": false, "gil_enabled": true, "warnings": []} 
+[22:49:12] gil 3.14.7t: {"python": "3.14.7t", "free_threaded_build": true, "gil_enabled": false, "warnings": []} 
+[22:49:12] == gil took 1 s
+[22:49:12] == rtt
+[22:49:13] rtt 3.13.15 zeo: {"config": "zeo", "python": "3.13.15", "loopback_tcp": {"wall_us_median": 20.2, "wall_us_p90": 20.4, "cpu_us_median": 8.8}, "new_oids": {"wall_us_median": 135.0, "wall_us_p90": 139.6, "cpu_us_median": 80.7}, "ping": {"wall_us_median": 132.0, "wall_us_p90": 135.4, "cpu_us_median": 79.4}} 
+[22:49:13] rtt 3.13.15 poc-proto: {"config": "poc-proto", "python": "3.13.15", "loopback_tcp": {"wall_us_median": 20.0, "wall_us_p90": 20.5, "cpu_us_median": 8.8}, "new_oids": {"wall_us_median": 70.1, "wall_us_p90": 70.7, "cpu_us_median": 32.3}} 
+[22:49:14] rtt 3.14.7t zeo: {"config": "zeo", "python": "3.14.7t", "loopback_tcp": {"wall_us_median": 20.1, "wall_us_p90": 20.6, "cpu_us_median": 8.8}, "new_oids": {"wall_us_median": 142.8, "wall_us_p90": 148.3, "cpu_us_median": 95.8}, "ping": {"wall_us_median": 138.5, "wall_us_p90": 143.1, "cpu_us_median": 95.3}} 
+[22:49:15] rtt 3.14.7t poc-proto: {"config": "poc-proto", "python": "3.14.7t", "loopback_tcp": {"wall_us_median": 20.3, "wall_us_p90": 20.5, "cpu_us_median": 8.9}, "new_oids": {"wall_us_median": 71.0, "wall_us_p90": 72.9, "cpu_us_median": 32.6}} 
+[22:49:15] == rtt took 2 s
+[22:49:15] == pyspy
+[22:49:19] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 3.96, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9548.6, "read_hot": 66009.8}}
+[22:49:28] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 8.37, "foreign_cores": 0.83, "ok": true, "ops": {"add": 8302.8, "read_hot": 24199.9}}
+[22:49:28] == pyspy took 13 s
+[22:49:28] == floor
+[22:49:28] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 0.38, "foreign_cores": 0.02, "ok": true, "ops": {"add": 34049.4, "update": 43520.1, "read_cold": 48556.6, "read_warm": 19542.5, "read_hot": 50393.1}}
+[22:49:29] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 0.56, "foreign_cores": 0.0, "ok": true, "ops": {"add": 30144.2, "update": 24851.6, "read_cold": 21465.3, "read_warm": 18943.2, "read_hot": 25352.5}}
+[22:49:30] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 0.97, "foreign_cores": 0.0, "ok": true, "ops": {"add": 27439.4, "update": 9068.8, "read_cold": 15079.4, "read_warm": 9346.0, "read_hot": 15898.5}}
+[22:49:34] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 3.38, "foreign_cores": 0.0, "ok": true, "ops": {"add": 24238.2, "update": 9308.7, "read_cold": 15848.1, "read_warm": 8283.4, "read_hot": 13942.1}}
+[22:49:36] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 1.03, "foreign_cores": 0.01, "ok": true, "ops": {"add": 11673.2, "update": 20929.4, "read_cold": 25560.7, "read_warm": 8750.9, "read_hot": 23545.7}}
+[22:49:38] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 1.34, "foreign_cores": 0.0, "ok": true, "ops": {"add": 11743.9, "update": 11485.9, "read_cold": 13478.9, "read_warm": 5803.0, "read_hot": 12140.8}}
+[22:49:41] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 2.11, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10820.9, "update": 4312.8, "read_cold": 8381.7, "read_warm": 4389.3, "read_hot": 10499.9}}
+[22:49:50] {"config": "floor", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 7.13, "foreign_cores": 0.03, "ok": true, "ops": {"add": 10562.7, "update": 4100.4, "read_cold": 7408.5, "read_warm": 3921.1, "read_hot": 9390.1}}
+[22:49:51] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 0.58, "foreign_cores": 0.01, "ok": true, "ops": {"add": 65497.9, "update": 127384.8, "read_cold": 95657.7, "read_warm": 64630.3, "read_hot": 200043.6}}
+[22:49:52] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 0.87, "foreign_cores": 0.0, "ok": true, "ops": {"add": 49632.6, "update": 125958.5, "read_cold": 281793.6, "read_warm": 101617.3, "read_hot": 359788.8}}
+[22:49:55] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 2.49, "foreign_cores": 0.0, "ok": true, "ops": {"add": 46181.2, "update": 151872.4, "read_cold": 326806.5, "read_warm": 116602.8, "read_hot": 283622.9}}
+[22:49:57] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 1.62, "foreign_cores": 0.03, "ok": true, "ops": {"add": 3342.7, "update": 37084.5, "read_cold": 35188.6, "read_warm": 20145.0, "read_hot": 49830.8}}
+[22:50:00] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 2.33, "foreign_cores": 0.01, "ok": true, "ops": {"add": 1707.3, "update": 41192.2, "read_cold": 74008.0, "read_warm": 37430.6, "read_hot": 88239.3}}
+[22:50:09] {"config": "floor", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 6.89, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1747.0, "update": 39577.5, "read_cold": 91397.1, "read_warm": 38247.3, "read_hot": 101866.2}}
+[22:50:10] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 0.52, "foreign_cores": 0.01, "ok": true, "ops": {"add": 28256.0, "update": 31703.6, "read_cold": 35754.2, "read_warm": 14889.5, "read_hot": 37878.7}}
+[22:50:10] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 0.49, "foreign_cores": 0.03, "ok": true, "ops": {"add": 27357.8, "update": 27819.1, "read_cold": 93414.3, "read_warm": 19777.9, "read_hot": 102352.3}}
+[22:50:11] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 0.6, "foreign_cores": 0.0, "ok": true, "ops": {"add": 25688.3, "update": 19184.4, "read_cold": 111276.5, "read_warm": 18208.9, "read_hot": 121772.1}}
+[22:50:14] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 1.73, "foreign_cores": 0.0, "ok": true, "ops": {"add": 21359.8, "update": 16076.0, "read_cold": 125764.1, "read_warm": 16502.8, "read_hot": 103624.2}}
+[22:50:16] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 1.16, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10749.5, "update": 15670.2, "read_cold": 19858.2, "read_warm": 5569.5, "read_hot": 22736.1}}
+[22:50:18] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 1.31, "foreign_cores": 0.15, "ok": true, "ops": {"add": 10794.0, "update": 13167.9, "read_cold": 49086.1, "read_warm": 6845.1, "read_hot": 63159.1}}
+[22:50:20] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 1.58, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9909.3, "update": 7652.6, "read_cold": 60299.8, "read_warm": 8663.5, "read_hot": 76096.0}}
+[22:50:26] {"config": "floor", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 3.89, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9716.2, "update": 7081.3, "read_cold": 75881.1, "read_warm": 7355.4, "read_hot": 62350.4}}
+[22:50:27] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 0.84, "foreign_cores": 2.18, "ok": true, "ops": {"add": 59288.0, "update": 103236.6, "read_cold": 128065.6, "read_warm": 50193.5, "read_hot": 143393.4}}
+[22:50:27] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 4, 1024, 1)
+[22:50:28] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 0.85, "foreign_cores": 2.13, "ok": true, "ops": {"add": 59285.5, "update": 102630.4, "read_cold": 125438.5, "read_warm": 50000.2, "read_hot": 143698.5}}
+[22:50:28] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 4, 1024, 1)
+[22:50:30] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 1.24, "foreign_cores": 5.9, "ok": true, "ops": {"add": 45620.3, "update": 93274.0, "read_cold": 167850.0, "read_warm": 93358.4, "read_hot": 286752.5}}
+[22:50:30] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 16, 1024, 1)
+[22:50:31] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 1.23, "foreign_cores": 5.88, "ok": true, "ops": {"add": 44908.5, "update": 93855.5, "read_cold": 167833.1, "read_warm": 93517.6, "read_hot": 285960.4}}
+[22:50:31] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 16, 1024, 1)
+[22:50:35] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 3.32, "foreign_cores": 9.21, "ok": true, "ops": {"add": 47691.7, "update": 117147.8, "read_cold": 255052.7, "read_warm": 106882.1, "read_hot": 684336.7}}
+[22:50:35] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 64, 1024, 1)
+[22:50:39] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 3.28, "foreign_cores": 9.26, "ok": true, "ops": {"add": 51882.9, "update": 126547.8, "read_cold": 255386.4, "read_warm": 116949.2, "read_hot": 538672.4}}
+[22:50:39] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 64, 1024, 1)
+[22:50:42] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 1.83, "foreign_cores": 2.17, "ok": true, "ops": {"add": 3306.0, "update": 33653.1, "read_cold": 55433.2, "read_warm": 18184.5, "read_hot": 68935.0}}
+[22:50:42] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 4, 102400, 1)
+[22:50:44] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 1.83, "foreign_cores": 2.18, "ok": true, "ops": {"add": 3294.8, "update": 33819.3, "read_cold": 55469.6, "read_warm": 18018.3, "read_hot": 73254.8}}
+[22:50:44] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 4, 102400, 1)
+[22:50:48] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 2.78, "foreign_cores": 7.38, "ok": true, "ops": {"add": 1578.6, "update": 29491.3, "read_cold": 80944.8, "read_warm": 33437.9, "read_hot": 136663.8}}
+[22:50:48] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 16, 102400, 1)
+[22:50:52] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 2.75, "foreign_cores": 7.14, "ok": true, "ops": {"add": 1581.4, "update": 33765.9, "read_cold": 72247.0, "read_warm": 33756.3, "read_hot": 134321.9}}
+[22:50:52] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 16, 102400, 1)
+[22:51:02] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 8.02, "foreign_cores": 10.22, "ok": true, "ops": {"add": 1567.7, "update": 42489.6, "read_cold": 97139.6, "read_warm": 41604.5, "read_hot": 299037.3}}
+[22:51:02] again: disturbed ('floor', '3.14.7t', 'floor', 'processes', 64, 102400, 1)
+[22:51:11] {"config": "floor", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 8.03, "foreign_cores": 10.15, "ok": true, "ops": {"add": 1562.6, "update": 41900.0, "read_cold": 89313.2, "read_warm": 43846.8, "read_hot": 316976.3}}
+[22:51:11] giving up after 2 attempts: ('floor', '3.14.7t', 'floor', 'processes', 64, 102400, 1)
+[22:51:11] == floor took 104 s
+[22:51:11] == main
+[22:51:13] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 1.06, "foreign_cores": 0.0, "ok": true, "ops": {"add": 11049.2, "update": 8717.3, "read_cold": 5295.5, "read_warm": 3436.4, "read_hot": 63126.8}}
+[22:51:14] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 1.37, "foreign_cores": 0.0, "ok": true, "ops": {"add": 20121.3, "update": 17268.4, "read_cold": 9739.2, "read_warm": 6365.6, "read_hot": 9516.0}}
+[22:51:16] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 2, "wall_s": 1.07, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10926.6, "update": 8633.5, "read_cold": 5313.7, "read_warm": 3430.4, "read_hot": 62776.7}}
+[22:51:17] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 2, "wall_s": 1.37, "foreign_cores": 0.0, "ok": true, "ops": {"add": 20071.1, "update": 17227.8, "read_cold": 9403.3, "read_warm": 6205.5, "read_hot": 9761.0}}
+[22:51:19] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 3, "wall_s": 1.07, "foreign_cores": 0.12, "ok": true, "ops": {"add": 11108.8, "update": 8684.6, "read_cold": 5268.2, "read_warm": 3301.2, "read_hot": 61360.1}}
+[22:51:20] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 1024, "round": 3, "wall_s": 1.37, "foreign_cores": 0.02, "ok": true, "ops": {"add": 20485.7, "update": 17547.1, "read_cold": 9772.1, "read_warm": 6343.0, "read_hot": 10067.2}}
+[22:51:22] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 1.19, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10105.4, "update": 7158.7, "read_cold": 6861.2, "read_warm": 3964.1, "read_hot": 27885.4}}
+[22:51:24] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 1.55, "foreign_cores": 0.0, "ok": true, "ops": {"add": 31409.0, "update": 21733.5, "read_cold": 24600.4, "read_warm": 11105.1, "read_hot": 25973.3}}
+[22:51:25] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 2, "wall_s": 1.19, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10035.5, "update": 7091.3, "read_cold": 6946.4, "read_warm": 3940.2, "read_hot": 27842.1}}
+[22:51:27] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 2, "wall_s": 1.56, "foreign_cores": 0.0, "ok": true, "ops": {"add": 30275.3, "update": 20841.9, "read_cold": 23878.6, "read_warm": 11689.6, "read_hot": 23559.5}}
+[22:51:28] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 3, "wall_s": 1.19, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9497.0, "update": 7171.8, "read_cold": 6912.9, "read_warm": 4106.6, "read_hot": 28698.2}}
+[22:51:30] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 1024, "round": 3, "wall_s": 1.55, "foreign_cores": 0.0, "ok": true, "ops": {"add": 30221.8, "update": 20295.0, "read_cold": 25788.7, "read_warm": 12804.1, "read_hot": 26160.5}}
+[22:51:32] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 1.79, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9950.0, "update": 4114.8, "read_cold": 7851.7, "read_warm": 4277.0, "read_hot": 24968.0}}
+[22:51:34] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 1.74, "foreign_cores": 0.0, "ok": true, "ops": {"add": 27272.4, "update": 12119.2, "read_cold": 25132.3, "read_warm": 11289.1, "read_hot": 27267.8}}
+[22:51:36] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 2, "wall_s": 1.74, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9417.1, "update": 4300.2, "read_cold": 7790.1, "read_warm": 4332.5, "read_hot": 25936.5}}
+[22:51:38] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 2, "wall_s": 1.74, "foreign_cores": 0.0, "ok": true, "ops": {"add": 27054.5, "update": 11655.1, "read_cold": 23388.9, "read_warm": 11337.1, "read_hot": 26171.0}}
+[22:51:40] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 3, "wall_s": 1.73, "foreign_cores": 0.0, "ok": true, "ops": {"add": 10558.9, "update": 4221.4, "read_cold": 8054.4, "read_warm": 4379.6, "read_hot": 26203.4}}
+[22:51:42] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 1024, "round": 3, "wall_s": 1.73, "foreign_cores": 0.0, "ok": true, "ops": {"add": 26621.3, "update": 12703.2, "read_cold": 28670.7, "read_warm": 11455.4, "read_hot": 29307.4}}
+[22:51:49] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 6.33, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9694.5, "update": 4181.0, "read_cold": 8140.1, "read_warm": 4054.3, "read_hot": 13779.4}}
+[22:51:53] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 3.54, "foreign_cores": 0.0, "ok": true, "ops": {"add": 25552.7, "update": 12069.1, "read_cold": 27470.7, "read_warm": 12481.0, "read_hot": 26063.8}}
+[22:51:59] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 2, "wall_s": 6.22, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9793.3, "update": 4253.4, "read_cold": 8381.1, "read_warm": 4209.2, "read_hot": 13798.0}}
+[22:52:03] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 2, "wall_s": 3.5, "foreign_cores": 0.0, "ok": true, "ops": {"add": 25855.2, "update": 12128.4, "read_cold": 30459.2, "read_warm": 12654.0, "read_hot": 24634.5}}
+[22:52:10] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 3, "wall_s": 6.3, "foreign_cores": 0.0, "ok": true, "ops": {"add": 9707.1, "update": 4079.0, "read_cold": 8399.3, "read_warm": 4181.9, "read_hot": 14043.6}}
+[22:52:13] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 1024, "round": 3, "wall_s": 3.56, "foreign_cores": 0.0, "ok": true, "ops": {"add": 25668.3, "update": 12994.9, "read_cold": 29381.1, "read_warm": 11211.0, "read_hot": 24429.2}}
+[22:52:17] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 2.93, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2695.1, "update": 2293.3, "read_cold": 3225.6, "read_warm": 1274.3, "read_hot": 16524.4}}
+[22:52:22] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 4.6, "foreign_cores": 0.05, "ok": true, "ops": {"add": 1605.8, "update": 1571.4, "read_cold": 3455.5, "read_warm": 1076.5, "read_hot": 3603.5}}
+[22:52:25] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 2, "wall_s": 2.89, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2740.0, "update": 2314.1, "read_cold": 3243.6, "read_warm": 1401.9, "read_hot": 16172.2}}
+[22:52:30] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 2, "wall_s": 4.6, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1559.9, "update": 1462.2, "read_cold": 3126.8, "read_warm": 990.0, "read_hot": 3426.0}}
+[22:52:33] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 3, "wall_s": 2.91, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2633.5, "update": 2389.1, "read_cold": 3181.1, "read_warm": 1392.4, "read_hot": 16179.8}}
+[22:52:38] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 1, "size": 102400, "round": 3, "wall_s": 4.6, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1600.8, "update": 1565.6, "read_cold": 3533.4, "read_warm": 1078.7, "read_hot": 3794.2}}
+[22:52:42] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 3.48, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2370.0, "update": 2093.0, "read_cold": 4221.8, "read_warm": 1493.9, "read_hot": 4587.8}}
+[22:52:45] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 3.06, "foreign_cores": 0.0, "ok": true, "ops": {"add": 3397.2, "update": 4471.9, "read_cold": 9676.3, "read_warm": 2989.6, "read_hot": 9390.4}}
+[22:52:49] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 2, "wall_s": 3.41, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2598.4, "update": 2140.4, "read_cold": 4334.7, "read_warm": 1519.6, "read_hot": 4433.5}}
+[22:52:52] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 2, "wall_s": 2.95, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4315.3, "update": 4484.7, "read_cold": 9491.1, "read_warm": 3150.0, "read_hot": 9620.5}}
+[22:52:56] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 3, "wall_s": 3.42, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2739.4, "update": 2118.4, "read_cold": 4244.8, "read_warm": 1507.7, "read_hot": 4267.4}}
+[22:52:59] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 4, "size": 102400, "round": 3, "wall_s": 2.92, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4776.2, "update": 4467.5, "read_cold": 9474.9, "read_warm": 3100.0, "read_hot": 9409.6}}
+[22:53:04] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 4.56, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2495.1, "update": 1522.1, "read_cold": 4430.0, "read_warm": 1712.8, "read_hot": 5095.3}}
+[22:53:07] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 3.46, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4500.5, "update": 3257.4, "read_cold": 11268.8, "read_warm": 3265.1, "read_hot": 10764.9}}
+[22:53:13] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 2, "wall_s": 4.8, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2318.7, "update": 1498.5, "read_cold": 3448.9, "read_warm": 1607.1, "read_hot": 5181.1}}
+[22:53:16] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 2, "wall_s": 3.42, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4588.6, "update": 3300.6, "read_cold": 11859.5, "read_warm": 3605.2, "read_hot": 11139.2}}
+[22:53:21] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 3, "wall_s": 4.59, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2513.4, "update": 1530.6, "read_cold": 3969.8, "read_warm": 1705.4, "read_hot": 5000.5}}
+[22:53:25] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 16, "size": 102400, "round": 3, "wall_s": 3.46, "foreign_cores": 0.03, "ok": true, "ops": {"add": 4395.1, "update": 3124.7, "read_cold": 10575.3, "read_warm": 3496.6, "read_hot": 10701.5}}
+[22:53:42] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 16.96, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2457.7, "update": 1511.7, "read_cold": 4185.0, "read_warm": 1433.5, "read_hot": 4381.0}}
+[22:53:51] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 8.72, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5448.0, "update": 3724.8, "read_cold": 11257.5, "read_warm": 3861.0, "read_hot": 10414.5}}
+[22:54:09] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 2, "wall_s": 16.77, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2547.4, "update": 1485.7, "read_cold": 4323.6, "read_warm": 1478.5, "read_hot": 4544.3}}
+[22:54:18] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 2, "wall_s": 8.71, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5423.1, "update": 3951.2, "read_cold": 11398.3, "read_warm": 3746.0, "read_hot": 10552.4}}
+[22:54:35] {"config": "zeo", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 3, "wall_s": 16.51, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2451.8, "update": 1561.2, "read_cold": 4438.0, "read_warm": 1513.2, "read_hot": 4498.5}}
+[22:54:44] {"config": "poc-proto", "python": "3.13.15", "mode": "threads", "c": 64, "size": 102400, "round": 3, "wall_s": 8.56, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5280.8, "update": 3869.3, "read_cold": 11930.9, "read_warm": 3863.8, "read_hot": 10678.9}}
+[22:54:45] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 1.13, "foreign_cores": 0.0, "ok": true, "ops": {"add": 24199.8, "update": 13328.6, "read_cold": 15855.5, "read_warm": 7383.0, "read_hot": 118661.2}}
+[22:54:48] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 2.35, "foreign_cores": 0.0, "ok": true, "ops": {"add": 38190.5, "update": 28459.9, "read_cold": 28355.0, "read_warm": 15418.5, "read_hot": 25958.5}}
+[22:54:49] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 2, "wall_s": 1.08, "foreign_cores": 0.0, "ok": true, "ops": {"add": 23867.1, "update": 17025.0, "read_cold": 17114.0, "read_warm": 8633.4, "read_hot": 245066.7}}
+[22:54:52] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 2, "wall_s": 2.35, "foreign_cores": 0.0, "ok": true, "ops": {"add": 35773.6, "update": 28144.0, "read_cold": 26632.9, "read_warm": 17770.3, "read_hot": 30635.8}}
+[22:54:53] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 3, "wall_s": 1.11, "foreign_cores": 0.0, "ok": true, "ops": {"add": 23261.0, "update": 16230.2, "read_cold": 18121.1, "read_warm": 7496.1, "read_hot": 121369.1}}
+[22:54:56] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 1024, "round": 3, "wall_s": 2.36, "foreign_cores": 0.0, "ok": true, "ops": {"add": 34204.2, "update": 30063.1, "read_cold": 27514.9, "read_warm": 15738.6, "read_hot": 29343.9}}
+[22:54:58] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 1.55, "foreign_cores": 0.27, "ok": true, "ops": {"add": 29717.5, "update": 10723.9, "read_cold": 19965.1, "read_warm": 10106.6, "read_hot": 411320.7}}
+[22:55:00] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 1.88, "foreign_cores": 0.0, "ok": true, "ops": {"add": 31798.1, "update": 26550.5, "read_cold": 54200.8, "read_warm": 22780.7, "read_hot": 53409.3}}
+[22:55:02] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 2, "wall_s": 1.55, "foreign_cores": 0.0, "ok": true, "ops": {"add": 21210.5, "update": 10148.7, "read_cold": 19369.5, "read_warm": 10419.5, "read_hot": 427639.4}}
+[22:55:04] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 2, "wall_s": 1.88, "foreign_cores": 0.0, "ok": true, "ops": {"add": 31277.7, "update": 27928.2, "read_cold": 53863.5, "read_warm": 23641.9, "read_hot": 53706.9}}
+[22:55:06] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 1.53, "foreign_cores": 0.0, "ok": true, "ops": {"add": 21631.4, "update": 11050.1, "read_cold": 21018.1, "read_warm": 10916.6, "read_hot": 484189.5}}
+[22:55:08] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 1.88, "foreign_cores": 0.0, "ok": true, "ops": {"add": 31394.6, "update": 27560.3, "read_cold": 56362.7, "read_warm": 23620.8, "read_hot": 53423.1}}
+[22:55:13] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 5.01, "foreign_cores": 0.0, "ok": true, "ops": {"add": 20259.8, "update": 13035.8, "read_cold": 34905.9, "read_warm": 12056.4, "read_hot": 502761.6}}
+[22:55:16] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 2.88, "foreign_cores": 0.0, "ok": true, "ops": {"add": 29259.8, "update": 34420.5, "read_cold": 96089.2, "read_warm": 28557.6, "read_hot": 56595.2}}
+[22:55:21] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 4.94, "foreign_cores": 0.0, "ok": true, "ops": {"add": 23321.6, "update": 14844.2, "read_cold": 23718.7, "read_warm": 12767.6, "read_hot": 456378.1}}
+[22:55:24] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 2.88, "foreign_cores": 0.0, "ok": true, "ops": {"add": 29752.8, "update": 35594.8, "read_cold": 82342.9, "read_warm": 26071.9, "read_hot": 57051.8}}
+[22:55:30] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 5.0, "foreign_cores": 0.0, "ok": true, "ops": {"add": 21073.1, "update": 12121.4, "read_cold": 32456.7, "read_warm": 11706.6, "read_hot": 436662.9}}
+[22:55:33] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 2.89, "foreign_cores": 0.0, "ok": true, "ops": {"add": 29876.6, "update": 33499.9, "read_cold": 85880.6, "read_warm": 28283.9, "read_hot": 56818.2}}
+[22:55:37] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 3.28, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2023.3, "update": 2658.8, "read_cold": 9286.4, "read_warm": 1912.9, "read_hot": 32150.0}}
+[22:55:41] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 4.05, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2235.7, "update": 4525.8, "read_cold": 9858.5, "read_warm": 2969.5, "read_hot": 9961.1}}
+[22:55:45] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 2, "wall_s": 3.33, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1858.9, "update": 2629.4, "read_cold": 8979.2, "read_warm": 1917.3, "read_hot": 33080.1}}
+[22:55:49] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 2, "wall_s": 4.07, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2214.6, "update": 4154.5, "read_cold": 9327.6, "read_warm": 3043.3, "read_hot": 9540.3}}
+[22:55:52] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 3, "wall_s": 3.26, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1905.2, "update": 3093.2, "read_cold": 9143.9, "read_warm": 2135.9, "read_hot": 51173.1}}
+[22:55:57] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 4, "size": 102400, "round": 3, "wall_s": 4.12, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2169.5, "update": 3915.8, "read_cold": 9454.1, "read_warm": 2934.7, "read_hot": 9697.4}}
+[22:56:07] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 9.52, "foreign_cores": 0.03, "ok": true, "ops": {"add": 1264.6, "update": 1848.5, "read_cold": 10495.9, "read_warm": 1619.4, "read_hot": 146748.0}}
+[22:56:11] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 4.37, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1452.3, "update": 3352.9, "read_cold": 14557.9, "read_warm": 3463.2, "read_hot": 14350.2}}
+[22:56:21] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 9.43, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1351.6, "update": 1427.1, "read_cold": 8576.3, "read_warm": 1742.2, "read_hot": 129618.3}}
+[22:56:26] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 4.37, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1418.9, "update": 3358.1, "read_cold": 15288.0, "read_warm": 3603.5, "read_hot": 14214.3}}
+[22:56:36] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 9.4, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1295.7, "update": 1806.8, "read_cold": 4067.7, "read_warm": 1899.6, "read_hot": 113699.5}}
+[22:56:40] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 4.33, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1462.6, "update": 3658.3, "read_cold": 14884.7, "read_warm": 3436.5, "read_hot": 14256.2}}
+[22:57:20] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 39.21, "foreign_cores": 0.0, "ok": true, "ops": {"add": 921.4, "update": 2087.3, "read_cold": 4163.0, "read_warm": 1366.5, "read_hot": 122077.6}}
+[22:57:32] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 12.0, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1314.3, "update": 3765.0, "read_cold": 14271.0, "read_warm": 3716.2, "read_hot": 12827.0}}
+[22:58:12] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 39.57, "foreign_cores": 0.0, "ok": true, "ops": {"add": 874.2, "update": 1306.5, "read_cold": 4135.2, "read_warm": 1048.9, "read_hot": 74107.0}}
+[22:58:25] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 11.85, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1313.5, "update": 3711.0, "read_cold": 14510.6, "read_warm": 3699.8, "read_hot": 12866.4}}
+[22:59:04] {"config": "zeo", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 39.26, "foreign_cores": 0.0, "ok": true, "ops": {"add": 924.6, "update": 1825.5, "read_cold": 6168.6, "read_warm": 898.0, "read_hot": 138991.1}}
+[22:59:17] {"config": "poc-proto", "python": "3.13.15", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 12.09, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1306.7, "update": 3709.4, "read_cold": 14309.7, "read_warm": 3643.4, "read_hot": 12828.6}}
+[22:59:18] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 1.08, "foreign_cores": 0.0, "ok": true, "ops": {"add": 14540.1, "update": 9679.9, "read_cold": 5192.2, "read_warm": 3434.8, "read_hot": 60435.6}}
+[22:59:20] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 1, "wall_s": 1.42, "foreign_cores": 0.0, "ok": true, "ops": {"add": 19766.4, "update": 16279.2, "read_cold": 9583.3, "read_warm": 6331.4, "read_hot": 9872.4}}
+[22:59:22] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 2, "wall_s": 1.07, "foreign_cores": 0.0, "ok": true, "ops": {"add": 15698.8, "update": 9656.8, "read_cold": 5184.8, "read_warm": 3465.7, "read_hot": 60922.1}}
+[22:59:23] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 2, "wall_s": 1.42, "foreign_cores": 0.0, "ok": true, "ops": {"add": 19987.2, "update": 16404.4, "read_cold": 9356.8, "read_warm": 6198.2, "read_hot": 9716.8}}
+[22:59:25] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 3, "wall_s": 1.07, "foreign_cores": 0.0, "ok": true, "ops": {"add": 15691.8, "update": 9684.3, "read_cold": 5230.1, "read_warm": 3462.7, "read_hot": 59378.7}}
+[22:59:26] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 1024, "round": 3, "wall_s": 1.41, "foreign_cores": 0.0, "ok": true, "ops": {"add": 19858.5, "update": 16358.8, "read_cold": 9439.4, "read_warm": 6267.5, "read_hot": 9849.3}}
+[22:59:28] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 1.19, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13847.5, "update": 7328.4, "read_cold": 6508.6, "read_warm": 4132.1, "read_hot": 80108.5}}
+[22:59:30] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 1, "wall_s": 1.57, "foreign_cores": 0.0, "ok": true, "ops": {"add": 48595.5, "update": 25203.2, "read_cold": 26148.3, "read_warm": 14335.6, "read_hot": 25534.1}}
+[22:59:31] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 2, "wall_s": 1.12, "foreign_cores": 0.0, "ok": true, "ops": {"add": 14354.3, "update": 7970.7, "read_cold": 7535.2, "read_warm": 4468.0, "read_hot": 79990.0}}
+[22:59:33] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 2, "wall_s": 1.57, "foreign_cores": 0.0, "ok": true, "ops": {"add": 45602.8, "update": 25470.4, "read_cold": 25744.0, "read_warm": 15353.3, "read_hot": 27520.5}}
+[22:59:35] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 3, "wall_s": 1.15, "foreign_cores": 0.0, "ok": true, "ops": {"add": 14511.4, "update": 7913.3, "read_cold": 7528.8, "read_warm": 4084.0, "read_hot": 81456.0}}
+[22:59:36] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 1024, "round": 3, "wall_s": 1.57, "foreign_cores": 0.13, "ok": true, "ops": {"add": 49071.5, "update": 26191.8, "read_cold": 23503.6, "read_warm": 15052.8, "read_hot": 25684.0}}
+[22:59:39] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 1.78, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13616.8, "update": 4345.9, "read_cold": 6676.2, "read_warm": 4264.5, "read_hot": 34289.6}}
+[22:59:41] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 1, "wall_s": 1.68, "foreign_cores": 0.0, "ok": true, "ops": {"add": 38382.2, "update": 19233.0, "read_cold": 37228.9, "read_warm": 17656.2, "read_hot": 39454.5}}
+[22:59:43] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 2, "wall_s": 1.76, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13948.9, "update": 4290.8, "read_cold": 7057.2, "read_warm": 4335.4, "read_hot": 35145.1}}
+[22:59:45] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 2, "wall_s": 1.67, "foreign_cores": 0.0, "ok": true, "ops": {"add": 42000.9, "update": 20816.3, "read_cold": 36836.7, "read_warm": 17716.9, "read_hot": 38078.0}}
+[22:59:47] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 3, "wall_s": 1.73, "foreign_cores": 0.0, "ok": true, "ops": {"add": 14442.8, "update": 4390.8, "read_cold": 7468.7, "read_warm": 4432.5, "read_hot": 33284.4}}
+[22:59:49] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 1024, "round": 3, "wall_s": 1.67, "foreign_cores": 0.0, "ok": true, "ops": {"add": 39365.2, "update": 20250.5, "read_cold": 38883.6, "read_warm": 19478.7, "read_hot": 37893.2}}
+[22:59:55] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 6.01, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13124.1, "update": 4433.6, "read_cold": 8764.4, "read_warm": 4149.5, "read_hot": 14371.5}}
+[22:59:58] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 1, "wall_s": 2.54, "foreign_cores": 0.0, "ok": true, "ops": {"add": 54770.8, "update": 20408.9, "read_cold": 37838.3, "read_warm": 17872.0, "read_hot": 38454.0}}
+[23:00:05] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 2, "wall_s": 6.17, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13138.4, "update": 4216.1, "read_cold": 7076.9, "read_warm": 4495.4, "read_hot": 14000.1}}
+[23:00:07] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 2, "wall_s": 2.55, "foreign_cores": 0.0, "ok": true, "ops": {"add": 50770.0, "update": 19808.1, "read_cold": 39454.7, "read_warm": 19313.7, "read_hot": 37441.7}}
+[23:00:14] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 3, "wall_s": 5.94, "foreign_cores": 0.0, "ok": true, "ops": {"add": 13112.8, "update": 4427.6, "read_cold": 8794.7, "read_warm": 4365.2, "read_hot": 14599.9}}
+[23:00:16] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 1024, "round": 3, "wall_s": 2.57, "foreign_cores": 0.0, "ok": true, "ops": {"add": 48811.7, "update": 19899.0, "read_cold": 38142.3, "read_warm": 17981.1, "read_hot": 38406.2}}
+[23:00:20] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 3.28, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2394.9, "update": 1909.6, "read_cold": 2788.5, "read_warm": 1107.4, "read_hot": 24608.2}}
+[23:00:25] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 1, "wall_s": 4.65, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1580.2, "update": 1566.6, "read_cold": 3243.7, "read_warm": 960.6, "read_hot": 3290.9}}
+[23:00:29] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 2, "wall_s": 3.26, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2395.8, "update": 1938.6, "read_cold": 2823.4, "read_warm": 1126.3, "read_hot": 27151.5}}
+[23:00:34] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 2, "wall_s": 4.65, "foreign_cores": 0.0, "ok": true, "ops": {"add": 1589.3, "update": 1561.8, "read_cold": 3405.7, "read_warm": 1051.3, "read_hot": 3571.6}}
+[23:00:37] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 3, "wall_s": 3.29, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2354.3, "update": 1955.3, "read_cold": 2826.0, "read_warm": 1105.7, "read_hot": 27254.4}}
+[23:00:42] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 1, "size": 102400, "round": 3, "wall_s": 4.65, "foreign_cores": 0.04, "ok": true, "ops": {"add": 1580.9, "update": 1559.2, "read_cold": 3620.9, "read_warm": 1071.8, "read_hot": 3706.4}}
+[23:00:47] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 3.92, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2281.7, "update": 1811.1, "read_cold": 4130.6, "read_warm": 1369.7, "read_hot": 4885.6}}
+[23:00:50] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 1, "wall_s": 3.23, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4033.8, "update": 3992.2, "read_cold": 9043.8, "read_warm": 2370.6, "read_hot": 9977.1}}
+[23:00:55] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 2, "wall_s": 3.93, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2229.6, "update": 1811.1, "read_cold": 4121.2, "read_warm": 1391.2, "read_hot": 4512.4}}
+[23:00:58] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 2, "wall_s": 3.22, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4400.9, "update": 3673.5, "read_cold": 9544.1, "read_warm": 3031.6, "read_hot": 9254.7}}
+[23:01:02] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 3, "wall_s": 3.91, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2160.3, "update": 1830.2, "read_cold": 4269.6, "read_warm": 1320.5, "read_hot": 4715.6}}
+[23:01:06] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 4, "size": 102400, "round": 3, "wall_s": 3.21, "foreign_cores": 0.0, "ok": true, "ops": {"add": 4342.1, "update": 4358.4, "read_cold": 9005.5, "read_warm": 2257.2, "read_hot": 10028.8}}
+[23:01:12] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 5.18, "foreign_cores": 0.05, "ok": true, "ops": {"add": 2289.5, "update": 1454.4, "read_cold": 4461.6, "read_warm": 1395.1, "read_hot": 4650.8}}
+[23:01:16] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 1, "wall_s": 3.67, "foreign_cores": 0.0, "ok": true, "ops": {"add": 3832.5, "update": 3549.7, "read_cold": 11515.3, "read_warm": 3531.3, "read_hot": 11559.5}}
+[23:01:21] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 2, "wall_s": 5.18, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2290.7, "update": 1421.1, "read_cold": 4355.0, "read_warm": 1395.2, "read_hot": 4764.6}}
+[23:01:25] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 2, "wall_s": 3.67, "foreign_cores": 0.0, "ok": true, "ops": {"add": 3672.8, "update": 3561.7, "read_cold": 11462.5, "read_warm": 3622.5, "read_hot": 11705.0}}
+[23:01:31] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 3, "wall_s": 5.16, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2314.1, "update": 1427.1, "read_cold": 4547.7, "read_warm": 1418.7, "read_hot": 4632.4}}
+[23:01:35] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 16, "size": 102400, "round": 3, "wall_s": 3.64, "foreign_cores": 0.0, "ok": true, "ops": {"add": 3905.8, "update": 3528.5, "read_cold": 11820.9, "read_warm": 3632.4, "read_hot": 11683.3}}
+[23:01:52] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 17.19, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2358.9, "update": 1401.1, "read_cold": 4690.3, "read_warm": 1460.5, "read_hot": 4708.5}}
+[23:02:01] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 1, "wall_s": 8.46, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5313.8, "update": 3704.2, "read_cold": 11329.8, "read_warm": 3686.7, "read_hot": 11452.9}}
+[23:02:19] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 2, "wall_s": 17.13, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2362.3, "update": 1419.8, "read_cold": 4822.3, "read_warm": 1455.5, "read_hot": 4626.5}}
+[23:02:28] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 2, "wall_s": 8.44, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5381.4, "update": 3719.3, "read_cold": 11350.5, "read_warm": 3676.4, "read_hot": 11536.5}}
+[23:02:46] {"config": "zeo", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 3, "wall_s": 17.22, "foreign_cores": 0.0, "ok": true, "ops": {"add": 2270.3, "update": 1418.2, "read_cold": 4713.5, "read_warm": 1477.2, "read_hot": 4598.4}}
+[23:02:54] {"config": "poc-proto", "python": "3.14.7t", "mode": "threads", "c": 64, "size": 102400, "round": 3, "wall_s": 8.42, "foreign_cores": 0.0, "ok": true, "ops": {"add": 5340.4, "update": 3748.5, "read_cold": 11227.4, "read_warm": 3713.0, "read_hot": 11415.1}}
+[23:02:56] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 1.4, "foreign_cores": 2.15, "ok": true, "ops": {"add": 24408.7, "update": 15406.4, "read_cold": 15991.0, "read_warm": 8625.4, "read_hot": 106434.8}}
+[23:02:56] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 1)
+[23:02:58] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 1.44, "foreign_cores": 2.09, "ok": true, "ops": {"add": 21886.7, "update": 13772.0, "read_cold": 13562.4, "read_warm": 6461.1, "read_hot": 115719.3}}
+[23:02:58] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 1)
+[23:03:01] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 1, "wall_s": 2.6, "foreign_cores": 0.41, "ok": true, "ops": {"add": 34289.1, "update": 29699.8, "read_cold": 26630.5, "read_warm": 16711.6, "read_hot": 28447.2}}
+[23:03:03] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 2, "wall_s": 1.43, "foreign_cores": 2.14, "ok": true, "ops": {"add": 21008.2, "update": 13964.0, "read_cold": 13432.3, "read_warm": 8167.2, "read_hot": 187242.0}}
+[23:03:03] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 2)
+[23:03:05] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 2, "wall_s": 1.43, "foreign_cores": 2.1, "ok": true, "ops": {"add": 21929.4, "update": 13938.6, "read_cold": 13502.1, "read_warm": 6865.7, "read_hot": 195158.8}}
+[23:03:05] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 2)
+[23:03:07] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 2, "wall_s": 2.6, "foreign_cores": 0.43, "ok": true, "ops": {"add": 33929.6, "update": 30032.9, "read_cold": 26047.4, "read_warm": 17115.5, "read_hot": 29521.9}}
+[23:03:09] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 3, "wall_s": 1.37, "foreign_cores": 2.22, "ok": true, "ops": {"add": 24916.6, "update": 16098.6, "read_cold": 15774.7, "read_warm": 8440.1, "read_hot": 219130.7}}
+[23:03:09] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 3)
+[23:03:11] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 3, "wall_s": 1.42, "foreign_cores": 2.1, "ok": true, "ops": {"add": 22065.9, "update": 13917.1, "read_cold": 13942.3, "read_warm": 8639.7, "read_hot": 128522.0}}
+[23:03:11] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 1024, 3)
+[23:03:14] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 1024, "round": 3, "wall_s": 2.6, "foreign_cores": 0.61, "ok": true, "ops": {"add": 35504.3, "update": 28969.8, "read_cold": 26994.5, "read_warm": 16136.3, "read_hot": 27649.4}}
+[23:03:16] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 2.0, "foreign_cores": 5.71, "ok": true, "ops": {"add": 21806.1, "update": 8925.8, "read_cold": 17226.7, "read_warm": 9111.3, "read_hot": 425789.4}}
+[23:03:16] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 1)
+[23:03:19] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 1.99, "foreign_cores": 5.75, "ok": true, "ops": {"add": 23938.2, "update": 9710.2, "read_cold": 15802.0, "read_warm": 10125.5, "read_hot": 398245.2}}
+[23:03:19] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 1)
+[23:03:21] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 1, "wall_s": 2.18, "foreign_cores": 1.38, "ok": true, "ops": {"add": 29843.8, "update": 30302.4, "read_cold": 56329.9, "read_warm": 28590.9, "read_hot": 52101.1}}
+[23:03:24] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 2, "wall_s": 2.0, "foreign_cores": 5.73, "ok": true, "ops": {"add": 21430.4, "update": 10294.9, "read_cold": 15289.7, "read_warm": 9599.8, "read_hot": 395099.6}}
+[23:03:24] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 2)
+[23:03:36] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 2, "wall_s": 11.92, "foreign_cores": 0.92, "ok": false, "ops": {"add": 24705.8}}
+[23:03:36] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 2)
+[23:03:38] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 2, "wall_s": 2.19, "foreign_cores": 1.35, "ok": true, "ops": {"add": 31149.7, "update": 29700.5, "read_cold": 55661.0, "read_warm": 22189.4, "read_hot": 52905.7}}
+[23:03:41] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 2.04, "foreign_cores": 5.7, "ok": true, "ops": {"add": 22748.0, "update": 9510.2, "read_cold": 17785.6, "read_warm": 8851.5, "read_hot": 314408.7}}
+[23:03:41] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 3)
+[23:03:43] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 2.02, "foreign_cores": 5.73, "ok": true, "ops": {"add": 16650.7, "update": 8423.9, "read_cold": 14492.7, "read_warm": 7811.9, "read_hot": 393263.6}}
+[23:03:43] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 1024, 3)
+[23:03:46] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 2.22, "foreign_cores": 1.52, "ok": true, "ops": {"add": 30987.3, "update": 29159.8, "read_cold": 52903.0, "read_warm": 27928.5, "read_hot": 54136.1}}
+[23:03:46] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 16, 1024, 3)
+[23:03:48] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 1024, "round": 3, "wall_s": 2.19, "foreign_cores": 1.33, "ok": true, "ops": {"add": 29714.2, "update": 30205.8, "read_cold": 48484.9, "read_warm": 25963.0, "read_hot": 53491.7}}
+[23:03:55] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 6.41, "foreign_cores": 7.95, "ok": true, "ops": {"add": 18302.0, "update": 9254.5, "read_cold": 11684.8, "read_warm": 8542.4, "read_hot": 712771.5}}
+[23:03:55] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 1)
+[23:04:02] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 6.55, "foreign_cores": 7.84, "ok": true, "ops": {"add": 18770.6, "update": 8941.8, "read_cold": 11013.8, "read_warm": 5554.5, "read_hot": 1152095.1}}
+[23:04:02] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 1)
+[23:04:05] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 3.23, "foreign_cores": 3.76, "ok": true, "ops": {"add": 34745.8, "update": 45426.5, "read_cold": 153900.3, "read_warm": 40834.2, "read_hot": 79303.5}}
+[23:04:05] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 1)
+[23:04:09] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 1, "wall_s": 3.28, "foreign_cores": 3.68, "ok": true, "ops": {"add": 32315.9, "update": 49183.0, "read_cold": 154141.8, "read_warm": 37683.4, "read_hot": 74489.3}}
+[23:04:09] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 1)
+[23:04:16] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 6.45, "foreign_cores": 8.0, "ok": true, "ops": {"add": 17341.2, "update": 9337.3, "read_cold": 11484.4, "read_warm": 5906.2, "read_hot": 655980.8}}
+[23:04:16] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 2)
+[23:04:23] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 6.47, "foreign_cores": 8.0, "ok": true, "ops": {"add": 15031.9, "update": 6526.0, "read_cold": 14001.3, "read_warm": 8619.6, "read_hot": 644223.0}}
+[23:04:23] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 2)
+[23:04:26] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 3.29, "foreign_cores": 3.72, "ok": true, "ops": {"add": 46267.7, "update": 51721.0, "read_cold": 179004.0, "read_warm": 38242.3, "read_hot": 83826.3}}
+[23:04:26] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 2)
+[23:04:38] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 2, "wall_s": 11.19, "foreign_cores": 0.51, "ok": false, "ops": {}}
+[23:04:38] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 2)
+[23:04:45] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 6.6, "foreign_cores": 7.79, "ok": true, "ops": {"add": 18324.8, "update": 8269.4, "read_cold": 10769.9, "read_warm": 7781.5, "read_hot": 689881.5}}
+[23:04:45] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 3)
+[23:04:52] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 6.52, "foreign_cores": 7.97, "ok": true, "ops": {"add": 18017.8, "update": 7535.6, "read_cold": 16024.0, "read_warm": 9203.0, "read_hot": 875325.4}}
+[23:04:52] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 1024, 3)
+[23:04:55] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 3.28, "foreign_cores": 3.75, "ok": true, "ops": {"add": 28886.0, "update": 48523.1, "read_cold": 139714.0, "read_warm": 43144.4, "read_hot": 72524.8}}
+[23:04:55] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 3)
+[23:05:09] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 1024, "round": 3, "wall_s": 13.3, "foreign_cores": 0.93, "ok": false, "ops": {"add": 43454.3, "update": 48937.5, "read_cold": 182210.8}}
+[23:05:09] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 1024, 3)
+[23:05:13] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 3.75, "foreign_cores": 1.8, "ok": true, "ops": {"add": 1949.4, "update": 2370.8, "read_cold": 7624.4, "read_warm": 1801.3, "read_hot": 40240.4}}
+[23:05:13] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 1)
+[23:05:17] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 3.72, "foreign_cores": 1.81, "ok": true, "ops": {"add": 1871.3, "update": 2459.2, "read_cold": 7850.8, "read_warm": 1850.0, "read_hot": 77744.9}}
+[23:05:17] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 1)
+[23:05:22] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 1, "wall_s": 4.36, "foreign_cores": 1.03, "ok": true, "ops": {"add": 2031.2, "update": 4304.8, "read_cold": 9066.2, "read_warm": 2918.8, "read_hot": 9471.5}}
+[23:05:26] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 2, "wall_s": 3.76, "foreign_cores": 1.76, "ok": true, "ops": {"add": 1864.6, "update": 2355.7, "read_cold": 7428.4, "read_warm": 1838.9, "read_hot": 41260.2}}
+[23:05:26] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 2)
+[23:05:30] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 2, "wall_s": 3.76, "foreign_cores": 1.75, "ok": true, "ops": {"add": 1789.3, "update": 2384.3, "read_cold": 8367.9, "read_warm": 1968.4, "read_hot": 79826.4}}
+[23:05:30] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 2)
+[23:05:35] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 2, "wall_s": 4.39, "foreign_cores": 0.9, "ok": true, "ops": {"add": 1948.3, "update": 4460.6, "read_cold": 8955.8, "read_warm": 2768.4, "read_hot": 9398.6}}
+[23:05:39] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 3, "wall_s": 3.58, "foreign_cores": 1.86, "ok": true, "ops": {"add": 1978.2, "update": 2690.9, "read_cold": 7883.6, "read_warm": 2000.8, "read_hot": 73826.9}}
+[23:05:39] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 3)
+[23:05:43] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 3, "wall_s": 3.62, "foreign_cores": 1.85, "ok": true, "ops": {"add": 1887.3, "update": 2703.4, "read_cold": 8187.3, "read_warm": 1802.0, "read_hot": 37887.8}}
+[23:05:43] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 4, 102400, 3)
+[23:05:48] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 4, "size": 102400, "round": 3, "wall_s": 4.35, "foreign_cores": 0.89, "ok": true, "ops": {"add": 2143.8, "update": 4272.1, "read_cold": 8973.9, "read_warm": 2951.7, "read_hot": 9119.8}}
+[23:05:58] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 9.63, "foreign_cores": 2.82, "ok": true, "ops": {"add": 1232.9, "update": 1499.8, "read_cold": 7373.0, "read_warm": 981.2, "read_hot": 201385.4}}
+[23:05:58] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 1)
+[23:06:08] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 9.62, "foreign_cores": 2.73, "ok": true, "ops": {"add": 1240.7, "update": 1195.7, "read_cold": 6536.8, "read_warm": 1698.6, "read_hot": 154899.0}}
+[23:06:08] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 1)
+[23:06:13] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 4.68, "foreign_cores": 3.42, "ok": true, "ops": {"add": 1402.1, "update": 3591.8, "read_cold": 15075.8, "read_warm": 3475.5, "read_hot": 14231.7}}
+[23:06:13] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 1)
+[23:06:18] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 1, "wall_s": 4.68, "foreign_cores": 3.45, "ok": true, "ops": {"add": 1410.3, "update": 3424.7, "read_cold": 14945.6, "read_warm": 3581.3, "read_hot": 14060.0}}
+[23:06:18] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 1)
+[23:06:28] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 9.68, "foreign_cores": 2.78, "ok": true, "ops": {"add": 1262.8, "update": 1377.6, "read_cold": 6346.7, "read_warm": 1159.6, "read_hot": 160655.2}}
+[23:06:28] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 2)
+[23:06:38] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 9.59, "foreign_cores": 2.75, "ok": true, "ops": {"add": 1281.7, "update": 1708.6, "read_cold": 5776.2, "read_warm": 928.6, "read_hot": 217369.8}}
+[23:06:38] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 2)
+[23:06:43] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 4.7, "foreign_cores": 3.43, "ok": true, "ops": {"add": 1400.7, "update": 3423.7, "read_cold": 15086.7, "read_warm": 3441.9, "read_hot": 14292.7}}
+[23:06:43] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 2)
+[23:06:48] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 2, "wall_s": 4.7, "foreign_cores": 3.44, "ok": true, "ops": {"add": 1388.9, "update": 3544.2, "read_cold": 14949.8, "read_warm": 3557.4, "read_hot": 14378.6}}
+[23:06:48] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 2)
+[23:06:58] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 9.7, "foreign_cores": 2.8, "ok": true, "ops": {"add": 1304.2, "update": 1970.0, "read_cold": 2407.7, "read_warm": 1418.1, "read_hot": 219495.8}}
+[23:06:58] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 3)
+[23:07:08] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 9.52, "foreign_cores": 2.75, "ok": true, "ops": {"add": 1277.3, "update": 1170.5, "read_cold": 7342.5, "read_warm": 981.3, "read_hot": 108962.0}}
+[23:07:08] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 16, 102400, 3)
+[23:07:13] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 4.68, "foreign_cores": 3.45, "ok": true, "ops": {"add": 1409.2, "update": 3437.3, "read_cold": 15377.0, "read_warm": 3550.0, "read_hot": 14432.4}}
+[23:07:13] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 3)
+[23:07:18] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 16, "size": 102400, "round": 3, "wall_s": 4.69, "foreign_cores": 3.42, "ok": true, "ops": {"add": 1428.6, "update": 3293.1, "read_cold": 15315.6, "read_warm": 3483.6, "read_hot": 14281.8}}
+[23:07:18] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 16, 102400, 3)
+[23:07:59] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 39.96, "foreign_cores": 2.96, "ok": true, "ops": {"add": 1109.2, "update": 1181.0, "read_cold": 2468.5, "read_warm": 1156.3, "read_hot": 9271.2}}
+[23:07:59] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 1)
+[23:08:39] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 39.7, "foreign_cores": 2.95, "ok": true, "ops": {"add": 1127.3, "update": 879.8, "read_cold": 2506.2, "read_warm": 1790.2, "read_hot": 5691.5}}
+[23:08:39] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 1)
+[23:08:52] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 12.9, "foreign_cores": 5.45, "ok": true, "ops": {"add": 1231.5, "update": 3711.3, "read_cold": 14079.4, "read_warm": 3868.0, "read_hot": 12285.0}}
+[23:08:52] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 1)
+[23:09:06] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 1, "wall_s": 12.8, "foreign_cores": 5.55, "ok": true, "ops": {"add": 1245.2, "update": 3886.6, "read_cold": 14874.8, "read_warm": 3749.6, "read_hot": 12584.8}}
+[23:09:06] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 1)
+[23:09:45] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 38.88, "foreign_cores": 3.02, "ok": true, "ops": {"add": 1342.8, "update": 1755.7, "read_cold": 2765.0, "read_warm": 803.6, "read_hot": 22297.9}}
+[23:09:45] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 2)
+[23:10:26] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 40.89, "foreign_cores": 2.54, "ok": false, "ops": {"add": 1122.9, "update": 1170.1, "read_cold": 5303.8}}
+[23:10:26] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 2)
+[23:10:40] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 12.78, "foreign_cores": 5.54, "ok": true, "ops": {"add": 1255.1, "update": 3834.6, "read_cold": 14925.4, "read_warm": 3763.5, "read_hot": 12794.1}}
+[23:10:40] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 2)
+[23:10:53] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 2, "wall_s": 12.75, "foreign_cores": 5.52, "ok": true, "ops": {"add": 1261.1, "update": 3854.3, "read_cold": 14832.5, "read_warm": 3743.6, "read_hot": 12315.8}}
+[23:10:53] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 2)
+[23:11:33] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 39.56, "foreign_cores": 2.97, "ok": true, "ops": {"add": 988.9, "update": 879.4, "read_cold": 4199.2, "read_warm": 1514.9, "read_hot": 466108.1}}
+[23:11:33] again: disturbed ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 3)
+[23:12:13] {"config": "zeo", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 39.61, "foreign_cores": 2.95, "ok": true, "ops": {"add": 1064.4, "update": 749.7, "read_cold": 3647.5, "read_warm": 956.1, "read_hot": 4056.9}}
+[23:12:13] giving up after 2 attempts: ('main', '3.14.7t', 'zeo', 'processes', 64, 102400, 3)
+[23:12:26] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 12.84, "foreign_cores": 5.45, "ok": true, "ops": {"add": 1248.9, "update": 3733.2, "read_cold": 14724.1, "read_warm": 3973.5, "read_hot": 12624.5}}
+[23:12:26] again: disturbed ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 3)
+[23:12:40] {"config": "poc-proto", "python": "3.14.7t", "mode": "processes", "c": 64, "size": 102400, "round": 3, "wall_s": 12.96, "foreign_cores": 5.41, "ok": true, "ops": {"add": 1232.8, "update": 3702.8, "read_cold": 14820.9, "read_warm": 3879.8, "read_hot": 12443.2}}
+[23:12:40] giving up after 2 attempts: ('main', '3.14.7t', 'poc-proto', 'processes', 64, 102400, 3)
+[23:12:40] == main took 1288 s
+[23:12:40] == spans
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 1, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 1, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'threads', 64, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('spans', '3.13.15', 'poc-proto', 'processes', 64, 102400, 1)
+[23:12:40] == spans took 0 s
+[23:12:40] == ref
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 1, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 1, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'threads', 64, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.13.15', 'poc-main', 'processes', 64, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 1, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 1, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'threads', 64, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 4, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 16, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 64, 1024, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 4, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 16, 102400, 1)
+[23:12:40] SKIPPED, over the budget of 840 s: ('main', '3.14.7t', 'poc-main', 'processes', 64, 102400, 1)
+[23:12:40] == ref took 0 s
+[23:12:40] DONE in 1414 s
