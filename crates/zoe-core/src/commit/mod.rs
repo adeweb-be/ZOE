@@ -725,6 +725,82 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// the oid is a written oid that the caller can resolve. The check
     /// gives each such oid with its committed record.
     fn check_serials(&self, resolve: bool) -> Result<Check> {
+        let t = crate::poc::start();
+        let r = if crate::poc::FLAGS.tid_only {
+            self.check_serials_tids(resolve)
+        } else {
+            self.check_serials_full(resolve)
+        };
+        crate::poc::stop(crate::poc::K::VoteCheck, t);
+        crate::poc::add(crate::poc::K::Votes, 1);
+        r
+    }
+
+    /// POC: compare the tids from the keys; read a full record only for a
+    /// stale written oid.
+    fn check_serials_tids(&self, resolve: bool) -> Result<Check> {
+        let mut conflicts = Vec::new();
+        let staged: Vec<_> = self.staged.iter().collect();
+        for chunk in staged.chunks(READ_CHUNK) {
+            let tids = self
+                .store
+                .backend
+                .current_tids(&mut chunk.iter().map(|(oid, _)| *oid))?;
+            if tids.len() != chunk.len() {
+                return Err(ZoeError::Backend("short current_tids".into()));
+            }
+            for (&(oid, staged), tid) in chunk.iter().zip(tids) {
+                if tid.unwrap_or(Tid::ZERO) == staged.serial {
+                    continue;
+                }
+                let record = self.load_current(std::iter::once(oid))?.pop().flatten();
+                let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
+                if current == staged.serial {
+                    continue;
+                }
+                match record {
+                    Some(record)
+                        if resolve
+                            && !staged.restored
+                            && staged.serial != Tid::ZERO
+                            && staged.pickle_len() != 0
+                            && !record.data.is_empty() =>
+                    {
+                        conflicts.push((oid, record));
+                    }
+                    _ => {
+                        return Ok(Check::Failed(Stale {
+                            oid,
+                            current,
+                            read: staged.serial,
+                            read_only: false,
+                        }));
+                    }
+                }
+            }
+        }
+        let read_current: Vec<_> = self.read_current.iter().collect();
+        for chunk in read_current.chunks(READ_CHUNK) {
+            let tids = self
+                .store
+                .backend
+                .current_tids(&mut chunk.iter().map(|&(&oid, _)| oid))?;
+            for (&(&oid, &read), tid) in chunk.iter().zip(tids) {
+                let current = tid.unwrap_or(Tid::ZERO);
+                if current != read {
+                    return Ok(Check::Failed(Stale {
+                        oid,
+                        current,
+                        read,
+                        read_only: true,
+                    }));
+                }
+            }
+        }
+        Ok(Check::Passed(conflicts))
+    }
+
+    fn check_serials_full(&self, resolve: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
@@ -837,9 +913,29 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
+        let encoded = if crate::poc::FLAGS.store_compress {
+            self.staged.take_encoded()
+        } else if crate::poc::FLAGS.precompress {
+            let t = crate::poc::start();
+            let compression = crate::poc::FLAGS.compression.unwrap_or_default();
+            let encoded = self
+                .staged
+                .records()
+                .map(|r| {
+                    let (_, _, data) = r?;
+                    let (codec, payload) = crate::format::encode_payload(&data, compression);
+                    Ok((codec, payload.into_owned()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            crate::poc::stop(crate::poc::K::Precompress, t);
+            Some(encoded)
+        } else {
+            None
+        };
         let member = Member {
             tid: self.tid,
             deferred: self.deferred,
+            encoded,
             staged: std::mem::take(&mut self.staged),
             blobs: std::mem::take(&mut self.blobs),
             user: std::mem::take(&mut self.user),

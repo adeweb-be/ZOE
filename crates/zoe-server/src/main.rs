@@ -5,5 +5,8 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let code = zoe_server::cli::main(std::env::args_os().collect());
+    if zoe_core::poc::FLAGS.profile {
+        eprintln!("{}", zoe_core::poc::dump());
+    }
     u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from)
 }

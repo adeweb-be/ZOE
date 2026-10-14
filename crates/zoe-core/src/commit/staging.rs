@@ -184,6 +184,8 @@ pub(crate) struct Staged {
     /// so a conflict on it cannot be resolved.
     pub(crate) restored: bool,
     pickle: Pickle,
+    /// POC: the payload that the store call encoded.
+    encoded: Option<(crate::format::Codec, Vec<u8>)>,
 }
 
 impl Staged {
@@ -242,10 +244,20 @@ impl Staging {
             self.in_memory = others;
             pickle
         };
+        let encoded = if crate::poc::FLAGS.store_compress && matches!(pickle, Pickle::Memory(_)) {
+            let t = crate::poc::start();
+            let compression = crate::poc::FLAGS.compression.unwrap_or_default();
+            let (codec, payload) = crate::format::encode_payload(data, compression);
+            crate::poc::stop(crate::poc::K::Precompress, t);
+            Some((codec, payload.into_owned()))
+        } else {
+            None
+        };
         let staged = Staged {
             serial,
             restored,
             pickle,
+            encoded,
         };
         self.records.insert(oid, staged);
         Ok(())
@@ -264,6 +276,20 @@ impl Staging {
             len: data.len(),
             hash: xxh3_64(data),
         })
+    }
+
+    /// POC: take the payloads that the store calls encoded, in oid order,
+    /// when every record has one.
+    pub(crate) fn take_encoded(&mut self) -> Option<Vec<(crate::format::Codec, Vec<u8>)>> {
+        if self.records.values().any(|s| s.encoded.is_none()) {
+            return None;
+        }
+        Some(
+            self.records
+                .values_mut()
+                .map(|s| s.encoded.take().unwrap())
+                .collect(),
+        )
     }
 
     /// Return the bytes of the pickles in memory.

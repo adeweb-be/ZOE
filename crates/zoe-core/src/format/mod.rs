@@ -62,6 +62,7 @@ pub use codec::{Codec, Compression};
 
 #[cfg(test)]
 pub(crate) use codec::EMPTY_ZSTD_PAYLOADS;
+pub(crate) use codec::encode as encode_payload;
 
 /// The name and version of the format, in the `format` row of `meta`.
 /// An open refuses a store with another name.
@@ -176,6 +177,18 @@ pub fn encode_frame_with(
         "the data of a frame fits in 4 GiB"
     );
     let (codec, payload) = codec::encode(data, compression);
+    encode_frame_raw(space, key, branch, prev, codec, &payload)
+}
+
+/// Encode the frame of the row `key` of `space` around an encoded payload.
+pub(crate) fn encode_frame_raw(
+    space: KeySpace,
+    key: &[u8],
+    branch: u32,
+    prev: Tid,
+    codec: Codec,
+    payload: &[u8],
+) -> Vec<u8> {
     let payload_len = u32::try_from(payload.len()).expect("a payload fits in 4 GiB");
     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
     frame.push(FRAME_VERSION);
@@ -187,9 +200,9 @@ pub fn encode_frame_with(
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&0u16.to_le_bytes());
-    let checksum = checksum(space, key, &frame[..24], &[], &payload);
+    let checksum = checksum(space, key, &frame[..24], &[], payload);
     frame.extend_from_slice(&checksum.to_le_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     frame
 }
 

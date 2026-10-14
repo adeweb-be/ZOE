@@ -83,6 +83,17 @@ const RUOK: &[u8] = b"ruok";
 /// waits for room. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
+/// POC: the window, from ZOE_POC_QUEUE.
+pub(crate) fn queue() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("ZOE_POC_QUEUE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(QUEUE)
+    });
+    *N
+}
+
 /// The longest time that a connection reads and drops bytes at a stop,
 /// after its writer sent its last frame and shut down its side, when it
 /// cannot read the send queue of its socket. A stock client closes its
@@ -439,7 +450,7 @@ pub(crate) async fn serve_stream(
         }
     }
 
-    let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storages.client_queue);
+    let (outbox, mut inbox, mut closing) = Outbox::new(queue(), storages.client_queue);
     let mut calls = Calls::new(
         storages,
         outbox.clone(),

@@ -206,6 +206,7 @@ impl RedbBackend {
     /// Write new records with `compression`. The backend reads records of
     /// every codec, whatever this setting.
     pub(crate) fn with_compression(self, compression: Compression) -> Self {
+        let compression = crate::poc::FLAGS.compression.unwrap_or(compression);
         Self {
             compression,
             ..self
@@ -308,6 +309,25 @@ impl Backend for RedbBackend {
                     let (key, value) = entry.map_err(backend)?;
                     inside(oid, key.value(), start..end)?;
                     Self::record(oid, key.value(), value.value()).map(Some)
+                }
+                None => Ok(None),
+            }
+        })
+        .collect()
+    }
+
+    fn current_tids(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        oids.map(|oid| {
+            let start = format::record_key(oid, Tid::ZERO);
+            let end = format::record_key(oid, Tid::MAX);
+            let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
+            match range.next_back() {
+                Some(entry) => {
+                    let (key, _) = entry.map_err(backend)?;
+                    inside(oid, key.value(), start..end)?;
+                    Ok(Some(format::split_record_key(key.value()).1))
                 }
                 None => Ok(None),
             }
@@ -449,6 +469,8 @@ impl Backend for RedbBackend {
     }
 
     fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)> {
+        let t = crate::poc::start();
+        let r = (|| -> Result<(Option<Record>, Option<Tid>)> {
         let txn = self.db.begin_read().map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;
         let start = format::record_key(oid, Tid::ZERO);
@@ -479,6 +501,10 @@ impl Backend for RedbBackend {
             None => None,
         };
         Ok((before, next))
+        })();
+        crate::poc::stop(crate::poc::K::Load, t);
+        crate::poc::add(crate::poc::K::Loads, 1);
+        r
     }
 
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>> {
@@ -788,6 +814,7 @@ impl WriteTxn for RedbWrite<'_> {
         for record in new {
             let (oid, prev, data) = record?;
             let key = format::record_key(oid, tid);
+            let t = crate::poc::start();
             let frame = format::encode_frame_with(
                 KeySpace::Records,
                 &key,
@@ -796,10 +823,45 @@ impl WriteTxn for RedbWrite<'_> {
                 &data,
                 self.compression,
             );
+            crate::poc::stop(crate::poc::K::Encode, t);
+            let t = crate::poc::start();
             records.insert(&key, frame.as_slice()).map_err(backend)?;
             index
                 .insert(&format::txn_oid_key(tid, oid), ())
                 .map_err(backend)?;
+            crate::poc::stop(crate::poc::K::Insert, t);
+            crate::poc::add(crate::poc::K::Records, 1);
+            self.max_oid = self.max_oid.max(Some(oid));
+        }
+        Ok(())
+    }
+
+    fn put_encoded_records(
+        &mut self,
+        tid: Tid,
+        new: &mut dyn Iterator<Item = (Oid, Tid, format::Codec, &[u8])>,
+    ) -> Result<()> {
+        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
+        for (oid, prev, codec, payload) in new {
+            let key = format::record_key(oid, tid);
+            let t = crate::poc::start();
+            let frame = format::encode_frame_raw(
+                KeySpace::Records,
+                &key,
+                format::MAIN_BRANCH,
+                prev,
+                codec,
+                payload,
+            );
+            crate::poc::stop(crate::poc::K::Encode, t);
+            let t = crate::poc::start();
+            records.insert(&key, frame.as_slice()).map_err(backend)?;
+            index
+                .insert(&format::txn_oid_key(tid, oid), ())
+                .map_err(backend)?;
+            crate::poc::stop(crate::poc::K::Insert, t);
+            crate::poc::add(crate::poc::K::Records, 1);
             self.max_oid = self.max_oid.max(Some(oid));
         }
         Ok(())
@@ -943,7 +1005,9 @@ impl WriteTxn for RedbWrite<'_> {
                     .map_err(backend)?;
             }
         }
+        let t = crate::poc::start();
         self.txn.commit().map_err(backend)?;
+        crate::poc::stop(crate::poc::K::Commit, t);
         if let Some(tid) = self.written_tid {
             self.last_tid.store(tid.0, Ordering::Release);
         }

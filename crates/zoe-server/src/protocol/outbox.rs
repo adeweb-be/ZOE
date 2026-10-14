@@ -196,7 +196,7 @@ impl Drop for Charge {
         self.flow.0.send_modify(|count| {
             count.waiting -= self.bytes;
             if self.sent && count.waiting <= WAITING {
-                count.window = (count.window + 1).min(QUEUE);
+                count.window = (count.window + 1).min(super::queue());
             }
         });
     }

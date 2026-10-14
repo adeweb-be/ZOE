@@ -93,6 +93,11 @@ impl Default for Compression {
     }
 }
 
+thread_local! {
+    static CCTX: std::cell::RefCell<Option<(i32, Compressor<'static>)>> = const { std::cell::RefCell::new(None) };
+    static DCTX: std::cell::RefCell<Option<Decompressor<'static>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Encode `data` for the payload of a frame. Return the codec and the
 /// payload.
 pub(crate) fn encode(data: &[u8], compression: Compression) -> (Codec, Cow<'_, [u8]>) {
@@ -115,6 +120,18 @@ fn zstd_smaller(data: &[u8], level: i32) -> Option<Vec<u8>> {
     // smaller, because it needs some free space in the buffer. Then the
     // data is stored as it is. That costs a few bytes and is correct.
     let mut packed = Vec::with_capacity(data.len().checked_sub(1)?);
+    if crate::poc::FLAGS.zstd_tls {
+        CCTX.with_borrow_mut(|slot| {
+            if slot.as_ref().is_none_or(|(l, _)| *l != level) {
+                let mut c = Compressor::new(level).ok()?;
+                c.include_contentsize(true).ok()?;
+                *slot = Some((level, c));
+            }
+            let (_, c) = slot.as_mut()?;
+            c.compress_to_buffer(data, &mut packed).ok()
+        })?;
+        return (packed.len() < data.len()).then_some(packed);
+    }
     let mut compressor = Compressor::new(level).ok()?;
     // The reader needs the data length in the zstd frame header.
     compressor.include_contentsize(true).ok()?;
@@ -138,9 +155,18 @@ fn unzstd(stored: &[u8]) -> Result<Vec<u8>, FrameError> {
     let mut data = Vec::new();
     data.try_reserve_exact(len)
         .map_err(|_| FrameError::Payload)?;
-    let written = Decompressor::new()
-        .and_then(|mut decompressor| decompressor.decompress_to_buffer(stored, &mut data))
-        .map_err(|_| FrameError::Payload)?;
+    let written = if crate::poc::FLAGS.zstd_tls {
+        DCTX.with_borrow_mut(|slot| {
+            if slot.is_none() {
+                *slot = Some(Decompressor::new()?);
+            }
+            slot.as_mut().unwrap().decompress_to_buffer(stored, &mut data)
+        })
+    } else {
+        Decompressor::new()
+            .and_then(|mut decompressor| decompressor.decompress_to_buffer(stored, &mut data))
+    }
+    .map_err(|_| FrameError::Payload)?;
     if written != len {
         return Err(FrameError::Payload);
     }

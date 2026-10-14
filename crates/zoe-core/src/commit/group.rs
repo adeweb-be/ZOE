@@ -49,6 +49,8 @@ pub(super) struct Member {
     pub(super) tid: Option<Tid>,
     /// True for a restore transaction whose finish commits without a sync.
     pub(super) deferred: bool,
+    /// POC: the payloads that the transaction thread encoded, in oid order.
+    pub(super) encoded: Option<Vec<(crate::format::Codec, Vec<u8>)>>,
     pub(super) staged: Staging,
     pub(super) blobs: BTreeMap<Oid, PendingBlob>,
     pub(super) user: Vec<u8>,
@@ -168,6 +170,9 @@ impl Drop for Lead<'_> {
 /// and the store halts. The write commits without a sync when each of
 /// these members is a deferred restore.
 fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
+    crate::poc::add(crate::poc::K::Batches, 1);
+    crate::poc::add(crate::poc::K::Members, batch.len() as u64);
+    let held = crate::poc::start();
     let mut sequencer = store.lock_sequencer();
     let Some(start) = *sequencer else {
         return batch
@@ -206,7 +211,10 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
             tracing::info_span!("fsync", commits)
         };
-        match span.in_scope(|| write(store, &mut members, deferred)) {
+        let t = crate::poc::start();
+        let written = span.in_scope(|| write(store, &mut members, deferred));
+        crate::poc::stop(crate::poc::K::LeaderWrite, t);
+        match written {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this
@@ -240,6 +248,7 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
         }
     }
     drop(sequencer);
+    crate::poc::stop(crate::poc::K::SeqHeld, held);
     if synced > 0
         && let Some(observer) = store.observer()
     {
@@ -274,7 +283,20 @@ fn write(
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
         // A spilled pickle is read back here, one at a time.
-        write.put_records(tid, &mut member.staged.records())?;
+        if let Some(encoded) = member.encoded.as_ref() {
+            write.put_encoded_records(
+                tid,
+                &mut member
+                    .staged
+                    .iter()
+                    .zip(encoded)
+                    .map(|((oid, staged), (codec, payload))| {
+                        (oid, staged.serial, *codec, payload.as_slice())
+                    }),
+            )?;
+        } else {
+            write.put_records(tid, &mut member.staged.records())?;
+        }
         for (oid, _) in member.staged.iter() {
             if let Some(blob) = member.blobs.get(&oid) {
                 write.put_blob(oid, tid, blob.record())?;
@@ -289,7 +311,7 @@ fn write(
             status: TxnStatus::Committed,
         })?;
     }
-    if deferred {
+    if deferred || crate::poc::FLAGS.nosync {
         write.commit_deferred()?;
     } else {
         write.commit()?;

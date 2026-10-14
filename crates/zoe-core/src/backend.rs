@@ -115,6 +115,15 @@ pub trait Backend: Send + Sync {
         oids.map(|oid| self.load_before(oid, Tid::MAX)).collect()
     }
 
+    /// POC: the tid of the current version of each oid, with no payload read.
+    fn current_tids(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
+        Ok(self
+            .load_current(oids)?
+            .into_iter()
+            .map(|r| r.map(|r| r.tid))
+            .collect())
+    }
+
     /// Return the pickle that `tid` wrote for `oid`.
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
 
@@ -290,6 +299,15 @@ pub trait WriteTxn {
             self.put_record(oid, tid, prev, &data)?;
         }
         Ok(())
+    }
+
+    /// POC: stage versions whose payloads the caller encoded.
+    fn put_encoded_records(
+        &mut self,
+        _tid: Tid,
+        _records: &mut dyn Iterator<Item = (Oid, Tid, Codec, &[u8])>,
+    ) -> Result<()> {
+        unimplemented!("put_encoded_records")
     }
 
     /// Stage the blob record of the version of `oid` that `tid` writes.

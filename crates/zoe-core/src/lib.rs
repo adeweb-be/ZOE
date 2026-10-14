@@ -15,6 +15,7 @@ mod format;
 mod guard;
 mod lock;
 mod pack;
+pub mod poc;
 mod read;
 mod redb_backend;
 mod sequence;

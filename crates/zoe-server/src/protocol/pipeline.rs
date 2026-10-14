@@ -379,7 +379,7 @@ impl Calls {
             stopping,
             read_only: false,
             lane: Arc::new(Lane::new()),
-            slots: Arc::new(Semaphore::new(QUEUE)),
+            slots: Arc::new(Semaphore::new(super::queue())),
             running: Running::new(),
             ended: Ended::new(),
         }
@@ -430,7 +430,7 @@ impl Calls {
         let slots = Arc::clone(&self.slots);
         async move {
             let _all = slots
-                .acquire_many_owned(QUEUE as u32)
+                .acquire_many_owned(super::queue() as u32)
                 .await
                 .expect("the slots of a connection never close");
         }
@@ -684,7 +684,7 @@ mod tests {
             let early = tokio::time::timeout(Duration::from_millis(50), connection.quiet()).await;
             assert!(early.is_err());
             let mut others = Vec::new();
-            for _ in 1..QUEUE {
+            for _ in 1..super::queue() {
                 others.push(
                     tokio::time::timeout(limit, connection.ticket(&ping))
                         .await
