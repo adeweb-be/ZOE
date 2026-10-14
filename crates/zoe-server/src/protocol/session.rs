@@ -4234,10 +4234,11 @@ mod tests {
     /// The message `info` with the sizes of `storage`.
     fn info_of(storage: &NamedStorage) -> Vec<u8> {
         let size = storage.size().unwrap();
+        let length = storage.store.object_count().unwrap_or(0);
         message::notify(
             "info",
             vec![Value::Map(vec![
-                (Value::from("length"), Value::from(0)),
+                (Value::from("length"), Value::from(length)),
                 (Value::from("size"), Value::from(size)),
             ])],
         )
