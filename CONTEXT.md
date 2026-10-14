@@ -128,6 +128,14 @@ _Avoid_: outbox (that word belongs to post-commit delivery), send buffer
 The queue of one connection that holds the replies of its session, a few frames (`QUEUE`); the session waits while it is full, so a slow client slows only its own connection.
 _Avoid_: outbox, reply buffer
 
+**Stop**:
+The graceful end of a server on SIGTERM or SIGINT: it accepts no more connections, runs the calls that it received, so a received `tpc_finish` commits and gets its reply, aborts the open transactions, closes each connection, then closes the stores.
+_Avoid_: kill (SIGKILL is not a stop), drain
+
+**Shutdown timeout**:
+The longest time that a stop takes, `--shutdown-timeout`; at its end the process exits, and the store of a session whose call still runs does not close cleanly.
+_Avoid_: grace period (that is the setting of the orchestrator, which must be longer)
+
 ## Operations
 
 **Pack**:
@@ -153,6 +161,18 @@ _Avoid_: change log, event stream, CDC
 **Scrub**:
 A walk of the whole store that verifies every checksum and reports every mismatch.
 _Avoid_: fsck, verify (verify checks references and classes)
+
+**Dump**:
+One file that `zoe backup` writes: the transactions of one tid range with their records and blobs, the ends of the sequences, and a BLAKE3 hash of its bytes; a backup never changes it.
+_Avoid_: snapshot (a snapshot is a view of the store), backup file
+
+**Full dump**:
+The first dump of a chain: every transaction of the store, from tid 0.
+_Avoid_: base backup
+
+**Chain of dumps**:
+The full dump and the dumps after it, each one starting after the last tid of the dump before it; one backup directory holds one chain, and `zoe restore` reads the chain in order.
+_Avoid_: backup set, backup history
 
 **Deployment tier**:
 One of the four Kubernetes shapes: in-process (0), one server (1), leader and follower (2), stateless fronts over a distributed backend (3).
