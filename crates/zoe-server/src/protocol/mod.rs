@@ -534,6 +534,15 @@ pub(crate) async fn serve_stream(
                 break;
             }
         };
+        // `register` ended before the reader read this frame. So the
+        // session tells if the connection declared `trace_context`.
+        if call.context.is_some() && !calls.traces() {
+            tracing::warn!(
+                client = peer.as_str(),
+                "a frame is not a call: it has a trace context, and the connection did not declare trace_context"
+            );
+            break;
+        }
         if call.is_heartbeat() {
             continue;
         }

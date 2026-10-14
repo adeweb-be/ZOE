@@ -547,15 +547,26 @@ impl Session {
     }
 
     /// Return the span of `call` in the traces: a span named after its
-    /// method, with the storage of the session. Enter it inside the span
-    /// of the connection.
+    /// method, with the storage of the session, in the trace of the
+    /// traceparent of the call, if it has one. Enter it inside the span of
+    /// the connection.
     pub(crate) fn request(&self, call: &Call) -> tracing::Span {
-        crate::telemetry::request(&call.method, &self.storage.name)
+        crate::telemetry::request(&call.method, &self.storage.name, call.traceparent())
     }
 
     /// Tell if `register` selected the storage of the session.
     pub(crate) fn is_registered(&self) -> bool {
         self.registration.get().is_some()
+    }
+
+    /// Tell if the server accepted `trace_context` from the declaration of
+    /// the client. Only then can a call of the connection have a trace
+    /// context.
+    pub(crate) fn traces(&self) -> bool {
+        self.registration
+            .get()
+            .and_then(|r| r.extensions.as_deref())
+            .is_some_and(|accepted| accepted.contains(&negotiation::TRACE_CONTEXT))
     }
 
     /// Tell if the client registered read-only.
@@ -1892,6 +1903,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -2018,6 +2030,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register =
             |name: &str| request("register", vec![Value::from(name), Value::Boolean(false)]);
@@ -2575,6 +2588,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2631,6 +2645,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2845,12 +2860,29 @@ mod tests {
         s
     }
 
+    #[test]
+    fn only_a_declaration_of_trace_context_lets_the_calls_have_a_trace_context() {
+        assert!(!session("traces-unregistered").session.traces());
+        let mut stock = session("traces-stock");
+        done(call(
+            &mut stock,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        assert!(!stock.session.traces());
+        let other = declaring("traces-other", false, &["sequences"]);
+        assert!(!other.session.traces());
+        let s = declaring("traces", false, &["sequences", "trace_context"]);
+        assert!(s.session.traces());
+    }
+
     fn sequence_next(name: Value) -> Call {
         Call {
             id: Value::from(1),
             oneway: false,
             method: "sequence_next".into(),
             args: vec![name],
+            context: None,
         }
     }
 
@@ -3768,6 +3800,7 @@ mod tests {
             oneway: true,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -4108,6 +4141,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register = vec![Value::from("1"), Value::Boolean(false)];
         calls
@@ -4317,6 +4351,7 @@ mod tests {
                 oneway: false,
                 method: "loadBefore".into(),
                 args: vec![p64(42), p64(u64::MAX >> 1)],
+                context: None,
             };
             let mut reply = Reply::new(room);
             let outcome = session.call(&call, &mut reply);
@@ -4375,6 +4410,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
