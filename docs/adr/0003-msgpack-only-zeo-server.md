@@ -8,7 +8,7 @@ Plone clusters talk to storage through `ZEO.ClientStorage`. Asking every site to
 
 ## Decision
 
-`zoe serve` speaks the ZEO 6 msgpack protocol so that an unmodified `ZEO.ClientStorage` connects. It replaces `runzeo`, not the client. ZOE's own additions (`lock_intent`, `client_resolve`, `trace_context`) are extensions negotiated at registration; a stock client never sees them.
+`zoe serve` speaks the ZEO 6 msgpack protocol so that an unmodified `ZEO.ClientStorage` connects. It replaces `runzeo`, not the client. ZOE's own additions (`lock_intent`, `trace_context`) are extensions negotiated at registration; a stock client never sees them. A conflict that only the client can resolve needs no extension: the reply of `vote` lists it as ZEO 6 does, and a stock client resolves it (ADR 0004).
 
 ## Consequences
 

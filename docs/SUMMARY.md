@@ -39,6 +39,7 @@
   - [0027. The blob directory](adr/0027-blob-directory.md)
   - [0028. The zoe command](adr/0028-the-zoe-command.md)
   - [0029. The frame checksum covers the key space](adr/0029-key-space-in-the-checksum.md)
+  - [0030. Dump files: a format of ZOE's own, one file per tid range](adr/0030-dump-files.md)
 
 # Reference
 
@@ -47,6 +48,8 @@
   - [Free-threading in persistent, BTrees and zodbpickle](spikes/free-threading-upstream.md)
   - [Byte-identical pickle round trip in zoe-pickle](spikes/pickle-round-trip.md)
   - [redb versus an append-only log for the record store](spikes/record-store.md)
+  - [The ZEO 6 wire contract, recorded from a stock server](spikes/zeo-wire.md)
+  - [A deterministic simulator for the server](spikes/deterministic-simulation.md)
 - [Finding: persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
 - [Finding: zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)
 - [Finding: BTrees turns the GIL on in a ZODB application on CPython 3.14t](findings/btrees-free-threading.md)
