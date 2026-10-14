@@ -129,7 +129,7 @@ impl NativeClient {
     /// raises at once.
     #[new]
     #[pyo3(signature = (host, port, storage, *, read_only, extensions, wait_timeout, traceparent=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         host: String,
@@ -176,6 +176,8 @@ impl NativeClient {
         })
     }
 
+    // The class is frozen, so it has no `__clear__`. The callable makes no
+    // cycle that the collector cannot break at another object.
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(traceparent) = &self.traceparent {
             visit.call(traceparent)?;

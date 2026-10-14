@@ -32,9 +32,8 @@ TCP address, one connection, one transaction at a time, no cache, no blob
 and no reconnect. It declares `sequences`, and `trace_context` when the
 package `opentelemetry` is installed, and sends the traceparent as the
 client of ZEO does. It speaks only the msgpack protocol `M5`: a stock ZEO
-server needs `msgpack true`. `_NOT_BUILT` names
-the arguments whose feature it does not have yet. `native` is false by
-default.
+server needs `msgpack true`. `_NOT_BUILT` names the arguments whose feature
+it does not have yet. `native` is false by default.
 """
 
 import contextvars
@@ -55,6 +54,7 @@ from ZODB.POSException import (
 from ZODB.utils import maxtid, z64
 
 try:
+    from opentelemetry.trace import get_current_span
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
@@ -81,6 +81,9 @@ def _traceparent():
     Without a valid current span, or without OpenTelemetry, return None.
     """
     if _PROPAGATOR is None:
+        return None
+    # Without a valid span, build no carrier.
+    if not get_current_span().get_span_context().is_valid:
         return None
     carrier = {}
     _PROPAGATOR.inject(carrier)

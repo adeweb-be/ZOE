@@ -757,11 +757,13 @@ async fn a_call_inside_traced_carries_the_traceparent() {
         assert_eq!(parts.get(4), Some(&context));
         peer
     });
-    let client = Client::open(runtime, addr(), "1", &tracing())
-        .await
-        .unwrap();
-    assert_eq!(client.extensions(), ["trace_context".to_owned()]);
     let traced = Some(TRACEPARENT.to_owned());
+    // `register` and `get_info` have four elements, also inside `traced`:
+    // `Peer::recv` reads only four.
+    let options = tracing();
+    let open = Client::open(runtime, addr(), "1", &options);
+    let client = zoe_client::traced(traced.clone(), open).await.unwrap();
+    assert_eq!(client.extensions(), ["trace_context".to_owned()]);
     let load = client.load_before(Oid(1), Tid(9));
     let loaded = zoe_client::traced(traced.clone(), load).await;
     assert_eq!(loaded.unwrap(), None);
