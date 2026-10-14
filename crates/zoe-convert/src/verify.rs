@@ -277,7 +277,7 @@ fn blob(store: &Store, oid: Oid, tid: Tid, report: &mut Verification) {
                 report.blob_files.push(BlobProblem {
                     oid,
                     tid,
-                    error: error.to_string(),
+                    error: blob_error(store, oid, tid, error),
                 });
             }
         }
@@ -286,6 +286,25 @@ fn blob(store: &Store, oid: Oid, tid: Tid, report: &mut Verification) {
             .push(frame_problem(Some((oid, tid)), error)),
     }
 }
+
+/// Return the text of `error`, the failed check of the blob file of `oid`
+/// at `tid`. The text of a missing file says "missing". The text of a file
+/// that does not match its blob record does not. The finding gives the oid
+/// and the tid, so the text names no path: a path can hold any word.
+fn blob_error(store: &Store, oid: Oid, tid: Tid, error: ZoeError) -> String {
+    match (store.has_blob_file(oid, tid), error) {
+        (Ok(false), _) => MISSING_BLOB_FILE.to_owned(),
+        (Ok(true), ZoeError::CorruptBlob { .. }) => DAMAGED_BLOB_FILE.to_owned(),
+        (_, error) => error.to_string(),
+    }
+}
+
+/// The text of a blob file that is missing.
+const MISSING_BLOB_FILE: &str = "the blob file is missing";
+
+/// The text of a blob file that does not match its blob record.
+const DAMAGED_BLOB_FILE: &str =
+    "the blob file does not match the size and the BLAKE3 hash of its blob record";
 
 /// Count the class of the current record `data` of `oid` at `tid`, and
 /// check its references.
@@ -475,6 +494,46 @@ mod tests {
         let report = verify(&store, None);
         assert_eq!(report.blobs, 1);
         assert_eq!(report.problems(), 0, "{report:?}");
+    }
+
+    #[test]
+    fn a_missing_blob_file_and_a_damaged_one_have_two_texts() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-verify-blob-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let pickle = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+        for oid in [Oid(0), Oid(1)] {
+            let mut file = store.new_blob_file().unwrap();
+            file.write_all(b"bytes").unwrap();
+            txn.store_blob(oid, Tid::ZERO, pickle, file).unwrap();
+        }
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        let (missing, damaged) = (
+            store.blob_path(Oid(0), tid).unwrap(),
+            store.blob_path(Oid(1), tid).unwrap(),
+        );
+        std::fs::remove_file(&missing).unwrap();
+        let mut permissions = std::fs::metadata(&damaged).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&damaged, permissions).unwrap();
+        std::fs::write(&damaged, b"bytez").unwrap();
+
+        let report = verify(&store, None);
+        let texts: Vec<_> = report
+            .blob_files
+            .iter()
+            .map(|p| (p.oid, p.error.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            [(Oid(0), MISSING_BLOB_FILE), (Oid(1), DAMAGED_BLOB_FILE)]
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -307,6 +307,28 @@ impl Store {
     /// crash left open fails with `NotClosedCleanly`: a writer open
     /// rebuilds the free-space map of its database.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with(dir, Options::default())
+    }
+
+    /// Open the existing store in the directory `dir` for reads only, with
+    /// `options`, as `open_read_only` does.
+    ///
+    /// With `options.blob_dir`, the store reads its blob files in that
+    /// directory. The call changes no byte and creates nothing in the blob
+    /// directory or in the directory that holds it, and neither need exist.
+    /// The path must end in a name that is UTF-8, and an existing entry
+    /// there must be a directory. As `open_read_only`, the call does not
+    /// check that the blob directory is the one of the store:
+    /// `check_blob_dir` does.
+    pub fn open_read_only_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        let relocated = match options.blob_dir.as_deref().map(blob_location) {
+            Some(location) => {
+                let (parent, name) = location?;
+                let parent: Box<dyn blob::BlobDir> = Box::new(blob::ReadOnlyDir::new(parent));
+                Some((parent, name))
+            }
+            None => None,
+        };
         let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
         let db = redb::Builder::new()
             .open_read_only(dir.path(DATABASE))
@@ -315,8 +337,14 @@ impl Store {
                 e => ZoeError::Backend(Box::new(e)),
             })?;
         let backend = RedbBackend::open_read_only(db)?;
-        let options = Options::default();
-        Self::assemble(backend, dir, Box::new(SystemClock), options, true, None)
+        Self::assemble(
+            backend,
+            dir,
+            Box::new(SystemClock),
+            options,
+            true,
+            relocated,
+        )
     }
 
     /// Make a store from an open backend and the directory that holds its
@@ -465,9 +493,15 @@ impl Store {
         self.backend.remove_record_for_test(oid, tid)
     }
 
-    /// Tell if no transaction holds or waits for a lock. A test of a skin
-    /// uses it to show that every lock is released.
-    #[doc(hidden)]
+    /// Tell if no transaction holds or waits for a lock. The method changes
+    /// nothing.
+    ///
+    /// The lock table of a store that the process just opened is empty, so
+    /// it holds no stale entry. For this reason, the readiness of
+    /// `zoe serve` reads the method once after the open of each store. A
+    /// running transaction holds locks, and these locks are not stale. The
+    /// lock table lives in the memory of one process, so the method tells
+    /// nothing about other processes.
     pub fn lock_table_is_empty(&self) -> bool {
         self.locks.is_empty()
     }
@@ -528,6 +562,24 @@ impl Store {
     pub fn blob_path(&self, oid: Oid, tid: Tid) -> Result<PathBuf> {
         self.blob_record(oid, tid)?;
         Ok(self.blobs().path(oid, tid))
+    }
+
+    /// Fail with `MissingBlobDir` when the store has blob records and its
+    /// blob directory has no layout file. Then the blob directory of the
+    /// open is not the one of the store: the option is missing or wrong, or
+    /// the directory is not mounted. The call changes nothing.
+    ///
+    /// A writer open makes this check itself. A read-only open does not, so
+    /// a reader that needs the blob files calls it.
+    pub fn check_blob_dir(&self) -> Result<()> {
+        self.blobs().check_present(&**self.backend)
+    }
+
+    /// Tell if the blob file that `tid` wrote for `oid` exists. This reads
+    /// no byte of the file. A missing blob record is `NotFound`.
+    pub fn has_blob_file(&self, oid: Oid, tid: Tid) -> Result<bool> {
+        self.blob_record(oid, tid)?;
+        self.blobs().has_file(oid, tid)
     }
 
     /// Return the blob store.
@@ -1386,5 +1438,83 @@ mod tests {
         let _reader = Store::open_read_only(&dir).unwrap();
         assert!(dir.join(LOCK).is_file());
         assert!(matches!(Store::open(&dir), Err(ZoeError::Locked)));
+    }
+
+    /// Return every entry under `dir`, by path: the bytes of a file, `None`
+    /// for a directory.
+    fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                    entries.insert(path, None);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    entries.insert(path, Some(bytes));
+                }
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn a_read_only_open_reads_a_blob_directory_elsewhere_and_creates_nothing() {
+        let root = fresh_dir("read-only-blob-dir");
+        let (dir, blobs) = (root.join("store"), root.join("blobs-elsewhere"));
+        let with = |blob_dir: &Path| Options {
+            blob_dir: Some(blob_dir.to_path_buf()),
+            ..Options::default()
+        };
+        let (oid, tid) = {
+            let store = Store::open_with(&dir, with(&blobs)).unwrap();
+            let mut file = store.new_blob_file().unwrap();
+            io::Write::write_all(&mut file, b"bytes").unwrap();
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store_blob(Oid(1), Tid::ZERO, b"a", file).unwrap();
+            txn.vote().unwrap();
+            (Oid(1), txn.finish().unwrap())
+        };
+        let before = tree(&root);
+
+        let store = Store::open_read_only_with(&dir, with(&blobs)).unwrap();
+        store.check_blob_dir().unwrap();
+        store.verify_blob(oid, tid).unwrap();
+        assert!(store.has_blob_file(oid, tid).unwrap());
+        assert!(store.blob_path(oid, tid).unwrap().starts_with(&blobs));
+        assert!(matches!(store.new_blob_file(), Err(ZoeError::ReadOnly)));
+        drop(store);
+
+        // The default blob directory, an empty one and one whose parent
+        // does not exist are not the blob directory of the store.
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let before = {
+            let mut before = before;
+            before.insert(empty.clone(), None);
+            before
+        };
+        let wrong = [
+            None,
+            Some(empty.clone()),
+            Some(root.join("no").join("blobs")),
+        ];
+        for blob_dir in wrong {
+            let expected = blob_dir.clone().unwrap_or_else(|| dir.join("blobs"));
+            let options = Options {
+                blob_dir,
+                ..Options::default()
+            };
+            let store = Store::open_read_only_with(&dir, options).unwrap();
+            match store.check_blob_dir() {
+                Err(ZoeError::MissingBlobDir { path }) => assert_eq!(path, expected),
+                other => panic!("{other:?}"),
+            }
+            assert!(!store.has_blob_file(oid, tid).unwrap());
+        }
+        assert_eq!(tree(&root), before);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

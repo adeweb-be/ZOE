@@ -17,13 +17,14 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | Recipe | Does |
 | --- | --- |
 | `just check` | `cargo fmt` check, the `Cargo.lock` of the fuzz targets, clippy with warnings as errors, ruff lint and format check |
-| `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t |
+| `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t, then `just deploy check` |
 | `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan` |
 | `just fuzz` | builds the fuzz targets of `zoe serve` (`crates/zoe-server/fuzz`) with libFuzzer and AddressSanitizer into `target/fuzz`, then runs them for 60 seconds in all; `just fuzz 3600` runs them for an hour, `just fuzz 600 frame` runs only `frame` |
 | `just conformance` | ZODB's storage suites and test modules in-process against `zoe.Storage`, on every interpreter |
 | `just plone` | builds the Plone instance of a scenario under `plone/` into `target/plone` and starts it; `just plone zoe check` creates a Plone site on the zoe scenario by script and reads it over HTTP |
 | `just bench` | benchmarks (not built yet) |
 | `just loupe` | builds and runs Loupe (not built yet) |
+| `just deploy check` | the tests of `deploy/tests` on the deployment files: the Tier 1 manifests, the host units, the Grafana dashboard; `just test` runs it at its end |
 | `just docs` | builds the documentation site into `target/book` |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
 | `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release test` runs the tests of `ci/`. Publishing is not built yet |
@@ -47,7 +48,9 @@ A pull request that touches a red zone needs the human's approval. `CODEOWNERS` 
 - `crates/zoe-core/src/pack/`: pack, because it deletes data.
 - `.github/` (the workflows and `CODEOWNERS`) and `loops/` (the role briefs). Only a human changes these.
 
-Everything else, `ci/` and `devenv.nix` included, merges on the reviewer's approval with the acceptance test, the crash simulation and TSan green.
+Everything else, `ci/` and `devenv.nix` included, merges on the reviewer's approval with the acceptance test and the crash simulation green.
+
+TSan is a phase gate. `just tsan` runs once on `main` at the end of a phase, not for each card or pull request. A race that it reports becomes a card.
 
 ## Stop and ask
 
@@ -71,7 +74,7 @@ Then write `docs/handoffs/<card>.md`: the state, what you tried, what failed, th
 
 Definition of Ready: a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, no dependency on an unmerged card.
 
-Definition of Done: acceptance test green; unit tests added; TSan and the pull-request harness tier green; benchmark numbers posted and inside the regression gate; claims and evidence list what was tested and what was not; reviewer approval; human approval for a red zone; the specification or an ADR updated when behaviour changed.
+Definition of Done: acceptance test green; unit tests added; the pull-request harness tier green; benchmark numbers posted and inside the regression gate; claims and evidence list what was tested and what was not; reviewer approval; human approval for a red zone; the specification or an ADR updated when behaviour changed.
 
 ## Rules
 
