@@ -14,7 +14,7 @@ use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Args};
 use zoe_core::{Clock, Options, PackReport, Store, Tid, timestamp};
 
-use super::{Failure, store_failure};
+use super::{Failure, open_read_only, store_failure};
 
 /// The seconds in a day.
 const DAY: u64 = 86_400;
@@ -84,10 +84,9 @@ pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Re
         ..Options::default()
     };
     let (report, title) = if args.dry_run {
-        // A dry run only reads. A read-only open changes no byte of the
-        // store.
-        let store =
-            Store::open_read_only_with(path, options).map_err(|e| store_failure(path, e))?;
+        // A dry run only reads. A read-only open changes no byte of a
+        // clean store. It repairs a store that a writer left open.
+        let store = open_read_only(path, options)?;
         let report = store.pack_dry_run(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
             "A pack of the store {} as of tid {:#018x} would remove:",

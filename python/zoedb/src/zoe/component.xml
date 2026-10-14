@@ -143,8 +143,9 @@
     </key>
     <key name="listen" datatype="string">
       <description>
-        The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
-        port. The default is 127.0.0.1:8100.
+        The address of the ZEO port, as HOST:PORT, or the path of a unix
+        domain socket: a value with a / is a path, such as ./zeo.sock. A
+        port of 0 takes a free port. The default is 127.0.0.1:8100.
       </description>
     </key>
     <key name="admin-listen" datatype="string">
@@ -156,6 +157,13 @@
     <key name="invalidation-queue-size" datatype="string">
       <description>
         The most transactions that getInvalidations covers.
+      </description>
+    </key>
+    <key name="invalidation-age" datatype="string">
+      <description>
+        Past invalidation-queue-size, getInvalidations also covers a tid
+        younger than this, in whole seconds, such as 3600 or 1h, as the
+        key invalidation-age of ZEO. 0, the default, turns it off.
       </description>
     </key>
     <key name="client-queue-size" datatype="string">

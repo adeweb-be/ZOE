@@ -14,25 +14,123 @@ store and per name, not part of a transaction. It needs a server that
 accepted `sequences` on the connection. Without it, `next()` raises
 `ZODB.POSException.Unsupported`.
 
+When the package `opentelemetry` is installed, each connection also declares
+`trace_context`. When the server accepts it, each call that the client makes
+inside a span carries the W3C traceparent of that span: a fifth element of
+the message, a map with the key `traceparent`. The span of the call on the
+server then joins the trace of the client. A call outside a span has four
+elements. The client exports no span: the application configures
+OpenTelemetry.
+
 `%import zoe` gives the ZConfig section `<zoeclient>`, which opens this class.
 """
+
+import contextvars
 
 from ZEO.asyncio.client import ClientIO, ClientThread, Fallback, Protocol
 from ZEO.asyncio.futures import run_coroutine_threadsafe
 from ZEO.ClientStorage import ClientStorage as ZEOClientStorage
 from ZODB.POSException import ReadOnlyError, Unsupported
 
+try:
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+except ImportError:
+    _PROPAGATOR = None
+else:
+    _PROPAGATOR = TraceContextTextMapPropagator()
+
 __all__ = ["EXTENSIONS", "ClientStorage", "Sequence"]
 
-# The extensions that each connection declares in `register`.
-EXTENSIONS = ("sequences",)
+# The extension that lets a call carry the trace context of the client.
+_TRACE_CONTEXT = "trace_context"
+
+# The extensions that each connection declares in `register`. Without
+# OpenTelemetry, the client has no trace context to send.
+EXTENSIONS = ("sequences",) if _PROPAGATOR is None else ("sequences", _TRACE_CONTEXT)
+
+
+def _traceparent():
+    """Return the W3C traceparent of the current span, or None.
+
+    Without a valid current span, or without OpenTelemetry, return None.
+    """
+    if _PROPAGATOR is None:
+        return None
+    carrier = {}
+    _PROPAGATOR.inject(carrier)
+    return carrier.get("traceparent")
+
+
+class _InContext:
+    """A coroutine that runs each of its steps in the context of its caller.
+
+    The network thread runs the coroutine. ZEO runs the steps of a coroutine
+    without a context of their own, so a step sees the context that the
+    network thread has at that time. This wrapper runs each step in a copy
+    of the context of the thread that made the coroutine. So the current
+    span of OpenTelemetry in a step is the span of the caller.
+    """
+
+    __slots__ = ("_coro", "_context")
+
+    def __init__(self, coro):
+        self._coro = coro
+        self._context = contextvars.copy_context()
+
+    def send(self, value):
+        return self._context.run(self._coro.send, value)
+
+    def throw(self, error):
+        return self._context.run(self._coro.throw, error)
+
+    def close(self):
+        return self._coro.close()
 
 
 class _Protocol(Protocol):
-    """A connection to one server. It declares `EXTENSIONS` in `register`."""
+    """A connection to one server. It declares `EXTENSIONS` in `register`.
+
+    When the server accepted `trace_context`, each call carries the
+    traceparent of the current span.
+    """
 
     # The connection sends the declaration until a server refuses it.
     declares = True
+    # True when the server accepted `trace_context` on the connection.
+    # `ClientStorage.notify_connected` sets it.
+    traces = False
+
+    def finish_connection(self, protocol_version):
+        super().finish_connection(protocol_version)
+        # A connection without a protocol in common has no encoder.
+        self._encode = getattr(self, "encode", None)
+        if self._encode is not None:
+            self.encode = self._encode_call
+
+    def _encode_call(self, message_id, async_, method, args):
+        """Encode a call, with the traceparent of the current span when the
+        connection traces."""
+        traceparent = _traceparent() if self.traces else None
+        return self._encode_traced(message_id, async_, method, args, traceparent)
+
+    def _encode_traced(self, message_id, async_, method, args, traceparent):
+        """Encode a call. With a `traceparent`, add the trace context."""
+        if traceparent is None:
+            return self._encode(message_id, async_, method, args)
+        context = {"traceparent": traceparent}
+        return self._encode(message_id, async_, method, args, context)
+
+    def call_async_iter(self, it):
+        # This is `call_async_iter` of ZEO, with the traceparent of now. The
+        # socket can take the messages after this call ends, in another
+        # context.
+        traceparent = _traceparent() if self.traces else None
+        self.write_message_iter(
+            self._encode_traced(0, True, method, args, traceparent)
+            for method, args in it
+        )
 
     async def _register(self, read_only):
         if self.declares:
@@ -117,13 +215,20 @@ class _ClientThread(ClientThread):
         self._io_kwargs = kwargs
 
     def setup_delegation(self, loop):
-        # This is `ClientRunner.setup_delegation` of ZEO, with `_ClientIO`.
+        # This is `ClientRunner.setup_delegation` of ZEO, with `_ClientIO`,
+        # and an `io_call` that runs its coroutine in the context of its
+        # caller. The asynchronous calls need no change: the event loop
+        # runs a callback of `call_soon_threadsafe` in the context of its
+        # caller.
         self.loop = loop
         self.client = client = _ClientIO(loop, *self._io_args, **self._io_kwargs)
         self.call_sync_co = client.call_sync_co
         self.load_before_co = client.load_before_co
 
         def io_call(coro, wait=True):
+            if _PROPAGATOR is not None:
+                # The call sees the current span of its caller.
+                coro = _InContext(coro)
             future = run_coroutine_threadsafe(coro, loop)
             try:
                 return future.result() if wait else future
@@ -161,6 +266,9 @@ class ClientStorage(ZEOClientStorage):
         super().__init__(*args, _client_factory=_client_factory, **kw)
 
     def notify_connected(self, conn, info):
+        # The calls of the connection carry the trace context only when the
+        # server accepted `trace_context`.
+        conn.protocol.traces = _TRACE_CONTEXT in info.get("extensions", ())
         super().notify_connected(conn, info)
         # A server that got no declaration gives no key `extensions`. Then
         # remove the key of an earlier connection. The key stays during the

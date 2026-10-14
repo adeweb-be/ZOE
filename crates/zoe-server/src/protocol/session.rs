@@ -19,7 +19,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use rmpv::Value;
 use zoe_core::{BlobFile, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
@@ -549,15 +549,26 @@ impl Session {
     }
 
     /// Return the span of `call` in the traces: a span named after its
-    /// method, with the storage of the session. Enter it inside the span
-    /// of the connection.
+    /// method, with the storage of the session, in the trace of the
+    /// traceparent of the call, if it has one. Enter it inside the span of
+    /// the connection.
     pub(crate) fn request(&self, call: &Call) -> tracing::Span {
-        crate::telemetry::request(&call.method, &self.storage.name)
+        crate::telemetry::request(&call.method, &self.storage.name, call.traceparent())
     }
 
     /// Tell if `register` selected the storage of the session.
     pub(crate) fn is_registered(&self) -> bool {
         self.registration.get().is_some()
+    }
+
+    /// Tell if the server accepted `trace_context` from the declaration of
+    /// the client. Only then can a call of the connection have a trace
+    /// context.
+    pub(crate) fn traces(&self) -> bool {
+        self.registration
+            .get()
+            .and_then(|r| r.extensions.as_deref())
+            .is_some_and(|accepted| accepted.contains(&negotiation::TRACE_CONTEXT))
     }
 
     /// Tell if the client registered read-only.
@@ -1016,17 +1027,27 @@ impl Session {
     ///
     /// Return nil when more than `invalidation-queue-size` transactions
     /// that wrote records come after the tid, or when the index does not
-    /// read. The client then verifies its cache.
+    /// read. The client then verifies its cache. A tid younger than
+    /// `invalidation-age` gets every transaction after it, whatever their
+    /// number. The index reads in slices, each a snapshot, so a commit
+    /// never waits for the read.
     fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
         let [tid] = arity::<1>(args, "getInvalidations")?;
         let tid = u64_of(tid)?;
         // The connection gets the invalidation of each commit after `last`.
         let last = self.storage.invalidations.published();
+        let queues = self.storage.queues;
+        // The clock is read only when the age is on, so a server without
+        // the age reads no wall clock here.
+        let limit = if !queues.invalidation_age.is_zero()
+            && clock::younger_than(Tid(tid), queues.invalidation_age, SystemTime::now())
+        {
+            usize::MAX
+        } else {
+            queues.invalidations
+        };
         let oids = match tid.checked_add(1) {
-            Some(from) => {
-                self.store
-                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
-            }
+            Some(from) => self.store.written_oids(Tid(from), last, limit),
             None => Ok(Some(Vec::new())),
         };
         Ok(match oids {
@@ -1894,6 +1915,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -2020,6 +2042,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register =
             |name: &str| request("register", vec![Value::from(name), Value::Boolean(false)]);
@@ -2577,6 +2600,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2633,6 +2657,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2846,12 +2871,29 @@ mod tests {
         s
     }
 
+    #[test]
+    fn only_a_declaration_of_trace_context_lets_the_calls_have_a_trace_context() {
+        assert!(!session("traces-unregistered").session.traces());
+        let mut stock = session("traces-stock");
+        done(call(
+            &mut stock,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        assert!(!stock.session.traces());
+        let other = declaring("traces-other", false, &["sequences"]);
+        assert!(!other.session.traces());
+        let s = declaring("traces", false, &["sequences", "trace_context"]);
+        assert!(s.session.traces());
+    }
+
     fn sequence_next(name: Value) -> Call {
         Call {
             id: Value::from(1),
             oneway: false,
             method: "sequence_next".into(),
             args: vec![name],
+            context: None,
         }
     }
 
@@ -3292,7 +3334,7 @@ mod tests {
     fn get_invalidations_covers_the_gap_or_gives_nil() {
         let queues = Queues {
             invalidations: 2,
-            client: 1_000,
+            ..Queues::DEFAULT
         };
         let mut s = Client::new(storage("get-invalidations", queues), outbox());
         done(call(
@@ -3318,6 +3360,35 @@ mod tests {
         assert_eq!(get(&mut s, p64(u64::MAX)), nothing);
         let fault = failed(call(&mut s, "getInvalidations", vec![Value::from(1)]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn get_invalidations_covers_a_young_tid_past_the_queue_size() {
+        let queues = Queues {
+            invalidations: 2,
+            invalidation_age: std::time::Duration::from_secs(3_600),
+            ..Queues::DEFAULT
+        };
+        let mut s = Client::new(storage("invalidation-age", queues), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let second = commit(&mut s, 2, 2, 0, b"b").unwrap();
+        commit(&mut s, 3, 3, 0, b"c").unwrap();
+        commit(&mut s, 4, 2, second, b"d").unwrap();
+        let last = commit(&mut s, 5, 1, first, b"e").unwrap();
+        let get = |s: &mut Client, tid: Value| done(call(s, "getInvalidations", vec![tid]));
+
+        // Four commits come after `first`, and each oid comes once.
+        assert_eq!(
+            get(&mut s, p64(first)),
+            Value::Array(vec![p64(last), Value::Array(vec![p64(1), p64(2), p64(3)])])
+        );
+        // The tid 0 is from 1900: older than the age.
+        assert_eq!(get(&mut s, p64(0)), Value::Nil);
     }
 
     #[test]
@@ -3769,6 +3840,7 @@ mod tests {
             oneway: true,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -4109,6 +4181,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register = vec![Value::from("1"), Value::Boolean(false)];
         calls
@@ -4318,6 +4391,7 @@ mod tests {
                 oneway: false,
                 method: "loadBefore".into(),
                 args: vec![p64(42), p64(u64::MAX >> 1)],
+                context: None,
             };
             let mut reply = Reply::new(room);
             let outcome = session.call(&call, &mut reply);
@@ -4376,6 +4450,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };

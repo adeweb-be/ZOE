@@ -2,7 +2,7 @@
 
 Loupe is the desktop inspector and editor for ZOE stores and servers: a Tauri 2 application with a React and TypeScript window, built with Vite. Its Rust side is the `zoe-loupe` crate.
 
-Loupe has folder mode, the object browser, time travel and the space screen. It opens a store folder read-only and holds the lock of the store, so a running instance and Loupe never share a store. It shows the root, follows references and resolves Plone paths. For each object it shows the class, the oid, the serial, the size, the decoded state, the outbound references and the history. It never writes to the folder.
+Loupe has folder mode, the object browser, time travel and the space screen. It opens a store folder read-only and holds the lock of the store, so a running instance and Loupe never share a store. It shows the root, follows references and resolves Plone paths. For each object it shows the class, the oid, the serial, the size, the decoded state, the outbound references and the history. It writes to the folder only to repair a store that a writer left open (ADR 0032): then it writes the database file once, at the open, and the window says so with the same text as the commands, `<path>: the store was not closed cleanly: repaired the store`. It writes nothing to a store that was closed cleanly.
 
 Time travel has three parts:
 
@@ -62,7 +62,7 @@ Oids and tids are strings in ZODB form, as `ZODB.utils.oid_repr` writes them: `0
 
 | Command | Arguments | Returns |
 | --- | --- | --- |
-| `open_folder` | `path` | `{ path, lastTid }`. It closes the open folder first. |
+| `open_folder` | `path` | `{ path, lastTid, repaired }`. It closes the open folder first. `repaired` is true when the open repaired the store. |
 | `pick_folder` | none | the folder that the native dialog gives, or null |
 | `root` | none | the root object |
 | `object` | `oid` | the object `oid` |
@@ -92,7 +92,7 @@ A background job runs in a thread of the blocking pool, so the window and the ot
 
 A change is `{ path, before, after }`. `path` is a JSON pointer into the two states, and `""` is the whole state. A side that does not have the value has no field. The diff compares the decoded trees, not the bytes: key order, memo puts and opcode width are not changes, and a reference compares by oid. The module documentation of `crates/zoe-loupe/src/diff.rs` gives the rules and the limits. A value that the state cuts can change in a part that does not show; then the two sides of the change look the same, and the view says so. The comparisons of one diff also have a work budget. Past it, each pair that the diff did not compare is a change: the diff can show a change that is not one, but it never misses a change. A deletion has no state: against a deletion, the diff is one change of the whole state without a value on the side of the deletion.
 
-A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notClosedCleanly`, `noRecord`, `noRecordAsOf`, `noObject`, `refused`, `badId`, `stopped` and `other`. `noRecordAsOf` has the oid and the tid of the view: a later transaction creates the object. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
+A command that fails gives `{ kind, ...parameters }`, for example `{ "kind": "noObject", "path": "/site/x", "segment": "x" }`. The kinds are `noFolder`, `noStore`, `locked`, `notRepaired`, `noRecord`, `noRecordAsOf`, `noObject`, `refused`, `badId`, `stopped` and `other`. `notRepaired` has the `message` of a store that was not closed cleanly and whose repair failed, with the error of the system, for example on a read-only file system: Loupe must write the database file once to repair the store. `noRecordAsOf` has the oid and the tid of the view: a later transaction creates the object. The window shows the UI string `error.<kind>` of the catalog, with the parameters.
 
 The pane shows the start of a large state, and a button shows all of it.
 
