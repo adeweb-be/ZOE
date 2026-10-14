@@ -5,7 +5,7 @@
 //! `config` and `storage`. A key takes a string, an integer or a boolean,
 //! with the syntax of its option. Each `[storages.NAME]` table adds a store
 //! that the server serves under the storage name NAME. Its keys are `path`,
-//! which is necessary, `blob-dir` and `read-only`.
+//! which is necessary, `blob-dir`, `read-only` and `pack-gc`.
 //!
 //! An option on the command line or in its twin wins over the file. So the
 //! file gives only the options that neither of them gives. The stores of
@@ -102,15 +102,18 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
     let mut path = None;
     let mut blob_dir = None;
     let mut read_only = false;
+    let mut pack_gc = true;
     for (key, value) in table {
+        let boolean = || {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("{STORAGES}.{name}.{key} takes true or false"))
+        };
         match key.as_str() {
             "path" => path = Some(directory(name, key, value)?),
             "blob-dir" => blob_dir = Some(directory(name, key, value)?),
-            "read-only" => {
-                read_only = value
-                    .as_bool()
-                    .ok_or_else(|| format!("{STORAGES}.{name}.{key} takes true or false"))?;
-            }
+            "read-only" => read_only = boolean()?,
+            "pack-gc" => pack_gc = boolean()?,
             _ => return Err(format!("{key} is not a key of {STORAGES}.{name}")),
         }
     }
@@ -120,6 +123,7 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
         path,
         blob_dir,
         read_only,
+        pack_gc,
     })
 }
 
@@ -212,12 +216,14 @@ mod tests {
                     path: "c".into(),
                     blob_dir: Some("cb".into()),
                     read_only: false,
+                    pack_gc: true,
                 },
                 Storage {
                     name: "main".into(),
                     path: "m".into(),
                     blob_dir: None,
                     read_only: false,
+                    pack_gc: true,
                 },
             ]
         );
@@ -238,6 +244,23 @@ mod tests {
             .map(|storage| (storage.name.as_str(), storage.read_only))
             .collect();
         assert_eq!(read_only, [("archive", true), ("live", false)]);
+    }
+
+    #[test]
+    fn pack_gc_false_packs_one_store_without_gc() {
+        let config = parse_with(
+            "[storages.kept]\npath = \"k\"\npack-gc = false\n\n\
+             [storages.main]\npath = \"m\"\npack-gc = true\n\n\
+             [storages.other]\npath = \"o\"\n",
+            &[],
+        )
+        .unwrap();
+        let pack_gc: Vec<(&str, bool)> = config
+            .storages
+            .iter()
+            .map(|storage| (storage.name.as_str(), storage.pack_gc))
+            .collect();
+        assert_eq!(pack_gc, [("kept", false), ("main", true), ("other", true)]);
     }
 
     #[test]
@@ -265,6 +288,10 @@ mod tests {
             (
                 "[storages.main]\npath = \"m\"\nread-only = 1\n",
                 "takes true or false",
+            ),
+            (
+                "[storages.main]\npath = \"m\"\npack-gc = \"no\"\n",
+                "storages.main.pack-gc takes true or false",
             ),
             ("[storages.\"\"]\npath = \"m\"\n", "empty name"),
         ] {

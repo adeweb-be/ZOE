@@ -1,18 +1,20 @@
 //! `zoe backup`: write a dump of a store into a backup directory.
 //!
 //! `zoe_convert::backup` does the work. The command opens the store
-//! read-only, so it changes no byte of the store. The first dump of a
-//! directory is the full dump. A later dump holds the transactions after
-//! the last dump. With nothing new, the command writes nothing.
+//! read-only, so it changes no byte of a store that was closed cleanly.
+//! It repairs a store that a writer left open, and says so. The first
+//! dump of a directory is the full dump. A later dump holds the
+//! transactions after the last dump. With nothing new, the command writes
+//! nothing.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 use zoe_convert::Backup;
-use zoe_core::Store;
+use zoe_core::Options;
 
-use super::{Failure, store_failure};
+use super::{Failure, open_read_only};
 
 /// The options of `zoe backup`.
 #[derive(Debug, Args)]
@@ -33,9 +35,9 @@ pub(super) struct BackupArgs {
 /// Run `zoe backup` and write its report to `out`.
 pub(super) fn run(args: &BackupArgs, out: &mut dyn Write) -> Result<(), Failure> {
     let path = &args.path;
-    // A read-only open changes no byte of the store, and fails on a
+    // A read-only open changes no byte of a clean store, and fails on a
     // directory without a store.
-    let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
+    let store = open_read_only(path, Options::default())?;
     let report = zoe_convert::backup(&store, &args.to)
         .map_err(|error| Failure::Message(error.to_string()))?;
     drop(store);

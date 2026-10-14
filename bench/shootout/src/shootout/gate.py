@@ -7,6 +7,10 @@ the baseline in each scenario and cell of the baseline. The gate passes
 when every ratio is at least the ratio of the gate. A cell of the baseline
 without a counterpart in the storage fails the gate, and so does a tree
 without a result of the baseline.
+
+The gate leaves out the scenarios of `LEFT_OUT`, because no read of these
+scenarios reaches the server. The report prints their cells with the
+verdict `left out`. These cells count neither as below nor as missing.
 """
 
 import datetime
@@ -18,6 +22,13 @@ from shootout.environment import python_tag
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
+# The scenarios that the gate leaves out, each with its reason.
+LEFT_OUT = {
+    "read_hot": "it empties the object cache of the connection, then reads "
+    "the objects from the cache of ZEO.ClientStorage, so no read reaches "
+    "the server",
+}
+
 
 def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -> int:
     """Write the gate report to out. Return 0 when the gate passes, else 1."""
@@ -27,7 +38,7 @@ def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -
         print(f"gate: no result of {baseline} under {root}", file=out)
         return 1
 
-    below = missing = total = 0
+    below = missing = left_out = total = 0
     for group in groups:
         machine, python, kind = group
         base = last[group, baseline]
@@ -43,26 +54,34 @@ def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -
         for cell, base_ops in sorted(_cells(base).items()):
             total += 1
             ops = cells.get(cell)
-            if ops is None:
+            value = None if ops is None else ops / base_ops
+            if cell[0] in LEFT_OUT:
+                left_out += 1
+                verdict = "left out"
+            elif value is None:
                 missing += 1
-                print(
-                    ROW.format(*cell, "-", f"{base_ops:.0f}", "-", "missing"), file=out
-                )
-                continue
-            value = ops / base_ops
-            verdict = "pass" if value >= ratio else "FAIL"
-            if value < ratio:
+                verdict = "missing"
+            elif value < ratio:
                 below += 1
+                verdict = "FAIL"
+            else:
+                verdict = "pass"
             row = ROW.format(
-                *cell, f"{ops:.0f}", f"{base_ops:.0f}", f"{value:.2f}", verdict
+                *cell,
+                "-" if ops is None else f"{ops:.0f}",
+                f"{base_ops:.0f}",
+                "-" if value is None else f"{value:.2f}",
+                verdict,
             )
             print(row, file=out)
 
+    for name, reason in LEFT_OUT.items():
+        print(f"left out: {name}, because {reason}", file=out)
     passed = below == 0 and missing == 0
     print(
         f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}, "
-        f"at least {ratio:g}x in each cell; {total} cells, {below} below, "
-        f"{missing} missing",
+        f"at least {ratio:g}x in each cell but {', '.join(LEFT_OUT)}; "
+        f"{total} cells, {below} below, {missing} missing, {left_out} left out",
         file=out,
     )
     return 0 if passed else 1

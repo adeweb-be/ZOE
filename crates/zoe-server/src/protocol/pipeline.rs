@@ -398,6 +398,14 @@ impl Calls {
         self.ended.clone()
     }
 
+    /// Tell if a call of the connection can have a trace context: the
+    /// connection registered, and the server accepted `trace_context`.
+    pub(crate) fn traces(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.traces())
+    }
+
     /// Wait for the ticket of `call`: first a slot, then a turn in the
     /// window for a call of the read pool, or else until at most
     /// `outbox::WAITING` bytes wait, then room for its reply. The future
@@ -603,6 +611,7 @@ mod tests {
             oneway: id == 0,
             method: method.into(),
             args,
+            context: None,
         }
     }
 
