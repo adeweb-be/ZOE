@@ -66,6 +66,8 @@ Before each cell, the harness compares `disk_needed(storage, cell)` with the fre
 
 So the full set needs about 44 GB of free space, and the quick set about 1 GB.
 
+The populate of a value is one transaction: about 0.67 GB at concurrency 64 with objects of 100 KB. Through `ZEO.ClientStorage`, for `zeo` and `zoe-server`, the transaction buffer of the client holds a copy of it in a temporary file under `TMPDIR`, and for `zeo` the commit log of the ZEO server holds a second copy there. These files are outside the work directory and outside the check, so `TMPDIR` needs room for them.
+
 ## Results
 
 Each run of one storage gives one JSON document that validates against [`schema/results.schema.json`](schema/results.schema.json). The document names the storage, the machine (CPU, logical CPUs, memory, kernel, the disk that holds the storage files), the Python build (version, free-threaded or not), the versions of every package and server, the commit, and one entry per scenario and cell. It holds no host name, user name or path.
