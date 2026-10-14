@@ -213,6 +213,15 @@ impl Store {
         Self::open_full(vfs, clock, Options::default())
     }
 
+    /// Open the store in the directory `dir` with a page cache of
+    /// `cache_size` bytes, and create it if necessary. A spike prototype:
+    /// it measures the memory of a conversion with a small page cache.
+    #[doc(hidden)]
+    pub fn open_with_cache_size(dir: impl AsRef<Path>, cache_size: usize) -> Result<Self> {
+        let vfs = OsVfs::new(dir.as_ref())?;
+        Self::open_parts(vfs, SystemClock, Options::default(), Some(cache_size), None)
+    }
+
     /// Open the store in the simulated filesystem `vfs` with no page
     /// cache, and create it if necessary. Each page that a read needs then
     /// comes from the file, so a test can count the bytes that a read
