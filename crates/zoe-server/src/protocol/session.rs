@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use rmpv::Value;
-use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Finished, Oid, Store, Tid, Txn, ZoeError};
 
-use super::blob::{Download, Upload};
+use super::blob::Download;
 use super::clock;
 use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
@@ -392,10 +392,10 @@ struct Open {
     /// The number of conflicts that the last vote listed for the client to
     /// resolve. When it is not 0, the next vote is the second vote.
     listed: u64,
-    /// The blob that the client uploads, from `storeBlobStart` to
+    /// The blob file that the client uploads, from `storeBlobStart` to
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
-    upload: Option<Upload>,
+    upload: Option<BlobFile>,
 }
 
 impl Open {
@@ -1480,9 +1480,17 @@ impl Transaction {
         if open.upload.is_some() {
             return Err(Fault::value_error("storeBlobStart: an upload is open"));
         }
-        let dir = self.session.store.blob_temp_dir()?;
-        let upload = Upload::create(&dir)
-            .map_err(|error| Fault::storage(format!("cannot create an upload file: {error}")))?;
+        // The blob file of the core goes through the `Vfs` of the store.
+        let upload = self
+            .session
+            .store
+            .new_blob_file()
+            .map_err(|error| match error {
+                ZoeError::Io(error) => {
+                    Fault::storage(format!("cannot create an upload file: {error}"))
+                }
+                error => Fault::from(error),
+            })?;
         open.upload = Some(upload);
         Ok(Value::Nil)
     }
@@ -1503,14 +1511,13 @@ impl Transaction {
             .upload
             .as_mut()
             .ok_or_else(|| Fault::value_error("storeBlobChunk: no upload is open"))?;
-        upload
-            .write(chunk)
+        std::io::Write::write_all(upload, chunk)
             .map_err(|error| Fault::storage(format!("cannot write an upload file: {error}")))?;
         Ok(Value::Nil)
     }
 
-    /// Stage the uploaded blob with `data` for `oid`. `Txn::store_blob_at`
-    /// takes the file by rename. A stock client sent `storea` for the oid
+    /// Stage the uploaded blob with `data` for `oid` with `Txn::store_blob`,
+    /// which syncs the file. A stock client sent `storea` for the oid
     /// before, and this store keeps the pickle and adds the blob. An error
     /// of the stage fails the vote, as an error of `storea` does.
     fn store_blob_end(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -1521,14 +1528,13 @@ impl Transaction {
         if open.txn.is_err() {
             return Ok(Value::Nil);
         }
-        let mut upload =
-            upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
+        let upload = upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
         open.stage(|txn| {
             let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
-            Ok(txn.store_blob_at(oid, serial, data, upload.close())?)
+            Ok(txn.store_blob(oid, serial, data, upload)?)
         });
         Ok(Value::Nil)
     }
@@ -3389,7 +3395,7 @@ mod tests {
         let none = Vec::<std::path::PathBuf>::new();
         let mut s = registered("blob-refused");
         upload(&mut s, 1, 1, b"the blob");
-        // The core refuses an empty pickle, and leaves the file in place.
+        // The core refuses an empty pickle, and the drop of the file removes it.
         done(store_blob_end(&mut s, 1, 1, b""));
         assert_eq!(blob_tree(&s.storage), none);
         let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
