@@ -1,11 +1,24 @@
-//! The read-only ops tools: `object_get`, `history`, `diff` and
-//! `references`.
+//! The read-only ops tools: `object_get`, `history`, `diff`,
+//! `references`, `space`, `verify` and `explain_conflict`.
 //!
-//! Each tool calls `zoe-loupe` and gives its JSON as the structured
-//! content of the result, and as text too. `object_get` gives the
-//! `Object` of Loupe. The other tools give an object with the oid and
-//! the list of Loupe: `revisions`, `changes` or `references`. Oids and
-//! tids are ZODB-form strings, as Loupe writes them: `0x00`.
+//! Each tool gives its JSON as the structured content of the result, and
+//! as text too. Oids and tids are ZODB-form strings, as Loupe writes them:
+//! `0x00`.
+//!
+//! - `object_get`, `history`, `diff`, `references` and `space` call
+//!   `zoe-loupe`. `object_get` gives the `Object` of Loupe. `history`,
+//!   `diff` and `references` give an object with the oid and the list of
+//!   Loupe: `revisions`, `changes` or `references`. `space` gives the
+//!   `Space` of Loupe with the newest part of its growth.
+//! - `verify` calls `zoe_convert::verify` on the store of the folder and
+//!   gives the keys of `zoe verify --format json`.
+//! - `explain_conflict` reads the transaction with the iterator of the
+//!   core and the neighbours with Loupe's `history`. The module `txn`
+//!   gives the rules.
+//!
+//! Each list of a result has a limit, and the result gives its full
+//! count. No result holds a state or pickle bytes, except `object_get`
+//! and `diff`, which give Loupe's decoded state.
 //!
 //! A tool that fails gives a result with `isError` and a message. The
 //! session goes on. Each tool runs on the blocking pool, because the
@@ -17,15 +30,30 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars::JsonSchema;
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zoe_convert::Verification;
 use zoe_core::ZoeError;
 use zoe_loupe::{Folder, oid_repr, parse_oid, parse_tid, tid_repr};
 
+use crate::txn;
+
+/// The number of largest records that `space` gives by default.
+const LARGEST: usize = 20;
+
+/// The most largest records that `space` gives.
+const LARGEST_LIMIT: usize = 1000;
+
+/// The most transactions of the growth that `space` gives: the newest.
+const GROWTH_LIMIT: usize = 100;
+
+/// The most findings of each list that `verify` gives.
+const FINDING_LIMIT: usize = 100;
+
 /// An error of a tool. The client gets it as a result with `isError`.
 #[derive(Debug, thiserror::Error)]
-enum ToolError {
+pub(crate) enum ToolError {
     /// Loupe fails: a bad id, an oid without a record, a path that leads
     /// to no object, or an error of the store.
     #[error("{}", loupe_message(.0))]
@@ -44,6 +72,19 @@ enum ToolError {
         /// The refusal of the decoder.
         error: String,
     },
+
+    /// The store has no transaction with this tid.
+    #[error("tid {0}: no transaction")]
+    NoTransaction(String),
+
+    /// The store has blob records, but the blob directory in the store
+    /// folder has no layout file. The blob directory of the store is
+    /// elsewhere.
+    #[error(
+        "the store has blobs, but the blob directory {0} has no layout file: \
+         zoe mcp reads the blob directory in the store folder only"
+    )]
+    BlobDir(String),
 
     /// The result does not convert to JSON.
     #[error("cannot write the JSON: {0}")]
@@ -67,13 +108,14 @@ struct ObjectGetArgs {
     as_of: Option<String>,
 }
 
-/// The arguments of `history` and `references`.
+/// The arguments of `history`, `references` and the prompt
+/// `why_conflict`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-struct OidArgs {
+pub(crate) struct OidArgs {
     /// The oid of the object in ZODB form, for example `0x00`.
-    oid: String,
+    pub(crate) oid: String,
 }
 
 /// The arguments of `diff`.
@@ -91,10 +133,55 @@ struct DiffArgs {
     tid_b: String,
 }
 
+impl ToolError {
+    /// Tell if the error comes from an argument: an id that is not in
+    /// ZODB form, an oid without a record, or a tid without a
+    /// transaction. Each other error comes from the store or the server.
+    pub(crate) fn is_bad_argument(&self) -> bool {
+        matches!(
+            self,
+            ToolError::Loupe(
+                zoe_loupe::Error::BadId(_)
+                    | zoe_loupe::Error::NoObject { .. }
+                    | zoe_loupe::Error::NoRecordAsOf { .. }
+                    | zoe_loupe::Error::Store(ZoeError::NotFound { .. })
+            ) | ToolError::OidOrPath
+                | ToolError::NoTransaction(_)
+        )
+    }
+}
+
+/// The arguments of `verify`: none.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
+/// The arguments of `space`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct SpaceArgs {
+    /// The number of largest records to give: 20 by default, at most
+    /// 1000.
+    largest: Option<u32>,
+}
+
+/// The arguments of `explain_conflict` and of the prompt
+/// `explain_transaction`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TidArgs {
+    /// The tid of the transaction in ZODB form, for example
+    /// `0x03f0b0c0d0e0f000`.
+    pub(crate) tid: String,
+}
+
 /// The MCP server of the read-only ops tools on one store folder.
 #[derive(Clone)]
 pub(crate) struct Ops {
-    folder: Arc<Folder>,
+    pub(crate) folder: Arc<Folder>,
 }
 
 impl Ops {
@@ -168,14 +255,59 @@ impl Ops {
     async fn references(&self, Parameters(args): Parameters<OidArgs>) -> CallToolResult {
         self.run(move |folder| references_json(folder, &args)).await
     }
+
+    /// Measure the space of the store.
+    #[tool(
+        description = "Measure the store as of its last transaction, as Loupe's space screen \
+                       does: for each class the number of current records and their bytes, \
+                       the blob files, the largest current records (20 by default, give \
+                       largest for more, at most 1000), and the bytes that each of the newest \
+                       100 transactions wrote. transactions gives the number of all \
+                       transactions. The call reads every current record.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn space(&self, Parameters(args): Parameters<SpaceArgs>) -> CallToolResult {
+        self.run(move |folder| space_json(folder, &args)).await
+    }
+
+    /// Check the store as `zoe verify` does.
+    #[tool(
+        description = "Check the store as zoe verify does: the checksum of each frame, each \
+                       blob file, the persistent references of each current record and its \
+                       class. The lists checksums, blobs, references and pickles hold the \
+                       findings, at most 100 each; totals gives the full count of each list, \
+                       and findings the sum. classes gives the count of each class. The call \
+                       reads the whole store.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn verify(&self, Parameters(NoArgs {}): Parameters<NoArgs>) -> CallToolResult {
+        self.run(verify_json).await
+    }
+
+    /// Show the transaction of a tid and the neighbours of its objects.
+    #[tool(
+        description = "Show what a transaction wrote and who else wrote the same objects. For \
+                       the transaction of tid: its user and description, and each object that \
+                       it wrote (at most 100, records gives the count) with its class and \
+                       size. For each object, before and after are the revisions just before \
+                       and just after it, with their tid, user and description. The store \
+                       keeps no record of conflicts: this is the history only.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn explain_conflict(&self, Parameters(args): Parameters<TidArgs>) -> CallToolResult {
+        self.run(move |folder| txn::explain(folder, parse_tid(&args.tid)?))
+            .await
+    }
 }
 
 #[tool_handler(
     name = "zoe",
-    instructions = "The read-only ops tools of one ZOE store. Oids and tids are ZODB-form \
-                    strings, for example 0x00. A path starts at root[\"Application\"], for \
-                    example /plone/folder. No tool writes to the store."
+    instructions = "The read-only ops tools and prompts of one ZOE store. Oids and tids are \
+                    ZODB-form strings, for example 0x00. A path starts at \
+                    root[\"Application\"], for example /plone/folder. No tool writes to the \
+                    store."
 )]
+#[prompt_handler]
 impl ServerHandler for Ops {}
 
 /// Return the message of an error of Loupe. Oids and tids are in ZODB
@@ -252,6 +384,87 @@ fn references_json(folder: &Folder, args: &OidArgs) -> Result<Value, ToolError> 
         "serial": tid_repr(object.serial),
         "references": serde_json::to_value(object.references)?,
     }))
+}
+
+/// Return the space of the store as Loupe's `Space`, with the newest
+/// [`GROWTH_LIMIT`] transactions of the growth. `transactions` gives the
+/// number of all transactions, and `tid` the last tid.
+fn space_json(folder: &Folder, args: &SpaceArgs) -> Result<Value, ToolError> {
+    let largest = args
+        .largest
+        .map_or(LARGEST, |n| (n as usize).min(LARGEST_LIMIT));
+    let mut space = folder.space(largest)?;
+    let transactions = space.growth.len();
+    space
+        .growth
+        .drain(..transactions.saturating_sub(GROWTH_LIMIT));
+    let mut value = serde_json::to_value(space)?;
+    value["tid"] = json!(tid_repr(folder.last_tid()));
+    value["transactions"] = json!(transactions);
+    Ok(value)
+}
+
+/// Check the store of `folder` with `zoe_convert::verify`. A store whose
+/// blob directory is not in the folder is an error, as for `zoe verify`.
+fn verify_json(folder: &Folder) -> Result<Value, ToolError> {
+    let store = folder.store();
+    store.check_blob_dir().map_err(|error| match error {
+        ZoeError::MissingBlobDir { path } => ToolError::BlobDir(path.display().to_string()),
+        error => zoe_loupe::Error::from(error).into(),
+    })?;
+    Ok(verification_json(&zoe_convert::verify(store, None)))
+}
+
+/// Return the report of `zoe_convert::verify` with the keys of
+/// `zoe verify --format json`, and oids and tids in ZODB form. Each list
+/// holds at most [`FINDING_LIMIT`] findings. `totals` gives the full
+/// count of each list, `findings` their sum, and `walked` the counts of
+/// the walk.
+fn verification_json(report: &Verification) -> Value {
+    fn first<T>(items: &[T], json: impl Fn(&T) -> Value) -> Vec<Value> {
+        items.iter().take(FINDING_LIMIT).map(json).collect()
+    }
+    let checksums = first(&report.checksums, |p| {
+        json!({
+            "oid": p.oid.map(oid_repr),
+            "tid": p.tid.map(tid_repr),
+            "error": p.error,
+        })
+    });
+    let blobs = first(
+        &report.blob_files,
+        |p| json!({"oid": oid_repr(p.oid), "tid": tid_repr(p.tid), "error": p.error}),
+    );
+    let references = first(
+        &report.references,
+        |d| json!({"oid": oid_repr(d.oid), "tid": tid_repr(d.tid), "missing": oid_repr(d.missing)}),
+    );
+    let pickles = first(
+        &report.pickles,
+        |p| json!({"oid": oid_repr(p.oid), "tid": tid_repr(p.tid), "error": p.error}),
+    );
+    json!({
+        "findings": report.problems(),
+        "totals": {
+            "checksums": report.checksums.len(),
+            "blobs": report.blob_files.len(),
+            "references": report.references.len(),
+            "pickles": report.pickles.len(),
+        },
+        "walked": {
+            "transactions": report.transactions,
+            "sequences": report.sequences,
+            "records": report.records,
+            "objects": report.objects,
+            "blobs": report.blobs,
+        },
+        "checksums": checksums,
+        "blobs": blobs,
+        "references": references,
+        "pickles": pickles,
+        "classes": report.classes,
+        "unknown_classes": report.unknown_classes,
+    })
 }
 
 #[cfg(test)]
@@ -478,10 +691,21 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_are_the_four_read_only_ops_tools() {
+    fn the_tools_are_the_read_only_ops_tools() {
         let tools = Ops::tool_router().list_all();
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(names, ["diff", "history", "object_get", "references"]);
+        assert_eq!(
+            names,
+            [
+                "diff",
+                "explain_conflict",
+                "history",
+                "object_get",
+                "references",
+                "space",
+                "verify"
+            ]
+        );
         for tool in &tools {
             let annotations = tool.annotations.as_ref().unwrap();
             assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
@@ -587,6 +811,11 @@ mod tests {
                 let reply = client.call("history", arguments.clone()).await;
                 assert_eq!(reply["result"]["isError"], true, "{arguments}: {reply}");
             }
+            // verify takes no argument, so it takes no list of classes.
+            let reply = client.call("verify", json!({"classes": ["m.C"]})).await;
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let reply = client.call("verify", json!({})).await;
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
             // A tool that the server does not offer is a protocol error.
             let pack = client.call("pack", json!({})).await;
             assert_eq!(pack["error"]["code"], -32602, "{pack}");
@@ -681,5 +910,120 @@ mod tests {
             .map(|r| (r["oid"].as_str().unwrap(), r["at"].as_str().unwrap()))
             .collect();
         assert_eq!(found, [("0x01", "/a"), ("0x02", "/b"), ("0x03", "/c")]);
+    }
+
+    #[test]
+    fn space_gives_the_space_of_loupe_with_the_newest_growth() {
+        let (dir, _, second) = store("space");
+        let store = Store::open(&dir).unwrap();
+        for _ in 0..GROWTH_LIMIT {
+            let serial = store.last_transaction();
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(Oid(2), serial, &document("again")).unwrap();
+            txn.vote().unwrap();
+            txn.finish().unwrap();
+        }
+        drop(store);
+        let folder = Folder::open(&dir).unwrap();
+        let loupe = folder.space(LARGEST).unwrap();
+        let space = space_json(&folder, &SpaceArgs::default()).unwrap();
+        assert_eq!(
+            space["by_class"],
+            serde_json::to_value(&loupe.by_class).unwrap()
+        );
+        assert_eq!(
+            space["largest"],
+            serde_json::to_value(&loupe.largest).unwrap()
+        );
+        assert_eq!(space["tid"], tid_repr(folder.last_tid()));
+        assert_eq!(space["transactions"], GROWTH_LIMIT + 2);
+        let growth = space["growth"].as_array().unwrap();
+        assert_eq!(growth.len(), GROWTH_LIMIT);
+        // The growth keeps the newest transactions, in tid order.
+        assert!(growth[0]["tid"].as_str().unwrap() > tid_repr(second).as_str());
+        assert_eq!(growth[GROWTH_LIMIT - 1]["tid"], tid_repr(folder.last_tid()));
+
+        let one = SpaceArgs { largest: Some(1) };
+        let one = space_json(&folder, &one).unwrap();
+        assert_eq!(one["largest"].as_array().unwrap().len(), 1);
+        let many = SpaceArgs {
+            largest: Some(u32::MAX),
+        };
+        assert!(space_json(&folder, &many).is_ok());
+    }
+
+    #[test]
+    fn verify_gives_the_findings_in_zodb_form() {
+        let (dir, first, _) = store("verify");
+        let folder = Folder::open(&dir).unwrap();
+        let report = verify_json(&folder).unwrap();
+        // Oid 3 holds a record that does not decode.
+        assert_eq!(report["findings"], 1, "{report}");
+        assert_eq!(report["totals"]["pickles"], 1);
+        assert_eq!(report["pickles"][0]["oid"], "0x03");
+        assert_eq!(report["pickles"][0]["tid"], tid_repr(first));
+        assert_eq!(report["references"], json!([]));
+        assert_eq!(report["checksums"], json!([]));
+        assert_eq!(report["blobs"], json!([]));
+        assert_eq!(report["unknown_classes"], json!([]));
+        assert_eq!(report["classes"]["m.Doc"], 1);
+        assert_eq!(report["walked"]["transactions"], 2);
+        assert_eq!(report["walked"]["objects"], 4);
+    }
+
+    #[test]
+    fn each_list_of_verify_has_a_limit_and_a_total() {
+        use zoe_convert::{Dangling, FrameProblem};
+        let report = Verification {
+            checksums: vec![FrameProblem {
+                oid: None,
+                tid: Some(Tid(5)),
+                error: "corrupt transaction row".to_owned(),
+            }],
+            references: (0..=FINDING_LIMIT as u64)
+                .map(|missing| Dangling {
+                    oid: Oid(0),
+                    tid: Tid(3),
+                    missing: Oid(0x100 + missing),
+                })
+                .collect(),
+            ..Verification::default()
+        };
+        let json = verification_json(&report);
+        assert_eq!(json["findings"], FINDING_LIMIT + 2);
+        assert_eq!(json["totals"]["references"], FINDING_LIMIT + 1);
+        let references = json["references"].as_array().unwrap();
+        assert_eq!(references.len(), FINDING_LIMIT);
+        assert_eq!(references[0]["missing"], "0x0100");
+        assert_eq!(references[0]["tid"], "0x03");
+        assert_eq!(json["checksums"][0]["oid"], Value::Null);
+        assert_eq!(json["checksums"][0]["tid"], "0x05");
+    }
+
+    #[test]
+    fn verify_with_the_blob_directory_elsewhere_is_an_error() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("zoe-mcp-blobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, blobs) = (root.join("store"), root.join("elsewhere"));
+        let options = zoe_core::Options {
+            blob_dir: Some(blobs),
+            ..zoe_core::Options::default()
+        };
+        let store = Store::open_with(&dir, options).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let mut file = store.new_blob_file().unwrap();
+        file.write_all(b"blob").unwrap();
+        let blob = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+        txn.store_blob(Oid(1), Tid(0), blob, file).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        drop(store);
+
+        let folder = Folder::open(&dir).unwrap();
+        let error = verify_json(&folder).unwrap_err();
+        assert!(matches!(error, ToolError::BlobDir(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("has no layout file"), "{message}");
     }
 }

@@ -140,8 +140,9 @@ pub struct BackupCheck {
 /// file. A dump that does not follow the dump before it fails the call with
 /// `Dump`. When the last tid of the dumps is not a tid of the store, the
 /// call fails with `BackupDiverged` and writes nothing. When the store was
-/// packed at or after that tid, it fails with `BackupPacked` and writes
-/// nothing. Both errors ask for a new full dump in a new directory.
+/// packed after that tid, it fails with `BackupPacked` and writes nothing.
+/// A pack at that tid removes only history that the dumps hold, so the
+/// backup goes on. Both errors ask for a new full dump in a new directory.
 ///
 /// For an exact dump, no writer changes the store during the call. A
 /// read-only open makes sure of this.
@@ -251,12 +252,12 @@ pub fn restore(dir: &Path, target: &Path) -> Result<Restored, Error> {
 /// the size and the BLAKE3 hash of its blob. A pack removes records at or
 /// before its tid, and the dumps keep them. So at or before the pack
 /// watermark of `store`, a record or a transaction that `store` lacks is
-/// no difference. A pack at or after the last tid of the dumps is a
-/// difference: the history that the dumps hold changed. The current record
-/// of each oid at the last tid of the dumps must be the same too, so a
-/// store whose history diverged differs, unless a pack removed that
-/// record. In `store`, the end of each sequence of the dumps must be at or
-/// above its end in the dumps.
+/// no difference. A pack after the last tid of the dumps is a difference:
+/// it changed history that the next dump must hold. A pack at that tid is
+/// no difference. The current record of each oid at the last tid of the
+/// dumps must be the same too, so a store whose history diverged differs,
+/// unless a pack removed that record. In `store`, the end of each sequence
+/// of the dumps must be at or above its end in the dumps.
 ///
 /// A dump that does not restore fails the call with its error. The call
 /// first removes the directories in `scratch` that a check in a process
@@ -447,7 +448,7 @@ fn parse_header(path: &Path, header: &[u8; HEADER]) -> Result<(Tid, Tid), Error>
 
 /// Check that the store continues the dumps that end at `after`: `after`
 /// is a tid of the store, before its last tid `last`, and no pack of the
-/// store reached `after`.
+/// store went past `after`.
 ///
 /// The pack watermark does not tell one store from another, so a missing
 /// transaction always refuses: a store restored from a part of the dumps,
@@ -468,9 +469,10 @@ fn continues(store: &Store, dir: &Path, after: Tid, last: Tid) -> Result<(), Err
         Some(Err(error)) => return Err(error.into()),
         _ => return Err(diverged()),
     }
-    // A pack at or after `after` changed history that the dumps hold.
+    // A pack after `after` changed history that the next dump must hold.
+    // A pack at `after` removed only history that the dumps hold.
     let watermark = store.pack_watermark()?;
-    if watermark >= after {
+    if watermark > after {
         return Err(Error::BackupPacked {
             path: dir.to_owned(),
             last: after,
@@ -1033,9 +1035,9 @@ fn compare(store: &Store, copy: &Store, last: Tid) -> Result<Vec<String>, Error>
         });
     }
 
-    if watermark != Tid::ZERO && watermark >= last {
+    if watermark > last {
         problems.summary(format!(
-            "the store was packed at tid {}, at or after the last tid {} of the dumps; \
+            "the store was packed at tid {}, after the last tid {} of the dumps; \
              write a new full dump into a new directory",
             hex(watermark.0),
             hex(last.0)
@@ -1853,20 +1855,37 @@ mod tests {
         assert_eq!(check.differences, Vec::<String>::new());
         assert_eq!((check.restored.dumps, check.restored.transactions), (2, 5));
 
-        // A pack at or after the last tid of the dumps stops the backups,
-        // and it is a difference.
-        commit(&store, 600, &[W::Data(2, &pickle(b"e"))]);
+        // A pack at the last tid of the dumps removes only history that the
+        // dumps hold, so the backups go on.
         store.pack(Tid(500)).unwrap();
+        assert!(store.load_serial(Oid(0), Tid(100)).is_err());
+        assert!(store.load_serial(Oid(2), Tid(400)).is_err());
+        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        assert_eq!(check.differences, Vec::<String>::new());
+        commit(&store, 600, &[W::Data(0, &pickle(b"root once more"))]);
+        let written = backup(&store, &dumps).unwrap();
+        assert_eq!((written.after, written.transactions), (Tid(500), 1));
+        let check = verify_backup(&store, &dumps, &scratch).unwrap();
+        assert_eq!(check.differences, Vec::<String>::new());
+        assert_eq!((check.restored.dumps, check.restored.transactions), (3, 6));
+
+        // A pack after the last tid of the dumps stops the backups, and it
+        // is a difference. The pack keeps the root at 600, so the last
+        // transaction of the dumps stays in the store.
+        commit(&store, 700, &[W::Data(3, &pickle(b"f"))]);
+        store.pack(Tid(700)).unwrap();
         match backup(&store, &dumps) {
             Err(Error::BackupPacked {
                 last, watermark, ..
-            }) => assert_eq!((last, watermark), (Tid(500), Tid(500))),
+            }) => assert_eq!((last, watermark), (Tid(600), Tid(700))),
             other => panic!("{other:?}"),
         }
-        assert_eq!(dump_files(&dumps).len(), 2);
+        assert_eq!(dump_files(&dumps).len(), 3);
         let check = verify_backup(&store, &dumps, &scratch).unwrap();
         assert_eq!(check.differences.len(), 1, "{:?}", check.differences);
-        assert!(check.differences[0].starts_with("the store was packed at tid 0x00000000000001f4"));
+        assert!(check.differences[0].starts_with(
+            "the store was packed at tid 0x00000000000002bc, after the last tid 0x0000000000000258"
+        ));
         drop(store);
         let _ = fs::remove_dir_all(&dir);
     }

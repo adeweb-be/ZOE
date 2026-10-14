@@ -162,6 +162,35 @@ conformance:
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
     done
 
+# Run the process kill loop against `zoe serve` for `runs` rounds, on
+# CPython 3.13. Each round kills the server with SIGKILL while several
+# writers commit objects and blobs, restarts it, stops it cleanly, runs
+# `zoe verify` and loads every acknowledged commit. `just test` does not
+# collect it. Without a seed, the recipe takes a random one. It prints the
+# seed. The traceback of a failure shows its local variables, so it gives
+# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
+# the order of the threads. The store and the blob caches go to TMPDIR:
+# 10,000 rounds need about 3 GB there.
+crash runs="200" seed="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{ seed }}"
+    if [ -z "$seed" ]; then
+        seed=$(( (RANDOM << 15) | RANDOM ))
+    fi
+    # The server is the `zoe` binary of this build.
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+    export ZOE_KILL_LOOP_RUNS="{{ runs }}" ZOE_KILL_LOOP_SEED="$seed"
+    echo "just crash: {{ runs }} rounds, seed $seed"
+    status=0
+    UV_PROJECT_ENVIRONMENT=.venv-3.13 uv run --locked --directory python --python 3.13 \
+        pytest -q --showlocals zoedb/tests/crash || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
+    fi
+    exit "$status"
+
 # Build the Plone instance of a scenario under plone/ with buildout, and run
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
