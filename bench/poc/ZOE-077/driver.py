@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 from pathlib import Path
@@ -172,7 +173,7 @@ def start(args, wd):
         if args.server == "zeo-msgpack":
             env["ZEO_MSGPACK"] = "1"
         proc = subprocess.Popen(
-            [sys.executable, "-m", "ZEO.runzeo", "-a", f"127.0.0.1:{port}", "-f", str(wd / "Data.fs")],
+            [os.environ.get("POC_ZEO_PYTHON", sys.executable), "-m", "ZEO.runzeo", "-a", f"127.0.0.1:{port}", "-f", str(wd / "Data.fs")],
             stdout=log, stderr=subprocess.STDOUT, env=env,
         )
         for _ in range(200):
@@ -325,6 +326,11 @@ def main():
             result["cpu_ms_per_commit"] = round((c1 - c0) / commits * 1e3, 2)
             result["disk_kb_per_commit"] = round((io1["write_bytes"] - io0["write_bytes"]) / commits / 1024, 1)
             result["syscw_per_commit"] = round((io1["syscw"] - io0["syscw"]) / commits, 1)
+    # On a free-threaded interpreter, the modules that turned the GIL back on.
+    gil = sorted(set(re.findall(r"GIL\) has been enabled to load module '([^']+)'",
+                                (wd / "zodbshootout.log").read_text(errors="replace"))))
+    result["python"] = sys.version.split()[0] + ("t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "")
+    result["gil_enabled_by"] = gil
     err = (wd / "server.err").read_text() if (wd / "server.err").exists() else ""
     poc = [line for line in err.splitlines() if line.startswith("POC ")]
     if poc:

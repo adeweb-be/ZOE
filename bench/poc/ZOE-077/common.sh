@@ -12,3 +12,8 @@ if command -v cc >/dev/null; then
   libstdcxx="$(dirname "$(cc -print-file-name=libstdc++.so.6)")"
   export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+# POC_LIBPQ: a directory with libpq and the libraries that it needs, without
+# glibc. A psycopg2 built from source on a free-threaded interpreter needs it.
+if [ -n "${POC_LIBPQ:-}" ]; then
+  export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$POC_LIBPQ"
+fi

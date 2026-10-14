@@ -208,7 +208,7 @@ impl ZTxn {
     }
 }
 
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn _zoeclientx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ZClient>()?;
     m.add_class::<ZTxn>()?;
