@@ -888,8 +888,9 @@ mod tests {
         // A large frame goes in whole. Then no call starts.
         assert!(outbox.send(vec![0; 2 * WAITING]));
         assert!(!turn_is_free(&outbox));
-        // A frame that goes in while much waits closes the window.
-        assert!(outbox.send(b"reply".to_vec()));
+        // A frame that goes in while much waits closes the window. A reply
+        // takes its room before its call, so it does not wait for the count.
+        assert!(outbox.blocking_room().put(Some(b"reply".to_vec())));
         assert_eq!(count(&outbox).1, 1);
         // The frames drop unsent, as at a close. The two calls still hold
         // their turns.
@@ -906,7 +907,7 @@ mod tests {
     fn a_large_frame_that_the_writer_sends_opens_the_window_when_little_else_waits() {
         let (outbox, mut inbox, _closing) = Outbox::new(100, 10);
         assert!(outbox.send(vec![0; 2 * WAITING]));
-        assert!(outbox.send(vec![0; 2 * WAITING]));
+        assert!(outbox.blocking_room().put(Some(vec![0; 2 * WAITING])));
         // Another large frame waits: the window stays closed.
         inbox.try_recv().unwrap().sent();
         assert_eq!(count(&outbox), (2 * WAITING, 1));
