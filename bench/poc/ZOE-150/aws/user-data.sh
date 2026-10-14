@@ -9,6 +9,8 @@
 # at the commit of the POC branch, builds, runs the reduced run, and writes
 # /var/lib/zoe150/status: "running", then "done" or "failed".
 set -euo pipefail
+# cloud-init runs this script as root without HOME. The nix installer needs it.
+export HOME=/root
 
 # The dead-man switch: the instance stops (and so terminates) after 90
 # minutes, also when the launcher is gone.
