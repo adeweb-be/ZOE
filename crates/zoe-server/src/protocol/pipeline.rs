@@ -476,20 +476,20 @@ impl Calls {
         }
     }
 
-    /// The reader gives no more calls. End the lock wait of the session.
-    fn end(&self) {
+    /// End the lock wait of the vote of the session, and each later one:
+    /// the vote fails at once and releases the locks that it took. The end
+    /// of the connection calls it, except at a stop of the server.
+    pub(crate) fn end_lock_wait(&self) {
         if let Some(session) = &self.session {
             session.end_lock_wait();
         }
-        self.lane.end();
     }
 
-    /// Wait until each call that started ends. A vote that waits for a
-    /// lock fails at once, and so does a vote that must wait later. The
-    /// thread of the transaction runs the calls that wait, then ends, and
-    /// that aborts the open transaction.
+    /// Wait until each call that started ends. The thread of the
+    /// transaction runs the calls that wait, then ends, and that aborts the
+    /// open transaction.
     pub(crate) async fn finish(mut self) {
-        self.end();
+        self.lane.end();
         self.storages = None;
         self.session = None;
         self.running.wait().await;
@@ -502,7 +502,8 @@ impl Drop for Calls {
     /// lock wait ends, and the thread runs the calls that wait, then ends
     /// and aborts the open transaction.
     fn drop(&mut self) {
-        self.end();
+        self.end_lock_wait();
+        self.lane.end();
     }
 }
 
@@ -666,6 +667,7 @@ mod tests {
             start(&mut connection, calls).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             let started = Instant::now();
+            connection.end_lock_wait();
             connection.finish().await;
             started.elapsed()
         });
