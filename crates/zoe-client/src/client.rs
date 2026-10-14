@@ -39,6 +39,10 @@ const INVALIDATIONS: usize = 1024;
 /// The most oids that one `new_oids` call of the protocol gives.
 const OIDS_PER_CALL: usize = 100;
 
+/// The largest chunk of a blob that `Transaction::store_blob` sends, as
+/// `ZEO.ClientStorage` sends it.
+pub const BLOB_CHUNK: usize = 59_000;
+
 /// A client of one storage of a ZEO 6 server.
 ///
 /// Its methods take `&self`, so many calls of one client can wait for
@@ -403,6 +407,31 @@ impl Transaction {
                 vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()],
             )
             .await
+    }
+
+    /// Store `data` for `oid` with the blob `blob`, as `ZEO.ClientStorage`
+    /// does without a shared blob directory: `storea`, then
+    /// `storeBlobStart`, one `storeBlobChunk` per chunk of `BLOB_CHUNK`
+    /// bytes, and `storeBlobEnd`. No call has a reply. The server reports
+    /// an error of the stage at the vote. After a failed vote, it fails
+    /// with `Error::Invalid` and sends nothing.
+    pub async fn store_blob(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        blob: &[u8],
+    ) -> Result<(), Error> {
+        self.check()?;
+        let args = vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()];
+        self.inner.notify("storea", args.clone()).await?;
+        self.inner.notify("storeBlobStart", vec![]).await?;
+        for chunk in blob.chunks(BLOB_CHUNK) {
+            self.inner
+                .notify("storeBlobChunk", vec![chunk.into()])
+                .await?;
+        }
+        self.inner.notify("storeBlobEnd", args).await
     }
 
     /// Vote. A stale serial fails with `Error::Conflict`, both when the
