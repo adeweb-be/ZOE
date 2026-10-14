@@ -82,9 +82,10 @@ def disk_needed(storage: str, cell: Cell) -> int:
     """Return an upper bound of the bytes that one value of a cell takes.
 
     A value holds the populate of zodbshootout and two calls of one
-    scenario: the warmup and the value. Two calls of update write the most.
-    The data of relstorage goes to PostgreSQL, so only the logs and the
-    pyperf output of a value go to the work directory.
+    scenario: the warmup and the value. The calls of update, or of add on a
+    store that zodbshootout cannot zap, write the most. The data of
+    relstorage goes to PostgreSQL, so only the logs and the pyperf output
+    of a value go to the work directory.
     """
     if storage == "relstorage":
         return STORE_OVERHEAD
@@ -92,7 +93,8 @@ def disk_needed(storage: str, cell: Cell) -> int:
     n = OBJECTS_PER_TRANSACTION
     # The populate writes n objects per worker and n more. The root, the
     # tree and the mappings of the workers take c + 3 records. Each call of
-    # update writes c × L transactions of at most n + 1 records.
+    # update or add writes c × L transactions of at most n + 1 records: add
+    # also writes the mapping of the worker again.
     records = (c * n + n) + (c + 3) + 2 * c * _inner_loops(c) * (n + 1)
     return records * (cell.object_size + RECORD_OVERHEAD) + STORE_OVERHEAD
 
