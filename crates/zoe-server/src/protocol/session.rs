@@ -19,7 +19,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use rmpv::Value;
 use zoe_core::{BlobFile, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
@@ -62,15 +62,17 @@ const READ_CONFLICT: &str = "database read conflict error";
 
 /// The interfaces that the store provides, as `(module, name)`, in the
 /// order of `providedBy(zoe.Storage(path)).__iro__`. A stock client takes
-/// the storage interfaces of this list as its own. The store does not
-/// provide `IStorageUndoable` or `IExternalGC`.
-const INTERFACES: [(&str, &str); 7] = [
+/// the storage interfaces of this list as its own. The store provides
+/// `IExternalGC`, because `deleteObject` writes a deletion. It does not
+/// provide `IStorageUndoable`.
+const INTERFACES: [(&str, &str); 8] = [
     ("ZODB.interfaces", "IBlobStorageRestoreable"),
     ("ZODB.interfaces", "IBlobStorage"),
     ("ZODB.interfaces", "IStorageRestoreable"),
     ("ZODB.interfaces", "IStorageCurrentRecordIteration"),
-    ("ZODB.interfaces", "IStorage"),
     ("ZODB.interfaces", "IStorageIteration"),
+    ("ZODB.interfaces", "IExternalGC"),
+    ("ZODB.interfaces", "IStorage"),
     ("zope.interface", "Interface"),
 ];
 
@@ -123,6 +125,15 @@ impl Fault {
 
     fn storage(text: impl Into<String>) -> Self {
         Self::new("ZODB.POSException.StorageError", text)
+    }
+
+    /// The error of a call that names no object `oid`: a `POSKeyError` of
+    /// the oid as the client sent it.
+    fn no_object(oid: Value) -> Self {
+        Self {
+            class: "ZODB.POSException.POSKeyError",
+            args: Value::Array(vec![oid]),
+        }
     }
 
     /// The error of a call that names no iterator `id`: a `KeyError` of the
@@ -233,10 +244,7 @@ impl Fault {
     fn of(error: &ZoeError) -> Self {
         let text = error.to_string();
         match *error {
-            ZoeError::NotFound { oid } => Self {
-                class: "ZODB.POSException.POSKeyError",
-                args: Value::Array(vec![p64(oid.0)]),
-            },
+            ZoeError::NotFound { oid } => Self::no_object(p64(oid.0)),
             ZoeError::Conflict { oid } => Self::conflict(CONFLICT_ERROR, CONFLICT, oid, None, None),
             ZoeError::ReadConflict { oid } => {
                 Self::conflict(READ_CONFLICT_ERROR, READ_CONFLICT, oid, None, None)
@@ -385,6 +393,15 @@ pub(crate) fn runs_long(method: &str) -> bool {
 /// transaction and does not run long.
 pub(crate) fn on_read_pool(method: &str) -> bool {
     method != "set_client_label" && !in_transaction(method) && !runs_long(method)
+}
+
+/// Tell if the reader waits for the end of `method` before it starts the
+/// next call of the connection. Each call that starts after
+/// `set_client_label` logs with the label. A stock client sends
+/// `iterator_gc` with no reply, and a later call for an iterator that it
+/// listed must fail with `KeyError`.
+pub(crate) fn ends_before_next(method: &str) -> bool {
+    matches!(method, "set_client_label" | "iterator_gc")
 }
 
 /// The open transaction of a connection.
@@ -547,15 +564,26 @@ impl Session {
     }
 
     /// Return the span of `call` in the traces: a span named after its
-    /// method, with the storage of the session. Enter it inside the span
-    /// of the connection.
+    /// method, with the storage of the session, in the trace of the
+    /// traceparent of the call, if it has one. Enter it inside the span of
+    /// the connection.
     pub(crate) fn request(&self, call: &Call) -> tracing::Span {
-        crate::telemetry::request(&call.method, &self.storage.name)
+        crate::telemetry::request(&call.method, &self.storage.name, call.traceparent())
     }
 
     /// Tell if `register` selected the storage of the session.
     pub(crate) fn is_registered(&self) -> bool {
         self.registration.get().is_some()
+    }
+
+    /// Tell if the server accepted `trace_context` from the declaration of
+    /// the client. Only then can a call of the connection have a trace
+    /// context.
+    pub(crate) fn traces(&self) -> bool {
+        self.registration
+            .get()
+            .and_then(|r| r.extensions.as_deref())
+            .is_some_and(|accepted| accepted.contains(&negotiation::TRACE_CONTEXT))
     }
 
     /// Tell if the client registered read-only.
@@ -885,15 +913,22 @@ impl Session {
     /// Return at most `size` records of an oid, newest first, as the maps
     /// of FileStorage's `history`. A map has no keys of the transaction
     /// extension.
+    ///
+    /// An oid that is not 8 bytes names no object: the call fails with
+    /// `POSKeyError` before it checks the size, as ZEO's server does.
     fn history(&self, args: &[Value]) -> Result<Value, Fault> {
         let (oid, size) = match args {
-            [oid] => (oid, 1),
-            // A negative size gives no entry, as in FileStorage.
-            [oid, Value::Integer(size)] => (oid, size.as_u64().unwrap_or(0)),
-            [_, _] => return Err(Fault::type_error("size is not an int")),
+            [oid] => (oid, None),
+            [oid, size] => (oid, Some(size)),
             _ => return Err(Fault::type_error("history takes 1 or 2 arguments")),
         };
-        let oid = Oid(u64_of(oid)?);
+        let oid = Oid(u64_of(oid).map_err(|_| Fault::no_object(oid.clone()))?);
+        let size = match size {
+            None => 1,
+            // A negative size gives no entry, as in FileStorage.
+            Some(Value::Integer(size)) => size.as_u64().unwrap_or(0),
+            Some(_) => return Err(Fault::type_error("size is not an int")),
+        };
         let size = usize::try_from(size).unwrap_or(usize::MAX);
         let entries = self.store.history(oid, size)?;
         Ok(Value::Array(
@@ -1014,17 +1049,26 @@ impl Session {
     ///
     /// Return nil when more than `invalidation-queue-size` transactions
     /// that wrote records come after the tid, or when the index does not
-    /// read. The client then verifies its cache.
+    /// read. The client then verifies its cache. A tid younger than
+    /// `invalidation-age` gets every transaction after it, whatever their
+    /// number. The index reads in slices, each a snapshot, so a commit
+    /// never waits for the read.
     fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
         let [tid] = arity::<1>(args, "getInvalidations")?;
         let tid = u64_of(tid)?;
         // The connection gets the invalidation of each commit after `last`.
         let last = self.storage.invalidations.published();
+        let queues = self.storage.queues;
+        // The session reads the clock only when the age is on.
+        let limit = if !queues.invalidation_age.is_zero()
+            && clock::younger_than(Tid(tid), queues.invalidation_age, SystemTime::now())
+        {
+            usize::MAX
+        } else {
+            queues.invalidations
+        };
         let oids = match tid.checked_add(1) {
-            Some(from) => {
-                self.store
-                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
-            }
+            Some(from) => self.store.written_oids(Tid(from), last, limit),
             None => Ok(Some(Vec::new())),
         };
         Ok(match oids {
@@ -1428,7 +1472,7 @@ impl Transaction {
     fn check_current_serial(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial, id] = arity::<3>(args, "checkCurrentSerialInTransaction")?;
         self.current(id)?.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let (oid, serial) = (Oid(u64_of(oid)?), serial_of(serial)?);
             Ok(txn.check_current_serial(oid, serial)?)
         });
         Ok(Value::Nil)
@@ -1439,7 +1483,7 @@ impl Transaction {
     fn delete_object(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial, id] = arity::<3>(args, "deleteObject")?;
         self.current(id)?.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let (oid, serial) = (Oid(u64_of(oid)?), serial_of(serial)?);
             Ok(txn.delete(oid, serial)?)
         });
         Ok(Value::Nil)
@@ -1718,10 +1762,29 @@ fn optional_tid(value: &Value) -> Result<Option<Tid>, Fault> {
     }
 }
 
-/// The serial of a store, `storea` or `storeBlobEnd`. A nil serial is the
-/// zero tid, the serial of a new object, as in FileStorage.
+/// The serial of a store, `storea`, `storeBlobEnd` or `storeBlobShared`.
+/// A nil serial is the zero tid, the serial of a new object, as in
+/// FileStorage. Another serial reads as `serial_of` reads it.
 fn store_serial(value: &Value) -> Result<Tid, Fault> {
-    Ok(optional_tid(value)?.unwrap_or(Tid::ZERO))
+    match value {
+        Value::Nil => Ok(Tid::ZERO),
+        serial => serial_of(serial),
+    }
+}
+
+/// The serial argument of a call of the transaction: 8 bytes, or a str
+/// whose UTF-8 bytes are 8 bytes. ZEO's tests send the serial of a new
+/// object as the str `'\0' * 8`, and ZEO's server takes it. A str of
+/// another length fails as a str oid or tid does.
+fn serial_of(value: &Value) -> Result<Tid, Fault> {
+    match value {
+        Value::String(text) => text
+            .as_str()
+            .and_then(|text| <[u8; 8]>::try_from(text.as_bytes()).ok())
+            .map(|bytes| Tid(u64::from_be_bytes(bytes)))
+            .ok_or_else(|| Fault::type_error("an oid or a tid is not bytes")),
+        serial => Ok(Tid(u64_of(serial)?)),
+    }
 }
 
 /// The number in the 8 big-endian bytes of `value`.
@@ -1892,6 +1955,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -2018,6 +2082,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register =
             |name: &str| request("register", vec![Value::from(name), Value::Boolean(false)]);
@@ -2575,6 +2640,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2631,6 +2697,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -2796,9 +2863,8 @@ mod tests {
             })
             .collect();
         assert_eq!(interfaces, INTERFACES);
-        for name in ["IStorageUndoable", "IExternalGC"] {
-            assert!(!interfaces.contains(&("ZODB.interfaces", name)), "{name}");
-        }
+        assert!(interfaces.contains(&("ZODB.interfaces", "IExternalGC")));
+        assert!(!interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
 
         let sizes = done(call(&mut s, "get_size_info", vec![]));
         assert_eq!(keys(&sizes), ["length", "size"]);
@@ -2845,12 +2911,29 @@ mod tests {
         s
     }
 
+    #[test]
+    fn only_a_declaration_of_trace_context_lets_the_calls_have_a_trace_context() {
+        assert!(!session("traces-unregistered").session.traces());
+        let mut stock = session("traces-stock");
+        done(call(
+            &mut stock,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        assert!(!stock.session.traces());
+        let other = declaring("traces-other", false, &["sequences"]);
+        assert!(!other.session.traces());
+        let s = declaring("traces", false, &["sequences", "trace_context"]);
+        assert!(s.session.traces());
+    }
+
     fn sequence_next(name: Value) -> Call {
         Call {
             id: Value::from(1),
             oneway: false,
             method: "sequence_next".into(),
             args: vec![name],
+            context: None,
         }
     }
 
@@ -3052,6 +3135,31 @@ mod tests {
         }
         let fault = failed(call(&mut s, "history", vec![p64(9), Value::from(1)]));
         assert_eq!(fault.class, "ZODB.POSException.POSKeyError");
+    }
+
+    #[test]
+    fn history_of_an_oid_that_is_not_8_bytes_is_a_poskeyerror_before_the_size() {
+        let mut s = registered("history-bad-oid");
+        commit(&mut s, 1, 1, 0, b"data").unwrap();
+        let oids = [
+            Value::Nil,
+            Value::from("\0\0\0\0\0\0\0\x01"),
+            Value::Binary(vec![0; 7]),
+        ];
+        for oid in oids {
+            for size in [Value::Nil, Value::from(1)] {
+                let fault = failed(call(&mut s, "history", vec![oid.clone(), size]));
+                assert_eq!(fault, Fault::no_object(oid.clone()));
+            }
+            let fault = failed(call(&mut s, "history", vec![oid.clone()]));
+            assert_eq!(fault, Fault::no_object(oid));
+        }
+        // A good oid with a size that is not an int still fails with
+        // `TypeError`.
+        let fault = failed(call(&mut s, "history", vec![p64(1), Value::Nil]));
+        assert_eq!(fault, Fault::type_error("size is not an int"));
+        let fault = failed(call(&mut s, "history", vec![]));
+        assert_eq!(fault.class, "builtins.TypeError");
     }
 
     #[test]
@@ -3291,7 +3399,7 @@ mod tests {
     fn get_invalidations_covers_the_gap_or_gives_nil() {
         let queues = Queues {
             invalidations: 2,
-            client: 1_000,
+            ..Queues::DEFAULT
         };
         let mut s = Client::new(storage("get-invalidations", queues), outbox());
         done(call(
@@ -3317,6 +3425,35 @@ mod tests {
         assert_eq!(get(&mut s, p64(u64::MAX)), nothing);
         let fault = failed(call(&mut s, "getInvalidations", vec![Value::from(1)]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn get_invalidations_covers_a_young_tid_past_the_queue_size() {
+        let queues = Queues {
+            invalidations: 2,
+            invalidation_age: std::time::Duration::from_secs(3_600),
+            ..Queues::DEFAULT
+        };
+        let mut s = Client::new(storage("invalidation-age", queues), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let first = commit(&mut s, 1, 1, 0, b"a").unwrap();
+        let second = commit(&mut s, 2, 2, 0, b"b").unwrap();
+        commit(&mut s, 3, 3, 0, b"c").unwrap();
+        commit(&mut s, 4, 2, second, b"d").unwrap();
+        let last = commit(&mut s, 5, 1, first, b"e").unwrap();
+        let get = |s: &mut Client, tid: Value| done(call(s, "getInvalidations", vec![tid]));
+
+        // Four commits come after `first`, and each oid comes once.
+        assert_eq!(
+            get(&mut s, p64(first)),
+            Value::Array(vec![p64(last), Value::Array(vec![p64(1), p64(2), p64(3)])])
+        );
+        // The tid 0 is from 1900: older than the age.
+        assert_eq!(get(&mut s, p64(0)), Value::Nil);
     }
 
     #[test]
@@ -3768,6 +3905,7 @@ mod tests {
             oneway: true,
             method: method.into(),
             args,
+            context: None,
         })
     }
 
@@ -4108,6 +4246,7 @@ mod tests {
             oneway: false,
             method: method.into(),
             args,
+            context: None,
         };
         let register = vec![Value::from("1"), Value::Boolean(false)];
         calls
@@ -4317,6 +4456,7 @@ mod tests {
                 oneway: false,
                 method: "loadBefore".into(),
                 args: vec![p64(42), p64(u64::MAX >> 1)],
+                context: None,
             };
             let mut reply = Reply::new(room);
             let outcome = session.call(&call, &mut reply);
@@ -4375,6 +4515,7 @@ mod tests {
                 oneway,
                 method: method.into(),
                 args,
+                context: None,
             };
             calls.blocking_send(call).unwrap();
         };
@@ -4540,6 +4681,77 @@ mod tests {
             let fault = vote_and_finish(&mut s, id).unwrap_err();
             assert_eq!(fault.class, "builtins.TypeError");
         }
+    }
+
+    #[test]
+    fn a_str_serial_of_8_bytes_reads_as_those_bytes() {
+        let mut s = registered("str-serial");
+        let zero = Value::from("\0".repeat(8));
+
+        // A new oid commits with the str serial of a new object.
+        begin(&mut s, 1, None);
+        store_with(&mut s, 1, 1, zero.clone(), MAPPING);
+        let first = vote_and_finish(&mut s, 1).unwrap();
+        assert_eq!(
+            u64_of(&done(call(&mut s, "getTid", vec![p64(1)]))).unwrap(),
+            first
+        );
+
+        // An oid with a record fails the vote, as with the zero tid in
+        // bytes.
+        begin(&mut s, 2, None);
+        store_with(&mut s, 2, 1, zero.clone(), MAPPING);
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                Oid(1),
+                Some((Tid(first), Tid(0))),
+                Some("persistent.mapping.PersistentMapping".into())
+            )
+        );
+
+        // `checkCurrentSerialInTransaction` and `deleteObject` read the
+        // same serial.
+        begin(&mut s, 3, None);
+        let check = vec![p64(1), zero.clone(), Value::from(3)];
+        done(call(&mut s, "checkCurrentSerialInTransaction", check));
+        let fault = vote_and_finish(&mut s, 3).unwrap_err();
+        assert_eq!(fault.class, READ_CONFLICT_ERROR);
+        begin(&mut s, 4, None);
+        done(call(
+            &mut s,
+            "deleteObject",
+            vec![p64(1), zero.clone(), Value::from(4)],
+        ));
+        let fault = vote_and_finish(&mut s, 4).unwrap_err();
+        assert_eq!(fault.class, CONFLICT_ERROR);
+
+        // A str of another length, and an oid as a str, still fail.
+        let not_bytes = Fault::type_error("an oid or a tid is not bytes");
+        begin(&mut s, 5, None);
+        store_with(&mut s, 5, 2, Value::from("\0".repeat(7)), MAPPING);
+        assert_eq!(vote_and_finish(&mut s, 5).unwrap_err(), not_bytes);
+        begin(&mut s, 6, None);
+        let args = vec![
+            zero.clone(),
+            zero,
+            Value::Binary(MAPPING.to_vec()),
+            Value::from(6),
+        ];
+        done(call(&mut s, "storea", args));
+        assert_eq!(vote_and_finish(&mut s, 6).unwrap_err(), not_bytes);
+
+        // The UTF-8 bytes of the str are the serial.
+        let text = "\u{e9}".repeat(4);
+        let bytes = <[u8; 8]>::try_from(text.as_bytes()).unwrap();
+        assert_eq!(
+            serial_of(&Value::from(text)),
+            Ok(Tid(u64::from_be_bytes(bytes)))
+        );
+        assert_eq!(store_serial(&Value::Nil), Ok(Tid::ZERO));
     }
 
     #[test]

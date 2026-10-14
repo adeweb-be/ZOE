@@ -66,6 +66,7 @@ KEYS = {
     "lock-timeout": lock_timeout,
     "early-locks": early_locks,
     "read-only": stock_datatypes["boolean"],
+    "pack-gc": stock_datatypes["boolean"],
 }
 
 
@@ -99,6 +100,7 @@ def open_storage(settings):
         read_only=settings.get("read-only", False),
         lock_timeout=settings.get("lock-timeout"),
         blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
+        pack_gc=settings.get("pack-gc", True),
     )
 
 

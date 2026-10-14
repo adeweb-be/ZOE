@@ -27,6 +27,46 @@ const DATABASE: &str = "zoe.redb";
 /// The name under which a new database is written before it is renamed.
 const NEW_DATABASE: &str = "zoe.redb.new";
 
+/// Open the database file `path` read-only, with a page cache of
+/// `cache_size` bytes, or the default of redb.
+fn read_only_database(
+    path: &Path,
+    cache_size: Option<usize>,
+) -> std::result::Result<redb::ReadOnlyDatabase, redb::DatabaseError> {
+    let mut builder = redb::Builder::new();
+    if let Some(bytes) = cache_size {
+        builder.set_cache_size(bytes);
+    }
+    builder.open_read_only(path)
+}
+
+/// Repair the database file `path` that a writer left open, with a page
+/// cache of `cache_size` bytes, or the default of redb.
+///
+/// redb repairs the file when it opens it for writes. The open creates no
+/// file. The drop of the database closes it cleanly: it writes the
+/// allocator state and clears the recovery flag.
+fn repair_database(path: &Path, cache_size: Option<usize>) -> Result<()> {
+    let mut builder = redb::Builder::new();
+    if let Some(bytes) = cache_size {
+        builder.set_cache_size(bytes);
+    }
+    drop(builder.open(path).map_err(repair_failed)?);
+    Ok(())
+}
+
+/// Return the `RepairFailed` error of the redb error `error`. An error of
+/// the system stays as it is, so the text gives it without the words of
+/// redb.
+fn repair_failed(error: redb::DatabaseError) -> ZoeError {
+    match error {
+        redb::DatabaseError::Storage(redb::StorageError::Io(e)) => {
+            ZoeError::RepairFailed(Box::new(e))
+        }
+        e => ZoeError::RepairFailed(Box::new(e)),
+    }
+}
+
 /// Return the directory that holds the blob directory `blob_dir`, and the
 /// name of the blob directory there.
 ///
@@ -105,6 +145,13 @@ pub struct Options {
     /// to the file. `None`, the default, keeps the default of redb, 1 GiB.
     /// This is `cache-size` in the configuration.
     pub cache_size: Option<usize>,
+    /// Pack with garbage collection when true, the default. When false, a
+    /// pack removes old revisions only: of each object, it keeps the
+    /// newest record at or before the pack tid, also when no reader can
+    /// reach the object. When that record is a deletion, the object goes.
+    /// Such a pack reads no reference. The store does not record this
+    /// option. This is `pack-gc` in the configuration.
+    pub pack_gc: bool,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -124,6 +171,7 @@ impl Default for Options {
             transaction_warn: None,
             blob_dir: None,
             cache_size: None,
+            pack_gc: true,
             _more: (),
         }
     }
@@ -170,6 +218,10 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
+    /// True when a pack collects garbage. This is `Options::pack_gc`.
+    pub(crate) pack_gc: bool,
+    /// True when the open repaired the store.
+    repaired: bool,
     /// The state that a pack shares with the finishes. A finish takes its
     /// lock under the commit sequencer.
     pub(crate) packing: PackState,
@@ -311,7 +363,9 @@ impl Store {
     /// redb opens a database read-only only from a path. So this call
     /// reaches the files directly, not through a `Vfs`. A store that a
     /// crash left open fails with `NotClosedCleanly`: a writer open
-    /// rebuilds the free-space map of its database.
+    /// rebuilds the free-space map of its database. This open is strict:
+    /// it never repairs, so it tells if a store was closed cleanly. A tool
+    /// that reads a store uses `open_read_only_repairing`.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_read_only_with(dir, Options::default())
     }
@@ -327,6 +381,45 @@ impl Store {
     /// check that the blob directory is the one of the store:
     /// `check_blob_dir` does.
     pub fn open_read_only_with(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        Self::open_reader(dir.as_ref(), options, false)
+    }
+
+    /// Open the existing store in the directory `dir` for reads only, with
+    /// `options`, as `open_read_only_with` does. Repair the store first
+    /// when a writer left it open.
+    ///
+    /// The call takes the lock of the store before it reads the database,
+    /// and the store holds the lock until it closes. So no other open comes
+    /// between the repair and the read-only open. On a store that was
+    /// closed cleanly, the call is `open_read_only_with`: it changes no
+    /// byte. On a store that a writer left open, the read-only open of redb
+    /// fails. Then the call opens `zoe.redb` for writes, and redb repairs
+    /// the file. The call closes that database, which writes the allocator
+    /// state and clears the recovery flag. Then it opens the store
+    /// read-only. `repaired` tells that the open repaired the store. The
+    /// core logs nothing for it: the caller tells the operator.
+    ///
+    /// The repair writes only `zoe.redb`, and keeps every commit that was
+    /// durable. It runs no recovery of the store: it removes no
+    /// `zoe.redb.new` and no file in `blobs/tmp/` or `staging/`, replays
+    /// no intent file, and writes nothing in the blob directory. The next
+    /// writer open does these. The repair reads every page of the database
+    /// file, with `options.cache_size` as its page cache.
+    ///
+    /// A failure of the open for writes or of the repair fails with
+    /// `RepairFailed`. A read-only file system, or a database file without
+    /// write permission, fails the open for writes before redb writes a
+    /// byte. Another holder of the lock fails the call with `Locked`
+    /// before any write.
+    pub fn open_read_only_repairing(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
+        Self::open_reader(dir.as_ref(), options, true)
+    }
+
+    /// Open the existing store in `dir` for reads only, with `options`.
+    /// With `repair`, repair a store that a writer left open, as
+    /// `open_read_only_repairing` tells. Without it, such a store fails
+    /// with `NotClosedCleanly`.
+    fn open_reader(dir: &Path, options: Options, repair: bool) -> Result<Self> {
         let relocated = match options.blob_dir.as_deref().map(blob_location) {
             Some(location) => {
                 let (parent, name) = location?;
@@ -335,26 +428,36 @@ impl Store {
             }
             None => None,
         };
-        let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
-        let mut builder = redb::Builder::new();
-        if let Some(bytes) = options.cache_size {
-            builder.set_cache_size(bytes);
-        }
-        let db = builder
-            .open_read_only(dir.path(DATABASE))
-            .map_err(|e| match e {
-                redb::DatabaseError::RepairAborted => ZoeError::NotClosedCleanly,
-                e => ZoeError::Backend(Box::new(e)),
-            })?;
+        let dir = OsVfs::existing(dir, DATABASE)?;
+        let path = dir.path(DATABASE);
+        let (db, repaired) = match read_only_database(&path, options.cache_size) {
+            Ok(db) => (db, false),
+            Err(redb::DatabaseError::RepairAborted) if repair => {
+                repair_database(&path, options.cache_size)?;
+                let db = read_only_database(&path, options.cache_size).map_err(repair_failed)?;
+                (db, true)
+            }
+            Err(redb::DatabaseError::RepairAborted) => return Err(ZoeError::NotClosedCleanly),
+            Err(e) => return Err(ZoeError::Backend(Box::new(e))),
+        };
         let backend = RedbBackend::open_read_only(db)?;
-        Self::assemble(
+        let mut store = Self::assemble(
             backend,
             dir,
             Box::new(SystemClock),
             options,
             true,
             relocated,
-        )
+        )?;
+        store.repaired = repaired;
+        Ok(store)
+    }
+
+    /// Tell if the open of this store repaired it:
+    /// `open_read_only_repairing` found a store that a writer left open,
+    /// and repaired its database file. Every other open gives false.
+    pub fn repaired(&self) -> bool {
+        self.repaired
     }
 
     /// Make a store from an open backend and the directory that holds its
@@ -398,6 +501,8 @@ impl Store {
             group: GroupCommit::default(),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
+            pack_gc: options.pack_gc,
+            repaired: false,
             packing: PackState::default(),
             sequences: Sequences::default(),
         })
@@ -1500,6 +1605,47 @@ mod tests {
         drop(Store::open(&copy).unwrap());
         let store = Store::open_read_only(&copy).unwrap();
         assert_eq!(store.load(oid).unwrap().0, b"a");
+    }
+
+    #[test]
+    fn only_the_open_that_repairs_a_store_says_that_it_repaired_it() {
+        let open = fresh_dir("repaired-open");
+        let copy = fresh_dir("repaired-copy");
+        let (oid, _) = write_store(&open);
+        let store = Store::open(&open).unwrap();
+        assert!(!store.repaired());
+        std::fs::copy(open.join(DATABASE), copy.join(DATABASE)).unwrap();
+        drop(store);
+        assert!(!Store::open_read_only(&open).unwrap().repaired());
+        let clean = Store::open_read_only_repairing(&open, Options::default()).unwrap();
+        assert!(!clean.repaired());
+        drop(clean);
+
+        let store = Store::open_read_only_repairing(&copy, Options::default()).unwrap();
+        assert!(store.repaired());
+        assert_eq!(store.load(oid).unwrap().0, b"a");
+        drop(store);
+        let store = Store::open_read_only_repairing(&copy, Options::default()).unwrap();
+        assert!(!store.repaired());
+    }
+
+    #[test]
+    fn a_failed_repair_gives_the_error_of_the_system_and_creates_no_file() {
+        let system = io::Error::from_raw_os_error(libc::EROFS);
+        let error = repair_failed(redb::DatabaseError::Storage(redb::StorageError::Io(system)));
+        assert!(matches!(error, ZoeError::RepairFailed(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "the store was not closed cleanly, and its repair failed: \
+             Read-only file system (os error 30)"
+        );
+
+        // The open for writes of the repair creates no database file.
+        let dir = fresh_dir("repair-no-file");
+        let result = repair_database(&dir.join(DATABASE), None);
+        let refused = |e: &ZoeError| matches!(e, ZoeError::RepairFailed(s) if s.to_string().contains("os error 2"));
+        assert!(result.as_ref().is_err_and(refused), "{result:?}");
+        assert!(files(&dir).is_empty());
     }
 
     #[test]
