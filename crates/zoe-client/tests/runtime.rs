@@ -193,6 +193,43 @@ async fn a_bad_frame_closes_the_connection() {
 }
 
 #[tokio::test]
+async fn a_bad_invalidation_closes_the_connection() {
+    let (runtime, mut peer) = scripted(1);
+    let (registered, ready) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        ready.await.unwrap();
+        peer.recv().await;
+        // An oid of 3 bytes.
+        let args = Value::Array(vec![
+            bin8(9),
+            Value::Array(vec![Value::Binary(vec![0, 0, 1])]),
+        ]);
+        peer.send(Value::Array(vec![
+            0.into(),
+            true.into(),
+            "invalidateTransaction".into(),
+            args,
+        ]))
+        .await;
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut invalidations = client.invalidations();
+    registered.send(()).unwrap();
+    let pending = tokio::time::timeout(TIMEOUT, client.new_oids(1))
+        .await
+        .unwrap();
+    assert!(matches!(pending, Err(Error::Disconnected)), "{pending:?}");
+    let next = tokio::time::timeout(TIMEOUT, invalidations.recv())
+        .await
+        .unwrap();
+    assert!(matches!(next, Err(Error::Disconnected)), "{next:?}");
+    assert_eq!(client.last_transaction(), Tid(0));
+    let _peer = server.await.unwrap();
+}
+
+#[tokio::test]
 async fn another_protocol_is_refused() {
     let (runtime, mut peer) = scripted(1);
     let server = tokio::spawn(async move {
@@ -231,6 +268,11 @@ async fn a_listed_conflict_fails_the_vote_and_aborts() {
         assert_eq!(method, "tpc_abort");
         assert_eq!(args, Value::Array(vec![txn]));
         peer.reply(id, Value::Nil).await;
+        // After the abort, the transaction sends nothing: the next frame
+        // is the next call of the client.
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "new_oids");
+        peer.reply(id, Value::Array(vec![bin8(1)])).await;
         peer
     });
     let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
@@ -243,7 +285,13 @@ async fn a_listed_conflict_fails_the_vote_and_aborts() {
         }
         other => panic!("not a conflict: {other:?}"),
     }
+    // The server ended the transaction, so the client refuses more calls.
+    let store = txn.store(Oid(5), Tid(3), b"q").await;
+    assert!(matches!(store, Err(Error::Invalid(_))), "{store:?}");
+    let vote = txn.vote().await;
+    assert!(matches!(vote, Err(Error::Invalid(_))), "{vote:?}");
     drop(txn);
+    assert_eq!(client.new_oids(1).await.unwrap(), vec![Oid(1)]);
     let _peer = server.await.unwrap();
     client.close().await;
 }

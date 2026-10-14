@@ -332,6 +332,7 @@ impl Client {
             inner: self.inner.clone(),
             id,
             open: true,
+            ended: false,
             _guard: guard,
         })
     }
@@ -339,6 +340,12 @@ impl Client {
     /// Return a receiver of the invalidations that the server sends from
     /// now on: the commits of the other clients of the storage. The
     /// commits of this client give no invalidation.
+    ///
+    /// Subscribe first, then read `last_transaction`. The client raises
+    /// `last_transaction` before it sends an invalidation to the receivers.
+    /// So the receiver gets each invalidation after the tid that
+    /// `last_transaction` then gives. In the other order, an invalidation
+    /// can come between the two steps, and the receiver misses it.
     pub fn invalidations(&self) -> Invalidations {
         match &*lock(&self.inner.invalidations) {
             Some(sender) => Invalidations(sender.subscribe()),
@@ -373,16 +380,22 @@ impl std::fmt::Debug for Client {
 pub struct Transaction {
     inner: Arc<Inner>,
     id: u64,
-    /// `false` after a finish, an abort or a failed vote.
+    /// `true` until the server confirmed the finish or the abort. While it
+    /// is `true`, the drop sends `tpc_abort`.
     open: bool,
+    /// `true` after a failed vote or an abort. The server ended the
+    /// transaction, so the client sends no more calls for it.
+    ended: bool,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Transaction {
     /// Store `data` for `oid`. `serial` is the serial that the client read,
     /// or `Tid(0)` for a new object. The server reports an error of the
-    /// store at the vote.
+    /// store at the vote. After a failed vote, it fails with
+    /// `Error::Invalid` and sends nothing.
     pub async fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<(), Error> {
+        self.check()?;
         self.inner
             .notify(
                 "storea",
@@ -394,8 +407,11 @@ impl Transaction {
     /// Vote. A stale serial fails with `Error::Conflict`, both when the
     /// server fails the vote and when it lists the conflict for the client
     /// to resolve: this client resolves no conflict. A failed vote aborts
-    /// the transaction.
+    /// the transaction, and a later `store`, `vote` or `finish` fails with
+    /// `Error::Invalid`. A stock server can list the oids that it resolved:
+    /// the vote passes, and the client ignores these oids.
     pub async fn vote(&mut self) -> Result<(), Error> {
+        self.check()?;
         let result = match self.inner.call("vote", vec![self.id.into()]).await {
             // A stock server lists the oids that it resolved, and a server
             // with conflict resolution in the client lists the conflicts.
@@ -407,17 +423,28 @@ impl Transaction {
             Err(e) => Err(e),
         };
         if result.is_err() {
-            self.open = false;
+            self.ended = true;
             // The server keeps the locks of a listed conflict until the
-            // abort. The abort of a failed vote gets nil.
-            let _ = self.inner.call("tpc_abort", vec![self.id.into()]).await;
+            // abort. The abort of a failed vote gets nil. When this future
+            // is dropped before the abort returns, the drop of the
+            // transaction sends it.
+            if self
+                .inner
+                .call("tpc_abort", vec![self.id.into()])
+                .await
+                .is_ok()
+            {
+                self.open = false;
+            }
         }
         result
     }
 
     /// Finish the transaction after a vote, and return its tid. The server
-    /// replies when the commit is durable.
+    /// replies when the commit is durable. `Error::Disconnected` here means
+    /// that the outcome is unknown: the commit can be durable.
     pub async fn finish(mut self) -> Result<Tid, Error> {
+        self.check()?;
         let reply = self.inner.call("tpc_finish", vec![self.id.into()]).await?;
         let tid = tid(&reply, "tpc_finish")?;
         self.open = false;
@@ -427,8 +454,19 @@ impl Transaction {
 
     /// Abort the transaction, and wait for the reply of the server.
     pub async fn abort(mut self) -> Result<(), Error> {
-        self.open = false;
+        self.ended = true;
         self.inner.call("tpc_abort", vec![self.id.into()]).await?;
+        self.open = false;
+        Ok(())
+    }
+
+    /// Fail with `Error::Invalid` when the server ended the transaction.
+    fn check(&self) -> Result<(), Error> {
+        if self.ended {
+            return Err(Error::Invalid(
+                "a call for a transaction that the server ended".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -446,6 +484,7 @@ impl std::fmt::Debug for Transaction {
         f.debug_struct("Transaction")
             .field("id", &self.id)
             .field("open", &self.open)
+            .field("ended", &self.ended)
             .finish_non_exhaustive()
     }
 }
@@ -509,8 +548,10 @@ impl Inner {
         }
     }
 
-    /// Handle one message from the server.
-    fn dispatch(&self, message: Message) {
+    /// Handle one message from the server. An invalidation in a bad shape
+    /// fails with `Error::Protocol`: the reader then closes the connection,
+    /// so that no receiver misses a commit without a signal.
+    fn dispatch(&self, message: Message) -> Result<(), Error> {
         match message {
             Message::Reply { id, result } => {
                 let sender = lock(&self.calls).pending.remove(&id);
@@ -520,7 +561,7 @@ impl Inner {
             }
             Message::Call { method, args } if method == "invalidateTransaction" => {
                 let Some(invalidation) = invalidation(&args) else {
-                    return;
+                    return Err(bad("invalidateTransaction", &args));
                 };
                 self.last_tid
                     .fetch_max(invalidation.tid.0, Ordering::SeqCst);
@@ -531,6 +572,7 @@ impl Inner {
             // `info` and the other calls of the server change nothing here.
             Message::Call { .. } | Message::Other => {}
         }
+        Ok(())
     }
 
     /// Close the connection: stop the tasks, and fail each call that waits.
@@ -576,9 +618,11 @@ async fn read(inner: Arc<Inner>, mut stream: ReadHalf<Box<dyn Stream>>, _alive: 
             frame = protocol::read_frame(&mut stream) => frame,
         };
         let Ok(Some(payload)) = frame else { break };
-        match protocol::decode(&payload) {
-            Ok(message) => inner.dispatch(message),
-            Err(_) => break,
+        if protocol::decode(&payload)
+            .and_then(|message| inner.dispatch(message))
+            .is_err()
+        {
+            break;
         }
     }
     inner.shut();

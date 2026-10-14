@@ -6,6 +6,7 @@ use zoe_core::{Oid, Tid};
 
 /// An error of a call of the client.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The server answered with an error. `class` is the class name of the
     /// exception, as `ZODB.POSException.POSKeyError`. `message` shows the
