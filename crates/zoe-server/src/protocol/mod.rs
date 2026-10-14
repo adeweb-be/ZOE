@@ -298,10 +298,13 @@ async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
 ///
 /// The server closes the connection when the client sends no frame for
 /// `idle_timeout`: no protocol after the accept, or no frame after the last
-/// frame. The time while the reader waits for room for a call does not
-/// count, because the client cannot send then. The time counts from the
-/// last whole frame, so a frame that takes longer than the timeout to
-/// arrive is cut. This close is an end of the connection, as a close of the
+/// frame while no call of the connection runs. A call runs from its ticket
+/// until it puts its reply, and a download until it ends. The time counts
+/// again from the later of the last frame and the end of the last call.
+/// The time while the reader waits for room for a call does not count,
+/// because the client cannot send then. The time counts from the last
+/// whole frame, so a frame that takes longer than the timeout to arrive is
+/// cut. This close is an end of the connection, as a close of the
 /// hub is: the writer stops at once, and each call ends at the first reply
 /// that it cannot queue. `None` closes no idle connection.
 ///
@@ -341,7 +344,8 @@ pub(crate) struct Connection {
     pub(crate) runtime: Arc<dyn Runtime>,
     /// The longest frame that the connection takes.
     pub(crate) max_frame_size: u32,
-    /// The longest time without a frame, or `None` for no limit.
+    /// The longest time without a frame and without a call that runs, or
+    /// `None` for no limit.
     pub(crate) idle_timeout: Option<Duration>,
     /// True when the client may register read-only only, as the holder of
     /// a certificate of the read-only client CA.
@@ -450,18 +454,24 @@ pub(crate) async fn serve_stream(
     loop {
         // An end of the connection or a stop wins over a frame that waits.
         // A frame that arrived wins over the idle timeout. The idle time
-        // starts again for each frame, after its call took its room.
+        // starts again for each frame, after its call took its room. It
+        // does not count while a call of the connection runs, and starts
+        // again when the last call ends.
+        let quiet = calls.quiet();
         let read = tokio::select! {
             biased;
             () = ended.wait() => break,
             () = closing.wait() => break,
             () = stopping.wait() => break,
             read = frame::read(&mut reader, max_frame_size) => read,
-            () = idle(&*runtime, idle_timeout) => {
+            () = async {
+                quiet.await;
+                idle(&*runtime, idle_timeout).await;
+            } => {
                 tracing::info!(client = peer.as_str(), "no frame within the idle timeout: closing the connection");
-                // The writer stops at once. So a call that waits for room
-                // in the session queue stops too, and the transaction
-                // aborts, also when the client reads nothing.
+                // No call runs now. The writer stops at once, also when it
+                // waits for a client that reads nothing. Then the
+                // transaction aborts.
                 outbox.close();
                 break;
             }

@@ -1,0 +1,16 @@
+# A node drain does not evict the server. Tier 1 has one replica, so an
+# eviction stops all writes. Move the pod in a manual window: delete it,
+# and the StatefulSet starts it again.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zoe
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zoe
+      app.kubernetes.io/component: server
