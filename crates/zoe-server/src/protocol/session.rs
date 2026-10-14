@@ -486,6 +486,7 @@ impl Session {
             "new_oids" => self.new_oids(args),
             "loadBefore" => self.load_before(args),
             "loadSerial" => self.load_serial(args),
+            "getTid" => self.get_tid(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
             "record_iternext" => self.record_iternext(args),
@@ -636,6 +637,30 @@ impl Session {
         value
     }
 
+    /// Return the serial of the current record of an oid, as the reads of
+    /// the connection see it: the record before the last published tid
+    /// plus 1, as `loadBefore` reads. An oid without a record there, and an
+    /// oid whose record there is a deletion, fail with `POSKeyError`, as in
+    /// FileStorage.
+    ///
+    /// The reply takes its place after the read, so it comes after the
+    /// invalidation of the commit whose tid it gives. The client keeps no
+    /// state of the reply, so the reply can come after the invalidation of
+    /// a later commit.
+    fn get_tid(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid] = arity::<1>(args, "getTid")?;
+        let oid = Oid(u64_of(oid)?);
+        let published = self.storage.invalidations.published();
+        match self
+            .store
+            .load_before(oid, Tid(published.0.saturating_add(1)))?
+        {
+            Some(record) => Ok(p64(record.serial.0)),
+            // The oid has only records that the hub did not publish yet.
+            None => Err(ZoeError::NotFound { oid }.into()),
+        }
+    }
+
     fn load_serial(&self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial] = arity::<2>(args, "loadSerial")?;
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
@@ -763,7 +788,9 @@ impl Session {
     fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial, data, id] = arity::<4>(args, "storea")?;
         self.current(id)?.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let oid = Oid(u64_of(oid)?);
+            // A nil serial is the serial of a new object, as in FileStorage.
+            let serial = optional_tid(serial)?.unwrap_or(Tid::ZERO);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
@@ -2601,6 +2628,155 @@ mod tests {
                 ".reply"
             ]
         );
+    }
+
+    /// Stage a store of `data` for `oid` with the serial `serial` in the
+    /// open transaction `id`.
+    fn store_with(s: &mut Session, id: i64, oid: u64, serial: Value, data: &[u8]) {
+        let args = vec![
+            p64(oid),
+            serial,
+            Value::Binary(data.to_vec()),
+            Value::from(id),
+        ];
+        assert_eq!(done(call(s, "storea", args)), Value::Nil);
+    }
+
+    #[test]
+    fn a_nil_serial_is_the_serial_of_a_new_object() {
+        let mut s = session("nil-serial");
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+
+        // A new oid commits with a nil serial.
+        begin(&mut s, 1, None);
+        store_with(&mut s, 1, 1, Value::Nil, MAPPING);
+        let first = vote_and_finish(&mut s, 1).unwrap();
+        let load = done(call(&mut s, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(
+            load,
+            Value::Array(vec![
+                Value::Binary(MAPPING.to_vec()),
+                p64(first),
+                Value::Nil
+            ])
+        );
+
+        // An oid with a record fails the vote, as with a zero serial. The
+        // core does not hand the conflict back for the client to resolve.
+        begin(&mut s, 2, None);
+        store_with(&mut s, 2, 1, Value::Nil, MAPPING);
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                Oid(1),
+                Some((Tid(first), Tid(0))),
+                Some("persistent.mapping.PersistentMapping".into())
+            )
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+            Value::Nil
+        );
+        assert_eq!(
+            u64_of(&done(call(&mut s, "getTid", vec![p64(1)]))).unwrap(),
+            first
+        );
+
+        // A serial that is not nil must still be 8 bytes.
+        for (id, serial) in [(3, Value::from("x")), (4, Value::Binary(vec![0; 7]))] {
+            begin(&mut s, id, None);
+            store_with(&mut s, id, 2, serial, MAPPING);
+            let fault = vote_and_finish(&mut s, id).unwrap_err();
+            assert_eq!(fault.class, "builtins.TypeError");
+        }
+    }
+
+    #[test]
+    fn get_tid_gives_the_serial_of_the_current_record() {
+        let mut s = session("get-tid");
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let missing = Fault::from(ZoeError::NotFound { oid: Oid(1) });
+        assert_eq!(failed(call(&mut s, "getTid", vec![p64(1)])), missing);
+
+        let first = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(first));
+        let second = commit(&mut s, 2, 1, first, MAPPING).unwrap();
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(second));
+
+        // A read needs no transaction and takes no lock: it works while
+        // the open transaction holds the lock of the oid after its vote.
+        begin(&mut s, 3, None);
+        store(&mut s, 3, 1, second, MAPPING);
+        done(call(&mut s, "vote", vec![Value::from(3)]));
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(second));
+        let abort = done(call(&mut s, "tpc_abort", vec![Value::from(3)]));
+        assert_eq!(abort, Value::Nil);
+
+        // A deletion is the current record: the oid has no tid.
+        begin(&mut s, 4, None);
+        let delete = vec![p64(1), p64(second), Value::from(4)];
+        done(call(&mut s, "deleteObject", delete));
+        vote_and_finish(&mut s, 4).unwrap();
+        assert_eq!(failed(call(&mut s, "getTid", vec![p64(1)])), missing);
+
+        // Wrong arguments fail the call, and the connection stays open.
+        let fault = failed(call(&mut s, "getTid", vec![]));
+        assert_eq!(fault, Fault::type_error("getTid takes 1 arguments"));
+        let fault = failed(call(&mut s, "getTid", vec![Value::from(1)]));
+        assert_eq!(fault, Fault::type_error("an oid or a tid is not bytes"));
+        assert!(matches!(call(&mut s, "ping", vec![]), Outcome::Done(_)));
+    }
+
+    #[test]
+    fn get_tid_shows_only_the_commits_that_the_hub_published() {
+        let storage = storage("get-tid-published", Queues::DEFAULT);
+        let (mut writer, _own) = connected(&storage);
+        let (mut reader, mut frames) = connected(&storage);
+        let first = commit(&mut writer, 1, 1, 0, b"old").unwrap();
+        assert_eq!(messages(&mut frames), [invalidation(first, &[1])]);
+
+        // A commit that the store made visible and the hub did not publish
+        // yet: a new record of oid 1, and the first record of oid 2.
+        let mut txn = storage.store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid(first), b"new").unwrap();
+        txn.store(Oid(2), Tid(0), b"two").unwrap();
+        txn.vote().unwrap();
+        let hidden = txn.finish_after().unwrap();
+
+        assert_eq!(done(call(&mut reader, "getTid", vec![p64(1)])), p64(first));
+        let fault = failed(call(&mut reader, "getTid", vec![p64(2)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(2) }));
+
+        // The hub publishes the commit. Then the reads show it.
+        storage.invalidations.publish(Commit {
+            previous: hidden.previous,
+            tid: hidden.tid,
+            origin: None,
+            outbox: outbox(),
+            own: Vec::new(),
+            others: Others::Send(message::notify(
+                "invalidateTransaction",
+                vec![p64(hidden.tid.0), Value::Array(vec![p64(1), p64(2)])],
+            )),
+        });
+        for oid in [1, 2] {
+            let tid = done(call(&mut reader, "getTid", vec![p64(oid)]));
+            assert_eq!(tid, p64(hidden.tid.0));
+        }
+        // The call takes no place before its read, so its reply goes out
+        // after the invalidation of the commit that it shows.
+        assert!(reader.place.is_none());
     }
 
     #[test]
