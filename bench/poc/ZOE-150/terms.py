@@ -25,6 +25,11 @@ GATE = 3.0
 CLIENT_CPUS = 12
 
 
+def fmt(ratio):
+    # Two decimals keep a ratio under 0.5 within 5 % only with three.
+    return f"{ratio:.2f}" if ratio >= 0.5 else f"{ratio:.3f}"
+
+
 def term(k, z, q, f, proto, hit):
     py, sc, mode, c, size = k
     if sc == "read_hot":
@@ -67,12 +72,12 @@ def main():
         f = med(floor[k]) if k in floor else None
         ratio = q / z
         t, card = ("-", "") if ratio >= GATE else term(k, z, q, f, proto[k], hit)
-        table.append(f"| {sc} | {mode} | {c} | {size_text(size)} | {py} | {z:,.0f} | {q:,.0f} | {ratio:.2f} | {t} |")
+        table.append(f"| {sc} | {mode} | {c} | {size_text(size)} | {py} | {z:,.0f} | {q:,.0f} | {fmt(ratio)} | {t} |")
         if ratio < GATE:
             fl = f"{f / z:.1f}" if f else "-"
             dist = sum(r["disturbed"] for r in zeo[k] + proto[k])
             under.append(
-                f"| {sc} | {mode} | {c} | {size_text(size)} | {py} | {ratio:.2f} | {fl} "
+                f"| {sc} | {mode} | {c} | {size_text(size)} | {py} | {fmt(ratio)} | {fl} "
                 f"| {spread(zeo[k]):.0f} % / {spread(proto[k]):.0f} % | {t} | {card} |"
             )
     print("| scenario | mode | concurrency | object size | python | zeo ops/s | poc ops/s | ratio | term |")
