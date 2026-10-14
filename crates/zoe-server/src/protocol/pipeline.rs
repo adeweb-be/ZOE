@@ -381,6 +381,22 @@ impl Calls {
         }
     }
 
+    /// Wait until no call of the connection runs. A call runs from its
+    /// ticket until it puts its reply, or until it ends when it has no
+    /// reply, because it keeps its slot that long. A download keeps its
+    /// slot until it ends. The future holds no borrow of `self`. Call it
+    /// only while the reader takes no ticket: the future takes each slot,
+    /// then gives them back at once.
+    pub(crate) fn quiet(&self) -> impl Future<Output = ()> + Send + 'static {
+        let slots = Arc::clone(&self.slots);
+        async move {
+            let _all = slots
+                .acquire_many_owned(QUEUE as u32)
+                .await
+                .expect("the slots of a connection never close");
+        }
+    }
+
     /// Start `call`, which took `ticket`. Wait only for `register`.
     pub(crate) async fn start(&mut self, call: Call, ticket: Ticket) {
         let Some(session) = self.session.clone() else {

@@ -186,8 +186,8 @@ pub(super) struct ServeArgs {
     /// idle for longer: its open transaction aborts and its locks go, as
     /// when the client closes. So a client that stalls during a commit, or
     /// a host that dies, holds its locks at most this long. The time while
-    /// the server reads no calls of the connection, because 4 calls wait,
-    /// does not count. 0 closes no idle connection.
+    /// a call of the connection runs does not count: a client that waits
+    /// for its reply is not idle. 0 closes no idle connection.
     #[arg(
         long,
         env = "ZOE_IDLE_TIMEOUT",
