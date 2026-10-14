@@ -42,6 +42,7 @@ The tinted boxes are the only two places the human is in the loop; a card that t
 - `CONTEXT.md`: the domain glossary (oid, tid, serial, ghost, vote, pack, intent lock) so agents and humans use one vocabulary.
 - Skills for the recurring procedures: run the conformance suite, run the benchmark set and compare to baseline, cut a release, write a handoff when a session ends unfinished.
 - Trunk-based: short-lived branch per card, one agent per worktree, squash merge, no force pushes, CI configuration changed only by a human.
+- Stacked pull requests: when several PRs are open at once, they form one merge train. Each branch merges the tail of the train before it is marked ready, PRs merge in train order, and the next branch merges `main` after each squash merge. The root `CLAUDE.md` gives the steps.
 - `CODEOWNERS` marks the red zones: the on-disk format, pack, and the process files (`.github/` and `loops/`). A red-zone PR needs the human's approval; everything else merges on the reviewer agent's approval (ADR 0022).
 
 **Tooling**
