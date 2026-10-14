@@ -11,6 +11,7 @@ repository = "https://github.com/adeweb-be/ZOE"
 publish = false
 
 [workspace.dependencies]
+zoe-client = { path = "crates/zoe-client" }
 zoe-convert = { path = "crates/zoe-convert" }
 zoe-core = { path = "crates/zoe-core" }
 zoe-loupe = { path = "crates/zoe-loupe" }
