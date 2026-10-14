@@ -60,14 +60,14 @@ BAD_MESSAGE_TESTS = [
 RUNS = 5
 
 
-def tests_and_layers(suite, layers=()):
+def cases_and_layers(suite, layers=()):
     """Yield each test of suite with the layers of the suites around it."""
     layer = getattr(suite, "layer", None)
     if layer is not None and layer not in layers:
         layers = layers + (layer,)
     if isinstance(suite, unittest.TestSuite):
         for item in suite:
-            yield from tests_and_layers(item, layers)
+            yield from cases_and_layers(item, layers)
     else:
         yield suite, layers
 
@@ -75,7 +75,7 @@ def tests_and_layers(suite, layers=()):
 def select(suite, ids):
     """Return the tests of suite with these ids, each with its layers."""
     found = [
-        (test, layers) for test, layers in tests_and_layers(suite) if test.id() in ids
+        (test, layers) for test, layers in cases_and_layers(suite) if test.id() in ids
     ]
     assert sorted(test.id() for test, _ in found) == sorted(ids)
     return found
