@@ -9,8 +9,8 @@
 //! The copy pass holds one record at a time. The store holds the records of
 //! a restore transaction in memory until its finish. The verification pass
 //! holds one transaction of the file and one of the store. The transaction
-//! iterator of the store also holds the transaction rows and the record
-//! keys of the whole store.
+//! iterator of the store holds one transaction and a slice of tids at a
+//! time, whatever the size of the store.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
