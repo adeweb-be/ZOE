@@ -105,6 +105,8 @@ pub(crate) fn accept(
         max_frame_size: DEFAULT_MAX_FRAME_SIZE.get(),
         idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
         read_only: false,
+        // The stream of the simulator has no socket.
+        socket: None,
     };
     // No stop of the server comes: the simulator stops a server by a
     // crash or at the end of a run.

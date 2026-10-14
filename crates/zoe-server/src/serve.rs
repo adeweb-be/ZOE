@@ -29,6 +29,7 @@ use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -818,6 +819,7 @@ async fn serve_tls(
             return;
         }
     };
+    let socket = Some(stream.get_ref().0.as_raw_fd());
     let (reader, writer) = tokio::io::split(stream);
     let connection = Connection {
         peer,
@@ -825,6 +827,7 @@ async fn serve_tls(
         max_frame_size,
         idle_timeout,
         read_only,
+        socket,
     };
     protocol::serve_stream(reader, writer, connection, storages, stopping).await;
 }
