@@ -177,10 +177,10 @@ impl ServeOptions {
     /// Close a connection that sends no frame for `timeout`. The time counts
     /// from the last frame that the server read, a heartbeat included, and
     /// from the accept for the protocol of the client. The time while the
-    /// call queue of the connection is full does not count. The close ends
-    /// the connection as a close of the client does: its session runs the
-    /// calls that arrived, then aborts its open transaction. A timeout of 0
-    /// closes no connection.
+    /// call queue of the connection is full does not count. The close stops
+    /// the writer at once, as a close of the hub does. The session runs the
+    /// calls that arrived, up to the first reply that it cannot queue, then
+    /// aborts its open transaction. A timeout of 0 closes no connection.
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
