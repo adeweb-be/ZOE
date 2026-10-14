@@ -6,10 +6,12 @@
 //! - `GET /readyz` gives 200 when every store loaded its last tid and its
 //!   lock table held no entry at the open, and the server does not stop.
 //!   Otherwise it gives 503.
+//! - `GET /metrics` gives the metrics of each storage in the Prometheus
+//!   text format once every store is open, and 503 before.
 //! - Each other path gives 404. A known path with a method other than
 //!   `GET` or `HEAD` gives 405.
 //!
-//! The body is plain text, one line for each storage. A reply to `HEAD`
+//! The body of the probes is plain text, one line for each storage. A reply to `HEAD`
 //! has no body, whatever its status. The server reads one request on each
 //! connection, sends one reply and closes the connection.
 //! It never speaks ZEO on this port. The admin port is not a task of the
@@ -22,6 +24,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
+
+use crate::protocol::metrics::{self, Exported};
 
 /// The longest request head, in bytes, with the empty line at its end. A
 /// longer head gets 431.
@@ -43,6 +47,9 @@ pub(crate) struct Health {
     /// The stores, in the order of the configuration. It is empty until
     /// every store is open.
     stores: OnceLock<Vec<StoreHealth>>,
+    /// The metrics of each storage, in the order of the configuration. It
+    /// is empty until every store is open.
+    metrics: OnceLock<Vec<Exported>>,
     /// The stop signal of the server. `true` from the stop on.
     stopping: watch::Receiver<bool>,
 }
@@ -62,6 +69,7 @@ impl Health {
     pub(crate) fn new(stopping: watch::Receiver<bool>) -> Arc<Self> {
         Arc::new(Self {
             stores: OnceLock::new(),
+            metrics: OnceLock::new(),
             stopping,
         })
     }
@@ -70,6 +78,22 @@ impl Health {
     /// tid.
     pub(crate) fn opened(&self, stores: Vec<StoreHealth>) {
         let _ = self.stores.set(stores);
+    }
+
+    /// Record the metrics of each storage, once every store is open.
+    pub(crate) fn measured(&self, storages: Vec<Exported>) {
+        let _ = self.metrics.set(storages);
+    }
+
+    /// The reply to `/metrics`.
+    fn metrics(&self) -> Reply {
+        match self.metrics.get() {
+            Some(storages) => Reply {
+                content_type: metrics::CONTENT_TYPE,
+                ..Reply::text(Status::Ok, metrics::render(storages))
+            },
+            None => Reply::text(Status::Unavailable, "starting\n".to_owned()),
+        }
     }
 
     /// The reply to `/healthz`.
@@ -203,7 +227,8 @@ fn respond(health: &Health, head: &[u8]) -> Reply {
     let reply = match path {
         "/healthz" => health.live(),
         "/readyz" => health.ready(),
-        // Each new path of the admin port, `/metrics` too, goes here.
+        "/metrics" => health.metrics(),
+        // Each new path of the admin port goes here.
         _ => return Reply::text(Status::NotFound, "not found\n"),
     };
     match method {
@@ -274,7 +299,7 @@ pub(crate) async fn serve(listener: TcpListener, health: Arc<Health>) {
                 });
             }
             Err(error) => {
-                eprintln!("zoe serve: admin accept failed: {error}");
+                tracing::warn!("admin accept failed: {error}");
                 tokio::task::yield_now().await;
             }
         }
@@ -378,10 +403,39 @@ mod tests {
     }
 
     #[test]
+    fn metrics_come_in_the_text_format_once_the_stores_are_open() {
+        let (_stop, stopping) = watch::channel(false);
+        let health = Health::new(stopping);
+        let starting = get(&health, "/metrics");
+        assert_eq!((code(&starting), starting.content_type), (503, TEXT));
+
+        let dir = std::env::temp_dir().join(format!("zoe-admin-metrics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(zoe_core::Store::open(&dir).unwrap());
+        let storage =
+            crate::protocol::NamedStorage::new("1", &dir, store, crate::protocol::Queues::DEFAULT);
+        health.measured(vec![storage.exported()]);
+        drop(storage);
+        // The admin port holds no store: the store closed.
+        drop(zoe_core::Store::open(&dir).unwrap());
+        let reply = get(&health, "/metrics");
+        assert_eq!(code(&reply), 200);
+        assert_eq!(reply.content_type, metrics::CONTENT_TYPE);
+        assert!(
+            reply.body.contains("zoe_loads_total{storage=\"1\"} 0\n"),
+            "{}",
+            reply.body
+        );
+        let head = respond(&health, b"HEAD /metrics HTTP/1.1\r\n\r\n").bytes(true);
+        assert!(String::from_utf8(head).unwrap().ends_with("\r\n\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn other_paths_methods_and_bad_requests() {
         let (_stop, health) = health(&[true]);
         assert_eq!(code(&get(&health, "/")), 404);
-        assert_eq!(code(&get(&health, "/metrics")), 404);
+        assert_eq!(code(&get(&health, "/metrics/")), 404);
         assert_eq!(code(&get(&health, "/healthz/")), 404);
         let reply = respond(&health, b"POST /readyz HTTP/1.1\r\n\r\n");
         assert_eq!(code(&reply), 405);

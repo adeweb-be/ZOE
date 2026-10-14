@@ -156,6 +156,18 @@ impl Invalidations {
         (id, state.published)
     }
 
+    /// Return the most frames that wait in the hub queue of one
+    /// connection.
+    pub(crate) fn deepest_queue(&self) -> usize {
+        let state = self.lock();
+        state
+            .clients
+            .values()
+            .map(Outbox::hub_len)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Remove the connection `id`.
     pub(crate) fn unsubscribe(&self, id: ClientId) {
         self.lock().clients.remove(&id);
@@ -238,7 +250,10 @@ impl Invalidations {
 /// Write a log line for the connections that a full queue closed.
 fn log_overflows(overflows: usize) {
     if overflows > 0 {
-        eprintln!("zoe serve: closing {overflows} connection(s): the client queue of each is full");
+        tracing::warn!(
+            connections = overflows,
+            "closing connections: the client queue of each is full"
+        );
     }
 }
 
@@ -408,6 +423,21 @@ mod tests {
         hub.publish(writer.commit(7, 8));
         assert!(gone.take().is_empty());
         assert_eq!(writer.take().len(), 6);
+    }
+
+    #[test]
+    fn the_deepest_queue_is_the_longest_hub_queue_of_one_connection() {
+        let hub = Invalidations::new(Tid(0));
+        assert_eq!(hub.deepest_queue(), 0);
+        let mut a = Client::new(&hub, 10);
+        let _b = Client::new(&hub, 10);
+        hub.publish(a.commit(0, 1));
+        hub.send_to_all(b"info".to_vec());
+        // The committer holds `info`, its reply and the frame for all. The
+        // other connection holds the invalidation and the frame for all.
+        assert_eq!(hub.deepest_queue(), 3);
+        assert_eq!(a.take().len(), 3);
+        assert_eq!(hub.deepest_queue(), 2);
     }
 
     #[test]
