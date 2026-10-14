@@ -106,6 +106,12 @@ impl From<io::Error> for Failure {
     }
 }
 
+impl From<zoe_convert::Error> for Failure {
+    fn from(error: zoe_convert::Error) -> Self {
+        Self::Message(error.to_string())
+    }
+}
+
 /// Return the failure of the store in `path`.
 fn store_failure(path: &Path, error: ZoeError) -> Failure {
     Failure::Message(format!("{}: {error}", path.display()))
@@ -292,7 +298,7 @@ mod tests {
         let expected: [(&str, &[&str]); 3] = [
             ("backup", &["ZOE_PATH", "ZOE_TO"]),
             ("restore", &["ZOE_FROM", "ZOE_PATH"]),
-            ("verify", &["ZOE_PATH", "ZOE_BACKUP"]),
+            ("verify", &["ZOE_PATH", "ZOE_BACKUP", "ZOE_SCRATCH"]),
         ];
         let mut command = Cli::command();
         for (name, twins) in expected {
