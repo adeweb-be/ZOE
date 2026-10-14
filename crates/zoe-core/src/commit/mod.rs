@@ -94,6 +94,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The tid of a restore transaction. A normal transaction gets its tid
     /// at finish.
     tid: Option<Tid>,
+    /// True for a restore transaction whose finish commits without a sync.
+    deferred: bool,
     user: Vec<u8>,
     description: Vec<u8>,
     extension: Vec<u8>,
@@ -153,6 +155,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             store,
             thread: thread::current().id(),
             tid: None,
+            deferred: false,
             user: user.to_vec(),
             description: description.to_vec(),
             extension: extension.to_vec(),
@@ -185,6 +188,28 @@ impl<S: Deref<Target = Store>> Txn<S> {
         check_restore_tid(tid, store.last_transaction())?;
         let mut txn = Self::begin(store, user, description, extension);
         txn.tid = Some(tid);
+        Ok(txn)
+    }
+
+    /// Begin a restore transaction on `store`, as `begin_restore` does,
+    /// whose finish commits without a sync of the database file.
+    ///
+    /// The finish runs the same commit path: the tid check, the locks and
+    /// the placement of the blobs with all their syncs. Only the backend
+    /// commit has no sync. The commit is visible to readers and sets the
+    /// last tid when `finish` returns. It becomes durable with the next
+    /// durable commit: `Store::sync`, or a finish of another kind. A crash
+    /// before it loses the commit, and the next writer open removes its
+    /// blob files.
+    pub fn begin_restore_deferred(
+        store: S,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Self> {
+        let mut txn = Self::begin_restore(store, tid, user, description, extension)?;
+        txn.deferred = true;
         Ok(txn)
     }
 
@@ -783,7 +808,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 
     /// Commit the transaction and return its tid. The commit is durable
-    /// when this returns.
+    /// when this returns, except for a deferred restore
+    /// (`begin_restore_deferred`): that commit is only visible, and the
+    /// next durable commit makes it durable.
     ///
     /// A restore transaction commits under its own tid. If that tid is not
     /// after the last tid, `finish` fails with `Protocol`. A normal
@@ -812,6 +839,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let member = Member {
             tid: self.tid,
+            deferred: self.deferred,
             staged: std::mem::take(&mut self.staged),
             blobs: std::mem::take(&mut self.blobs),
             user: std::mem::take(&mut self.user),

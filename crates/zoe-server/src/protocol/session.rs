@@ -4363,6 +4363,12 @@ mod tests {
             })
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            // Another test thread can register the callsite of the
+            // connection span while this subscriber registers. tracing can
+            // then cache the interest of the span as "never", and the line
+            // of the lock loses the fields of the span. A rebuild here
+            // computes the interest again with this subscriber.
+            tracing::callsite::rebuild_interest_cache();
             run(serving(Arc::clone(&storage)), received, replies);
         });
 

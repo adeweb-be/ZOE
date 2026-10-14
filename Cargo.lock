@@ -1383,6 +1383,7 @@ name = "zoe-convert"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "redb",
  "thiserror",
  "zoe-core",
  "zoe-pickle",

@@ -6,6 +6,11 @@
 //! reads the file again, up to where the copy pass stopped, and compares
 //! it with every transaction of the store.
 //!
+//! The copy pass restores each transaction without a sync of the database
+//! file, and makes the store durable once per batch of transactions and
+//! once at its end, before the verification pass. A crash loses only the
+//! restores of the open batch, and the next conversion resumes after them.
+//!
 //! The copy pass holds one record at a time. The store holds the records of
 //! a restore transaction in memory until its finish. The verification pass
 //! holds one transaction of the file and one of the store. The transaction
@@ -36,6 +41,14 @@ const MAX_PROBLEMS: usize = 100;
 /// The size of the buffers of the blob comparison.
 const CHUNK: usize = 1 << 16;
 
+/// The copy pass makes the store durable after at most this many restore
+/// transactions.
+const BATCH_TRANSACTIONS: u64 = 1_000;
+
+/// The copy pass makes the store durable after at most this many bytes of
+/// pickles and blobs, when that comes before `BATCH_TRANSACTIONS`.
+const BATCH_BYTES: u64 = 64 << 20;
+
 /// Convert the FileStorage file `data_fs` into the store `target`, then
 /// verify the store against the file.
 ///
@@ -47,6 +60,12 @@ const CHUNK: usize = 1 << 16;
 /// a tid of the file, else the call fails with `Diverged` before it copies
 /// anything. Each transaction is restored under its own tid, with its
 /// user, its description and its extension bytes unchanged.
+///
+/// A restore commits without a sync of the database file. The store
+/// becomes durable after each batch of at most 1,000 transactions or
+/// 64 MiB of pickles and blobs, whichever comes first, and once more
+/// before the verification. A crash loses only the restores of the open
+/// batch, and a later call resumes after them.
 ///
 /// The verification compares the tids, the metadata and every pickle of
 /// the file with those of the store, checks that every blob is in the
@@ -73,8 +92,58 @@ pub fn from_datafs(
 }
 
 /// Copy the transactions of `reader` that are after the last tid of
-/// `target`. Return the count of copied transactions.
+/// `target`, and make them durable. Return the count of copied
+/// transactions.
+///
+/// After an error, the call makes the restores before it durable too, and
+/// returns the first error.
 fn copy(reader: &mut Reader, blobs: Option<&BlobDir>, target: &Store) -> Result<u64, Error> {
+    let mut batch = Batch::default();
+    let copied = copy_batches(reader, blobs, target, &mut batch);
+    let synced = batch.sync(target);
+    let copied = copied?;
+    synced?;
+    Ok(copied)
+}
+
+/// The restores of the copy pass since the last sync of the store.
+#[derive(Default)]
+struct Batch {
+    transactions: u64,
+    bytes: u64,
+}
+
+impl Batch {
+    /// Count one restore of `bytes` bytes of pickles and blobs. Sync the
+    /// store when the batch is full.
+    fn add(&mut self, bytes: u64, target: &Store) -> Result<(), Error> {
+        self.transactions += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.transactions >= BATCH_TRANSACTIONS || self.bytes >= BATCH_BYTES {
+            self.sync(target)?;
+        }
+        Ok(())
+    }
+
+    /// Make the restores of the batch durable, and start a new batch. An
+    /// empty batch does nothing.
+    fn sync(&mut self, target: &Store) -> Result<(), Error> {
+        if self.transactions > 0 {
+            *self = Self::default();
+            target.sync()?;
+        }
+        Ok(())
+    }
+}
+
+/// Copy the transactions as `copy` does, and sync the store after each
+/// full batch. The restores of the last batch stay in `batch`.
+fn copy_batches(
+    reader: &mut Reader,
+    blobs: Option<&BlobDir>,
+    target: &Store,
+    batch: &mut Batch,
+) -> Result<u64, Error> {
     let last = target.last_transaction();
     // An empty store continues every file. A store that is not empty
     // continues the file only when its last tid is a tid of the file.
@@ -88,8 +157,9 @@ fn copy(reader: &mut Reader, blobs: Option<&BlobDir>, target: &Store) -> Result<
         if !continues {
             return Err(Error::Diverged { last });
         }
-        copy_txn(reader, &txn, blobs, target)?;
+        let bytes = copy_txn(reader, &txn, blobs, target)?;
         copied += 1;
+        batch.add(bytes, target)?;
     }
     if !continues {
         return Err(Error::Diverged { last });
@@ -97,7 +167,9 @@ fn copy(reader: &mut Reader, blobs: Option<&BlobDir>, target: &Store) -> Result<
     Ok(copied)
 }
 
-/// Restore the transaction `header` of `reader` in `target`.
+/// Restore the transaction `header` of `reader` in `target`, without a
+/// sync of the database file. Return the count of bytes of its pickles and
+/// blobs.
 ///
 /// A blob record with a file in `blobs` is staged with `store_blob`. Its
 /// serial is the current serial of the oid in the store, so the serial
@@ -108,15 +180,17 @@ fn copy_txn(
     header: &TxnHeader,
     blobs: Option<&BlobDir>,
     target: &Store,
-) -> Result<(), Error> {
-    let mut txn = target.tpc_begin_restore(
+) -> Result<u64, Error> {
+    let mut txn = target.tpc_begin_restore_deferred(
         header.tid,
         &header.user,
         &header.description,
         &header.extension,
     )?;
+    let mut bytes = 0u64;
     for record in reader.records(header) {
         let DataRecord { oid, data } = record?;
+        bytes = bytes.saturating_add(data.as_ref().map_or(0, |pickle| pickle.len() as u64));
         let source = match (&data, blobs) {
             (Some(pickle), Some(blobs)) if is_blob_record(pickle) => {
                 open_source(&blobs.path(oid, header.tid))?
@@ -126,7 +200,9 @@ fn copy_txn(
         match (data, source) {
             (Some(pickle), Some((path, mut source))) => {
                 let mut file = target.new_blob_file()?;
-                io::copy(&mut source, &mut file).map_err(|source| Error::Io { path, source })?;
+                let size = io::copy(&mut source, &mut file)
+                    .map_err(|source| Error::Io { path, source })?;
+                bytes = bytes.saturating_add(size);
                 let serial = current_serial(target, oid)?;
                 txn.store_blob(oid, serial, &pickle, file)?;
             }
@@ -135,7 +211,7 @@ fn copy_txn(
     }
     txn.vote()?;
     txn.finish()?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Open the blob file `path` of the source. A missing file gives `None`.
@@ -769,6 +845,27 @@ mod tests {
                  but it is not a whole last transaction: the conversion stops there"
             )]
         );
+    }
+
+    #[test]
+    fn an_error_of_the_copy_pass_keeps_the_restores_before_it() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', NO_META, &[(1, Data::Bytes(b"a"))]);
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"b"))]);
+        // A tid that does not increase stops the copy pass with `Corrupt`.
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"c"))]);
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let error = from_datafs(&file.write("copy-error"), None, &store).unwrap_err();
+        assert!(matches!(error, Error::Corrupt { .. }), "{error:?}");
+
+        // The copy pass synced the store before it returned the error, so
+        // a crash keeps both restores.
+        let image = vfs.crash_now(|_| 0);
+        let reopened = Store::open_vfs(image).unwrap();
+        assert_eq!(reopened.last_transaction(), Tid(20));
+        assert_eq!(reopened.load(Oid(1)).unwrap(), (b"b".to_vec(), Tid(20)));
+        drop(store);
     }
 
     #[test]
