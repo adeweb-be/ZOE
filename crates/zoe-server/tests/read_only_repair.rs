@@ -11,6 +11,11 @@
 //! acknowledged commit is there. On a store that was closed cleanly, the
 //! command changes no byte of the store.
 //!
+//! A command that repaired the store says so: it writes one line to
+//! stderr that holds the phrase `repaired the store`. It writes no such
+//! line for a clean store, and never to stdout. `zoe mcp` keeps stdout for
+//! MCP messages only.
+//!
 //! A command that cannot write the database file, as on a read-only file
 //! system, fails with 1 and changes no byte. Its message says that the
 //! store was not closed cleanly and gives the error of the system. The
@@ -21,15 +26,17 @@ mod wire;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wire::{Server, ZOE, commit, fresh_dir, load, record, s};
+use wire::{Conn, Server, ZOE, commit, fresh_dir, load, record, s};
 use zoe_core::{Oid, Store, ZoeError};
 
 /// The longest run of one command.
@@ -38,10 +45,46 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// The capabilities that let root ignore the mode of a file.
 const MODE_CAPS: &str = "-dac_override,-dac_read_search";
 
+/// The stable phrase of the line that a command writes to stderr when it
+/// repaired the store. The card states it; the rest of the line is free.
+const REPAIRED: &str = "repaired the store";
+
+/// The stdin of `zoe mcp`: an `initialize` request and the notification
+/// that follows it. Then stdin ends, and the session ends with 0.
+const MCP_INPUT: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"#,
+    r#""protocolVersion":"2025-06-18","capabilities":{},"#,
+    r#""clientInfo":{"name":"acceptance","version":"0"}}}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    "\n",
+);
+
 /// The end of a run of the `zoe` binary.
 struct Run {
     status: ExitStatus,
+    stdout: String,
     stderr: String,
+}
+
+/// Return the number of lines of `text` that hold the phrase `REPAIRED`.
+fn repair_lines(text: &str) -> usize {
+    text.lines().filter(|line| line.contains(REPAIRED)).count()
+}
+
+/// Check that `stdout` holds only MCP messages, and the reply of the
+/// `initialize` request of `MCP_INPUT`.
+fn assert_mcp_only(stdout: &str) {
+    let mut initialized = false;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let message: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("zoe mcp wrote a line that is not JSON: {line}: {e}"));
+        assert_eq!(message["jsonrpc"], "2.0", "not an MCP message: {line}");
+        if message["id"] == 1 && message["result"].is_object() {
+            initialized = true;
+        }
+    }
+    assert!(initialized, "zoe mcp did not reply to initialize: {stdout}");
 }
 
 /// Make a store in `root/killed` that a writer left open: `zoe serve`
@@ -135,10 +178,17 @@ fn modes_apply() -> bool {
 /// that is not root does: when this process ignores the modes, the binary
 /// runs through `setpriv`, without the capabilities that bypass them.
 fn zoe(root: &Path, args: &[String], obey_modes: bool) -> Run {
+    zoe_with_input(root, args, obey_modes, "")
+}
+
+/// Run the `zoe` binary as `zoe` does, with `input` as its stdin.
+fn zoe_with_input(root: &Path, args: &[String], obey_modes: bool, input: &str) -> Run {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
+    let stdin = root.join(format!("run-{n}.in"));
     let stdout = root.join(format!("run-{n}.out"));
     let stderr = root.join(format!("run-{n}.err"));
+    fs::write(&stdin, input).unwrap();
     let mut command = if obey_modes && !modes_apply() {
         let mut command = Command::new("setpriv");
         command
@@ -156,7 +206,7 @@ fn zoe(root: &Path, args: &[String], obey_modes: bool) -> Run {
     }
     command
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(fs::File::open(&stdin).unwrap())
         .stdout(fs::File::create(&stdout).unwrap())
         .stderr(fs::File::create(&stderr).unwrap());
     let mut child = {
@@ -182,7 +232,98 @@ fn zoe(root: &Path, args: &[String], obey_modes: bool) -> Run {
     };
     Run {
         status,
+        stdout: fs::read_to_string(&stdout).unwrap(),
         stderr: fs::read_to_string(&stderr).unwrap(),
+    }
+}
+
+/// Return the stdin of the command `name` in this test.
+fn input_of(name: &str) -> &'static str {
+    if name == "mcp" { MCP_INPUT } else { "" }
+}
+
+/// A `zoe serve --read-only` process whose stderr goes to a file.
+struct ReadOnlyServer {
+    child: Child,
+    _stdout: BufReader<ChildStdout>,
+    addr: SocketAddr,
+    stderr: PathBuf,
+}
+
+impl ReadOnlyServer {
+    /// Serve the store in `path` read-only, with no `ZOE_*` variable, and
+    /// wait until it listens. Its stderr goes to a file in `root`.
+    fn start(root: &Path, path: &Path) -> ReadOnlyServer {
+        static SERVERS: AtomicUsize = AtomicUsize::new(0);
+        let n = SERVERS.fetch_add(1, Ordering::Relaxed);
+        let stderr = root.join(format!("serve-{n}.err"));
+        let mut command = Command::new(ZOE);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("ZOE_") {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args(["serve", "--read-only", "--path", s(path)])
+            .args(["--listen", "127.0.0.1:0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap());
+        let mut child = {
+            let _spawn = wire::spawn_lock();
+            command.spawn().unwrap()
+        };
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let addr = loop {
+            let mut line = String::new();
+            if stdout.read_line(&mut line).unwrap() == 0 {
+                let status = child.wait().unwrap();
+                panic!(
+                    "zoe serve --read-only stopped before it listened: {status}: {}",
+                    fs::read_to_string(&stderr).unwrap_or_default()
+                );
+            }
+            if let Some(addr) = line.trim_end().strip_prefix("listening ") {
+                break addr.parse().unwrap();
+            }
+        };
+        ReadOnlyServer {
+            child,
+            _stdout: stdout,
+            addr,
+            stderr,
+        }
+    }
+
+    /// Stop the server with SIGTERM. Return its exit status and its
+    /// stderr.
+    fn stop(mut self) -> (ExitStatus, String) {
+        let sent = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > TIMEOUT {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("zoe serve --read-only did not stop within {TIMEOUT:?}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        (status, fs::read_to_string(&self.stderr).unwrap())
+    }
+}
+
+impl Drop for ReadOnlyServer {
+    /// Kill a server that a failed test left running.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -287,16 +428,41 @@ fn each_read_only_command_repairs_a_store_that_a_writer_left_open() {
         copy_store(&killed, &image);
         let arguments = command(name, &image, &root.join(format!("out-{index}")), &dumps);
 
-        let run = zoe(&root, &arguments, false);
+        let input = input_of(name);
+
+        let run = zoe_with_input(&root, &arguments, false, input);
         assert!(run.status.success(), "zoe {name}: {}", run.stderr);
         assert_clean(&image, last, name);
+        assert_eq!(
+            repair_lines(&run.stderr),
+            1,
+            "zoe {name} does not say once on stderr that it repaired the store: {}",
+            run.stderr
+        );
+        assert_eq!(
+            repair_lines(&run.stdout),
+            0,
+            "zoe {name} wrote the repair to stdout"
+        );
+        if name == "mcp" {
+            assert_mcp_only(&run.stdout);
+        }
 
-        // The store is clean now: the command runs again and changes no
-        // byte of it.
+        // The store is clean now: the command runs again, changes no byte
+        // of it and repairs nothing.
         let before = tree(&image);
-        let run = zoe(&root, &arguments, false);
+        let run = zoe_with_input(&root, &arguments, false, input);
         assert!(run.status.success(), "zoe {name} again: {}", run.stderr);
         assert!(tree(&image) == before, "zoe {name} changed a clean store");
+        assert_eq!(
+            repair_lines(&run.stderr) + repair_lines(&run.stdout),
+            0,
+            "zoe {name} says that it repaired a clean store: {}",
+            run.stderr
+        );
+        if name == "mcp" {
+            assert_mcp_only(&run.stdout);
+        }
     }
 }
 
@@ -307,27 +473,38 @@ fn a_read_only_server_repairs_a_store_that_a_writer_left_open() {
     let image = root.join("image");
     copy_store(&killed, &image);
 
-    let mut server = Server::start(&["--path", s(&image), "--read-only"], &[]);
-    let mut conn = server.connect();
+    let server = ReadOnlyServer::start(&root, &image);
+    let mut conn = Conn::open(server.addr);
     conn.register("1", true).unwrap();
     assert_eq!(load(&mut conn, 0).unwrap(), (record(b"second"), last));
     drop(conn);
-    let (status, _) = server.terminate(TIMEOUT);
-    assert_eq!(status.code(), Some(0));
+    let (status, stderr) = server.stop();
+    assert_eq!(status.code(), Some(0), "{stderr}");
     assert_clean(&image, last, "serve --read-only");
+    assert_eq!(
+        repair_lines(&stderr),
+        1,
+        "zoe serve --read-only does not say once that it repaired the store: {stderr}"
+    );
 
-    // The store is clean now: a read-only server changes no byte of it.
+    // The store is clean now: a read-only server changes no byte of it and
+    // repairs nothing.
     let before = tree(&image);
-    let mut server = Server::start(&["--path", s(&image), "--read-only"], &[]);
-    let mut conn = server.connect();
+    let server = ReadOnlyServer::start(&root, &image);
+    let mut conn = Conn::open(server.addr);
     conn.register("1", true).unwrap();
     assert_eq!(load(&mut conn, 0).unwrap(), (record(b"second"), last));
     drop(conn);
-    let (status, _) = server.terminate(TIMEOUT);
-    assert_eq!(status.code(), Some(0));
+    let (status, stderr) = server.stop();
+    assert_eq!(status.code(), Some(0), "{stderr}");
     assert!(
         tree(&image) == before,
         "a read-only server changed a clean store"
+    );
+    assert_eq!(
+        repair_lines(&stderr),
+        0,
+        "zoe serve --read-only says that it repaired a clean store: {stderr}"
     );
 }
 
@@ -345,7 +522,7 @@ fn a_command_that_cannot_write_the_store_fails_with_the_cause_and_changes_nothin
         set_modes(&image, 0o444, 0o555);
         let before = tree(&image);
 
-        let run = zoe(&root, &arguments, true);
+        let run = zoe_with_input(&root, &arguments, true, input_of(name));
 
         let after = tree(&image);
         set_modes(&image, 0o644, 0o755);
@@ -361,5 +538,10 @@ fn a_command_that_cannot_write_the_store_fails_with_the_cause_and_changes_nothin
             run.stderr
         );
         assert!(after == before, "zoe {name} changed the store");
+        assert_eq!(
+            repair_lines(&run.stderr) + repair_lines(&run.stdout),
+            0,
+            "zoe {name} says that it repaired a store that it could not write"
+        );
     }
 }
