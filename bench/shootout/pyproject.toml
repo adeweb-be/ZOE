@@ -19,6 +19,9 @@ dependencies = [
     "six",
     "ZODB>=6",
     "ZEO>=6",
+    # zoe serve speaks only the msgpack protocol M5 of ZEO. The ZEO client of
+    # the storage zoe-server needs msgpack for it.
+    "msgpack>=1",
     "RelStorage>=4.1",
     # The binary wheel needs no libpq headers to install.
     "psycopg2-binary>=2.9",
