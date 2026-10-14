@@ -21,4 +21,8 @@ pub use protocol::fuzz;
 #[cfg(feature = "serve")]
 mod protocol;
 #[cfg(feature = "serve")]
+mod runtime;
+#[cfg(feature = "serve")]
 pub mod serve;
+#[cfg(feature = "sim")]
+pub mod sim;

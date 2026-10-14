@@ -1288,15 +1288,18 @@ name = "zoe-server"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "redb",
  "rmpv",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zoe-client",
  "zoe-convert",
  "zoe-core",
  "zoe-mcp",
+ "zoe-server",
 ]
 
 [[package]]
