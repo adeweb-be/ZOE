@@ -76,10 +76,11 @@ struct SaturateArgs {
     #[arg(long, default_value = "0.0003", value_name = "SECONDS", value_parser = seconds)]
     p99_ceiling: f64,
     /// The time at the start of each step that does not count, in seconds.
+    /// At most 3600.
     #[arg(long, default_value = "0.2", value_name = "SECONDS", value_parser = seconds_or_zero)]
     warmup_seconds: f64,
-    /// The time of each step after the warm-up, in seconds.
-    #[arg(long, default_value = "1.0", value_name = "SECONDS", value_parser = seconds)]
+    /// The time of each step after the warm-up, in seconds. At most 3600.
+    #[arg(long, default_value = "1.0", value_name = "SECONDS", value_parser = step_seconds)]
     step_seconds: f64,
     /// The most transactions of each client in a step after the warm-up.
     /// A step ends at the end of its time or at this limit, the first of
@@ -163,10 +164,24 @@ fn exponent(text: &str) -> Result<f64, String> {
     }
 }
 
+/// The longest warm-up or step of `saturate`, in seconds.
+const MAX_STEP_SECONDS: f64 = 3600.0;
+
 fn seconds_or_zero(text: &str) -> Result<f64, String> {
     match text.parse::<f64>() {
-        Ok(x) if x.is_finite() && x >= 0.0 => Ok(x),
-        _ => Err("not a number of seconds of 0 or more".into()),
+        Ok(x) if (0.0..=MAX_STEP_SECONDS).contains(&x) => Ok(x),
+        _ => Err(format!(
+            "not a number of seconds from 0 to {MAX_STEP_SECONDS}"
+        )),
+    }
+}
+
+fn step_seconds(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(x) if x > 0.0 && x <= MAX_STEP_SECONDS => Ok(x),
+        _ => Err(format!(
+            "not a number of seconds over 0 and at most {MAX_STEP_SECONDS}"
+        )),
     }
 }
 
@@ -324,5 +339,34 @@ mod tests {
             panic!("not saturate");
         };
         assert_eq!(saturate.write_ratio, 0.5);
+    }
+
+    #[test]
+    fn a_huge_or_bad_step_time_is_a_usage_error() {
+        for (option, value) in [
+            ("--warmup-seconds", "3601"),
+            ("--warmup-seconds", "1e300"),
+            ("--warmup-seconds", "-1"),
+            ("--warmup-seconds", "inf"),
+            ("--step-seconds", "3601"),
+            ("--step-seconds", "1e300"),
+            ("--step-seconds", "0"),
+            ("--step-seconds", "NaN"),
+        ] {
+            let args = ["zoe-bench", "saturate", "--server", "h:1", option, value];
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert!(error.use_stderr(), "{option} {value}");
+        }
+        let args = [
+            "zoe-bench",
+            "saturate",
+            "--server",
+            "h:1",
+            "--warmup-seconds",
+            "3600",
+            "--step-seconds",
+            "3600",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
     }
 }

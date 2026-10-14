@@ -365,6 +365,8 @@ bench *args="run":
         trap 'rm -f "$partial"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
         ZOE_BENCH_COMMIT="${ZOE_BENCH_COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}" \
             "$bin/zoe-bench" "$command" --server "$addr" "$@" >"$partial"
+        # mktemp creates the file with the mode 0600.
+        chmod 0644 "$partial"
         mv "$partial" "$result"
         cat "$result"
         exit 0
