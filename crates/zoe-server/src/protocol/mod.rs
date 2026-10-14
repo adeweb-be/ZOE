@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use zoe_core::Store;
 
 use invalidation::Invalidations;
@@ -166,6 +166,19 @@ impl Storages {
         self.storages.iter().find(|storage| storage.name == name)
     }
 
+    /// Return the name of each storage whose store stays open when the
+    /// server drops `storages`. A session that runs holds the store of its
+    /// storage. A session that did not register yet holds every store.
+    pub(crate) fn held(storages: &Arc<Self>) -> Vec<&str> {
+        let all = Arc::strong_count(storages) > 1;
+        storages
+            .storages
+            .iter()
+            .filter(|storage| all || Arc::strong_count(&storage.store) > 1)
+            .map(|storage| storage.name.as_str())
+            .collect()
+    }
+
     /// Return the reply to `ruok`: the status of each storage. It reads the
     /// stores.
     fn ruok(&self) -> String {
@@ -178,14 +191,42 @@ impl Storages {
     }
 }
 
-/// Serve one client on `stream` until it closes, or until the server
-/// closes the connection. The client selects one of `storages` with
-/// `register`. A frame longer than `max_frame_size` bytes closes the
-/// connection before the server reserves memory for it.
+/// The signal of a stop of the server, as the tasks that serve see it.
+#[derive(Clone)]
+pub(crate) struct Stopping(watch::Receiver<bool>);
+
+impl Stopping {
+    /// Return the sender of the signal and the signal. Send `true` to stop.
+    pub(crate) fn new() -> (watch::Sender<bool>, Self) {
+        let (sender, signal) = watch::channel(false);
+        (sender, Self(signal))
+    }
+
+    /// Wait until the server stops. When the sender drops and sent no
+    /// stop, wait forever.
+    pub(crate) async fn wait(&mut self) {
+        if self.0.wait_for(|stop| *stop).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Serve one client on `stream` until it closes, until the server closes
+/// the connection, or until `stopping` tells that the server stops. The
+/// client selects one of `storages` with `register`. A frame longer than
+/// `max_frame_size` bytes closes the connection before the server reserves
+/// memory for it.
+///
+/// At a stop, the reader reads no more frames. The session runs the calls
+/// that the reader already decoded, so a `tpc_finish` that the server
+/// received commits and gets its reply. Then the session ends, and that
+/// aborts its open transaction. The writer sends the frames that wait,
+/// and closes the connection.
 pub(crate) async fn serve_connection(
     stream: TcpStream,
     storages: Arc<Storages>,
     max_frame_size: u32,
+    mut stopping: Stopping,
 ) {
     let peer = stream
         .peer_addr()
@@ -194,7 +235,12 @@ pub(crate) async fn serve_connection(
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
     }
-    match frame::read(&mut reader, max_frame_size).await {
+    // A client that does not answer the protocol does not hold a stop.
+    let protocol = tokio::select! {
+        protocol = frame::read(&mut reader, max_frame_size) => protocol,
+        () = stopping.wait() => return,
+    };
+    match protocol {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
             // The status reads the stores, so it runs on the blocking pool.
@@ -257,10 +303,13 @@ pub(crate) async fn serve_connection(
     };
 
     loop {
+        // An end of the connection or a stop wins over a frame that waits.
         let read = tokio::select! {
-            read = frame::read(&mut reader, max_frame_size) => read,
+            biased;
             () = closed.notified() => break,
             () = closing.wait() => break,
+            () = stopping.wait() => break,
+            read = frame::read(&mut reader, max_frame_size) => read,
         };
         let bytes = match read {
             Ok(Some(bytes)) => bytes,
@@ -326,6 +375,11 @@ mod tests {
         client.write_all(&frame::encode(payload).unwrap()).unwrap();
     }
 
+    /// Return a signal that never tells a stop: its sender is gone.
+    fn never_stops() -> Stopping {
+        Stopping::new().1
+    }
+
     #[test]
     fn a_connection_that_the_hub_closes_ends_with_its_session() {
         let dir = std::env::temp_dir().join(format!("zoe-protocol-close-{}", std::process::id()));
@@ -347,7 +401,8 @@ mod tests {
         let served = Arc::clone(&storages);
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_connection(stream, served, crate::serve::DEFAULT_MAX_FRAME_SIZE.get()).await;
+            let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
+            serve_connection(stream, served, max, never_stops()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();
@@ -427,7 +482,12 @@ mod tests {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
-                tokio::spawn(serve_connection(stream, Arc::clone(&served), max));
+                tokio::spawn(serve_connection(
+                    stream,
+                    Arc::clone(&served),
+                    max,
+                    never_stops(),
+                ));
             }
         });
         (runtime, addr)
@@ -448,6 +508,12 @@ mod tests {
 
     /// Connect to `addr`, answer the protocol and register.
     fn registered(addr: std::net::SocketAddr) -> Client {
+        registered_as(addr, "1")
+    }
+
+    /// Connect to `addr`, answer the protocol and register with the
+    /// storage `name`.
+    fn registered_as(addr: std::net::SocketAddr, name: &str) -> Client {
         let mut client = Client::connect(addr).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -458,7 +524,7 @@ mod tests {
             &mut client,
             1,
             "register",
-            vec![Value::from("1"), Value::Boolean(false)],
+            vec![Value::from(name), Value::Boolean(false)],
         );
         read_frame(&mut client);
         client
@@ -546,5 +612,165 @@ mod tests {
 
         server.stop();
         assert_eq!(files(), 0);
+    }
+
+    /// Read the frames of the server until it closes the connection.
+    /// Return the method and the arguments of each frame.
+    fn read_until_closed(client: &mut Client) -> Vec<(String, Value)> {
+        let mut frames = Vec::new();
+        loop {
+            let mut len = [0u8; 4];
+            match client.read_exact(&mut len) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return frames;
+                }
+                Err(error) => panic!("the connection failed: {error}"),
+            }
+            let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+            client.read_exact(&mut payload).unwrap();
+            let message = rmpv::decode::read_value(&mut payload.as_slice()).unwrap();
+            let Value::Array(parts) = message else {
+                panic!("not a message: {message:?}");
+            };
+            let [_, _, method, args] = <[Value; 4]>::try_from(parts).unwrap();
+            frames.push((method.as_str().unwrap().to_owned(), args));
+        }
+    }
+
+    #[test]
+    fn a_stop_answers_a_finish_that_it_received_and_aborts_the_other_transactions() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-stop-finish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = crate::serve::Server::start(crate::serve::ServeOptions::new(&dir)).unwrap();
+        // One client voted on the oid 1, so it holds the lock of the oid.
+        let mut holder = registered(server.addr());
+        begin_and_store(&mut holder, 1);
+        send(&mut holder, 2, "vote", vec![Value::from(7)]);
+        assert_eq!(
+            read_frame(&mut holder),
+            message::reply(Value::from(2), Value::Array(Vec::new()))
+        );
+        // One client only stored the oid 2.
+        let mut staged = registered(server.addr());
+        begin_and_store(&mut staged, 2);
+        send(&mut staged, 2, "ping", vec![]);
+        read_frame(&mut staged);
+        // One client also votes on the oid 1. Its vote waits for the lock,
+        // and its finish waits behind the vote.
+        let mut committer = registered(server.addr());
+        begin_and_store(&mut committer, 1);
+        send(&mut committer, 2, "vote", vec![Value::from(7)]);
+        send(&mut committer, 3, "tpc_finish", vec![Value::from(7)]);
+        // Give the reader of the connection time to read the finish.
+        std::thread::sleep(Duration::from_millis(200));
+
+        server.stop();
+        // The stop aborts the transaction that holds the lock. So the vote
+        // gets the lock, and the finish commits and gets its reply before
+        // the close.
+        let frames = read_until_closed(&mut committer);
+        let methods: Vec<&str> = frames.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, [".reply", "info", ".reply"], "{frames:?}");
+        assert_eq!(frames[0].1, Value::Array(Vec::new()));
+        let Value::Binary(tid) = &frames[2].1 else {
+            panic!("the finish gives no tid: {frames:?}");
+        };
+        let tid = Tid(u64::from_be_bytes(tid.as_slice().try_into().unwrap()));
+        for client in [&mut holder, &mut staged] {
+            read_until_closed(client);
+        }
+        // The store closed cleanly. It holds the commit, and nothing of the
+        // aborted transactions.
+        let store = Store::open_read_only(&dir).unwrap();
+        assert_eq!(
+            store.load(zoe_core::Oid(1)).unwrap(),
+            (b"pickle".to_vec(), tid)
+        );
+        assert!(store.load(zoe_core::Oid(2)).is_err());
+    }
+
+    #[test]
+    fn a_session_past_the_shutdown_timeout_keeps_only_the_store_of_its_storage() {
+        use crate::serve::{ServeOptions, Server, StorageOptions};
+
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-stop-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = ServeOptions::with_storages([
+            StorageOptions::new("a", dir.join("a")),
+            StorageOptions::new("b", dir.join("b")),
+        ])
+        .lock_timeout(Duration::from_secs(60))
+        .shutdown_timeout(Duration::from_millis(400));
+        // The test keeps the store of a, so it can hold a lock there.
+        let mut kept = None;
+        let server = Server::start_with(options, |name, path, options| {
+            let store = Arc::new(Store::open_with(path, options).unwrap());
+            if name == "a" {
+                kept = Some(Arc::clone(&store));
+            }
+            Ok(store)
+        })
+        .unwrap();
+        let a = kept.unwrap();
+        let mut holder = a.tpc_begin(b"", b"", b"").unwrap();
+        holder
+            .store(zoe_core::Oid(1), Tid::ZERO, b"pickle")
+            .unwrap();
+        holder.vote().unwrap();
+        // A session on a votes on the same oid. Its vote waits for the lock
+        // past the shutdown timeout. A session on b ends at the stop.
+        let mut waiter = registered_as(server.addr(), "a");
+        begin_and_store(&mut waiter, 1);
+        send(&mut waiter, 2, "vote", vec![Value::from(7)]);
+        let _idle = registered_as(server.addr(), "b");
+        std::thread::sleep(Duration::from_millis(200));
+
+        server.stop();
+        // The store of b closed cleanly.
+        Store::open_read_only(dir.join("b")).unwrap();
+        // The abort of the holder ends the lock wait, so the session ends,
+        // and the store of a closes too.
+        drop(holder);
+        drop(a);
+        wait_until("the store of a stays open", || {
+            Store::open_read_only(dir.join("a")).is_ok()
+        });
+    }
+
+    #[test]
+    fn the_held_storages_are_those_whose_store_a_session_keeps() {
+        let named = |name: &str| {
+            let storage = storage(&format!("held-{name}"));
+            let store = Arc::clone(&storage.store);
+            Arc::new(NamedStorage::new(
+                name,
+                &storage.path,
+                store,
+                Queues::DEFAULT,
+            ))
+        };
+        let (a, b) = (named("a"), named("b"));
+        let storages = Arc::new(Storages::new(
+            vec![Arc::clone(&a), Arc::clone(&b)],
+            Queues::DEFAULT.client,
+        ));
+        assert!(Storages::held(&storages).is_empty());
+        // A session on a keeps the store of a.
+        let session = Arc::clone(&a.store);
+        assert_eq!(Storages::held(&storages), ["a"]);
+        drop(session);
+        // A session that did not register yet keeps every store.
+        let unregistered = Arc::clone(&storages);
+        assert_eq!(Storages::held(&storages), ["a", "b"]);
+        drop(unregistered);
+        assert!(Storages::held(&storages).is_empty());
     }
 }
