@@ -2,6 +2,7 @@
 // for example "0x00".
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import { isMessageKey, t } from "./i18n";
 
@@ -50,6 +51,82 @@ export interface Change {
 /** The most revisions that `history` gives: `HISTORY_LIMIT` of zoe-loupe. */
 export const HISTORY_LIMIT = 4096;
 
+/** A number of records or objects and their bytes. */
+export interface Totals {
+  count: number;
+  bytes: number;
+}
+
+/** One of the largest current records. */
+export interface Large {
+  oid: string;
+  class: string | null;
+  size: number;
+}
+
+/** What one transaction wrote. */
+export interface Growth {
+  tid: string;
+  bytes: number;
+}
+
+/** The space of the store as of its last transaction. */
+export interface Space {
+  /** The current records of each class. The key `<unknown>` holds the
+   * records whose class pickle gives no name. */
+  by_class: Record<string, Totals>;
+  /** The current blob files. */
+  blobs: Totals;
+  /** The largest current records, biggest first. */
+  largest: Large[];
+  /** What each transaction wrote, in tid order. */
+  growth: Growth[];
+}
+
+/** One item of a path, with the objects that it owns. */
+export interface PathItem {
+  name: string;
+  oid: string;
+  class: string | null;
+  reach: Totals;
+}
+
+/** The space of a path: what it reaches, shared by its items. */
+export interface PathSpace {
+  path: string;
+  oid: string;
+  class: string | null;
+  /** Every object that the object reaches, itself included, each once. */
+  reach: Totals;
+  /** The object, and what it reaches that no item owns. */
+  own: Totals;
+  /** The largest items, biggest first, at most `ITEM_LIMIT` of zoe-loupe. */
+  items: PathItem[];
+  /** The items past that limit. */
+  others: { count: number; reach: Totals };
+}
+
+/** What a pack at `tid` would remove: the dry run of the core. */
+export interface Reclaim {
+  tid: string;
+  records: number;
+  bytes: number;
+  objects: number;
+  blobs: number;
+  blob_bytes: number;
+  by_class: Record<string, Totals>;
+}
+
+/** The progress of a background job of the Rust side. */
+export interface JobProgress {
+  job: "space" | "pathSpace" | "reclaimable";
+  walk: "records" | "transactions" | "objects";
+  done: number;
+}
+
+/** The number of largest records that the space screen lists. */
+export const LARGEST = 10;
+
 // `open_folder` and `set_as_of` move the "as of" switch of the Rust side.
 // They go through one queue, one call at a time and in order, so the last
 // call wins. A read of an object waits for the calls before it, so it
@@ -90,6 +167,32 @@ export const setAsOf = (tid: string | null) =>
 
 export const diff = (oid: string, tidA: string, tidB: string) =>
   invoke<Change[]>("diff", { oid, tidA, tidB });
+
+// The commands of the space screen read the last transaction, whatever the
+// switch holds. Each one is a background job of the Rust side.
+
+export const space = (largest: number) =>
+  afterSwitch(() => invoke<Space>("space", { largest }));
+
+export const pathSpace = (path: string) =>
+  afterSwitch(() => invoke<PathSpace>("path_space", { path }));
+
+/** Return what a pack at a tid, or at the last transaction, would remove. */
+export const reclaimable = (tid: string | null) =>
+  afterSwitch(() => invoke<Reclaim>("reclaimable", { tid }));
+
+/**
+ * Call `handler` with each progress event of the background jobs. Return
+ * a function that stops the calls.
+ */
+export function onProgress(handler: (progress: JobProgress) => void): () => void {
+  const stop = listen<JobProgress>("job-progress", (event) =>
+    handler(event.payload),
+  );
+  return () => {
+    void stop.then((unlisten) => unlisten());
+  };
+}
 
 /** Return the value at the JSON pointer `at` in `value`. */
 export function pointer(value: unknown, at: string): unknown {
