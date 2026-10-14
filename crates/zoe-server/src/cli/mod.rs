@@ -10,17 +10,25 @@
 //! The report of a subcommand goes to stdout. A message goes to stderr.
 //! The exit code is [`SUCCESS`], [`FAILURE`] or [`USAGE`]. The command
 //! parses all its arguments before it opens a file, so a usage error
-//! changes nothing on disk.
+//! changes nothing on disk. `zoe serve` also reads its configuration file
+//! before it opens a file.
 
+mod backup;
+#[cfg(feature = "serve")]
+mod config;
 mod convert;
+mod mcp;
 mod pack;
+mod restore;
+mod serve;
+mod verify;
 
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use zoe_core::{Clock, SystemClock, ZoeError};
 
 /// The exit code of a command that succeeds.
@@ -56,6 +64,21 @@ enum Command {
     /// Pack a store as of a number of days ago, or report what that pack
     /// would remove.
     Pack(pack::PackArgs),
+    /// Serve stores with the ZEO 6 msgpack protocol until SIGTERM, each
+    /// under its own storage name.
+    Serve(serve::ServeArgs),
+    /// Serve the read-only ops tools of a store to an agent, over MCP on
+    /// stdin and stdout.
+    Mcp(mcp::McpArgs),
+    /// Check the checksums, the blob files, the references and the classes
+    /// of a store, or compare the dumps of a backup directory with it, and
+    /// change nothing. Exit with 1 on a finding.
+    Verify(verify::VerifyArgs),
+    /// Write a dump of a store into a backup directory: the full dump the
+    /// first time, then the transactions after the last dump.
+    Backup(backup::BackupArgs),
+    /// Rebuild a store from the dumps of a backup directory.
+    Restore(restore::RestoreArgs),
 }
 
 /// Why a subcommand failed. The command writes it to stderr and exits with
@@ -100,10 +123,21 @@ fn closed_by_reader(error: &io::Error) -> bool {
 /// The binary `zoe` and the console script of the `zoedb` wheel call this
 /// function. `zoe pack --days` reads the time of the system clock.
 pub fn main(args: Vec<OsString>) -> i32 {
-    match Cli::try_parse_from(args) {
-        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout().lock()),
+    match parse(args) {
+        // Each write takes the lock of stdout. `zoe mcp` writes to stdout
+        // from other threads, so the command does not hold the lock.
+        Ok(cli) => run(&cli, &SystemClock, &mut io::stdout()),
         Err(error) => usage(&error),
     }
+}
+
+/// Parse `args`, the program name first. `zoe serve` also takes options
+/// and stores from its configuration file.
+fn parse(args: Vec<OsString>) -> Result<Cli, clap::Error> {
+    let mut command = Cli::command();
+    let matches = command.try_get_matches_from_mut(&args)?;
+    let cli = Cli::from_arg_matches(&matches).map_err(|error| error.format(&mut command))?;
+    serve::configure(cli, &matches, args)
 }
 
 /// Write the help, the version or the usage error of `error`, and return
@@ -128,6 +162,11 @@ fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
     let (name, result) = match &cli.command {
         Command::Convert(args) => ("convert", convert::run(args, out)),
         Command::Pack(args) => ("pack", pack::run(args, clock, out)),
+        Command::Serve(args) => ("serve", serve::run(args, out)),
+        Command::Mcp(args) => ("mcp", mcp::run(args)),
+        Command::Verify(args) => ("verify", verify::run(args, out)),
+        Command::Backup(args) => ("backup", backup::run(args, out)),
+        Command::Restore(args) => ("restore", restore::run(args, out)),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.
@@ -197,6 +236,23 @@ mod tests {
     #[test]
     fn the_command_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_help_of_the_dump_options_names_their_twins() {
+        let expected: [(&str, &[&str]); 3] = [
+            ("backup", &["ZOE_PATH", "ZOE_TO"]),
+            ("restore", &["ZOE_FROM", "ZOE_PATH"]),
+            ("verify", &["ZOE_PATH", "ZOE_BACKUP"]),
+        ];
+        let mut command = Cli::command();
+        for (name, twins) in expected {
+            let subcommand = command.find_subcommand_mut(name).unwrap();
+            let help = subcommand.render_long_help().to_string();
+            for twin in twins {
+                assert!(help.contains(twin), "{name}: no {twin} in:\n{help}");
+            }
+        }
     }
 
     #[test]
