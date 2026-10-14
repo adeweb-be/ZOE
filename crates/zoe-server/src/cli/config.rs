@@ -101,19 +101,16 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
     }
     let mut path = None;
     let mut blob_dir = None;
+    let mut read_only = false;
     for (key, value) in table {
         match key.as_str() {
             "path" => path = Some(directory(name, key, value)?),
             "blob-dir" => blob_dir = Some(directory(name, key, value)?),
-            "read-only" => match value.as_bool() {
-                Some(false) => {}
-                Some(true) => {
-                    return Err(format!(
-                        "{STORAGES}.{name}: a read-only store is not built yet"
-                    ));
-                }
-                None => return Err(format!("{STORAGES}.{name}.{key} takes true or false")),
-            },
+            "read-only" => {
+                read_only = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{STORAGES}.{name}.{key} takes true or false"))?;
+            }
             _ => return Err(format!("{key} is not a key of {STORAGES}.{name}")),
         }
     }
@@ -122,6 +119,7 @@ fn storage(name: &str, value: &Value) -> Result<Storage, String> {
         name: name.to_owned(),
         path,
         blob_dir,
+        read_only,
     })
 }
 
@@ -179,6 +177,15 @@ mod tests {
     }
 
     #[test]
+    fn blob_dir_and_shared_blob_dir_are_keys_of_the_file() {
+        let config = parse_with("blob-dir = \"b\"\nshared-blob-dir = true\n", &[]).unwrap();
+        assert_eq!(args(&config), ["--blob-dir=b", "--shared-blob-dir=true"]);
+        let given = ["--blob-dir", "a", "--shared-blob-dir=false"];
+        let config = parse_with("blob-dir = \"b\"\nshared-blob-dir = true\n", &given).unwrap();
+        assert!(config.args.is_empty());
+    }
+
+    #[test]
     fn an_option_of_the_command_line_wins_over_its_key() {
         let config = parse_with(
             "listen = \"192.0.2.1:1\"\nlock-timeout = \"2m\"\n",
@@ -204,15 +211,33 @@ mod tests {
                     name: "catalog".into(),
                     path: "c".into(),
                     blob_dir: Some("cb".into()),
+                    read_only: false,
                 },
                 Storage {
                     name: "main".into(),
                     path: "m".into(),
                     blob_dir: None,
+                    read_only: false,
                 },
             ]
         );
         assert_eq!(parse_with("[storages]\n", &[]).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn read_only_makes_one_store_read_only() {
+        let config = parse_with(
+            "[storages.archive]\npath = \"a\"\nread-only = true\n\n\
+             [storages.live]\npath = \"l\"\n",
+            &[],
+        )
+        .unwrap();
+        let read_only: Vec<(&str, bool)> = config
+            .storages
+            .iter()
+            .map(|storage| (storage.name.as_str(), storage.read_only))
+            .collect();
+        assert_eq!(read_only, [("archive", true), ("live", false)]);
     }
 
     #[test]
@@ -240,10 +265,6 @@ mod tests {
             (
                 "[storages.main]\npath = \"m\"\nread-only = 1\n",
                 "takes true or false",
-            ),
-            (
-                "[storages.main]\npath = \"m\"\nread-only = true\n",
-                "read-only store",
             ),
             ("[storages.\"\"]\npath = \"m\"\n", "empty name"),
         ] {

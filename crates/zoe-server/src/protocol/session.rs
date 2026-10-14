@@ -1,28 +1,41 @@
-//! The calls of one connection, run in order on one thread.
+//! The calls of one connection.
 //!
-//! The session holds the open transaction of the connection. Its thread
-//! begins the core transaction and makes every later call of it, so the
-//! core never refuses a call with `WrongThread`.
+//! A `Session` holds the state of a connection that all its calls share.
+//! The calls that are not calls of the transaction run on many threads at
+//! once. A `Transaction` holds the open transaction of the connection. One
+//! thread holds it and runs the calls of the transaction in order. That
+//! thread begins the core transaction and makes every later call of it, so
+//! the core never refuses a call with `WrongThread`.
 //!
 //! `register` adds the connection to the invalidations of the storage. A
 //! commit goes to the invalidations with the reply of its `tpc_finish`, so
 //! the reply and the invalidations reach each client in commit order.
+//!
+//! Each call runs in a `connection` span of its own (`Session::span`): its
+//! fields `storage` and `client` go into each log line of the call, the
+//! log lines of the core too. The client is the label of
+//! `set_client_label` when the call starts, or the address of the peer.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Instant;
 
 use rmpv::Value;
-use tokio::sync::mpsc::Receiver;
-use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Finished, Oid, Store, Tid, Txn, ZoeError};
 
-use super::blob::{Download, Upload};
+use super::blob::Download;
 use super::clock;
 use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
-use super::outbox::{Outbox, Place};
+use super::negotiation;
+use super::outbox::{Outbox, Place, Room};
 use super::status::Stats;
-use super::{NamedStorage, Storages};
+use super::{NamedStorage, Stopping, Storages};
+
+/// The longest client label that a log line takes, in characters.
+const MAX_LABEL: usize = 200;
 
 /// The most oids that one `new_oids` call gives, as in ZEO.
 const MAX_NEW_OIDS: u64 = 100;
@@ -140,7 +153,8 @@ impl Fault {
 
     /// Return the exception of ZODB for an error of a pack, as
     /// `zoe.Storage.pack` raises it. A record that fails its checksum or
-    /// does not decode stops the pack with `StorageSystemError`.
+    /// does not decode stops the pack with `StorageSystemError`. A pack
+    /// that the stop of the server stopped fails with `StorageError`.
     fn of_pack(error: &ZoeError) -> Self {
         match error {
             ZoeError::CorruptRecord { .. } => Self::new(
@@ -151,6 +165,7 @@ impl Fault {
                 "ZODB.POSException.StorageSystemError",
                 format!("pack stopped: {text}"),
             ),
+            ZoeError::Closed => Self::storage("pack stopped: the server stops"),
             _ => Self::of(error),
         }
     }
@@ -248,13 +263,13 @@ impl From<ZoeError> for Fault {
 
 /// What a call gives back.
 #[derive(Debug)]
-enum Outcome {
+pub(crate) enum Outcome {
     /// The result of the call.
     Done(Value),
     /// A `tpc_finish` that committed. Its reply went out with the
     /// invalidations of the commit.
     Published,
-    /// The client is gone. The session ends.
+    /// The client is gone. The connection ends.
     Gone,
     /// The exception of the call.
     Failed(Fault),
@@ -272,6 +287,98 @@ impl From<Result<Value, Fault>> for Outcome {
     }
 }
 
+/// The way of the reply of one call to its client: the room that the call
+/// took in the session queue before it ran, or the place that it took in
+/// the order of the connection.
+pub(crate) struct Reply {
+    room: Option<Room>,
+    place: Option<Place>,
+}
+
+impl Reply {
+    /// The reply of a call that took `room`.
+    pub(crate) fn new(room: Room) -> Self {
+        Self {
+            room: Some(room),
+            place: None,
+        }
+    }
+
+    /// Put the reply of `call`, whose outcome is `outcome`, in the queue of
+    /// `outbox`. Return false when the connection ends: the client is gone,
+    /// the call closes the connection, or a call without a reply failed.
+    ///
+    /// A call without a reply has no way to report its error, so the server
+    /// closes the connection, as ZEO does.
+    pub(crate) fn send(self, call: &Call, outcome: Outcome, outbox: &Outbox) -> bool {
+        let frame = match outcome {
+            Outcome::Published => None,
+            Outcome::Gone => return false,
+            Outcome::Done(_) if call.oneway => None,
+            Outcome::Done(value) => Some(message::reply(call.id.clone(), value)),
+            // The text that a client sends goes only into fields, never
+            // into the message. The text format quotes and escapes a field
+            // of text, so a line feed in it cannot add a log line.
+            Outcome::Failed(fault) if call.oneway => {
+                let args = fault.args.to_string();
+                tracing::warn!(
+                    method = call.method.as_str(),
+                    class = fault.class,
+                    args = args.as_str(),
+                    "a call without a reply failed: closing the connection"
+                );
+                return false;
+            }
+            Outcome::Failed(fault) => {
+                Some(message::error(call.id.clone(), fault.class, fault.args))
+            }
+            Outcome::Close(why) => {
+                tracing::warn!(reason = why.as_str(), "closing the connection");
+                return false;
+            }
+        };
+        // A place that the call took gets the reply, or stays empty.
+        match (self.place, frame) {
+            (Some(place), frame) => place.fill(frame),
+            (None, Some(frame)) => match self.room {
+                Some(room) => room.put(Some(frame)),
+                // A download used the room of its call for its first frame.
+                None => outbox.send(frame),
+            },
+            (None, None) => true,
+        }
+    }
+}
+
+/// The calls of the open transaction of a connection. One thread runs
+/// them in order, from `tpc_begin` to the end of the transaction.
+const TRANSACTION_CALLS: [&str; 12] = [
+    "tpc_begin",
+    "storea",
+    "restorea",
+    "checkCurrentSerialInTransaction",
+    "deleteObject",
+    "vote",
+    "tpc_finish",
+    "tpc_abort",
+    "storeBlobStart",
+    "storeBlobChunk",
+    "storeBlobEnd",
+    "storeBlobShared",
+];
+
+/// Tell if `method` is a call of the transaction of the connection.
+pub(crate) fn in_transaction(method: &str) -> bool {
+    TRANSACTION_CALLS.contains(&method)
+}
+
+/// Tell if `method` can run for a long time or wait for the client: a
+/// download waits while the client reads, and a pack reads the whole
+/// store. Such a call runs on a thread of its own, not on the read pool.
+pub(crate) fn runs_long(method: &str) -> bool {
+    matches!(method, "sendBlob" | "pack")
+}
+
 /// The open transaction of a connection.
 struct Open {
     /// The id that the client gave to the transaction.
@@ -285,10 +392,10 @@ struct Open {
     /// The number of conflicts that the last vote listed for the client to
     /// resolve. When it is not 0, the next vote is the second vote.
     listed: u64,
-    /// The blob that the client uploads, from `storeBlobStart` to
+    /// The blob file that the client uploads, from `storeBlobStart` to
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
-    upload: Option<Upload>,
+    upload: Option<BlobFile>,
 }
 
 impl Open {
@@ -303,72 +410,43 @@ impl Open {
     }
 }
 
-/// The state of one connection.
+/// What `register` gave to a connection.
+struct Registration {
+    /// The id of the connection in the invalidations of the storage.
+    client: ClientId,
+    read_only: bool,
+    /// The extensions that the server accepted from the declaration of
+    /// the client, or none when the client declared nothing.
+    extensions: Option<Vec<&'static str>>,
+}
+
+/// The state of one connection that all its calls share. The calls that
+/// are not calls of the transaction run on many threads at once.
 pub(crate) struct Session {
     storage: Arc<NamedStorage>,
     /// The store of `storage`.
     store: Arc<Store>,
     /// The frames that wait for the client.
     outbox: Outbox,
-    /// The id of the connection in the invalidations of the storage, from
-    /// `register` on.
-    client: Option<ClientId>,
-    /// The place in the order of the connection that the current call took
-    /// for its reply, before the reply exists.
-    place: Option<Place>,
-    registered: bool,
-    read_only: bool,
-    open: Option<Open>,
-    iterators: Iterators,
+    /// The registration of the connection, from `register` on.
+    registration: OnceLock<Registration>,
+    /// The iterators of the connection. One call at a time uses them.
+    iterators: Mutex<Iterators>,
+    /// The label that the client gave with `set_client_label`, for the log
+    /// lines of the calls that start after it.
+    label: Mutex<Option<String>>,
+    /// The stop of the server. A pack stops between two batches when the
+    /// server stops.
+    stopping: Stopping,
 }
 
-/// Run the calls that arrive on `calls` in order, and put each reply in
-/// `outbox`. The first `register` that names one of `storages` selects the
-/// storage of the connection. Return when `calls` closes, or when the
-/// session closes the connection. A transaction still open aborts.
-pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
-    let mut session: Option<Session> = None;
-    while let Some(call) = calls.blocking_recv() {
-        let outcome = match &mut session {
-            Some(session) => session.call(&call),
-            None => match select(&storages, &call) {
-                Ok(storage) => session
-                    .insert(Session::new(storage, outbox.clone()))
-                    .call(&call),
-                Err(outcome) => outcome,
-            },
-        };
-        let reply = match outcome {
-            Outcome::Published => None,
-            Outcome::Gone => break,
-            Outcome::Done(_) if call.oneway => None,
-            Outcome::Done(value) => Some(message::reply(call.id, value)),
-            // A call without a reply has no way to report its error, so
-            // the server closes the connection, as ZEO does.
-            Outcome::Failed(fault) if call.oneway => {
-                eprintln!(
-                    "zoe serve: {} failed: {} {:?}",
-                    call.method, fault.class, fault.args
-                );
-                break;
-            }
-            Outcome::Failed(fault) => Some(message::error(call.id, fault.class, fault.args)),
-            Outcome::Close(why) => {
-                eprintln!("zoe serve: closing a connection: {why}");
-                break;
-            }
-        };
-        // A place that the call took gets the reply, or stays empty.
-        let place = session.as_mut().and_then(|session| session.place.take());
-        let sent = match (place, reply) {
-            (Some(place), reply) => outbox.send_at(place, reply),
-            (None, Some(reply)) => outbox.send(reply),
-            (None, None) => true,
-        };
-        if !sent {
-            break;
-        }
-    }
+/// The open transaction of one connection. One thread holds it and runs
+/// the calls of the transaction in order. That thread begins the core
+/// transaction and makes every later call of it, so the core never refuses
+/// a call with `WrongThread`.
+pub(crate) struct Transaction {
+    session: Arc<Session>,
+    open: Option<Open>,
 }
 
 /// Return the storage that `call` registers with, before the connection
@@ -376,16 +454,27 @@ pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Ou
 /// `storages`. Otherwise, return the outcome of the call: a call before
 /// `register` closes the connection, and an unknown name fails the call,
 /// as in ZEO.
-fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorage>, Outcome> {
+pub(crate) fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorage>, Outcome> {
     if call.method != "register" {
         return Err(Outcome::Close(format!("{} before register", call.method)));
     }
-    let [name, _] = arity::<2>(&call.args, "register").map_err(Outcome::Failed)?;
+    let (name, _, _) = register_args(&call.args).map_err(Outcome::Failed)?;
     let name = storage_name(name);
     storages
         .get(&name)
         .cloned()
         .ok_or_else(|| Outcome::Failed(Fault::value_error(format!("unknown storage: {name}"))))
+}
+
+/// Return the arguments of `register`: the storage name, the read-only
+/// flag and the declaration of the extensions. A stock client gives no
+/// declaration.
+fn register_args(args: &[Value]) -> Result<(&Value, &Value, Option<&Value>), Fault> {
+    match args {
+        [storage, read_only] => Ok((storage, read_only, None)),
+        [storage, read_only, declaration] => Ok((storage, read_only, Some(declaration))),
+        _ => Err(Fault::type_error("register takes 2 or 3 arguments")),
+    }
 }
 
 /// Return the storage name that a client gives to `register`.
@@ -399,51 +488,93 @@ fn storage_name(value: &Value) -> String {
 
 impl Session {
     /// Return the session of a connection to `storage`, whose frames go to
-    /// `outbox`.
-    pub(crate) fn new(storage: Arc<NamedStorage>, outbox: Outbox) -> Self {
+    /// `outbox`. `stopping` is the stop of the server.
+    pub(crate) fn new(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
         Self {
             store: Arc::clone(&storage.store),
             storage,
             outbox,
-            client: None,
-            place: None,
-            registered: false,
-            read_only: false,
-            open: None,
-            iterators: Iterators::default(),
+            registration: OnceLock::new(),
+            iterators: Mutex::new(Iterators::default()),
+            label: Mutex::new(None),
+            stopping,
         }
     }
 
-    /// Run one call, and count it in the status of the storage.
-    fn call(&mut self, call: &Call) -> Outcome {
-        let was_open = self.open.is_some();
-        let outcome = self.dispatch(call);
-        self.count(&call.method, &outcome, was_open);
+    /// Return the label that the client gave, if any.
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Return the span of a call of this session: the client, the label or
+    /// else `peer`, and the storage.
+    pub(crate) fn span(&self, peer: &str) -> tracing::Span {
+        let label = self.label();
+        let client = label.as_deref().unwrap_or(peer);
+        tracing::info_span!("connection", client, storage = self.storage.name.as_str())
+    }
+
+    /// Tell if `register` selected the storage of the session.
+    pub(crate) fn is_registered(&self) -> bool {
+        self.registration.get().is_some()
+    }
+
+    /// Tell if the client registered read-only.
+    fn read_only(&self) -> bool {
+        self.registration.get().is_some_and(|r| r.read_only)
+    }
+
+    /// Return the error of a call to a method of an extension that the
+    /// connection did not declare. The connection stays open.
+    fn undeclared(&self, method: &str) -> Option<Fault> {
+        let accepted = self
+            .registration
+            .get()
+            .and_then(|r| r.extensions.as_deref());
+        negotiation::refused(method, accepted, negotiation::SERVED).map(Fault::value_error)
+    }
+
+    /// The id of the connection in the invalidations of the storage.
+    fn client(&self) -> Option<ClientId> {
+        self.registration.get().map(|r| r.client)
+    }
+
+    /// The iterators of the connection.
+    fn iterators(&self) -> MutexGuard<'_, Iterators> {
+        self.iterators
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The frames that wait for the client.
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
+    }
+
+    /// Run one call that is not a call of the transaction, and count it in
+    /// the status and the metrics of the storage. The call puts its reply
+    /// with `reply`, or takes a place there.
+    pub(crate) fn call(&self, call: &Call, reply: &mut Reply) -> Outcome {
+        let started = Instant::now();
+        let outcome = self.dispatch(call, reply);
+        if call.method == "loadBefore" {
+            let metrics = &self.storage.metrics;
+            metrics.load_latency.observe_duration(started.elapsed());
+        }
+        self.count(&call.method, &outcome);
         outcome
     }
 
-    /// Count a call that ran, as ZEO counts it. `was_open` tells if a
-    /// transaction was open before the call.
-    fn count(&self, method: &str, outcome: &Outcome, was_open: bool) {
+    /// Count a call that ran, as ZEO counts it.
+    fn count(&self, method: &str, outcome: &Outcome) {
         let stats = &self.storage.stats;
-        let is_open = self.open.is_some();
-        match (was_open, is_open) {
-            (false, true) => Stats::add(&stats.active_txns),
-            (true, false) => Stats::sub(&stats.active_txns),
-            _ => {}
-        }
-        // An end of the transaction that the call named.
-        let ended = was_open && !is_open;
         let counter = match outcome {
             Outcome::Close(_) | Outcome::Gone => None,
             Outcome::Done(_) if method == "register" => Some(&stats.connections),
-            Outcome::Done(_) if STORES.contains(&method) => Some(&stats.stores),
-            Outcome::Failed(fault) if method == "vote" && fault.is_conflict() => {
-                Some(&stats.conflicts)
-            }
             _ if method == "loadBefore" => Some(&stats.loads),
-            _ if method == "tpc_finish" && ended => Some(&stats.commits),
-            _ if method == "tpc_abort" && ended => Some(&stats.aborts),
             _ => None,
         };
         if let Some(counter) = counter {
@@ -452,13 +583,16 @@ impl Session {
     }
 
     /// Run one call.
-    fn dispatch(&mut self, call: &Call) -> Outcome {
+    fn dispatch(&self, call: &Call, reply: &mut Reply) -> Outcome {
         let args = call.args.as_slice();
-        if !self.registered {
+        if !self.is_registered() {
             return match call.method.as_str() {
                 "register" => self.register(args).into(),
                 method => Outcome::Close(format!("{method} before register")),
             };
+        }
+        if let Some(fault) = self.undeclared(&call.method) {
+            return Outcome::Failed(fault);
         }
         let result = match call.method.as_str() {
             "register" => Err(Fault::value_error("duplicate register() call")),
@@ -471,55 +605,161 @@ impl Session {
                 arity::<0>(args, "server_status").map(|_| self.storage.status().to_value())
             }
             "ping" => arity::<0>(args, "ping").map(|_| Value::Nil),
-            // ZEO puts the label in its log lines. The server does not keep
-            // it.
-            "set_client_label" => arity::<1>(args, "set_client_label").map(|_| Value::Nil),
+            // ZEO puts the label in its log lines, and so does the server.
+            "set_client_label" => arity::<1>(args, "set_client_label").map(|[label]| {
+                // An empty label gives the address of the peer back.
+                *self.label.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(client_label(label)).filter(|label| !label.trim().is_empty());
+                Value::Nil
+            }),
+            "getTid" => self.get_tid(args),
             "new_oids" => self.new_oids(args),
-            "loadBefore" => self.load_before(args),
+            "loadBefore" => self.load_before(args, reply),
             "loadSerial" => self.load_serial(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
             "record_iternext" => self.record_iternext(args),
-            "tpc_begin" => self.tpc_begin(args),
-            "storea" => self.storea(args),
-            "restorea" => self.restorea(args),
-            "checkCurrentSerialInTransaction" => self.check_current_serial(args),
-            "deleteObject" => self.delete_object(args),
-            "vote" => self.vote(args),
-            "tpc_finish" => return self.tpc_finish(call),
-            "tpc_abort" => self.tpc_abort(args),
             "iterator_start" => self.iterator_start(args),
             "iterator_next" => self.iterator_next(args),
             "iterator_record_start" => self.iterator_record_start(args),
             "iterator_record_next" => self.iterator_record_next(args),
             "iterator_gc" => self.iterator_gc(args),
             "pack" => self.pack(args),
-            "storeBlobStart" => self.store_blob_start(args),
-            "storeBlobChunk" => self.store_blob_chunk(args),
-            "storeBlobEnd" => self.store_blob_end(args),
-            "sendBlob" => return self.send_blob(args),
+            "sendBlob" => return self.send_blob(args, reply),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
     }
 
-    fn register(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [storage, read_only] = arity::<2>(args, "register")?;
+    /// Register the connection with its storage. A ZOE client declares the
+    /// extensions that it wants in a third argument. The server keeps the
+    /// names that it serves and leaves out the other names.
+    fn register(&self, args: &[Value]) -> Result<Value, Fault> {
+        let (storage, read_only, declaration) = register_args(args)?;
         let storage = storage_name(storage);
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
-        self.read_only = truth(read_only);
-        self.registered = true;
+        let extensions = declaration
+            .map(|value| {
+                let names = negotiation::declared(value).map_err(Fault::type_error)?;
+                Ok::<_, Fault>(negotiation::accept(&names, negotiation::SERVED))
+            })
+            .transpose()?;
+        // A client that asks to write a read-only storage gets
+        // `ReadOnlyError`, as from ZEO. The connection stays open, so a
+        // client with `read_only_fallback` registers again read-only.
+        let read_only = truth(read_only);
+        if !read_only && self.storage.read_only {
+            return Err(Fault::read_only());
+        }
         // The client gets the invalidation of each commit after this tid.
         let (client, published) = self.storage.invalidations.subscribe(self.outbox.clone());
-        self.client = Some(client);
+        let registration = Registration {
+            client,
+            read_only,
+            extensions,
+        };
+        if self.registration.set(registration).is_err() {
+            self.storage.invalidations.unsubscribe(client);
+            return Err(Fault::value_error("duplicate register() call"));
+        }
         Ok(p64(published.0))
+    }
+
+    /// Load the record of an oid before a tid: `[data, serial, next serial
+    /// or nil]`, or nil.
+    ///
+    /// The reply shows the commits that the hub published, and no other:
+    /// the read takes the record before the last published tid plus 1 at
+    /// most, and it gives a next serial only when the hub published it. The
+    /// reply then takes its place in the order of the connection, if the
+    /// hub published no commit during the read. So the reply comes after
+    /// the invalidation of each commit that it shows, and before the
+    /// invalidation of each later commit. A stock client keeps a record
+    /// without a next serial as the current one, and needs this order.
+    ///
+    /// A publication during the read makes the call read again. After
+    /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
+    fn load_before(&self, args: &[Value], reply: &mut Reply) -> Result<Value, Fault> {
+        let [oid, tid] = arity::<2>(args, "loadBefore")?;
+        let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
+        let store = &self.store;
+        let read = |published: Tid| -> Result<Value, Fault> {
+            let before = tid.min(Tid(published.0.saturating_add(1)));
+            Ok(match store.load_before(oid, before)? {
+                Some(record) => Value::Array(vec![
+                    Value::Binary(record.data),
+                    p64(record.serial.0),
+                    record
+                        .next
+                        .filter(|next| *next <= published)
+                        .map_or(Value::Nil, |next| p64(next.0)),
+                ]),
+                None => Value::Nil,
+            })
+        };
+        let invalidations = &self.storage.invalidations;
+        let mut room = reply
+            .room
+            .take()
+            .unwrap_or_else(|| self.outbox.blocking_room());
+        for _ in 0..LOAD_TRIES {
+            let seen = invalidations.published();
+            // An error takes its place too, so it goes out in the room of
+            // the call and never waits for the client.
+            let value = read(seen);
+            match invalidations.place_since(seen, room) {
+                Ok(place) => {
+                    reply.place = Some(place);
+                    return value;
+                }
+                Err(back) => room = back,
+            }
+        }
+        let (value, place) = invalidations.read_placed(room, read);
+        reply.place = Some(place);
+        value
+    }
+
+    /// Send the blob of `oid` at `serial` to the client: `receiveBlobStart`,
+    /// the chunks and `receiveBlobStop`. The reply nil comes after them, so
+    /// the client has the file when the reply arrives.
+    ///
+    /// The call first reads the whole blob and checks its size and its
+    /// hash. So a blob that does not match its record goes out as an error
+    /// reply, never as a chunk.
+    ///
+    /// The first frame takes the room of the call. Each later frame waits
+    /// for room in the session queue, without holding room. So many
+    /// downloads of one connection never wait for each other in a circle.
+    fn send_blob(&self, args: &[Value], reply: &mut Reply) -> Outcome {
+        let download = arity::<2>(args, "sendBlob").and_then(|[oid, serial]| {
+            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            self.store.verify_blob(oid, serial)?;
+            let reader = self.store.open_blob(oid, serial)?;
+            Ok(Download::new(oid, serial, reader))
+        });
+        let download = match download {
+            Ok(download) => download,
+            Err(fault) => return Outcome::Failed(fault),
+        };
+        let send = |frame| match reply.room.take() {
+            Some(room) => room.put(Some(frame)),
+            None => self.outbox.send(frame),
+        };
+        match download.send(send) {
+            Ok(true) => Outcome::Done(Value::Nil),
+            Ok(false) => Outcome::Gone,
+            Err(error) => Outcome::Failed(error.into()),
+        }
     }
 
     /// The information that a stock client asks for after `register`. The
     /// name is the directory of the store, as `zoe.Storage.getName` gives
-    /// it.
+    /// it. The key `extensions` holds the extensions that the server
+    /// accepted from the declaration of the client. A client that declared
+    /// nothing gets no such key.
     fn info(&self) -> Result<Value, Fault> {
         let interfaces = INTERFACES
             .iter()
@@ -538,6 +778,11 @@ impl Session {
             ),
             (Value::from("interfaces"), Value::Array(interfaces)),
         ]);
+        let accepted = self.registration.get().and_then(|r| r.extensions.as_ref());
+        if let Some(accepted) = accepted {
+            let names = accepted.iter().map(|name| Value::from(*name)).collect();
+            items.push((Value::from("extensions"), Value::Array(names)));
+        }
         Ok(Value::Map(items))
     }
 
@@ -565,59 +810,13 @@ impl Session {
                 .clamp(1, 100) as u64,
             _ => return Err(Fault::type_error("new_oids takes at most 1 argument")),
         };
-        if self.read_only {
+        if self.read_only() {
             return Err(Fault::read_only());
         }
         let oids = (0..n)
             .map(|_| self.store.new_oid().map(|oid| p64(oid.0)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Value::Array(oids))
-    }
-
-    /// Load the record of an oid before a tid: `[data, serial, next serial
-    /// or nil]`, or nil.
-    ///
-    /// The reply shows the commits that the hub published, and no other:
-    /// the read takes the record before the last published tid plus 1 at
-    /// most, and it gives a next serial only when the hub published it. The
-    /// reply then takes its place in the order of the connection, if the
-    /// hub published no commit during the read. So the reply comes after
-    /// the invalidation of each commit that it shows, and before the
-    /// invalidation of each later commit. A stock client keeps a record
-    /// without a next serial as the current one, and needs this order.
-    ///
-    /// A publication during the read makes the call read again. After
-    /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
-    fn load_before(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, tid] = arity::<2>(args, "loadBefore")?;
-        let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
-        let store = &self.store;
-        let read = |published: Tid| -> Result<Value, Fault> {
-            let before = tid.min(Tid(published.0.saturating_add(1)));
-            Ok(match store.load_before(oid, before)? {
-                Some(record) => Value::Array(vec![
-                    Value::Binary(record.data),
-                    p64(record.serial.0),
-                    record
-                        .next
-                        .filter(|next| *next <= published)
-                        .map_or(Value::Nil, |next| p64(next.0)),
-                ]),
-                None => Value::Nil,
-            })
-        };
-        let invalidations = &self.storage.invalidations;
-        for _ in 0..LOAD_TRIES {
-            let seen = invalidations.published();
-            let value = read(seen)?;
-            if let Some(place) = invalidations.place_since(seen, &self.outbox) {
-                self.place = Some(place);
-                return Ok(value);
-            }
-        }
-        let (value, place) = invalidations.read_placed(&self.outbox, read);
-        self.place = Some(place);
-        value
     }
 
     fn load_serial(&self, args: &[Value]) -> Result<Value, Fault> {
@@ -678,6 +877,388 @@ impl Session {
         ]))
     }
 
+    /// Publish a commit of this connection. Every other client gets its
+    /// invalidation, with an empty list for a commit that wrote no oid, as
+    /// from ZEO. This client gets `info`, then `reply`.
+    ///
+    /// The oids come from the transaction index of the store. When they do
+    /// not read, the hub closes the other connections, so each client
+    /// verifies its cache when it connects again. The hub publishes the
+    /// commit also when a read panics, so later commits never wait for
+    /// this one.
+    fn publish(&self, finished: Finished, reply: Option<Vec<u8>>) {
+        let mut publication = self.storage.invalidations.prepare(Commit {
+            previous: finished.previous,
+            tid: finished.tid,
+            origin: self.client(),
+            outbox: self.outbox.clone(),
+            own: reply.into_iter().collect(),
+            others: Others::Close,
+        });
+        let tid = finished.tid;
+        let others = match self.store.written_oids(tid, tid, usize::MAX) {
+            Ok(Some(oids)) => Others::Send(message::notify(
+                "invalidateTransaction",
+                vec![
+                    p64(tid.0),
+                    Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
+                ],
+            )),
+            Ok(None) => Others::Close,
+            Err(error) => {
+                tracing::warn!(
+                    tid = format_args!("{:016x}", tid.0),
+                    "the oids of the commit do not read: {error}"
+                );
+                Others::Close
+            }
+        };
+        // `info` gives the sizes of the store, as ZEO sends them before the
+        // reply. Sizes that do not read leave it out.
+        let info = self
+            .sizes()
+            .ok()
+            .map(|sizes| message::notify("info", vec![Value::Map(sizes.into())]));
+        let commit = publication.commit();
+        commit.others = others;
+        if let Some(info) = info {
+            commit.own.insert(0, info);
+        }
+    }
+
+    /// Return the serial of the current record of an oid, as the reads of
+    /// the connection see it: the record before the last published tid
+    /// plus 1, as `loadBefore` reads. An oid without a record there, and an
+    /// oid whose record there is a deletion, fail with `POSKeyError`, as in
+    /// FileStorage.
+    ///
+    /// The reply takes its place after the read, so it comes after the
+    /// invalidation of the commit whose tid it gives. The client keeps no
+    /// state of the reply, so the reply can come after the invalidation of
+    /// a later commit.
+    fn get_tid(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid] = arity::<1>(args, "getTid")?;
+        let oid = Oid(u64_of(oid)?);
+        let published = self.storage.invalidations.published();
+        match self
+            .store
+            .load_before(oid, Tid(published.0.saturating_add(1)))?
+        {
+            Some(record) => Ok(p64(record.serial.0)),
+            // The oid has only records that the hub did not publish yet.
+            None => Err(ZoeError::NotFound { oid }.into()),
+        }
+    }
+
+    /// Return the last published tid and every oid that a commit after the
+    /// tid of the call wrote: `[tid, oids]`, each oid once. The oids come
+    /// from the transaction index of the store, so the reply does not
+    /// depend on what this process saw.
+    ///
+    /// Return nil when more than `invalidation-queue-size` transactions
+    /// that wrote records come after the tid, or when the index does not
+    /// read. The client then verifies its cache.
+    fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [tid] = arity::<1>(args, "getInvalidations")?;
+        let tid = u64_of(tid)?;
+        // The connection gets the invalidation of each commit after `last`.
+        let last = self.storage.invalidations.published();
+        let oids = match tid.checked_add(1) {
+            Some(from) => {
+                self.store
+                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
+            }
+            None => Ok(Some(Vec::new())),
+        };
+        Ok(match oids {
+            Ok(Some(oids)) => Value::Array(vec![
+                p64(last.0),
+                Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
+            ]),
+            Ok(None) => Value::Nil,
+            Err(error) => {
+                tracing::warn!("getInvalidations: the transaction index does not read: {error}");
+                Value::Nil
+            }
+        })
+    }
+
+    /// Start an iterator over the transactions from the tid `start` to the
+    /// tid `stop`, both included. Nil is no bound. Return the id of the
+    /// iterator.
+    fn iterator_start(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [start, stop] = arity::<2>(args, "iterator_start")?;
+        let (start, stop) = (optional_tid(start)?, optional_tid(stop)?);
+        let transactions = self.store.iterator(start, stop)?;
+        let id = self
+            .iterators()
+            .start(transactions)
+            .map_err(|refused| Fault::of_iterator(refused, &Value::Nil))?;
+        Ok(Value::from(id))
+    }
+
+    /// Return the next transaction of the iterator `id`, as `[tid, status,
+    /// user, description, extension]`, or nil at its end. The status is
+    /// always `" "`. The extension is the map of the extension bytes that
+    /// the store keeps, because a stock client takes the value of the wire
+    /// as the extension.
+    fn iterator_next(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [id] = arity::<1>(args, "iterator_next")?;
+        let next = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators().next_transaction(iid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?;
+        let txn = match next {
+            None => return Ok(Value::Nil),
+            Some(Err(error)) => return Err(Fault::of(&error)),
+            Some(Ok(txn)) => txn,
+        };
+        let extension = extension::unpickle(&txn.extension).map_err(|why| {
+            Fault::value_error(format!(
+                "the extension of the transaction {:016x}: {why}",
+                txn.tid.0
+            ))
+        })?;
+        Ok(Value::Array(vec![
+            p64(txn.tid.0),
+            Value::from(" "),
+            Value::Binary(txn.user.clone()),
+            Value::Binary(txn.description.clone()),
+            extension,
+        ]))
+    }
+
+    /// Start an iterator over the records of `tid`, the last transaction
+    /// that the transaction iterator `id` gave. Return the id of the record
+    /// iterator.
+    fn iterator_record_start(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [id, tid] = arity::<2>(args, "iterator_record_start")?;
+        let tid = Tid(u64_of(tid)?);
+        let records = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators().start_records(&self.store, iid, tid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?
+            .map_err(|error| Fault::of(&error))?;
+        Ok(Value::from(records))
+    }
+
+    /// Return the next record of the record iterator `id`, as `[oid, tid,
+    /// data, data_txn]`, or nil at its end. The data of a deletion is nil.
+    /// The store keeps every pickle whole, so `data_txn` is always nil. The
+    /// iterator reads the record now, and leaves out a record that a pack
+    /// removed after the iterator started.
+    fn iterator_record_next(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [id] = arity::<1>(args, "iterator_record_next")?;
+        let next = id
+            .as_u64()
+            .ok_or(Refused::Unknown)
+            .and_then(|iid| self.iterators().next_record(&self.store, iid))
+            .map_err(|refused| Fault::of_iterator(refused, id))?;
+        let record = match next {
+            None => return Ok(Value::Nil),
+            Some(Err(error)) => return Err(Fault::of(&error)),
+            Some(Ok(record)) => record,
+        };
+        Ok(Value::Array(vec![
+            p64(record.oid.0),
+            p64(record.tid.0),
+            record.data.map_or(Value::Nil, Value::Binary),
+            Value::Nil,
+        ]))
+    }
+
+    /// Remove the iterators that the client dropped. The client lists each
+    /// record iterator that it dropped, also one at its end, which is gone.
+    /// So an id that names no open iterator does nothing, as in ZEO.
+    fn iterator_gc(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [ids] = arity::<1>(args, "iterator_gc")?;
+        let Value::Array(ids) = ids else {
+            return Err(Fault::type_error("the iterator ids are not a list"));
+        };
+        self.iterators().gc(ids.iter().filter_map(Value::as_u64));
+        Ok(Value::Nil)
+    }
+
+    /// Pack the store at the tid of the time `time`, as FileStorage
+    /// computes it, or at the last published tid when that is lower. The
+    /// other connections read and commit while the pack runs. The pack
+    /// runs on a thread of its own, so the other calls of this connection
+    /// run too.
+    ///
+    /// After the pack, the hub sends `info` with the new size to every
+    /// client of the storage. The reply goes out after the `info` of this
+    /// client. It also goes out after the pack when `wait` is false. When
+    /// the sizes do not read, no client gets `info`, and the reply is nil,
+    /// because the pack is done.
+    ///
+    /// A read-only connection packs, as in ZEO: `zeopack` connects
+    /// read-only. A store that the server opened read-only refuses the pack
+    /// with `ReadOnlyError`.
+    ///
+    /// When the server stops, the pack stops between two batches and fails
+    /// with `StorageError`. It does not stop during the mark. The store
+    /// keeps what the pack did not remove, and the next pack removes it.
+    fn pack(&self, args: &[Value]) -> Result<Value, Fault> {
+        let time = match args {
+            [time] | [time, _] => time,
+            _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
+        };
+        let time = match time {
+            Value::F64(time) => *time,
+            Value::F32(time) => f64::from(*time),
+            Value::Integer(time) => time.as_f64().unwrap_or(f64::NAN),
+            _ => return Err(Fault::type_error("the pack time is not a number")),
+        };
+        let tid = clock::pack_tid(time)
+            .ok_or_else(|| Fault::value_error(format!("the pack time {time} has no tid")))?;
+        // The store makes a commit durable before the hub publishes it, and
+        // a client reads only the published commits. A pack after the last
+        // published tid can remove a record that such a read needs.
+        let invalidations = &self.storage.invalidations;
+        let tid = tid.min(invalidations.published());
+        let stopping = &self.stopping;
+        self.store
+            .pack_until(tid, || stopping.is_set())
+            .map_err(|error| Fault::of_pack(&error))?;
+        // `info` gives the sizes of the store. Sizes that do not read leave it
+        // out, as for a commit.
+        if let Ok(sizes) = self.sizes() {
+            let info = message::notify("info", vec![Value::Map(sizes.into())]);
+            invalidations.send_to_all(info);
+        }
+        Ok(Value::Nil)
+    }
+}
+
+impl Drop for Session {
+    /// The end of a connection leaves the status. The connection leaves the
+    /// invalidations of the storage, and its iterators go with the session.
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            Stats::sub(&self.storage.stats.connections);
+            self.storage.invalidations.unsubscribe(registration.client);
+        }
+    }
+}
+
+impl Transaction {
+    /// Return the transaction state of a connection of `session`, with no
+    /// open transaction.
+    pub(crate) fn new(session: Arc<Session>) -> Self {
+        Self {
+            session,
+            open: None,
+        }
+    }
+
+    /// Tell if a transaction is open.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Run one call of the transaction, and count it in the status of the
+    /// storage.
+    pub(crate) fn call(&mut self, call: &Call) -> Outcome {
+        let was_open = self.open.is_some();
+        let listed = self.open.as_ref().map_or(0, |open| open.listed);
+        let started = Instant::now();
+        let outcome = self.dispatch(call);
+        let elapsed = started.elapsed();
+        self.count(&call.method, &outcome, was_open);
+        self.measure(&call.method, &outcome, was_open, listed, elapsed);
+        outcome
+    }
+
+    /// Add a call that ran for `elapsed` to the metrics of the storage.
+    /// `was_open` tells if a transaction was open before the call, and
+    /// `listed` gives the conflicts that its last vote listed. Only the
+    /// thread of the transaction changes `open`, so the call sees the
+    /// state that it left.
+    fn measure(
+        &self,
+        method: &str,
+        outcome: &Outcome,
+        was_open: bool,
+        listed: u64,
+        elapsed: std::time::Duration,
+    ) {
+        let metrics = &self.session.storage.metrics;
+        let ended = was_open && self.open.is_none();
+        let conflict = matches!(outcome, Outcome::Failed(fault) if fault.is_conflict());
+        match method {
+            "vote" => metrics.vote_latency.observe_duration(elapsed),
+            "tpc_finish" if ended => {
+                metrics.finish_latency.observe_duration(elapsed);
+                if matches!(outcome, Outcome::Published) {
+                    add(&metrics.commits);
+                }
+            }
+            _ => {}
+        }
+        // A vote that fails with a conflict raises it in the client. So
+        // does a transaction that ends between the two votes: the client
+        // did not resolve a conflict that the vote listed.
+        if (method == "vote" && conflict) || (ended && listed > 0 && method != "vote") {
+            add(&metrics.conflicts_raised);
+        }
+    }
+
+    /// Count a call that ran, as ZEO counts it. `was_open` tells if a
+    /// transaction was open before the call.
+    fn count(&self, method: &str, outcome: &Outcome, was_open: bool) {
+        let stats = &self.session.storage.stats;
+        let is_open = self.open.is_some();
+        match (was_open, is_open) {
+            (false, true) => Stats::add(&stats.active_txns),
+            (true, false) => Stats::sub(&stats.active_txns),
+            _ => {}
+        }
+        // An end of the transaction that the call named.
+        let ended = was_open && !is_open;
+        let counter = match outcome {
+            Outcome::Close(_) | Outcome::Gone => None,
+            Outcome::Done(_) if STORES.contains(&method) => Some(&stats.stores),
+            Outcome::Failed(fault) if method == "vote" && fault.is_conflict() => {
+                Some(&stats.conflicts)
+            }
+            _ if method == "tpc_finish" && ended => Some(&stats.commits),
+            _ if method == "tpc_abort" && ended => Some(&stats.aborts),
+            _ => None,
+        };
+        if let Some(counter) = counter {
+            Stats::add(counter);
+        }
+    }
+
+    /// Run one call of the transaction.
+    fn dispatch(&mut self, call: &Call) -> Outcome {
+        let args = call.args.as_slice();
+        if !self.session.is_registered() {
+            return Outcome::Close(format!("{} before register", call.method));
+        }
+        if let Some(fault) = self.session.undeclared(&call.method) {
+            return Outcome::Failed(fault);
+        }
+        let result = match call.method.as_str() {
+            "tpc_begin" => self.tpc_begin(args),
+            "storea" => self.storea(args),
+            "restorea" => self.restorea(args),
+            "checkCurrentSerialInTransaction" => self.check_current_serial(args),
+            "deleteObject" => self.delete_object(args),
+            "vote" => self.vote(args),
+            "tpc_finish" => return self.tpc_finish(call),
+            "tpc_abort" => self.tpc_abort(args),
+            "storeBlobStart" => self.store_blob_start(args),
+            "storeBlobChunk" => self.store_blob_chunk(args),
+            "storeBlobEnd" => self.store_blob_end(args),
+            "storeBlobShared" => self.store_blob_shared(args),
+            method => return Outcome::Close(format!("unknown method {method}")),
+        };
+        result.into()
+    }
+
     /// Begin the transaction of the client. `tpc_begin` has no reply, so
     /// an error in it fails the vote of the transaction, and the
     /// connection stays open.
@@ -708,7 +1289,7 @@ impl Session {
         if args.len() < 4 || args.len() > 6 {
             return Err(Fault::type_error("tpc_begin takes 4 to 6 arguments"));
         }
-        if self.read_only {
+        if self.session.read_only() {
             return Err(Fault::read_only());
         }
         // A copy gives the status of the copied transaction: " " for a
@@ -723,7 +1304,7 @@ impl Session {
         let user = text_bytes(&args[1])?;
         let description = text_bytes(&args[2])?;
         let ext = extension::pickle(&args[3]).map_err(Fault::type_error)?;
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.session.store);
         match args.get(4).filter(|tid| !tid.is_nil()) {
             None => Ok(Txn::begin(store, &user, &description, &ext)),
             Some(tid) => {
@@ -747,7 +1328,7 @@ impl Session {
     fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial, data, id] = arity::<4>(args, "storea")?;
         self.current(id)?.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
@@ -831,7 +1412,7 @@ impl Session {
                 open.listed = conflicts.len() as u64;
                 // A second vote that passes counts the conflicts that the
                 // client resolved.
-                Stats::add_n(&self.storage.stats.conflicts_resolved, listed);
+                Stats::add_n(&self.session.storage.stats.conflicts_resolved, listed);
                 Ok(Value::Array(conflicts))
             }
             Err(fault) => {
@@ -852,7 +1433,7 @@ impl Session {
             Err(fault) => return Outcome::Failed(fault),
         };
         let reply = (!call.oneway).then(|| message::reply(call.id.clone(), p64(finished.tid.0)));
-        self.publish(finished, reply);
+        self.session.publish(finished, reply);
         Outcome::Published
     }
 
@@ -871,90 +1452,6 @@ impl Session {
         Ok(Some(txn.finish_after()?))
     }
 
-    /// Publish a commit of this connection. Every other client gets its
-    /// invalidation, with an empty list for a commit that wrote no oid, as
-    /// from ZEO. This client gets `info`, then `reply`.
-    ///
-    /// The oids come from the transaction index of the store. When they do
-    /// not read, the hub closes the other connections, so each client
-    /// verifies its cache when it connects again. The hub publishes the
-    /// commit also when a read panics, so later commits never wait for
-    /// this one.
-    fn publish(&self, finished: Finished, reply: Option<Vec<u8>>) {
-        let mut publication = self.storage.invalidations.prepare(Commit {
-            previous: finished.previous,
-            tid: finished.tid,
-            origin: self.client,
-            outbox: self.outbox.clone(),
-            own: reply.into_iter().collect(),
-            others: Others::Close,
-        });
-        let tid = finished.tid;
-        let others = match self.store.written_oids(tid, tid, usize::MAX) {
-            Ok(Some(oids)) => Others::Send(message::notify(
-                "invalidateTransaction",
-                vec![
-                    p64(tid.0),
-                    Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
-                ],
-            )),
-            Ok(None) => Others::Close,
-            Err(error) => {
-                eprintln!(
-                    "zoe serve: the oids of the commit {:016x} do not read: {error}",
-                    tid.0
-                );
-                Others::Close
-            }
-        };
-        // `info` gives the sizes of the store, as ZEO sends them before the
-        // reply. Sizes that do not read leave it out.
-        let info = self
-            .sizes()
-            .ok()
-            .map(|sizes| message::notify("info", vec![Value::Map(sizes.into())]));
-        let commit = publication.commit();
-        commit.others = others;
-        if let Some(info) = info {
-            commit.own.insert(0, info);
-        }
-    }
-
-    /// Return the last published tid and every oid that a commit after the
-    /// tid of the call wrote: `[tid, oids]`, each oid once. The oids come
-    /// from the transaction index of the store, so the reply does not
-    /// depend on what this process saw.
-    ///
-    /// Return nil when more than `invalidation-queue-size` transactions
-    /// that wrote records come after the tid, or when the index does not
-    /// read. The client then verifies its cache.
-    fn get_invalidations(&self, args: &[Value]) -> Result<Value, Fault> {
-        let [tid] = arity::<1>(args, "getInvalidations")?;
-        let tid = u64_of(tid)?;
-        // The connection gets the invalidation of each commit after `last`.
-        let last = self.storage.invalidations.published();
-        let oids = match tid.checked_add(1) {
-            Some(from) => {
-                self.store
-                    .written_oids(Tid(from), last, self.storage.queues.invalidations)
-            }
-            None => Ok(Some(Vec::new())),
-        };
-        Ok(match oids {
-            Ok(Some(oids)) => Value::Array(vec![
-                p64(last.0),
-                Value::Array(oids.into_iter().map(|oid| p64(oid.0)).collect()),
-            ]),
-            Ok(None) => Value::Nil,
-            Err(error) => {
-                eprintln!(
-                    "zoe serve: getInvalidations: the transaction index does not read: {error}"
-                );
-                Value::Nil
-            }
-        })
-    }
-
     fn tpc_abort(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [id] = arity::<1>(args, "tpc_abort")?;
         // As in ZEO, an abort of another transaction does nothing.
@@ -962,143 +1459,6 @@ impl Session {
             && let Some(Open { txn: Ok(txn), .. }) = self.open.take()
         {
             txn.abort();
-        }
-        Ok(Value::Nil)
-    }
-
-    /// Start an iterator over the transactions from the tid `start` to the
-    /// tid `stop`, both included. Nil is no bound. Return the id of the
-    /// iterator.
-    fn iterator_start(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [start, stop] = arity::<2>(args, "iterator_start")?;
-        let (start, stop) = (optional_tid(start)?, optional_tid(stop)?);
-        let transactions = self.store.iterator(start, stop)?;
-        let id = self
-            .iterators
-            .start(transactions)
-            .map_err(|refused| Fault::of_iterator(refused, &Value::Nil))?;
-        Ok(Value::from(id))
-    }
-
-    /// Return the next transaction of the iterator `id`, as `[tid, status,
-    /// user, description, extension]`, or nil at its end. The status is
-    /// always `" "`. The extension is the map of the extension bytes that
-    /// the store keeps, because a stock client takes the value of the wire
-    /// as the extension.
-    fn iterator_next(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [id] = arity::<1>(args, "iterator_next")?;
-        let next = id
-            .as_u64()
-            .ok_or(Refused::Unknown)
-            .and_then(|iid| self.iterators.next_transaction(iid))
-            .map_err(|refused| Fault::of_iterator(refused, id))?;
-        let txn = match next {
-            None => return Ok(Value::Nil),
-            Some(Err(error)) => return Err(Fault::of(&error)),
-            Some(Ok(txn)) => txn,
-        };
-        let extension = extension::unpickle(&txn.extension).map_err(|why| {
-            Fault::value_error(format!(
-                "the extension of the transaction {:016x}: {why}",
-                txn.tid.0
-            ))
-        })?;
-        Ok(Value::Array(vec![
-            p64(txn.tid.0),
-            Value::from(" "),
-            Value::Binary(txn.user.clone()),
-            Value::Binary(txn.description.clone()),
-            extension,
-        ]))
-    }
-
-    /// Start an iterator over the records of `tid`, the last transaction
-    /// that the transaction iterator `id` gave. Return the id of the record
-    /// iterator.
-    fn iterator_record_start(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [id, tid] = arity::<2>(args, "iterator_record_start")?;
-        let tid = Tid(u64_of(tid)?);
-        let records = id
-            .as_u64()
-            .ok_or(Refused::Unknown)
-            .and_then(|iid| self.iterators.start_records(iid, tid))
-            .map_err(|refused| Fault::of_iterator(refused, id))?;
-        Ok(Value::from(records))
-    }
-
-    /// Return the next record of the record iterator `id`, as `[oid, tid,
-    /// data, data_txn]`, or nil at its end. The data of a deletion is nil.
-    /// The store keeps every pickle whole, so `data_txn` is always nil.
-    fn iterator_record_next(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [id] = arity::<1>(args, "iterator_record_next")?;
-        let next = id
-            .as_u64()
-            .ok_or(Refused::Unknown)
-            .and_then(|iid| self.iterators.next_record(iid))
-            .map_err(|refused| Fault::of_iterator(refused, id))?;
-        Ok(next.map_or(Value::Nil, |record| {
-            Value::Array(vec![
-                p64(record.oid.0),
-                p64(record.tid.0),
-                record.data.map_or(Value::Nil, Value::Binary),
-                Value::Nil,
-            ])
-        }))
-    }
-
-    /// Remove the iterators that the client dropped. The client lists each
-    /// record iterator that it dropped, also one at its end, which is gone.
-    /// So an id that names no open iterator does nothing, as in ZEO.
-    fn iterator_gc(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [ids] = arity::<1>(args, "iterator_gc")?;
-        let Value::Array(ids) = ids else {
-            return Err(Fault::type_error("the iterator ids are not a list"));
-        };
-        self.iterators.gc(ids.iter().filter_map(Value::as_u64));
-        Ok(Value::Nil)
-    }
-
-    /// Pack the store at the tid of the time `time`, as FileStorage
-    /// computes it, or at the last published tid when that is lower. The
-    /// other connections read and commit while the pack runs. The later
-    /// calls of this connection wait for the pack, because a connection
-    /// runs its calls in order.
-    ///
-    /// After the pack, the hub sends `info` with the new size to every
-    /// client of the storage. The reply goes out after the `info` of this
-    /// client. It also goes out after the pack when `wait` is false. When
-    /// the sizes do not read, no client gets `info`, and the reply is nil,
-    /// because the pack is done.
-    ///
-    /// A read-only connection packs, as in ZEO: `zeopack` connects
-    /// read-only. A store that the server opened read-only refuses the pack
-    /// with `ReadOnlyError`.
-    fn pack(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let time = match args {
-            [time] | [time, _] => time,
-            _ => return Err(Fault::type_error("pack takes 1 or 2 arguments")),
-        };
-        let time = match time {
-            Value::F64(time) => *time,
-            Value::F32(time) => f64::from(*time),
-            Value::Integer(time) => time.as_f64().unwrap_or(f64::NAN),
-            _ => return Err(Fault::type_error("the pack time is not a number")),
-        };
-        let tid = clock::pack_tid(time)
-            .ok_or_else(|| Fault::value_error(format!("the pack time {time} has no tid")))?;
-        // The store makes a commit durable before the hub publishes it, and
-        // a client reads only the published commits. A pack after the last
-        // published tid can remove a record that such a read needs.
-        let invalidations = &self.storage.invalidations;
-        let tid = tid.min(invalidations.published());
-        self.store
-            .pack(tid)
-            .map_err(|error| Fault::of_pack(&error))?;
-        // `info` gives the sizes of the store. Sizes that do not read leave it
-        // out, as for a commit.
-        if let Ok(sizes) = self.sizes() {
-            let info = message::notify("info", vec![Value::Map(sizes.into())]);
-            invalidations.send_to_all(info);
         }
         Ok(Value::Nil)
     }
@@ -1120,9 +1480,17 @@ impl Session {
         if open.upload.is_some() {
             return Err(Fault::value_error("storeBlobStart: an upload is open"));
         }
-        let dir = self.store.blob_temp_dir()?;
-        let upload = Upload::create(&dir)
-            .map_err(|error| Fault::storage(format!("cannot create an upload file: {error}")))?;
+        // The blob file of the core goes through the `Vfs` of the store.
+        let upload = self
+            .session
+            .store
+            .new_blob_file()
+            .map_err(|error| match error {
+                ZoeError::Io(error) => {
+                    Fault::storage(format!("cannot create an upload file: {error}"))
+                }
+                error => Fault::from(error),
+            })?;
         open.upload = Some(upload);
         Ok(Value::Nil)
     }
@@ -1143,14 +1511,13 @@ impl Session {
             .upload
             .as_mut()
             .ok_or_else(|| Fault::value_error("storeBlobChunk: no upload is open"))?;
-        upload
-            .write(chunk)
+        std::io::Write::write_all(upload, chunk)
             .map_err(|error| Fault::storage(format!("cannot write an upload file: {error}")))?;
         Ok(Value::Nil)
     }
 
-    /// Stage the uploaded blob with `data` for `oid`. `Txn::store_blob_at`
-    /// takes the file by rename. A stock client sent `storea` for the oid
+    /// Stage the uploaded blob with `data` for `oid` with `Txn::store_blob`,
+    /// which syncs the file. A stock client sent `storea` for the oid
     /// before, and this store keeps the pickle and adds the blob. An error
     /// of the stage fails the vote, as an error of `storea` does.
     fn store_blob_end(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -1161,59 +1528,63 @@ impl Session {
         if open.txn.is_err() {
             return Ok(Value::Nil);
         }
-        let mut upload =
-            upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
+        let upload = upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
         open.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
-            Ok(txn.store_blob_at(oid, serial, data, upload.close())?)
+            Ok(txn.store_blob(oid, serial, data, upload)?)
         });
         Ok(Value::Nil)
     }
 
-    /// Send the blob of `oid` at `serial` to the client: `receiveBlobStart`,
-    /// the chunks and `receiveBlobStop`. The reply nil comes after them, so
-    /// the client has the file when the reply arrives.
+    /// Stage the blob in the file `filename` of the directory of `oid` with
+    /// `data`, for a client that shares the blob directory of the store.
+    /// `Txn::store_blob_shared` takes the file by rename. `filename` must
+    /// be a name that ends in `.tmp` or `.tmp-`, never a path.
     ///
-    /// The call first reads the whole blob and checks its size and its
-    /// hash. So a blob that does not match its record goes out as an error
-    /// reply, never as a chunk.
-    fn send_blob(&self, args: &[Value]) -> Outcome {
-        let download = arity::<2>(args, "sendBlob").and_then(|[oid, serial]| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-            self.store.verify_blob(oid, serial)?;
-            let reader = self.store.open_blob(oid, serial)?;
-            Ok(Download::new(oid, serial, reader))
+    /// The call has no reply. Without `--shared-blob-dir`, a name that the
+    /// core refuses, and each other error of the stage fail the vote, as an
+    /// error of `storea` does. Then the file stays in its place.
+    fn store_blob_shared(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, filename, id] = arity::<5>(args, "storeBlobShared")?;
+        let shared = self.session.storage.shared_blob_dir;
+        self.current(id)?.stage(|txn| {
+            if !shared {
+                return Err(Fault::storage(
+                    "storeBlobShared needs zoe serve --shared-blob-dir \
+                     (ZOE_SHARED_BLOB_DIR): this server does not share its blob \
+                     directory with its clients",
+                ));
+            }
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
+            let Value::Binary(data) = data else {
+                return Err(Fault::type_error("data is not bytes"));
+            };
+            let name = match filename {
+                Value::String(text) => text.as_str(),
+                Value::Binary(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            }
+            .ok_or_else(|| Fault::type_error("the blob file name is not a str"))?;
+            Ok(txn.store_blob_shared(oid, serial, data, name)?)
         });
-        let download = match download {
-            Ok(download) => download,
-            Err(fault) => return Outcome::Failed(fault),
-        };
-        match download.send(|frame| self.outbox.send(frame)) {
-            Ok(true) => Outcome::Done(Value::Nil),
-            Ok(false) => Outcome::Gone,
-            Err(error) => Outcome::Failed(error.into()),
-        }
+        Ok(Value::Nil)
     }
 }
 
-impl Drop for Session {
-    /// The end of a connection leaves the status: a transaction that is
-    /// still open counts as an abort, as in ZEO. The connection leaves the
-    /// invalidations of the storage, and its iterators go with the session.
+impl Drop for Transaction {
+    /// A transaction that is still open at the end of a connection counts
+    /// as an abort, as in ZEO. The drop of the core transaction aborts it.
     fn drop(&mut self) {
-        let stats = &self.storage.stats;
-        if self.open.is_some() {
+        if let Some(open) = &self.open {
+            if open.listed > 0 {
+                add(&self.session.storage.metrics.conflicts_raised);
+            }
+            let stats = &self.session.storage.stats;
             Stats::sub(&stats.active_txns);
             Stats::add(&stats.aborts);
-        }
-        if self.registered {
-            Stats::sub(&stats.connections);
-        }
-        if let Some(client) = self.client.take() {
-            self.storage.invalidations.unsubscribe(client);
         }
     }
 }
@@ -1247,6 +1618,22 @@ fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Vec<Value>, Fault> {
         .collect()
 }
 
+/// Add 1 to the metric `counter`.
+fn add(counter: &AtomicU64) {
+    Stats::add(counter);
+}
+
+/// Return the label of a client for the log lines: its text, with each
+/// control character replaced by a space, and at most `MAX_LABEL`
+/// characters.
+fn client_label(value: &Value) -> String {
+    let text = storage_name(value);
+    text.chars()
+        .take(MAX_LABEL)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Return the `N` arguments of `method`.
 fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Value; N], Fault> {
     args.try_into()
@@ -1264,6 +1651,12 @@ fn optional_tid(value: &Value) -> Result<Option<Tid>, Fault> {
         Value::Nil => Ok(None),
         tid => Ok(Some(Tid(u64_of(tid)?))),
     }
+}
+
+/// The serial of a store, `storea` or `storeBlobEnd`. A nil serial is the
+/// zero tid, the serial of a new object, as in FileStorage.
+fn store_serial(value: &Value) -> Result<Tid, Fault> {
+    Ok(optional_tid(value)?.unwrap_or(Tid::ZERO))
 }
 
 /// The number in the 8 big-endian bytes of `value`.
@@ -1300,6 +1693,8 @@ fn truth(value: &Value) -> bool {
 mod tests {
     use zoe_core::Options;
 
+    use tokio::sync::mpsc::Receiver;
+
     use super::super::outbox::Inbox;
     use super::*;
     use crate::protocol::Queues;
@@ -1308,6 +1703,96 @@ mod tests {
     /// writes it: the class pickle, then the state pickle.
     const MAPPING: &[u8] = b"\x80\x03X\x12\x00\x00\x00persistent.mappingq\x00\
         X\x11\x00\x00\x00PersistentMappingq\x01\x86q\x02N\x86q\x03.\x80\x03}q\x00.";
+
+    /// A connection whose calls run in order on the thread of the test.
+    struct Client {
+        session: Arc<Session>,
+        txn: Transaction,
+        /// The place that the last call took for its reply.
+        place: Option<Place>,
+    }
+
+    impl Client {
+        fn new(storage: Arc<NamedStorage>, outbox: Outbox) -> Self {
+            Self::stopping(storage, outbox, never_stops())
+        }
+
+        /// A connection whose pack stops when `stopping` tells it.
+        fn stopping(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
+            let session = Arc::new(Session::new(storage, outbox, stopping));
+            Self {
+                txn: Transaction::new(Arc::clone(&session)),
+                session,
+                place: None,
+            }
+        }
+
+        /// Run one call. Keep the place that it took for its reply.
+        fn call(&mut self, call: &Call) -> Outcome {
+            if self.session.is_registered() && in_transaction(&call.method) {
+                return self.txn.call(call);
+            }
+            let mut reply = Reply::new(self.session.outbox.blocking_room());
+            let outcome = self.session.call(call, &mut reply);
+            self.place = reply.place.take();
+            outcome
+        }
+    }
+
+    impl std::ops::Deref for Client {
+        type Target = Session;
+
+        fn deref(&self) -> &Session {
+            &self.session
+        }
+    }
+
+    /// Run the calls that arrive on `calls` as a connection runs them, and
+    /// put their replies in `outbox`. Return when `calls` closes and each
+    /// call ended, or when a call ends the connection. The threads of the
+    /// calls log to the subscriber of the thread of the test.
+    fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
+        use super::super::pipeline::Calls;
+        use crate::runtime::Tokio;
+
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_start(move || {
+                std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+            })
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                never_stops(),
+            );
+            let ended = connection.ended();
+            loop {
+                let call = tokio::select! {
+                    call = calls.recv() => call,
+                    () = ended.wait() => None,
+                };
+                let Some(call) = call else { break };
+                let ticket = connection.ticket().await;
+                if ticket.is_closed() {
+                    break;
+                }
+                connection.start(call, ticket).await;
+            }
+            drop(outbox);
+            connection.finish().await;
+        });
+    }
+
+    /// Return a signal that never tells a stop: its sender is gone.
+    fn never_stops() -> Stopping {
+        Stopping::new().1
+    }
 
     /// Return an outbox whose frames go nowhere.
     fn outbox() -> Outbox {
@@ -1322,8 +1807,8 @@ mod tests {
         Arc::new(NamedStorage::new("1", &dir, store, queues))
     }
 
-    fn session(name: &str) -> Session {
-        Session::new(storage(name, Queues::DEFAULT), outbox())
+    fn session(name: &str) -> Client {
+        Client::new(storage(name, Queues::DEFAULT), outbox())
     }
 
     /// Return the storages of a server that serves only `storage`.
@@ -1331,7 +1816,7 @@ mod tests {
         Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client))
     }
 
-    fn call(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
+    fn call(session: &mut Client, method: &str, args: Vec<Value>) -> Outcome {
         session.call(&Call {
             id: Value::from(1),
             oneway: false,
@@ -1356,7 +1841,7 @@ mod tests {
 
     /// Finish the transaction `id`, and return its tid. With no other
     /// session, the commit is the last published one.
-    fn finish(s: &mut Session, id: Value) -> u64 {
+    fn finish(s: &mut Client, id: Value) -> u64 {
         match call(s, "tpc_finish", vec![id]) {
             Outcome::Published => {}
             other => panic!("not published: {other:?}"),
@@ -1366,7 +1851,7 @@ mod tests {
 
     /// Begin the transaction `id`, with the tid `tid` for a restore
     /// transaction.
-    fn begin(s: &mut Session, id: i64, tid: Option<u64>) {
+    fn begin(s: &mut Client, id: i64, tid: Option<u64>) {
         let tid = tid.map_or(Value::Nil, p64);
         let args = vec![
             Value::from(id),
@@ -1379,7 +1864,7 @@ mod tests {
         assert_eq!(done(call(s, "tpc_begin", args)), Value::Nil);
     }
 
-    fn store(s: &mut Session, id: i64, oid: u64, serial: u64, data: &[u8]) {
+    fn store(s: &mut Client, id: i64, oid: u64, serial: u64, data: &[u8]) {
         let args = vec![
             p64(oid),
             p64(serial),
@@ -1391,7 +1876,7 @@ mod tests {
 
     /// Vote and finish the transaction `id`. Return the committed tid, or
     /// the exception of the vote.
-    fn vote_and_finish(s: &mut Session, id: i64) -> Result<u64, Fault> {
+    fn vote_and_finish(s: &mut Client, id: i64) -> Result<u64, Fault> {
         match call(s, "vote", vec![Value::from(id)]) {
             Outcome::Done(_) => Ok(finish(s, Value::from(id))),
             outcome => Err(failed(outcome)),
@@ -1475,6 +1960,15 @@ mod tests {
             vec![Value::Binary(b"b".to_vec()), Value::Boolean(false)],
         );
         assert_eq!(select(&storages, &by_bytes).ok().unwrap().name, "b");
+        let declaring = request(
+            "register",
+            vec![
+                Value::from("a"),
+                Value::Boolean(false),
+                Value::Array(vec![]),
+            ],
+        );
+        assert_eq!(select(&storages, &declaring).ok().unwrap().name, "a");
         let fault = failed(select(&storages, &register("1")).err().unwrap());
         assert_eq!(fault.class, "builtins.ValueError");
         let fault = failed(
@@ -1503,7 +1997,7 @@ mod tests {
         store(&mut s, 1, 1, 0, b"a");
         let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
         assert_eq!(fault, Fault::read_only());
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
     }
 
     #[test]
@@ -1530,7 +2024,7 @@ mod tests {
         store(&mut s, 9, 2, 0, b"a");
         let fault = failed(call(&mut s, "vote", vec![Value::from(9)]));
         assert_eq!(fault.class, TRANSACTION_ERROR);
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
         // As in ZEO, a finish or an abort of no transaction gives None.
         assert_eq!(
             done(call(&mut s, "tpc_finish", vec![Value::from(9)])),
@@ -1685,7 +2179,7 @@ mod tests {
             )
         );
         assert_eq!(item(&fault, "class_name"), Value::Nil);
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
         assert_eq!(
             done(call(&mut s, "tpc_abort", vec![Value::from(3)])),
             Value::Nil
@@ -1799,7 +2293,7 @@ mod tests {
 
     /// Run the call of the frame `raw`, in hex. Return the frame of its
     /// reply, or `None` for a call without a reply.
-    fn replay(s: &mut Session, raw: &str) -> Option<Vec<u8>> {
+    fn replay(s: &mut Client, raw: &str) -> Option<Vec<u8>> {
         let call = message::decode(&hex(raw)).unwrap();
         match s.call(&call) {
             Outcome::Done(Value::Nil) if call.oneway => None,
@@ -1891,7 +2385,7 @@ mod tests {
     /// Begin the transaction `id` that stores `data` over `serial` for each
     /// `(oid, serial)` of `stores`, and vote. Return the outcome of the
     /// vote.
-    fn store_and_vote(s: &mut Session, id: i64, stores: &[(u64, u64)], data: &[u8]) -> Outcome {
+    fn store_and_vote(s: &mut Client, id: i64, stores: &[(u64, u64)], data: &[u8]) -> Outcome {
         begin(s, id, None);
         for &(oid, serial) in stores {
             store(s, id, oid, serial, data);
@@ -1924,7 +2418,7 @@ mod tests {
             )
         );
         // The failed vote ends the transaction and releases its locks.
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
         commit(&mut s, 6, 2, two_later, MAPPING).unwrap();
     }
 
@@ -1945,7 +2439,7 @@ mod tests {
         // The data is the pickle of the client, not the committed one.
         assert_eq!(get(&conflicts[0], "data"), &Value::Binary(b"mine".to_vec()));
         // The transaction keeps its locks: it is still open.
-        assert!(s.open.is_some());
+        assert!(s.txn.open.is_some());
 
         // A second vote without a resolved pickle fails on the stale
         // serial, and the transaction ends.
@@ -1956,7 +2450,7 @@ mod tests {
             item(&fault, "serials"),
             Value::Array(vec![p64(second), p64(first)])
         );
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
         let status = s.storage.status().to_value();
         assert_eq!(count(&status, "conflicts"), 1);
         assert_eq!(count(&status, "conflicts_resolved"), 0);
@@ -1977,7 +2471,7 @@ mod tests {
         let fault = failed(call(&mut s, "vote", vec![Value::from(4)]));
         assert_eq!(fault.class, CONFLICT_ERROR);
         assert_eq!(item(&fault, "oid"), p64(2));
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
     }
 
     #[test]
@@ -1991,7 +2485,7 @@ mod tests {
         };
         let store = Arc::new(Store::open_with(&dir, options).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
-        let mut other = Session::new(Arc::clone(&storage), outbox());
+        let mut other = Client::new(Arc::clone(&storage), outbox());
         let register = vec![Value::from("1"), Value::Boolean(false)];
         done(call(&mut other, "register", register));
         let first = commit(&mut other, 1, 1, 0, MAPPING).unwrap();
@@ -2142,7 +2636,7 @@ mod tests {
         commit(&mut s, 7, 1, tid, MAPPING).unwrap();
     }
 
-    fn registered(name: &str) -> Session {
+    fn registered(name: &str) -> Client {
         let mut s = session(name);
         done(call(
             &mut s,
@@ -2154,7 +2648,7 @@ mod tests {
 
     /// Commit the transaction `id` that stores `data` for `oid` over
     /// `serial`. Return its tid, or the fault of its vote.
-    fn commit(s: &mut Session, id: i64, oid: u64, serial: u64, data: &[u8]) -> Result<u64, Fault> {
+    fn commit(s: &mut Client, id: i64, oid: u64, serial: u64, data: &[u8]) -> Result<u64, Fault> {
         let user = Value::Binary(format!("user-{id}").into_bytes());
         let description = Value::Binary(b"description".to_vec());
         let id = Value::from(id);
@@ -2244,6 +2738,31 @@ mod tests {
     }
 
     #[test]
+    fn get_info_gives_back_the_accepted_extensions_of_a_declaration() {
+        let mut s = session("declared");
+        let register =
+            |declaration: Value| vec![Value::from("1"), Value::Boolean(false), declaration];
+        // A declaration that is not a list of names fails, and the client
+        // can register again.
+        let fault = failed(call(&mut s, "register", register(Value::from("a"))));
+        assert_eq!(fault.class, "builtins.TypeError");
+        assert!(!s.session.is_registered());
+        let declaration = Value::Array(vec![Value::from("unknown"), Value::from("unknown")]);
+        assert_eq!(
+            done(call(&mut s, "register", register(declaration))),
+            p64(0)
+        );
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(keys(&info).last(), Some(&"extensions"));
+        assert_eq!(get(&info, "extensions"), &Value::Array(vec![]));
+        let again = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(
+            failed(call(&mut s, "register", again)).class,
+            "builtins.ValueError"
+        );
+    }
+
+    #[test]
     fn ping_answers_nil_and_set_client_label_takes_one_label() {
         let mut s = registered("ping");
         assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
@@ -2315,9 +2834,9 @@ mod tests {
     fn a_closed_session_leaves_the_status() {
         let mut s = registered("closed");
         let storage = Arc::clone(&s.storage);
-        let mut other = Session::new(Arc::clone(&storage), outbox());
+        let mut other = Client::new(Arc::clone(&storage), outbox());
         // A session that does not register is not a connection.
-        let _unregistered = Session::new(Arc::clone(&storage), outbox());
+        let _unregistered = Client::new(Arc::clone(&storage), outbox());
         done(call(
             &mut other,
             "register",
@@ -2429,9 +2948,9 @@ mod tests {
 
     /// A registered session of `storage`. Its frames wait in the receiver
     /// for the test.
-    fn connected(storage: &Arc<NamedStorage>) -> (Session, Inbox) {
+    fn connected(storage: &Arc<NamedStorage>) -> (Client, Inbox) {
         let (outbox, frames, _closing) = Outbox::new(1_000, 1_000);
-        let mut s = Session::new(Arc::clone(storage), outbox);
+        let mut s = Client::new(Arc::clone(storage), outbox);
         done(call(
             &mut s,
             "register",
@@ -2507,7 +3026,7 @@ mod tests {
 
     /// Put the reply `value` of the last call of `s` at the place that the
     /// call took.
-    fn answer(s: &mut Session, value: Value) {
+    fn answer(s: &mut Client, value: Value) {
         let place = s.place.take().expect("the call took a place");
         assert!(
             s.outbox
@@ -2624,7 +3143,7 @@ mod tests {
             invalidations: 2,
             client: 1_000,
         };
-        let mut s = Session::new(storage("get-invalidations", queues), outbox());
+        let mut s = Client::new(storage("get-invalidations", queues), outbox());
         done(call(
             &mut s,
             "register",
@@ -2634,7 +3153,7 @@ mod tests {
         let second = commit(&mut s, 2, 2, 0, b"b").unwrap();
         commit(&mut s, 3, 3, 0, b"c").unwrap();
         let last = commit(&mut s, 4, 1, first, b"d").unwrap();
-        let get = |s: &mut Session, tid: Value| done(call(s, "getInvalidations", vec![tid]));
+        let get = |s: &mut Client, tid: Value| done(call(s, "getInvalidations", vec![tid]));
 
         // Two commits after `second` wrote the oids 3 and 1.
         assert_eq!(
@@ -2730,7 +3249,7 @@ mod tests {
                 // This session registers after 5 commits of the first one.
                 early.wait();
                 let (outbox, frames, _closing) = Outbox::new(1_000, 1_000);
-                let mut s = Session::new(Arc::clone(storage), outbox);
+                let mut s = Client::new(Arc::clone(storage), outbox);
                 let register = vec![Value::from("1"), Value::Boolean(false)];
                 let registered = u64_of(&done(call(&mut s, "register", register))).unwrap();
                 for n in 0..COMMITS {
@@ -2784,7 +3303,7 @@ mod tests {
 
     /// Begin the transaction `id`, store a pickle for `oid` and open an
     /// upload with one chunk, as a stock client does.
-    fn upload(s: &mut Session, id: i64, oid: u64, chunk: &[u8]) {
+    fn upload(s: &mut Client, id: i64, oid: u64, chunk: &[u8]) {
         begin(s, id, None);
         store(s, id, oid, 0, b"pickle");
         done(call(s, "storeBlobStart", vec![]));
@@ -2795,7 +3314,7 @@ mod tests {
         ));
     }
 
-    fn store_blob_end(s: &mut Session, id: i64, oid: u64, data: &[u8]) -> Outcome {
+    fn store_blob_end(s: &mut Client, id: i64, oid: u64, data: &[u8]) -> Outcome {
         let data = Value::Binary(data.to_vec());
         call(
             s,
@@ -2876,12 +3395,12 @@ mod tests {
         let none = Vec::<std::path::PathBuf>::new();
         let mut s = registered("blob-refused");
         upload(&mut s, 1, 1, b"the blob");
-        // The core refuses an empty pickle, and leaves the file in place.
+        // The core refuses an empty pickle, and the drop of the file removes it.
         done(store_blob_end(&mut s, 1, 1, b""));
         assert_eq!(blob_tree(&s.storage), none);
         let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
         assert_eq!(fault.class, TRANSACTION_ERROR);
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
 
         // An oid that is not 8 bytes fails the vote, as in storea.
         upload(&mut s, 2, 1, b"the blob");
@@ -2947,7 +3466,7 @@ mod tests {
 
     /// Store `chunk` as the blob of `oid` over `serial` in the open
     /// transaction `id`, as a stock client does: `storea`, then the upload.
-    fn store_blob(s: &mut Session, id: i64, oid: u64, serial: u64, chunk: &[u8]) {
+    fn store_blob(s: &mut Client, id: i64, oid: u64, serial: u64, chunk: &[u8]) {
         store(s, id, oid, serial, b"pickle");
         done(call(s, "storeBlobStart", vec![]));
         let chunk = vec![Value::Binary(chunk.to_vec())];
@@ -2999,7 +3518,7 @@ mod tests {
         done(call(&mut s, "vote", vec![Value::from(4)]));
         let fault = failed(call(&mut s, "vote", vec![Value::from(4)]));
         assert_eq!(fault.class, CONFLICT_ERROR);
-        assert!(s.open.is_none());
+        assert!(s.txn.open.is_none());
         assert_eq!(blob_tree(&s.storage), committed);
     }
 
@@ -3012,7 +3531,7 @@ mod tests {
         let tid = vote_and_finish(&mut s, 1).unwrap();
         messages(&mut frames);
         let send_blob =
-            |s: &mut Session, oid: u64, tid: u64| call(s, "sendBlob", vec![p64(oid), p64(tid)]);
+            |s: &mut Client, oid: u64, tid: u64| call(s, "sendBlob", vec![p64(oid), p64(tid)]);
         assert_eq!(done(send_blob(&mut s, 1, tid)), Value::Nil);
         let methods: Vec<String> = messages(&mut frames).into_iter().map(|(m, _)| m).collect();
         assert_eq!(
@@ -3073,7 +3592,7 @@ mod tests {
     }
 
     /// Run `method` with `args` as a call without a reply.
-    fn send(session: &mut Session, method: &str, args: Vec<Value>) -> Outcome {
+    fn send(session: &mut Client, method: &str, args: Vec<Value>) -> Outcome {
         session.call(&Call {
             id: Value::from(0),
             oneway: true,
@@ -3084,7 +3603,7 @@ mod tests {
 
     /// Commit the transaction `id` with the extension `ext`. It stores
     /// `data` for each `(oid, serial)` of `oids`. Return its tid.
-    fn commit_with(s: &mut Session, id: i64, ext: Value, oids: &[(u64, u64)], data: &[u8]) -> u64 {
+    fn commit_with(s: &mut Client, id: i64, ext: Value, oids: &[(u64, u64)], data: &[u8]) -> u64 {
         let id = Value::from(id);
         let begin = vec![
             id.clone(),
@@ -3191,7 +3710,7 @@ mod tests {
         assert_eq!(fault, Fault::no_iterator(&iid));
 
         // The bounds of the range are tids, both included.
-        let range = |s: &mut Session, start: Value, stop: Value| {
+        let range = |s: &mut Client, start: Value, stop: Value| {
             let iid = done(call(s, "iterator_start", vec![start, stop]));
             std::iter::from_fn(|| {
                 let txn = done(call(s, "iterator_next", vec![iid.clone()]));
@@ -3308,7 +3827,7 @@ mod tests {
     #[test]
     fn restorea_copies_a_record_only_in_a_restore_transaction() {
         let mut s = registered("restorea");
-        let restore = |s: &mut Session, id: i64, oid: u64, data: Value| {
+        let restore = |s: &mut Client, id: i64, oid: u64, data: Value| {
             let args = vec![p64(oid), p64(0), data, Value::Nil, Value::from(id)];
             send(s, "restorea", args)
         };
@@ -3401,7 +3920,7 @@ mod tests {
         let storage = storage("pack-info", Queues::DEFAULT);
         let (mut other, mut other_frames) = connected(&storage);
         let (outbox, mut unregistered_frames, _closing) = Outbox::new(10, 10);
-        let _unregistered = Session::new(Arc::clone(&storage), outbox);
+        let _unregistered = Client::new(Arc::clone(&storage), outbox);
         let root = commit(&mut other, 1, 0, 0, MAPPING).unwrap();
         let dropped = commit(&mut other, 2, 1, 0, MAPPING).unwrap();
         // The info and the reply of each commit.
@@ -3516,7 +4035,7 @@ mod tests {
         let store = Arc::new(Store::open_read_only(&dir).unwrap());
         let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
         for read_only in [false, true] {
-            let mut s = Session::new(Arc::clone(&storage), outbox());
+            let mut s = Client::new(Arc::clone(&storage), outbox());
             done(call(
                 &mut s,
                 "register",
@@ -3536,7 +4055,7 @@ mod tests {
 
         // A read-only connection, as `zeopack` opens it.
         let (outbox, mut frames, _closing) = Outbox::new(10, 10);
-        let mut reader = Session::new(Arc::clone(&storage), outbox);
+        let mut reader = Client::new(Arc::clone(&storage), outbox);
         let register = vec![Value::from("1"), Value::Boolean(true)];
         assert_eq!(done(call(&mut reader, "register", register)), p64(new));
         let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
@@ -3582,5 +4101,424 @@ mod tests {
         assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
         let load = done(call(&mut packer, "loadSerial", vec![p64(0), p64(new)]));
         assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+    }
+    #[test]
+    fn a_failed_load_puts_its_error_in_its_room_and_never_waits_for_the_client() {
+        // A session queue of 2 frames that no writer drains.
+        let (outbox, mut frames, _closing) = Outbox::new(2, 100);
+        let mut s = Client::new(storage("failed-load-room", Queues::DEFAULT), outbox.clone());
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        done(call(&mut s, "register", register));
+        // One reply waits in the queue: the client reads nothing.
+        let waiting = message::reply(Value::from(1), Value::Nil);
+        assert!(outbox.blocking_room().put(Some(waiting)));
+        // The load takes the last room before it starts.
+        let room = outbox.blocking_room();
+        // The reader waits for room for the next call.
+        let reader = outbox.clone();
+        let next = std::thread::spawn(move || reader.blocking_room());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let session = Arc::clone(&s.session);
+        let load = std::thread::spawn(move || {
+            let call = Call {
+                id: Value::from(5),
+                oneway: false,
+                method: "loadBefore".into(),
+                args: vec![p64(42), p64(u64::MAX >> 1)],
+            };
+            let mut reply = Reply::new(room);
+            let outcome = session.call(&call, &mut reply);
+            reply.send(&call, outcome, session.outbox())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !load.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed load waits for the client"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(load.join().unwrap());
+        // The error went into the room of the load, so the reader still
+        // waits. It gets room when the client reads.
+        assert!(!next.is_finished());
+        let taken = messages(&mut frames);
+        assert!(next.join().unwrap().put(None));
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        let class = taken[1].1.as_array().map(|error| error[0].clone());
+        assert_eq!(class, Some(Value::from("ZODB.POSException.POSKeyError")));
+        drop(s);
+    }
+
+    /// A writer into a buffer that the test reads.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_lock_that_the_end_of_a_connection_releases_is_logged_with_its_client() {
+        let dir = std::env::temp_dir().join(format!("zoe-session-lock-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = zoe_core::Options {
+            lock_warn: Some(std::time::Duration::ZERO),
+            ..zoe_core::Options::default()
+        };
+        let store = Arc::new(Store::open_with(&dir, options).unwrap());
+        let storage = Arc::new(NamedStorage::new("main", &dir, store, Queues::DEFAULT));
+        let (calls, received) = tokio::sync::mpsc::channel(16);
+        let (replies, _inbox, _closing) = Outbox::new(16, 16);
+        let send = |oneway: bool, method: &str, args: Vec<Value>| {
+            let call = Call {
+                id: Value::from(1),
+                oneway,
+                method: method.into(),
+                args,
+            };
+            calls.blocking_send(call).unwrap();
+        };
+        send(
+            false,
+            "register",
+            vec![Value::from("main"), Value::Boolean(false)],
+        );
+        send(false, "set_client_label", vec![Value::from("worker-7")]);
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(true, "tpc_begin", begin);
+        let data = Value::Binary(b"secret-pickle".to_vec());
+        send(true, "storea", vec![p64(5), p64(0), data, Value::from(7)]);
+        send(false, "vote", vec![Value::from(7)]);
+        // The connection ends with the transaction voted.
+        drop(calls);
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            run(serving(Arc::clone(&storage)), received, replies);
+        });
+
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("secret-pickle"), "{text}");
+        let line = text
+            .lines()
+            .find(|line| line.contains("\"oid\":5"))
+            .unwrap_or_else(|| panic!("no line of the lock in:\n{text}"));
+        assert!(line.contains("\"client\":\"worker-7\""), "{line}");
+        assert!(line.contains("\"storage\":\"main\""), "{line}");
+        assert!(storage.store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn the_metrics_count_commits_votes_and_raised_conflicts() {
+        use std::sync::atomic::Ordering;
+
+        let mut s = registered("metrics");
+        let metrics = Arc::clone(&s.storage.metrics);
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        commit(&mut s, 2, 1, one, MAPPING).unwrap();
+        assert_eq!(get(&metrics.commits), 2);
+
+        // A listed conflict that the client aborts is raised in the client.
+        done(store_and_vote(&mut s, 3, &[(1, one)], MAPPING));
+        done(call(&mut s, "tpc_abort", vec![Value::from(3)]));
+        assert_eq!(get(&metrics.conflicts_raised), 1);
+        // So is a vote that fails with a conflict: a new object over a
+        // stale serial is never listed.
+        let fault = commit(&mut s, 4, 9, 1, MAPPING).unwrap_err();
+        assert!(fault.is_conflict(), "{fault:?}");
+        assert_eq!(get(&metrics.conflicts_raised), 2);
+        // A listed conflict that the end of the connection leaves.
+        done(store_and_vote(&mut s, 5, &[(1, one)], MAPPING));
+        let text = |storage: &NamedStorage| super::super::metrics::render(&[storage.exported()]);
+        let storage = Arc::clone(&s.storage);
+        drop(s);
+        assert_eq!(get(&metrics.conflicts_raised), 3);
+        assert_eq!(get(&metrics.commits), 2);
+        let text = text(&storage);
+        // Five first votes, each with its locks, two finishes, and two syncs
+        // of one commit each.
+        for line in [
+            "zoe_vote_latency_seconds_count{storage=\"1\"} 5\n",
+            "zoe_finish_latency_seconds_count{storage=\"1\"} 2\n",
+            "zoe_fsync_batch_size_bucket{storage=\"1\",le=\"1\"} 2\n",
+            "zoe_lock_wait_seconds_count{storage=\"1\"} 5\n",
+            "zoe_clients_connected{storage=\"1\"} 0\n",
+        ] {
+            assert!(text.contains(line), "no {line} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_client_label_is_one_line_of_at_most_200_characters() {
+        assert_eq!(client_label(&Value::from("worker\n1")), "worker 1");
+        let long = "x".repeat(500);
+        assert_eq!(client_label(&Value::from(long.as_str())).len(), 200);
+        let mut s = registered("label");
+        done(call(&mut s, "set_client_label", vec![Value::from("web-1")]));
+        assert_eq!(s.label().as_deref(), Some("web-1"));
+        // An empty label gives the address of the peer back.
+        done(call(&mut s, "set_client_label", vec![Value::from(" ")]));
+        assert_eq!(s.label(), None);
+    }
+
+    /// Stage a store of `data` for `oid` with the serial `serial` in the
+    /// open transaction `id`.
+    fn store_with(s: &mut Client, id: i64, oid: u64, serial: Value, data: &[u8]) {
+        let args = vec![
+            p64(oid),
+            serial,
+            Value::Binary(data.to_vec()),
+            Value::from(id),
+        ];
+        assert_eq!(done(call(s, "storea", args)), Value::Nil);
+    }
+
+    #[test]
+    fn a_nil_serial_is_the_serial_of_a_new_object() {
+        let mut s = session("nil-serial");
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+
+        // A new oid commits with a nil serial.
+        begin(&mut s, 1, None);
+        store_with(&mut s, 1, 1, Value::Nil, MAPPING);
+        let first = vote_and_finish(&mut s, 1).unwrap();
+        let load = done(call(&mut s, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(
+            load,
+            Value::Array(vec![
+                Value::Binary(MAPPING.to_vec()),
+                p64(first),
+                Value::Nil
+            ])
+        );
+
+        // An oid with a record fails the vote, as with a zero serial. The
+        // core does not hand the conflict back for the client to resolve.
+        begin(&mut s, 2, None);
+        store_with(&mut s, 2, 1, Value::Nil, MAPPING);
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(
+            fault,
+            Fault::conflict(
+                CONFLICT_ERROR,
+                CONFLICT,
+                Oid(1),
+                Some((Tid(first), Tid(0))),
+                Some("persistent.mapping.PersistentMapping".into())
+            )
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+            Value::Nil
+        );
+        assert_eq!(
+            u64_of(&done(call(&mut s, "getTid", vec![p64(1)]))).unwrap(),
+            first
+        );
+
+        // A serial that is not nil must still be 8 bytes.
+        for (id, serial) in [(3, Value::from("x")), (4, Value::Binary(vec![0; 7]))] {
+            begin(&mut s, id, None);
+            store_with(&mut s, id, 2, serial, MAPPING);
+            let fault = vote_and_finish(&mut s, id).unwrap_err();
+            assert_eq!(fault.class, "builtins.TypeError");
+        }
+    }
+
+    #[test]
+    fn get_tid_gives_the_serial_of_the_current_record() {
+        let mut s = session("get-tid");
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let missing = Fault::from(ZoeError::NotFound { oid: Oid(1) });
+        assert_eq!(failed(call(&mut s, "getTid", vec![p64(1)])), missing);
+
+        let first = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(first));
+        let second = commit(&mut s, 2, 1, first, MAPPING).unwrap();
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(second));
+
+        // A read needs no transaction and takes no lock: it works while
+        // the open transaction holds the lock of the oid after its vote.
+        begin(&mut s, 3, None);
+        store(&mut s, 3, 1, second, MAPPING);
+        done(call(&mut s, "vote", vec![Value::from(3)]));
+        assert_eq!(done(call(&mut s, "getTid", vec![p64(1)])), p64(second));
+        let abort = done(call(&mut s, "tpc_abort", vec![Value::from(3)]));
+        assert_eq!(abort, Value::Nil);
+
+        // A deletion is the current record: the oid has no tid.
+        begin(&mut s, 4, None);
+        let delete = vec![p64(1), p64(second), Value::from(4)];
+        done(call(&mut s, "deleteObject", delete));
+        vote_and_finish(&mut s, 4).unwrap();
+        assert_eq!(failed(call(&mut s, "getTid", vec![p64(1)])), missing);
+
+        // Wrong arguments fail the call, and the connection stays open.
+        let fault = failed(call(&mut s, "getTid", vec![]));
+        assert_eq!(fault, Fault::type_error("getTid takes 1 arguments"));
+        let fault = failed(call(&mut s, "getTid", vec![Value::from(1)]));
+        assert_eq!(fault, Fault::type_error("an oid or a tid is not bytes"));
+        assert!(matches!(call(&mut s, "ping", vec![]), Outcome::Done(_)));
+    }
+
+    #[test]
+    fn get_tid_shows_only_the_commits_that_the_hub_published() {
+        let storage = storage("get-tid-published", Queues::DEFAULT);
+        let (mut writer, _own) = connected(&storage);
+        let (mut reader, mut frames) = connected(&storage);
+        let first = commit(&mut writer, 1, 1, 0, b"old").unwrap();
+        assert_eq!(messages(&mut frames), [invalidation(first, &[1])]);
+
+        // A commit that the store made visible and the hub did not publish
+        // yet: a new record of oid 1, and the first record of oid 2.
+        let mut txn = storage.store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid(first), b"new").unwrap();
+        txn.store(Oid(2), Tid(0), b"two").unwrap();
+        txn.vote().unwrap();
+        let hidden = txn.finish_after().unwrap();
+
+        assert_eq!(done(call(&mut reader, "getTid", vec![p64(1)])), p64(first));
+        let fault = failed(call(&mut reader, "getTid", vec![p64(2)]));
+        assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(2) }));
+
+        // The hub publishes the commit. Then the reads show it.
+        storage.invalidations.publish(Commit {
+            previous: hidden.previous,
+            tid: hidden.tid,
+            origin: None,
+            outbox: outbox(),
+            own: Vec::new(),
+            others: Others::Send(message::notify(
+                "invalidateTransaction",
+                vec![p64(hidden.tid.0), Value::Array(vec![p64(1), p64(2)])],
+            )),
+        });
+        for oid in [1, 2] {
+            let tid = done(call(&mut reader, "getTid", vec![p64(oid)]));
+            assert_eq!(tid, p64(hidden.tid.0));
+        }
+        // The call takes no place before its read, so its reply goes out
+        // after the invalidation of the commit that it shows.
+        assert!(reader.place.is_none());
+    }
+
+    #[test]
+    fn a_blob_with_a_nil_serial_is_a_new_object() {
+        let mut s = registered("blob-nil-serial");
+        // A stock `storeBlob(oid, None, ...)`: `storea`, the upload and
+        // `storeBlobEnd`, each with the nil serial.
+        let send = |s: &mut Client, id: i64, data: &[u8]| {
+            begin(s, id, None);
+            store_with(s, id, 1, Value::Nil, b"pickle");
+            done(call(s, "storeBlobStart", vec![]));
+            done(call(
+                s,
+                "storeBlobChunk",
+                vec![Value::Binary(data.to_vec())],
+            ));
+            let end = vec![
+                p64(1),
+                Value::Nil,
+                Value::Binary(b"pickle".to_vec()),
+                Value::from(id),
+            ];
+            done(call(s, "storeBlobEnd", end));
+        };
+        send(&mut s, 1, b"the blob");
+        let tid = Tid(vote_and_finish(&mut s, 1).unwrap());
+        assert_eq!(s.store.load_serial(Oid(1), tid).unwrap(), b"pickle");
+        let path = s.store.blob_path(Oid(1), tid).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the blob");
+
+        // The oid has a record now: the nil serial fails the vote.
+        send(&mut s, 2, b"another blob");
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(fault.class, CONFLICT_ERROR);
+        assert_eq!(
+            item(&fault, "serials"),
+            Value::Array(vec![p64(tid.0), p64(0)])
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+            Value::Nil
+        );
+        assert_eq!(blob_tree(&s.storage), [path]);
+    }
+
+    #[test]
+    fn a_read_only_storage_refuses_a_writing_register_and_takes_a_read_only_one() {
+        let dir = storage("register-read-only", Queues::DEFAULT).path.clone();
+        let store = Arc::new(Store::open_read_only(&dir).unwrap());
+        let storage = NamedStorage::new("1", &dir, store, Queues::DEFAULT).read_only(true);
+        let mut s = Client::new(Arc::new(storage), outbox());
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(failed(call(&mut s, "register", write)), Fault::read_only());
+        // The connection stays open, and the client registers again.
+        let read = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut s, "register", read)), p64(0));
+        assert_eq!(done(call(&mut s, "lastTransaction", vec![])), p64(0));
+        for (method, args) in [("new_oids", vec![]), ("pack", vec![Value::F64(1e9)])] {
+            assert_eq!(failed(call(&mut s, method, args)), Fault::read_only());
+        }
+    }
+
+    #[test]
+    fn the_stop_of_the_server_stops_a_pack_between_two_batches() {
+        let storage = storage("pack-stop", Queues::DEFAULT);
+        let (stop, stopping) = Stopping::new();
+        let (outbox, _frames, _closing) = Outbox::new(10, 10);
+        let mut s = Client::stopping(Arc::clone(&storage), outbox, stopping);
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        done(call(&mut s, "register", register));
+        // The root refers to nothing. The 1,500 other objects make two
+        // batches of the pack.
+        let oids: Vec<(u64, u64)> = (0..=1_500).map(|oid| (oid, 0)).collect();
+        let tid = commit_with(&mut s, 1, Value::Map(vec![]), &oids, MAPPING);
+
+        // The stop comes before the pack. The pack still runs its first
+        // batch, which removes the oldest 1,000 keys, then stops.
+        stop.send_replace(true);
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        let fault = failed(call(&mut s, "pack", pack.clone()));
+        assert_eq!(fault, Fault::storage("pack stopped: the server stops"));
+        let load = |s: &mut Client, oid: u64| call(s, "loadSerial", vec![p64(oid), p64(tid)]);
+        assert_eq!(
+            failed(load(&mut s, 1_000)),
+            Fault::from(ZoeError::NotFound { oid: Oid(1_000) })
+        );
+        assert_eq!(done(load(&mut s, 1_001)), Value::Binary(MAPPING.to_vec()));
+        drop(s);
+
+        // A session that no stop reaches removes what the pack left.
+        let (mut s, _frames) = connected(&storage);
+        assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
+        assert_eq!(
+            failed(load(&mut s, 1_500)),
+            Fault::from(ZoeError::NotFound { oid: Oid(1_500) })
+        );
+        assert_eq!(done(load(&mut s, 0)), Value::Binary(MAPPING.to_vec()));
     }
 }

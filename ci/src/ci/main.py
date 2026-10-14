@@ -1,3 +1,4 @@
+import random
 import tomllib
 from typing import Annotated
 
@@ -149,13 +150,18 @@ class Ci:
 
     @function
     async def conformance(self, source: Source) -> str:
-        """Run the ZODB conformance suites in-process. The ZEO suites are not built."""
+        """Run the ZODB suites in-process and the ZEO suites against zoe serve."""
         return await self.recipe(source, "conformance").stdout()
 
     @function
     async def plone(self, source: Source) -> str:
-        """Build the Plone instances and run the Plone suites. Not built yet."""
-        return await self.recipe(source, "plone").stdout()
+        """Run the Plone suites on ZOE in-process, then through zoe serve."""
+        # The second run starts from the first one, so it reuses its eggs.
+        zoe = self.recipe(source, "plone", ("zoe", "suites"))
+        zeoclient = zoe.with_exec(
+            ["devenv", "shell", "--", "just", "plone", "zeoclient", "suites"]
+        )
+        return await zoe.stdout() + await zeoclient.stdout()
 
     @function
     def bench(
@@ -193,19 +199,33 @@ class Ci:
             .directory("/results")
         )
 
-    @function
-    async def crash(self, source: Source) -> str:
-        """Run the crash-consistency harness. Not built yet."""
-        return (
-            await self.devenv(source)
-            .with_exec(
-                [
-                    "echo",
-                    "crash: runs the Vfs simulation, the kill loop and the power-loss emulation. Not built yet.",
-                ]
-            )
-            .stdout()
-        )
+    @function(cache="never")
+    async def crash(
+        self,
+        source: Source,
+        runs: Annotated[int, Doc("The rounds of the kill loop")] = 10_000,
+        seed: Annotated[
+            int | None, Doc("The seed of the kill loop. The default is a random seed")
+        ] = None,
+        seeds: Annotated[
+            int, Doc("The seeds of the kill loop under the simulator")
+        ] = 10_000,
+    ) -> str:
+        """Run the process kill loop, then the kill loop under the simulator.
+
+        The process kill loop runs 10,000 rounds against zoe serve by
+        default. The output gives the seed. The traceback of a failure
+        shows the round. 10,000 rounds need about 3 GB in TMPDIR. The kill
+        loop under the simulator runs `ZOE_SIM_SEEDS=10000` by default,
+        with power-loss crash images at each phase of a commit. A failing
+        seed prints `ZOE_SIM_SEED=<seed>`.
+        """
+        # The cache policy "never" makes each call run this body. A new seed
+        # for each call also gives a new exec, so the exec cache misses too.
+        if seed is None:
+            seed = random.randrange(1 << 30)
+        args = (str(runs), str(seed), str(seeds))
+        return await self.recipe(source, "crash", args).stdout()
 
     @function
     def zoe_binary(self, source: Source) -> dagger.File:
