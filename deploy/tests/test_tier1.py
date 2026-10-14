@@ -14,7 +14,8 @@ StatefulSet, as the specification lists them:
 - a `PodDisruptionBudget` with `maxUnavailable: 0`;
 - a `CronJob` that runs `zoe backup --admin` against the server, then
   restores the dumps into a scratch directory with `zoe restore` and runs
-  `zoe verify` on the copy.
+  `zoe verify` on the copy. It waits for phase 6: the phase 2 manifests
+  ship no backup CronJob.
 
 Every object has the label `app.kubernetes.io/name: zoe`. Beside them,
 `deploy/systemd/zoe.service` and `deploy/supervisor/zoe.conf` run the
@@ -28,6 +29,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 DEPLOY = Path(__file__).resolve().parents[1]
@@ -119,6 +121,13 @@ def test_the_disruption_budget_waits_for_a_manual_window():
     assert budget["spec"]["maxUnavailable"] == 0
 
 
+@pytest.mark.xfail(
+    reason=(
+        "the phase 2 manifests ship no backup CronJob: it comes with the "
+        "backup of a store that the server holds open, in phase 6"
+    ),
+    strict=True,
+)
 def test_the_backup_job_backs_up_restores_and_verifies():
     (job,) = one("CronJob")
     pod = job["spec"]["jobTemplate"]["spec"]["template"]["spec"]
