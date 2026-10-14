@@ -4,7 +4,7 @@ For `zeo`, `ZEO.ClientStorage` calls `new_oids(1)` and `ping` on the ZEO
 server. For `poc-main` and `poc-proto`, the POC client calls `new_oids(1)`
 on `zoe serve`. Each line also gives a loopback TCP round trip between two
 Python processes, the floor of any call. The times are wall time per call
-and client CPU per call, median and 90th percentile of 20 batches.
+and client CPU per call, median and 90th percentile of 10 batches.
 """
 
 import argparse
@@ -26,7 +26,7 @@ sys.path.insert(0, str(HERE.parent / "ZOE-077" / "rustclient" / "python"))
 
 from driver import REPO, cpu_state, pinned, start_server, stop_server  # noqa: E402
 
-BATCHES, CALLS = 20, 250
+BATCHES, CALLS = 10, 100
 
 ECHO = """
 import socket, sys

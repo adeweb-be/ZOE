@@ -1,8 +1,9 @@
 """One run of the ZOE-150 spike. Not for merge.
 
-Start one server on a fresh store, run zodbshootout for one scenario of one
-cell as the harness runs one value (one pyperf worker, one warmup, the
-values, one loop per sample), and append one JSON line to the results.
+Start one server on a fresh store, run the five scenarios of zodbshootout
+for one cell in one process (shoot.py), and append one JSON line to the
+results. Each scenario gives one sample: each worker runs a few
+transactions of 100 objects (default_loops), with no warmup.
 
 Configurations:
 
@@ -301,12 +302,20 @@ def zconfig(args, wd, addr):
     )
 
 
-def objects(args):
-    """The objects that one call of the scenario reads or writes."""
-    if args.scenario == "warm":
-        return args.concurrency * 100
-    loops = 100 if args.concurrency <= 10 else 30
-    return args.concurrency * loops * 100
+def default_loops(concurrency):
+    """The transactions of each worker in one scenario of the reduced run.
+
+    zodbshootout runs 100 at a concurrency of 10 or less and 30 above. The
+    reduced run keeps at least 16 transactions per scenario in all.
+    """
+    return max(1, 16 // concurrency)
+
+
+def objects(scenario, concurrency, loops):
+    """The objects that one scenario reads or writes."""
+    if scenario == "warm":
+        return concurrency * 100
+    return concurrency * loops * 100
 
 
 def main():
@@ -317,11 +326,10 @@ def main():
     p.add_argument("--mode", choices=["threads", "processes"], required=True)
     p.add_argument("-c", "--concurrency", type=int, required=True)
     p.add_argument("-s", "--size", type=int, required=True)
-    p.add_argument("--scenario", choices=sorted(SCENARIOS), required=True)
+    p.add_argument("--scenarios", nargs="+", choices=list(SCENARIOS), default=list(SCENARIOS))
+    p.add_argument("--inner-loops", type=int, help="the transactions of each worker per scenario")
     p.add_argument("--round", type=int, default=0)
     p.add_argument("--attempt", type=int, default=1)
-    p.add_argument("--values", type=int, default=1)
-    p.add_argument("--warmups", type=int, default=1)
     p.add_argument("--pool", type=int, default=16)
     p.add_argument("--tag", default="main", help="main, spans, pyspy or floor")
     p.add_argument("--spans", action="store_true", help="receive the OTLP spans of zoe serve")
@@ -336,19 +344,20 @@ def main():
     p.add_argument("--results", type=Path, required=True)
     p.add_argument("--keep", action="store_true", help="keep the store after the run")
     args = p.parse_args()
+    loops = args.inner_loops or default_loops(args.concurrency)
 
     python = sys.version.split()[0] + ("t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "")
-    name = f"{args.tag}-{python}-{args.config}-{args.mode}-c{args.concurrency}-s{args.size}-{args.scenario}-r{args.round}-a{args.attempt}"
+    name = f"{args.tag}-{python}-{args.config}-{args.mode}-c{args.concurrency}-s{args.size}-r{args.round}-a{args.attempt}"
     wd = args.work / name
     shutil.rmtree(wd, ignore_errors=True)
     wd.mkdir(parents=True)
     result = {
         "tag": args.tag, "config": args.config, "python": python, "mode": args.mode,
-        "c": args.concurrency, "size": args.size, "scenario": NAMES[args.scenario],
-        "round": args.round, "attempt": args.attempt, "values": args.values, "warmups": args.warmups,
-        "pool": args.pool if args.config.startswith("poc") else None,
+        "c": args.concurrency, "size": args.size, "round": args.round, "attempt": args.attempt,
+        "inner_loops": loops, "pool": args.pool if args.config.startswith("poc") else None,
         "server_cpus": args.server_cpus, "client_cpus": args.client_cpus,
-        "objects_per_call": objects(args), "disk_free_before": shutil.disk_usage(args.work).free,
+        "objects": {NAMES[s]: objects(s, args.concurrency, loops) for s in args.scenarios},
+        "disk_free_before": shutil.disk_usage(args.work).free,
         "started": time.time(), "cpu_before": cpu_state(),
     }
     spans = Spans() if args.spans else None
@@ -361,20 +370,19 @@ def main():
             proc, addr, admin = start_server(args, wd, spans)
         conf = wd / "zodb.conf"
         conf.write_text(zconfig(args, wd, addr))
+        # One process runs every scenario of the cell, in the order of
+        # zodbshootout: add, update, read_cold, read_warm, read_hot. pyperf
+        # starts no worker process, and there is no warmup.
         cmd = [
-            *args.client_wrap.split(), sys.executable, "-m", "zodbshootout",
-            "--processes", "1", "--values", str(args.values), "--warmups", str(args.warmups), "--loops", "1",
+            *args.client_wrap.split(), sys.executable, str(HERE / "shoot.py"), "--worker",
+            "--values", "1", "--warmups", "0", "--loops", "1",
             "--object-counts", "100", "--object-size", str(args.size), "--concurrency", str(args.concurrency),
-            "--include-mapping", "no", "--quiet", "--output", str(wd / "pyperf.json"),
+            "--include-mapping", "no", "--output", str(wd / "pyperf.json"),
         ]
-        if args.scenario == "add" and args.config != "floor":
-            cmd += ["--zap", "force"]
         if args.mode == "threads":
             cmd += ["--threads", "shared"]
-        # pyperf starts its workers with a reduced environment.
-        cmd += ["--inherit-environ", "LD_LIBRARY_PATH,PYTHONPATH"]
-        cmd += [str(conf), args.scenario]
-        env = dict(os.environ)
+        cmd += [str(conf), *args.scenarios]
+        env = dict(os.environ, ZOE150_INNER_LOOPS=str(loops))
         if args.config.startswith("poc"):
             env["PYTHONPATH"] = str(CLIENT)
         import resource
@@ -395,28 +403,32 @@ def main():
         result["store_bytes"] = du(wd)
         client_cpu = (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
         result["wall_s"] = round(wall, 2)
-        result["client_cpu_s"] = round(client_cpu, 2)
-        result["server_cpu_s"] = round(s1 - s0, 2)
-        # The CPU of the other processes of the machine during the run, and
-        # of the kernel threads: the sync and the disk encryption of the
-        # run are kernel threads.
+        result["client_cpu_s"] = round(client_cpu, 3)
+        result["server_cpu_s"] = round(s1 - s0, 3)
+        # The CPU of the other processes of the machine during the run. The
+        # kernel threads (the sync, the disk) count apart.
         result["kernel_cores"] = round((k1 - k0) / wall, 2)
         result["foreign_cores"] = round(max(0.0, (b1 - b0) - (k1 - k0) - client_cpu - (s1 - s0)) / wall, 2)
         log_text = (wd / "zodbshootout.log").read_text(errors="replace")
         result["gil_enabled_by"] = sorted(set(re.findall(r"GIL\) has been enabled to load module '([^']+)'", log_text)))
-        if done.returncode:
+        if done.returncode or not (wd / "pyperf.json").exists():
             result["error"] = log_text[-2000:]
         else:
             import pyperf
 
             suite = pyperf.BenchmarkSuite.load(str(wd / "pyperf.json"))
-            text = SCENARIOS[args.scenario].format(n=100)
-            found = [b for b in suite.get_benchmarks() if b.get_name().endswith(f": {text}")]
-            values = list(found[0].get_values())
-            mean = sum(values) / len(values)
-            result["samples_s"] = values
-            result["mean_ms"] = round(mean * 1e3, 3)
-            result["ops"] = round(args.concurrency * 100 / mean, 1)
+            result["scenarios"] = {}
+            for s in args.scenarios:
+                text = SCENARIOS[s].format(n=100)
+                found = [b for b in suite.get_benchmarks() if b.get_name().endswith(f": {text}")]
+                values = list(found[0].get_values())
+                mean = sum(values) / len(values)
+                if mean >= 600:
+                    # zodbshootout gives 666 s to a benchmark that failed.
+                    raise RuntimeError(f"{s} failed:\n{log_text[-2000:]}")
+                result["scenarios"][NAMES[s]] = {
+                    "ops": round(args.concurrency * 100 / mean, 1), "mean_ms": round(mean * 1e3, 3),
+                }
             ok = True
         delta = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
         if delta:
@@ -450,7 +462,8 @@ def main():
     line = json.dumps(result)
     with open(args.results, "a") as f:
         f.write(line + "\n")
-    brief = {k: result.get(k) for k in ("config", "python", "mode", "c", "size", "scenario", "round", "ops", "wall_s", "foreign_cores", "ok")}
+    brief = {k: result.get(k) for k in ("config", "python", "mode", "c", "size", "round", "wall_s", "foreign_cores", "ok")}
+    brief["ops"] = {k: v["ops"] for k, v in result.get("scenarios", {}).items()}
     print(json.dumps(brief), flush=True)
     return 0 if ok else 1
 

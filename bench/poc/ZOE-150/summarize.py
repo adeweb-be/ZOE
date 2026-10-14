@@ -34,8 +34,15 @@ def load(path, limit):
     runs = [json.loads(line) for line in open(path) if line.strip()]
     rounds = defaultdict(list)
     for r in runs:
-        if r.get("tag") in ("main", "floor", "spans", "pyspy"):
-            rounds[(r["tag"], major(r["python"]), r["scenario"], r["mode"], r["c"], r["size"], r["config"], r["round"])].append(r)
+        if r.get("tag") not in ("main", "floor", "spans", "pyspy"):
+            continue
+        # One run holds every scenario of a cell. Split it into one record
+        # per scenario; the CPU and the counters stay those of the run.
+        for name, sc in (r.get("scenarios") or {"-": {}}).items():
+            one = {**r, **sc, "scenario": name, "run_objects": sum(r.get("objects", {}).values())}
+            if not r.get("ok"):
+                one["ok"] = False
+            rounds[(r["tag"], major(r["python"]), name, r["mode"], r["c"], r["size"], r["config"], r["round"])].append(one)
     picked = {}
     for k, attempts in rounds.items():
         ok = [a for a in attempts if a.get("ok")]
@@ -70,8 +77,8 @@ def key_order(k):
 
 
 def per_call_objects(r):
-    # Each value runs one warmup and the values, on one store.
-    return r["objects_per_call"] * (r.get("warmups", 1) + r.get("values", 1))
+    # The client CPU is that of the whole run: every scenario of the cell.
+    return r["run_objects"]
 
 
 def main():
