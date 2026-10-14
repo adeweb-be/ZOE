@@ -16,7 +16,10 @@
 //! the storage in the OpenTelemetry context of that span. Each span under it
 //! gets that context, the spans of the core too. `StorageAttribute` then
 //! gives each span the attribute `zoe.storage`. So the core never names a
-//! storage.
+//! storage. A call with a valid W3C traceparent (the extension
+//! `trace_context`) joins the trace of its client: its span gets the trace
+//! id of the traceparent and the span of the client as its parent. Any
+//! other call is the root of its trace.
 //!
 //! The log lines show the events and the span `connection` only. The
 //! traces take the spans of the zoe crates, except `connection`, and no
@@ -25,11 +28,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry::propagation::{Extractor, TextMapPropagator as _};
 use opentelemetry::trace::{Span as _, TracerProvider as _};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracerProvider, Span, SpanData, SpanProcessor};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
@@ -151,15 +156,38 @@ fn traces_url(endpoint: &str) -> String {
 }
 
 /// Return the span of a call of a session on `storage`, named after
-/// `method` in the traces. The span is disabled when no layer takes it.
-pub(crate) fn request(method: &str, storage: &str) -> tracing::Span {
+/// `method` in the traces. With a valid W3C `traceparent`, the span joins
+/// that trace, with the span of the traceparent as its parent. Otherwise,
+/// the span is the root of its trace. The span is disabled when no layer
+/// takes it.
+pub(crate) fn request(method: &str, storage: &str, traceparent: Option<&str>) -> tracing::Span {
     let span = tracing::info_span!("request", otel.name = method);
     if !span.is_disabled() {
+        // An invalid traceparent gives the empty context back.
+        let parent = match traceparent {
+            Some(traceparent) => TraceContextPropagator::new()
+                .extract_with_context(&Context::new(), &Traceparent(traceparent)),
+            None => Context::new(),
+        };
         // The span did not start yet, so its parent context can change.
-        let named = Context::new().with_value(StorageName(Arc::from(storage)));
+        let named = parent.with_value(StorageName(Arc::from(storage)));
         let _ = span.set_parent(named);
     }
     span
+}
+
+/// The traceparent of a call, as the W3C propagator reads it. It has no
+/// `tracestate`.
+struct Traceparent<'a>(&'a str);
+
+impl Extractor for Traceparent<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        (key == "traceparent").then_some(self.0)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
+    }
 }
 
 /// The name of the storage in an OpenTelemetry context.
@@ -270,7 +298,7 @@ mod tests {
             .with_filter(Select(is_logged));
         let subscriber = tracing_subscriber::registry().with(logs);
         tracing::subscriber::with_default(subscriber, || {
-            assert!(request("loadBefore", "1").is_disabled());
+            assert!(request("loadBefore", "1", None).is_disabled());
             assert!(!tracing::info_span!("connection").is_disabled());
         });
     }
@@ -311,7 +339,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(telemetry.layer());
         tracing::subscriber::with_default(subscriber, || {
             let _connection = tracing::info_span!("connection", client = "c").entered();
-            let _request = request("vote", "main").entered();
+            let _request = request("vote", "main", None).entered();
             let _wait = tracing::info_span!("lock_wait", oid = 7u64).entered();
             tracing::warn!("an event is not a span");
         });
@@ -332,5 +360,74 @@ mod tests {
         assert_eq!(wait.parent_span_id, vote.span_context.span_id());
         assert_eq!(wait.span_context.trace_id(), vote.span_context.trace_id());
         assert_eq!(vote.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    }
+
+    /// Run a call `request` with `traceparent` under a provider that keeps
+    /// the spans, and return them.
+    fn traced(traceparent: Option<&str>) -> Vec<SpanData> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let kept = Kept::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(StorageAttribute)
+            .with_span_processor(kept.clone())
+            .build();
+        let telemetry = Telemetry {
+            provider,
+            _runtime: None,
+        };
+        let subscriber = tracing_subscriber::registry().with(telemetry.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            let _request = request("loadBefore", "main", traceparent).entered();
+            let _wait = tracing::info_span!("lock_wait").entered();
+        });
+        kept.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_request_with_a_traceparent_joins_the_trace_of_the_client() {
+        use opentelemetry::trace::{SpanId, TraceId};
+
+        let spans = traced(Some(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ));
+        let (wait, load) = (&spans[0], &spans[1]);
+        let trace = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        assert_eq!(load.span_context.trace_id(), trace);
+        assert_eq!(
+            load.parent_span_id,
+            SpanId::from_hex("00f067aa0ba902b7").unwrap()
+        );
+        assert!(load.parent_span_is_remote);
+        // The spans under the request stay in the trace, with their storage.
+        assert_eq!(wait.span_context.trace_id(), trace);
+        assert_eq!(wait.parent_span_id, load.span_context.span_id());
+        for span in &spans {
+            assert!(
+                span.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == STORAGE && kv.value.as_str() == "main"),
+                "{}",
+                span.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_with_an_invalid_traceparent_is_the_root_of_its_trace() {
+        use opentelemetry::trace::SpanId;
+
+        for traceparent in [
+            "",
+            "not a traceparent",
+            // A trace id of zeros is not valid.
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            // W3C asks for lower case.
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        ] {
+            let spans = traced(Some(traceparent));
+            assert_eq!(spans.len(), 2, "{traceparent:?}");
+            assert_eq!(spans[1].parent_span_id, SpanId::INVALID, "{traceparent:?}");
+        }
     }
 }

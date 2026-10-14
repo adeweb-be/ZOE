@@ -53,6 +53,15 @@
         directory. The default is false.
       </description>
     </key>
+    <key name="pack-gc" datatype="string">
+      <description>
+        If false, a pack removes old revisions only, as the pack-gc of
+        filestorage does: it keeps the newest revision of each object at or
+        before the pack time, also when no reader can reach the object. An
+        object whose newest revision is a deletion goes. The store does not
+        record it. The default is true: a pack collects garbage.
+      </description>
+    </key>
   </sectiontype>
 
   <sectiontype name="zoeclient" extends="zeoclient" datatype=".ZoeClient"
@@ -60,14 +69,25 @@
     <description>
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
-      the same values, and wait-timeout. It declares the ZOE extensions to
-      the server, and works as a zeoclient against a stock ZEO server.
+      the same values, wait-timeout and native. It declares the ZOE
+      extensions to the server, and works as a zeoclient against a stock
+      ZEO server.
     </description>
     <key name="wait-timeout" datatype="integer" default="30">
       <description>
         The longest wait for a connection to the server, in seconds, at the
         open and after a disconnection. A longer wait raises
         ClientDisconnected. The default is 30.
+      </description>
+    </key>
+    <key name="native" datatype="boolean" default="false">
+      <description>
+        If true, the client runs on the native client, built on the Rust
+        crate zoe-client, and not on the asyncio client of ZEO. It has one
+        TCP address, one connection and no cache, no blob and no reconnect
+        yet: a key of these features with a value other than its default
+        fails the open. Against a stock ZEO server, it needs msgpack true
+        on the server. The default is false.
       </description>
     </key>
   </sectiontype>
@@ -94,6 +114,12 @@
     <key name="read-only" datatype="boolean" default="false">
       <description>
         If true, the server serves this store for reads only.
+      </description>
+    </key>
+    <key name="pack-gc" datatype="boolean" default="true">
+      <description>
+        If false, a pack of this store keeps the objects that no reader can
+        reach, and removes old revisions only.
       </description>
     </key>
   </sectiontype>
@@ -128,8 +154,9 @@
     </key>
     <key name="listen" datatype="string">
       <description>
-        The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
-        port. The default is 127.0.0.1:8100.
+        The address of the ZEO port, as HOST:PORT, or the path of a unix
+        domain socket: a value with a / is a path, such as ./zeo.sock. A
+        port of 0 takes a free port. The default is 127.0.0.1:8100.
       </description>
     </key>
     <key name="admin-listen" datatype="string">
@@ -141,6 +168,13 @@
     <key name="invalidation-queue-size" datatype="string">
       <description>
         The most transactions that getInvalidations covers.
+      </description>
+    </key>
+    <key name="invalidation-age" datatype="string">
+      <description>
+        Past invalidation-queue-size, getInvalidations also covers a tid
+        younger than this, in whole seconds, such as 3600 or 1h, as the
+        key invalidation-age of ZEO. 0, the default, turns it off.
       </description>
     </key>
     <key name="client-queue-size" datatype="string">
@@ -204,6 +238,12 @@
       <description>
         If true, the server serves every store for reads only. The default
         is false.
+      </description>
+    </key>
+    <key name="pack-gc" datatype="string">
+      <description>
+        If false, a pack of each store keeps the objects that no reader can
+        reach, and removes old revisions only. The default is true.
       </description>
     </key>
     <key name="shared-blob-dir" datatype="string">

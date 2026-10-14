@@ -1,6 +1,6 @@
 # 0001. A synchronous Rust core
 
-Status: accepted. A decision of the human sets where async lives outside the server skin: tokio is allowed in `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe, and stays out of `zoe-core` and `zoe-py`.
+Status: accepted. A decision of the human sets where async lives outside the server skin: tokio is allowed in `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe, and stays out of `zoe-core`. ADR 0035 supersedes the part that kept tokio out of `zoe-py`: the extension links `zoe-client` and tokio for the native client, and still never links rmcp.
 
 ## Context
 
@@ -10,7 +10,7 @@ Other crates talk to a network or to an agent: the Rust client of the ZEO protoc
 
 ## Decision
 
-One crate, `zoe-core`, owns correctness. It is synchronous Rust with no tokio and no Python inside. The in-process storage and the server are thin skins that call it the same way. Async lives in the server skin (`zoe-server`), which runs core calls on a blocking pool, and in the crates that talk to a network or to an agent: `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe. The extension module (`zoe-py`) never links tokio or rmcp: `cargo tree -p zoe-py -e normal` lists neither.
+One crate, `zoe-core`, owns correctness. It is synchronous Rust with no tokio and no Python inside. The in-process storage and the server are thin skins that call it the same way. Async lives in the server skin (`zoe-server`), which runs core calls on a blocking pool, and in the crates that talk to a network or to an agent: `zoe-client`, `zoe-bench`, `zoe-mcp` and the server mode of Loupe. The extension module (`zoe-py`) never links rmcp. It links tokio only through `zoe-client`, for the native client, and starts its threads when a client opens (ADR 0035): `cargo tree -p zoe-py -e normal` lists tokio, not rmcp.
 
 ## Consequences
 
