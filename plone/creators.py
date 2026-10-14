@@ -8,7 +8,7 @@ that ZOE_PLONE_ADMIN_FILE names holds that text.
 
 As the admin user, the script sets `_uid_counter` of `portal_uidgenerator`
 of the site to SEED and commits: the site has given ids up to SEED. Then it
-adds the folder `creators` and gives it a history id, so the load does not
+adds the folder `id-allocation-load` and gives it a history id, so the load does not
 write the folder for its history id. Then it runs THREADS threads, each
 with its own connection. Each thread creates ITEMS Documents in the folder,
 one transaction for each Document, and retries a transaction on
@@ -42,7 +42,9 @@ from zope.component.hooks import setSite
 from zope.globalrequest import setRequest
 
 SITE_ID = "Plone"
-FOLDER_ID = "creators"
+# The site root takes the id `creators` from Dublin Core, so the folder
+# has an id that nothing in Plone uses.
+FOLDER_ID = "id-allocation-load"
 # The instance runs the script with exec. sys.argv holds the path of the
 # script, then the arguments of the script.
 SCRIPT = sys._getframe().f_code.co_filename
@@ -98,7 +100,7 @@ tool = getToolByName(site, "portal_uidgenerator")
 aq_base(tool)._uid_counter = SEED
 transaction.commit()
 seed = counter_of(tool)
-site.invokeFactory("Folder", FOLDER_ID, title="Creators")
+site.invokeFactory("Folder", FOLDER_ID, title="Id allocation load")
 getToolByName(site, "portal_historyidhandler").register(site[FOLDER_ID])
 transaction.commit()
 
