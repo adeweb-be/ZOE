@@ -130,7 +130,7 @@ _Avoid_: outbox, reply buffer
 
 **Stop**:
 The graceful end of a server on SIGTERM or SIGINT: it accepts no more connections, runs the calls that it received, so a received `tpc_finish` commits and gets its reply, aborts the open transactions, closes each connection, then closes the stores.
-_Avoid_: kill (SIGKILL is not a stop), drain
+_Avoid_: kill (SIGKILL is not a stop), drain (that is maintenance mode)
 
 **Shutdown timeout**:
 The longest time that a stop takes, `--shutdown-timeout`; at its end the process exits, and the store of a session whose call still runs does not close cleanly.
