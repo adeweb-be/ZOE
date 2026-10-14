@@ -3,7 +3,9 @@
 //! the store.
 //!
 //! `zoe_convert::verify` and `zoe_convert::verify_backup` do the work. The
-//! command opens the store read-only, so it changes no byte. With
+//! command opens the store read-only, so it changes no byte of a store
+//! that was closed cleanly. It writes `zoe.redb` only when it repairs a
+//! store that a writer left open, and then says so on stderr. With
 //! `--backup`, it opens the store only after it built its copy of the
 //! dumps. It fails with a report that lists a finding.
 
@@ -92,9 +94,10 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     }
     let known = args.classes.as_deref().map(read_classes).transpose()?;
     let path = &args.path;
-    // A read-only open changes no byte of the store, and fails on a
-    // directory without a store. A wrong blob directory fails here, so the
-    // report does not list each blob.
+    // A read-only open changes no byte of a clean store. It writes
+    // `zoe.redb` only when it repairs a store that a writer left open. It
+    // fails on a directory without a store. A wrong blob directory fails
+    // here, so the report does not list each blob.
     let store = open_with_blobs(path, args.blob_dir.as_deref())?;
     let report = zoe_convert::verify(&store, known.as_ref());
     drop(store);

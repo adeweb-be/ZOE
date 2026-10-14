@@ -1059,8 +1059,7 @@ impl Session {
         // The connection gets the invalidation of each commit after `last`.
         let last = self.storage.invalidations.published();
         let queues = self.storage.queues;
-        // The clock is read only when the age is on, so a server without
-        // the age reads no wall clock here.
+        // The session reads the clock only when the age is on.
         let limit = if !queues.invalidation_age.is_zero()
             && clock::younger_than(Tid(tid), queues.invalidation_age, SystemTime::now())
         {

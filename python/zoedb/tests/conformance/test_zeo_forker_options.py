@@ -78,7 +78,8 @@ ZEO_TESTS = [
 
 # The blob suite of ZODB on a client that shares the blob directory of the
 # server, as `ZEO.tests.testZEO` builds it. `blob_transaction.txt` also
-# stores with a serial given as a str: ZOE-131 makes it pass.
+# stores with a serial given as a str. It passes only when zoe serve reads
+# that serial.
 SHARED_BLOB_TESTS = [
     "blob_connection_txt",
     "blob_importexport_txt",
