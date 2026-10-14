@@ -54,6 +54,21 @@ pub struct Client {
     /// Each task of the connection holds a sender. `close` waits until
     /// every sender is gone.
     tasks: mpsc::Receiver<()>,
+    /// The reply of `get_info` at `Client::open`, or nil.
+    info: Value,
+    /// The extensions that the server accepted at `Client::open`.
+    extensions: Vec<String>,
+}
+
+/// What `Client::open` declares to the server in `register`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Register read-only. The server then refuses each write of the
+    /// connection with `ReadOnlyError`.
+    pub read_only: bool,
+    /// The extensions that the client declares in a third argument of
+    /// `register`. With none, `register` has two arguments.
+    pub extensions: Vec<String>,
 }
 
 /// One version of an object, as `loadBefore` gives it.
@@ -96,6 +111,17 @@ pub struct Invalidation {
 pub struct Invalidations(broadcast::Receiver<Invalidation>);
 
 impl Invalidations {
+    /// Return the next invalidation that waits, or `None` when none waits.
+    /// It does not wait. It fails as `recv` does.
+    pub fn try_recv(&mut self) -> Result<Option<Invalidation>, Error> {
+        match self.0.try_recv() {
+            Ok(invalidation) => Ok(Some(invalidation)),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => Err(Error::Disconnected),
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => Err(Error::Lagged(missed)),
+        }
+    }
+
     /// Wait for the next invalidation. It fails with `Error::Lagged` when
     /// the receiver missed invalidations, and with `Error::Disconnected`
     /// after the last invalidation of a closed connection.
@@ -152,6 +178,57 @@ impl Client {
         addr: SocketAddr,
         storage: &str,
     ) -> Result<Client, Error> {
+        let client = Client::handshake(runtime, addr).await?;
+        let reply = client
+            .inner
+            .call("register", vec![storage.into(), false.into()])
+            .await?;
+        client.registered(reply).await?;
+        Ok(client)
+    }
+
+    /// Connect to the ZEO 6 server at `addr` through `runtime`, register
+    /// with the storage `storage` as `options` says, and call `get_info`.
+    ///
+    /// The client declares `options.extensions` in a third argument of
+    /// `register`. A stock server takes two arguments only: it refuses the
+    /// third with `TypeError` and keeps the connection open and
+    /// unregistered. The client then registers again with two arguments.
+    /// The extensions that the server accepted are the names of the key
+    /// `extensions` of `get_info` that the client declared.
+    pub async fn open(
+        runtime: Arc<dyn Runtime>,
+        addr: SocketAddr,
+        storage: &str,
+        options: &Options,
+    ) -> Result<Client, Error> {
+        let mut client = Client::handshake(runtime, addr).await?;
+        let mut declare = !options.extensions.is_empty();
+        let reply = loop {
+            let mut args = vec![storage.into(), options.read_only.into()];
+            if declare {
+                let names = options.extensions.iter();
+                args.push(Value::Array(
+                    names.map(|name| name.as_str().into()).collect(),
+                ));
+            }
+            match client.inner.call("register", args).await {
+                Err(Error::Server { class, .. }) if declare && is_type_error(&class) => {
+                    declare = false;
+                }
+                reply => break reply?,
+            }
+        };
+        client.registered(reply).await?;
+        let info = client.inner.call("get_info", vec![]).await?;
+        client.extensions = accepted(&info, &options.extensions);
+        client.info = info;
+        Ok(client)
+    }
+
+    /// Open the stream to `addr`, agree on the protocol and start the
+    /// tasks of the connection.
+    async fn handshake(runtime: Arc<dyn Runtime>, addr: SocketAddr) -> Result<Client, Error> {
         let mut stream = runtime.connect(addr).await?;
         match protocol::read_frame(&mut stream).await? {
             Some(theirs) if theirs == protocol::PROTOCOL => {}
@@ -164,19 +241,19 @@ impl Client {
             None => return Err(Error::Disconnected),
         }
         protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
+        Ok(Client::start(runtime, stream))
+    }
 
-        let client = Client::start(runtime, stream);
-        let last = match client
-            .inner
-            .call("register", vec![storage.into(), false.into()])
-            .await?
-        {
-            Value::Nil => client.inner.call("lastTransaction", vec![]).await?,
+    /// Take the last tid from the reply of `register`. A nil reply asks
+    /// the server for it with `lastTransaction`.
+    async fn registered(&self, reply: Value) -> Result<(), Error> {
+        let last = match reply {
+            Value::Nil => self.inner.call("lastTransaction", vec![]).await?,
             last => last,
         };
         let last = tid(&last, "register")?;
-        client.inner.last_tid.fetch_max(last.0, Ordering::SeqCst);
-        Ok(client)
+        self.inner.last_tid.fetch_max(last.0, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Start the tasks of the connection on `stream`.
@@ -208,7 +285,30 @@ impl Client {
             alive.clone(),
         )));
         runtime.spawn(Box::pin(beat(inner.clone(), alive)));
-        Client { inner, tasks }
+        Client {
+            inner,
+            tasks,
+            info: Value::Nil,
+            extensions: Vec::new(),
+        }
+    }
+
+    /// Return the reply of `get_info` at `Client::open`: a map of the
+    /// server, such as `length`, `size` and `supportsUndo`. A client of
+    /// `connect` did not call `get_info`, and gets nil.
+    pub fn info(&self) -> &Value {
+        &self.info
+    }
+
+    /// Return the extensions that the server accepted at `Client::open`.
+    pub fn extensions(&self) -> &[String] {
+        &self.extensions
+    }
+
+    /// Tell if the connection is open: no call failed yet with
+    /// `Error::Disconnected` because the connection closed.
+    pub fn is_connected(&self) -> bool {
+        !lock(&self.inner.calls).closed
     }
 
     /// Return the last tid that the client knows: the tid of `register`,
@@ -279,6 +379,33 @@ impl Client {
                 end => Some(self::tid(end, "loadBefore")?),
             },
         }))
+    }
+
+    /// Load the record of `oid` that the transaction `serial` wrote. An
+    /// oid without such a record fails with the `POSKeyError` of the
+    /// server.
+    pub async fn load_serial(&self, oid: Oid, serial: Tid) -> Result<Vec<u8>, Error> {
+        let reply = self
+            .inner
+            .call("loadSerial", vec![bin8(oid.0), bin8(serial.0)])
+            .await?;
+        match reply.as_slice() {
+            Some(data) => Ok(data.to_vec()),
+            None => Err(bad("loadSerial", &reply)),
+        }
+    }
+
+    /// Return the next value of the sequence `name` of the store. It needs
+    /// the extension `sequences`: without it, it fails with
+    /// `Error::Unsupported` and sends nothing.
+    pub async fn sequence_next(&self, name: &str) -> Result<u64, Error> {
+        if !self.extensions.iter().any(|accepted| accepted == SEQUENCES) {
+            return Err(Error::Unsupported(format!(
+                "the server did not accept the extension {SEQUENCES}"
+            )));
+        }
+        let reply = self.inner.call("sequence_next", vec![name.into()]).await?;
+        reply.as_u64().ok_or_else(|| bad("sequence_next", &reply))
     }
 
     /// Return at most `size` entries of the history of `oid`, newest first.
@@ -357,6 +484,13 @@ impl Client {
         }
     }
 
+    /// Close the connection, and do not wait for its tasks. Each call that
+    /// waits fails with `Error::Disconnected`, and so does each later
+    /// call.
+    pub fn disconnect(&self) {
+        self.inner.closing.send_replace(true);
+    }
+
     /// Close the connection, and wait until its tasks stop.
     pub async fn close(mut self) {
         self.inner.closing.send_replace(true);
@@ -409,6 +543,20 @@ impl Transaction {
             .await
     }
 
+    /// Ask the server to check at the vote that `serial` is still the
+    /// current serial of `oid`. A stale serial fails the vote with
+    /// `Error::ReadConflict`. After a failed vote, it fails with
+    /// `Error::Invalid` and sends nothing.
+    pub async fn check_current_serial(&mut self, oid: Oid, serial: Tid) -> Result<(), Error> {
+        self.check()?;
+        self.inner
+            .notify(
+                "checkCurrentSerialInTransaction",
+                vec![bin8(oid.0), bin8(serial.0), self.id.into()],
+            )
+            .await
+    }
+
     /// Store `data` for `oid` with the blob `blob`, as `ZEO.ClientStorage`
     /// does without a shared blob directory: `storea`, then
     /// `storeBlobStart`, one `storeBlobChunk` per chunk of `BLOB_CHUNK`
@@ -441,13 +589,20 @@ impl Transaction {
     /// `Error::Invalid`. A stock server can list the oids that it resolved:
     /// the vote passes, and the client ignores these oids.
     pub async fn vote(&mut self) -> Result<(), Error> {
+        self.vote_resolved().await.map(drop)
+    }
+
+    /// Vote as `vote` does, and return the oids that the server resolved.
+    /// The server stored another pickle than the client for each of them,
+    /// so the client must load them again.
+    pub async fn vote_resolved(&mut self) -> Result<Vec<Oid>, Error> {
         self.check()?;
         let result = match self.inner.call("vote", vec![self.id.into()]).await {
             // A stock server lists the oids that it resolved, and a server
             // with conflict resolution in the client lists the conflicts.
             Ok(Value::Array(items)) => match items.iter().find(|item| item.is_map()) {
                 Some(item) => Err(protocol::conflict(item).unwrap_or_else(|| bad("vote", item))),
-                None => Ok(()),
+                None => items.iter().map(|item| oid(item, "vote")).collect(),
             },
             Ok(other) => Err(bad("vote", &other)),
             Err(e) => Err(e),
@@ -712,6 +867,28 @@ async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
     }
 }
 
+/// The extension of the sequences.
+const SEQUENCES: &str = "sequences";
+
+/// Tell if `class` is the class of a `TypeError`, as `builtins.TypeError`.
+fn is_type_error(class: &str) -> bool {
+    class.rsplit('.').next() == Some("TypeError")
+}
+
+/// Return the names of the key `extensions` of the map `info` that the
+/// client declared in `declared`, in the order of the server.
+fn accepted(info: &Value, declared: &[String]) -> Vec<String> {
+    let Some(Value::Array(names)) = get(info, "extensions") else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| declared.iter().any(|declared| declared.as_str() == *name))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Read the args `[tid, [oid, ...]]` of `invalidateTransaction`.
 fn invalidation(args: &Value) -> Option<Invalidation> {
     let [tid, oids] = <&[Value; 2]>::try_from(args.as_array()?.as_slice()).ok()?;
@@ -777,6 +954,28 @@ mod tests {
         ] {
             assert!(matches!(extension_map(&bad), Err(Error::Invalid(_))));
         }
+    }
+
+    #[test]
+    fn a_type_error_of_any_module_is_a_type_error() {
+        assert!(is_type_error("builtins.TypeError"));
+        assert!(is_type_error("exceptions.TypeError"));
+        assert!(!is_type_error("builtins.ValueError"));
+        assert!(!is_type_error("ZODB.POSException.NotTypeError"));
+    }
+
+    #[test]
+    fn the_accepted_extensions_are_the_declared_names_of_get_info() {
+        let declared = vec!["sequences".to_owned(), "other".to_owned()];
+        let info = Value::Map(vec![(
+            "extensions".into(),
+            Value::Array(vec!["sequences".into(), "unknown".into()]),
+        )]);
+        assert_eq!(accepted(&info, &declared), vec!["sequences".to_owned()]);
+        // A stock server gives no key `extensions`.
+        let stock = Value::Map(vec![("length".into(), 0.into())]);
+        assert!(accepted(&stock, &declared).is_empty());
+        assert!(accepted(&Value::Nil, &declared).is_empty());
     }
 
     #[test]
