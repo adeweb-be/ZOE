@@ -7,6 +7,9 @@
 //! store, and so does each `[storages.NAME]` table of the configuration
 //! file of `--config`.
 //!
+//! `--listen` takes `HOST:PORT` or, with a `/`, the path of a unix domain
+//! socket, as the `address` of the `<zeo>` section of ZEO does.
+//!
 //! The command writes the line `listening <address>` to stdout once it
 //! accepts connections, so a port of 0 gives a free port. With
 //! `--admin-listen`, it writes the line `admin <address>` before it. The
@@ -65,15 +68,22 @@ pub(super) struct ServeArgs {
     #[arg(long, env = "ZOE_CONFIG", value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
-    /// port.
+    /// The address of the ZEO port: HOST:PORT, or the path of a unix domain
+    /// socket. A value with a / is a path, such as ./zeo.sock, as the
+    /// address of the <zeo> section of ZEO. A port of 0 takes a free port.
+    /// The server binds a relative path as it is, relative to its current
+    /// directory, so the path must be shorter than 108 bytes. At its start,
+    /// the server removes a socket file on which no process accepts
+    /// connections, and fails when a process accepts connections there. At
+    /// its stop, it removes its socket file. TLS needs HOST:PORT.
     #[arg(
         long,
         env = "ZOE_LISTEN",
-        value_name = "HOST:PORT",
-        default_value = "127.0.0.1:8100"
+        value_name = "ADDRESS",
+        default_value = "127.0.0.1:8100",
+        value_parser = listen_address
     )]
-    listen: SocketAddr,
+    listen: Listen,
 
     /// The address of the admin port, as HOST:PORT: an HTTP port for the
     /// probes. GET /healthz gives 200 while every store is open. GET
@@ -322,6 +332,27 @@ pub(super) struct ServeArgs {
     storages: Vec<Storage>,
 }
 
+/// The value of `--listen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Listen {
+    /// `HOST:PORT`, with an IP address as host.
+    Tcp(SocketAddr),
+    /// The path of a unix domain socket, as the value gives it.
+    Unix(PathBuf),
+}
+
+/// Parse the value of `--listen`. A value that holds a `/` is the path of
+/// a unix domain socket, as ZConfig reads the `address` of the `<zeo>`
+/// section. Any other value is `HOST:PORT`.
+fn listen_address(value: &str) -> Result<Listen, String> {
+    if value.contains('/') {
+        return Ok(Listen::Unix(PathBuf::from(value)));
+    }
+    value.parse().map(Listen::Tcp).map_err(|_| {
+        format!("{value} is neither HOST:PORT nor the path of a unix domain socket with a /")
+    })
+}
+
 /// The format of the log lines of `zoe serve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(super) enum LogFormat {
@@ -431,6 +462,13 @@ pub(super) fn configure(
         Cli::try_parse_from(args)?
     };
     if let Command::Serve(serve) = &mut cli.command {
+        if let (Listen::Unix(path), Some(_)) = (&serve.listen, &serve.tls_cert) {
+            return Err(usage_error(format!(
+                "--tls-cert needs --listen HOST:PORT: TLS does not apply to the unix \
+                 domain socket {}",
+                path.display()
+            )));
+        }
         serve.storages = storages(serve, config.storages).map_err(usage_error)?;
     }
     Ok(cli)
@@ -505,7 +543,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
 
-    use crate::serve::{ServeOptions, Server, StorageOptions, TlsOptions};
+    use crate::serve::{Address, ServeOptions, Server, StorageOptions, TlsOptions};
 
     let storages = args.storages.iter().map(|storage| {
         let options =
@@ -515,8 +553,12 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
             None => options,
         }
     });
+    let listen = match &args.listen {
+        Listen::Tcp(addr) => Address::Tcp(*addr),
+        Listen::Unix(path) => Address::Unix(path.clone()),
+    };
     let mut options = ServeOptions::with_storages(storages)
-        .listen(args.listen)
+        .listen(listen)
         .invalidation_queue_size(args.invalidation_queue_size)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
@@ -621,6 +663,68 @@ mod tests {
             Command::Serve(args) => Ok(*args),
             other => panic!("not serve: {other:?}"),
         }
+    }
+
+    #[test]
+    fn listen_takes_host_and_port_or_a_path_with_a_slash() {
+        assert_eq!(
+            serve(&[]).unwrap().listen,
+            Listen::Tcp("127.0.0.1:8100".parse().unwrap())
+        );
+        let args = serve(&["--listen", "[::1]:0"]).unwrap();
+        assert_eq!(args.listen, Listen::Tcp("[::1]:0".parse().unwrap()));
+        for path in ["./zeo.sock", "/run/zoe/zeo.sock", "dir/zeo.sock"] {
+            let args = serve(&["--listen", path]).unwrap();
+            assert_eq!(args.listen, Listen::Unix(PathBuf::from(path)), "{path}");
+        }
+        for value in ["zeo.sock", "localhost:8100", "8100"] {
+            let error = serve(&["--listen", value]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn the_key_listen_of_the_configuration_file_takes_a_path() {
+        use std::ffi::OsString;
+
+        let file = std::env::temp_dir().join(format!("zoe-listen-{}.toml", std::process::id()));
+        std::fs::write(&file, "path = \"store\"\nlisten = \"./zeo.sock\"\n").unwrap();
+        let line = ["zoe", "serve", "--config"].map(OsString::from);
+        let parsed = super::super::parse([&line[..], &[file.clone().into()]].concat());
+        std::fs::remove_file(&file).unwrap();
+        let Command::Serve(args) = parsed.unwrap().command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.listen, Listen::Unix(PathBuf::from("./zeo.sock")));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn tls_on_a_unix_domain_socket_is_a_usage_error_that_names_both_options() {
+        let line = [
+            "zoe",
+            "serve",
+            "--path",
+            "store",
+            "--listen",
+            "./zeo.sock",
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "k.pem",
+        ];
+        let error = super::super::parse(line.map(Into::into).to_vec()).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        let text = error.to_string();
+        assert!(
+            text.contains("--tls-cert") && text.contains("--listen"),
+            "{text}"
+        );
     }
 
     #[test]

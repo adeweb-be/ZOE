@@ -9,10 +9,14 @@
 //! The binary runs it until SIGTERM or SIGINT. A test runs it in its own
 //! process with [`Server::start`] and [`Server::stop`].
 //!
+//! The ZEO port is a TCP address or a unix domain socket ([`Address`]). The
+//! server removes a stale socket file at its start, and its own socket file
+//! at its stop.
+//!
 //! With [`TlsOptions`], the ZEO port speaks TLS. A client CA makes a client
 //! certificate necessary, and the holder of a certificate of the read-only
 //! client CA registers read-only only. A failed handshake closes only its
-//! connection.
+//! connection. TLS needs a TCP address.
 //!
 //! A stop takes at most the shutdown timeout. The server stops accepting
 //! connections, and each connection reads no more calls. The calls that
@@ -26,15 +30,17 @@
 //! stores close.
 
 use std::fmt;
+use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
@@ -68,6 +74,33 @@ const FORCED_CLOSE: Duration = Duration::from_secs(1);
 /// longer timeout counts as this one, so the deadline of a stop never
 /// overflows the clock.
 const LONGEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4_294_967_295);
+
+/// The address of the ZEO port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    /// A TCP address. A port of 0 takes a free port.
+    Tcp(SocketAddr),
+    /// The path of a unix domain socket. The server binds the path as it
+    /// is, so a relative path is relative to the current directory, and
+    /// the limit of 108 bytes of a socket address applies to the path as
+    /// given.
+    Unix(PathBuf),
+}
+
+impl From<SocketAddr> for Address {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Tcp(addr)
+    }
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(addr) => addr.fmt(f),
+            Self::Unix(path) => path.display().fmt(f),
+        }
+    }
+}
 
 /// A store that a server serves under a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +146,7 @@ impl StorageOptions {
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     storages: Vec<StorageOptions>,
-    listen: SocketAddr,
+    listen: Address,
     admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
@@ -148,7 +181,7 @@ impl ServeOptions {
     pub fn with_storages(storages: impl IntoIterator<Item = StorageOptions>) -> Self {
         Self {
             storages: storages.into_iter().collect(),
-            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            listen: Address::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
             admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
@@ -165,10 +198,13 @@ impl ServeOptions {
         }
     }
 
-    /// Listen on `addr`. A port of 0 takes a free port.
+    /// Listen on `addr`: a `SocketAddr`, or an [`Address`]. A port of 0
+    /// takes a free port. On a unix domain socket, the start removes a
+    /// socket file at the path on which no process accepts connections,
+    /// and the stop removes the socket file of the server.
     #[must_use]
-    pub fn listen(mut self, addr: SocketAddr) -> Self {
-        self.listen = addr;
+    pub fn listen(mut self, addr: impl Into<Address>) -> Self {
+        self.listen = addr.into();
         self
     }
 
@@ -310,7 +346,8 @@ impl ServeOptions {
 
     /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
     /// reads them before it listens, so a file that does not read creates
-    /// no store. Without this call, the ZEO port speaks plain TCP.
+    /// no store. TLS needs a TCP address: on a unix domain socket, the
+    /// start fails. Without this call, the ZEO port speaks plain TCP.
     #[must_use]
     pub fn tls(mut self, tls: TlsOptions) -> Self {
         self.tls = Some(tls);
@@ -358,15 +395,18 @@ impl ServeOptions {
 pub enum Error {
     /// The options give no storage, or give a storage name twice.
     Storages(String),
-    /// The server cannot listen on the address.
-    Listen(SocketAddr, io::Error),
+    /// The server cannot listen on the address. On a unix domain socket,
+    /// the error is `AddrInUse` when another process accepts connections on
+    /// the path, and `AlreadyExists` when the path is not a socket.
+    Listen(Address, io::Error),
     /// The server cannot listen on the address of the admin port.
     AdminListen(SocketAddr, io::Error),
     /// The store does not open.
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
     Runtime(io::Error),
-    /// A file of TLS does not read or does not fit.
+    /// A file of TLS does not read or does not fit, or the address is a
+    /// unix domain socket.
     Tls(String),
 }
 
@@ -391,7 +431,10 @@ impl std::error::Error for Error {}
 pub struct Server {
     runtime: Option<Runtime>,
     storages: Option<Arc<Storages>>,
-    addr: SocketAddr,
+    /// The address that the server listens on, with the port that it took.
+    address: Address,
+    /// The socket file of a unix domain socket. The stop removes it.
+    socket_file: Option<SocketFile>,
     /// The address of the admin port, when the server has one.
     admin: Option<SocketAddr>,
     /// The sender of the stop to the accept loop and to each connection.
@@ -456,6 +499,12 @@ impl Server {
         options: ServeOptions,
         mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
     ) -> Result<Self, Error> {
+        if let (Some(_), Address::Unix(path)) = (&options.tls, &options.listen) {
+            return Err(Error::Tls(format!(
+                "TLS needs a TCP address, not the unix domain socket {}",
+                path.display()
+            )));
+        }
         // A file of TLS that does not read changes nothing on disk.
         let tls = options
             .tls
@@ -465,14 +514,16 @@ impl Server {
             .map_err(Error::Tls)?
             .map(Arc::new);
         // Listen first: a server that cannot listen changes nothing on
-        // disk.
-        let listener = {
+        // disk, except a stale socket file that goes. A start that fails
+        // later drops the socket file, which removes it.
+        let (listener, socket_file) = {
             let _enter = runtime.enter();
-            bind(options.listen).map_err(|error| Error::Listen(options.listen, error))?
+            Listener::bind(&options.listen)
+                .map_err(|error| Error::Listen(options.listen.clone(), error))?
         };
-        let addr = listener
-            .local_addr()
-            .map_err(|error| Error::Listen(options.listen, error))?;
+        let address = listener
+            .address()
+            .map_err(|error| Error::Listen(options.listen.clone(), error))?;
         let (stop_signal, stopping) = Stopping::new();
         // The admin port answers from now on, 503 until the stores are
         // open. It is not a task of the stop: it stays open until the
@@ -481,8 +532,8 @@ impl Server {
         let admin = match options.admin_listen {
             Some(admin_listen) => {
                 let _enter = runtime.enter();
-                let listener =
-                    bind(admin_listen).map_err(|error| Error::AdminListen(admin_listen, error))?;
+                let listener = bind_tcp(admin_listen)
+                    .map_err(|error| Error::AdminListen(admin_listen, error))?;
                 let admin = listener
                     .local_addr()
                     .map_err(|error| Error::AdminListen(admin_listen, error))?;
@@ -545,7 +596,8 @@ impl Server {
         Ok(Self {
             runtime: Some(runtime),
             storages: Some(storages),
-            addr,
+            address,
+            socket_file,
             admin,
             stop_signal,
             tasks,
@@ -556,9 +608,26 @@ impl Server {
         })
     }
 
-    /// The address that the server listens on.
+    /// The TCP address that the server listens on.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server listens on a unix domain socket. Then
+    /// [`Server::address`] gives its path.
     pub fn addr(&self) -> SocketAddr {
-        self.addr
+        match &self.address {
+            Address::Tcp(addr) => *addr,
+            Address::Unix(path) => panic!(
+                "the server listens on the unix domain socket {}",
+                path.display()
+            ),
+        }
+    }
+
+    /// The address that the server listens on: the TCP address with the
+    /// port that it took, or the path of its unix domain socket.
+    pub fn address(&self) -> &Address {
+        &self.address
     }
 
     /// The address of the admin port, when the server has one.
@@ -585,7 +654,7 @@ impl Server {
     /// stops the server at once.
     pub(crate) fn serve_until_signal(
         mut self,
-        ready: impl FnOnce(SocketAddr) -> io::Result<()>,
+        ready: impl FnOnce(&Address) -> io::Result<()>,
     ) -> io::Result<()> {
         let runtime = self.runtime.as_ref().expect("the server runs");
         let mut signals = match self.signals.take() {
@@ -593,7 +662,7 @@ impl Server {
             // A server from `Server::start` handles the signals from here.
             None => Signals::handle(runtime)?,
         };
-        ready(self.addr)?;
+        ready(&self.address)?;
         signals.wait(runtime);
         self.shutdown();
         Ok(())
@@ -623,6 +692,8 @@ impl Server {
         std::thread::scope(|scope| {
             scope.spawn(move || runtime.shutdown_timeout(rest));
         });
+        // The listener is gone. The drop removes the socket file.
+        drop(self.socket_file.take());
         #[cfg(test)]
         let _ = self.stop_times.set(StopTimes {
             start,
@@ -709,9 +780,140 @@ fn open_read_only(path: &Path, options: Options) -> Result<Arc<Store>, Error> {
         .map_err(|error| Error::Store(path.to_path_buf(), error))
 }
 
+/// The listening socket of the ZEO port.
+enum Listener {
+    Tcp(TcpListener),
+    /// A unix domain socket, with its path as the options give it.
+    Unix(UnixListener, Arc<Path>),
+}
+
+/// A connection that the listener accepted.
+enum Accepted {
+    Tcp(TcpStream, SocketAddr),
+    /// A connection on a unix domain socket, with the path of the socket.
+    Unix(UnixStream, Arc<Path>),
+}
+
+impl Listener {
+    /// Listen on `address`. Return the socket file of a unix domain
+    /// socket too: its drop removes the file. The call must run in the
+    /// context of a runtime.
+    fn bind(address: &Address) -> io::Result<(Self, Option<SocketFile>)> {
+        match address {
+            Address::Tcp(addr) => Ok((Self::Tcp(bind_tcp(*addr)?), None)),
+            Address::Unix(path) => {
+                let (listener, file) = bind_unix(path)?;
+                Ok((Self::Unix(listener, Arc::from(path.as_path())), file))
+            }
+        }
+    }
+
+    /// The address of the listener: a TCP address with the port that it
+    /// took, or the path of the socket as the options give it.
+    fn address(&self) -> io::Result<Address> {
+        match self {
+            Self::Tcp(listener) => listener.local_addr().map(Address::Tcp),
+            Self::Unix(_, path) => Ok(Address::Unix(path.to_path_buf())),
+        }
+    }
+
+    /// Accept the next connection.
+    async fn accept(&self) -> io::Result<Accepted> {
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, peer) = listener.accept().await?;
+                Ok(Accepted::Tcp(stream, peer))
+            }
+            Self::Unix(listener, path) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(Accepted::Unix(stream, Arc::clone(path)))
+            }
+        }
+    }
+}
+
+/// The socket file of the unix domain socket of a server. Its drop removes
+/// the file, but only when the file at the path is still the one that the
+/// server bound. So it never removes the socket of another server that
+/// took the path meanwhile.
+struct SocketFile {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl SocketFile {
+    /// Return the socket file at `path`, which the server just bound.
+    fn bound(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let same = fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode);
+        if same && let Err(error) = fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "cannot remove the socket file: {error}"
+            );
+        }
+    }
+}
+
+/// Listen on the unix domain socket `path`. The call binds the path as it
+/// is, so a relative path is relative to the current directory. When a
+/// socket file is at the path, the call connects to it first, as runzeo
+/// does. When a process accepts the connection, the call fails with
+/// `AddrInUse`, and the file stays. When the connection is refused, the
+/// file is stale and goes. A path that is not a socket, a symbolic link
+/// included, fails with `AlreadyExists` and stays.
+fn bind_unix(path: &Path) -> io::Result<(UnixListener, Option<SocketFile>)> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "another process accepts connections on the socket",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    match fs::remove_file(path) {
+                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the path exists and is not a socket",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(path)?;
+    // Without its device and inode, the stop cannot tell that the file is
+    // still the socket of the server, so the file stays.
+    let file = SocketFile::bound(path).ok();
+    Ok((listener, file))
+}
+
 /// Listen on `addr`. The socket takes SO_REUSEADDR, so a restarted server
 /// binds the same port at once.
-fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
@@ -727,10 +929,10 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 /// takes frames of at most
 /// `max_frame_size` bytes, closes after `idle_timeout` without a frame and
 /// without a call that runs, and
-/// counts in `tasks` while it runs. With `tls`, each connection starts with
-/// the TLS handshake.
+/// counts in `tasks` while it runs. With `tls`, each connection on TCP
+/// starts with the TLS handshake.
 async fn accept(
-    listener: TcpListener,
+    listener: Listener,
     storages: Arc<Storages>,
     max_frame_size: u32,
     idle_timeout: Option<Duration>,
@@ -745,7 +947,22 @@ async fn accept(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, peer)) => {
+            Ok(Accepted::Unix(stream, path)) => {
+                let running = tasks.start();
+                let connection = protocol::serve_unix_connection(
+                    stream,
+                    path,
+                    Arc::clone(&storages),
+                    max_frame_size,
+                    idle_timeout,
+                    stopping.clone(),
+                );
+                tokio::spawn(async move {
+                    connection.await;
+                    drop(running);
+                });
+            }
+            Ok(Accepted::Tcp(stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 let running = tasks.start();
                 if let Some(tls) = &tls {
@@ -789,7 +1006,7 @@ async fn accept(
 /// within `idle_timeout`, as the protocol of a plain client must. A stop
 /// ends it at once. A failed handshake closes only this connection.
 async fn serve_tls(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     peer: String,
     tls: Arc<Tls>,
     storages: Arc<Storages>,
@@ -1167,6 +1384,109 @@ mod tests {
         assert!(matches!(error, Error::Tls(_)), "{error}");
         assert!(error.to_string().contains("missing.pem"), "{error}");
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_server_on_a_unix_domain_socket_serves_and_removes_its_socket_file_at_the_stop() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let dir = fresh_dir("unix");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zeo.sock");
+        let options = ServeOptions::new(dir.join("store")).listen(Address::Unix(path.clone()));
+        let server = Server::start(options).unwrap();
+        assert_eq!(server.address(), &Address::Unix(path.clone()));
+        assert_eq!(server.address().to_string(), path.display().to_string());
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut protocol = [0u8; 6];
+        client.read_exact(&mut protocol).unwrap();
+        assert_eq!(&protocol, b"\0\0\0\x02M5");
+
+        let started = Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(client.read(&mut protocol).unwrap(), 0);
+        assert!(!path.exists());
+        Store::open_read_only(dir.join("store")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_socket_file_goes_and_a_live_socket_or_another_file_stays() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = fresh_dir("unix-stale");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zeo.sock");
+        let on_path =
+            |store: &str| ServeOptions::new(dir.join(store)).listen(Address::Unix(path.clone()));
+        // No process accepts connections on a socket file whose listener
+        // is gone.
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(UnixStream::connect(&path).is_err());
+        let server = Server::start(on_path("store")).unwrap();
+        UnixStream::connect(&path).unwrap();
+
+        // A second server on the path fails, creates no store and leaves
+        // the socket of the first.
+        let error = Server::start(on_path("other")).err().unwrap();
+        assert!(
+            matches!(&error, Error::Listen(_, e) if e.kind() == io::ErrorKind::AddrInUse),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&*path.to_string_lossy()),
+            "{error}"
+        );
+        assert!(!dir.join("other").exists());
+        UnixStream::connect(&path).unwrap();
+        server.stop();
+        assert!(!path.exists());
+
+        // A path that is not a socket stays.
+        fs::write(&path, b"data").unwrap();
+        let error = Server::start(on_path("other")).err().unwrap();
+        assert!(
+            matches!(&error, Error::Listen(_, e) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"data");
+        assert!(!dir.join("other").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_start_that_fails_on_a_unix_domain_socket_leaves_no_socket_file() {
+        let dir = fresh_dir("unix-fail");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zeo.sock");
+        // A read-only store that does not exist fails after the bind.
+        let options = ServeOptions::new(dir.join("missing"))
+            .read_only(true)
+            .listen(Address::Unix(path.clone()));
+        let error = Server::start(options).err();
+        assert!(matches!(error, Some(Error::Store(..))), "{error:?}");
+        assert!(!path.exists());
+
+        // TLS needs a TCP address.
+        let tls = TlsOptions::new(dir.join("c.pem"), dir.join("k.pem"));
+        let options = ServeOptions::new(dir.join("store"))
+            .listen(Address::Unix(path.clone()))
+            .tls(tls);
+        let error = Server::start(options).err().unwrap();
+        assert!(matches!(error, Error::Tls(_)), "{error}");
+        assert!(error.to_string().contains("unix domain socket"), "{error}");
+        assert!(!path.exists());
+        assert!(!dir.join("store").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
