@@ -48,7 +48,9 @@ def main(argv: list[str] | None = None) -> int:
         "--workdir",
         type=Path,
         default=Path("target/bench/work"),
-        help="where the storages write their files (default: %(default)s)",
+        help="where the storages write their files: each value of a cell runs on "
+        "a fresh store there, and the harness removes it when the value ends "
+        "(default: %(default)s)",
     )
 
     index_cmd = commands.add_parser(
