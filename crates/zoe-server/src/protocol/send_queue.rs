@@ -4,18 +4,19 @@ use std::io;
 use std::os::fd::RawFd;
 
 /// Return the count of bytes in the send queue of the TCP socket `fd`:
-/// the bytes that the peer did not acknowledge, the FIN included. Linux
-/// gives this count for the ioctl `SIOCOUTQ`, which has the value of
-/// `TIOCOUTQ`. A descriptor that is not a TCP socket gives an error.
+/// the bytes that the kernel did not send yet and the bytes that the peer
+/// did not acknowledge yet. The FIN counts too. Linux gives this count
+/// for the ioctl `SIOCOUTQ`, which has the value of `TIOCOUTQ`. The count
+/// is 0 when the peer acknowledged every byte and the FIN. `fd` must be
+/// the descriptor of a TCP socket that the caller holds open.
 #[allow(unsafe_code)]
-pub(crate) fn unsent(fd: RawFd) -> io::Result<usize> {
+pub(crate) fn unacked(fd: RawFd) -> io::Result<usize> {
     let mut count: libc::c_int = 0;
-    // SAFETY: The ioctl `TIOCOUTQ` writes one `c_int` through its third
-    // argument and reads no other memory. The pointer points to `count`, a
-    // local `c_int` that lives until the call returns. The descriptor is
-    // not memory: a closed or wrong descriptor gives an error, never
-    // undefined behaviour. The caller holds the stream of `fd`, so the
-    // descriptor stays open while the call runs.
+    // SAFETY: The caller holds the TCP stream of `fd` open for the whole
+    // call, so `fd` is a live TCP socket. For a TCP socket, the ioctl
+    // `TIOCOUTQ` writes one `c_int` through its third argument and reads
+    // no other memory. The pointer points to `count`, a local `c_int` that
+    // lives until the call returns.
     let result = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &raw mut count) };
     if result < 0 {
         return Err(io::Error::last_os_error());
@@ -35,13 +36,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        assert_eq!(unsent(server.as_raw_fd()).unwrap(), 0);
-        assert_eq!(unsent(client.as_raw_fd()).unwrap(), 0);
+        assert_eq!(unacked(server.as_raw_fd()).unwrap(), 0);
+        assert_eq!(unacked(client.as_raw_fd()).unwrap(), 0);
     }
 
     #[test]
-    fn a_descriptor_that_is_not_a_socket_gives_an_error() {
+    fn dev_null_gives_an_error() {
         let file = std::fs::File::open("/dev/null").unwrap();
-        assert!(unsent(file.as_raw_fd()).is_err());
+        assert!(unacked(file.as_raw_fd()).is_err());
     }
 }

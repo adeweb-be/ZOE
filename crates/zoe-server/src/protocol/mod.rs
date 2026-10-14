@@ -552,7 +552,15 @@ pub(crate) async fn serve_stream(
         let _ = writer_ended.await;
     };
     if stopped {
-        linger(&mut reader, socket, finished, &*runtime, &mut closing).await;
+        linger(
+            &mut reader,
+            &peer,
+            socket,
+            finished,
+            &*runtime,
+            &mut closing,
+        )
+        .await;
     } else {
         finished.await;
     }
@@ -586,6 +594,7 @@ pub(crate) async fn serve_stream(
 /// wait follows. The forced close of the stop bounds the whole wait.
 async fn linger(
     reader: &mut (impl AsyncRead + Unpin),
+    peer: &str,
     mut socket: Option<RawFd>,
     finished: impl Future<Output = ()>,
     runtime: &dyn Runtime,
@@ -619,11 +628,14 @@ async fn linger(
             () = closing.wait() => return,
             () = &mut timer => {
                 let Some(fd) = socket else { return };
-                match send_queue::unsent(fd) {
+                match send_queue::unacked(fd) {
                     Ok(0) => return,
                     Ok(_) => timer = runtime.sleep(DRAIN_PAUSE),
                     Err(error) => {
-                        tracing::debug!("cannot read the send queue of the socket: {error}");
+                        tracing::debug!(
+                            client = peer,
+                            "cannot read the send queue of the socket: {error}"
+                        );
                         socket = None;
                         timer = runtime.sleep(LINGER);
                     }
