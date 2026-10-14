@@ -101,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     ]
     needs_dsn = [s for s in storages if STORAGES[s].needs_dsn]
     if needs_dsn and not args.dsn:
-        parser.error(f"{' and '.join(needs_dsn)} need --dsn or ZOE_BENCH_PG_DSN")
+        verb = "needs" if len(needs_dsn) == 1 else "need"
+        parser.error(f"{' and '.join(needs_dsn)} {verb} --dsn or ZOE_BENCH_PG_DSN")
     if not args.dsn and not args.storage:
         skipped = " and ".join(s for s in STORAGES if STORAGES[s].needs_dsn)
         print(f"{skipped} skipped: no PostgreSQL DSN", file=sys.stderr)

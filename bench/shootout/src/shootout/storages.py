@@ -137,7 +137,7 @@ def reset_database(storage: Storage, dsn: str | None) -> None:
         adapter = PostgreSQLAdapter(dsn=dsn, options=Options(keep_history=keep_history))
         adapter.schema.drop_all()
         names.update(adapter.schema.procedures)
-    # The functions of the two modes have the same names and other
+    # The functions of the two modes have the same names but other
     # arguments, so each mode would keep the functions of the other.
     with contextlib.closing(psycopg2.connect(dsn)) as conn:
         with conn, conn.cursor() as cursor:

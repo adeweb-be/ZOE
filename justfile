@@ -491,8 +491,8 @@ plone scenario="zoe" command="start" *args:
 # the store when the value ends, and fails a cell before it starts when that
 # disk has less free space than one value needs. Each result records the GIL
 # of each worker process. `run` and `test` build `zoe` in release for the
-# storages zoe-server and zoe-native, unless ZOE_BINARY names a binary. `just bench load` and
-# `just bench saturate` build `zoe` and `zoe-bench` in release, start
+# storages zoe-server and zoe-native, unless ZOE_BINARY names a binary.
+# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench` in release, start
 # `zoe serve` on a new store in target/bench/work/zoe-bench, run
 # `zoe-bench load` or `zoe-bench saturate` with its default settings and the
 # options that follow, and write the JSON result to stdout and to
