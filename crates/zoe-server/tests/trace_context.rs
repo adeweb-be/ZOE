@@ -56,18 +56,18 @@ impl Collector {
                         if line.is_empty() {
                             break;
                         }
-                        if let Some((name, value)) = line.split_once(':') {
-                            if name.eq_ignore_ascii_case("content-length") {
-                                length = value.trim().parse().unwrap();
-                            }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
                         }
                     }
                     let mut body = vec![0u8; length];
                     reader.read_exact(&mut body).unwrap();
-                    if path.contains("/v1/traces") {
-                        if let Ok(json) = serde_json::from_slice(&body) {
-                            kept.lock().unwrap().push(json);
-                        }
+                    if path.contains("/v1/traces")
+                        && let Ok(json) = serde_json::from_slice(&body)
+                    {
+                        kept.lock().unwrap().push(json);
                     }
                     let mut stream = stream;
                     let _ = stream.write_all(
