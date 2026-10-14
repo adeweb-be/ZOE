@@ -15,11 +15,12 @@ use zoe_server::serve::{ServeOptions, Server};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A runtime whose one connection is an in-memory stream, and whose
-/// sleeps take `1 / speed` of their time.
+/// A runtime whose one connection is an in-memory stream, whose sleeps
+/// take `1 / speed` of their time, and whose spawned tasks start `late`.
 struct Scripted {
     stream: Mutex<Option<DuplexStream>>,
     speed: u32,
+    late: Duration,
 }
 
 impl Runtime for Scripted {
@@ -32,7 +33,13 @@ impl Runtime for Scripted {
     }
 
     fn spawn(&self, task: BoxFuture<()>) {
-        tokio::spawn(task);
+        let late = self.late;
+        tokio::spawn(async move {
+            if !late.is_zero() {
+                tokio::time::sleep(late).await;
+            }
+            task.await
+        });
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
@@ -99,10 +106,18 @@ fn bin8(n: u64) -> Value {
 
 /// A runtime with one scripted connection, and the server side of it.
 fn scripted(speed: u32) -> (Arc<dyn Runtime>, Peer) {
+    scripted_late(speed, Duration::ZERO)
+}
+
+/// A runtime with one scripted connection whose spawned tasks start
+/// `late`, as a scheduler that runs them after the caller, and the server
+/// side of it.
+fn scripted_late(speed: u32, late: Duration) -> (Arc<dyn Runtime>, Peer) {
     let (client, server) = tokio::io::duplex(1 << 16);
     let runtime = Scripted {
         stream: Mutex::new(Some(client)),
         speed,
+        late,
     };
     (Arc::new(runtime), Peer(server))
 }
@@ -319,6 +334,53 @@ async fn a_dropped_transaction_aborts() {
     // The next transaction begins: the dropped one released the lock.
     let txn = client.begin(b"u", b"d", b"").await.unwrap();
     drop(txn);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn the_abort_of_a_dropped_transaction_comes_before_the_next_begin() {
+    // The task that sends the abort of a full queue starts after the next
+    // `begin` asked for room in the queue.
+    let (runtime, mut peer) = scripted_late(1, Duration::from_millis(50));
+    let (start, reading) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        // Read nothing until the client waits, so its queue stays full.
+        reading.await.unwrap();
+        let mut methods = Vec::new();
+        loop {
+            let (_, _, method, _) = peer.recv().await;
+            if method != "storea" {
+                methods.push(method.clone());
+            }
+            if method == "tpc_begin" && methods.len() > 1 {
+                return methods;
+            }
+        }
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    // Store until a store waits for room: the outgoing channel is full.
+    let data = vec![0u8; 16 << 10];
+    let mut stores = 0;
+    while tokio::time::timeout(Duration::from_millis(100), txn.store(Oid(1), Tid(0), &data))
+        .await
+        .is_ok()
+    {
+        stores += 1;
+        assert!(stores < 10_000, "the queue never filled");
+    }
+    drop(txn);
+    let (next, ()) = tokio::join!(client.begin(b"u", b"d", b""), async {
+        start.send(()).unwrap();
+    });
+    let next = next.unwrap();
+    let methods = tokio::time::timeout(TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(methods, ["tpc_begin", "tpc_abort", "tpc_begin"]);
+    drop(next);
     client.close().await;
 }
 

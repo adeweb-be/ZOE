@@ -333,7 +333,7 @@ impl Client {
             id,
             open: true,
             ended: false,
-            _guard: guard,
+            guard: Some(guard),
         })
     }
 
@@ -386,7 +386,8 @@ pub struct Transaction {
     /// `true` after a failed vote or an abort. The server ended the
     /// transaction, so the client sends no more calls for it.
     ended: bool,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The commit lock of the client. The drop gives it to `abort_later`.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl Transaction {
@@ -474,7 +475,7 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if self.open {
-            self.inner.abort_later(self.id);
+            self.inner.abort_later(self.id, self.guard.take());
         }
     }
 }
@@ -527,7 +528,10 @@ impl Inner {
 
     /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
     /// reply. The reader drops the reply, because no call waits for its id.
-    fn abort_later(&self, txn: u64) {
+    /// `guard` is the commit lock of the transaction. It is released only
+    /// after the frame is in the channel, so the `tpc_begin` of the next
+    /// transaction always comes after this abort.
+    fn abort_later(&self, txn: u64, guard: Option<tokio::sync::OwnedMutexGuard<()>>) {
         let id = {
             let mut calls = lock(&self.calls);
             if calls.closed {
@@ -544,6 +548,7 @@ impl Inner {
             let outgoing = self.outgoing.clone();
             self.runtime.spawn(Box::pin(async move {
                 let _ = outgoing.send(frame).await;
+                drop(guard);
             }));
         }
     }
