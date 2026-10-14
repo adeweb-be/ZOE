@@ -255,9 +255,21 @@ mod tests {
     }
 
     #[test]
-    fn a_request_span_without_a_layer_is_disabled() {
-        let span = request("loadBefore", "1");
-        assert!(span.is_disabled());
+    fn a_request_span_without_the_traces_layer_is_disabled() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // The subscriber of the log lines alone, as without
+        // `ZOE_OTLP_ENDPOINT`. The tests share the callsites, so the test
+        // needs a subscriber of its own: with none, a callsite that
+        // another test enabled gives a span that is not disabled.
+        let logs = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(Select(is_logged));
+        let subscriber = tracing_subscriber::registry().with(logs);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(request("loadBefore", "1").is_disabled());
+            assert!(!tracing::info_span!("connection").is_disabled());
+        });
     }
 
     /// A processor that keeps each span that ends.
