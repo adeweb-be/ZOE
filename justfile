@@ -150,10 +150,13 @@ fuzz seconds="60" *targets="frame handshake":
             "$out/corpus/$target" "$fuzz/corpus/$target"
     done
 
-# Run the test suites of ZODB in-process against zoe.Storage, on every
-# interpreter. `just test` does not collect them. The ZEO suites against
-# zoe serve are not built yet.
+# Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
+# suites against zoe serve, on every interpreter. `just test` does not
+# collect them. The test forker of ZEO starts the `zoe` binary of the debug
+# build.
 conformance:
+    cargo build --locked -p zoe-server --bin zoe
+    export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
     for py in {{ pythons }}; do \
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
@@ -163,18 +166,21 @@ conformance:
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
-# site over HTTP. The other scenarios are filestorage, zeo and zeoclient; the
-# instances of zeo and zeoclient need their server. `just plone zeoclient
-# check` builds the `zoe` binary, starts `zoe serve` on
-# target/plone/zeoclient/var/zoe and stops it at the end. The build goes to
-# target/plone. ZOE_PLONE_ADMIN gives the admin user as user:password.
-# Without it, the recipe makes a random password once, in target/plone/admin.
-# The instance listens on 127.0.0.1, on the port ZOE_PLONE_PORT or 8080.
+# site over HTTP. The other scenarios are filestorage, zeo, zeoclient and
+# zeoclient-mount. The instances of zeo, zeoclient and zeoclient-mount need
+# their server. `just plone zeoclient check` builds the `zoe` binary,
+# starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
+# end. `just plone zeoclient-mount check` starts one `zoe serve` with the
+# two named storages main and content, and puts the site in the mount
+# point /content. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# admin user as user:password. Without it, the recipe makes a random
+# password once, in target/plone/admin. The instance listens on 127.0.0.1,
+# on the port ZOE_PLONE_PORT or 8080.
 plone scenario="zoe" command="start":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
-        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe or zeoclient." >&2
+        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient or zeoclient-mount." >&2
         exit 2
     fi
     target="{{ justfile_directory() }}/target/plone"
@@ -273,14 +279,33 @@ plone scenario="zoe" command="start":
                 fi
             }
             trap stop EXIT
-            if [ "{{ scenario }}" = zeoclient ]; then
+            # The instance gives the site from its root, or from the mount
+            # point /content of zeoclient-mount.
+            folder=""
+            case "{{ scenario }}" in
+                zeoclient)
+                    # zoe serve serves the store of the scenario under the
+                    # storage name 1, the default of ZEO.
+                    stores=(--path "$target/zeoclient/var/zoe")
+                    ;;
+                zeoclient-mount)
+                    # One zoe serve serves the two databases of the
+                    # instance: main at / and content at /content.
+                    stores=(--storage "main=$target/zeoclient-mount/var/main"
+                        --storage "content=$target/zeoclient-mount/var/content")
+                    folder=/content
+                    ;;
+                *)
+                    stores=()
+                    ;;
+            esac
+            if [ "${#stores[@]}" -gt 0 ]; then
                 # The instance is a ZEO client of zoe serve. The server is
                 # the `zoe` binary of this build. It listens on the
-                # zeo-address of zeoclient.cfg and serves the store of the
-                # scenario under the storage name 1, the default of ZEO.
+                # zeo-address of zeoclient.cfg.
                 cargo build --locked -p zoe-server --bin zoe
                 zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
-                log="$target/zeoclient/var/log/zoe-serve.log"
+                log="$target/{{ scenario }}/var/log/zoe-serve.log"
                 # The server gets no ZOE_* variable of the caller, so only
                 # the options here apply. The admin password does not go
                 # to the server.
@@ -288,8 +313,7 @@ plone scenario="zoe" command="start":
                     for name in "${!ZOE_@}"; do
                         unset "$name"
                     done
-                    exec "$zoe" serve --path "$target/zeoclient/var/zoe" \
-                        --listen 127.0.0.1:8100
+                    exec "$zoe" serve "${stores[@]}" --listen 127.0.0.1:8100
                 ) </dev/null >"$log" 2>&1 &
                 server=$!
                 # zoe serve writes `listening <address>` once it accepts
@@ -308,13 +332,13 @@ plone scenario="zoe" command="start":
                 echo "just plone: zoe serve listens on 127.0.0.1:8100, its log is $log"
             fi
             "$instance" run plone/set_admin.py
-            "$instance" run plone/create_site.py "$mark"
+            "$instance" run plone/create_site.py "$mark" ${folder:+"$folder"}
             "$instance" console &
             pid=$!
             # Wait for the instance, then read the page of the site, which
             # holds the title with the mark. Only the admin user can read
             # the management page of the site.
-            site="http://127.0.0.1:$port/Plone"
+            site="http://127.0.0.1:$port$folder/Plone"
             python3.13 plone/read_site.py "$site" "Check site $mark"
             python3.13 plone/read_site.py "$site/manage_main" portal_catalog
             ;;
