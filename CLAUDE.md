@@ -17,13 +17,14 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | Recipe | Does |
 | --- | --- |
 | `just check` | `cargo fmt` check, the `Cargo.lock` of the fuzz targets, clippy with warnings as errors, ruff lint and format check |
-| `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t |
+| `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t, then `just deploy check` |
 | `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan` |
 | `just fuzz` | builds the fuzz targets of `zoe serve` (`crates/zoe-server/fuzz`) with libFuzzer and AddressSanitizer into `target/fuzz`, then runs them for 60 seconds in all; `just fuzz 3600` runs them for an hour, `just fuzz 600 frame` runs only `frame` |
 | `just conformance` | ZODB's storage suites and test modules in-process against `zoe.Storage`, on every interpreter |
 | `just plone` | builds the Plone instance of a scenario under `plone/` into `target/plone` and starts it; `just plone zoe check` creates a Plone site on the zoe scenario by script and reads it over HTTP |
 | `just bench` | benchmarks (not built yet) |
 | `just loupe` | builds and runs Loupe (not built yet) |
+| `just deploy check` | the tests of `deploy/tests` on the deployment files: the Tier 1 manifests, the host units, the Grafana dashboard; `just test` runs it at its end |
 | `just docs` | builds the documentation site into `target/book` |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
 | `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release test` runs the tests of `ci/`. Publishing is not built yet |

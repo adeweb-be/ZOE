@@ -18,6 +18,7 @@
 //! their blobs and the ends of the sequences. [`restore`] rebuilds the
 //! store from the dumps, and [`verify_backup`] compares them with a store.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use zoe_core::{Tid, ZoeError};
@@ -59,6 +60,97 @@ pub struct Report {
     /// transactions, records and blobs follow, and a last line counts the
     /// others.
     pub problems: Vec<String>,
+    /// The count of the problems of each kind, with no cap. A kind without
+    /// a problem has no entry.
+    counts: BTreeMap<ProblemKind, u64>,
+}
+
+impl Report {
+    /// Return an empty report: no transaction and no problem.
+    pub(crate) fn empty() -> Self {
+        Self {
+            transactions: 0,
+            copied: 0,
+            records: 0,
+            blobs: 0,
+            last_tid: Tid::ZERO,
+            problems: Vec::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    /// Return the number of problems of the kind `kind`. The count has no
+    /// cap.
+    pub fn count(&self, kind: ProblemKind) -> u64 {
+        self.counts.get(&kind).copied().unwrap_or(0)
+    }
+
+    /// Return the number of problems. This is the sum of the counts of the
+    /// kinds, not the number of lines in `problems`.
+    pub fn problem_count(&self) -> u64 {
+        self.counts.values().sum()
+    }
+
+    /// Return each kind that has a problem, with its count, in the order of
+    /// `ProblemKind`.
+    pub fn counts(&self) -> impl Iterator<Item = (ProblemKind, u64)> + '_ {
+        self.counts.iter().map(|(&kind, &count)| (kind, count))
+    }
+}
+
+/// The kind of a problem in the report of a conversion. Each problem has
+/// exactly one kind.
+///
+/// The source is the side that the conversion reads, and the target is
+/// the side that it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProblemKind {
+    /// The read of the `Data.fs` stopped before the end of the file.
+    Stopped,
+    /// The `Data.fs` has blob records, and no blob directory was given.
+    /// This is one problem, whatever the number of blob records.
+    NoBlobDirectory,
+    /// One side has a transaction that the other side does not have.
+    MissingTransaction,
+    /// The user, the description or the extension of a transaction
+    /// differs.
+    MetadataDiffers,
+    /// One side of a transaction has a record of an oid that the other
+    /// side does not have.
+    MissingRecord,
+    /// A pickle of the store differs from the pickle in the file.
+    RecordDiffers,
+    /// The blob directory has no blob file for a blob record.
+    MissingBlobFile,
+    /// The store has no blob for a blob record of the source.
+    MissingBlob,
+    /// A blob of the store and its blob file have different sizes or
+    /// different bytes.
+    BlobDiffers,
+    /// The store does not read a blob, or its blob file.
+    UnreadableBlob,
+    /// The transaction iterator of the store failed.
+    UnreadableStore,
+}
+
+impl ProblemKind {
+    /// Return the name of the problems of this kind, in the plural, for a
+    /// line of a report.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "stops before the end of the file",
+            Self::NoBlobDirectory => "no blob directory",
+            Self::MissingTransaction => "missing transactions",
+            Self::MetadataDiffers => "users, descriptions or extensions that differ",
+            Self::MissingRecord => "missing records",
+            Self::RecordDiffers => "records that differ",
+            Self::MissingBlobFile => "missing blob files",
+            Self::MissingBlob => "blobs that the store does not have",
+            Self::BlobDiffers => "blobs that differ",
+            Self::UnreadableBlob => "blobs that the store does not read",
+            Self::UnreadableStore => "failed reads of the store",
+        }
+    }
 }
 
 /// An error that stops a conversion.
