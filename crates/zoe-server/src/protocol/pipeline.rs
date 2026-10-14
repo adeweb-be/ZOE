@@ -19,7 +19,13 @@
 //!   for the client or run for a long time. A download keeps its slot until
 //!   it ends, and gives back its room after its first frame.
 //! - The other calls run on the read pool: at most `--blocking-threads`
-//!   calls of all the connections run at once.
+//!   calls of all the connections run at once. A call of the read pool
+//!   also takes a turn in the window of its connection (`outbox::Turn`),
+//!   so a client that reads slowly runs one such call at a time.
+//!
+//! A call starts only while at most `outbox::WAITING` bytes of frames of
+//! the session wait for the client. It waits for that, and for its turn,
+//! before it starts, never on a thread of the read pool.
 //!
 //! A connection with no call that runs and no open transaction holds no
 //! thread. The calls reach their tasks and their threads through the
@@ -38,7 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use super::message::Call;
-use super::outbox::{Outbox, Room};
+use super::outbox::{Outbox, Room, Turn};
 use super::session::{self, Reply, Session, Transaction};
 use super::{QUEUE, Stopping, Storages};
 use crate::runtime::{Runtime, block_on};
@@ -157,10 +163,12 @@ impl Drop for Mark {
 }
 
 /// What a call takes before it starts: a slot among the calls of its
-/// connection that run or wait, and room for its reply in the session
-/// queue. The call gives back its slot when it ends.
+/// connection that run or wait, a turn in the window when it runs on the
+/// read pool, and room for its reply in the session queue. The call gives
+/// back its slot and its turn when it ends.
 pub(crate) struct Ticket {
     slot: OwnedSemaphorePermit,
+    turn: Option<Turn>,
     room: Room,
 }
 
@@ -278,7 +286,13 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
 
     let _guard = Guard(lane, ended);
     let mut transaction = Transaction::new(Arc::clone(session));
-    while let Some((call, Ticket { slot: _slot, room })) = lane.next(transaction.is_open()) {
+    while let Some((
+        call,
+        Ticket {
+            slot: _slot, room, ..
+        },
+    )) = lane.next(transaction.is_open())
+    {
         if ended.is_set() {
             lane.stop();
             break;
@@ -299,7 +313,11 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
 /// connection, and put its reply. A panic ends the connection.
 fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended, peer: &str) {
     let _guard = EndOnPanic(ended);
-    let Ticket { slot: _slot, room } = ticket;
+    let Ticket {
+        slot: _slot,
+        turn: _turn,
+        room,
+    } = ticket;
     if ended.is_set() {
         return;
     }
@@ -366,9 +384,12 @@ impl Calls {
         self.ended.clone()
     }
 
-    /// Wait for the ticket of the next call: first a slot, then room for
-    /// its reply. The future holds no borrow of `self`.
-    pub(crate) fn ticket(&self) -> impl Future<Output = Ticket> + Send + 'static {
+    /// Wait for the ticket of `call`: first a slot, then a turn in the
+    /// window for a call of the read pool, or else until at most
+    /// `outbox::WAITING` bytes wait, then room for its reply. The future
+    /// holds no borrow of `self`.
+    pub(crate) fn ticket(&self, call: &Call) -> impl Future<Output = Ticket> + Send + 'static {
+        let reads = self.session.is_some() && session::on_read_pool(&call.method);
         let slots = Arc::clone(&self.slots);
         let outbox = self.outbox.clone();
         async move {
@@ -376,8 +397,14 @@ impl Calls {
                 .acquire_owned()
                 .await
                 .expect("the slots of a connection never close");
+            let turn = if reads {
+                Some(outbox.turn().await)
+            } else {
+                outbox.below().await;
+                None
+            };
             let room = outbox.room().await;
-            Ticket { slot, room }
+            Ticket { slot, turn, room }
         }
     }
 
@@ -464,7 +491,9 @@ impl Calls {
         let registered = self
             .pool
             .run(&*self.runtime, move || {
-                let Ticket { slot: _slot, room } = ticket;
+                let Ticket {
+                    slot: _slot, room, ..
+                } = ticket;
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
@@ -558,7 +587,7 @@ mod tests {
     /// Start `calls` on `connection`, each with its ticket.
     async fn start(connection: &mut Calls, calls: Vec<Call>) {
         for call in calls {
-            let ticket = connection.ticket().await;
+            let ticket = connection.ticket(&call).await;
             connection.start(call, ticket).await;
         }
     }
@@ -621,14 +650,15 @@ mod tests {
             tokio::time::timeout(limit, connection.quiet())
                 .await
                 .unwrap();
-            let held = connection.ticket().await;
+            let ping = call(1, "ping", Vec::new());
+            let held = connection.ticket(&ping).await;
             // A quiet that stops early gives back the slots that it took.
             let early = tokio::time::timeout(Duration::from_millis(50), connection.quiet()).await;
             assert!(early.is_err());
             let mut others = Vec::new();
             for _ in 1..QUEUE {
                 others.push(
-                    tokio::time::timeout(limit, connection.ticket())
+                    tokio::time::timeout(limit, connection.ticket(&ping))
                         .await
                         .unwrap(),
                 );
