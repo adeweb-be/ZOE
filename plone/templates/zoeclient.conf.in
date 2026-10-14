@@ -1,0 +1,19 @@
+%import zoe
+%define INSTANCEHOME ${buildout:parts-directory}/instance
+instancehome $INSTANCEHOME
+debug-mode off
+security-policy-implementation C
+verbose-security off
+default-zpublisher-encoding utf-8
+
+<zodb_db main>
+    cache-size 30000
+    <zoeclient>
+      server 127.0.0.1:8100
+      storage 1
+      name zoeclient
+      blob-dir ${buildout:var-directory}/blobcache
+      shared-blob-dir off
+    </zoeclient>
+    mount-point /
+</zodb_db>

@@ -212,19 +212,26 @@ crash runs="200" seed="" seeds="200":
 # it. `just plone zoe` builds the zoe scenario and starts its instance in the
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
-# site over HTTP. The other scenarios are filestorage, zeo, zeoclient and
-# zeoclient-mount. The instances of zeo, zeoclient and zeoclient-mount need
-# their server. `just plone zeoclient check` builds the `zoe` binary,
-# starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
-# end. `just plone zeoclient-mount check` starts one `zoe serve` with the
-# two named storages main and content, and puts the site in the mount
-# point /content. `just plone zoe suites` runs the test suites of
+# site over HTTP. The other scenarios are filestorage, zeo, zeoclient,
+# zoeclient and zeoclient-mount. The instances of zeo, zeoclient, zoeclient
+# and zeoclient-mount need their server. `just plone zeoclient check` builds
+# the `zoe` binary, starts `zoe serve` on target/plone/zeoclient/var/zoe and
+# stops it at the end; `just plone zoeclient check` does the same on
+# target/plone/zoeclient/var/zoe. `just plone zeoclient-mount check` starts
+# one `zoe serve` with the two named storages main and content, and puts
+# the site in the mount point /content. `just plone zoe suites` runs the test suites of
 # Products.CMFPlone, plone.app.contenttypes and plone.restapi with the
 # `bin/test` of the scenario, on the layer of zoe.plone.testing; the options
 # that follow go to `bin/test`. `just plone zeoclient suites` runs them
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
-# plone.testing. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# plone.testing. `just plone <scenario> creators THREADS ITEMS SEED` creates
+# a Plone site, sets the counter of portal_uidgenerator to SEED, and runs
+# plone/creators.py: THREADS threads that create ITEMS Documents each. Its
+# last line of stdout is a JSON report. It runs on zoe, zeoclient and
+# zoeclient; for zeoclient and zoeclient, it starts `zoe serve` on a new
+# store, target/plone/<scenario>/var/creators, and stops it at the end.
+# The build goes to target/plone. ZOE_PLONE_ADMIN gives the
 # admin user as user:password. Without it, the recipe makes a random
 # password once, in target/plone/admin. The instance listens on 127.0.0.1,
 # on the port ZOE_PLONE_PORT or 8080.
@@ -232,7 +239,7 @@ plone scenario="zoe" command="start" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
-        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient or zeoclient-mount." >&2
+        echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient, zoeclient or zeoclient-mount." >&2
         exit 2
     fi
     target="{{ justfile_directory() }}/target/plone"
@@ -385,10 +392,10 @@ plone scenario="zoe" command="start" *args:
             # point /content of zeoclient-mount.
             folder=""
             case "{{ scenario }}" in
-                zeoclient)
+                zeoclient | zoeclient)
                     # zoe serve serves the store of the scenario under the
                     # storage name 1, the default of ZEO.
-                    stores=(--path "$target/zeoclient/var/zoe")
+                    stores=(--path "$target/{{ scenario }}/var/zoe")
                     ;;
                 zeoclient-mount)
                     # One zoe serve serves the two databases of the
@@ -402,8 +409,9 @@ plone scenario="zoe" command="start" *args:
                     ;;
             esac
             if [ "${#stores[@]}" -gt 0 ]; then
-                # The instance is a ZEO client of zoe serve. It listens on
-                # the zeo-address of zeoclient.cfg.
+                # The instance is a ZEO client of zoe serve. The server
+                # listens on the zeo-address of zeoclient.cfg, which
+                # templates/zoeclient.conf.in also gives.
                 serve "$target/{{ scenario }}/var/log/zoe-serve.log" \
                     "${stores[@]}" --listen 127.0.0.1:8100
             fi
@@ -435,8 +443,37 @@ plone scenario="zoe" command="start" *args:
             "$target/{{ scenario }}/bin/test" -s Products.CMFPlone \
                 -s plone.app.contenttypes -s plone.restapi "$@"
             ;;
+        creators)
+            # The creators script runs in the instance with the storage of
+            # the scenario, after a new site. The instance must not run.
+            set -- {{ args }}
+            if [ "$#" -ne 3 ]; then
+                echo "just plone: use just plone {{ scenario }} creators THREADS ITEMS SEED." >&2
+                exit 2
+            fi
+            case "{{ scenario }}" in
+                zoe)
+                    ;;
+                zeoclient | zoeclient)
+                    # A new store for each run, on the address of the
+                    # configuration of the instance.
+                    store="$target/{{ scenario }}/var/creators"
+                    rm -rf "$store"
+                    serve "$target/{{ scenario }}/var/log/zoe-serve-creators.log" \
+                        --path "$store" --listen 127.0.0.1:8100
+                    ;;
+                *)
+                    echo "just plone: the creators run on zoe, zeoclient or zoeclient." >&2
+                    exit 2
+                    ;;
+            esac
+            "$instance" run plone/set_admin.py
+            "$instance" run plone/create_site.py "creators-$RANDOM$RANDOM"
+            # The last line of stdout is the JSON report of the script.
+            "$instance" run plone/creators.py "$@"
+            ;;
         *)
-            echo "just plone: unknown command {{ command }}. Use start, build, check or suites." >&2
+            echo "just plone: unknown command {{ command }}. Use start, build, check, suites or creators." >&2
             exit 2
             ;;
     esac
