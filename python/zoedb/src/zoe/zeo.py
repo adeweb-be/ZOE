@@ -161,10 +161,12 @@ class ClientStorage(ZEOClientStorage):
         super().__init__(*args, _client_factory=_client_factory, **kw)
 
     def notify_connected(self, conn, info):
-        # A server that got no declaration gives no key `extensions`. Do not
-        # keep the key of an earlier connection.
-        self._info.pop("extensions", None)
         super().notify_connected(conn, info)
+        # A server that got no declaration gives no key `extensions`. Then
+        # remove the key of an earlier connection. The key stays during the
+        # update, so a call of `next()` meanwhile does not fail.
+        if "extensions" not in info:
+            self._info.pop("extensions", None)
 
     def sequence(self, name):
         """Return the sequence `name` of the store."""
