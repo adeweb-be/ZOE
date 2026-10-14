@@ -37,6 +37,8 @@ toml = { version = "1.1", default-features = false, features = ["std", "parse", 
 # Only zoe-server, zoe-client, zoe-bench, zoe-mcp and Loupe's server mode use it.
 tokio = { version = "1.53", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# The log lines of `zoe serve`, as text or as JSON. Only zoe-server uses it.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = { version = "0.14", default-features = false }
 

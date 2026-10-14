@@ -39,6 +39,7 @@
 //! them, and logs itself when it ends, if it was slow.
 
 mod group;
+mod observer;
 mod staging;
 
 use std::borrow::Cow;
@@ -46,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::thread::{self, ThreadId};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
@@ -57,6 +58,7 @@ use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
 
@@ -565,10 +567,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        match store
+        // A store without an observer does not read the clock.
+        let started = store.observer().map(|_| Instant::now());
+        let acquired = store
             .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock)
-        {
+            .acquire(&requests, store.lock_timeout, &*store.clock);
+        if let (Some(observer), Some(started)) = (store.observer(), started) {
+            observer.locks_acquired(started.elapsed());
+        }
+        match acquired {
             Ok(locks) => {
                 self.locks = Some(locks.keep());
                 Ok(())
