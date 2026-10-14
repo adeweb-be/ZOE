@@ -686,13 +686,18 @@ impl Drop for Driver {
     /// Drop the tasks, then end the threads that are left, so that no
     /// thread outlives the run.
     fn drop(&mut self) {
-        self.tasks.clear();
-        let mut state = self.shared.lock();
-        state.spawned.clear();
-        drop(state);
-        // After a failure, a thread can be stuck: the drop does not wait
-        // for it.
+        // After a failure, a thread can be stuck and hold the state: the
+        // drop does not wait for it.
         let failed = std::thread::panicking();
+        self.tasks.clear();
+        let state = if failed {
+            self.shared.try_lock()
+        } else {
+            Some(self.shared.lock())
+        };
+        if let Some(mut state) = state {
+            state.spawned.clear();
+        }
         for (_, baton) in std::mem::take(&mut self.batons) {
             let _ = baton.resume.send(Resume::Killed);
             drop(baton.resume);
