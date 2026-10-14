@@ -23,6 +23,7 @@ mod restore;
 mod serve;
 mod verify;
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -81,6 +82,27 @@ enum Command {
     Restore(restore::RestoreArgs),
 }
 
+impl Command {
+    /// Return the name of the subcommand.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Convert(_) => "convert",
+            Self::Pack(_) => "pack",
+            Self::Serve(_) => "serve",
+            Self::Mcp(_) => "mcp",
+            Self::Verify(_) => "verify",
+            Self::Backup(_) => "backup",
+            Self::Restore(_) => "restore",
+        }
+    }
+}
+
+thread_local! {
+    /// The name of the subcommand that runs on this thread. The line of a
+    /// repair starts with it, as a failure does.
+    static COMMAND: Cell<&'static str> = const { Cell::new("") };
+}
+
 /// Why a subcommand failed. The command writes it to stderr and exits with
 /// [`FAILURE`].
 #[derive(Debug)]
@@ -117,9 +139,38 @@ fn store_failure(path: &Path, error: ZoeError) -> Failure {
     Failure::Message(format!("{}: {error}", path.display()))
 }
 
+/// Open the existing store in `path` read-only, with `options`, for a
+/// command that only reads the store.
+///
+/// The open repairs a store that a writer left open (ADR 0032), and writes
+/// one line to stderr that says so. On a store that was closed cleanly, it
+/// changes no byte and creates nothing. A store whose repair fails gives
+/// the failure, which says that the store was not closed cleanly and gives
+/// the error of the system.
+fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
+    let store =
+        Store::open_read_only_repairing(path, options).map_err(|e| store_failure(path, e))?;
+    if store.repaired() {
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(stderr, "{}", repair_line(path));
+        let _ = stderr.flush();
+    }
+    Ok(store)
+}
+
+/// Return the line of a repair of the store in `path`, for the subcommand
+/// that runs on this thread.
+fn repair_line(path: &Path) -> String {
+    format!(
+        "zoe {}: {}: the store was not closed cleanly: repaired the store",
+        COMMAND.get(),
+        path.display()
+    )
+}
+
 /// Open the store in `path` read-only, with its blob files in `blob_dir`
 /// (`blobs` in `path` when `None`), for a command that reads the blob
-/// files. The open changes no byte and creates nothing.
+/// files, as `open_read_only` does.
 ///
 /// A store with blob records whose blob directory has no layout file
 /// fails: that directory is not the one of the store (ADR 0027). The
@@ -129,7 +180,7 @@ fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failur
         blob_dir: blob_dir.map(Path::to_path_buf),
         ..Options::default()
     };
-    let store = Store::open_read_only_with(path, options).map_err(|e| store_failure(path, e))?;
+    let store = open_read_only(path, options)?;
     store
         .check_blob_dir()
         .map_err(|e| blob_dir_failure(path, e))?;
@@ -199,14 +250,16 @@ fn usage(error: &clap::Error) -> i32 {
 /// Run the subcommand of `cli` with the time of `clock`. Write the report
 /// to `out` and a failure to stderr. Return the exit code.
 fn run(cli: &Cli, clock: &dyn Clock, out: &mut dyn Write) -> i32 {
-    let (name, result) = match &cli.command {
-        Command::Convert(args) => ("convert", convert::run(args, out)),
-        Command::Pack(args) => ("pack", pack::run(args, clock, out)),
-        Command::Serve(args) => ("serve", serve::run(args, out)),
-        Command::Mcp(args) => ("mcp", mcp::run(args)),
-        Command::Verify(args) => ("verify", verify::run(args, out)),
-        Command::Backup(args) => ("backup", backup::run(args, out)),
-        Command::Restore(args) => ("restore", restore::run(args, out)),
+    let name = cli.command.name();
+    COMMAND.set(name);
+    let result = match &cli.command {
+        Command::Convert(args) => convert::run(args, out),
+        Command::Pack(args) => pack::run(args, clock, out),
+        Command::Serve(args) => serve::run(args, out),
+        Command::Mcp(args) => mcp::run(args),
+        Command::Verify(args) => verify::run(args, out),
+        Command::Backup(args) => backup::run(args, out),
+        Command::Restore(args) => restore::run(args, out),
     };
     // The console script runs this code in the Python process. Nothing
     // flushes stdout there when the process ends, so flush it here.
@@ -279,6 +332,15 @@ mod tests {
     }
 
     #[test]
+    fn the_line_of_a_repair_names_the_command_and_the_store() {
+        COMMAND.set("verify");
+        assert_eq!(
+            repair_line(Path::new("/srv/store")),
+            "zoe verify: /srv/store: the store was not closed cleanly: repaired the store"
+        );
+    }
+
+    #[test]
     fn a_wrong_blob_directory_names_the_option() {
         let blobs = PathBuf::from("elsewhere");
         let error = ZoeError::MissingBlobDir { path: blobs };
@@ -341,5 +403,32 @@ mod tests {
         assert!(!kept(tids[0]), "{report}");
         assert!(kept(tids[1]) && kept(tids[2]), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dry_run_repairs_a_store_that_a_writer_left_open() {
+        let tid = timestamp(day(1));
+        let dir = store_with_roots("dry-run-repair", &[tid]);
+        // A copy of the database of an open store is what a crash leaves.
+        let copy = dir.with_extension("copy");
+        let _ = std::fs::remove_dir_all(&copy);
+        std::fs::create_dir_all(&copy).unwrap();
+        let store = Store::open(&dir).unwrap();
+        std::fs::copy(dir.join("zoe.redb"), copy.join("zoe.redb")).unwrap();
+        drop(store);
+        let strict = Store::open_read_only(&copy);
+        assert!(matches!(strict, Err(ZoeError::NotClosedCleanly)));
+
+        let path = copy.to_str().unwrap();
+        let args = ["zoe", "pack", "--path", path, "--days", "0", "--dry-run"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run(&cli, &Fixed(day(2)), &mut out), SUCCESS);
+
+        let store = Store::open_read_only(&copy).unwrap();
+        assert_eq!(store.last_transaction(), tid);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy);
     }
 }
