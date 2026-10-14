@@ -1,0 +1,58 @@
+# zoe serve on a host, as a systemd service.
+#
+# Install the static zoe binary as /usr/local/bin/zoe, the configuration
+# file as /etc/zoe/zoe.toml (deploy/zoe.toml is an example), and create the
+# user zoe. systemd creates /var/lib/zoe for the user.
+#
+#   cp deploy/systemd/zoe.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now zoe
+[Unit]
+Description=ZOE storage server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=zoe
+Group=zoe
+ExecStart=/usr/local/bin/zoe serve --config /etc/zoe/zoe.toml
+# On SIGTERM, zoe serve completes the tpc_finish calls that it received,
+# aborts the other transactions, closes the stores and exits with 0. The
+# stop takes at most shutdown-timeout (30 seconds by default). Give systemd
+# a longer timeout. Else it sends SIGKILL before the stores close.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=2s
+StateDirectory=zoe
+StateDirectoryMode=0750
+ConfigurationDirectory=zoe
+WorkingDirectory=/var/lib/zoe
+LimitNOFILE=65536
+UMask=0027
+
+# Hardening. zoe serve writes only to its state directory.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
