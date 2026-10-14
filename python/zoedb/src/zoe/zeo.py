@@ -296,6 +296,11 @@ class ClientStorage(ZEOClientStorage):
     def __new__(cls, *args, native=False, **kw):
         if native and cls is ClientStorage:
             cls = _NativeClientStorage
+        elif native and not issubclass(cls, _NativeClientStorage):
+            raise TypeError(
+                f"{cls.__name__} runs the client of ZEO: native=True needs"
+                " zoe.zeo.ClientStorage itself"
+            )
         return super().__new__(cls)
 
     def __init__(
@@ -557,6 +562,17 @@ class _NativeClientStorage(ClientStorage):
             self._native.close()
             raise
 
+    def _check_process(self):
+        """Raise `RuntimeError` in a child of `os.fork()`.
+
+        The check comes before any lock: a thread of the parent can hold a
+        lock at the fork, and the child would wait for it for ever.
+        """
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                "the client was opened in another process, before a fork"
+            )
+
     # The calls that the native client does not have yet.
 
     def _call(self, method, *args, **kw):
@@ -595,6 +611,7 @@ class _NativeClientStorage(ClientStorage):
         return False
 
     def close(self):
+        self._check_process()
         self._native.close()
         delivery = self._delivery
         if delivery is not None and delivery is not threading.current_thread():
@@ -649,6 +666,7 @@ class _NativeClientStorage(ClientStorage):
         return None
 
     def lastTransaction(self):
+        self._check_process()
         with self._deliver_lock:
             self._deliver()
             return self._last_tid
@@ -671,12 +689,9 @@ class _NativeClientStorage(ClientStorage):
         return self.load(oid)[1]
 
     def new_oid(self):
+        self._check_process()
         if self._is_read_only:
             raise ReadOnlyError()
-        if os.getpid() != self._pid:
-            raise RuntimeError(
-                "the client was opened in another process, before a fork"
-            )
         with self._oids_lock:
             if not self._oids:
                 self._oids = list(reversed(self._native.new_oids(_NEW_OIDS)))
@@ -697,6 +712,7 @@ class _NativeClientStorage(ClientStorage):
         return self._transaction
 
     def tpc_begin(self, txn, tid=None, status=" "):
+        self._check_process()
         if self._is_read_only:
             raise ReadOnlyError()
         if tid is not None:
@@ -730,16 +746,21 @@ class _NativeClientStorage(ClientStorage):
         return self._native.vote() or None
 
     def tpc_finish(self, txn, f=lambda tid: None):
+        self._check_process()
         self._check_trans(txn, "tpc_finish")
         try:
-            tid = self._native.finish()
+            # The lock covers the round trip. So the thread of the
+            # invalidations gives no later tid to the DB before `f(tid)`.
+            # The call waits only for the server, never for that thread.
             with self._deliver_lock:
+                tid = self._native.finish()
                 self._deliver(tid, f)
         finally:
             self.tpc_end(txn)
         return tid
 
     def tpc_abort(self, txn, timeout=None):
+        self._check_process()
         if txn is None or txn is not self._transaction:
             return
         try:
