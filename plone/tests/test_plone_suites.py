@@ -25,8 +25,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 # The suites hold thousands of tests. A run that collects fewer did not
-# run them all.
-FLOOR = 3000
+# run them all. The floor leaves out the robot tests, which need a browser.
+FLOOR = 2900
 SUMMARY = re.compile(
     r"Total: (?P<tests>\d+) tests, (?P<failures>\d+) failures?, "
     r"(?P<errors>\d+) errors?"
