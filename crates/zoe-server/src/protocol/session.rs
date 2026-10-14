@@ -4544,9 +4544,22 @@ mod tests {
             // Another test thread can register the callsite of the
             // connection span while this subscriber registers. tracing can
             // then cache the interest of the span as "never", and the line
-            // of the lock loses the fields of the span. A rebuild here
-            // computes the interest again with this subscriber.
-            tracing::callsite::rebuild_interest_cache();
+            // of the lock loses the fields of the span. One rebuild does
+            // not always fix it: a registration that is in progress can
+            // store its interest after the rebuild. A span that is enabled
+            // proves that the callsite is registered for good, so rebuild
+            // until the span of a session is enabled.
+            let probe = Session::new(Arc::clone(&storage), outbox(), never_stops());
+            let mut enabled = false;
+            for _ in 0..10_000 {
+                tracing::callsite::rebuild_interest_cache();
+                if !probe.span("probe").is_disabled() {
+                    enabled = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(enabled, "the span of the connection stays disabled");
             run(serving(Arc::clone(&storage)), received, replies);
         });
 
