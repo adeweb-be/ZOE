@@ -12,6 +12,9 @@
 //! `--admin-listen`, it writes the line `admin <address>` before it. The
 //! logs go to stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
 //! the command closes the connections and the stores, and exits with 0.
+//! The command handles both signals before it creates anything on disk. A
+//! signal during the start stops the server when the start ends, so a
+//! store that the start creates is complete and closes cleanly.
 //!
 //! The console script of the wheel has no server: its extension never
 //! links tokio. There, the command fails with 1 and names the `zoe` binary.
@@ -102,6 +105,21 @@ pub(super) struct ServeArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     client_queue_size: u64,
+
+    /// The most bytes that the page cache of each store holds, such as
+    /// 1073741824, 512MB or 1GB: KB, MB and GB in any case are powers of
+    /// 1024, as in ZConfig's byte-size. The cache does not grow with the
+    /// size of the store. With the blocking threads, the client queues and
+    /// the staging memory of the open transactions, it bounds the resident
+    /// memory of the server. The default is the default of the store, 1GB.
+    #[arg(
+        long,
+        env = "ZOE_CACHE_SIZE",
+        value_name = "BYTES",
+        value_parser = byte_size
+    )]
+    cache_size: Option<usize>,
+
     /// The longest time that a vote waits for the lock of an object, in
     /// whole seconds, such as 10, 10s or 2m, as the key lock-timeout of the
     /// <zoe> section takes it. A longer wait fails the vote with
@@ -359,6 +377,25 @@ fn whole_seconds(value: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{value} is not a whole number of seconds, 0 or more"))
 }
 
+/// Parse a size in bytes, as ZConfig's `byte-size` does: a whole number,
+/// 0 or more, with the suffix `KB`, `MB` or `GB` in any case, or none for
+/// bytes. A suffix is a power of 1024.
+fn byte_size(value: &str) -> Result<usize, String> {
+    let text = value.trim().to_ascii_lowercase();
+    let (number, unit) = match text.len().checked_sub(2).map(|n| text.split_at(n)) {
+        Some((number, "kb")) => (number, 1 << 10),
+        Some((number, "mb")) => (number, 1 << 20),
+        Some((number, "gb")) => (number, 1 << 30),
+        _ => (text.as_str(), 1),
+    };
+    number
+        .trim_end()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| format!("{value} is not a whole number of bytes, 0 or more"))
+}
+
 /// Complete the arguments `cli` of the command line `args`, whose parse
 /// gave `matches`. For `zoe serve`, add the options and the stores of the
 /// configuration file, and set the stores to serve. A configuration file
@@ -462,7 +499,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 
 /// Serve until SIGTERM or SIGINT, then stop. Write the line
 /// `admin <address>` when the server has an admin port, then the line
-/// `listening <address>`, to `out`.
+/// `listening <address>`, to `out`. Handle both signals from before the
+/// start: a signal during the start stops the server when the start ends.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -487,6 +525,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .shared_blob_dir(args.shared_blob_dir);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
+    }
+    if let Some(bytes) = args.cache_size {
+        options = options.cache_size(bytes);
     }
     if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
         options = options.lock_warn(threshold);
@@ -514,7 +555,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         }
         options = options.tls(tls);
     }
-    let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
+    let server =
+        Server::start_with_signals(options).map_err(|error| Failure::Message(error.to_string()))?;
     if let Some(admin) = server.admin_addr() {
         writeln!(out, "admin {admin}")?;
     }
@@ -644,6 +686,37 @@ mod tests {
         assert!(!serve(&["--read-only=false"]).unwrap().read_only);
         let error = serve(&["--read-only=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_cache_size_keeps_the_default_of_the_store_and_takes_a_byte_size() {
+        assert_eq!(serve(&[]).unwrap().cache_size, None);
+        let args = serve(&["--cache-size", "16MB"]).unwrap();
+        assert_eq!(args.cache_size, Some(16 << 20));
+        let error = serve(&["--cache-size", "16 MiB"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        for (value, bytes) in [
+            ("0", 0),
+            ("4096", 4096),
+            ("1kb", 1 << 10),
+            ("512MB", 512 << 20),
+            ("1Gb", 1 << 30),
+            (" 2 GB ", 2 << 30),
+        ] {
+            assert_eq!(byte_size(value), Ok(bytes), "{value}");
+        }
+        for value in [
+            "",
+            "mb",
+            "-1",
+            "1.5MB",
+            "ten",
+            "1TB",
+            "1 KiB",
+            "18446744073709551615kb",
+        ] {
+            assert!(byte_size(value).is_err(), "{value}");
+        }
     }
 
     #[test]

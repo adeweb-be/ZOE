@@ -636,9 +636,27 @@ impl Session {
             "iterator_gc" => self.iterator_gc(args),
             "pack" => self.pack(args),
             "sendBlob" => return self.send_blob(args, reply),
+            "sequence_next" => self.sequence_next(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
+    }
+
+    /// Return the next value of the sequence `name` of the store (F29),
+    /// for a connection that declared the extension `sequences`. The value
+    /// is not part of a transaction: an abort does not give it back. A
+    /// read-only connection fails with `ReadOnlyError`, as `zoe.Storage`
+    /// does. Every 100 values of a name, the call waits for one write of
+    /// the backend.
+    fn sequence_next(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [name] = arity::<1>(args, "sequence_next")?;
+        let name = name
+            .as_str()
+            .ok_or_else(|| Fault::type_error("the name of a sequence is not a str"))?;
+        if self.read_only() {
+            return Err(Fault::read_only());
+        }
+        Ok(Value::from(self.store.sequence(name).next()?))
     }
 
     /// Register the connection with its storage. A ZOE client declares the
@@ -2782,6 +2800,86 @@ mod tests {
             failed(call(&mut s, "register", again)).class,
             "builtins.ValueError"
         );
+    }
+
+    /// Return a session registered with the declaration `declaration`.
+    fn declaring(name: &str, read_only: bool, declaration: &[&str]) -> Client {
+        let mut s = session(name);
+        let names = declaration.iter().map(|name| Value::from(*name)).collect();
+        let args = vec![
+            Value::from("1"),
+            Value::Boolean(read_only),
+            Value::Array(names),
+        ];
+        done(call(&mut s, "register", args));
+        s
+    }
+
+    fn sequence_next(name: Value) -> Call {
+        Call {
+            id: Value::from(1),
+            oneway: false,
+            method: "sequence_next".into(),
+            args: vec![name],
+        }
+    }
+
+    #[test]
+    fn sequence_next_gives_the_values_of_each_name_from_one() {
+        let mut s = declaring("sequence-next", false, &["sequences"]);
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(
+            get(&info, "extensions"),
+            &Value::Array(vec![Value::from("sequences")])
+        );
+        let values: Vec<_> = (0..150)
+            .map(|_| done(s.call(&sequence_next(Value::from("intids")))))
+            .collect();
+        let expected: Vec<_> = (1..=150_u64).map(Value::from).collect();
+        assert_eq!(values, expected);
+        assert_eq!(
+            done(s.call(&sequence_next(Value::from("lexicon")))),
+            Value::from(1)
+        );
+        let fault = failed(s.call(&sequence_next(Value::Binary(b"intids".to_vec()))));
+        assert_eq!(fault.class, "builtins.TypeError");
+        let fault = failed(call(&mut s, "sequence_next", vec![]));
+        assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn sequence_next_is_outside_the_transaction() {
+        let mut s = declaring("sequence-abort", false, &["sequences"]);
+        begin(&mut s, 7, None);
+        let next = sequence_next(Value::from("intids"));
+        assert_eq!(done(s.call(&next)), Value::from(1));
+        done(call(&mut s, "tpc_abort", vec![Value::from(7)]));
+        assert_eq!(done(s.call(&next)), Value::from(2));
+    }
+
+    #[test]
+    fn a_read_only_connection_takes_no_value() {
+        let mut s = declaring("sequence-read-only", true, &["sequences"]);
+        let fault = failed(s.call(&sequence_next(Value::from("intids"))));
+        assert_eq!(fault, Fault::read_only());
+    }
+
+    #[test]
+    fn sequence_next_needs_the_declaration_in_both_dispatches() {
+        let next = sequence_next(Value::from("intids"));
+        for mut s in [
+            registered("sequence-stock"),
+            declaring("sequence-none", false, &[]),
+            declaring("sequence-other", false, &["unknown"]),
+        ] {
+            let mut reply = Reply::new(s.session.outbox.blocking_room());
+            let fault = failed(s.session.call(&next, &mut reply));
+            assert_eq!(fault.class, "builtins.ValueError");
+            assert_eq!(failed(s.txn.call(&next)).class, "builtins.ValueError");
+            // The connection stays open, and the store gave no value.
+            assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
+            assert_eq!(s.store.sequence("intids").next().unwrap(), 1);
+        }
     }
 
     #[test]
