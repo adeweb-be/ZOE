@@ -176,6 +176,10 @@ fn convert_failure(path: &Path, error: zoe_convert::Error) -> Failure {
 }
 
 /// Write the report of a conversion.
+///
+/// The line `problems` gives the number of problems. One line for each
+/// kind with a problem follows, with its count and no cap. Then come the
+/// lines of the capped list.
 fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::Result<()> {
     writeln!(out, "Converted {title}")?;
     writeln!(out, "  transactions  {}", report.transactions)?;
@@ -183,7 +187,15 @@ fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::R
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
     writeln!(out, "  last tid      {:#018x}", report.last_tid.0)?;
-    writeln!(out, "  problems      {}", report.problems.len())?;
+    writeln!(out, "  problems      {}", report.problem_count())?;
+    let width = report
+        .counts()
+        .map(|(kind, _)| kind.label().len())
+        .max()
+        .unwrap_or(0);
+    for (kind, count) in report.counts() {
+        writeln!(out, "    {:<width$}  {count}", kind.label())?;
+    }
     for problem in &report.problems {
         writeln!(out, "    {problem}")?;
     }
