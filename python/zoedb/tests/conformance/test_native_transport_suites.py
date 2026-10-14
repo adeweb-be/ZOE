@@ -16,9 +16,11 @@ The run collects `ZEO.tests.testssl` unchanged and the doctest
 layers and the layers of their suites. A test passes, or is in `OUT` with
 its reason. `OUT` holds the tests that the answer to the question about
 `ssl=` contexts excludes: ZEO's `<ssl>` section of `<clientstorage>`
-gives the client an `ssl.SSLContext`, not the paths of its files. `OUT` is
-empty until the human answers. No network thread of ZEO's own client
-starts during the run, so the tests exercise the native client.
+gives the client an `ssl.SSLContext`, not the paths of its files. The
+answer: the native client takes only the files of the `<ssl>` section of
+`<zoeclient>`, and an `ssl` context fails the open. No network thread of
+ZEO's own client starts during the run, so the tests exercise the native
+client.
 """
 
 import contextlib
@@ -30,7 +32,16 @@ import zoe.testing
 # The tests that the run does not run, and why. A name is the class that
 # defines the test and its method, or the name of a doctest. The answer to
 # the question about `ssl=` contexts fills it.
-OUT = {}
+OUT = {
+    "SSLConfigTest.test_ssl_basic": (
+        "its <clientstorage> gives the client an ssl context: the native "
+        "client takes only the files of the <ssl> section of <zoeclient>"
+    ),
+    "SSLConfigTest.test_ssl_hostname_check": (
+        "its <clientstorage> gives the client an ssl context: the native "
+        "client takes only the files of the <ssl> section of <zoeclient>"
+    ),
+}
 
 # The tests of ZEO that this run must hold.
 EXPECTED = {

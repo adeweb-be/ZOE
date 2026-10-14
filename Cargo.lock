@@ -2373,8 +2373,10 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "rmpv",
+ "rustls",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "zoe-core",
  "zoe-server",
 ]

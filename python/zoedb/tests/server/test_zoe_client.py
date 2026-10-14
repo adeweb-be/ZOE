@@ -2,11 +2,14 @@
 
 The acceptance test covers the sequences over the protocol, a stock client,
 a stock server and the section that opens the client. These tests cover the
-rest: the keys of the section, the read-only fallback with the declaration,
-a name that is not a str, and the switch to the native client.
+rest: the keys of the section, its `<ssl>` section, the read-only fallback
+with the declaration, a name that is not a str, the switch to the native
+client, and the arguments of TLS and of the addresses of the native client.
 """
 
 import io
+import socket
+import types
 
 import pytest
 import ZConfig
@@ -34,7 +37,7 @@ def client(server, **kw):
 
 
 def keys(schema, name):
-    return {key for key, _ in schema.gettype(name)}
+    return {key for key, info in schema.gettype(name) if not info.issection()}
 
 
 def test_the_zoeclient_section_takes_every_key_of_zeoclient():
@@ -43,6 +46,36 @@ def test_the_zoeclient_section_takes_every_key_of_zeoclient():
         "wait-timeout",
         "native",
     }
+
+
+def test_the_ssl_section_takes_the_keys_of_the_ssl_section_of_zeo():
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    assert keys(schema, "ssl") == {
+        "certificate",
+        "key",
+        "password-function",
+        "authenticate",
+        "check-hostname",
+        "server-hostname",
+    }
+
+
+def test_the_ssl_section_of_zoeclient_keeps_its_files(tmp_path):
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    text = (
+        "%import zoe\n<zoeclient>\nserver 127.0.0.1:1\n"
+        f"<ssl>\ncertificate {tmp_path / 'c.pem'}\n"
+        f"authenticate {tmp_path / 'ca.pem'}\nserver-hostname localhost\n"
+        "</ssl>\n</zoeclient>\n"
+    )
+    config, _ = ZConfig.loadConfigFile(schema, io.StringIO(text))
+    ssl = config.storage.config.ssl
+    assert ssl.certificate == str(tmp_path / "c.pem")
+    assert ssl.key is None
+    assert ssl.authenticate == str(tmp_path / "ca.pem")
+    assert ssl.check_hostname is True
+    assert ssl.server_hostname == "localhost"
+    assert ssl.password_function is None
 
 
 def test_a_read_only_fallback_keeps_the_declaration(tmp_path):
@@ -124,14 +157,88 @@ def test_the_native_client_ignores_what_zeo_ignores(tmp_path):
             storage.close()
 
 
-def test_the_native_client_refuses_a_unix_socket_and_several_addresses():
+def test_an_ssl_context_fails_the_native_open_and_names_it():
+    import ssl
+
     from ZODB.POSException import Unsupported
 
     import zoe.testing
 
-    for address in ("./zeo.sock", [("127.0.0.1", 1), ("127.0.0.1", 2)]):
-        with pytest.raises(Unsupported, match="one TCP address"):
-            zoe.testing.native_client(address, wait_timeout=1)
+    context = ssl.create_default_context()
+    with pytest.raises(Unsupported, match="ssl context"):
+        zoe.testing.native_client(("127.0.0.1", 1), ssl=context, wait_timeout=1)
+
+
+def ssl_section(**keys):
+    """Return an object with the attributes of an `<ssl>` section."""
+    section = {
+        "certificate": "c.pem",
+        "key": None,
+        "password_function": None,
+        "authenticate": "ca.pem",
+        "check_hostname": True,
+        "server_hostname": None,
+    }
+    section.update(keys)
+    return types.SimpleNamespace(**section)
+
+
+def test_the_native_tls_takes_the_files_of_the_ssl_section(tmp_path, monkeypatch):
+    import zoe.zeo
+
+    monkeypatch.chdir(tmp_path)
+    tls = zoe.zeo._native_tls(ssl_section(), None)
+    assert tls == (
+        str(tmp_path / "c.pem"),
+        None,
+        str(tmp_path / "ca.pem"),
+        True,
+        None,
+    )
+    tls = zoe.zeo._native_tls(
+        ssl_section(key="k.pem", check_hostname=False, server_hostname="a"), None
+    )
+    assert tls[1] == str(tmp_path / "k.pem")
+    assert tls[3:] == (False, "a")
+    # The argument ssl_server_hostname comes before the section.
+    tls = zoe.zeo._native_tls(ssl_section(server_hostname="a"), "b")
+    assert tls[4] == "b"
+
+
+def test_the_native_tls_refuses_what_it_does_not_read(tmp_path):
+    from ZODB.POSException import Unsupported
+
+    import zoe.zeo
+
+    refused = {
+        "password-function": ssl_section(password_function="m.f"),
+        "authenticate": ssl_section(authenticate=None),
+        "directory": ssl_section(authenticate=str(tmp_path)),
+    }
+    for match, section in refused.items():
+        with pytest.raises(Unsupported, match=match):
+            zoe.zeo._native_tls(section, None)
+
+
+def test_an_empty_host_is_the_loopback_for_the_native_client():
+    import zoe.zeo
+
+    assert zoe.zeo._native_address(("", 8100)) == ("127.0.0.1", 8100)
+    assert zoe.zeo._native_address(("db", 8100)) == ("db", 8100)
+    assert zoe.zeo._native_address("./zeo.sock") == "./zeo.sock"
+
+
+def test_a_native_open_without_a_server_raises_client_disconnected(tmp_path):
+    from ZEO.Exceptions import ClientDisconnected
+
+    import zoe.testing
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()
+    addresses = [closed, str(tmp_path / "zeo.sock")]
+    with pytest.raises(ClientDisconnected, match="zeo.sock"):
+        zoe.testing.native_client(addresses, wait_timeout=1)
 
 
 def test_a_call_after_the_close_raises_client_disconnected(tmp_path):
