@@ -21,6 +21,7 @@ filter-syscalls = false
 accept-flake-config = true
 extra-substituters = https://devenv.cachix.org
 extra-trusted-public-keys = devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
+!include /etc/nix/access-tokens.conf
 """
 
 # The user of the server image: a numeric id that is not root. A runtime
@@ -64,18 +65,31 @@ Source = Annotated[
 class Ci:
     """The CI functions. GitHub Actions workflows call them."""
 
-    def devenv(self, source: dagger.Directory) -> dagger.Container:
+    github_token: Annotated[
+        dagger.Secret | None,
+        Doc("A GitHub token. Nix sends it with its requests to the GitHub API"),
+    ] = None
+
+    async def devenv(self, source: dagger.Directory) -> dagger.Container:
         """Return a container with devenv and the repository in /src."""
         base = dag.container().from_(NIX_IMAGE)
-        return (
-            base.with_mounted_cache(
-                "/nix",
-                dag.cache_volume("zoe-nix"),
-                source=base.directory("/nix"),
-                sharing=dagger.CacheSharingMode.LOCKED,
+        ctr = base.with_mounted_cache(
+            "/nix",
+            dag.cache_volume("zoe-nix"),
+            source=base.directory("/nix"),
+            sharing=dagger.CacheSharingMode.LOCKED,
+        ).with_new_file("/etc/nix/nix.conf", NIX_CONF)
+        # Nix fetches the github: inputs through the GitHub API. Without a
+        # token, the API allows few requests for each address, and hosted
+        # runners share their addresses. Nix ignores a missing include file.
+        if self.github_token is not None:
+            token = await self.github_token.plaintext()
+            tokens = dag.set_secret(
+                "nix-access-tokens", f"access-tokens = github.com={token}\n"
             )
-            .with_new_file("/etc/nix/nix.conf", NIX_CONF)
-            .with_exec(["nix", "profile", "add", DEVENV])
+            ctr = ctr.with_mounted_secret("/etc/nix/access-tokens.conf", tokens)
+        return (
+            ctr.with_exec(["nix", "profile", "add", DEVENV])
             .with_mounted_cache(
                 "/root/.cargo/registry", dag.cache_volume("zoe-cargo-registry")
             )
@@ -86,7 +100,7 @@ class Ci:
             .with_workdir("/src")
         )
 
-    def recipe(
+    async def recipe(
         self,
         source: dagger.Directory,
         name: str,
@@ -95,7 +109,7 @@ class Ci:
         privileged: bool = False,
     ) -> dagger.Container:
         """Run one just recipe inside the devenv shell."""
-        ctr = self.devenv(source)
+        ctr = await self.devenv(source)
         if cache_target:
             ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
         return ctr.with_exec(
@@ -111,12 +125,14 @@ class Ci:
     @function
     async def check(self, source: Source) -> str:
         """Check the format and run clippy and the Python lints."""
-        return await self.recipe(source, "check").stdout()
+        ctr = await self.recipe(source, "check")
+        return await ctr.stdout()
 
     @function
     async def test(self, source: Source) -> str:
         """Run the Rust tests and the Python tests on every interpreter."""
-        return await self.recipe(source, "test").stdout()
+        ctr = await self.recipe(source, "test")
+        return await ctr.stdout()
 
     @function
     async def tsan(self, source: Source) -> str:
@@ -125,7 +141,8 @@ class Ci:
         # the personality call and runs the test again. The seccomp filter of a
         # normal container refuses this call. So this exec runs with all root
         # capabilities and no seccomp filter.
-        return await self.recipe(source, "tsan", privileged=True).stdout()
+        ctr = await self.recipe(source, "tsan", privileged=True)
+        return await ctr.stdout()
 
     @function
     async def fuzz(
@@ -138,33 +155,34 @@ class Ci:
         """Run the fuzz targets of zoe serve, one hour by default."""
         # The inputs that libFuzzer finds stay in the target cache volume, so
         # the next run starts from them.
-        return await self.recipe(source, "fuzz", (str(seconds),)).stdout()
+        ctr = await self.recipe(source, "fuzz", (str(seconds),))
+        return await ctr.stdout()
 
     @function
-    def docs(self, source: Source) -> dagger.Directory:
+    async def docs(self, source: Source) -> dagger.Directory:
         """Build the documentation site and return it."""
         # The book goes to target/book, so target must not be a cache volume here.
-        return self.recipe(source, "docs", cache_target=False).directory(
-            "/src/target/book"
-        )
+        ctr = await self.recipe(source, "docs", cache_target=False)
+        return ctr.directory("/src/target/book")
 
     @function
     async def conformance(self, source: Source) -> str:
         """Run the ZODB suites in-process and the ZEO suites against zoe serve."""
-        return await self.recipe(source, "conformance").stdout()
+        ctr = await self.recipe(source, "conformance")
+        return await ctr.stdout()
 
     @function
     async def plone(self, source: Source) -> str:
         """Run the Plone suites on ZOE in-process, then through zoe serve."""
         # The second run starts from the first one, so it reuses its eggs.
-        zoe = self.recipe(source, "plone", ("zoe", "suites"))
+        zoe = await self.recipe(source, "plone", ("zoe", "suites"))
         zeoclient = zoe.with_exec(
             ["devenv", "shell", "--", "just", "plone", "zeoclient", "suites"]
         )
         return await zoe.stdout() + await zeoclient.stdout()
 
     @function
-    def bench(
+    async def bench(
         self,
         source: Source,
         quick: Annotated[
@@ -186,9 +204,9 @@ class Ci:
             .as_service()
         )
         run = ["devenv", "shell", "--", "just", "bench", "run", "--output", "/results"]
+        ctr = await self.devenv(source)
         return (
-            self.devenv(source)
-            .with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
+            ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
             .with_service_binding("postgres", postgres)
             .with_env_variable(
                 "ZOE_BENCH_PG_DSN", "host=postgres dbname=zoe_bench user=postgres"
@@ -207,28 +225,37 @@ class Ci:
         seed: Annotated[
             int | None, Doc("The seed of the kill loop. The default is a random seed")
         ] = None,
+        seeds: Annotated[
+            int, Doc("The seeds of the kill loop under the simulator")
+        ] = 10_000,
     ) -> str:
-        """Run the process kill loop against zoe serve, 10,000 rounds by default.
+        """Run the process kill loop, then the kill loop under the simulator.
 
-        The output gives the seed. The traceback of a failure shows the
-        round. 10,000 rounds need about 3 GB in TMPDIR. The simulated kill
-        loop and the power-loss emulation are not built yet.
+        The process kill loop runs 10,000 rounds against zoe serve by
+        default. The output gives the seed. The traceback of a failure
+        shows the round. 10,000 rounds need about 3 GB in TMPDIR. The kill
+        loop under the simulator runs `ZOE_SIM_SEEDS=10000` by default,
+        with power-loss crash images at each phase of a commit. A failing
+        seed prints `ZOE_SIM_SEED=<seed>`.
         """
         # The cache policy "never" makes each call run this body. A new seed
         # for each call also gives a new exec, so the exec cache misses too.
         if seed is None:
             seed = random.randrange(1 << 30)
-        return await self.recipe(source, "crash", (str(runs), str(seed))).stdout()
+        args = (str(runs), str(seed), str(seeds))
+        ctr = await self.recipe(source, "crash", args)
+        return await ctr.stdout()
 
     @function
-    def zoe_binary(self, source: Source) -> dagger.File:
+    async def zoe_binary(self, source: Source) -> dagger.File:
         """Build the static `zoe` binary, with `serve`, for Linux x86-64."""
         # The build uses no shared target cache. Cargo finds changed files
         # by their mtimes, so a cache that another checkout filled can give
         # objects of other code.
-        return self.recipe(
+        ctr = await self.recipe(
             source, "release", ("binary", "/dist"), cache_target=False
-        ).file("/dist/zoe")
+        )
+        return ctr.file("/dist/zoe")
 
     @function
     async def server_image(self, source: Source) -> dagger.Container:
@@ -238,11 +265,12 @@ class Ci:
         is ghcr.io/adeweb-be/zoe, and its tags are the release versions.
         """
         package = await self.workspace(source)
+        binary = await self.zoe_binary(source)
         # The image starts empty: no shell, no package manager, no
         # interpreter. The binary needs no C library.
         return (
             dag.container(platform=dagger.Platform("linux/amd64"))
-            .with_file("/usr/local/bin/zoe", self.zoe_binary(source), permissions=0o755)
+            .with_file("/usr/local/bin/zoe", binary, permissions=0o755)
             .with_directory(IMAGE_STORE, dag.directory(), owner=IMAGE_USER)
             .with_env_variable("ZOE_PATH", IMAGE_STORE)
             # The runtime of the container exposes the ports, so the server
@@ -275,10 +303,9 @@ class Ci:
         if tag and tag != f"v{version}":
             raise ValueError(f"the tag {tag} is not v{version}, the version")
         image = await self.server_image(source)
+        binary = await self.zoe_binary(source)
         return (
             dag.directory()
-            .with_file(
-                f"zoe-{version}-x86_64-unknown-linux-musl", self.zoe_binary(source)
-            )
+            .with_file(f"zoe-{version}-x86_64-unknown-linux-musl", binary)
             .with_file(f"zoe-{version}-image.tar", image.as_tarball())
         )

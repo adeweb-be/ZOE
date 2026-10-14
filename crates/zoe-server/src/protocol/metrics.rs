@@ -21,7 +21,7 @@
 //!   ended between the two votes, so that the client raised
 //!   `ConflictError`.
 //! - `zoe_clients_connected`: the connections that registered.
-//! - `zoe_invalidation_queue_depth`: the frames that wait in the deepest
+//! - `zoe_invalidation_queue_depth`: the messages that wait in the deepest
 //!   hub queue among the connections of the storage.
 
 use std::fmt::Write as _;
@@ -258,7 +258,7 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         &mut out,
         "zoe_invalidation_queue_depth",
         "gauge",
-        "The frames that wait in the deepest hub queue among the connections of the storage.",
+        "The messages that wait in the deepest hub queue among the connections of the storage.",
         &|s| s.hub.deepest_queue() as u64,
     );
     out

@@ -1,0 +1,41 @@
+# The ZEO port, for the ZEO clients: the Plone instances. Only a ready
+# pod gets clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: zoe
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+  ports:
+    - name: zeo
+      port: 8100
+      targetPort: zeo
+      protocol: TCP
+---
+# The admin port, for Prometheus. It is also the governing Service of the
+# StatefulSet. It publishes the pod before it is ready and while it stops,
+# so the metrics of these phases are scraped too.
+apiVersion: v1
+kind: Service
+metadata:
+  name: zoe-admin
+  labels:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: admin
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: zoe
+    app.kubernetes.io/component: server
+  ports:
+    - name: admin
+      port: 8101
+      targetPort: admin
+      protocol: TCP

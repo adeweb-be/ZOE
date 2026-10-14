@@ -9,13 +9,21 @@
 //! The binary runs it until SIGTERM or SIGINT. A test runs it in its own
 //! process with [`Server::start`] and [`Server::stop`].
 //!
+//! With [`TlsOptions`], the ZEO port speaks TLS. A client CA makes a client
+//! certificate necessary, and the holder of a certificate of the read-only
+//! client CA registers read-only only. A failed handshake closes only its
+//! connection.
+//!
 //! A stop takes at most the shutdown timeout. The server stops accepting
 //! connections, and each connection reads no more calls. The calls that
 //! the server already received run, so a `tpc_finish` that the
 //! server received commits and gets its reply. A running pack stops between
 //! two of its batches. Then the open transaction of
 //! each connection aborts, and each connection sends the frames that wait
-//! and closes. Then the stores close.
+//! and shuts down its side. Each connection reads and drops the bytes that
+//! its client sends after the stop, so its close is not a reset. It closes
+//! when the client closes, or a short time after its last frame. Then the
+//! stores close.
 
 use std::fmt;
 use std::io;
@@ -31,7 +39,10 @@ use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
-use crate::protocol::{self, NamedStorage, Pool, Queues, Stopping, Storages};
+use crate::protocol::{self, Connection, NamedStorage, Pool, Queues, Stopping, Storages};
+use crate::runtime::Tokio;
+use crate::tls::Tls;
+pub use crate::tls::TlsOptions;
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
 /// frame holds a whole record, and the store sets no limit on a record by
@@ -105,6 +116,7 @@ pub struct ServeOptions {
     admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
+    cache_size: Option<usize>,
     lock_warn: Option<Duration>,
     transaction_warn: Option<Duration>,
     max_frame_size: NonZeroU32,
@@ -113,6 +125,7 @@ pub struct ServeOptions {
     blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
     shared_blob_dir: bool,
+    tls: Option<TlsOptions>,
 }
 
 impl ServeOptions {
@@ -121,7 +134,8 @@ impl ServeOptions {
     /// [`DEFAULT_MAX_FRAME_SIZE`] bytes. The invalidation queue covers
     /// 100,000 transactions, and 1,000 invalidations can wait for one
     /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
-    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`] closes.
+    /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`], while
+    /// no call of the connection runs, closes.
     /// The calls that read run on as many threads as the machine has
     /// cores.
     pub fn new(path: impl AsRef<Path>) -> Self {
@@ -137,6 +151,7 @@ impl ServeOptions {
             admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
+            cache_size: None,
             lock_warn: None,
             transaction_warn: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -145,6 +160,7 @@ impl ServeOptions {
             blocking_threads: None,
             read_only: false,
             shared_blob_dir: false,
+            tls: None,
         }
     }
 
@@ -190,6 +206,15 @@ impl ServeOptions {
         self
     }
 
+    /// Let the page cache of each store hold at most `bytes`. Without this
+    /// call, each store keeps the default of the store, 1 GiB. The cache
+    /// does not grow with the size of the store.
+    #[must_use]
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = Some(bytes);
+        self
+    }
+
     /// Log each lock held longer than `threshold`, with its oid, its client
     /// and its storage, when the lock is released. Without this call, the
     /// server logs no lock.
@@ -229,10 +254,12 @@ impl ServeOptions {
         self
     }
 
-    /// Close a connection that sends no frame for `timeout`. The time counts
-    /// from the last frame that the server read, a heartbeat included, and
-    /// from the accept for the protocol of the client. The time while 4
-    /// calls of the connection run or wait does not count. The close stops
+    /// Close a connection that sends no frame for `timeout` while no call
+    /// of the connection runs. The time counts from the accept for the
+    /// protocol of the client. Then it counts from the later of two times:
+    /// the last frame that the server read, a heartbeat included, and the
+    /// end of the last call of the connection. A call runs until it puts
+    /// its reply, and a download until it ends. The close stops
     /// the writer at once, as a close of the hub does. The calls that
     /// arrived run, up to the first reply that cannot be queued, then the
     /// open transaction aborts. A timeout of 0 closes no connection.
@@ -280,6 +307,15 @@ impl ServeOptions {
         self
     }
 
+    /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
+    /// reads them before it listens, so a file that does not read creates
+    /// no store. Without this call, the ZEO port speaks plain TCP.
+    #[must_use]
+    pub fn tls(mut self, tls: TlsOptions) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Tell if the server serves the store of `storage` for reads only.
     fn is_read_only(&self, storage: &StorageOptions) -> bool {
         self.read_only || storage.read_only
@@ -291,6 +327,7 @@ impl ServeOptions {
         if let Some(timeout) = self.lock_timeout {
             options.lock_timeout = timeout;
         }
+        options.cache_size = self.cache_size;
         options.lock_warn = self.lock_warn;
         options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);
@@ -328,6 +365,8 @@ pub enum Error {
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
     Runtime(io::Error),
+    /// A file of TLS does not read or does not fit.
+    Tls(String),
 }
 
 impl fmt::Display for Error {
@@ -340,6 +379,7 @@ impl fmt::Display for Error {
             }
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
+            Self::Tls(message) => write!(f, "TLS: {message}"),
         }
     }
 }
@@ -358,6 +398,23 @@ pub struct Server {
     /// The accept loop and the connections that run.
     tasks: Arc<Tasks>,
     shutdown_timeout: Duration,
+    /// SIGTERM and SIGINT, when the start handled them.
+    signals: Option<Signals>,
+    /// The times of the stop. The stop sets them once.
+    #[cfg(test)]
+    stop_times: Arc<std::sync::OnceLock<StopTimes>>,
+}
+
+/// The times of a stop that the shutdown timeout bounds. The tests of the
+/// crate read them.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StopTimes {
+    /// The start of the stop, before the stop signal.
+    pub(crate) start: Instant,
+    /// The end of the wait for the sessions, before the close of the
+    /// stores.
+    pub(crate) waited: Instant,
 }
 
 impl Server {
@@ -365,11 +422,18 @@ impl Server {
     /// accepts connections. When a store does not open, close the stores
     /// that opened and fail.
     pub fn start(options: ServeOptions) -> Result<Self, Error> {
-        Self::start_with(options, |_, path, store_options| {
-            Store::open_with(path, store_options)
-                .map(Arc::new)
-                .map_err(|error| Error::Store(path.to_path_buf(), error))
-        })
+        Self::start_with(options, open_writer)
+    }
+
+    /// Start as [`Server::start`] does, but handle SIGTERM and SIGINT
+    /// before the start creates anything on disk. A signal during the
+    /// start does not stop the start: each store open ends, and the start
+    /// ends or fails. Then [`Server::serve_until_signal`] stops at once.
+    pub(crate) fn start_with_signals(options: ServeOptions) -> Result<Self, Error> {
+        options.check_storages()?;
+        let runtime = new_runtime()?;
+        let signals = Signals::handle(&runtime).map_err(Error::Runtime)?;
+        Self::start_on(runtime, Some(signals), options, open_writer)
     }
 
     /// Start as [`Server::start`] does, but open the store of each storage
@@ -377,14 +441,28 @@ impl Server {
     /// store directory and the options of the store.
     pub(crate) fn start_with(
         options: ServeOptions,
-        mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
+        open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
     ) -> Result<Self, Error> {
         options.check_storages()?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("zoe-serve")
-            .build()
-            .map_err(Error::Runtime)?;
+        Self::start_on(new_runtime()?, None, options, open)
+    }
+
+    /// Start in `runtime`, with the signals that the server keeps for
+    /// [`Server::serve_until_signal`], as [`Server::start_with`] does.
+    fn start_on(
+        runtime: Runtime,
+        signals: Option<Signals>,
+        options: ServeOptions,
+        mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
+    ) -> Result<Self, Error> {
+        // A file of TLS that does not read changes nothing on disk.
+        let tls = options
+            .tls
+            .as_ref()
+            .map(Tls::load)
+            .transpose()
+            .map_err(Error::Tls)?
+            .map(Arc::new);
         // Listen first: a server that cannot listen changes nothing on
         // disk.
         let listener = {
@@ -455,6 +533,7 @@ impl Server {
             (!options.idle_timeout.is_zero()).then_some(options.idle_timeout),
             stopping,
             Arc::clone(&tasks),
+            tls,
         );
         runtime.spawn(async move {
             accept.await;
@@ -470,6 +549,9 @@ impl Server {
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
+            signals,
+            #[cfg(test)]
+            stop_times: Arc::default(),
         })
     }
 
@@ -491,30 +573,27 @@ impl Server {
         self.shutdown();
     }
 
+    /// Return the cell that the stop fills with its times.
+    #[cfg(test)]
+    pub(crate) fn stop_times(&self) -> Arc<std::sync::OnceLock<StopTimes>> {
+        Arc::clone(&self.stop_times)
+    }
+
     /// Call `ready` with the address, then serve until SIGTERM or SIGINT.
-    /// Then stop.
+    /// Then stop. A signal that came after the start handled the signals
+    /// stops the server at once.
     pub(crate) fn serve_until_signal(
         mut self,
         ready: impl FnOnce(SocketAddr) -> io::Result<()>,
     ) -> io::Result<()> {
-        use tokio::signal::unix::{SignalKind, signal};
-
         let runtime = self.runtime.as_ref().expect("the server runs");
-        let (mut term, mut interrupt) = {
-            let _enter = runtime.enter();
-            (
-                signal(SignalKind::terminate())?,
-                signal(SignalKind::interrupt())?,
-            )
+        let mut signals = match self.signals.take() {
+            Some(signals) => signals,
+            // A server from `Server::start` handles the signals from here.
+            None => Signals::handle(runtime)?,
         };
         ready(self.addr)?;
-        runtime.block_on(async {
-            tokio::select! {
-                biased;
-                _ = term.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-        });
+        signals.wait(runtime);
         self.shutdown();
         Ok(())
     }
@@ -524,9 +603,11 @@ impl Server {
             return;
         };
         let timeout = self.shutdown_timeout.min(LONGEST_SHUTDOWN_TIMEOUT);
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         // The accept loop drops the listener, and each connection reads no
-        // more calls. The sessions run the calls that wait, then end.
+        // more calls. The sessions run the calls that wait, then end. Each
+        // connection drops the bytes that arrive until it closes.
         self.stop_signal.send_replace(true);
         let forced = timeout - FORCED_CLOSE.min(timeout / 2);
         if self.tasks.wait(forced) > 0 {
@@ -540,6 +621,11 @@ impl Server {
         let rest = deadline.saturating_duration_since(Instant::now());
         std::thread::scope(|scope| {
             scope.spawn(move || runtime.shutdown_timeout(rest));
+        });
+        #[cfg(test)]
+        let _ = self.stop_times.set(StopTimes {
+            start,
+            waited: Instant::now(),
         });
         // A session that runs holds the store of its storage. This drop
         // closes every other store.
@@ -559,6 +645,56 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Build the multi-thread runtime of a server.
+fn new_runtime() -> Result<Runtime, Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("zoe-serve")
+        .build()
+        .map_err(Error::Runtime)
+}
+
+/// Open the store in `path` for writes with `options`. Create a store that
+/// does not exist.
+fn open_writer(_name: &str, path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+    Store::open_with(path, options)
+        .map(Arc::new)
+        .map_err(|error| Error::Store(path.to_path_buf(), error))
+}
+
+/// SIGTERM and SIGINT, handled through the runtime of the server. The
+/// process keeps the handlers until it exits, so a later signal never
+/// kills it.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    /// Handle SIGTERM and SIGINT from now on. A signal that comes after
+    /// this call waits until [`Signals::wait`] reads it.
+    fn handle(runtime: &Runtime) -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _enter = runtime.enter();
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait in `runtime` for the first SIGTERM or SIGINT.
+    fn wait(&mut self, runtime: &Runtime) {
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.term.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        });
     }
 }
 
@@ -588,8 +724,10 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 /// Accept clients until `stopping` tells that the server stops. Then drop
 /// the listener, so the server accepts no more connections. Each connection
 /// takes frames of at most
-/// `max_frame_size` bytes, closes after `idle_timeout` without a frame, and
-/// counts in `tasks` while it runs.
+/// `max_frame_size` bytes, closes after `idle_timeout` without a frame and
+/// without a call that runs, and
+/// counts in `tasks` while it runs. With `tls`, each connection starts with
+/// the TLS handshake.
 async fn accept(
     listener: TcpListener,
     storages: Arc<Storages>,
@@ -597,6 +735,7 @@ async fn accept(
     idle_timeout: Option<Duration>,
     mut stopping: Stopping,
     tasks: Arc<Tasks>,
+    tls: Option<Arc<Tls>>,
 ) {
     loop {
         let accepted = tokio::select! {
@@ -605,9 +744,25 @@ async fn accept(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 let running = tasks.start();
+                if let Some(tls) = &tls {
+                    let connection = serve_tls(
+                        stream,
+                        peer.to_string(),
+                        Arc::clone(tls),
+                        Arc::clone(&storages),
+                        max_frame_size,
+                        idle_timeout,
+                        stopping.clone(),
+                    );
+                    tokio::spawn(async move {
+                        connection.await;
+                        drop(running);
+                    });
+                    continue;
+                }
                 let connection = protocol::serve_connection(
                     stream,
                     Arc::clone(&storages),
@@ -626,6 +781,52 @@ async fn accept(
             }
         }
     }
+}
+
+/// Run the TLS handshake of `tls` on `stream`, then serve the client
+/// `peer` as `protocol::serve_connection` does. The handshake must end
+/// within `idle_timeout`, as the protocol of a plain client must. A stop
+/// ends it at once. A failed handshake closes only this connection.
+async fn serve_tls(
+    stream: tokio::net::TcpStream,
+    peer: String,
+    tls: Arc<Tls>,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+    idle_timeout: Option<Duration>,
+    mut stopping: Stopping,
+) {
+    let idle = async {
+        match idle_timeout {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    };
+    let handshake = tokio::select! {
+        biased;
+        () = stopping.wait() => return,
+        handshake = tls.accept(stream) => handshake,
+        () = idle => {
+            tracing::info!(client = peer.as_str(), "no TLS handshake within the idle timeout: closing the connection");
+            return;
+        }
+    };
+    let (stream, read_only) = match handshake {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            tracing::warn!(client = peer.as_str(), "the TLS handshake failed: {error}");
+            return;
+        }
+    };
+    let (reader, writer) = tokio::io::split(stream);
+    let connection = Connection {
+        peer,
+        runtime: Arc::new(Tokio),
+        max_frame_size,
+        idle_timeout,
+        read_only,
+    };
+    protocol::serve_stream(reader, writer, connection, storages, stopping).await;
 }
 
 /// The count of the tasks that serve: the accept loop and one task for
@@ -951,6 +1152,18 @@ mod tests {
         assert!(matches!(writer, Some(ZoeError::Locked)), "{writer:?}");
         server.stop();
         drop(Store::open(&dir).unwrap());
+    }
+
+    #[test]
+    fn a_server_whose_tls_files_do_not_read_creates_no_store() {
+        let dir = fresh_dir("no-tls");
+        let tls = TlsOptions::new(dir.join("missing.pem"), dir.join("missing.key"));
+        let error = Server::start(ServeOptions::new(&dir).tls(tls))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Tls(_)), "{error}");
+        assert!(error.to_string().contains("missing.pem"), "{error}");
+        assert!(!dir.exists());
     }
 
     #[test]

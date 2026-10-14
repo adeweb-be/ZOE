@@ -32,7 +32,8 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - The verification reads the file again, up to where the copy stopped. It compares the file with every transaction of the store: the tids, the user, the description, the extension and every pickle, byte for byte. It checks that the store has every blob, with the size of its blob file. It compares the first blob and then one blob in 16 byte for byte, and this read also checks the BLAKE3 hash of the store.
 - Each difference is one line in `Report.problems`. The lines about the whole source come first, and no cap hides them: where the conversion stopped before the end of the file, and the blob records without a blob directory. At most 100 other lines follow, and a last line counts the others. An empty list means that the store holds the whole file.
 - A conversion never gives an empty list when it stopped before the end of the file, except for a commit in progress at the end.
-- The verification uses the transaction iterator of the store. That iterator holds the transaction rows and the record keys of the whole store in memory.
+- Each problem has exactly one `ProblemKind`. `Report::count` gives the count of a kind and `Report::problem_count` the number of problems, with no cap: the counts add up to `problem_count`, and `problem_count` is 0 exactly when `Report.problems` is empty. The kinds are named after the problem texts. Blob records without a blob directory are one problem of the kind `NoBlobDirectory`, as they are one line.
+- The verification uses the transaction iterator of the store. That iterator holds one transaction and a slice of tids at a time, whatever the size of the store.
 
 ## ZOE to `Data.fs`
 
@@ -59,7 +60,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - The verification reads the written file with the reader of `Data.fs` to ZOE, so the file passes every check of that reader. It compares the file with every transaction of the store up to the last tid at the start of the conversion: the tids, the user, the description, the extension and every pickle, byte for byte. It checks that the blob directory has every blob of the store with its size, and compares the first blob and then one blob in 16 byte for byte.
 - Any difference that the verification finds blocks the rename: the conversion removes the `.new` file, keeps the old file and fails with `Mismatch`. The error names the first difference and lists the differences, with the cap of `Report.problems`. When the conversion wrote nothing, the file stays and the call fails the same way. So a conversion that succeeds leaves a file that matches the store.
 - A difference is a transaction of the store that the file does not have and the reverse, a record, a user, a description or an extension that differs, a blob file that is missing or differs, a transaction that the store does not read, and a file that the reader stops in before its end.
-- The counts of the report describe the store. `Report.problems` lists only the blobs that the store does not read.
+- The counts of the report describe the store. `Report.problems` lists only the blobs that the store does not read, and each has the kind `UnreadableBlob`. The differences of `Mismatch` have kinds too, but `Mismatch` gives only their lines.
 
 ## Verify
 

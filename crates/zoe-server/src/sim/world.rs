@@ -89,8 +89,6 @@ pub(crate) enum Timer {
     Reset { conn: u64 },
     /// The partition of a client ends.
     Heal { client: usize },
-    /// The server of a generation crashes.
-    Crash { generation: u32 },
     /// The server starts again.
     Restart,
     /// The late sync of the deliberate durability bug.
@@ -114,11 +112,36 @@ pub(crate) struct ServerState {
     pub(crate) halted: bool,
 }
 
-/// A commit that a client saw acknowledged: its tid and its records.
+/// A commit that a client saw acknowledged: its tid, its records and its
+/// blobs.
 #[derive(Clone, Debug)]
 pub(crate) struct Acked {
     pub(crate) tid: u64,
     pub(crate) records: Vec<(u64, Vec<u8>)>,
+    pub(crate) blobs: Vec<(u64, Vec<u8>)>,
+}
+
+/// The phase of a commit when the server crashes.
+pub(crate) mod phase {
+    /// The client stored its records and did not vote yet.
+    pub(crate) const STAGED: &str = "staged";
+    /// The vote passed: the server holds the locks, and the client did not
+    /// send `tpc_finish` yet.
+    pub(crate) const LOCKED: &str = "locked";
+    /// The server syncs the database file in `tpc_finish`.
+    pub(crate) const FINISHING: &str = "finishing";
+    /// The client got the reply of `tpc_finish`.
+    pub(crate) const ACKNOWLEDGED: &str = "acknowledged";
+    /// Every phase, in the order of a commit.
+    pub(crate) const ALL: [&str; 4] = [STAGED, LOCKED, FINISHING, ACKNOWLEDGED];
+}
+
+/// A planned crash: the server crashes at the first commit that reaches
+/// `phase` after the clients saw `after` commits acknowledged.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlannedCrash {
+    pub(crate) phase: &'static str,
+    pub(crate) after: usize,
 }
 
 /// The mutable state of a run.
@@ -156,6 +179,11 @@ pub(crate) struct State {
     pub(crate) known: BTreeMap<u64, u64>,
     pub(crate) stale_reads: usize,
     pub(crate) clients_done: usize,
+    /// The crashes that did not happen yet.
+    pub(crate) crash_plan: Vec<PlannedCrash>,
+    /// The phase of a crash that a client reached. The driver crashes the
+    /// server after the step of that client.
+    pub(crate) crash_now: Option<&'static str>,
 }
 
 /// A fault of the network that starts at a planned frame.
@@ -236,6 +264,24 @@ impl State {
             .filter(|until| *until > self.now)
     }
 
+    /// Tell if a commit that reaches `phase` now crashes the server, and
+    /// take that crash from the plan.
+    pub(crate) fn crash_at(&mut self, phase: &'static str) -> bool {
+        if !self.server.up || self.crash_now.is_some() {
+            return false;
+        }
+        let acked = self.acked.len();
+        let Some(i) = self
+            .crash_plan
+            .iter()
+            .position(|plan| plan.phase == phase && plan.after <= acked)
+        else {
+            return false;
+        };
+        self.crash_plan.remove(i);
+        true
+    }
+
     /// Return the report of the run so far.
     pub(crate) fn report(&mut self) -> Report {
         Report {
@@ -244,6 +290,8 @@ impl State {
             lost: 0,
             stale_reads: self.stale_reads,
             crashes: 0,
+            crash_phases: Vec::new(),
+            verify: Vec::new(),
             elapsed: self.now,
         }
     }
@@ -292,6 +340,7 @@ impl Shared {
         seed: u64,
         faults: Faults,
         fault_plan: BTreeMap<u64, Vec<NetFault>>,
+        crash_plan: Vec<PlannedCrash>,
         yields: mpsc::Sender<(u64, Why)>,
     ) -> Arc<Self> {
         let delay = faults.delay.unwrap_or(super::DEFAULT_DELAY);
@@ -322,6 +371,8 @@ impl Shared {
                 known: BTreeMap::new(),
                 stale_reads: 0,
                 clients_done: 0,
+                crash_plan,
+                crash_now: None,
             }),
             ready: Ready::default(),
             permits: IdSet::default(),

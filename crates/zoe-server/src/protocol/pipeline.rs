@@ -325,6 +325,8 @@ pub(crate) struct Calls {
     peer: Arc<str>,
     /// The stop of the server, for the pack of the session.
     stopping: Stopping,
+    /// True when the client may register read-only only.
+    read_only: bool,
     lane: Arc<Lane>,
     /// The slots of the calls that run or wait.
     slots: Arc<Semaphore>,
@@ -354,11 +356,18 @@ impl Calls {
             runtime,
             peer: peer.into(),
             stopping,
+            read_only: false,
             lane: Arc::new(Lane::new()),
             slots: Arc::new(Semaphore::new(QUEUE)),
             running: Running::new(),
             ended: Ended::new(),
         }
+    }
+
+    /// Let the client register read-only only, when `read_only` is true.
+    pub(crate) fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// The signal that a call ended the connection.
@@ -378,6 +387,22 @@ impl Calls {
                 .expect("the slots of a connection never close");
             let room = outbox.room().await;
             Ticket { slot, room }
+        }
+    }
+
+    /// Wait until no call of the connection runs. A call runs from its
+    /// ticket until it puts its reply, or until it ends when it has no
+    /// reply, because it keeps its slot that long. A download keeps its
+    /// slot until it ends. The future holds no borrow of `self`. Call it
+    /// only while the reader takes no ticket: the future takes each slot,
+    /// then gives them back at once.
+    pub(crate) fn quiet(&self) -> impl Future<Output = ()> + Send + 'static {
+        let slots = Arc::clone(&self.slots);
+        async move {
+            let _all = slots
+                .acquire_many_owned(QUEUE as u32)
+                .await
+                .expect("the slots of a connection never close");
         }
     }
 
@@ -445,6 +470,7 @@ impl Calls {
         let ended = self.ended.clone();
         let peer = Arc::clone(&self.peer);
         let stopping = self.stopping.clone();
+        let read_only = self.read_only;
         let registered = self
             .pool
             .run(&*self.runtime, move || {
@@ -452,7 +478,8 @@ impl Calls {
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
-                        let session = Session::new(storage, outbox.clone(), stopping);
+                        let session = Session::new(storage, outbox.clone(), stopping)
+                            .read_only_client(read_only);
                         let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
@@ -498,9 +525,11 @@ impl Calls {
 
 impl Drop for Calls {
     /// The thread of the transaction ends also when the task of the
-    /// connection drops before `finish`, as at the stop of the runtime: a
-    /// lock wait ends, and the thread runs the calls that wait, then ends
-    /// and aborts the open transaction.
+    /// connection drops before `finish`, as at the stop of the runtime. A
+    /// drop before `finish` ends the lock wait of the session. A drop
+    /// inside `finish`, as at the forced close of a stop, ends no lock
+    /// wait, because `finish` removes the session first. Then the thread
+    /// runs the calls that wait, ends and aborts the open transaction.
     fn drop(&mut self) {
         self.end_lock_wait();
         self.lane.end();
@@ -597,6 +626,45 @@ mod tests {
             while tasks.join_next().await.is_some() {}
         });
         assert_eq!(most.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn quiet_waits_until_each_ticket_is_given_back() {
+        let (storages, _store) = storages("quiet");
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = Calls::new(
+                storages,
+                outbox,
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
+            let limit = Duration::from_secs(30);
+            // No call runs, so the connection is quiet at once.
+            tokio::time::timeout(limit, connection.quiet())
+                .await
+                .unwrap();
+            let held = connection.ticket().await;
+            // A quiet that stops early gives back the slots that it took.
+            let early = tokio::time::timeout(Duration::from_millis(50), connection.quiet()).await;
+            assert!(early.is_err());
+            let mut others = Vec::new();
+            for _ in 1..QUEUE {
+                others.push(
+                    tokio::time::timeout(limit, connection.ticket())
+                        .await
+                        .unwrap(),
+                );
+            }
+            drop(others);
+            // The connection is quiet when the last ticket goes.
+            let quiet = tokio::spawn(connection.quiet());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            drop(held);
+            tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
     }
 
     #[test]
