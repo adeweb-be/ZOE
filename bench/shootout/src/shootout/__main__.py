@@ -73,8 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     gate_cmd.add_argument(
         "--ratio",
         type=_ratio,
-        default=3.0,
-        help="the smallest ratio of ops/s in each cell (default: %(default)s)",
+        default=1.0,
+        help="the smallest ratio of ops/s in each cell but "
+        f"{', '.join(gate.LEFT_OUT)} (default: %(default)g, parity)",
     )
     gate_cmd.add_argument("root", type=Path, help="the root of a results tree")
 

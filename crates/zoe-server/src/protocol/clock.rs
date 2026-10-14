@@ -1,7 +1,7 @@
 //! The times of the protocol: the `time` of a history entry, the `start`
-//! of a status and the time of a pack.
+//! of a status, the time of a pack and the age of a tid.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zoe_core::Tid;
 
@@ -34,6 +34,17 @@ pub(crate) fn tid_time(tid: Tid) -> f64 {
     // The C code of `persistent` adds and subtracts in this order. Another
     // order can change the last bit.
     whole + seconds - EPOCH
+}
+
+/// Return true when the time of `tid` is less than `age` before `now`, as
+/// ZEO's server compares `invalidation_age` with `time.time()` minus
+/// `TimeStamp(tid).timeTime()`. A tid after `now` is younger than each age
+/// above zero.
+pub(crate) fn younger_than(tid: Tid, age: Duration, now: SystemTime) -> bool {
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64());
+    age.as_secs_f64() > now - tid_time(tid)
 }
 
 /// Return the tid of the time `time`, in seconds since 1970-01-01, as
@@ -153,6 +164,23 @@ mod tests {
             let time = UNIX_EPOCH + Duration::from_secs(secs);
             assert_eq!(tid_time(zoe_core::timestamp(time)), secs as f64);
         }
+    }
+
+    #[test]
+    fn a_tid_is_younger_than_an_age_that_is_longer_than_its_time_before_now() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_752_628);
+        let tid = zoe_core::timestamp(now - Duration::from_millis(2_500));
+        assert!(younger_than(tid, Duration::from_secs(3), now));
+        assert!(!younger_than(tid, Duration::from_secs(2), now));
+        assert!(!younger_than(tid, Duration::ZERO, now));
+        // The age is a strict bound, as in ZEO.
+        let tid = zoe_core::timestamp(now - Duration::from_secs(60));
+        assert!(!younger_than(tid, Duration::from_secs(60), now));
+        assert!(younger_than(tid, Duration::from_secs(61), now));
+        // A tid after the clock is younger than each age above zero.
+        let tid = zoe_core::timestamp(now + Duration::from_secs(10));
+        assert!(younger_than(tid, Duration::from_secs(1), now));
+        assert!(!younger_than(Tid::ZERO, Duration::from_secs(3_600), now));
     }
 
     #[test]
