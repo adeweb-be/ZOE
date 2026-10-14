@@ -192,3 +192,13 @@ def test_a_child_of_fork_refuses_a_client_of_its_parent(tmp_path):
             assert len(storage.new_oid()) == 8
         finally:
             storage.close()
+
+
+def test_native_on_another_subclass_raises_type_error():
+    import zoe.zeo
+
+    class Mine(zoe.zeo.ClientStorage):
+        pass
+
+    with pytest.raises(TypeError, match="native=True"):
+        Mine(("127.0.0.1", 1), native=True)

@@ -29,7 +29,7 @@ The MCP server for ops and content agents. Specification: "AI-native: MCP server
 - `references` gives Loupe's `Object.references`: every strong reference of the record, as ZODB's `referencesf` and pack read them, the ones inside opaque nodes too. A record whose state or references do not decode is an error, not an empty list, because its references are not known. `object_get` shows the refusal in `error`, as Loupe does.
 - The session runs on a tokio runtime with one thread. Each tool runs on the blocking pool, because the store is synchronous.
 - stdout carries only MCP messages. Nothing else in the process writes to it.
-- This crate uses tokio and rmcp. Only the feature `serve` of `zoe-server` depends on it, so the extension module never links it: `cargo tree -p zoe-py -e normal` lists no tokio and no rmcp.
+- This crate uses tokio and rmcp. Only the feature `serve` of `zoe-server` depends on it, so the extension module never links it: `cargo tree -p zoe-py -e normal` lists no rmcp. It lists tokio, which comes through `zoe-client` for the native client (ADR 0035).
 
 ## Tests
 
