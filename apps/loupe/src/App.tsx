@@ -247,6 +247,11 @@ export function App() {
             {t("folder.opened", { path: folder.path, tid: folder.lastTid })}
           </p>
         )}
+        {folder?.repaired && (
+          <p className="status" role="status" data-testid="repaired">
+            {t("folder.repaired", { path: folder.path })}
+          </p>
+        )}
         {folder && (
           <div className="as-of">
             <label>
