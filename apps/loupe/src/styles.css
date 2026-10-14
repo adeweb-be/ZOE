@@ -6,6 +6,7 @@
   --panel: #f5f6f8;
   --accent: #2a5aa0;
   --selected: #dce7f7;
+  --hover: #bfd3f0;
   --error: #a3261b;
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
@@ -21,12 +22,18 @@
     --panel: #1d2128;
     --accent: #7fa8e6;
     --selected: #24344d;
+    --hover: #30486b;
     --error: #f08a7e;
   }
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* An element with the hidden attribute stays hidden, whatever its display. */
+[hidden] {
+  display: none !important;
 }
 
 body {
@@ -261,4 +268,192 @@ main {
   margin: 0;
   max-height: 20em;
   overflow: auto;
+}
+
+.screens {
+  display: flex;
+  gap: 4px;
+}
+
+.screens button {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.screens button[aria-selected="true"] {
+  border-color: var(--accent);
+  background: var(--selected);
+}
+
+.screen {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.space {
+  max-width: 1200px;
+  padding: 12px;
+}
+
+.space section {
+  margin-bottom: 24px;
+}
+
+.space h2 {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+
+.crumbs {
+  margin-bottom: 8px;
+  font-family: ui-monospace, monospace;
+}
+
+.crumbs button,
+.oid-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+}
+
+.treemap,
+.timeline {
+  width: 100%;
+}
+
+.treemap svg,
+.timeline svg {
+  display: block;
+}
+
+.cell rect {
+  fill: var(--selected);
+}
+
+.cell.item {
+  cursor: pointer;
+}
+
+.cell.item:hover rect {
+  fill: var(--hover);
+}
+
+.cell.item:focus {
+  outline: none;
+}
+
+.cell.item:focus-visible rect {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.cell.own rect,
+.cell.others rect {
+  fill: var(--panel);
+  stroke: var(--line);
+}
+
+.cell.others rect {
+  stroke-dasharray: 4 3;
+}
+
+.cell text {
+  fill: var(--fg);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.cell .size {
+  fill: var(--muted);
+}
+
+.sizes {
+  border-collapse: collapse;
+}
+
+.sizes th,
+.sizes td {
+  padding: 2px 16px 2px 0;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+.sizes th {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.sizes tfoot td {
+  border-bottom: 0;
+  color: var(--muted);
+}
+
+.sizes .number {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.class-name {
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.timeline .area {
+  fill: var(--accent);
+  opacity: 0.12;
+}
+
+.timeline .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.timeline .grid line {
+  stroke: var(--line);
+}
+
+.timeline text {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.crosshair line {
+  stroke: var(--muted);
+  stroke-dasharray: 3 3;
+}
+
+.crosshair circle {
+  fill: var(--accent);
+  stroke: var(--bg);
+  stroke-width: 2;
+}
+
+.tooltip {
+  margin: 4px 0;
+  font-family: ui-monospace, monospace;
+}
+
+.pack {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pack label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pack input {
+  width: 26em;
+  font-family: ui-monospace, monospace;
 }

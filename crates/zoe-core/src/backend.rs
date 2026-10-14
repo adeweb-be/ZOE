@@ -133,7 +133,11 @@ pub trait Backend: Send + Sync {
     /// Open a write transaction. The core opens one for each `tpc_finish`.
     fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>>;
 
-    /// Iterate over the transactions from `from` to `to`.
+    /// Iterate over the transactions from `from` to `to`, both included,
+    /// in tid order. A row that does not decode gives its error, and the
+    /// iterator goes on. A failed scan gives its error and ends the
+    /// iterator. A backend can read the rows as the iterator goes, from
+    /// one snapshot.
     fn iter_txns(&self, from: Tid, to: Tid) -> TxnIter<'_>;
 
     /// Return at most `limit` versions of `oid`, newest first.
@@ -155,6 +159,21 @@ pub trait Backend: Send + Sync {
     /// the tids of the map: `txn_records` reads the oids of each
     /// transaction with their records.
     fn txn_oids(&self, from: Tid, to: Tid) -> Result<BTreeMap<Tid, Vec<Oid>>>;
+
+    /// Return the tids from `from` to `to`, both included, that have keys
+    /// in the transaction index, in tid order. The list stops at `limit`
+    /// tids. One snapshot gives the list. The call reads only the index. A
+    /// key outside the range, or a key that does not come after the key
+    /// before it, is `CorruptTxn`, as in `txn_oids`.
+    ///
+    /// This default calls `txn_oids`, which holds every oid of the range.
+    /// So its memory grows with the range. A backend must override this
+    /// method to bound the memory of the transaction iterator: the
+    /// override keeps only the tids, at most `limit` of them. The redb
+    /// backend does this.
+    fn indexed_tids(&self, from: Tid, to: Tid, limit: usize) -> Result<Vec<Tid>> {
+        Ok(self.txn_oids(from, to)?.into_keys().take(limit).collect())
+    }
 
     /// Return the first oid at or after `from` that has a version, with
     /// its newest version.
@@ -231,6 +250,13 @@ pub trait Backend: Send + Sync {
     /// first value that the store has not reserved. Return `None` when the
     /// sequence has no row.
     fn sequence_end(&self, name: &str) -> Result<Option<u64>>;
+
+    /// Return the names of the sequences that have a row, in key order.
+    /// One snapshot gives the list. The call reads only the keys, not the
+    /// frames: `sequence_end` reads and checks the row of a name. A key
+    /// that does not decode, such as a name that is not UTF-8, fails the
+    /// whole call with an error, not a panic.
+    fn sequence_names(&self) -> Result<Vec<String>>;
 }
 
 /// A version that a commit writes: the oid, the serial of the previous
@@ -424,6 +450,10 @@ mod tests {
 
         fn sequence_end(&self, _: &str) -> Result<Option<u64>> {
             Ok(None)
+        }
+
+        fn sequence_names(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
