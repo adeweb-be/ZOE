@@ -1,19 +1,20 @@
 //! The protocol layer: msgpack frames, the handshake and the method table.
 //!
-//! Each connection has one tokio task that reads its frames, one task that
-//! writes them, and one thread of the blocking pool that runs its calls in
-//! order. That thread runs every core call of the connection, so one
-//! thread drives each core transaction, and no core call runs on a thread
-//! of the async runtime.
+//! Each connection has one tokio task that reads its frames and starts its
+//! calls, and one task that writes its frames. The calls of a connection
+//! run concurrently (`pipeline`): the calls of its transaction in order on
+//! one thread, from `tpc_begin` to the end of the transaction, and the
+//! calls that read on the read pool. No core call runs on a thread of the
+//! async runtime. A connection with no call that runs and no open
+//! transaction holds no thread.
 //!
-//! The calls of a client wait in a queue of `QUEUE` calls. The frames for
-//! the client wait in two queues: the replies of the session, at most
-//! `QUEUE` frames, and the invalidations with the frames of each commit, at
-//! most `client-queue-size` frames. The reader waits for room for the calls,
-//! and the session waits for room for its replies. So an upload or a
-//! download holds a few chunks in memory. The invalidations never wait: a
-//! full queue closes the connection. The writer task sends the frames of
-//! both queues in the order in which they went in.
+//! Each call takes room for its reply in the session queue of its
+//! connection before it starts: at most `QUEUE` frames. The reader waits
+//! for that room, so at most `QUEUE` calls of a connection run or wait at
+//! once. The invalidations with the frames of each commit wait in the hub
+//! queue, at most `client-queue-size` frames. They never wait: a full queue
+//! closes the connection. The writer task sends the frames of both queues
+//! in the order in which they went in.
 
 mod blob;
 mod clock;
@@ -23,6 +24,7 @@ mod invalidation;
 mod iteration;
 mod message;
 mod outbox;
+mod pipeline;
 mod session;
 mod status;
 
@@ -37,11 +39,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::watch;
 use zoe_core::Store;
 
 use invalidation::Invalidations;
 use outbox::Outbox;
+use pipeline::Calls;
+pub(crate) use pipeline::Pool;
 use status::Stats;
 
 /// The protocol that the server announces and the only one it takes: ZEO 6
@@ -52,21 +56,19 @@ pub(crate) const PROTOCOL: &[u8] = b"M5";
 /// status of the server.
 const RUOK: &[u8] = b"ruok";
 
-/// The most calls that wait for the session of a connection, decoded, and
-/// the most replies that wait in its session queue. A full queue makes its
-/// sender wait. When the call queue is full, the reader reads no more
-/// bytes, so TCP makes the client wait. So a connection holds at most this
-/// many decoded calls, the call that the reader holds, and the call that
-/// the session runs. An upload or a download holds a few chunks in memory,
-/// whatever the size of the blob. The session runs one call at a time and
-/// needs only the next calls ready: the bytes of a burst wait in the
-/// buffers of TCP.
+/// The most calls of a connection that run or wait at once, and the most
+/// replies that wait in its session queue. A call takes room for its reply
+/// before it starts, and the reader waits for that room. While it waits,
+/// it reads no more bytes, so TCP makes the client wait. So a connection
+/// holds at most this many decoded calls and the call that the reader
+/// holds. An upload or a download holds a few chunks in memory, whatever
+/// the size of the blob.
 ///
 /// The writer task empties the queues of the frames without the reader, so
-/// the reader, the session and the writer never wait for each other in a
+/// the reader, the calls and the writer never wait for each other in a
 /// circle. Only a client that sends calls and reads no reply can stop its
-/// own connection: its replies fill the session queue, then its calls fill
-/// the call queue. A stock client reads its replies while it sends.
+/// own connection: its replies fill the session queue, then the reader
+/// waits for room. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
 
 /// The name of the storage that `--path` gives. It is the default of ZEO.
@@ -79,8 +81,8 @@ pub(crate) struct Queues {
     /// reply is nil.
     pub(crate) invalidations: usize,
     /// The most invalidations that wait for one client. Past it, the server
-    /// closes the connection. The replies of the session wait in a queue of
-    /// `QUEUE` frames, and the session waits for room there.
+    /// closes the connection. The replies of the calls wait in a queue of
+    /// `QUEUE` frames, and each call takes its room before it starts.
     pub(crate) client: usize,
 }
 
@@ -223,25 +225,26 @@ async fn idle(timeout: Option<Duration>) {
 /// the connection, or until `stopping` tells that the server stops. The
 /// client selects one of `storages` with `register`. A frame longer than
 /// `max_frame_size` bytes closes the connection before the server reserves
-/// memory for it.
+/// memory for it. The calls that read run on `pool`.
 ///
 /// The server closes the connection when the client sends no frame for
 /// `idle_timeout`: no protocol after the accept, or no frame after the last
-/// frame. The time while the reader waits for room in the call queue does
-/// not count, because the client cannot send then. The time counts from
-/// the last whole frame, so a frame that takes longer than the timeout to
+/// frame. The time while the reader waits for room for a call does not
+/// count, because the client cannot send then. The time counts from the
+/// last whole frame, so a frame that takes longer than the timeout to
 /// arrive is cut. This close is an end of the connection, as a close of the
-/// hub is: the writer stops at once, and the session ends at the first
-/// reply that it cannot queue. `None` closes no idle connection.
+/// hub is: the writer stops at once, and each call ends at the first reply
+/// that it cannot queue. `None` closes no idle connection.
 ///
-/// At a stop, the reader reads no more frames. The session runs the calls
-/// that the reader already decoded, so a `tpc_finish` that the server
-/// received commits and gets its reply. Then the session ends, and that
-/// aborts its open transaction. The writer sends the frames that wait,
-/// and closes the connection.
+/// At a stop, the reader reads no more frames. The calls that the reader
+/// already started run, so a `tpc_finish` that the server received commits
+/// and gets its reply. Then the transaction ends, and that aborts it if it
+/// is still open. The writer sends the frames that wait, and closes the
+/// connection.
 pub(crate) async fn serve_connection(
     stream: TcpStream,
     storages: Arc<Storages>,
+    pool: Pool,
     max_frame_size: u32,
     idle_timeout: Option<Duration>,
     mut stopping: Stopping,
@@ -265,9 +268,9 @@ pub(crate) async fn serve_connection(
     match protocol {
         Ok(Some(protocol)) if protocol == PROTOCOL => {}
         Ok(Some(protocol)) if protocol == RUOK => {
-            // The status reads the stores, so it runs on the blocking pool.
-            let reply = tokio::task::spawn_blocking(move || storages.ruok()).await;
-            if let Ok(reply) = reply {
+            // The status reads the stores, so it runs on the read pool.
+            let reply = pool.run(move || storages.ruok()).await;
+            if let Some(reply) = reply {
                 let _ = frame::write(&mut writer, reply.as_bytes()).await;
             }
             let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
@@ -284,25 +287,14 @@ pub(crate) async fn serve_connection(
         }
     }
 
-    let (calls, received) = mpsc::channel(QUEUE);
     let (outbox, mut inbox, mut closing) = Outbox::new(QUEUE, storages.client_queue);
-    // The reader closes the connection with this outbox at the idle
-    // timeout. It drops it before it waits for the writer, because the
-    // writer ends only when every outbox is gone.
-    let idle_close = outbox.clone();
-    let closed = Arc::new(Notify::new());
-    let worker = {
-        let closed = Arc::clone(&closed);
-        tokio::task::spawn_blocking(move || {
-            session::run(storages, received, outbox);
-            closed.notify_one();
-        })
-    };
+    let mut calls = Calls::new(storages, outbox.clone(), pool);
+    let ended = calls.ended();
     let writing = {
         let mut closing = closing.clone();
         tokio::spawn(async move {
             // The writer stops at once when the server closes the
-            // connection. Otherwise it sends every frame, until the session
+            // connection. Otherwise it sends every frame, until each call
             // ends.
             loop {
                 let frame = tokio::select! {
@@ -322,7 +314,7 @@ pub(crate) async fn serve_connection(
                     break;
                 }
             }
-            // A session that waits for room in its queue stops.
+            // A call that waits for room in the session queue stops.
             drop(inbox);
             let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
         })
@@ -331,19 +323,19 @@ pub(crate) async fn serve_connection(
     loop {
         // An end of the connection or a stop wins over a frame that waits.
         // A frame that arrived wins over the idle timeout. The idle time
-        // starts again for each frame, after the call queue took the call.
+        // starts again for each frame, after its call took its room.
         let read = tokio::select! {
             biased;
-            () = closed.notified() => break,
+            () = ended.wait() => break,
             () = closing.wait() => break,
             () = stopping.wait() => break,
             read = frame::read(&mut reader, max_frame_size) => read,
             () = idle(idle_timeout) => {
                 eprintln!("zoe serve: {peer}: no frame within the idle timeout: closing the connection");
-                // The writer stops at once. So a session that waits for
-                // room in its queue stops too, and its transaction aborts,
-                // also when the client reads nothing.
-                idle_close.close();
+                // The writer stops at once. So a call that waits for room
+                // in the session queue stops too, and the transaction
+                // aborts, also when the client reads nothing.
+                outbox.close();
                 break;
             }
         };
@@ -369,21 +361,21 @@ pub(crate) async fn serve_connection(
         if call.is_heartbeat() {
             continue;
         }
-        // The reader waits while `QUEUE` calls wait for the session.
-        let sent = tokio::select! {
-            sent = calls.send(call) => sent.is_ok(),
-            () = closed.notified() => false,
-            () = closing.wait() => false,
+        // The reader waits while `QUEUE` calls run or wait for the client.
+        let room = tokio::select! {
+            room = outbox.room() => room,
+            () = ended.wait() => break,
+            () = closing.wait() => break,
         };
-        if !sent {
+        if room.is_closed() {
             break;
         }
+        calls.start(call, room).await;
     }
-    // The session ends when its channel closes. Dropping its transaction
-    // aborts it.
-    drop(calls);
-    drop(idle_close);
-    let _ = worker.await;
+    // The writer ends when every outbox is gone: the outbox of the reader,
+    // of the calls and of the session.
+    drop(outbox);
+    calls.finish().await;
     let _ = writing.await;
 }
 
@@ -417,6 +409,11 @@ mod tests {
         Stopping::new().1
     }
 
+    /// Return a read pool of 2 threads.
+    fn pool() -> Pool {
+        Pool::new(std::num::NonZeroUsize::new(2).unwrap())
+    }
+
     #[test]
     fn a_connection_that_the_hub_closes_ends_with_its_session() {
         let dir = std::env::temp_dir().join(format!("zoe-protocol-close-{}", std::process::id()));
@@ -439,7 +436,7 @@ mod tests {
         runtime.spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
-            serve_connection(stream, served, max, None, never_stops()).await;
+            serve_connection(stream, served, pool(), max, None, never_stops()).await;
         });
 
         let mut client = Client::connect(addr).unwrap();
@@ -522,6 +519,7 @@ mod tests {
                 tokio::spawn(serve_connection(
                     stream,
                     Arc::clone(&served),
+                    pool(),
                     max,
                     None,
                     never_stops(),
@@ -640,8 +638,10 @@ mod tests {
         let data = Value::Binary(b"pickle".to_vec());
         let end = vec![session::p64(2), session::p64(0), data, Value::from(7)];
         send(&mut ended, 0, "storeBlobEnd", end);
+        // The calls of a transaction run in order. So after the reply to an
+        // abort of another transaction, each upload file holds its chunk.
         for client in [&mut open, &mut ended] {
-            send(client, 2, "ping", vec![]);
+            send(client, 2, "tpc_abort", vec![Value::from(99)]);
             read_frame(client);
         }
         let temporary = dir.join("blobs").join("tmp");
@@ -806,14 +806,16 @@ mod tests {
             .store(zoe_core::Oid(1), Tid::ZERO, b"pickle")
             .unwrap();
         holder.vote().unwrap();
-        // The vote of the client waits for the lock. Its next calls fill the
-        // call queue, and the reader waits for room.
+        // The vote of the client waits for the lock. The calls of the
+        // transaction behind it wait for it, so they fill the session queue
+        // with their rooms, and the reader waits for room.
         let mut client = registered(server.addr());
         begin_and_store(&mut client, 1);
         send(&mut client, 2, "vote", vec![Value::from(7)]);
         std::thread::sleep(Duration::from_millis(100));
         for id in 3..=3 + QUEUE as i64 {
-            send(&mut client, id, "ping", vec![]);
+            // An abort of another transaction does nothing.
+            send(&mut client, id, "tpc_abort", vec![Value::from(99)]);
         }
         // The client sends nothing for more than twice the timeout. The
         // connection stays open, because the reader waits for room.
@@ -860,10 +862,9 @@ mod tests {
         assert_eq!(frames.first().map(|(m, _)| m.as_str()), Some("info"));
 
         // The client has a receive buffer of 4 KiB. It votes on the oid 2,
-        // then loads the large record 6 times and reads nothing. The writer
-        // waits on the first reply, the session queue holds 4, and the
-        // session waits for room with the last. The call queue is empty, so
-        // the reader waits for a frame.
+        // then loads the large record 5 times and reads nothing. The writer
+        // waits on the first reply, and the session queue holds the 4
+        // others. Each load took its room, so the reader waits for a frame.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -894,7 +895,7 @@ mod tests {
             message::reply(Value::from(2), Value::Array(Vec::new()))
         );
         assert!(!store.lock_table_is_empty());
-        for id in 3..=8 {
+        for id in 3..=7 {
             let load = vec![session::p64(1), session::p64(u64::MAX >> 1)];
             send(&mut client, id, "loadBefore", load);
         }
