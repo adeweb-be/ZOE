@@ -1,0 +1,11 @@
+<configure xmlns="http://namespaces.zope.org/zope">
+
+  <!-- Plone loads this file through the plone.autoinclude entry point of
+       zoedb. When Zope opened its database, the handler gives
+       portal_uidgenerator its ids from a sequence of the store. -->
+  <subscriber
+      for="zope.processlifetime.IDatabaseOpenedWithRoot"
+      handler=".uidgenerator.database_opened"
+      />
+
+</configure>

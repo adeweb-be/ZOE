@@ -33,6 +33,13 @@ uri = ["zodburi>=3"]
 [project.entry-points."zodburi.resolvers"]
 zoe = "zoe.config:resolve_uri"
 
+# Plone loads the configure.zcml of zoe.plone through plone.autoinclude.
+# The group z3c.autoinclude.plugin would import a module named after the
+# project, zoedb, which does not exist; this group names the module.
+[project.entry-points."plone.autoinclude.plugin"]
+target = "plone"
+module = "zoe.plone"
+
 [project.scripts]
 # The `zoe` command. It runs the code of the `zoe` binary.
 zoe = "zoe.__main__:main"
