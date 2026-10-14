@@ -223,8 +223,13 @@ pub(super) struct ServeArgs {
     /// and sends only its name, which ends in .tmp or .tmp-. The server
     /// takes the file into the transaction by rename, and the client reads
     /// each committed blob file in place. At the start, the server writes
-    /// the layout file of each blob directory. Without it, storeBlobShared
-    /// fails the vote with an error that names shared-blob-dir.
+    /// the layout file of each blob directory. A blob directory without a
+    /// layout file that holds other entries, such as the directories of an
+    /// oid that a client made, fails the start. The clients have the trust
+    /// of the user of the server, as with ZEO: run them as the same user. A
+    /// client can put a symbolic link in place of a blob file after the
+    /// check of the server. Without the option, storeBlobShared fails the
+    /// vote with an error that names shared-blob-dir.
     #[arg(
         long,
         env = "ZOE_SHARED_BLOB_DIR",

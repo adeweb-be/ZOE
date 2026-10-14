@@ -668,7 +668,9 @@ impl BlobStore {
     ///
     /// `name` is a name, never a path: it has no `/`, and it ends in `.tmp`
     /// or `.tmp-`. Another name is refused with `Protocol`, before the call
-    /// reads or changes anything. The file must be a regular file.
+    /// reads or changes anything. The file must be a regular file when the
+    /// call syncs it. The client has the trust of the user of the store: a
+    /// link that it puts in place of the file after the sync is followed.
     ///
     /// The client created the levels of the oid directory, and a stop of
     /// the client can leave them not durable. So the call syncs the parent
@@ -2209,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_file_keeps_its_inode_and_a_link_is_refused() {
+    fn a_shared_file_keeps_its_inode_and_a_link_at_the_check_is_refused() {
         use std::os::unix::fs::{MetadataExt, symlink};
 
         let dir = std::env::temp_dir().join(format!("zoe-blob-shared-{}", std::process::id()));

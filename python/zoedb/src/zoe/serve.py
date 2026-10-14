@@ -37,6 +37,7 @@ USAGE = 2
 # The keys of the section that are options of `zoe serve`.
 KEYS = (
     "path",
+    "blob-dir",
     "listen",
     "admin-listen",
     "invalidation-queue-size",
@@ -49,7 +50,11 @@ KEYS = (
     "transaction-warn",
     "log-format",
     "read-only",
+    "shared-blob-dir",
 )
+
+# The keys whose value is a boolean.
+BOOLEANS = ("read-only", "shared-blob-dir")
 
 # The keys whose leading ~ is the home directory.
 PATHS = ("path", "blob-dir")
@@ -93,19 +98,20 @@ def toml_string(text):
 def settings(section):
     """Return the keys of `zoe serve` that the section sets.
 
-    An empty value counts as not set. `read-only` becomes a boolean, and
-    the other values stay text, which `zoe serve` checks.
+    An empty value counts as not set. `read-only` and `shared-blob-dir`
+    become booleans, and the other values stay text, which `zoe serve`
+    checks.
     """
     values = {}
     for key in KEYS:
         text = getattr(section, key.replace("-", "_"))
         if not text:
             continue
-        if key == "read-only":
+        if key in BOOLEANS:
             try:
                 values[key] = stock_datatypes["boolean"](text)
             except ValueError as error:
-                raise UsageError(f"<zoe-server> read-only: {error}") from None
+                raise UsageError(f"<zoe-server> {key}: {error}") from None
         elif key in PATHS:
             values[key] = os.path.expanduser(text)
         else:
