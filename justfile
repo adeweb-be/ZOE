@@ -164,7 +164,9 @@ conformance:
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
 # site over HTTP. The other scenarios are filestorage, zeo and zeoclient; the
-# instances of zeo and zeoclient need their server. The build goes to
+# instances of zeo and zeoclient need their server. `just plone zeoclient
+# check` builds the `zoe` binary, starts `zoe serve` on
+# target/plone/zeoclient/var/zoe and stops it at the end. The build goes to
 # target/plone. ZOE_PLONE_ADMIN gives the admin user as user:password.
 # Without it, the recipe makes a random password once, in target/plone/admin.
 # The instance listens on 127.0.0.1, on the port ZOE_PLONE_PORT or 8080.
@@ -256,11 +258,59 @@ plone scenario="zoe" command="start":
             # A new mark in the title of the site tells that read_site.py
             # reads this instance, and not another process on the port.
             mark="mark-$RANDOM$RANDOM"
+            # At the exit, stop the instance, then the server, also when a
+            # step fails. SIGTERM makes zoe serve close its store cleanly.
+            pid=""
+            server=""
+            stop() {
+                if [ -n "$pid" ]; then
+                    kill "$pid" 2>/dev/null || true
+                    wait "$pid" || true
+                fi
+                if [ -n "$server" ]; then
+                    kill -TERM "$server" 2>/dev/null || true
+                    wait "$server" || true
+                fi
+            }
+            trap stop EXIT
+            if [ "{{ scenario }}" = zeoclient ]; then
+                # The instance is a ZEO client of zoe serve. The server is
+                # the `zoe` binary of this build. It listens on the
+                # zeo-address of zeoclient.cfg and serves the store of the
+                # scenario under the storage name 1, the default of ZEO.
+                cargo build --locked -p zoe-server --bin zoe
+                zoe="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"
+                log="$target/zeoclient/var/log/zoe-serve.log"
+                # The server gets no ZOE_* variable of the caller, so only
+                # the options here apply. The admin password does not go
+                # to the server.
+                (
+                    for name in "${!ZOE_@}"; do
+                        unset "$name"
+                    done
+                    exec "$zoe" serve --path "$target/zeoclient/var/zoe" \
+                        --listen 127.0.0.1:8100
+                ) </dev/null >"$log" 2>&1 &
+                server=$!
+                # zoe serve writes `listening <address>` once it accepts
+                # connections. Stop when the server exits or does not
+                # listen, before a ZEO client waits for it.
+                tries=0
+                until grep -q '^listening ' "$log"; do
+                    tries=$((tries + 1))
+                    if ! kill -0 "$server" 2>/dev/null || [ "$tries" -gt 300 ]; then
+                        cat "$log" >&2
+                        echo "just plone: zoe serve does not listen, see $log" >&2
+                        exit 1
+                    fi
+                    sleep 0.1
+                done
+                echo "just plone: zoe serve listens on 127.0.0.1:8100, its log is $log"
+            fi
             "$instance" run plone/set_admin.py
             "$instance" run plone/create_site.py "$mark"
             "$instance" console &
             pid=$!
-            trap 'kill "$pid" 2>/dev/null || true; wait "$pid" || true' EXIT
             # Wait for the instance, then read the page of the site, which
             # holds the title with the mark. Only the admin user can read
             # the management page of the site.
