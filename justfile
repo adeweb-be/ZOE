@@ -427,12 +427,15 @@ plone scenario="zoe" command="start" *args:
     esac
 
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
-# target/bench/results, `just bench run --quick` runs the quick set and
-# `just bench test` runs the tests of the harness. `just bench load` and
-# `just bench saturate` build `zoe` and `zoe-bench` in release, start
-# `zoe serve` on a new store in target/bench/work/zoe-bench, run
-# `zoe-bench load` or `zoe-bench saturate` with its default settings and
-# the options that follow, and write the JSON result to stdout and to
+# target/bench/results, `just bench run --quick` runs the quick set,
+# `just bench test` runs the tests of the harness and `just bench gate DIR`
+# compares zoe serve with ZEO cell by cell. `run` and `test` build `zoe` in
+# release for the storage zoe-server, unless ZOE_BINARY names a binary.
+# `just bench load` and `just bench saturate` build `zoe` and `zoe-bench`
+# in release, start `zoe serve` on a new store in
+# target/bench/work/zoe-bench, run `zoe-bench load` or `zoe-bench saturate`
+# with its default settings and the options that follow, and write the
+# JSON result to stdout and to
 # target/bench/zoe-bench/<command>-<started>.json. The criterion
 # benchmarks are not built yet.
 bench *args="run":
@@ -482,6 +485,11 @@ bench *args="run":
         export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
     shootout=(uv run --locked --project bench/shootout)
+    if { [ "${1:-}" = run ] || [ "${1:-}" = test ]; } && [ -z "${ZOE_BINARY:-}" ]; then
+        cargo build --release --locked -p zoe-server --bin zoe
+        ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
+        export ZOE_BINARY
+    fi
     if [ "{{ args }}" = test ]; then
         exec "${shootout[@]}" pytest -q bench/shootout/tests
     fi
