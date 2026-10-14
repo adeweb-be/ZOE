@@ -1,5 +1,9 @@
 //! The messages of ZEO 6 with msgpack: `[message_id, flags, method, args]`.
 //!
+//! A call of a client that declared the extension `trace_context` can have
+//! a fifth element: its trace context, a map. Its key `traceparent` holds
+//! a W3C traceparent.
+//!
 //! A reply has the method `.reply`. Its flags are 0, or 2 when it carries
 //! an error. The args of an error are `[class, args]`, as ZEO's
 //! `reduce_exception` gives them.
@@ -11,6 +15,9 @@ pub(crate) const HEARTBEAT: i64 = -1;
 
 /// The flags of an error reply.
 const ERROR: u8 = 2;
+
+/// The key of the W3C traceparent in the trace context of a call.
+const TRACEPARENT: &str = "traceparent";
 
 /// The decode budget for one frame. rmpv spends about two steps on each
 /// level of arrays or maps, so this allows about 60 levels. A deeper frame
@@ -39,12 +46,26 @@ pub(crate) struct Call {
     pub(crate) method: String,
     /// The arguments.
     pub(crate) args: Vec<Value>,
+    /// The trace context: the fifth element of the message, a map. Only a
+    /// connection that declared `trace_context` can send it.
+    pub(crate) context: Option<Vec<(Value, Value)>>,
 }
 
 impl Call {
     /// Tell if the call is a heartbeat.
     pub(crate) fn is_heartbeat(&self) -> bool {
         self.id.as_i64() == Some(HEARTBEAT)
+    }
+
+    /// Return the text of the key `traceparent` of the trace context, if
+    /// the call has one.
+    pub(crate) fn traceparent(&self) -> Option<&str> {
+        self.context
+            .as_ref()?
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(TRACEPARENT))?
+            .1
+            .as_str()
     }
 }
 
@@ -61,17 +82,29 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
     let Value::Array(parts) = value else {
         return Err("a message is not an array".into());
     };
-    let Ok([id, flags, method, args]) = <[Value; 4]>::try_from(parts) else {
-        return Err("a message does not have four parts".into());
+    let (id, flags, method, args, context) = match <[Value; 5]>::try_from(parts) {
+        Ok([id, flags, method, args, context]) => (id, flags, method, args, Some(context)),
+        Err(parts) => match <[Value; 4]>::try_from(parts) {
+            Ok([id, flags, method, args]) => (id, flags, method, args, None),
+            Err(_) => return Err("a message does not have four or five parts".into()),
+        },
+    };
+    let context = match context {
+        None => None,
+        Some(Value::Map(pairs)) => Some(pairs),
+        Some(_) => return Err("the trace context is not a map".into()),
     };
     // The stock client sends its heartbeat with nil args. A heartbeat gets
-    // no reply, so its other parts do not matter.
+    // no reply, so its other parts do not matter. It keeps its trace
+    // context, because only a connection that declared `trace_context`
+    // can send one.
     if id.as_i64() == Some(HEARTBEAT) {
         return Ok(Call {
             id,
             oneway: true,
             method: String::new(),
             args: Vec::new(),
+            context,
         });
     }
     let oneway = match flags {
@@ -93,6 +126,7 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
         oneway,
         method,
         args,
+        context,
     })
 }
 
@@ -375,6 +409,84 @@ mod tests {
             assert!(decode(&frame(value)).is_err());
         }
         assert!(decode(b"").is_err());
+    }
+
+    fn call_with(context: Value) -> Vec<u8> {
+        frame(Value::Array(vec![
+            Value::from(1),
+            Value::Boolean(false),
+            Value::from("loadBefore"),
+            Value::Array(vec![]),
+            context,
+        ]))
+    }
+
+    #[test]
+    fn a_call_with_a_fifth_element_has_a_trace_context() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let call = decode(&call_with(Value::Map(vec![
+            (Value::from("other"), Value::from(7)),
+            (Value::from("traceparent"), Value::from(traceparent)),
+        ])))
+        .unwrap();
+        assert_eq!(call.method, "loadBefore");
+        assert_eq!(call.traceparent(), Some(traceparent));
+        // A map without a traceparent, or with one that is not a str, is a
+        // trace context all the same.
+        let call = decode(&call_with(Value::Map(vec![]))).unwrap();
+        assert_eq!(call.context, Some(vec![]));
+        assert_eq!(call.traceparent(), None);
+        let call = decode(&call_with(Value::Map(vec![(
+            Value::from("traceparent"),
+            Value::from(7),
+        )])))
+        .unwrap();
+        assert!(call.context.is_some());
+        assert_eq!(call.traceparent(), None);
+    }
+
+    #[test]
+    fn a_call_with_four_elements_has_no_trace_context() {
+        let bytes = frame(Value::Array(vec![
+            Value::from(1),
+            Value::Boolean(false),
+            Value::from("loadBefore"),
+            Value::Array(vec![]),
+        ]));
+        let call = decode(&bytes).unwrap();
+        assert_eq!(call.context, None);
+        assert_eq!(call.traceparent(), None);
+    }
+
+    #[test]
+    fn a_fifth_element_that_is_not_a_map_or_a_sixth_is_refused() {
+        for context in [Value::Nil, Value::from("00-x"), Value::Array(vec![])] {
+            let error = decode(&call_with(context.clone())).unwrap_err();
+            assert!(error.contains("not a map"), "{context:?}: {error}");
+        }
+        let six = frame(Value::Array(vec![
+            Value::from(1),
+            Value::Boolean(false),
+            Value::from("loadBefore"),
+            Value::Array(vec![]),
+            Value::Map(vec![]),
+            Value::Nil,
+        ]));
+        assert!(decode(&six).is_err());
+    }
+
+    #[test]
+    fn a_heartbeat_keeps_its_trace_context() {
+        let bytes = frame(Value::Array(vec![
+            Value::from(-1),
+            Value::from(0),
+            Value::from(".reply"),
+            Value::Nil,
+            Value::Map(vec![]),
+        ]));
+        let call = decode(&bytes).unwrap();
+        assert!(call.is_heartbeat());
+        assert_eq!(call.context, Some(vec![]));
     }
 
     /// Return the bytes of the hex text `hex`.
