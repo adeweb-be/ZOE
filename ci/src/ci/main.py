@@ -31,6 +31,10 @@ IMAGE_USER = "65532:65532"
 # The store directory in the server image. The image user owns it.
 IMAGE_STORE = "/var/lib/zoe"
 
+# The capabilities that let root ignore the mode of a file. The containers
+# run as root, but some tests expect a read-only file to refuse a write.
+FILE_MODE_CAPS = "-dac_override,-dac_read_search"
+
 # Local state that must not go into the container.
 SOURCE_IGNORE = [
     ".git",
@@ -107,13 +111,24 @@ class Ci:
         args: tuple[str, ...] = (),
         cache_target: bool = True,
         privileged: bool = False,
+        file_modes: bool = False,
     ) -> dagger.Container:
         """Run one just recipe inside the devenv shell."""
         ctr = await self.devenv(source)
         if cache_target:
             ctr = ctr.with_mounted_cache("/src/target", dag.cache_volume("zoe-target"))
+        command = ["just", name, *args]
+        if file_modes:
+            # Root keeps its other capabilities. Without these two, the
+            # kernel applies the mode of each file to root too.
+            command = [
+                "setpriv",
+                f"--inh-caps={FILE_MODE_CAPS}",
+                f"--bounding-set={FILE_MODE_CAPS}",
+                *command,
+            ]
         return ctr.with_exec(
-            ["devenv", "shell", "--", "just", name, *args],
+            ["devenv", "shell", "--", *command],
             insecure_root_capabilities=privileged,
         )
 
@@ -168,7 +183,9 @@ class Ci:
     @function
     async def conformance(self, source: Source) -> str:
         """Run the ZODB suites in-process and the ZEO suites against zoe serve."""
-        ctr = await self.recipe(source, "conformance")
+        # The blob suite of ZODB opens a committed blob for writing and
+        # expects a PermissionError. Root gets none unless file modes apply.
+        ctr = await self.recipe(source, "conformance", file_modes=True)
         return await ctr.stdout()
 
     @function
