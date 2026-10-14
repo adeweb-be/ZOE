@@ -17,7 +17,7 @@ from ZODB.POSException import Unsupported
 
 import zoe
 from zoe.plone import uidgenerator
-from zoe.plone.uidgenerator import BLOCK, STATE, next_id
+from zoe.plone.uidgenerator import BLOCK, STATE, next_id, sequence_name
 
 # The ids that the stock counter of the site gave.
 SEED = 100_000
@@ -118,7 +118,7 @@ def test_the_counter_covers_every_id_given(db):
     for _ in range(5):
         taken = take(db, 37)
         counter, state = tool_state(db)
-        assert counter == state[2]
+        assert counter == state[3]
         assert max(taken) <= counter
 
 
@@ -126,10 +126,44 @@ def test_the_tool_gets_one_write_for_each_block(db):
     add_tool(db)
     take(db, 1)
     _, first = tool_state(db)
-    take(db, BLOCK - 1)
+    take(db, BLOCK)
     assert tool_state(db)[1] == first
     take(db, 1)
     assert tool_state(db)[1] != first
+
+
+def test_a_tool_that_is_a_ghost_takes_its_id_from_the_sequence(db):
+    add_tool(db)
+    take(db, 3)
+    manager = transaction.TransactionManager()
+    connection = db.open(transaction_manager=manager)
+    try:
+        with manager:
+            tool = connection.root()["tool"]
+            connection.cacheMinimize()
+            assert tool._p_changed is None
+            uid = next_id(tool)
+            assert uid is not None
+            assert not tool._p_changed
+    finally:
+        connection.close()
+    counter, _ = tool_state(db)
+    assert SEED < uid <= counter
+
+
+def test_each_tool_has_its_own_sequence(db):
+    add_tool(db)
+    with db.transaction() as connection:
+        other = PersistentMapping()
+        other._uid_counter = SEED
+        connection.root()["other"] = other
+    with db.transaction() as connection:
+        root = connection.root()
+        assert sequence_name(root["tool"]) != sequence_name(root["other"])
+        first = [next_id(root["tool"]) for _ in range(3)]
+        second = [next_id(root["other"]) for _ in range(3)]
+    assert len(set(first)) == 3
+    assert len(set(second)) == 3
 
 
 def test_an_old_counter_that_is_a_length_counts(db):
@@ -155,19 +189,63 @@ def test_ids_of_the_stock_counter_meanwhile_are_not_given_again(db):
     assert min(again) > max(stock)
 
 
-def test_a_copy_into_a_new_store_gives_no_id_again(db, tmp_path):
-    add_tool(db)
-    before = take(db, 25)
+def copy_store(db, tmp_path, lost=0):
+    """Copy the store of `db` into a new store, and return its database.
+
+    The sequence of the tool in the new store gives `lost` values before
+    the copy is used, as reservations that fail after their value do.
+    """
+    with db.transaction() as connection:
+        name = sequence_name(connection.root()["tool"])
     copy = zoe.Storage(str(tmp_path / "copy"))
     copy.copyTransactionsFrom(db.storage)
-    database = ZODB.DB(copy)
+    for _ in range(lost):
+        copy.sequence(name).next()
+    return ZODB.DB(copy)
+
+
+@pytest.mark.parametrize("lost", [0, 1, BLOCK])
+def test_a_copy_into_a_new_store_gives_no_id_again(db, tmp_path, lost):
+    add_tool(db)
+    before = take(db, 25)
+    # The sequence of the new store starts again at 1.
+    database = copy_store(db, tmp_path, lost)
     try:
-        # The sequence of the new store starts again at 1.
         after = take(database, 25)
     finally:
         database.close()
     assert min(after) > max(before)
     assert len(set(after)) == len(after)
+
+
+def test_threads_after_a_copy_give_no_id_again(db, tmp_path):
+    add_tool(db)
+    before = take(db, 2 * BLOCK + 5)
+    database = copy_store(db, tmp_path)
+    with database.transaction() as connection:
+        for index in range(8):
+            connection.root()[f"ids-{index}"] = PersistentMapping()
+    results = {}
+    errors = []
+
+    def creator(index):
+        try:
+            results[index] = take(database, 10, name=f"ids-{index}")
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=creator, args=(i,)) for i in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        database.close()
+    assert errors == []
+    after = [uid for taken in results.values() for uid in taken]
+    assert len(set(after)) == len(after) == 80
+    assert min(after) > max(before)
 
 
 def test_a_server_without_sequences_keeps_the_stock_counter(db, monkeypatch):
