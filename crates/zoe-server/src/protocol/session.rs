@@ -788,9 +788,7 @@ impl Session {
     fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [oid, serial, data, id] = arity::<4>(args, "storea")?;
         self.current(id)?.stage(|txn| {
-            let oid = Oid(u64_of(oid)?);
-            // A nil serial is the serial of a new object, as in FileStorage.
-            let serial = optional_tid(serial)?.unwrap_or(Tid::ZERO);
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
@@ -1213,7 +1211,7 @@ impl Session {
         let mut upload =
             upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
         open.stage(|txn| {
-            let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
@@ -1313,6 +1311,12 @@ fn optional_tid(value: &Value) -> Result<Option<Tid>, Fault> {
         Value::Nil => Ok(None),
         tid => Ok(Some(Tid(u64_of(tid)?))),
     }
+}
+
+/// The serial of a store, `storea` or `storeBlobEnd`. A nil serial is the
+/// zero tid, the serial of a new object, as in FileStorage.
+fn store_serial(value: &Value) -> Result<Tid, Fault> {
+    Ok(optional_tid(value)?.unwrap_or(Tid::ZERO))
 }
 
 /// The number in the 8 big-endian bytes of `value`.
@@ -3014,6 +3018,49 @@ mod tests {
         assert_eq!(blob_tree(&s.storage), [path]);
         // A stock client counts the storea, not the blob.
         assert_eq!(count(&s.storage.status().to_value(), "stores"), 1);
+    }
+
+    #[test]
+    fn a_blob_with_a_nil_serial_is_a_new_object() {
+        let mut s = registered("blob-nil-serial");
+        // A stock `storeBlob(oid, None, ...)`: `storea`, the upload and
+        // `storeBlobEnd`, each with the nil serial.
+        let send = |s: &mut Session, id: i64, data: &[u8]| {
+            begin(s, id, None);
+            store_with(s, id, 1, Value::Nil, b"pickle");
+            done(call(s, "storeBlobStart", vec![]));
+            done(call(
+                s,
+                "storeBlobChunk",
+                vec![Value::Binary(data.to_vec())],
+            ));
+            let end = vec![
+                p64(1),
+                Value::Nil,
+                Value::Binary(b"pickle".to_vec()),
+                Value::from(id),
+            ];
+            done(call(s, "storeBlobEnd", end));
+        };
+        send(&mut s, 1, b"the blob");
+        let tid = Tid(vote_and_finish(&mut s, 1).unwrap());
+        assert_eq!(s.store.load_serial(Oid(1), tid).unwrap(), b"pickle");
+        let path = s.store.blob_path(Oid(1), tid).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the blob");
+
+        // The oid has a record now: the nil serial fails the vote.
+        send(&mut s, 2, b"another blob");
+        let fault = vote_and_finish(&mut s, 2).unwrap_err();
+        assert_eq!(fault.class, CONFLICT_ERROR);
+        assert_eq!(
+            item(&fault, "serials"),
+            Value::Array(vec![p64(tid.0), p64(0)])
+        );
+        assert_eq!(
+            done(call(&mut s, "tpc_abort", vec![Value::from(2)])),
+            Value::Nil
+        );
+        assert_eq!(blob_tree(&s.storage), [path]);
     }
 
     #[test]
