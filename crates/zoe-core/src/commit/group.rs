@@ -15,6 +15,10 @@
 //!
 //! The queue mutex is held with no other lock. The leader takes the commit
 //! sequencer after it releases the queue mutex.
+//!
+//! The write of a batch and its sync run in a `tracing` span `fsync`, with
+//! the field `commits`, the number of members that have a tid. The span
+//! is a child of the span of the leader's finish.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -181,7 +185,9 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
     if last != start {
         // The sequencer stays empty if the write below fails.
         *sequencer = None;
-        match write(store, &mut members) {
+        let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
+        let span = tracing::info_span!("fsync", commits);
+        match span.in_scope(|| write(store, &mut members)) {
             Ok(intents) => {
                 for intent in intents {
                     store.blobs().finished(intent);

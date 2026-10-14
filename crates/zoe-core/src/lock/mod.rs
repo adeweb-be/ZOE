@@ -25,6 +25,9 @@
 //! waits on simulated time. The lock manager never calls the store clock
 //! or a waiter under the mutex, so a slow clock stops no other request, and
 //! a clock that panics leaks no lock.
+//!
+//! Each wait for the lock of an oid runs in a `tracing` span `lock_wait`,
+//! with the field `oid`. The call opens and closes it without the mutex.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -278,6 +281,8 @@ impl LockManager {
         // The call waits for one oid at a time, so one waiter is
         // sufficient.
         let mut wake: Option<Arc<dyn Waiter>> = None;
+        // The span of the wait for the oid that the call waits for.
+        let mut waited: Option<tracing::span::EnteredSpan> = None;
         let mut table = self.table();
         let mut next = 0;
         while let Some(&(oid, mode)) = requests.get(next) {
@@ -308,6 +313,9 @@ impl LockManager {
                 };
                 loop {
                     drop(table);
+                    if waited.is_none() {
+                        waited = Some(tracing::info_span!("lock_wait", oid = oid.0).entered());
+                    }
                     let left = deadline.saturating_sub(clock.monotonic());
                     if !left.is_zero() {
                         wake.wait(left);
@@ -342,6 +350,7 @@ impl LockManager {
                 // clock panics, `locks` drops and releases this lock too.
                 drop(table);
                 since = clock.now();
+                drop(waited.take());
                 table = self.table();
                 if let Some(last) = locks.held.last_mut() {
                     last.since = since;

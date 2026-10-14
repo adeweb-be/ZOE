@@ -15,6 +15,7 @@
 //! fields `storage` and `client` go into each log line of the call, the
 //! log lines of the core too. The client is the label of
 //! `set_client_label` when the call starts, or the address of the peer.
+//! Inside it, the call runs in the span of the traces (`Session::request`).
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -500,6 +501,13 @@ impl Session {
         let label = self.label();
         let client = label.as_deref().unwrap_or(peer);
         tracing::info_span!("connection", client, storage = self.storage.name.as_str())
+    }
+
+    /// Return the span of `call` in the traces: a span named after its
+    /// method, with the storage of the session. Enter it inside the span
+    /// of the connection.
+    pub(crate) fn request(&self, call: &Call) -> tracing::Span {
+        crate::telemetry::request(&call.method, &self.storage.name)
     }
 
     /// Tell if `register` selected the storage of the session.

@@ -454,7 +454,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(threshold) = args.transaction_warn.filter(|t| !t.is_zero()) {
         options = options.transaction_warn(threshold);
     }
-    init_logs(args.log_format);
+    // The traces flush when `_traces` drops, after the stop of the server.
+    let _traces = init_logs(args.log_format)?;
     if let Some(addr) = args.admin_listen {
         options = options.admin_listen(addr);
     }
@@ -477,22 +478,33 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
 
 /// Send the log lines of the process to stderr, in `format`, from the
 /// level INFO on. A JSON line holds the fields of the event and of its
-/// spans. A process that has a subscriber already keeps it.
+/// spans. With `ZOE_OTLP_ENDPOINT`, also export the spans over OTLP, and
+/// return the exporter. A process that has a subscriber already keeps it,
+/// and exports nothing.
 #[cfg(feature = "serve")]
-fn init_logs(format: LogFormat) {
-    use tracing::Level;
+fn init_logs(format: LogFormat) -> Result<Option<crate::telemetry::Telemetry>, Failure> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
 
-    let builder = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(Level::INFO);
-    let _ = match format {
-        LogFormat::Text => builder.try_init(),
-        LogFormat::Json => builder
+    use crate::telemetry::{Select, Telemetry, is_logged};
+
+    let traces = Telemetry::start().map_err(Failure::Message)?;
+    let logs = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let logs = match format {
+        LogFormat::Text => logs.boxed(),
+        LogFormat::Json => logs
             .json()
             .with_current_span(true)
             .with_span_list(true)
-            .try_init(),
+            .boxed(),
     };
+    let installed = tracing_subscriber::registry()
+        .with(logs.with_filter(Select(is_logged)))
+        .with(traces.as_ref().map(Telemetry::layer))
+        .try_init()
+        .is_ok();
+    Ok(traces.filter(|_| installed))
 }
 
 /// Fail: this build has no server.

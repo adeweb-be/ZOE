@@ -27,8 +27,9 @@
 //! `runtime::block_on`, so the simulator runs the same code.
 //!
 //! Each call runs in a `connection` span of its own, with the client and
-//! the storage that the session has when the call starts. The thread of
-//! the transaction drops the transaction in such a span too.
+//! the storage that the session has when the call starts, and inside it in
+//! the span of the call in the traces (`Session::request`). The thread of
+//! the transaction drops the transaction in a `connection` span too.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -284,6 +285,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
             break;
         }
         let _entered = session.span(peer).entered();
+        let _request = session.request(&call).entered();
         let outcome = transaction.call(&call);
         if !Reply::new(room).send(&call, outcome, session.outbox()) {
             lane.stop();
@@ -304,6 +306,7 @@ fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended, peer:
         return;
     }
     let _entered = session.span(peer).entered();
+    let _request = session.request(call).entered();
     let mut reply = Reply::new(room);
     let outcome = session.call(call, &mut reply);
     if !reply.send(call, outcome, session.outbox()) {
@@ -454,6 +457,7 @@ impl Calls {
                     Ok(storage) => {
                         let session = Session::new(storage, outbox.clone(), stopping);
                         let _entered = tracing::info_span!("connection", client = &*peer).entered();
+                        let _request = session.request(&call).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
                     }

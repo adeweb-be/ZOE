@@ -23,6 +23,10 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures = { version = "0.3.34", default-features = false, features = ["alloc"] }
 libc = "0.2"
+# The OpenTelemetry traces of `zoe serve`. Only zoe-server uses them.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "http-json", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 pyo3 = "0.29"
 redb = "4.3"
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
@@ -39,6 +43,8 @@ tokio = { version = "1.53", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # The log lines of `zoe serve`, as text or as JSON. Only zoe-server uses it.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
+# The bridge from the spans of `tracing` to OpenTelemetry. Only zoe-server uses it.
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = { version = "0.14", default-features = false }
 
