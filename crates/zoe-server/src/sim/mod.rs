@@ -4,9 +4,10 @@
 //! and a simulated clock. The store is on the `MemVfs` of the core. A seed
 //! decides the whole schedule: the order of the tasks and of the threads,
 //! the delays, losses, partitions and closes of the network, and the
-//! points where the server crashes. A crash drops the server process and
-//! opens the store again from a crash image of the `MemVfs`. The same seed
-//! gives the same run, event for event, so a failing seed reproduces.
+//! points where the server crashes. A crash comes at a phase of a commit:
+//! staged, locked, finishing or acknowledged. It drops the server process
+//! and opens the store again from a crash image of the `MemVfs`. The same
+//! seed gives the same run, event for event, so a failing seed reproduces.
 //!
 //! The simulator runs the production code. Each connection of the server
 //! runs `protocol::serve_stream`, the session of the server and the core,
@@ -30,6 +31,7 @@ mod server;
 mod world;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
@@ -40,9 +42,11 @@ use zoe_core::{Clock, Oid, Options, Store, Tid};
 
 use crate::protocol::{NamedStorage, Pool, Queues, STORAGE_NAME, Storages};
 use client::SimClient;
-use disk::{SimClock, SimVfs};
+use disk::{Cache, DATABASE, SimClock, SimVfs};
 use rng::Rng;
-use world::{Baton, NetFault, Owner, Resume, Shared, Task, TaskWaker, Timer, Wait, Why};
+use world::{
+    Baton, NetFault, Owner, PlannedCrash, Resume, Shared, Task, TaskWaker, Timer, Wait, Why, phase,
+};
 
 /// The most steps of one run. A run that needs more is a bug of the
 /// simulator or a livelock of the code that it runs.
@@ -85,9 +89,10 @@ pub struct Faults {
     /// `tpc_finish` before the commit is durable. The sync of the commit
     /// happens 5 to 100 ms later.
     pub ack_before_durable: bool,
-    /// A crash is a power loss: the disk keeps the synced writes and a
-    /// seeded prefix of the others. When false, a crash is a kill of the
-    /// process, and the disk keeps every write.
+    /// A crash is a power loss: the disk keeps the synced writes, a seeded
+    /// prefix of the other operations, and a seeded subset of the unsynced
+    /// writes to the database file, some of them torn. When false, a crash
+    /// is a kill of the process, and the disk keeps every write.
     pub power_loss: bool,
 }
 
@@ -122,6 +127,16 @@ pub struct Report {
     pub stale_reads: usize,
     /// The crashes of the server.
     pub crashes: usize,
+    /// The phase of the commit at each crash, in order: `staged` (the
+    /// client stored and did not vote), `locked` (between the vote and
+    /// `tpc_finish`), `finishing` (at the sync of the database file in
+    /// `tpc_finish`) or `acknowledged` (the client got the reply of
+    /// `tpc_finish`).
+    pub crash_phases: Vec<&'static str>,
+    /// The findings on the store after the last crash: those of the checks
+    /// of `zoe verify`, a blob file without its blob record, and a store
+    /// that does not open. Empty when the store is sound.
+    pub verify: Vec<String>,
     /// The simulated time of the run.
     pub elapsed: Duration,
 }
@@ -133,18 +148,20 @@ pub struct Simulation {
     clients: usize,
     commits: usize,
     crashes: usize,
+    blobs: bool,
     faults: Faults,
 }
 
 impl Simulation {
-    /// A run with the seed `seed`: 2 clients, 20 commits, no crash, and
-    /// the default faults.
+    /// A run with the seed `seed`: 2 clients, 20 commits, no crash, no
+    /// blob, and the default faults.
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
             clients: 2,
             commits: 20,
             crashes: 0,
+            blobs: false,
             faults: Faults::default(),
         }
     }
@@ -163,11 +180,20 @@ impl Simulation {
         self
     }
 
-    /// Crash the server `n` times, each at a sync of the database file or
-    /// up to 30 ms after one.
+    /// Crash the server `n` times. The seed gives each crash a phase of
+    /// the commit and a number of acknowledged commits. The crash comes at
+    /// the first commit that reaches that phase after that number.
     #[must_use]
     pub fn crashes(mut self, n: usize) -> Self {
         self.crashes = n;
+        self
+    }
+
+    /// With `true`, the clients also commit blobs, as `ZEO.ClientStorage`
+    /// uploads them, to oids of their own.
+    #[must_use]
+    pub fn blobs(mut self, blobs: bool) -> Self {
+        self.blobs = blobs;
         self
     }
 
@@ -184,15 +210,6 @@ impl Simulation {
     }
 }
 
-/// When a planned crash happens.
-#[derive(Clone, Copy, Debug)]
-enum CrashAt {
-    /// At the sync of the commit: the commit is not durable yet.
-    Sync,
-    /// This long after the sync of the commit.
-    After(Duration),
-}
-
 /// The driver of a run.
 struct Driver {
     plan: Simulation,
@@ -202,10 +219,10 @@ struct Driver {
     yields: mpsc::Receiver<(u64, Why)>,
     /// The disk of the current server process.
     disk: MemVfs,
-    /// The planned crashes, by the number of the sync of the database.
-    crash_plan: BTreeMap<u64, Vec<CrashAt>>,
-    syncs: u64,
+    /// The cache of the database file of the current server process.
+    cache: Arc<Cache>,
     crashes: usize,
+    crash_phases: Vec<&'static str>,
     flush_pending: bool,
     /// The numbers of the crash images, apart from the schedule.
     images: Rng,
@@ -216,16 +233,14 @@ impl Driver {
         let (send, yields) = mpsc::channel();
         let mut rng = Rng::new(plan.seed.rotate_left(32) ^ 0xC0FF_EE00);
         let span = plan.commits.max(1) as u64;
-        let mut crash_plan: BTreeMap<u64, Vec<CrashAt>> = BTreeMap::new();
-        for _ in 0..plan.crashes {
-            let at = 1 + rng.below(span);
-            let when = if rng.chance(0.3) {
-                CrashAt::Sync
-            } else {
-                CrashAt::After(rng.between(Duration::ZERO, Duration::from_millis(30)))
-            };
-            crash_plan.entry(at).or_default().push(when);
-        }
+        // A crash comes in the first half of the commits, so that the run
+        // reaches it also when some transactions give up.
+        let crash_plan: Vec<PlannedCrash> = (0..plan.crashes)
+            .map(|_| PlannedCrash {
+                phase: phase::ALL[rng.below(phase::ALL.len() as u64) as usize],
+                after: rng.below(span / 2 + 1) as usize,
+            })
+            .collect();
         // A commit sends about 10 frames. The faults of the network start
         // at frames that the seed chooses among those of the commits.
         let frames = span * 10;
@@ -242,7 +257,7 @@ impl Driver {
                     .push(fault);
             }
         }
-        let shared = Shared::new(plan.seed, plan.faults.clone(), fault_plan, send);
+        let shared = Shared::new(plan.seed, plan.faults.clone(), fault_plan, crash_plan, send);
         shared.lock().clients = plan.clients;
         Self {
             images: rng.fork(),
@@ -252,9 +267,9 @@ impl Driver {
             batons: BTreeMap::new(),
             yields,
             disk: MemVfs::new(),
-            crash_plan,
-            syncs: 0,
+            cache: Arc::default(),
             crashes: 0,
+            crash_phases: Vec::new(),
             flush_pending: false,
         }
     }
@@ -272,6 +287,7 @@ impl Driver {
                 transactions,
                 rng: state.rng.fork(),
                 stall: self.plan.faults.stall_client_for.filter(|_| id == 0),
+                blobs: self.plan.blobs,
             };
             state.spawn(
                 &self.shared.ready,
@@ -292,10 +308,12 @@ impl Driver {
         // The end of the run is a crash too. Then the store opens from what
         // is durable, and every acknowledged commit must be there.
         self.stop("stops at the end of the run");
-        let lost = self.verify();
+        let (lost, verify) = self.verify();
         let mut report = self.shared.lock().report();
         report.lost = lost;
+        report.verify = verify;
         report.crashes = self.crashes;
+        report.crash_phases = std::mem::take(&mut self.crash_phases);
         report
     }
 
@@ -303,7 +321,9 @@ impl Driver {
     fn start_server(&mut self, why: &str) {
         let clock = SimClock(Arc::clone(&self.shared));
         let start = clock.now();
-        let opened = Store::open_full(SimVfs(self.disk.clone()), clock, Options::default());
+        let vfs = SimVfs::new(self.disk.clone());
+        self.cache = Arc::clone(&vfs.cache);
+        let opened = Store::open_full(vfs, clock, Options::default());
         let mut state = self.shared.lock();
         match opened {
             Ok(store) => {
@@ -371,14 +391,6 @@ impl Driver {
                     state.trace(format!("net heals the partition of c{client}"));
                 }
             }
-            Timer::Crash { generation } => {
-                let current = state.server.up && state.server.generation == generation;
-                drop(state);
-                if current {
-                    self.crash("crashes after a sync");
-                }
-                return;
-            }
             Timer::Restart => {
                 drop(state);
                 self.start_server("starts again");
@@ -389,7 +401,7 @@ impl Driver {
                 if state.server.up && state.server.generation == generation {
                     state.trace("server syncs late");
                     drop(state);
-                    disk::sync_database(&self.disk);
+                    let _ = self.cache.flush(&self.disk.file(DATABASE));
                 }
                 return;
             }
@@ -424,6 +436,11 @@ impl Driver {
             self.run_thread(threads[pick - tasks.len()]);
         }
         self.adopt();
+        // A client reached the phase of a planned crash in this step.
+        let reached = self.shared.lock().crash_now.take();
+        if let Some(phase) = reached {
+            self.crash(phase, &format!("crashes in the phase {phase}"));
+        }
         true
     }
 
@@ -461,7 +478,8 @@ impl Driver {
                 Why::Sync => match self.on_sync() {
                     Some(next) => how = next,
                     None => {
-                        self.crash("crashes in a sync");
+                        let finishing = phase::FINISHING;
+                        self.crash(finishing, &format!("crashes in a sync, phase {finishing}"));
                         return;
                     }
                 },
@@ -514,19 +532,15 @@ impl Driver {
         why
     }
 
-    /// Count a sync of the database file. Return how the thread goes on,
-    /// or `None` when the server crashes now.
+    /// Note a sync of the database file: a commit in the phase
+    /// `finishing`. Return how the thread goes on, or `None` when the
+    /// server crashes now.
     fn on_sync(&mut self) -> Option<Resume> {
-        self.syncs += 1;
-        let plans = self.crash_plan.remove(&self.syncs).unwrap_or_default();
         let mut state = self.shared.lock();
-        let generation = state.server.generation;
-        for plan in plans {
-            match plan {
-                CrashAt::Sync => return None,
-                CrashAt::After(delay) => state.after(delay, Timer::Crash { generation }),
-            }
+        if state.crash_at(phase::FINISHING) {
+            return None;
         }
+        let generation = state.server.generation;
         if !state.faults.ack_before_durable {
             return Some(Resume::Go);
         }
@@ -540,13 +554,15 @@ impl Driver {
         Some(Resume::Defer)
     }
 
-    /// Crash the server now: keep a crash image of its disk, drop the
-    /// process, and start it again 5 to 100 ms later.
-    fn crash(&mut self, why: &str) {
+    /// Crash the server now, in the phase `phase` of a commit: keep a crash
+    /// image of its disk, drop the process, and start it again 5 to 100 ms
+    /// later.
+    fn crash(&mut self, phase: &'static str, why: &str) {
         if !self.shared.lock().server.up {
             return;
         }
         self.crashes += 1;
+        self.crash_phases.push(phase);
         self.stop(why);
         let mut state = self.shared.lock();
         let delay = state
@@ -556,9 +572,10 @@ impl Driver {
     }
 
     /// Stop the server process as a crash does. With a power loss, the
-    /// disk keeps what was synced and a seeded prefix of the rest; with a
-    /// kill, it keeps every write. Every connection of the process breaks,
-    /// its tasks drop, and its threads end.
+    /// disk keeps what was synced, a seeded prefix of the other operations,
+    /// and a seeded subset of the cached writes to the database file, some
+    /// of them torn; with a kill, it keeps every write. Every connection of
+    /// the process breaks, its tasks drop, and its threads end.
     fn stop(&mut self, why: &str) {
         let power_loss = self.shared.lock().faults.power_loss;
         let draw = self.images.next_u64();
@@ -572,11 +589,18 @@ impl Driver {
             landed = (n, pending);
             n
         });
+        let cached = self
+            .cache
+            .crash(&image, power_loss, &mut self.images)
+            .expect("a crash image takes the cached writes");
+        // The cached writes that landed are on the disk, as the rest of the
+        // image is.
+        let image = image.durable_copy();
         let (generation, wakers) = {
             let mut state = self.shared.lock();
             state.trace(format!(
-                "server {why}: {} of {} pending writes land",
-                landed.0, landed.1
+                "server {why}: {} of {} pending writes and {} of {} cached writes of the database land",
+                landed.0, landed.1, cached.0, cached.1
             ));
             let generation = state.server.generation;
             state.server.up = false;
@@ -624,34 +648,44 @@ impl Driver {
         self.disk = image;
     }
 
-    /// Open the disk after the last stop and count the acknowledged
-    /// commits that it does not hold.
-    fn verify(&mut self) -> usize {
+    /// Open the disk after the last stop. Return the number of the
+    /// acknowledged commits that it does not hold whole, records and blobs,
+    /// and the findings on the store.
+    fn verify(&mut self) -> (usize, Vec<String>) {
         let acked = self.shared.lock().acked.clone();
         let clock = SimClock(Arc::clone(&self.shared));
-        let store = match Store::open_full(SimVfs(self.disk.clone()), clock, Options::default()) {
+        let vfs = SimVfs::new(self.disk.clone());
+        let store = match Store::open_full(vfs, clock, Options::default()) {
             Ok(store) => store,
             Err(error) => {
-                self.shared
-                    .lock()
-                    .trace(format!("the store does not open: {error}"));
-                return acked.len();
+                let finding = format!("the store does not open: {error}");
+                self.shared.lock().trace(&finding);
+                return (acked.len(), vec![finding]);
             }
         };
         let lost = acked
             .iter()
             .filter(|commit| {
-                commit.records.iter().any(|(oid, data)| {
-                    !store
-                        .load_serial(Oid(*oid), Tid(commit.tid))
+                let tid = Tid(commit.tid);
+                let records = commit.records.iter().all(|(oid, data)| {
+                    store
+                        .load_serial(Oid(*oid), tid)
                         .is_ok_and(|stored| &stored == data)
-                })
+                });
+                let blobs = commit
+                    .blobs
+                    .iter()
+                    .all(|(oid, bytes)| read_blob(&store, Oid(*oid), tid).as_ref() == Some(bytes));
+                !(records && blobs)
             })
             .count();
-        self.shared
-            .lock()
-            .trace(format!("verify: {} acknowledged, {lost} lost", acked.len()));
-        lost
+        let findings = findings(&store, &self.disk);
+        let mut state = self.shared.lock();
+        state.trace(format!("verify: {} acknowledged, {lost} lost", acked.len()));
+        for finding in &findings {
+            state.trace(format!("verify: {finding}"));
+        }
+        (lost, findings)
     }
 
     /// Move the clock to the next timer or lock deadline.
@@ -685,6 +719,64 @@ impl Driver {
         let start = state.trace.len().saturating_sub(40);
         state.trace[start..].join("\n")
     }
+}
+
+/// Read the whole blob that `tid` wrote for `oid`, or `None` when it does
+/// not read or does not match its blob record.
+fn read_blob(store: &Store, oid: Oid, tid: Tid) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    store
+        .open_blob(oid, tid)
+        .ok()?
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Return the findings on `store`, whose files are on `disk`: each finding
+/// of the checks of `zoe verify`, and each blob file without its blob
+/// record.
+fn findings(store: &Store, disk: &MemVfs) -> Vec<String> {
+    let report = zoe_convert::verify(store, None);
+    let mut findings: Vec<String> = Vec::new();
+    findings.extend(report.checksums.iter().map(|p| format!("{p:?}")));
+    findings.extend(report.blob_files.iter().map(|p| format!("{p:?}")));
+    findings.extend(report.references.iter().map(|p| format!("{p:?}")));
+    findings.extend(report.pickles.iter().map(|p| format!("{p:?}")));
+    for name in disk.names() {
+        let Some(path) = name.strip_prefix("blobs/") else {
+            continue;
+        };
+        let Some(path) = path.strip_suffix(".blob") else {
+            continue;
+        };
+        match blob_ids(path) {
+            Some((oid, tid)) if matches!(store.load_blob(oid, tid), Ok(Some(_))) => {}
+            Some(_) => findings.push(format!("the blob file {name} has no blob record")),
+            None => findings.push(format!("the blob file {name} has no name of a blob")),
+        }
+    }
+    findings
+}
+
+/// Return the oid and the tid of a blob file from its path in the blob
+/// directory, without `.blob`: eight directories `0xNN`, one per byte of
+/// the oid, then the tid in hexadecimal with `0x`.
+fn blob_ids(path: &str) -> Option<(Oid, Tid)> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let [dirs @ .., tid] = parts.as_slice() else {
+        return None;
+    };
+    if dirs.len() != 8 {
+        return None;
+    }
+    let mut oid = 0u64;
+    for dir in dirs {
+        let byte = u8::from_str_radix(dir.strip_prefix("0x")?, 16).ok()?;
+        oid = oid << 8 | u64::from(byte);
+    }
+    let tid = u64::from_str_radix(tid.strip_prefix("0x")?, 16).ok()?;
+    Some((Oid(oid), Tid(tid)))
 }
 
 impl Drop for Driver {

@@ -159,6 +159,12 @@
         seconds. 0 closes no idle connection.
       </description>
     </key>
+    <key name="blocking-threads" datatype="string">
+      <description>
+        The number of threads that run the calls that read, for all the
+        connections together. The default is the number of cores.
+      </description>
+    </key>
     <key name="lock-warn" datatype="string">
       <description>
         Log each lock held longer than this, in whole seconds. 0 logs no
