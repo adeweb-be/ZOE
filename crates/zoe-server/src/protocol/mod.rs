@@ -438,6 +438,7 @@ pub(crate) async fn serve_stream(
                 if written.is_err() {
                     break;
                 }
+                frame.sent();
             }
             // A call that waits for room in the session queue stops.
             drop(inbox);

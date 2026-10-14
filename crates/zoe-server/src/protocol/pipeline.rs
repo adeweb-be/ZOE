@@ -398,7 +398,7 @@ impl Calls {
                 .await
                 .expect("the slots of a connection never close");
             let turn = if reads {
-                Some(outbox.turn().await)
+                outbox.turn().await
             } else {
                 outbox.below().await;
                 None
@@ -670,6 +670,85 @@ mod tests {
             assert!(!quiet.is_finished());
             drop(held);
             tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    /// Return a registered connection to `storages` whose frames go to
+    /// `outbox`.
+    async fn registered(storages: Arc<Storages>, outbox: Outbox) -> Calls {
+        let mut connection = Calls::new(
+            storages,
+            outbox,
+            Arc::new(Tokio),
+            "test".into(),
+            Stopping::new().1,
+        );
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        start(&mut connection, vec![call(1, "register", register)]).await;
+        assert!(connection.session.is_some());
+        connection
+    }
+
+    #[test]
+    fn quiet_waits_for_a_call_that_waits_for_its_turn() {
+        let (storages, _store) = storages("quiet-turn");
+        // The test reads no frame, so the window stays at one call.
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = registered(storages, outbox).await;
+            let limit = Duration::from_secs(30);
+            let load = call(2, "loadBefore", Vec::new());
+            let first = tokio::time::timeout(limit, connection.ticket(&load))
+                .await
+                .unwrap();
+            assert!(first.turn.is_some());
+            // The second load holds a slot and waits for its turn.
+            let waiting = tokio::spawn(connection.ticket(&load));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished());
+            let quiet = tokio::spawn(connection.quiet());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // The first load ends. The second takes its turn and runs.
+            drop(first);
+            let second = tokio::time::timeout(limit, waiting).await.unwrap().unwrap();
+            assert!(second.turn.is_some());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // No call runs, whatever the window: the connection is quiet.
+            drop(second);
+            tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn the_ticket_of_a_connection_whose_writer_is_gone_ends() {
+        use crate::protocol::outbox::WAITING;
+
+        let (storages, _store) = storages("writer-gone");
+        let (outbox, inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = registered(storages, outbox).await;
+            let limit = Duration::from_secs(30);
+            let load = call(2, "loadBefore", Vec::new());
+            let first = tokio::time::timeout(limit, connection.ticket(&load))
+                .await
+                .unwrap();
+            // The client resets, so the writer stops. Then the load puts a
+            // large reply, which can stay counted.
+            drop(inbox);
+            let Ticket { slot, turn, room } = first;
+            let _ = room.put(Some(vec![0; 2 * WAITING]));
+            drop((slot, turn));
+            // The next call does not wait for the count: its ticket ends,
+            // and the reader stops on it.
+            for method in ["loadBefore", "lastTransaction", "tpc_abort"] {
+                let next = call(3, method, Vec::new());
+                let ticket = tokio::time::timeout(limit, connection.ticket(&next))
+                    .await
+                    .unwrap();
+                assert!(ticket.is_closed(), "{method}");
+            }
         });
     }
 

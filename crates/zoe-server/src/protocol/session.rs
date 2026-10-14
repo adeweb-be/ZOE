@@ -3585,6 +3585,25 @@ mod tests {
     }
 
     #[test]
+    fn the_calls_of_the_read_pool_are_the_calls_that_read() {
+        for method in [
+            "loadBefore",
+            "loadSerial",
+            "history",
+            "new_oids",
+            "iterator_next",
+        ] {
+            assert!(on_read_pool(method), "{method}");
+        }
+        for method in TRANSACTION_CALLS {
+            assert!(!on_read_pool(method), "{method}");
+        }
+        for method in ["set_client_label", "sendBlob", "pack"] {
+            assert!(!on_read_pool(method), "{method}");
+        }
+    }
+
+    #[test]
     fn errors_have_the_class_names_of_zodb() {
         let fault = Fault::from(ZoeError::NotFound { oid: Oid(3) });
         assert_eq!(fault.class, "ZODB.POSException.POSKeyError");
