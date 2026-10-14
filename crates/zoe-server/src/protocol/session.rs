@@ -62,15 +62,17 @@ const READ_CONFLICT: &str = "database read conflict error";
 
 /// The interfaces that the store provides, as `(module, name)`, in the
 /// order of `providedBy(zoe.Storage(path)).__iro__`. A stock client takes
-/// the storage interfaces of this list as its own. The store does not
-/// provide `IStorageUndoable` or `IExternalGC`.
-const INTERFACES: [(&str, &str); 7] = [
+/// the storage interfaces of this list as its own. The store provides
+/// `IExternalGC`, because `deleteObject` writes a deletion. It does not
+/// provide `IStorageUndoable`.
+const INTERFACES: [(&str, &str); 8] = [
     ("ZODB.interfaces", "IBlobStorageRestoreable"),
     ("ZODB.interfaces", "IBlobStorage"),
     ("ZODB.interfaces", "IStorageRestoreable"),
     ("ZODB.interfaces", "IStorageCurrentRecordIteration"),
-    ("ZODB.interfaces", "IStorage"),
     ("ZODB.interfaces", "IStorageIteration"),
+    ("ZODB.interfaces", "IExternalGC"),
+    ("ZODB.interfaces", "IStorage"),
     ("zope.interface", "Interface"),
 ];
 
@@ -2796,9 +2798,8 @@ mod tests {
             })
             .collect();
         assert_eq!(interfaces, INTERFACES);
-        for name in ["IStorageUndoable", "IExternalGC"] {
-            assert!(!interfaces.contains(&("ZODB.interfaces", name)), "{name}");
-        }
+        assert!(interfaces.contains(&("ZODB.interfaces", "IExternalGC")));
+        assert!(!interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
 
         let sizes = done(call(&mut s, "get_size_info", vec![]));
         assert_eq!(keys(&sizes), ["length", "size"]);

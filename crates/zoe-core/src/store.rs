@@ -105,6 +105,13 @@ pub struct Options {
     /// to the file. `None`, the default, keeps the default of redb, 1 GiB.
     /// This is `cache-size` in the configuration.
     pub cache_size: Option<usize>,
+    /// Pack with garbage collection when true, the default. When false, a
+    /// pack removes old revisions only: of each object, it keeps the
+    /// newest record at or before the pack tid, also when no reader can
+    /// reach the object. When that record is a deletion, the object goes.
+    /// Such a pack reads no reference. The store does not record this
+    /// option. This is `pack-gc` in the configuration.
+    pub pack_gc: bool,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -124,6 +131,7 @@ impl Default for Options {
             transaction_warn: None,
             blob_dir: None,
             cache_size: None,
+            pack_gc: true,
             _more: (),
         }
     }
@@ -170,6 +178,8 @@ pub struct Store {
     next_oid: AtomicU64,
     /// True when the store is open for reads only.
     read_only: bool,
+    /// True when a pack collects garbage. This is `Options::pack_gc`.
+    pub(crate) pack_gc: bool,
     /// The state that a pack shares with the finishes. A finish takes its
     /// lock under the commit sequencer.
     pub(crate) packing: PackState,
@@ -398,6 +408,7 @@ impl Store {
             group: GroupCommit::default(),
             next_oid: AtomicU64::new(next_oid.0),
             read_only,
+            pack_gc: options.pack_gc,
             packing: PackState::default(),
             sequences: Sequences::default(),
         })

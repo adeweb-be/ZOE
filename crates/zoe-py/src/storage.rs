@@ -196,15 +196,18 @@ impl Storage {
     /// Open the store in the directory `path`, and create it if necessary.
     /// `lock_timeout` is the longest wait of a vote for its locks, in
     /// seconds. `blob_dir` is the directory of the blob files, `None` for
-    /// `<path>/blobs`. The core takes it as `Options::blob_dir`.
+    /// `<path>/blobs`. The core takes it as `Options::blob_dir`. With
+    /// `pack_gc` false, a pack keeps the objects that no reader can reach:
+    /// the core takes it as `Options::pack_gc`.
     #[new]
-    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None))]
+    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         read_only: bool,
         lock_timeout: Option<f64>,
         blob_dir: Option<PathBuf>,
+        pack_gc: bool,
     ) -> PyResult<Self> {
         let mut options = Options::default();
         if let Some(seconds) = lock_timeout {
@@ -213,6 +216,7 @@ impl Storage {
             })?;
         }
         options.blob_dir = blob_dir;
+        options.pack_gc = pack_gc;
         let (store, last, path) = py
             .detach(|| {
                 // A read-only storage creates no directory. It does not use
@@ -443,6 +447,10 @@ impl Storage {
     /// Pack the store at `tid`: remove the records that no reader at or
     /// after `tid` needs, with their blob files. `zoe.storage.Storage.pack`
     /// gives the tid of the pack time.
+    ///
+    /// A storage opened with `pack_gc` false keeps the objects that no
+    /// reader can reach, except an object whose newest record at or before
+    /// `tid` is a deletion.
     ///
     /// The whole pack runs without the GIL. Other threads read and commit
     /// while it runs. A read-only storage refuses the pack.

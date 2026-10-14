@@ -76,6 +76,7 @@ pub struct StorageOptions {
     path: PathBuf,
     blob_dir: Option<PathBuf>,
     read_only: bool,
+    pack_gc: bool,
 }
 
 impl StorageOptions {
@@ -87,6 +88,7 @@ impl StorageOptions {
             path: path.as_ref().to_path_buf(),
             blob_dir: None,
             read_only: false,
+            pack_gc: true,
         }
     }
 
@@ -107,6 +109,16 @@ impl StorageOptions {
         self.read_only = read_only;
         self
     }
+
+    /// Pack the store without garbage collection, when `pack_gc` is false:
+    /// a pack keeps the objects that no reader can reach, and removes old
+    /// revisions only. The store gets `Options::pack_gc` false. Without
+    /// this call, a pack collects garbage.
+    #[must_use]
+    pub fn pack_gc(mut self, pack_gc: bool) -> Self {
+        self.pack_gc = pack_gc;
+        self
+    }
 }
 
 /// The settings of a server.
@@ -125,6 +137,7 @@ pub struct ServeOptions {
     idle_timeout: Duration,
     blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
+    pack_gc: bool,
     shared_blob_dir: bool,
     tls: Option<TlsOptions>,
 }
@@ -160,6 +173,7 @@ impl ServeOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             blocking_threads: None,
             read_only: false,
+            pack_gc: true,
             shared_blob_dir: false,
             tls: None,
         }
@@ -295,6 +309,15 @@ impl ServeOptions {
         self
     }
 
+    /// Pack every store without garbage collection, when `pack_gc` is
+    /// false, as [`StorageOptions::pack_gc`] does for one store. A store
+    /// packs with garbage collection only when both are true.
+    #[must_use]
+    pub fn pack_gc(mut self, pack_gc: bool) -> Self {
+        self.pack_gc = pack_gc;
+        self
+    }
+
     /// Accept `storeBlobShared` when `shared` is true: the clients share
     /// the blob directory of each store, and give the name of a blob file
     /// in the directory of its oid. `Server::start` then makes the blob
@@ -332,6 +355,7 @@ impl ServeOptions {
         options.lock_warn = self.lock_warn;
         options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);
+        options.pack_gc = self.pack_gc && storage.pack_gc;
         options
     }
 
@@ -1069,6 +1093,21 @@ mod tests {
         .err();
         assert!(matches!(twice, Some(Error::Storages(_))), "{twice:?}");
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_store_packs_with_gc_unless_the_server_or_its_table_says_false() {
+        let pack_gc = |server: bool, store: bool| {
+            let storage = StorageOptions::new("1", "store").pack_gc(store);
+            let options = ServeOptions::with_storages([storage.clone()]).pack_gc(server);
+            options.store_options(&storage).pack_gc
+        };
+        let default = StorageOptions::new("1", "store");
+        assert!(ServeOptions::new("store").store_options(&default).pack_gc);
+        assert!(pack_gc(true, true));
+        assert!(!pack_gc(false, true));
+        assert!(!pack_gc(true, false));
+        assert!(!pack_gc(false, false));
     }
 
     #[test]

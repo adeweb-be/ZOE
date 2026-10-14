@@ -60,8 +60,8 @@ pub(super) struct ServeArgs {
     /// A TOML file of options. Its top-level keys are the options of zoe
     /// serve without --, except config and storage, such as listen =
     /// "127.0.0.1:8100". Each [storages.NAME] table adds a store, with the
-    /// keys path, blob-dir and read-only. An option on the command line or
-    /// in its twin wins over the file. An unknown key is an error.
+    /// keys path, blob-dir, read-only and pack-gc. An option on the command
+    /// line or in its twin wins over the file. An unknown key is an error.
     #[arg(long, env = "ZOE_CONFIG", value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -250,6 +250,26 @@ pub(super) struct ServeArgs {
     )]
     read_only: bool,
 
+    /// Pack each store with garbage collection, the default. With false, a
+    /// pack removes old revisions only, as the pack-gc of FileStorage does:
+    /// it keeps the newest revision of each object at or before the pack
+    /// time, also when no reader can reach the object. An object whose
+    /// newest revision there is a deletion goes. The key pack-gc = false of
+    /// a [storages.NAME] table sets it for one store. The store records
+    /// nothing, so give it at each start.
+    #[arg(
+        long,
+        env = "ZOE_PACK_GC",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    pack_gc: bool,
+
     /// Accept storeBlobShared: the server and its clients share the blob
     /// directory of each store, as with the option shared-blob-dir of a ZEO
     /// client. A client writes the blob file in the directory of its oid
@@ -341,6 +361,9 @@ pub(super) struct Storage {
     pub(super) blob_dir: Option<PathBuf>,
     /// True when the server serves the store for reads only.
     pub(super) read_only: bool,
+    /// False when a pack of the store keeps the objects that no reader can
+    /// reach.
+    pub(super) pack_gc: bool,
 }
 
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
@@ -352,6 +375,7 @@ fn named_storage(value: &str) -> Result<Storage, String> {
             path: PathBuf::from(path),
             blob_dir: None,
             read_only: false,
+            pack_gc: true,
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
@@ -478,6 +502,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
         path: path.clone(),
         blob_dir: args.blob_dir.clone(),
         read_only: false,
+        pack_gc: true,
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())
@@ -508,8 +533,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     use crate::serve::{ServeOptions, Server, StorageOptions, TlsOptions};
 
     let storages = args.storages.iter().map(|storage| {
-        let options =
-            StorageOptions::new(&storage.name, &storage.path).read_only(storage.read_only);
+        let options = StorageOptions::new(&storage.name, &storage.path)
+            .read_only(storage.read_only)
+            .pack_gc(storage.pack_gc);
         match &storage.blob_dir {
             Some(dir) => options.blob_dir(dir),
             None => options,
@@ -522,6 +548,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .shutdown_timeout(args.shutdown_timeout)
         .idle_timeout(args.idle_timeout)
         .read_only(args.read_only)
+        .pack_gc(args.pack_gc)
         .shared_blob_dir(args.shared_blob_dir);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
@@ -697,6 +724,16 @@ mod tests {
         assert!(serve(&["--read-only=true"]).unwrap().read_only);
         assert!(!serve(&["--read-only=false"]).unwrap().read_only);
         let error = serve(&["--read-only=maybe"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn pack_gc_is_true_by_default_and_takes_a_boolean() {
+        assert!(serve(&[]).unwrap().pack_gc);
+        assert!(serve(&["--pack-gc"]).unwrap().pack_gc);
+        assert!(serve(&["--pack-gc=true"]).unwrap().pack_gc);
+        assert!(!serve(&["--pack-gc=false"]).unwrap().pack_gc);
+        let error = serve(&["--pack-gc=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

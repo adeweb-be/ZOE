@@ -359,11 +359,15 @@ def _zeo_options(section):
 class _Store:
     """The ZOE store of a storage section of ZEO's configuration."""
 
-    def __init__(self, name, path, blob_dir=None, read_only=False, temporary=False):
+    def __init__(
+        self, name, path, blob_dir=None, read_only=False, temporary=False, pack_gc=True
+    ):
         self.name = name
         self.path = path
         self.blob_dir = blob_dir
         self.read_only = read_only
+        # False packs the store without garbage collection.
+        self.pack_gc = pack_gc
         # A store in place of a mapping storage goes at each stop.
         self.temporary = temporary
 
@@ -378,6 +382,8 @@ class _Store:
             lines.append(f"blob-dir = {json.dumps(self.blob_dir)}")
         if self.read_only:
             lines.append("read-only = true")
+        if not self.pack_gc:
+            lines.append("pack-gc = false")
         return "\n".join(lines) + "\n"
 
 
@@ -385,8 +391,8 @@ def _store(section):
     """Return the `_Store` of a storage section.
 
     The store has the name of the section, or 1 for a section without a
-    name, as ZEO does. A <filestorage> becomes a store at its path, a
-    <mappingstorage> a store in a new directory. A <blobstorage> around
+    name, as ZEO does. A <filestorage> becomes a store at its path, with its
+    `pack-gc`, a <mappingstorage> a store in a new directory. A <blobstorage> around
     either one gives its blob directory. Relative paths are relative to
     the current directory. Raise `ValueError` that names the first key or
     section that `zoe serve` lacks.
@@ -414,6 +420,7 @@ def _store(section):
     path = None
     create = False
     read_only = False
+    pack_gc = True
     for key, values in base.items():
         key, value = key.lower(), values[-1]
         if key == "path":
@@ -424,6 +431,8 @@ def _store(section):
             create = ZConfig.datatypes.asBoolean(value)
         elif key == "read-only":
             read_only = ZConfig.datatypes.asBoolean(value)
+        elif key == "pack-gc":
+            pack_gc = ZConfig.datatypes.asBoolean(value)
         else:
             raise _no_option(f"{key} {value} in <filestorage>")
     if path is None:
@@ -431,7 +440,7 @@ def _store(section):
     if create:
         # A FileStorage with create true starts empty.
         shutil.rmtree(path, ignore_errors=True)
-    return _Store(name, path, blob_dir, read_only)
+    return _Store(name, path, blob_dir, read_only, pack_gc=pack_gc)
 
 
 class ZeoLayer:
