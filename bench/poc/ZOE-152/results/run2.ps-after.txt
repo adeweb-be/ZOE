@@ -1,0 +1,11 @@
+    PID     ELAPSED %CPU COMMAND
+ 297285       00:00  100 ps -eo pid,etime,pcpu,args --sort=-pcpu
+ 296329       00:14  9.3 /usr/libexec/packagekitd
+ 123628       27:03  8.3 /home/aduchene/.cache/zoe-build/ZOE-098/src/target/debug/deps/zoe_server-89de76df9cf9d117
+3795367    01:12:27  5.2 claude
+2141119    13:21:12  3.4 /usr/bin/kgx --gapplication-service
+  11307  1-15:16:48  1.5 /usr/bin/gnome-shell --mode=user
+  94936       30:09  1.4 claude --resume
+    PID  NI     ELAPSED %CPU     TIME COMMAND
+ 103308   5       29:19  0.0 00:00:00 cargo test --workspace --locked
+ 123628   5       27:03  8.3 00:02:14 /home/aduchene/.cache/zoe-build/ZOE-098/src/target/debug/deps/zoe_server-89de76df9cf9d117
