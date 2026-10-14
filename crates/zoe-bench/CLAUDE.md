@@ -20,5 +20,6 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 - The repository holds only the synthetic conflict sample, never a real log.
 - The schedule of a client depends only on `--seed`, the index of the client and the settings, never on the time. A retry runs the same transaction again and takes nothing from the generator.
 - A vote that fails with a conflict counts as a conflict, and the next attempt of the transaction counts as a retry. Each retry counts. A transaction ends committed or read-only; after `MAX_ATTEMPTS` attempts the run fails instead of a hang.
+- `saturate` measures the read path: its `--write-ratio` is 0 by default. `load` writes in 10 % of its transactions by default. A unit test in `src/main.rs` checks both defaults.
 - The lock wait is the time of the vote, because the server takes the locks of the oids at the vote.
 - zoe-bench uses `zoe-client` and does not change its API. tokio is allowed in this crate.

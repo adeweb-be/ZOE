@@ -52,6 +52,10 @@ struct LoadArgs {
     /// The number of clients. Each client has its own connection.
     #[arg(long, default_value = "8", value_name = "N", value_parser = positive)]
     clients: usize,
+    /// The probability that a transaction writes back the objects that it
+    /// reads, from 0 to 1.
+    #[arg(long, default_value = "0.1", value_name = "W", value_parser = ratio)]
+    write_ratio: f64,
     #[command(flatten)]
     workload: WorkloadArgs,
 }
@@ -67,6 +71,10 @@ struct SaturateArgs {
     /// the threshold of N3.
     #[arg(long, default_value = "0.0003", value_name = "SECONDS", value_parser = seconds)]
     p99_ceiling: f64,
+    /// The probability that a transaction writes back the objects that it
+    /// reads, from 0 to 1. The default 0 measures only the read path.
+    #[arg(long, default_value = "0", value_name = "W", value_parser = ratio)]
+    write_ratio: f64,
     #[command(flatten)]
     workload: WorkloadArgs,
 }
@@ -96,10 +104,6 @@ struct WorkloadArgs {
     /// most --objects.
     #[arg(long, default_value = "10", value_name = "S", value_parser = positive)]
     txn_size: usize,
-    /// The probability that a transaction writes back the objects that it
-    /// reads, from 0 to 1.
-    #[arg(long, default_value = "0.1", value_name = "W", value_parser = ratio)]
-    write_ratio: f64,
     /// The exponent of the Zipf law that picks the objects. 0 is uniform.
     /// A larger exponent makes a smaller hot set.
     #[arg(long, default_value = "1.0", value_name = "Z", value_parser = exponent)]
@@ -111,14 +115,14 @@ struct WorkloadArgs {
 }
 
 impl WorkloadArgs {
-    fn workload(self, storage: String) -> Workload {
+    fn workload(self, storage: String, write_ratio: f64) -> Workload {
         Workload {
             storage,
             pipeline: self.pipeline,
             objects: self.objects,
             transactions: self.transactions,
             txn_size: self.txn_size,
-            write_ratio: self.write_ratio,
+            write_ratio,
             zipf: self.zipf,
             seed: self.seed,
             object_size: Workload::record_size(),
@@ -170,7 +174,9 @@ fn main() -> ExitCode {
             };
             let settings = LoadSettings {
                 clients: args.clients,
-                workload: args.workload.workload(args.target.storage),
+                workload: args
+                    .workload
+                    .workload(args.target.storage, args.write_ratio),
             };
             run("load", load::load(addr, settings))
         }
@@ -181,7 +187,9 @@ fn main() -> ExitCode {
             let settings = SaturateSettings {
                 max_clients: args.max_clients,
                 p99_ceiling_seconds: args.p99_ceiling,
-                workload: args.workload.workload(args.target.storage),
+                workload: args
+                    .workload
+                    .workload(args.target.storage, args.write_ratio),
             };
             run("saturate", load::saturate(addr, settings))
         }
@@ -255,5 +263,38 @@ fn print(command: &str, report: &impl Serialize) -> ExitCode {
             eprintln!("zoe-bench {command}: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Command {
+        Cli::try_parse_from(args).unwrap().command
+    }
+
+    #[test]
+    fn load_writes_and_saturate_only_reads_by_default() {
+        let Command::Load(load) = parse(&["zoe-bench", "load", "--server", "h:1"]) else {
+            panic!("not load");
+        };
+        assert_eq!(load.write_ratio, 0.1);
+        let Command::Saturate(saturate) = parse(&["zoe-bench", "saturate", "--server", "h:1"])
+        else {
+            panic!("not saturate");
+        };
+        assert_eq!(saturate.write_ratio, 0.0);
+        let Command::Saturate(saturate) = parse(&[
+            "zoe-bench",
+            "saturate",
+            "--server",
+            "h:1",
+            "--write-ratio",
+            "0.5",
+        ]) else {
+            panic!("not saturate");
+        };
+        assert_eq!(saturate.write_ratio, 0.5);
     }
 }
