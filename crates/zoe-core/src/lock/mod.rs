@@ -25,14 +25,104 @@
 //! waits on simulated time. The lock manager never calls the store clock
 //! or a waiter under the mutex, so a slow clock stops no other request, and
 //! a clock that panics leaks no lock.
+//!
+//! A `LockCancel` ends a lock wait from another thread. The vote then
+//! leaves the queue, releases the locks that it took, and fails with a
+//! conflict on the oid that it waits for, as at the timeout. A cancel
+//! stays: each later wait on the same `LockCancel` fails at once. A
+//! cancel takes no mutex of the lock manager, and wakes the waiter
+//! without it.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use crate::clock::{Clock, Waiter};
 use crate::error::ZoeError;
 use crate::types::Oid;
+
+/// A handle that ends the lock waits of votes from another thread.
+///
+/// The clones share one state. Give a clone to a transaction with
+/// `Txn::set_lock_cancel`, and keep one to call `cancel`. After `cancel`,
+/// a vote that waits for a lock, or starts to wait later, leaves the
+/// queue, releases the locks that it took and fails with `Conflict` on
+/// the oid that it waits for. A cancel does nothing to a vote that does
+/// not wait, or that has its locks.
+#[derive(Clone, Default)]
+pub struct LockCancel(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    /// The waiters of the lock waits that run.
+    waiters: Mutex<Vec<Arc<dyn Waiter>>>,
+}
+
+impl std::fmt::Debug for LockCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockCancel")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl LockCancel {
+    /// Return a new handle that is not cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// End the lock wait that runs, and each later lock wait. Call it from
+    /// any thread. The call does not block on the lock manager.
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        let waiters = self.waiters().clone();
+        wake_all(waiters);
+    }
+
+    /// Tell if `cancel` was called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn waiters(&self) -> MutexGuard<'_, Vec<Arc<dyn Waiter>>> {
+        self.0
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Make `cancel` wake `waiter` until the guard drops. Call it before
+    /// the first check of `is_cancelled`, so a cancel between the check and
+    /// the wait wakes the wait.
+    fn watch(&self, waiter: &Arc<dyn Waiter>) -> Watch<'_> {
+        self.waiters().push(Arc::clone(waiter));
+        Watch {
+            cancel: self,
+            waiter: Arc::clone(waiter),
+        }
+    }
+}
+
+/// The waiter of a lock wait in its `LockCancel`. The drop removes it.
+struct Watch<'a> {
+    cancel: &'a LockCancel,
+    waiter: Arc<dyn Waiter>,
+}
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        let mut waiters = self.cancel.waiters();
+        if let Some(index) = waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(waiter, &self.waiter))
+        {
+            waiters.swap_remove(index);
+        }
+    }
+}
 
 /// The mode of a lock request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,8 +293,8 @@ impl Locks<'_> {
 #[derive(Debug)]
 pub(crate) struct Refused {
     pub(crate) error: ZoeError,
-    /// The locks that the call took and released at a lock-wait timeout.
-    /// The list is empty for other errors.
+    /// The locks that the call took and released at a lock-wait timeout
+    /// or a cancel. The list is empty for other errors.
     pub(crate) released: Vec<Held>,
 }
 
@@ -257,11 +347,27 @@ impl LockManager {
     /// Each lock keeps the time of `clock` when the call took it. The call
     /// reads `clock` at its start and after each wait, without the mutex.
     /// It gets a waiter from `clock` only when it must wait.
+    #[cfg(test)]
     pub(crate) fn acquire(
         &self,
         requests: &[(Oid, Mode)],
         timeout: Duration,
         clock: &dyn Clock,
+    ) -> Result<Locks<'_>, Refused> {
+        self.acquire_cancellable(requests, timeout, clock, None)
+    }
+
+    /// Lock each oid of `requests` as `acquire` does. A `cancel` ends the
+    /// wait as the timeout does: the call leaves the queue, releases the
+    /// locks that it took and fails with `Conflict` on the oid that it
+    /// waits for. A call that must wait after the cancel fails at once. A
+    /// call that does not wait takes its locks also after a cancel.
+    pub(crate) fn acquire_cancellable(
+        &self,
+        requests: &[(Oid, Mode)],
+        timeout: Duration,
+        clock: &dyn Clock,
+        cancel: Option<&LockCancel>,
     ) -> Result<Locks<'_>, Refused> {
         if let Some(pair) = requests.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
             return Err(Refused {
@@ -278,6 +384,9 @@ impl LockManager {
         // The call waits for one oid at a time, so one waiter is
         // sufficient.
         let mut wake: Option<Arc<dyn Waiter>> = None;
+        // A cancel wakes the waiter while this guard lives.
+        let mut _watch: Option<Watch<'_>> = None;
+        let cancelled = || cancel.is_some_and(LockCancel::is_cancelled);
         let mut table = self.table();
         let mut next = 0;
         while let Some(&(oid, mode)) = requests.get(next) {
@@ -290,10 +399,23 @@ impl LockManager {
                     // The waiter comes from the clock, without the mutex.
                     // Then the call looks at the oid again.
                     drop(table);
-                    wake = Some(clock.waiter());
+                    let waiter = clock.waiter();
+                    _watch = cancel.map(|cancel| cancel.watch(&waiter));
+                    wake = Some(waiter);
                     table = self.table();
                     continue;
                 };
+                // A call that must wait after a cancel fails at once.
+                if cancelled() {
+                    let mut woken = Woken::new();
+                    table.release(&locks.held, &mut woken);
+                    drop(table);
+                    wake_all(woken);
+                    return Err(Refused {
+                        error: ZoeError::Conflict { oid },
+                        released: std::mem::take(&mut locks.held),
+                    });
+                }
                 entry.queue.push_back(Queued {
                     mode,
                     wake: Arc::clone(&wake),
@@ -318,8 +440,8 @@ impl LockManager {
                         break;
                     }
                     // A request that is still in the queue at its deadline
-                    // has used all its time.
-                    if left.is_zero() {
+                    // has used all its time. A cancel ends it too.
+                    if left.is_zero() || cancelled() {
                         queued.armed = false;
                         let mut woken = Woken::new();
                         table.withdraw(oid, &wake, &mut woken);
@@ -895,6 +1017,126 @@ mod tests {
             .map_err(|refused| refused.error);
         assert!(matches!(error, Err(ZoeError::Conflict { oid: Oid(1) })));
         assert_eq!(locks.waiting(Oid(1)), 0);
+        drop(holder);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_ends_a_wait_and_releases_what_the_call_took() {
+        let locks = LockManager::default();
+        let holder = locks
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
+        let cancel = LockCancel::new();
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let start = Instant::now();
+                let refused = locks
+                    .acquire_cancellable(
+                        &[(Oid(1), Exclusive), (Oid(2), Exclusive)],
+                        LONG,
+                        &SystemClock,
+                        Some(&cancel),
+                    )
+                    .unwrap_err();
+                (refused, start.elapsed())
+            });
+            until_waiting(&locks, Oid(2), 1);
+            cancel.cancel();
+            let (refused, waited) = waiter.join().unwrap();
+            assert!(waited < LONG, "{waited:?}");
+            assert!(matches!(refused.error, ZoeError::Conflict { oid: Oid(2) }));
+            let released: Vec<_> = refused.released.iter().map(|lock| lock.oid).collect();
+            assert_eq!(released, [Oid(1)]);
+        });
+        assert_eq!(locks.waiting(Oid(2)), 0);
+        locks
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
+        drop(holder);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_wait_that_starts_after_a_cancel_fails_at_once() {
+        let locks = LockManager::default();
+        let holder = locks
+            .acquire(&[(Oid(2), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
+        let cancel = LockCancel::new();
+        cancel.cancel();
+        let start = Instant::now();
+        let refused = locks
+            .acquire_cancellable(
+                &[(Oid(1), Exclusive), (Oid(2), Exclusive)],
+                LONG,
+                &SystemClock,
+                Some(&cancel),
+            )
+            .unwrap_err();
+        assert!(start.elapsed() < LONG);
+        assert!(matches!(refused.error, ZoeError::Conflict { oid: Oid(2) }));
+        let released: Vec<_> = refused.released.iter().map(|lock| lock.oid).collect();
+        assert_eq!(released, [Oid(1)]);
+        assert_eq!(locks.waiting(Oid(2)), 0);
+        drop(holder);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_does_nothing_to_a_call_that_does_not_wait() {
+        let locks = LockManager::default();
+        let cancel = LockCancel::new();
+        cancel.cancel();
+        let held = locks
+            .acquire_cancellable(&[(Oid(1), Exclusive)], LONG, &SystemClock, Some(&cancel))
+            .unwrap();
+        // A call that has its locks keeps them after a cancel.
+        let other = LockCancel::new();
+        let kept = locks
+            .acquire_cancellable(&[(Oid(2), Shared)], LONG, &SystemClock, Some(&other))
+            .unwrap()
+            .keep();
+        other.cancel();
+        assert_eq!(locks.waiting(Oid(1)), 0);
+        drop(held);
+        assert!(!locks.is_empty());
+        locks.release(&kept);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_wakes_each_wait_that_shares_it() {
+        let locks = LockManager::default();
+        let holder = locks
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap();
+        let cancel = LockCancel::new();
+        thread::scope(|scope| {
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        locks
+                            .acquire_cancellable(
+                                &[(Oid(1), Shared)],
+                                LONG,
+                                &SystemClock,
+                                Some(&cancel),
+                            )
+                            .map(drop)
+                            .map_err(|refused| refused.error)
+                    })
+                })
+                .collect();
+            until_waiting(&locks, Oid(1), 2);
+            cancel.cancel();
+            for waiter in waiters {
+                assert!(matches!(
+                    waiter.join().unwrap(),
+                    Err(ZoeError::Conflict { oid: Oid(1) })
+                ));
+            }
+        });
         drop(holder);
         assert!(locks.is_empty());
     }

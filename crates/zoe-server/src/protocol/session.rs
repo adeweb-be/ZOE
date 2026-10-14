@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use rmpv::Value;
-use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
 
 use super::blob::{Download, Upload};
 use super::clock;
@@ -434,6 +434,9 @@ pub(crate) struct Session {
     /// The stop of the server. A pack stops between two batches when the
     /// server stops.
     stopping: Stopping,
+    /// The end of the connection ends the lock wait of each transaction of
+    /// the session, also a wait that starts after the end.
+    lock_cancel: LockCancel,
 }
 
 /// The open transaction of one connection. One thread holds it and runs
@@ -483,7 +486,15 @@ impl Session {
             iterators: Mutex::new(Iterators::default()),
             label: Mutex::new(None),
             stopping,
+            lock_cancel: LockCancel::new(),
         }
+    }
+
+    /// End the lock wait of the vote of the session, and each later one.
+    /// The vote then fails, and its transaction releases the locks that it
+    /// took. The end of the connection calls it.
+    pub(crate) fn end_lock_wait(&self) {
+        self.lock_cancel.cancel();
     }
 
     /// Return the label that the client gave, if any.
@@ -1254,13 +1265,15 @@ impl Transaction {
         let description = text_bytes(&args[2])?;
         let ext = extension::pickle(&args[3]).map_err(Fault::type_error)?;
         let store = Arc::clone(&self.session.store);
-        match args.get(4).filter(|tid| !tid.is_nil()) {
-            None => Ok(Txn::begin(store, &user, &description, &ext)),
+        let mut txn = match args.get(4).filter(|tid| !tid.is_nil()) {
+            None => Txn::begin(store, &user, &description, &ext),
             Some(tid) => {
                 let tid = Tid(u64_of(tid)?);
-                Ok(Txn::begin_restore(store, tid, &user, &description, &ext)?)
+                Txn::begin_restore(store, tid, &user, &description, &ext)?
             }
-        }
+        };
+        txn.set_lock_cancel(self.session.lock_cancel.clone());
+        Ok(txn)
     }
 
     /// Return the open transaction with the id `id`. Another id fails with
