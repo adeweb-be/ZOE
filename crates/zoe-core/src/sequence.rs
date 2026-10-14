@@ -109,6 +109,47 @@ impl<'a> Sequence<'a> {
         Ok(value)
     }
 
+    /// Raise the sequence, so that its next value is at or above `end`.
+    ///
+    /// A restore calls this with the end of the sequence in a copy of
+    /// another store, so that no value of that store comes again. The call
+    /// lowers nothing: when the next value is at or above `end`, it changes
+    /// nothing. When the reserved values end below `end`, the call writes
+    /// `end` as the stored end, and the write is durable before the call
+    /// returns. Otherwise it only skips the reserved values below `end`.
+    /// The stored end never decreases. A read-only store fails with
+    /// `ReadOnly`. A failed write can reach the disk all the same, so after
+    /// it the open store forgets its reserved values, and the next call
+    /// reads the stored end.
+    pub fn restore_end(&self, end: u64) -> Result<()> {
+        self.store.writable()?;
+        let mut slot = self.lock();
+        let mut block = match *slot {
+            Some(block) => block,
+            None => self.load()?,
+        };
+        if block.next < end {
+            if block.end < end {
+                if let Err(error) = self.write_end(end) {
+                    *slot = None;
+                    return Err(error);
+                }
+                block.end = end;
+            }
+            block.next = end;
+        }
+        *slot = Some(block);
+        Ok(())
+    }
+
+    /// Write `end` as the stored end of the name, in a backend write
+    /// transaction of its own.
+    fn write_end(&self, end: u64) -> Result<()> {
+        let mut write = self.store.backend.begin_write()?;
+        write.put_sequence_end(&self.counter.name, end)?;
+        write.commit()
+    }
+
     fn lock(&self) -> MutexGuard<'_, Option<Block>> {
         // A panic cannot leave a block half changed: `next` writes it back
         // only after the reservation succeeds.
@@ -138,9 +179,7 @@ impl<'a> Sequence<'a> {
             return Err(ZoeError::Protocol("no value is left in the sequence"));
         }
         let end = start.saturating_add(BLOCK);
-        let mut write = self.store.backend.begin_write()?;
-        write.put_sequence_end(&self.counter.name, end)?;
-        write.commit()?;
+        self.write_end(end)?;
         Ok(end)
     }
 }
@@ -272,6 +311,68 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(sequence.next(), Err(ZoeError::Protocol(_))));
         }
+    }
+
+    #[test]
+    fn a_restored_end_raises_a_new_sequence_durably() {
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            store.sequence("intids").restore_end(500).unwrap();
+            assert_eq!(stored(&store, "intids"), Some(500));
+            assert_eq!(store.sequence("intids").next().unwrap(), 500);
+        }
+        // The reopen starts at the end of the block that `next` reserved.
+        let store = Store::open_vfs(vfs).unwrap();
+        assert_eq!(store.sequence("intids").next().unwrap(), 500 + BLOCK);
+    }
+
+    #[test]
+    fn a_restored_end_lowers_nothing() {
+        let store = store();
+        let sequence = store.sequence("intids");
+        for _ in 0..3 {
+            sequence.next().unwrap();
+        }
+        sequence.restore_end(2).unwrap();
+        assert_eq!(sequence.next().unwrap(), 4);
+        assert_eq!(stored(&store, "intids"), Some(1 + BLOCK));
+
+        // A stored end above the restored end stays.
+        let mut write = store.backend.begin_write().unwrap();
+        write.put_sequence_end("other", 1_000).unwrap();
+        write.commit().unwrap();
+        store.sequence("other").restore_end(10).unwrap();
+        assert_eq!(stored(&store, "other"), Some(1_000));
+        assert_eq!(store.sequence("other").next().unwrap(), 1_000);
+    }
+
+    #[test]
+    fn a_restored_end_inside_the_block_writes_nothing() {
+        let store = store();
+        let sequence = store.sequence("intids");
+        assert_eq!(sequence.next().unwrap(), 1);
+        sequence.restore_end(50).unwrap();
+        assert_eq!(stored(&store, "intids"), Some(1 + BLOCK));
+        assert_eq!(sequence.next().unwrap(), 50);
+        // Past the block, the next reservation starts at the next value.
+        sequence.restore_end(1 + 3 * BLOCK).unwrap();
+        assert_eq!(stored(&store, "intids"), Some(1 + 3 * BLOCK));
+        assert_eq!(sequence.next().unwrap(), 1 + 3 * BLOCK);
+        assert_eq!(stored(&store, "intids"), Some(1 + 4 * BLOCK));
+    }
+
+    #[test]
+    fn a_read_only_store_restores_no_end() {
+        let dir = std::env::temp_dir().join(format!("zoe-sequence-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(Store::open(&dir).unwrap());
+        let store = Store::open_read_only(&dir).unwrap();
+        let restored = store.sequence("intids").restore_end(10);
+        assert!(matches!(restored, Err(ZoeError::ReadOnly)), "{restored:?}");
+        assert_eq!(stored(&store, "intids"), None);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
