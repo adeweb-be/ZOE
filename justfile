@@ -18,8 +18,8 @@ check:
     cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
     cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    ruff check python ci/src deploy
-    ruff format --check python ci/src deploy
+    ruff check python ci/src deploy bench
+    ruff format --check python ci/src deploy bench
 
 # Run the Rust tests, then the Python tests on every interpreter, then the
 # checks of the deployment files.
