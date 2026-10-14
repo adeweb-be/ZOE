@@ -436,6 +436,7 @@ impl Server {
         ready(self.addr)?;
         runtime.block_on(async {
             tokio::select! {
+                biased;
                 _ = term.recv() => {}
                 _ = interrupt.recv() => {}
             }

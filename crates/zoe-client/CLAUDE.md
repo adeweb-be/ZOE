@@ -29,3 +29,4 @@ A Rust client for the ZEO protocol, with the ZOE extensions. `zoe.zeo.ClientStor
 
 - `tests/client.rs` is the acceptance test, against `zoe_server::serve::Server` in the test process.
 - `tests/runtime.rs` runs the client on a scripted server through a `Runtime` of the test: replies out of order, a lost connection, a bad frame, a listed conflict, a dropped transaction and the heartbeat.
+- `crates/zoe-server/tests/simulation.rs` runs the client under the deterministic simulator of `zoe-server`, through its `Runtime`, against the server code, with network faults and crashes of the server.

@@ -23,6 +23,7 @@ use super::message::{self, Call};
 use super::outbox::{Outbox, Place};
 use super::status::Stats;
 use super::{NamedStorage, Storages};
+use crate::runtime::block_on;
 
 /// The most oids that one `new_oids` call gives, as in ZEO.
 const MAX_NEW_OIDS: u64 = 100;
@@ -333,7 +334,7 @@ pub(crate) struct Session {
 pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Outbox) {
     let mut storages = Some(storages);
     let mut session: Option<Session> = None;
-    while let Some(call) = calls.blocking_recv() {
+    while let Some(call) = block_on(calls.recv()) {
         let outcome = match (&mut session, &storages) {
             (Some(session), _) => session.call(&call),
             (None, Some(all)) => match select(all, &call) {
