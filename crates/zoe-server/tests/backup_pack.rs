@@ -209,7 +209,8 @@ fn a_pack_at_the_last_dumped_tid_lets_the_chain_continue() {
     // refuses and writes nothing, and the check reports a difference.
     let later = {
         let store = common::open(&source);
-        commit(&store, &[(ROOT, next, record(b"4"))])
+        let other = store.new_oid().unwrap();
+        commit(&store, &[(other, Tid(0), record(b"4"))])
     };
     assert_exit(&pack(), 0, "pack after the last dumped tid");
     assert_eq!(watermark_and_last(&source), (later, later));
