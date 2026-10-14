@@ -103,9 +103,14 @@ fn a_load_passes_a_waiting_vote(extra: &[&str]) {
     // Then it loads another object on the same connection.
     let load = waiter.send_call("loadBefore", vec![p64(free), Value::Binary(MAX.to_vec())]);
 
-    // The load is answered first, while the vote still waits.
-    let message = waiter.recv().unwrap();
-    assert_eq!(message.method, ".reply");
+    // The load is answered first, while the vote still waits. The waiter
+    // registered before the first commit, so it gets that invalidation first.
+    let message = loop {
+        let message = waiter.recv().unwrap();
+        if message.method == ".reply" {
+            break message;
+        }
+    };
     assert_eq!(message.id, load, "the vote blocked the load");
     assert_eq!(u64_of(&items(&message.args)[1]), first);
 
