@@ -12,9 +12,10 @@
 //! A stop takes at most the shutdown timeout. The server stops accepting
 //! connections, and each connection reads no more calls. Each session runs
 //! the calls that the server already received, so a `tpc_finish` that the
-//! server received commits and gets its reply. Then each session ends and
-//! aborts its open transaction, and each connection sends the frames that
-//! wait and closes. Then the stores close.
+//! server received commits and gets its reply. A running pack stops
+//! between two of its batches. Then each session ends and aborts its open
+//! transaction, and each connection sends the frames that wait and closes.
+//! Then the stores close.
 
 use std::fmt;
 use std::io;
