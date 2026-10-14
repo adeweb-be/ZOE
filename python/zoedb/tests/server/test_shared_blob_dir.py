@@ -47,7 +47,9 @@ def write_blob(db, name, data):
             f.write(data)
         conn.root()[name] = blob
     with db.transaction() as conn:
-        return conn.root()[name]._p_oid, conn.root()[name]._p_serial
+        blob = conn.root()[name]
+        blob._p_activate()
+        return blob._p_oid, blob._p_serial
 
 
 def test_clients_write_and_read_blobs_in_the_shared_directory(tmp_path):
