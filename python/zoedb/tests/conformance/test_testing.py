@@ -2,6 +2,8 @@
 
 import importlib
 import os
+import stat
+import time
 
 import pytest
 import transaction
@@ -145,7 +147,6 @@ def layer(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "storage_conf, zeo_options, name",
     [
-        (FILESTORAGE, {"transaction_timeout": 5}, "transaction-timeout"),
         (FILESTORAGE, {"pid_filename": "zeo.pid"}, "pid-filename"),
         (FILESTORAGE, {"invalidation_age": 5}, "invalidation-age"),
         ("<filestorage>\npath Data.fs\nquota 9\n</filestorage>", {}, "quota"),
@@ -160,10 +161,50 @@ def test_an_option_that_zoe_serve_lacks_fails_the_start_with_its_name(
     assert layer._servers == []
 
 
-def test_an_ssl_section_fails_the_start_with_its_name(layer):
-    zeo_conf = "<zeo>\naddress 127.0.0.1:0\n<ssl>\ncertificate x\n</ssl>\n</zeo>"
-    with pytest.raises(ValueError, match="<ssl>"):
-        layer.start_zeo_server(FILESTORAGE, zeo_conf)
+def ssl_zeo_config(ssl):
+    return f"<zeo>\naddress 127.0.0.1:0\n<ssl>\n{ssl}\n</ssl>\n</zeo>"
+
+
+@pytest.mark.parametrize(
+    "ssl, name",
+    [
+        ("authenticate DYNAMIC", "authenticate DYNAMIC in <ssl>"),
+        ("authenticate {here}", r"authenticate /\S+ in <ssl>"),
+        ("authenticate {cert}\nciphers ALL", "ciphers ALL in <ssl>"),
+        ("", "<ssl> section of <zeo> has no authenticate"),
+    ],
+)
+def test_an_ssl_key_that_zoe_serve_lacks_fails_the_start_with_its_name(
+    layer, ssl, name
+):
+    from ZEO.tests import testssl
+
+    ssl = f"certificate {testssl.server_cert}\nkey {testssl.server_key}\n" + ssl
+    ssl = ssl.format(cert=testssl.client_cert, here=testssl.here)
+    with pytest.raises(ValueError, match=name):
+        layer.start_zeo_server(FILESTORAGE, ssl_zeo_config(ssl))
+    assert layer._servers == []
+
+
+def test_the_password_function_decrypts_the_key_for_the_start_only(layer, tmp_path):
+    from ZEO.tests import testssl
+
+    function = "ZEO.tests.testssl.pwfunc"
+    key = zoe.testing._decrypted_key(testssl.serverpw_key, function)
+    assert os.path.dirname(key) == os.path.realpath(tmp_path)
+    assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
+    with open(key) as file:
+        assert file.read().startswith("-----BEGIN PRIVATE KEY-----")
+    os.remove(key)
+
+    ssl = (
+        f"certificate {testssl.serverpw_cert}\nkey {testssl.serverpw_key}\n"
+        f"authenticate {testssl.client_cert}\npassword-function {function}"
+    )
+    addr, stop = layer.start_zeo_server(FILESTORAGE, ssl_zeo_config(ssl))
+    # The start removes the decrypted key: zoe serve reads it at its start.
+    assert list(tmp_path.glob("zoe-tls-key*")) == []
+    stop()
 
 
 def test_the_store_has_the_name_and_the_blob_directory_of_the_section(layer, tmp_path):
@@ -257,15 +298,16 @@ def test_zeo_options_become_options_of_zoe_serve(layer, tmp_path):
 
 def test_teardown_kills_the_servers_and_restores_the_forker(tmp_path, monkeypatch):
     from ZEO import _forker
-    from ZEO.tests import forker
+    from ZEO.tests import forker, testConfig
 
     monkeypatch.chdir(tmp_path)
-    originals = forker.start_zeo_server, _forker.start_zeo_server
+    modules = forker, _forker, testConfig
+    originals = tuple(module.start_zeo_server for module in modules)
     layer = zoe.testing.ZeoLayer("TEST_ZEO_LAYER")
     layer.setUp()
     try:
-        assert forker.start_zeo_server == layer.start_zeo_server
-        assert _forker.start_zeo_server == layer.start_zeo_server
+        for module in modules:
+            assert module.start_zeo_server == layer.start_zeo_server
         servers = []
         for path in ("a.fs", "b.fs"):
             forker.start_zeo_server(path=path)
@@ -274,7 +316,7 @@ def test_teardown_kills_the_servers_and_restores_the_forker(tmp_path, monkeypatc
         layer.tearDown()
     assert all(process.returncode is not None for process in servers)
     assert layer._servers == []
-    assert (forker.start_zeo_server, _forker.start_zeo_server) == originals
+    assert tuple(module.start_zeo_server for module in modules) == originals
 
 
 def test_the_protocol_5_starts_and_another_fails_with_its_name(layer):
@@ -327,3 +369,131 @@ def test_teardown_restores_the_forker_when_a_kill_fails(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="the kill fails"):
         layer.tearDown()
     assert forker.start_zeo_server is original
+
+
+def test_the_transaction_timeout_closes_an_idle_connection_in_the_log_file(
+    layer, tmp_path
+):
+    from ZEO.ClientStorage import ClientStorage
+
+    addr, stop = layer.start_zeo_server(
+        FILESTORAGE, {"transaction_timeout": 1}, log="server.log"
+    )
+    assert "--idle-timeout=1" in layer._servers[-1].args
+    storage = ClientStorage(addr, wait_timeout=30)
+    try:
+        # zoe serve writes its log lines to the file of the argument log.
+        deadline = time.monotonic() + 30
+        log = tmp_path / "server.log"
+        while "no frame within the idle timeout" not in log.read_text():
+            assert time.monotonic() < deadline, "the connection did not close"
+            time.sleep(0.1)
+    finally:
+        storage.close()
+    stop()
+
+
+@pytest.mark.parametrize(
+    "eventlog, name",
+    [
+        ("level DEBUG", "level DEBUG in <eventlog>"),
+        ("<syslog>\n</syslog>", "<syslog> section of <eventlog>"),
+        ("<logfile>\npath a.log\nformat x\n</logfile>", "format x in <logfile>"),
+    ],
+)
+def test_an_eventlog_that_zoe_serve_lacks_fails_the_start_with_its_name(
+    layer, eventlog, name
+):
+    storage_conf = f"<eventlog>\n{eventlog}\n</eventlog>\n{FILESTORAGE}"
+    with pytest.raises(ValueError, match=name):
+        layer.start_zeo_server(storage_conf, zeo_config())
+    assert layer._servers == []
+
+
+def test_a_read_only_server_on_a_missing_store_serves_a_new_store(layer):
+    from ZEO.ClientStorage import ClientStorage
+    from ZODB.POSException import POSKeyError
+
+    addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config(read_only=True))
+    storage = ClientStorage(addr, read_only=True, wait_timeout=30)
+    try:
+        with pytest.raises(POSKeyError):
+            storage.load(bytes(8))
+    finally:
+        storage.close()
+    stop()
+
+    # A read-only storage section does not create its store.
+    storage_conf = "<filestorage>\npath Data.fs\nread-only true\n</filestorage>"
+    with pytest.raises(RuntimeError, match="stopped with"):
+        layer.start_zeo_server(storage_conf, zeo_config(read_only=True))
+
+
+def test_a_filestorage_file_serves_its_content_at_each_start(layer, tmp_path):
+    from ZEO.ClientStorage import ClientStorage
+
+    db = ZODB.DB("Data.fs")
+    with db.transaction() as conn:
+        conn.root()["value"] = "in the file"
+    db.close()
+
+    addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config(), keep=True)
+    db = ZODB.DB(ClientStorage(addr, wait_timeout=30))
+    try:
+        with db.transaction() as conn:
+            assert conn.root()["value"] == "in the file"
+            conn.root()["value"] = "in the store"
+    finally:
+        db.close()
+    stop()
+    assert (tmp_path / "Data.fs.zoe").is_dir()
+
+    # The next start serves the file as it is, without the new commit.
+    addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config())
+    db = ZODB.DB(ClientStorage(addr, wait_timeout=30))
+    try:
+        with db.transaction() as conn:
+            assert conn.root()["value"] == "in the file"
+    finally:
+        db.close()
+    stop()
+    # Without keep, the stop removes the store and keeps the file.
+    assert not (tmp_path / "Data.fs.zoe").exists()
+    assert (tmp_path / "Data.fs").is_file()
+
+
+def test_a_filestorage_file_with_a_blob_directory_fails_the_start(layer, tmp_path):
+    (tmp_path / "Data.fs").write_bytes(b"FS30")
+    storage_conf = "<filestorage>\npath Data.fs\nblob-dir blobs\n</filestorage>"
+    with pytest.raises(ValueError, match="blob-dir .* with the FileStorage file"):
+        layer.start_zeo_server(storage_conf, zeo_config())
+
+
+def test_a_client_shares_the_blob_directory_of_the_section(layer, tmp_path):
+    import ZODB.blob
+    from ZEO.ClientStorage import ClientStorage
+
+    storage_conf = (
+        "<blobstorage>\nblob-dir blobs\n"
+        "<filestorage>\npath Data.fs\n</filestorage>\n</blobstorage>\n"
+    )
+    addr, stop = layer.start_zeo_server(storage_conf, zeo_config())
+    assert "--shared-blob-dir=true" in layer._servers[-1].args
+    storage = ClientStorage(
+        addr, blob_dir=str(tmp_path / "blobs"), shared_blob_dir=True, wait_timeout=30
+    )
+    db = ZODB.DB(storage)
+    try:
+        conn = db.open()
+        conn.root()["blob"] = ZODB.blob.Blob(b"shared")
+        transaction.commit()
+        with conn.root()["blob"].open() as file:
+            assert file.read() == b"shared"
+    finally:
+        db.close()
+    stop()
+
+    # Without a blob directory in a section, the server shares none.
+    addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config())
+    assert "--shared-blob-dir=true" not in layer._servers[-1].args
+    stop()

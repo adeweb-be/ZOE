@@ -19,6 +19,7 @@ This module needs the test extra of ZODB.
 """
 
 import ctypes
+import importlib
 import io
 import itertools
 import json
@@ -148,8 +149,9 @@ class ZoeServer:
 
     It runs `zoe serve --path path --listen 127.0.0.1:0` with the extra
     arguments `args`, and without `--path` when `path` is None. Only the
-    variables of `env` reach it as `ZOE_*`. As a context manager, it
-    starts the server and kills it at the end.
+    variables of `env` reach it as `ZOE_*`. The server writes its log
+    lines to stderr. With `log`, they go to the end of the file `log`. As
+    a context manager, it starts the server and kills it at the end.
 
     The server never outlives the process that started it. The kernel
     sends SIGKILL to the server when its parent ends (`PR_SET_PDEATHSIG`
@@ -158,10 +160,11 @@ class ZoeServer:
     ends.
     """
 
-    def __init__(self, path=None, args=(), env=None):
+    def __init__(self, path=None, args=(), env=None, log=None):
         self.path = path
         self.args = list(args)
         self.env = dict(env or {})
+        self.log = log
         self.address = None
         self._process = None
 
@@ -197,14 +200,21 @@ class ZoeServer:
         command += ["--listen", listen, *self.args]
         environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
         environ.update(self.env)
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            env=environ,
-            text=True,
-            preexec_fn=_die_with_parent(),
-        )
+        log = None if self.log is None else open(self.log, "a")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=log,
+                env=environ,
+                text=True,
+                preexec_fn=_die_with_parent(),
+            )
+        finally:
+            # The server has its own descriptor of the file.
+            if log is not None:
+                log.close()
         # The kill closes stdout, so the read below ends.
         expired = threading.Event()
 
@@ -321,20 +331,34 @@ def _address(value):
 
 
 def _zeo_options(section):
-    """Return the address and the `zoe serve` arguments of a <zeo> section.
+    """Return the options of a <zeo> section.
 
-    Raise `ValueError` that names the first option that `zoe serve` lacks.
+    Return the address, the `zoe serve` arguments, true for a read-only
+    server, and the `_Tls` of the <ssl> section or None. Raise
+    `ValueError` that names the first key or section that `zoe serve`
+    lacks.
     """
+    tls = None
     for sub in section.sections:
-        raise _no_option(f"the <{sub.type}> section of <zeo>")
+        if sub.type != "ssl" or tls is not None:
+            raise _no_option(f"the <{sub.type}> section of <zeo>")
+        tls = _Tls(sub)
     address = None
     args = []
+    read_only = False
     for key, values in section.items():
         key, value = key.lower(), values[-1]
         if key == "address":
             address = _address(value)
         elif key == "invalidation-queue-size":
             args += ["--invalidation-queue-size", value]
+        elif key == "transaction-timeout":
+            # zoe serve closes a connection that sends no frame for longer
+            # than --idle-timeout, and aborts its open transaction. So a
+            # transaction that stays open after its vote past the timeout
+            # loses its connection, as with ZEO. The timeout also closes an
+            # idle connection without a transaction.
+            args.append(f"--idle-timeout={int(value)}")
         elif key == "client-conflict-resolution":
             # zoe serve has no such option. It resolves the simple
             # conflicts itself and sends the others to the client in the
@@ -353,19 +377,148 @@ def _zeo_options(section):
             raise _no_option(f"{key} {value}")
     if address is None:
         raise ValueError("the <zeo> section has no address")
-    return address, args
+    return address, args, read_only, tls
+
+
+class _Tls:
+    """The <ssl> section of <zeo>: the TLS options of `zoe serve`.
+
+    `certificate` becomes `--tls-cert`, `key` `--tls-key`, and
+    `authenticate`, a file of CA certificates, `--tls-client-ca`. Without
+    `key`, the file of `certificate` holds the key, as for ZEO.
+    `password-function` is the dotted name of a function that returns the
+    password of the key. Raise `ValueError` that names a key that
+    `zoe serve` lacks: `authenticate` as a directory or `DYNAMIC`, or
+    another key.
+    """
+
+    def __init__(self, section):
+        self.certificate = None
+        self.key = None
+        self.authenticate = None
+        self.password_function = None
+        for key, values in section.items():
+            key, value = key.lower(), values[-1]
+            if key == "certificate":
+                self.certificate = os.path.abspath(value)
+            elif key == "key":
+                self.key = os.path.abspath(value)
+            elif key == "authenticate":
+                # zoe serve takes only a file of CA certificates.
+                if value == "DYNAMIC" or os.path.isdir(value):
+                    raise _no_option(f"authenticate {value} in <ssl>")
+                self.authenticate = os.path.abspath(value)
+            elif key == "password-function":
+                self.password_function = value
+            else:
+                raise _no_option(f"{key} {value} in <ssl>")
+        for key in ("certificate", "authenticate"):
+            if getattr(self, key) is None:
+                raise ValueError(f"the <ssl> section of <zeo> has no {key}")
+        if self.key is None:
+            self.key = self.certificate
+
+    def server_args(self):
+        """Return the `zoe serve` arguments, and the files that they name.
+
+        zoe serve reads the files at its start only. With a password
+        function, the test process calls the function, as a ZEO server
+        does, and decrypts the key into a new file. The caller removes the
+        new files after the start.
+        """
+        key, files = self.key, []
+        if self.password_function is not None:
+            key = _decrypted_key(self.key, self.password_function)
+            files.append(key)
+        args = ["--tls-cert", self.certificate, "--tls-key", key]
+        args += ["--tls-client-ca", self.authenticate]
+        return args, files
+
+
+def _decrypted_key(path, password_function):
+    """Write the key of the file `path`, decrypted, to a new file.
+
+    `password_function` is the dotted name of a function that returns the
+    password. The `openssl` command decrypts the key, because zoe serve
+    reads only a key that is not encrypted. The new file is in the current
+    directory, and only its owner reads it. Return its path.
+    """
+    module, _, name = password_function.rpartition(".")
+    password = getattr(importlib.import_module(module), name)()
+    if isinstance(password, str):
+        password = password.encode()
+    result = subprocess.run(
+        ["openssl", "pkey", "-in", path, "-passin", "stdin"],
+        input=bytes(password) + b"\n",
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        error = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"openssl did not decrypt {path}: {error}")
+    # mkstemp creates the file with the mode 0600.
+    descriptor, key = tempfile.mkstemp(".pem", prefix="zoe-tls-key", dir=".")
+    with os.fdopen(descriptor, "wb") as out:
+        out.write(result.stdout)
+    return os.path.abspath(key)
+
+
+def _log_file(section):
+    """Return the path of the log file of an <eventlog> section, or None.
+
+    The key `path` of its <logfile> section names the file. zoe serve logs
+    at the level INFO and above, so the key `level` must be INFO. Raise
+    `ValueError` that names another key or section.
+    """
+    for key, values in section.items():
+        key, value = key.lower(), values[-1]
+        if key != "level" or value.lower() != "info":
+            raise _no_option(f"{key} {value} in <eventlog>")
+    path = None
+    for index, sub in enumerate(section.sections):
+        if sub.type != "logfile" or index:
+            raise _no_option(f"the <{sub.type}> section of <eventlog>")
+        for key, values in sub.items():
+            if key.lower() != "path":
+                raise _no_option(f"{key} {values[-1]} in <logfile>")
+            path = os.path.abspath(values[-1])
+    return path
 
 
 class _Store:
     """The ZOE store of a storage section of ZEO's configuration."""
 
-    def __init__(self, name, path, blob_dir=None, read_only=False, temporary=False):
+    def __init__(
+        self,
+        name,
+        path,
+        blob_dir=None,
+        read_only=False,
+        temporary=False,
+        data_fs=None,
+    ):
         self.name = name
         self.path = path
         self.blob_dir = blob_dir
         self.read_only = read_only
         # A store in place of a mapping storage goes at each stop.
         self.temporary = temporary
+        # The FileStorage file that the store gets its content from.
+        self.data_fs = data_fs
+
+    def make_ready(self, read_only_server):
+        """Make the store ready for `zoe serve`.
+
+        A store of a FileStorage file gets the content of the file as it is
+        now. A read-only server needs an existing store, so a store that
+        does not exist becomes a new, empty store, as ZEO's FileStorage
+        creates its file. A read-only section does not create its store,
+        as for ZEO.
+        """
+        if self.data_fs is not None:
+            _convert(self.data_fs, self.path)
+        elif read_only_server and not self.read_only and not _is_store(self.path):
+            zoe.Storage(self.path, blob_dir=self.blob_dir).close()
 
     def toml(self):
         """Return the [storages.NAME] table of the store."""
@@ -381,15 +534,43 @@ class _Store:
         return "\n".join(lines) + "\n"
 
 
+def _is_store(path):
+    """Return true when the directory `path` exists and is not empty."""
+    return os.path.isdir(path) and bool(os.listdir(path))
+
+
+def _convert(data_fs, path):
+    """Convert the FileStorage file `data_fs` into a new store in `path`.
+
+    The store that is in `path` goes first. `zoe convert` does the work.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+    command = [ZoeServer.binary(), "convert", "--path", path, "--from-data-fs", data_fs]
+    environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=environ,
+        check=False,
+    )
+    if result.returncode:
+        error = result.stderr.strip()
+        raise RuntimeError(f"zoe convert stopped with {result.returncode}: {error}")
+
+
 def _store(section):
     """Return the `_Store` of a storage section.
 
     The store has the name of the section, or 1 for a section without a
     name, as ZEO does. A <filestorage> becomes a store at its path, a
-    <mappingstorage> a store in a new directory. A <blobstorage> around
-    either one gives its blob directory. Relative paths are relative to
-    the current directory. Raise `ValueError` that names the first key or
-    section that `zoe serve` lacks.
+    <mappingstorage> a store in a new directory. A <filestorage> whose
+    path is a FileStorage file becomes a store beside the file, at the
+    path with the suffix `.zoe`. A <blobstorage> around either one gives
+    its blob directory. Relative paths are relative to the current
+    directory. Raise `ValueError` that names the first key or section
+    that `zoe serve` lacks.
     """
     name = section.name or "1"
     blob_dir = None
@@ -430,21 +611,27 @@ def _store(section):
         raise ValueError("a <filestorage> section has no path")
     if create:
         # A FileStorage with create true starts empty.
-        shutil.rmtree(path, ignore_errors=True)
+        if os.path.isfile(path):
+            os.remove(path)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+    elif os.path.isfile(path):
+        # The conversion copies no blob.
+        if blob_dir is not None:
+            raise _no_option(f"blob-dir {blob_dir} with the FileStorage file {path}")
+        return _Store(name, path + ".zoe", read_only=read_only, data_fs=path)
     return _Store(name, path, blob_dir, read_only)
 
 
 class ZeoLayer:
     """A layer that makes the test forker of ZEO start `zoe serve`.
 
-    `setUp` replaces `start_zeo_server` in `ZEO.tests.forker` and in
-    `ZEO._forker`. The `start_server` of `ZEO.tests.forker.setUp` calls
-    the first one. `tearDown` kills every server that the layer started
-    and puts back the functions of ZEO.
-
-    A module that binds the function at import, as `ZEO.tests.testConfig`
-    does with `from .forker import start_zeo_server`, keeps the server of
-    ZEO.
+    `setUp` replaces `start_zeo_server` in `ZEO._forker` and in each module
+    of ZEO that binds it at import: `ZEO.tests.forker`, and
+    `ZEO.tests.testConfig`, which `setUp` imports first. The `start_server`
+    of `ZEO.tests.forker.setUp` calls the function of `ZEO.tests.forker`.
+    `tearDown` kills every server that the layer started and puts back each
+    function that `setUp` replaced.
 
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
@@ -460,11 +647,17 @@ class ZeoLayer:
 
     def setUp(self):
         from ZEO import _forker
-        from ZEO.tests import forker
 
-        for module in (forker, _forker):
-            self._patches.append((module, module.start_zeo_server))
-            module.start_zeo_server = self.start_zeo_server
+        # The import binds the function of ZEO in testConfig before the
+        # replacement.
+        importlib.import_module("ZEO.tests.testConfig")
+        function = _forker.start_zeo_server
+        for name, module in list(sys.modules.items()):
+            if name != "ZEO" and not name.startswith("ZEO."):
+                continue
+            if getattr(module, "__dict__", {}).get("start_zeo_server") is function:
+                self._patches.append((module, function))
+                module.start_zeo_server = self.start_zeo_server
 
     def tearDown(self):
         try:
@@ -495,12 +688,21 @@ class ZeoLayer:
         """Start `zoe serve` as ZEO's `start_zeo_server` starts a server.
 
         The arguments are those of ZEO's function. `suicide`, `debug`,
-        `threaded`, `name` and `log` control the process of a ZEO server.
-        They do not apply to `zoe serve`, which logs to stderr. A server
-        that does not listen within `start_timeout` seconds is killed, and
-        the start fails. Return the address and a stop function. The stop
-        function takes the argument `stop_timeout`. Without `keep`, it
-        removes the stores of the server.
+        `threaded` and `name` control the process of a ZEO server. They do
+        not apply to `zoe serve`. As for ZEO, `log` adds an <eventlog>
+        section when `zeo_conf` is None or a dict. A server that does not
+        listen within `start_timeout` seconds is killed, and the start
+        fails. Return the address and a stop function. The stop function
+        takes the argument `stop_timeout`. Without `keep`, it removes the
+        stores of the server.
+
+        The <zeo> section gives the options of `zoe serve` (see
+        `_zeo_options`), and each storage section a store (see `_store`).
+        When a storage section has a blob directory, a client can share
+        it: the server accepts `storeBlobShared` (`--shared-blob-dir`). A
+        client that does not share it still uploads its blobs. The <logfile>
+        of an <eventlog> section names the file that gets the log lines of
+        `zoe serve`. Without it, they go to stderr.
         """
         from ZEO._forker import ZEOConfig
 
@@ -517,7 +719,7 @@ class ZeoLayer:
             if port is None:
                 port = 0
             address = ("127.0.0.1", port) if isinstance(port, int) else port
-            config = ZEOConfig(address)
+            config = ZEOConfig(address, log=log)
             if zeo_conf:
                 config.__dict__.update(zeo_conf)
             zeo_conf = config
@@ -531,23 +733,36 @@ class ZeoLayer:
         zeo = [s for s in config.sections if s.type == "zeo"]
         if len(zeo) != 1:
             raise ValueError("the configuration needs one <zeo> section")
-        address, args = _zeo_options(zeo[0])
-        # zoe serve logs to stderr: an <eventlog> section does not apply.
+        address, args, read_only, tls = _zeo_options(zeo[0])
+        eventlog = [s for s in config.sections if s.type == "eventlog"]
+        if len(eventlog) > 1:
+            raise ValueError("the configuration has more than one <eventlog> section")
+        log_file = _log_file(eventlog[0]) if eventlog else None
         sections = [s for s in config.sections if s.type not in ("zeo", "eventlog")]
         if not sections:
             raise ValueError("the configuration has no storage section")
         stores = [_store(section) for section in sections]
+        if any(store.blob_dir is not None for store in stores):
+            args.append("--shared-blob-dir=true")
+        for store in stores:
+            store.make_ready(read_only)
 
         descriptor, file = tempfile.mkstemp(".toml", prefix="zoe-forker", dir=".")
         with os.fdopen(descriptor, "w") as out:
             out.write("".join(store.toml() for store in stores))
-        server = ZoeServer(args=["--config", os.path.abspath(file), *args])
-        server.address = address
+        # zoe serve reads these files before it listens.
+        files = [os.path.abspath(file)]
         try:
+            if tls is not None:
+                tls_args, tls_files = tls.server_args()
+                args += tls_args
+                files += tls_files
+            server = ZoeServer(args=["--config", files[0], *args], log=log_file)
+            server.address = address
             server.start(start_timeout)
         finally:
-            # zoe serve reads the file before it listens.
-            os.remove(file)
+            for leftover in files:
+                os.remove(leftover)
         self._servers.append(server)
 
         def stop(stop_timeout=99):
