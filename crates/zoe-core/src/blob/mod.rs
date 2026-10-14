@@ -478,11 +478,16 @@ impl BlobStore {
     }
 
     /// Remove the leftovers of a crash in `blobs/tmp/`. Only regular
-    /// files are removed there.
+    /// files with a name that the server owns are removed there. Other
+    /// files stay: with a shared blob directory, a ZEO client keeps its
+    /// temporary files in `blobs/tmp/`.
     fn recover(&self, backend: &dyn Backend) -> Result<()> {
         let mut leftovers = Vec::new();
         let mut intents = Vec::new();
         for file in self.dir.list_files(TMP_DIR)? {
+            if !is_owned_name(&file) {
+                continue;
+            }
             let name = format!("{TMP_DIR}/{file}");
             if let Some(tid) = intent_tid(&file) {
                 let mut bytes = Vec::new();
@@ -895,6 +900,19 @@ impl BlobStore {
 fn is_temp_name(file: &str) -> bool {
     file.strip_suffix(".tmp")
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Tell if `file`, a name in `blobs/tmp/`, is a name that the server owns:
+/// a temporary file of the core, an intent file, the new layout file, or
+/// `upload-` and one or more ASCII digits. A writer open removes only these
+/// files in `blobs/tmp/`.
+fn is_owned_name(file: &str) -> bool {
+    is_temp_name(file)
+        || intent_tid(file).is_some()
+        || format!("{TMP_DIR}/{file}") == NEW_LAYOUT_FILE
+        || file
+            .strip_prefix("upload-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Tell if `name` is a name that `take_shared` takes: one part without `/`
@@ -1874,6 +1892,67 @@ mod tests {
         assert!(!dir.join(blob_name(orphan, crashed)).exists());
         assert!(!dir.join(intent_name(crashed)).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_server_owns_only_its_names_in_tmp() {
+        for name in [
+            "0.tmp",
+            "7.tmp",
+            "1234567890.tmp",
+            "layout.tmp",
+            "0x03f0000000000010.intent",
+            "0x00000000000000FF.intent",
+            "upload-0",
+            "upload-12",
+        ] {
+            assert!(is_owned_name(name), "{name}");
+        }
+        for name in [
+            "tmpk3x9q2b_",
+            "tmp7.tmp",
+            "client.tmp-",
+            "7.tmp-",
+            "12a.tmp",
+            "-7.tmp",
+            ".tmp",
+            "7.tmp.part",
+            "0x10.intent",
+            "0x03f000000000001g.intent",
+            "0x03f0000000000010.intent.old",
+            "layout.tmp.1",
+            "Layout.tmp",
+            "upload-",
+            "upload-3x",
+            "upload--3",
+            "upload-+3",
+            "Upload-3",
+            "",
+        ] {
+            assert!(!is_owned_name(name), "{name}");
+        }
+    }
+
+    /// A writer open removes the files of the server in `blobs/tmp/`, syncs
+    /// the directory, and keeps every other file with its bytes.
+    #[test]
+    fn an_open_keeps_a_file_of_a_client_in_tmp() {
+        let vfs = MemVfs::new();
+        drop(blob_file(&Store::open_vfs(vfs.clone()).unwrap(), b"x"));
+        let client = format!("{TMP_DIR}/tmpk3x9q2b_");
+        let owned = format!("{TMP_DIR}/upload-3");
+        for name in [&client, &owned] {
+            let mut file = Vfs::create_file(&vfs, name).unwrap();
+            file.write_all(b"client").unwrap();
+            file.sync().unwrap();
+        }
+        Vfs::sync_dir_at(&vfs, TMP_DIR).unwrap();
+        drop(Store::open_vfs(vfs.clone()).unwrap());
+        assert_eq!(temp_files(&vfs), std::slice::from_ref(&client));
+        assert_eq!(contents(&vfs, &client), b"client");
+        // The removal is durable.
+        let image = vfs.crash_now(|_| 0);
+        assert_eq!(temp_files(&image), [client]);
     }
 
     #[test]
