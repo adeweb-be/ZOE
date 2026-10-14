@@ -103,6 +103,12 @@
         the home directory.
       </description>
     </key>
+    <key name="blob-dir" datatype="string">
+      <description>
+        The directory of the blob files of the store of path. The default
+        is the blobs directory in path. A leading ~ is the home directory.
+      </description>
+    </key>
     <key name="listen" datatype="string">
       <description>
         The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
@@ -175,6 +181,13 @@
       <description>
         If true, the server serves every store for reads only. The default
         is false.
+      </description>
+    </key>
+    <key name="shared-blob-dir" datatype="string">
+      <description>
+        If true, the server shares the blob directory of each store with
+        its clients, and accepts storeBlobShared. The clients have the
+        trust of the user of the server, as with ZEO. The default is false.
       </description>
     </key>
     <multisection type="storage" name="+" attribute="storages">

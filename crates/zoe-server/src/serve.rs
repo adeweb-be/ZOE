@@ -10,16 +10,17 @@
 //! process with [`Server::start`] and [`Server::stop`].
 //!
 //! A stop takes at most the shutdown timeout. The server stops accepting
-//! connections, and each connection reads no more calls. Each session runs
-//! the calls that the server already received, so a `tpc_finish` that the
-//! server received commits and gets its reply. Then each session ends and
-//! aborts its open transaction, and each connection sends the frames that
-//! wait and closes. Then the stores close.
+//! connections, and each connection reads no more calls. The calls that
+//! the server already received run, so a `tpc_finish` that the
+//! server received commits and gets its reply. A running pack stops between
+//! two of its batches. Then the open transaction of
+//! each connection aborts, and each connection sends the frames that wait
+//! and closes. Then the stores close.
 
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
-use crate::protocol::{self, NamedStorage, Queues, Stopping, Storages};
+use crate::protocol::{self, NamedStorage, Pool, Queues, Stopping, Storages};
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
 /// frame holds a whole record, and the store sets no limit on a record by
@@ -110,7 +111,9 @@ pub struct ServeOptions {
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
     idle_timeout: Duration,
+    blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
+    shared_blob_dir: bool,
 }
 
 impl ServeOptions {
@@ -120,6 +123,8 @@ impl ServeOptions {
     /// 100,000 transactions, and 1,000 invalidations can wait for one
     /// client. A stop takes at most [`DEFAULT_SHUTDOWN_TIMEOUT`]. A
     /// connection that sends no frame for [`DEFAULT_IDLE_TIMEOUT`] closes.
+    /// The calls that read run on as many threads as the machine has
+    /// cores.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::with_storages([StorageOptions::new(protocol::STORAGE_NAME, path)])
     }
@@ -139,7 +144,9 @@ impl ServeOptions {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            blocking_threads: None,
             read_only: false,
+            shared_blob_dir: false,
         }
     }
 
@@ -235,15 +242,32 @@ impl ServeOptions {
 
     /// Close a connection that sends no frame for `timeout`. The time counts
     /// from the last frame that the server read, a heartbeat included, and
-    /// from the accept for the protocol of the client. The time while the
-    /// call queue of the connection is full does not count. The close stops
-    /// the writer at once, as a close of the hub does. The session runs the
-    /// calls that arrived, up to the first reply that it cannot queue, then
-    /// aborts its open transaction. A timeout of 0 closes no connection.
+    /// from the accept for the protocol of the client. The time while 4
+    /// calls of the connection run or wait does not count. The close stops
+    /// the writer at once, as a close of the hub does. The calls that
+    /// arrived run, up to the first reply that cannot be queued, then the
+    /// open transaction aborts. A timeout of 0 closes no connection.
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
         self
+    }
+
+    /// Run the calls that read, such as `loadBefore`, on at most `threads`
+    /// threads at once, for all the connections together. Without this
+    /// call, the server uses as many threads as the machine has cores. A
+    /// transaction, a download and a pack each run on a thread of their
+    /// own, so a vote that waits for a lock holds no thread of the pool.
+    #[must_use]
+    pub fn blocking_threads(mut self, threads: NonZeroUsize) -> Self {
+        self.blocking_threads = Some(threads);
+        self
+    }
+
+    /// The number of threads of the read pool: the option, or the number of
+    /// cores, or 1 when that number is not known.
+    fn pool_threads(&self) -> NonZeroUsize {
+        self.blocking_threads.unwrap_or_else(Pool::cores)
     }
 
     /// Serve every store for reads only, when `read_only` is true, as
@@ -251,6 +275,19 @@ impl ServeOptions {
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Accept `storeBlobShared` when `shared` is true: the clients share
+    /// the blob directory of each store, and give the name of a blob file
+    /// in the directory of its oid. `Server::start` then makes the blob
+    /// directory of each store that is not read-only ready: the layout file
+    /// and `tmp/`. So a client can create the directory of an oid before
+    /// the first blob of the store. Without this call, `storeBlobShared`
+    /// fails the vote with an error that names `shared-blob-dir`.
+    #[must_use]
+    pub fn shared_blob_dir(mut self, shared: bool) -> Self {
+        self.shared_blob_dir = shared;
         self
     }
 
@@ -398,15 +435,27 @@ impl Server {
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
+            // The blob directory gets its layout file before a client of
+            // the shared directory creates the directory of an oid there.
+            if options.shared_blob_dir && !read_only {
+                store
+                    .blob_temp_dir()
+                    .map_err(|error| Error::Store(storage.path.clone(), error))?;
+            }
             stores.push(StoreHealth {
                 name: storage.name.clone(),
                 no_stale_locks: store.lock_table_is_empty(),
             });
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
-            storages.push(Arc::new(named.read_only(read_only)));
+            let named = named
+                .read_only(read_only)
+                .shared_blob_dir(options.shared_blob_dir);
+            storages.push(Arc::new(named));
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
-        let storages = Arc::new(Storages::new(storages, options.queues.client));
+        let storages = Storages::new(storages, options.queues.client)
+            .with_pool(Pool::new(options.pool_threads()));
+        let storages = Arc::new(storages);
         let tasks = Arc::new(Tasks::default());
         // The accept loop counts as a task from now on, so a stop waits for
         // it.
@@ -550,8 +599,9 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// Accept clients until `stopping` tells that the server stops. Then drop
 /// the listener, so the server accepts no more connections. Each connection
-/// takes frames of at most `max_frame_size` bytes, closes after
-/// `idle_timeout` without a frame, and counts in `tasks` while it runs.
+/// takes frames of at most
+/// `max_frame_size` bytes, closes after `idle_timeout` without a frame, and
+/// counts in `tasks` while it runs.
 async fn accept(
     listener: TcpListener,
     storages: Arc<Storages>,
@@ -853,6 +903,36 @@ mod tests {
         let catalog = reply.find(r#"}, "catalog": {"connections": 0, "#);
         assert!(matches!((main, catalog), (Some(0), Some(_))), "{reply}");
         server.stop();
+    }
+
+    #[test]
+    fn a_shared_blob_dir_gets_its_layout_file_at_the_start() {
+        let dir = fresh_dir("shared-start");
+        let blobs = dir.join("shared-blobs");
+        let options = ServeOptions::with_storages([
+            StorageOptions::new("1", dir.join("store")).blob_dir(&blobs)
+        ])
+        .shared_blob_dir(true);
+        let server = Server::start(options).unwrap();
+        assert_eq!(std::fs::read(blobs.join(".layout")).unwrap(), b"bushy");
+        assert!(blobs.join("tmp").is_dir());
+        server.stop();
+
+        // A read-only store gets no layout file: the server writes nothing
+        // there.
+        let other = dir.join("other");
+        Store::open(&other).unwrap();
+        let options = ServeOptions::new(&other)
+            .read_only(true)
+            .shared_blob_dir(true);
+        Server::start(options).unwrap().stop();
+        assert!(!other.join("blobs").exists());
+
+        // Without the option, the server makes no blob directory.
+        let plain = dir.join("plain");
+        Server::start(ServeOptions::new(&plain)).unwrap().stop();
+        assert!(!plain.join("blobs").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

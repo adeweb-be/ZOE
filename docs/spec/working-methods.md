@@ -31,7 +31,7 @@ The tinted boxes are the only two places the human is in the loop; a card that t
 | continuous | a session builds a Ready card, a fresh reviewer and CI run on every PR, the human merges | the merge |
 | per batch | the planner's next batch of cards is approved, open questions answered, order re-ranked; batches are as frequent as the human wants them, not calendar-bound | the main touchpoint |
 | per red-zone PR | the human reviews the diff with the reviewer agent's report beside it | minutes per PR |
-| per phase gate | gate check against the testing harness; the documenter reconciles specification and code; ADRs for every decision taken in the phase | an hour or two |
+| per phase gate | gate check against the testing harness; one `just tsan` run on `main`, where a reported race becomes a card; the documenter reconciles specification and code; ADRs for every decision taken in the phase | an hour or two |
 | retro, on the metrics | when rejection rate, cost per card or flaky tests cross a threshold, a retro happens; its output is changes to CLAUDE.md files, invariants files, skills and card templates: the retro improves the agents, not the people | the human reads the proposal |
 
 **Repository conventions that make agents reliable**
@@ -78,14 +78,14 @@ Out of scope: lock manager, backend trait
 Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
 Spike or build: build
 Budget: one session; a spent budget means stop and ask, not try harder
-Done when: acceptance green, TSan green, bench posted, reviewer approved
+Done when: acceptance green, bench posted, reviewer approved
 ```
 
 Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
 
 **Definition of Ready.** A card has a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
 
-**Definition of Done.** Acceptance test green; unit tests added; TSan and the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
+**Definition of Done.** Acceptance test green; unit tests added; the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
 
 **Stop-and-ask rules for builders.** A builder stops and writes a question on the card instead of guessing when a change would alter the on-disk format, the wire protocol, a public Python API, a trait signature used by another crate, or an acceptance test; when the budget is spent; and when the only way to make the test green is to weaken it.
 
