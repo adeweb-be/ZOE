@@ -4,7 +4,7 @@ The storage core. It owns correctness: the data model, two-phase commit, per-OID
 
 Red zones in this crate: `src/format/` and `src/pack/`. A change to the data model is a format change wherever its code lives.
 
-Every test of this crate also runs under ThreadSanitizer with `just tsan`. A data race fails it. The ignored test in `tests/tsan_canary.rs` holds a deliberate race: `just tsan` runs it and passes only when ThreadSanitizer reports that race.
+Every test of this crate also runs under ThreadSanitizer with `just tsan`, once on `main` at the end of a phase (a phase gate, not a check of each pull request). A data race fails it. The ignored test in `tests/tsan_canary.rs` holds a deliberate race: `just tsan` runs it and passes only when ThreadSanitizer reports that race.
 
 ## Invariants
 
