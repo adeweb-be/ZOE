@@ -3854,6 +3854,7 @@ dependencies = [
 
 [package.optional-dependencies]
 plone = [
+    { name = "msgpack" },
     { name = "products-cmfplone" },
 ]
 uri = [
@@ -3862,6 +3863,7 @@ uri = [
 
 [package.metadata]
 requires-dist = [
+    { name = "msgpack", marker = "extra == 'plone'", specifier = ">=1" },
     { name = "products-cmfplone", marker = "extra == 'plone'", specifier = ">=6.1" },
     { name = "zconfig", specifier = ">=4" },
     { name = "zodb", specifier = ">=6" },

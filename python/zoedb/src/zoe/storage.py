@@ -194,8 +194,8 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         every pickle whole. The store keeps no transaction status, so the
         status is always `" "`.
 
-        The iterator holds the rows of the range and the pickles of one
-        transaction at a time.
+        The iterator holds one transaction and a slice of tids at a time,
+        whatever the length of the range.
         """
         return _transactions(self._iterator(start, stop))
 
