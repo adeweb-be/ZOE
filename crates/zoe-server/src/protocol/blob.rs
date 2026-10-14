@@ -807,6 +807,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The scenario of the test above, with its checks, runs five times
+    /// in a row on a loaded machine: one busy thread for each core runs
+    /// during the whole test. Each run has a directory of its own.
+    #[test]
+    fn the_stop_during_a_download_keeps_its_checks_on_a_loaded_machine() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let busy = Arc::new(AtomicBool::new(true));
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let threads: Vec<_> = (0..cores)
+            .map(|_| {
+                let busy = Arc::clone(&busy);
+                std::thread::spawn(move || {
+                    let mut n: u64 = 0;
+                    while busy.load(Ordering::Relaxed) {
+                        n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(7));
+                    }
+                })
+            })
+            .collect();
+        let result = std::panic::catch_unwind(|| {
+            for round in 0..5 {
+                stop_during_a_download(&format!("stop-download-loaded-{round}"));
+            }
+        });
+        busy.store(false, Ordering::Relaxed);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     /// Return the path of each blob file under `dir`.
     fn blob_files(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
