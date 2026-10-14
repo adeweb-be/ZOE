@@ -8,7 +8,8 @@
 //! file of `--config`.
 //!
 //! The command writes the line `listening <address>` to stdout once it
-//! accepts connections, so a port of 0 gives a free port. The logs go to
+//! accepts connections, so a port of 0 gives a free port. With
+//! `--admin-listen`, it writes the line `admin <address>` before it. The logs go to
 //! stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
 //! the command closes the connections and the stores, and exits with 0.
 //!
@@ -61,6 +62,14 @@ pub(super) struct ServeArgs {
         default_value = "127.0.0.1:8100"
     )]
     listen: SocketAddr,
+
+    /// The address of the admin port, as HOST:PORT: an HTTP port for the
+    /// probes. GET /healthz gives 200 while every store is open. GET
+    /// /readyz gives 200 when every store is open and ready, and 503
+    /// before and from a stop on. The port does not speak ZEO. A port of 0
+    /// takes a free port. Without it, the server opens no admin port.
+    #[arg(long, env = "ZOE_ADMIN_LISTEN", value_name = "HOST:PORT")]
+    admin_listen: Option<SocketAddr>,
 
     /// The most transactions that getInvalidations covers. A client that
     /// reconnects further behind gets nil and verifies its cache.
@@ -287,7 +296,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 }
 
 /// Serve until SIGTERM or SIGINT, then stop. Write the line
-/// `listening <address>` to `out`.
+/// `admin <address>` when the server has an admin port, then the line
+/// `listening <address>`, to `out`.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -310,10 +320,16 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
+    if let Some(addr) = args.admin_listen {
+        options = options.admin_listen(addr);
+    }
     if let Some(bytes) = args.max_frame_size.and_then(NonZeroU32::new) {
         options = options.max_frame_size(bytes);
     }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
+    if let Some(admin) = server.admin_addr() {
+        writeln!(out, "admin {admin}")?;
+    }
     server.serve_until_signal(|addr| {
         writeln!(out, "listening {addr}")?;
         out.flush()

@@ -1,6 +1,7 @@
 //! Tests of the configuration file of `zoe serve` beside its acceptance
-//! test: the twin of an option wins over the file, and the stores of the
-//! file add to the stores of the command line.
+//! test: the twin of an option wins over the file, the stores of the file
+//! add to the stores of the command line, and the file opens the admin
+//! port.
 
 mod wire;
 
@@ -71,4 +72,20 @@ fn the_stores_of_the_file_add_to_the_stores_of_the_command_line() {
     for name in ["one", "main", "catalog"] {
         assert!(dir.join(name).join("zoe.redb").exists(), "{name}");
     }
+}
+
+#[test]
+fn the_file_gives_the_admin_port() {
+    let dir = fresh_dir("config-admin");
+    let config = dir.join("zoe.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "path = \"{}\"\nadmin-listen = \"127.0.0.1:0\"\n",
+            s(&dir.join("store"))
+        ),
+    )
+    .unwrap();
+    let server = Server::start(&["--config", s(&config)], &[]);
+    assert!(server.admin.is_some(), "the file opened no admin port");
 }
