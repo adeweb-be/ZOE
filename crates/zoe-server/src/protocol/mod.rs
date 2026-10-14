@@ -105,6 +105,8 @@ pub(crate) struct NamedStorage {
     /// The publication of the commits to the connections.
     invalidations: Invalidations,
     queues: Queues,
+    /// True when the server opened the store for reads only.
+    read_only: bool,
 }
 
 impl NamedStorage {
@@ -118,7 +120,15 @@ impl NamedStorage {
             store,
             stats: Stats::new(SystemTime::now()),
             queues,
+            read_only: false,
         }
+    }
+
+    /// Mark the storage read-only when `read_only` is true. Its store must
+    /// then be open for reads only. A `register` that asks to write fails.
+    pub(crate) fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// Return the status of the storage. It reads the store.
