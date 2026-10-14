@@ -34,6 +34,14 @@ pub(super) struct ServeArgs {
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: Option<PathBuf>,
 
+    /// The blob directory of the store of --path, the key blob-dir of the
+    /// <zoe> section. The default is blobs in the store directory. The
+    /// store does not record its blob directory, so give the same one at
+    /// each start. The key blob-dir of a [storages.NAME] table sets the
+    /// blob directory of that store.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
+
     /// A store that the server serves under the storage name NAME, which a
     /// client gives to register. Repeat the option to serve more stores.
     /// The twin gives one store. The server creates a store that does not
@@ -223,6 +231,32 @@ pub(super) struct ServeArgs {
     )]
     read_only: bool,
 
+    /// Accept storeBlobShared: the server and its clients share the blob
+    /// directory of each store, as with the option shared-blob-dir of a ZEO
+    /// client. A client writes the blob file in the directory of its oid
+    /// and sends only its name, which ends in .tmp or .tmp-. The server
+    /// takes the file into the transaction by rename, and the client reads
+    /// each committed blob file in place. At the start, the server writes
+    /// the layout file of each blob directory. A blob directory without a
+    /// layout file that holds other entries, such as the directories of an
+    /// oid that a client made, fails the start. The clients have the trust
+    /// of the user of the server, as with ZEO: run them as the same user. A
+    /// client can put a symbolic link in place of a blob file after the
+    /// check of the server. Without the option, storeBlobShared fails the
+    /// vote with an error that names shared-blob-dir.
+    #[arg(
+        long,
+        env = "ZOE_SHARED_BLOB_DIR",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    shared_blob_dir: bool,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
@@ -355,10 +389,17 @@ fn usage_error(message: String) -> clap::Error {
 /// `file`. Fail when there is no store, or when a name comes twice.
 #[cfg(feature = "serve")]
 fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String> {
+    if args.path.is_none() && args.blob_dir.is_some() {
+        return Err(
+            "--blob-dir is the blob directory of the store of --path: give --path too, \
+             or the key blob-dir of a [storages.NAME] table"
+                .to_owned(),
+        );
+    }
     let path = args.path.iter().map(|path| Storage {
         name: crate::protocol::STORAGE_NAME.to_owned(),
         path: path.clone(),
-        blob_dir: None,
+        blob_dir: args.blob_dir.clone(),
         read_only: false,
     });
     let storages: Vec<Storage> = path
@@ -402,7 +443,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
         .idle_timeout(args.idle_timeout)
-        .read_only(args.read_only);
+        .read_only(args.read_only)
+        .shared_blob_dir(args.shared_blob_dir);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
@@ -552,6 +594,35 @@ mod tests {
         assert!(!serve(&["--read-only=false"]).unwrap().read_only);
         let error = serve(&["--read-only=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn shared_blob_dir_is_false_by_default_and_takes_a_boolean() {
+        assert!(!serve(&[]).unwrap().shared_blob_dir);
+        assert!(serve(&["--shared-blob-dir"]).unwrap().shared_blob_dir);
+        assert!(serve(&["--shared-blob-dir=true"]).unwrap().shared_blob_dir);
+        assert!(!serve(&["--shared-blob-dir=false"]).unwrap().shared_blob_dir);
+        let error = serve(&["--shared-blob-dir=maybe"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn blob_dir_is_the_blob_directory_of_the_store_of_path() {
+        let args = serve(&["--blob-dir", "elsewhere"]).unwrap();
+        let stores = storages(&args, Vec::new()).unwrap();
+        assert_eq!(stores[0].blob_dir, Some(PathBuf::from("elsewhere")));
+        assert_eq!(
+            storages(&serve(&[]).unwrap(), Vec::new()).unwrap()[0].blob_dir,
+            None
+        );
+
+        let line = ["zoe", "serve", "--storage", "a=a", "--blob-dir", "b"];
+        let Command::Serve(args) = Cli::try_parse_from(line).unwrap().command else {
+            panic!("not serve");
+        };
+        let error = storages(&args, Vec::new()).unwrap_err();
+        assert!(error.contains("--path"), "{error}");
     }
 
     #[test]

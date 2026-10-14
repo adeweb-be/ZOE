@@ -76,6 +76,10 @@ in
     # the musl toolchain.
     CC_x86_64_unknown_linux_musl = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
+
+    # The Plone suites switch to Latin-1 locales. The interpreters find
+    # every locale in this archive.
+    LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
   };
 
   # Loupe, the Tauri app, and its end-to-end tests. Enter the profile with

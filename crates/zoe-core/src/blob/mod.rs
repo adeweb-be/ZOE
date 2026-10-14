@@ -659,8 +659,56 @@ impl BlobStore {
         if dir != TMP_DIR {
             self.dir.sync_dir_at(dir)?;
         }
+        self.adopt(store, &name)
+    }
+
+    /// Take the file `name` in the directory of `oid` for a blob of the
+    /// store `store`, and return the blob. This is the file of a client
+    /// that shares the blob directory, as ZEO's `storeBlobShared` gives it.
+    ///
+    /// `name` is a name, never a path: it has no `/`, and it ends in `.tmp`
+    /// or `.tmp-`. Another name is refused with `Protocol`, before the call
+    /// reads or changes anything. The file must be a regular file when the
+    /// call syncs it. The client has the trust of the user of the store: a
+    /// link that it puts in place of the file after the sync is followed.
+    ///
+    /// The client created the levels of the oid directory, and a stop of
+    /// the client can leave them not durable. So the call syncs the parent
+    /// of each level from the top down, then the oid directory, so that the
+    /// directory is durable before `finish` puts the blob file in it. Then
+    /// it takes the file as `take` does: it syncs it, renames it to a new
+    /// temporary name in `blobs/tmp/` and computes its BLAKE3 hash. An error
+    /// before the rename leaves the file in its place. After the rename,
+    /// the blob owns the file.
+    pub(crate) fn take_shared(
+        &self,
+        store: Weak<Opened>,
+        oid: Oid,
+        name: &str,
+    ) -> Result<PendingBlob> {
+        if !is_shared_name(name) {
+            return Err(ZoeError::Protocol(
+                "the blob file name is not a temporary name in the directory of its oid",
+            ));
+        }
+        self.make_ready()?;
+        let dir = oid_dir(oid);
+        let file = format!("{dir}/{name}");
+        self.dir.sync_file(&file)?;
+        for level in oid_levels(oid) {
+            self.dir.sync_dir_at(parent(&level))?;
+        }
+        self.dir.sync_dir_at(&dir)?;
+        self.adopt(store, &file)
+    }
+
+    /// Rename the synced file `name` to a new temporary name in
+    /// `blobs/tmp/`, compute its BLAKE3 hash and return the blob. After the
+    /// rename, the blob owns the file: an error drops the blob, and that
+    /// removes the file.
+    fn adopt(&self, store: Weak<Opened>, name: &str) -> Result<PendingBlob> {
         let temp = self.new_temp_name();
-        self.dir.rename(&name, &temp)?;
+        self.dir.rename(name, &temp)?;
         let mut blob = PendingBlob {
             store,
             temp: Some(temp.clone()),
@@ -849,6 +897,13 @@ fn is_temp_name(file: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Tell if `name` is a name that `take_shared` takes: one part without `/`
+/// or NUL, that ends in `.tmp` or `.tmp-`. A ZEO client with a shared blob
+/// directory gives a name that ends in `.tmp-`.
+fn is_shared_name(name: &str) -> bool {
+    !name.contains(['/', '\0']) && (name.ends_with(".tmp") || name.ends_with(".tmp-"))
+}
+
 /// Return the 8 levels of the directory of `oid`, from the top down:
 /// `blobs/0xAA`, `blobs/0xAA/0xBB`, and so on to `oid_dir(oid)`.
 fn oid_levels(oid: Oid) -> Vec<String> {
@@ -1033,6 +1088,7 @@ impl Read for BlobReader {
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
+    use crate::format::blob::tid_repr;
     use crate::guard::SizeLimit;
     use crate::store::{Options, Store};
     use crate::vfs::{CrashImage, MemVfs};
@@ -1995,6 +2051,196 @@ mod tests {
         assert!(committed.permissions().readonly());
         assert!(!path.exists());
         assert!(tmp.join("link").is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Create the levels of the directory of `oid` in `vfs`, as a client
+    /// that shares the blob directory does, with no sync. Then write the
+    /// file `name` there, with no sync either. Return the name of the file
+    /// in `vfs`.
+    fn shared_file(vfs: &MemVfs, oid: Oid, name: &str, bytes: &[u8]) -> String {
+        for level in oid_levels(oid) {
+            if !Vfs::exists(vfs, &level).unwrap() {
+                Vfs::create_dir(vfs, &level).unwrap();
+            }
+        }
+        let file = format!("{}/{name}", oid_dir(oid));
+        client_file(vfs, &file, bytes);
+        file
+    }
+
+    #[test]
+    fn a_file_of_the_oid_directory_commits_by_its_name() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        store.blob_temp_dir().unwrap();
+        let oids = [store.new_oid().unwrap(), store.new_oid().unwrap()];
+        let first = shared_file(&vfs, oids[0], "0x00abc.tmp-", b"first");
+        shared_file(&vfs, oids[1], "0x00def.tmp", b"second");
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob_shared(oids[0], Tid::ZERO, PICKLE, "0x00abc.tmp-")
+            .unwrap();
+        txn.store_blob_shared(oids[1], Tid::ZERO, PICKLE, "0x00def.tmp")
+            .unwrap();
+        // The transaction took the files: they have temporary names of the
+        // core now.
+        assert!(!Vfs::exists(&vfs, &first).unwrap());
+        assert_eq!(temp_files(&vfs).len(), 2);
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        assert_eq!(read(&store, oids[0], tid).unwrap(), b"first");
+        assert_eq!(read(&store, oids[1], tid).unwrap(), b"second");
+        assert!(temp_files(&vfs).is_empty());
+        for oid in oids {
+            let names = Vfs::list_entries(&vfs, &oid_dir(oid)).unwrap();
+            assert_eq!(names, [format!("{}.blob", tid_repr(tid))]);
+        }
+    }
+
+    #[test]
+    fn a_refused_shared_name_leaves_every_file_in_its_place() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        store.blob_temp_dir().unwrap();
+        let oid = store.new_oid().unwrap();
+        let file = shared_file(&vfs, oid, "client.tmp-", b"client");
+        client_file(&vfs, "blobs/escape.tmp", b"escape");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "client",
+            "client.tmpx",
+            "client.blob",
+            "../escape.tmp",
+            "sub/client.tmp",
+            "/escape.tmp",
+            "client\0.tmp",
+        ] {
+            let refused = txn.store_blob_shared(oid, Tid::ZERO, PICKLE, name);
+            assert!(
+                matches!(refused, Err(ZoeError::Protocol(_))),
+                "{name:?}: {refused:?}"
+            );
+        }
+        // A file that does not exist is an error of the filesystem.
+        let refused = txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "missing.tmp-");
+        assert!(matches!(refused, Err(ZoeError::Io(_))), "{refused:?}");
+        // The checks of the transaction come first.
+        let refused = txn.store_blob_shared(oid, Tid::ZERO, b"", "client.tmp-");
+        assert!(matches!(refused, Err(ZoeError::Protocol(_))), "{refused:?}");
+        txn.abort();
+
+        assert_eq!(contents(&vfs, &file), b"client");
+        assert_eq!(contents(&vfs, "blobs/escape.tmp"), b"escape");
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    #[test]
+    fn an_abort_removes_a_taken_shared_file() {
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        store.blob_temp_dir().unwrap();
+        let oid = store.new_oid().unwrap();
+        let file = shared_file(&vfs, oid, "client.tmp-", b"client");
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "client.tmp-")
+            .unwrap();
+        assert!(!Vfs::exists(&vfs, &file).unwrap());
+        assert_eq!(temp_files(&vfs).len(), 1);
+        txn.abort();
+        assert!(temp_files(&vfs).is_empty());
+    }
+
+    /// A client of a shared blob directory can create the layout file and
+    /// `tmp/` before the first blob of the store. The store accepts a
+    /// layout file that says `bushy`, at its open and at its first blob.
+    #[test]
+    fn a_layout_file_of_a_client_is_accepted() {
+        for open_after in [false, true] {
+            let vfs = MemVfs::new();
+            let early = (!open_after).then(|| Store::open_vfs(vfs.clone()).unwrap());
+            Vfs::create_dir(&vfs, BLOB_DIR).unwrap();
+            Vfs::create_dir(&vfs, TMP_DIR).unwrap();
+            client_file(&vfs, LAYOUT_FILE, b"bushy\n");
+            let store = early.unwrap_or_else(|| Store::open_vfs(vfs.clone()).unwrap());
+            let oid = store.new_oid().unwrap();
+            shared_file(&vfs, oid, "client.tmp-", b"client");
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "client.tmp-")
+                .unwrap();
+            txn.vote().unwrap();
+            let tid = txn.finish().unwrap();
+            assert_eq!(read(&store, oid, tid).unwrap(), b"client");
+            assert_eq!(contents(&vfs, LAYOUT_FILE), b"bushy\n");
+        }
+    }
+
+    /// No crash image of the commit of a shared file keeps a blob file
+    /// without its blob record, and each image after the acknowledgement
+    /// keeps the blob. The client did not sync the levels of the oid
+    /// directory, nor the file. An image before the rename can keep the
+    /// file of the client in the oid directory, as ZEO's server does.
+    #[test]
+    fn every_crash_image_of_a_shared_blob_opens_without_an_orphan() {
+        for neighbour in [false, true] {
+            let vfs = empty_store();
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            store.blob_temp_dir().unwrap();
+            // The blob of a neighbour makes the upper levels of the oid
+            // directory, so the client creates only the last one.
+            if neighbour {
+                commit_blobs(&store, &[store.new_oid().unwrap()], b"neighbour");
+            }
+            let oid = store.new_oid().unwrap();
+            shared_file(&vfs, oid, "client.tmp-", b"shared");
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "client.tmp-")
+                .unwrap();
+            txn.vote().unwrap();
+            let tid = txn.finish().unwrap();
+            vfs.mark("acknowledged");
+            drop(store);
+            check_images(&vfs, oid, tid, b"shared");
+        }
+    }
+
+    #[test]
+    fn a_shared_file_keeps_its_inode_and_a_link_at_the_check_is_refused() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let dir = std::env::temp_dir().join(format!("zoe-blob-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        store.blob_temp_dir().unwrap();
+        let oid = store.new_oid().unwrap();
+        let oid_path = dir.join(oid_dir(oid));
+        std::fs::create_dir_all(&oid_path).unwrap();
+        let path = oid_path.join("client.tmp-");
+        std::fs::write(&path, b"client").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let outside = dir.join("outside.tmp");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, oid_path.join("link.tmp-")).unwrap();
+
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let refused = txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "link.tmp-");
+        assert!(matches!(refused, Err(ZoeError::Io(_))), "{refused:?}");
+        txn.store_blob_shared(oid, Tid::ZERO, PICKLE, "client.tmp-")
+            .unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+
+        let committed = std::fs::metadata(store.blob_path(oid, tid).unwrap()).unwrap();
+        assert_eq!(committed.ino(), inode);
+        assert!(committed.permissions().readonly());
+        assert!(!path.exists());
+        assert!(oid_path.join("link.tmp-").is_symlink());
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();

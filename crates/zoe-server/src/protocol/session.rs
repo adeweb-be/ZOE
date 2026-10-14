@@ -351,7 +351,7 @@ impl Reply {
 
 /// The calls of the open transaction of a connection. One thread runs
 /// them in order, from `tpc_begin` to the end of the transaction.
-const TRANSACTION_CALLS: [&str; 11] = [
+const TRANSACTION_CALLS: [&str; 12] = [
     "tpc_begin",
     "storea",
     "restorea",
@@ -363,6 +363,7 @@ const TRANSACTION_CALLS: [&str; 11] = [
     "storeBlobStart",
     "storeBlobChunk",
     "storeBlobEnd",
+    "storeBlobShared",
 ];
 
 /// Tell if `method` is a call of the transaction of the connection.
@@ -1201,6 +1202,7 @@ impl Transaction {
             "storeBlobStart" => self.store_blob_start(args),
             "storeBlobChunk" => self.store_blob_chunk(args),
             "storeBlobEnd" => self.store_blob_end(args),
+            "storeBlobShared" => self.store_blob_shared(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
@@ -1476,6 +1478,40 @@ impl Transaction {
                 return Err(Fault::type_error("data is not bytes"));
             };
             Ok(txn.store_blob_at(oid, serial, data, upload.close())?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage the blob in the file `filename` of the directory of `oid` with
+    /// `data`, for a client that shares the blob directory of the store.
+    /// `Txn::store_blob_shared` takes the file by rename. `filename` must
+    /// be a name that ends in `.tmp` or `.tmp-`, never a path.
+    ///
+    /// The call has no reply. Without `--shared-blob-dir`, a name that the
+    /// core refuses, and each other error of the stage fail the vote, as an
+    /// error of `storea` does. Then the file stays in its place.
+    fn store_blob_shared(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, filename, id] = arity::<5>(args, "storeBlobShared")?;
+        let shared = self.session.storage.shared_blob_dir;
+        self.current(id)?.stage(|txn| {
+            if !shared {
+                return Err(Fault::storage(
+                    "storeBlobShared needs zoe serve --shared-blob-dir \
+                     (ZOE_SHARED_BLOB_DIR): this server does not share its blob \
+                     directory with its clients",
+                ));
+            }
+            let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
+            let Value::Binary(data) = data else {
+                return Err(Fault::type_error("data is not bytes"));
+            };
+            let name = match filename {
+                Value::String(text) => text.as_str(),
+                Value::Binary(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            }
+            .ok_or_else(|| Fault::type_error("the blob file name is not a str"))?;
+            Ok(txn.store_blob_shared(oid, serial, data, name)?)
         });
         Ok(Value::Nil)
     }

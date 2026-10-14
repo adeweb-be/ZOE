@@ -112,6 +112,7 @@ pub struct ServeOptions {
     idle_timeout: Duration,
     blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
+    shared_blob_dir: bool,
 }
 
 impl ServeOptions {
@@ -143,6 +144,7 @@ impl ServeOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             blocking_threads: None,
             read_only: false,
+            shared_blob_dir: false,
         }
     }
 
@@ -262,6 +264,19 @@ impl ServeOptions {
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Accept `storeBlobShared` when `shared` is true: the clients share
+    /// the blob directory of each store, and give the name of a blob file
+    /// in the directory of its oid. `Server::start` then makes the blob
+    /// directory of each store that is not read-only ready: the layout file
+    /// and `tmp/`. So a client can create the directory of an oid before
+    /// the first blob of the store. Without this call, `storeBlobShared`
+    /// fails the vote with an error that names `shared-blob-dir`.
+    #[must_use]
+    pub fn shared_blob_dir(mut self, shared: bool) -> Self {
+        self.shared_blob_dir = shared;
         self
     }
 
@@ -408,12 +423,22 @@ impl Server {
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
+            // The blob directory gets its layout file before a client of
+            // the shared directory creates the directory of an oid there.
+            if options.shared_blob_dir && !read_only {
+                store
+                    .blob_temp_dir()
+                    .map_err(|error| Error::Store(storage.path.clone(), error))?;
+            }
             stores.push(StoreHealth {
                 name: storage.name.clone(),
                 no_stale_locks: store.lock_table_is_empty(),
             });
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
-            storages.push(Arc::new(named.read_only(read_only)));
+            let named = named
+                .read_only(read_only)
+                .shared_blob_dir(options.shared_blob_dir);
+            storages.push(Arc::new(named));
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
         let storages = Storages::new(storages, options.queues.client)
@@ -866,6 +891,36 @@ mod tests {
         let catalog = reply.find(r#"}, "catalog": {"connections": 0, "#);
         assert!(matches!((main, catalog), (Some(0), Some(_))), "{reply}");
         server.stop();
+    }
+
+    #[test]
+    fn a_shared_blob_dir_gets_its_layout_file_at_the_start() {
+        let dir = fresh_dir("shared-start");
+        let blobs = dir.join("shared-blobs");
+        let options = ServeOptions::with_storages([
+            StorageOptions::new("1", dir.join("store")).blob_dir(&blobs)
+        ])
+        .shared_blob_dir(true);
+        let server = Server::start(options).unwrap();
+        assert_eq!(std::fs::read(blobs.join(".layout")).unwrap(), b"bushy");
+        assert!(blobs.join("tmp").is_dir());
+        server.stop();
+
+        // A read-only store gets no layout file: the server writes nothing
+        // there.
+        let other = dir.join("other");
+        Store::open(&other).unwrap();
+        let options = ServeOptions::new(&other)
+            .read_only(true)
+            .shared_blob_dir(true);
+        Server::start(options).unwrap().stop();
+        assert!(!other.join("blobs").exists());
+
+        // Without the option, the server makes no blob directory.
+        let plain = dir.join("plain");
+        Server::start(ServeOptions::new(&plain)).unwrap().stop();
+        assert!(!plain.join("blobs").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
