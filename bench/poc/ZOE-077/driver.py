@@ -51,6 +51,28 @@ def io(pid):
     return out
 
 
+def timerslack(ns):
+    """Return a preexec_fn that sets the timer slack of the child, or None."""
+    if ns is None:
+        return None
+
+    def set_slack():
+        import ctypes
+
+        # PR_SET_TIMERSLACK. The value stays after exec.
+        ctypes.CDLL(None).prctl(29, ns, 0, 0, 0)
+
+    return set_slack
+
+
+def server_cpu(proc):
+    return cpu_seconds(proc.pid) if proc else 0.0
+
+
+def server_io(proc):
+    return io(proc.pid) if proc else {"write_bytes": 0, "syscw": 0}
+
+
 def metrics(admin):
     if not admin:
         return {}
@@ -64,6 +86,8 @@ def metrics(admin):
 
 
 def start(args, wd):
+    if args.server == "mapping":
+        return None, None, None
     env = {k: v for k, v in os.environ.items() if not k.startswith(("ZOE_", "ZEO_"))}
     for kv in args.env:
         k, v = kv.split("=", 1)
@@ -102,7 +126,7 @@ def start(args, wd):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--server", choices=["zeo", "zeo-msgpack", "zoe"], required=True)
+    p.add_argument("--server", choices=["zeo", "zeo-msgpack", "zoe", "mapping"], required=True)
     p.add_argument("--binary")
     p.add_argument("--label", required=True)
     p.add_argument("--env", action="append", default=[])
@@ -115,6 +139,13 @@ def main():
     p.add_argument("--scenarios", nargs="+", default=["add", "update"])
     p.add_argument("--strace", help="strace -c output file; attaches to the server")
     p.add_argument("--wrap", default="", help="a prefix for the zoe serve command")
+    p.add_argument("--client-wrap", default="", help="a prefix for the zodbshootout command")
+    p.add_argument("--client-timerslack-ns", type=int,
+                   help="the timer slack of zodbshootout; ZEO.ClientStorage sleeps 1 µs after each reply")
+    p.add_argument("--client-pool", type=int, default=1,
+                   help="the connections of one zoeclientx storage; each transaction takes one")
+    p.add_argument("--client", choices=["zeo", "zoeclientx"], default="zeo",
+                   help="ZEO.ClientStorage, or the zoe-client storage of rustclient/")
     p.add_argument("--results", default=str(ROOT / "results.jsonl"))
     args = p.parse_args()
 
@@ -124,17 +155,26 @@ def main():
     proc, addr, admin = start(args, wd)
     try:
         conf = wd / "zodb.conf"
-        conf.write_text(f"<zodb bench>\n  <zeoclient>\n    server {addr}\n  </zeoclient>\n</zodb>\n")
-        cmd = [sys.executable, "-m", "zodbshootout", "--processes", str(args.processes),
+        if args.server == "mapping":
+            # zodbshootout runs its own MappingStorage first, then this
+            # FileStorage in the process. Both have no server.
+            conf.write_text(f"<zodb bench>\n  <filestorage>\n    path {wd / 'Data.fs'}\n  </filestorage>\n</zodb>\n")
+        elif args.client == "zoeclientx":
+            # The storage of rustclient/: zoe-client through PyO3.
+            conf.write_text(f"%import zoeclientx\n<zodb bench>\n  <zoeclientx>\n    server {addr}\n"
+                            f"    pool {args.client_pool}\n  </zoeclientx>\n</zodb>\n")
+        else:
+            conf.write_text(f"<zodb bench>\n  <zeoclient>\n    server {addr}\n  </zeoclient>\n</zodb>\n")
+        cmd = [*args.client_wrap.split(), sys.executable, "-m", "zodbshootout", "--processes", str(args.processes),
                "--values", str(args.values), "--warmups", "1", "--loops", "1",
                "--object-counts", "100", "--object-size", str(args.size),
                "--concurrency", str(args.concurrency),
                *(["--zap", "force"] if "add" in args.scenarios else []),
-               "--include-mapping", "no", "--quiet", "--output", str(wd / "pyperf.json")]
+               "--include-mapping", "yes" if args.server == "mapping" else "no", "--quiet", "--output", str(wd / "pyperf.json")]
         if args.mode == "threads":
             cmd += ["--threads", "shared"]
         cmd += [str(conf), *args.scenarios]
-        m0, c0, t0, io0 = metrics(admin), cpu_seconds(proc.pid), time.monotonic(), io(proc.pid)
+        m0, c0, t0, io0 = metrics(admin), server_cpu(proc), time.monotonic(), server_io(proc)
         tracer = None
         if args.strace:
             tracer = subprocess.Popen(
@@ -145,32 +185,44 @@ def main():
         ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         tc0 = time.monotonic()
         with open(wd / "zodbshootout.log", "wb") as log:
-            done = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+            env = dict(os.environ)
+            if args.client == "zoeclientx":
+                # zodbshootout gives the PYTHON* variables to its workers.
+                env["PYTHONPATH"] = str(ROOT / "rustclient" / "python")
+            done = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                                  preexec_fn=timerslack(args.client_timerslack_ns))
         ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         client_cpu = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
         client_wall = time.monotonic() - tc0
         if tracer:
             tracer.send_signal(signal.SIGINT)
             tracer.wait()
-        m1, c1, t1, io1 = metrics(admin), cpu_seconds(proc.pid), time.monotonic(), io(proc.pid)
+        m1, c1, t1, io1 = metrics(admin), server_cpu(proc), time.monotonic(), server_io(proc)
         if done.returncode:
             print((wd / "zodbshootout.log").read_text()[-3000:], file=sys.stderr)
             raise SystemExit("zodbshootout failed")
     finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     suite = pyperf.BenchmarkSuite.load(str(wd / "pyperf.json"))
-    result = {"label": args.label, "server": args.server, "mode": args.mode,
+    result = {"label": args.label, "server": args.server, "client": args.client,
+              "timerslack_ns": args.client_timerslack_ns, "pool": args.client_pool, "mode": args.mode,
               "c": args.concurrency, "size": args.size, "env": args.env,
               "server_cpu_s": round(c1 - c0, 2), "wall_s": round(t1 - t0, 1)}
     for b in suite.get_benchmarks():
         name = b.get_name()
+        if args.server == "mapping":
+            # The suite holds the benchmarks of MappingStorage and of FileStorage.
+            prefix = "inproc-mapping-" if "MappingStorage" in name else "inproc-filestorage-"
+        else:
+            prefix = ""
         key = next((v for k, v in [("write/read", "read_warm"), ("cold", "read_cold"), ("hot", "read_hot"), ("update", "update"), ("add", "add")] if k in name), name)
         mean = b.mean()
-        result[key] = {"ops": round(args.concurrency * 100 / mean), "mean_ms": round(mean * 1e3, 1)}
+        result[prefix + key] = {"ops": round(args.concurrency * 100 / mean), "mean_ms": round(mean * 1e3, 1)}
     delta = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
     if delta:
         commits = delta.get("zoe_commits_total", 0)
@@ -187,7 +239,7 @@ def main():
             result["cpu_ms_per_commit"] = round((c1 - c0) / commits * 1e3, 2)
             result["disk_kb_per_commit"] = round((io1["write_bytes"] - io0["write_bytes"]) / commits / 1024, 1)
             result["syscw_per_commit"] = round((io1["syscw"] - io0["syscw"]) / commits, 1)
-    err = (wd / "server.err").read_text()
+    err = (wd / "server.err").read_text() if proc else ""
     poc = [line for line in err.splitlines() if line.startswith("POC ")]
     if poc:
         result["poc"] = poc[-1]

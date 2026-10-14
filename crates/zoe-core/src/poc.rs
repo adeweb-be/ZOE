@@ -14,6 +14,7 @@ pub struct Flags {
     pub precompress: bool,
     pub nosync: bool,
     pub store_compress: bool,
+    pub par_compress: usize,
     pub compression: Option<Compression>,
 }
 
@@ -28,6 +29,9 @@ pub static FLAGS: LazyLock<Flags> = LazyLock::new(|| Flags {
     precompress: on("ZOE_POC_PRECOMPRESS"),
     nosync: on("ZOE_POC_NOSYNC"),
     store_compress: on("ZOE_POC_STORECOMPRESS"),
+    par_compress: std::env::var("ZOE_POC_PARCOMPRESS")
+        .ok()
+        .map_or(0, |v| v.parse().unwrap()),
     compression: std::env::var("ZOE_POC_COMPRESSION").ok().map(|v| {
         if v == "none" {
             Compression::None

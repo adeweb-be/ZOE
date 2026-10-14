@@ -1,0 +1,21 @@
+# A workspace of its own: a Python binding of zoe-client for the ZOE-077 POC.
+[workspace]
+
+[package]
+name = "poc-077-rustclient"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_zoeclientx"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "=0.29.3"
+tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
+zoe-client = { path = "../../../../crates/zoe-client" }
+zoe-core = { path = "../../../../crates/zoe-core" }
+
+[profile.release]
+debug = false

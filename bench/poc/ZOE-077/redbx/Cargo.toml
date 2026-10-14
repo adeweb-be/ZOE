@@ -11,6 +11,9 @@ publish = false
 redb = "=4.3.0"
 zstd = "=0.14.2"
 xxhash-rust = { version = "=0.8.19", features = ["xxh3"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+zoe-client = { path = "../../../../crates/zoe-client" }
+zoe-core = { path = "../../../../crates/zoe-core" }
 
 [[bin]]
 name = "redbx"
@@ -23,6 +26,10 @@ path = "src/codecx.rs"
 [[bin]]
 name = "readx"
 path = "src/readx.rs"
+
+[[bin]]
+name = "clientx"
+path = "src/clientx.rs"
 
 [profile.release]
 debug = false

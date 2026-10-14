@@ -1,0 +1,7 @@
+<component prefix="zoeclientx">
+  <sectiontype name="zoeclientx" datatype=".StorageConfig" implements="ZODB.storage">
+    <key name="server" required="yes" />
+    <key name="name" default="zoeclientx" />
+    <key name="pool" datatype="integer" default="1" />
+  </sectiontype>
+</component>

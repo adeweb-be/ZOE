@@ -278,6 +278,34 @@ impl Staging {
         })
     }
 
+    /// POC: encode the payload of each record in memory that has none, on
+    /// `threads` threads.
+    pub(crate) fn encode_all(&mut self, compression: crate::format::Compression, threads: usize) {
+        let mut todo: Vec<&mut Staged> = self
+            .records
+            .values_mut()
+            .filter(|s| s.encoded.is_none() && matches!(s.pickle, Pickle::Memory(_)))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let chunk = todo.len().div_ceil(threads.max(1));
+        std::thread::scope(|scope| {
+            for part in todo.chunks_mut(chunk) {
+                scope.spawn(move || {
+                    for staged in part.iter_mut() {
+                        let staged: &mut Staged = staged;
+                        if let Pickle::Memory(data) = &staged.pickle {
+                            let (codec, payload) = crate::format::encode_payload(data, compression);
+                            let payload = payload.into_owned();
+                            staged.encoded = Some((codec, payload));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// POC: take the payloads that the store calls encoded, in oid order,
     /// when every record has one.
     pub(crate) fn take_encoded(&mut self) -> Option<Vec<(crate::format::Codec, Vec<u8>)>> {

@@ -677,7 +677,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// the check and releases the locks.
     fn check(&mut self, resolve: bool) -> Result<Vec<(Oid, Record)>> {
         let error = match self.check_serials(resolve) {
-            Ok(Check::Passed(conflicts)) => return Ok(conflicts),
+            Ok(Check::Passed(conflicts)) => {
+                if crate::poc::FLAGS.par_compress > 0 {
+                    let t = crate::poc::start();
+                    let compression = crate::poc::FLAGS.compression.unwrap_or_default();
+                    self.staged
+                        .encode_all(compression, crate::poc::FLAGS.par_compress);
+                    crate::poc::stop(crate::poc::K::Precompress, t);
+                }
+                return Ok(conflicts);
+            }
             Ok(Check::Failed(stale)) => {
                 self.conflict = Some((stale.current, stale.read));
                 let oid = stale.oid;
@@ -913,7 +922,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
-        let encoded = if crate::poc::FLAGS.store_compress {
+        let encoded = if crate::poc::FLAGS.store_compress || crate::poc::FLAGS.par_compress > 0 {
             self.staged.take_encoded()
         } else if crate::poc::FLAGS.precompress {
             let t = crate::poc::start();
