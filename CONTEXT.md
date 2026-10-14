@@ -151,7 +151,7 @@ _Avoid_: lock timeout (that bounds a lock wait), keepalive
 ## Client
 
 **Runtime**:
-The trait through which `zoe-client` reaches the network, its tasks and the time (connect, spawn, sleep); `Tokio` is the runtime of production, and a simulator gives its own.
+The trait through which `zoe-client` reaches the network, its tasks and the time (connect, spawn, sleep); `Tokio` is the runtime of production, and a test gives its own.
 _Avoid_: executor (that is the scheduler of the simulator), tokio runtime
 
 ## Operations

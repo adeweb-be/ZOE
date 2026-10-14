@@ -5,7 +5,7 @@ ZOE, the Zope Object Engine, is a ZODB storage written in Rust. Plone 6.1 and la
 What works today:
 
 - In-process: `zoe.Storage` in the `zoedb` wheel, and the `<zoe>` section of `zope.conf`, run a Zope instance on a ZOE store.
-- Server: `zoe serve` serves ZOE stores to stock `ZEO.ClientStorage` clients over the ZEO 6 protocol. The scenarios under `plone/` create a Plone site in-process and through the server.
+- Server: `zoe serve` serves ZOE stores to stock `ZEO.ClientStorage` clients over the ZEO 6 protocol. The `zoe` scenario under `plone/` creates a Plone site in-process and reads it over HTTP.
 - Command line: `zoe convert` converts a `Data.fs` to a store and back, `zoe verify` checks a store, `zoe pack` packs it, `zoe backup` and `zoe restore` write and read dumps, and `zoe mcp` gives an agent read-only tools on a store folder.
 - Loupe: the desktop inspector opens a store folder read-only. It browses objects, shows their history and the diff of two revisions, and measures the space of the store.
 - `zoe-client`: a Rust client of the ZEO 6 protocol.
