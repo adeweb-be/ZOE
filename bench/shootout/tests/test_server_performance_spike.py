@@ -3,7 +3,8 @@
 The spike measures `zoe-server` against `zeo` with zodbshootout on the
 reference machine, the full set, and with `zoe-bench saturate` for the p99
 of `loadBefore` (N3, N4). It profiles the server in each scenario where the
-ratio is under 3, and writes the finding `docs/spikes/server-performance.md`.
+ratio is under 1, except `read_hot`, which never reaches the server, and
+writes the finding `docs/spikes/server-performance.md`.
 
 This test checks the finding:
 
