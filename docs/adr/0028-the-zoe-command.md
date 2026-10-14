@@ -6,7 +6,7 @@ Status: accepted
 
 The naming table asks for one CLI, `zoe`, as one binary and one console script of the same name. F14 asks for `zoe convert`, F8 and F26 for `zoe pack` and its dry run. `zoe serve` joins the same command in phase 2. Every option has a `ZOE_*` environment twin.
 
-The crate names are fixed: `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py` and the others of the naming table. `zoe-server` holds `zoe serve` and `zoe mcp`, which use tokio. The extension module `zoe._zoe` of the `zoedb` wheel must not link tokio.
+The crate names are fixed: `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py` and the others of the naming table. `zoe-server` holds `zoe serve` and `zoe mcp`, which use tokio. The extension module `zoe._zoe` of the `zoedb` wheel must not link tokio. ADR 0035 supersedes this rule: the extension links tokio through `zoe-client`, for the native client, and still never links rmcp.
 
 Three places can hold the binary: a `[[bin]]` in `zoe-server`, a thin binary crate, or a `main` inside the extension module that the console script calls. The wheel can ship a compiled binary beside the extension, or a console script that calls the extension.
 
@@ -18,7 +18,7 @@ Three places can hold the binary: a `[[bin]]` in `zoe-server`, a thin binary cra
 
 **The console script goes through the extension.** The extension exposes `zoe._zoe.main(argv) -> int`, which runs `zoe_server::cli::main` with the GIL released. `zoe/__main__.py` calls it with `sys.argv`, and the wheel declares the console script `zoe = "zoe.__main__:main"`. So the binary, the console script and `python -m zoe` run the same code. The entry point restores the default handler of SIGINT before the call, because Python handles a signal only when it runs Python code: Ctrl-C then stops the process, as it stops the binary.
 
-**`serve` sits behind a feature.** `zoe-server` has the cargo feature `serve`, on by default. The server code and the MCP server of `zoe mcp` compile only with it, and only it may bring in tokio. `zoe mcp` brings in tokio and rmcp through `zoe-mcp`. Without the feature, `zoe serve` and `zoe mcp` still parse, and fail with 1 and a message that names the `zoe` binary. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, and never links tokio or rmcp. `cargo tree -p zoe-py -e normal` shows it.
+**`serve` sits behind a feature.** `zoe-server` has the cargo feature `serve`, on by default. The server code and the MCP server of `zoe mcp` compile only with it, and only it may bring in tokio. `zoe mcp` brings in tokio and rmcp through `zoe-mcp`. Without the feature, `zoe serve` and `zoe mcp` still parse, and fail with 1 and a message that names the `zoe` binary. The workspace dependency on `zoe-server` turns the default features off, and `zoe-py` uses it without `serve`. So the extension holds the CLI and the converters, and never links the server or rmcp. `cargo tree -p zoe-py -e normal` shows it. ADR 0035 brings tokio into the extension through `zoe-client`, not through `zoe-server`.
 
 **`--path` everywhere.** The store is `--path` in every subcommand, with the twin `ZOE_PATH`, as in `zoe serve --path`.
 
