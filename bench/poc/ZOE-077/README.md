@@ -52,6 +52,8 @@ python3 summarize.py results/ab-tmpfs.jsonl
 | `wrap-pyspy.sh`, `pyspy_split.py` | A wrapper for `driver.py --client-wrap` that samples zodbshootout and its workers with py-spy, and the split of the samples by layer |
 | `show.py`, `summarize_client.py` | Short reports of the JSON lines of `driver.py` and of `ab-client.sh` |
 
+`driver.py --server relstorage` starts PostgreSQL in the container of the CI baseline (`postgres:17.10-alpine`, host network, data on tmpfs) and runs RelStorage with the section of `bench/shootout`; `--history-free` sets `keep-history false`. Run it in `devenv shell`: `common.sh` then gives RelStorage the `libstdc++` of the shell, as `just bench` does. `ab-relstorage.sh` compares it with ZEO and `zoe serve`.
+
 `driver.py --server mapping` runs zodbshootout with no server: its own MappingStorage, then a FileStorage in the process. These are the bounds of ZODB and zodbshootout alone.
 
 ## Results

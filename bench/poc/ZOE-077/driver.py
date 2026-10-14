@@ -65,12 +65,71 @@ def timerslack(ns):
     return set_slack
 
 
+def tree_cpu(pid):
+    """Return the CPU seconds of a process, of its live children and of the
+    children that it waited for. PostgreSQL runs a process per connection."""
+    tick = os.sysconf("SC_CLK_TCK")
+
+    def stat(p):
+        return Path(f"/proc/{p}/stat").read_text().rsplit(")", 1)[1].split()
+
+    own = stat(pid)
+    total = sum(int(own[i]) for i in (11, 12, 13, 14))
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = stat(entry.name)
+        except OSError:
+            continue
+        if int(fields[1]) == pid:
+            total += sum(int(fields[i]) for i in (11, 12, 13, 14))
+    return total / tick
+
+
 def server_cpu(proc):
-    return cpu_seconds(proc.pid) if proc else 0.0
+    return tree_cpu(proc.pid) if proc else 0.0
 
 
 def server_io(proc):
-    return io(proc.pid) if proc else {"write_bytes": 0, "syscw": 0}
+    try:
+        return io(proc.pid) if proc else {"write_bytes": 0, "syscw": 0}
+    except OSError:
+        # The processes of a container belong to another user.
+        return {"write_bytes": 0, "syscw": 0}
+
+
+PG_IMAGE = "postgres:17.10-alpine"
+
+
+class Postgres:
+    """PostgreSQL in the container of the CI baseline, on the host network,
+    with its data on tmpfs. It acts as the Popen of a server."""
+
+    def __init__(self, port):
+        self.port = port
+        self.name = f"zoe-poc-077-pg-{port}"
+        subprocess.run(
+            ["docker", "run", "-d", "--rm", "--name", self.name, "--network", "host",
+             "--tmpfs", "/var/lib/postgresql/data:rw",
+             "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_DB=zoe_bench",
+             PG_IMAGE, "-c", f"port={port}", "-c", "listen_addresses=127.0.0.1"],
+            check=True, capture_output=True)
+        self.pid = int(subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", self.name],
+            check=True, capture_output=True, text=True).stdout)
+
+    def send_signal(self, sig):
+        subprocess.run(["docker", "stop", "-t", "10", self.name], capture_output=True)
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        subprocess.run(["docker", "kill", self.name], capture_output=True)
+
+    def poll(self):
+        return None
 
 
 def metrics(admin):
@@ -88,6 +147,21 @@ def metrics(admin):
 def start(args, wd):
     if args.server == "mapping":
         return None, None, None
+    if args.server == "relstorage":
+        import psycopg2
+
+        pg = Postgres(free_port())
+        dsn = f"host=127.0.0.1 port={pg.port} dbname=zoe_bench user=postgres"
+        # The entrypoint first runs a server without TCP for its set-up. A
+        # TCP connection reaches the final server.
+        for _ in range(600):
+            try:
+                psycopg2.connect(dsn).close()
+                return pg, dsn, None
+            except psycopg2.OperationalError:
+                time.sleep(0.05)
+        pg.kill()
+        raise RuntimeError("postgres did not listen")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("ZOE_", "ZEO_"))}
     for kv in args.env:
         k, v = kv.split("=", 1)
@@ -126,7 +200,8 @@ def start(args, wd):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--server", choices=["zeo", "zeo-msgpack", "zoe", "mapping"], required=True)
+    p.add_argument("--server", choices=["zeo", "zeo-msgpack", "zoe", "mapping", "relstorage"], required=True)
+    p.add_argument("--history-free", action="store_true", help="RelStorage with keep-history false")
     p.add_argument("--binary")
     p.add_argument("--label", required=True)
     p.add_argument("--env", action="append", default=[])
@@ -159,6 +234,12 @@ def main():
             # zodbshootout runs its own MappingStorage first, then this
             # FileStorage in the process. Both have no server.
             conf.write_text(f"<zodb bench>\n  <filestorage>\n    path {wd / 'Data.fs'}\n  </filestorage>\n</zodb>\n")
+        elif args.server == "relstorage":
+            # The section of the harness, bench/shootout. It keeps history by default.
+            keep = "    keep-history false\n" if args.history_free else ""
+            conf.write_text(f"%import relstorage\n<zodb bench>\n  <relstorage>\n{keep}"
+                            f"    <postgresql>\n      dsn {addr}\n    </postgresql>\n"
+                            "  </relstorage>\n</zodb>\n")
         elif args.client == "zoeclientx":
             # The storage of rustclient/: zoe-client through PyO3.
             conf.write_text(f"%import zoeclientx\n<zodb bench>\n  <zoeclientx>\n    server {addr}\n"
@@ -173,6 +254,10 @@ def main():
                "--include-mapping", "yes" if args.server == "mapping" else "no", "--quiet", "--output", str(wd / "pyperf.json")]
         if args.mode == "threads":
             cmd += ["--threads", "shared"]
+        if "LD_LIBRARY_PATH" in os.environ:
+            # pyperf starts its workers with a reduced environment, and the
+            # last --inherit-environ wins over the one of zodbshootout.
+            cmd += ["--inherit-environ", "LD_LIBRARY_PATH,PYTHONPATH"]
         cmd += [str(conf), *args.scenarios]
         m0, c0, t0, io0 = metrics(admin), server_cpu(proc), time.monotonic(), server_io(proc)
         tracer = None
@@ -210,6 +295,7 @@ def main():
                 proc.kill()
     suite = pyperf.BenchmarkSuite.load(str(wd / "pyperf.json"))
     result = {"label": args.label, "server": args.server, "client": args.client,
+              "history_free": args.history_free,
               "timerslack_ns": args.client_timerslack_ns, "pool": args.client_pool, "mode": args.mode,
               "c": args.concurrency, "size": args.size, "env": args.env,
               "server_cpu_s": round(c1 - c0, 2), "wall_s": round(t1 - t0, 1)}
@@ -239,7 +325,7 @@ def main():
             result["cpu_ms_per_commit"] = round((c1 - c0) / commits * 1e3, 2)
             result["disk_kb_per_commit"] = round((io1["write_bytes"] - io0["write_bytes"]) / commits / 1024, 1)
             result["syscw_per_commit"] = round((io1["syscw"] - io0["syscw"]) / commits, 1)
-    err = (wd / "server.err").read_text() if proc else ""
+    err = (wd / "server.err").read_text() if (wd / "server.err").exists() else ""
     poc = [line for line in err.splitlines() if line.startswith("POC ")]
     if poc:
         result["poc"] = poc[-1]

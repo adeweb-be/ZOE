@@ -6,3 +6,9 @@ V=${POC_PYTHON:-$repo/target/bench/venv-3.13/bin/python}
 # The zoe binary of this branch. With no ZOE_POC_* toggle it runs as main.
 ZOE=${POC_ZOE:-${CARGO_TARGET_DIR:-$repo/target}/release/zoe}
 P=ZOE_POC_PROFILE=1
+# The RelStorage wheel links libstdc++, which the Nix interpreters do not
+# find on their own. The compiler of the devenv shell knows where it is.
+if command -v cc >/dev/null; then
+  libstdcxx="$(dirname "$(cc -print-file-name=libstdc++.so.6)")"
+  export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
