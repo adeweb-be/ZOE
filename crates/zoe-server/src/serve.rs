@@ -104,6 +104,7 @@ pub struct ServeOptions {
     admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
+    cache_size: Option<usize>,
     lock_warn: Option<Duration>,
     transaction_warn: Option<Duration>,
     max_frame_size: NonZeroU32,
@@ -132,6 +133,7 @@ impl ServeOptions {
             admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
+            cache_size: None,
             lock_warn: None,
             transaction_warn: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -180,6 +182,15 @@ impl ServeOptions {
     #[must_use]
     pub fn lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = Some(timeout);
+        self
+    }
+
+    /// Let the page cache of each store hold at most `bytes`. Without this
+    /// call, each store keeps the default of the store, 1 GiB. The cache
+    /// does not grow with the size of the store.
+    #[must_use]
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = Some(bytes);
         self
     }
 
@@ -254,6 +265,7 @@ impl ServeOptions {
         if let Some(timeout) = self.lock_timeout {
             options.lock_timeout = timeout;
         }
+        options.cache_size = self.cache_size;
         options.lock_warn = self.lock_warn;
         options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);
