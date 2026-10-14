@@ -420,6 +420,25 @@ blob-dir = "/var/zoe/catalog-blobs"
 
 An option on the command line wins over its twin, and both win over the file. The stores of the file add to the stores of `--path` and `--storage`, and a relative path is taken from the working directory, as on the command line. A file that does not read or does not parse, an unknown key, a value of the wrong type, a store without a path and a storage name that comes twice are usage errors (exit code 2): the command reads the file before it opens anything, so it creates nothing.
 
+**The `<zoe-server>` section.** Buildout users configure the server in ZConfig too. `python -m zoe.serve -C FILE` reads the `<zoe-server>` section of the file, which `%import zoe` declares, and runs `zoe serve` with its settings:
+
+```
+%import zoe
+<zoe-server>
+  listen 0.0.0.0:8100
+  lock-timeout 10s
+  <storage main>
+    path /var/zoe/main
+  </storage>
+  <storage catalog>
+    path /var/zoe/catalog
+    blob-dir /var/zoe/catalog-blobs
+  </storage>
+</zoe-server>
+```
+
+The keys of the section are the top-level keys of the configuration file, with the syntax of their options, and `binary`. Each `<storage NAME>` subsection is a `[storages.NAME]` table, with the keys `path` (necessary), `blob-dir` and `read-only`; ZConfig gives the name of a section in lower case, as for `runzeo`. A leading `~` in `path` and `blob-dir` is the home directory. The section wins over the twins, as the `<zoe>` section does: `zoe.serve` removes from the environment of the server the twin of each key that the section sets, and an empty value counts as not set. The wheel ships no server, because the extension never links tokio: the binary is the key `binary`, else `ZOE_BINARY`, else the `zoe` binary on the PATH, and the search on the PATH skips a script, such as the console script `zoe` of the wheel. `zoe.serve` writes the settings as a configuration file into a memory file (`memfd_create`), which has no path on disk, and replaces itself with `zoe serve --config /proc/self/fd/N` (`execve`). So no Python stays in the process of the server, a supervisor stops it with SIGTERM, and no value of the section goes into the arguments of the process. An unknown key, a bad boolean, a storage without a path and a storage name that comes twice are usage errors (exit code 2) before anything starts; `zoe serve` checks the other values and refuses a bad one with 2 too. A missing binary exits with 1. ADR 0028 records the choice.
+
 **Modes.** `--read-only` serves reads and refuses `tpc_begin` with ZEO's `ReadOnlyError`. Built so far: `--read-only` (`ZOE_READ_ONLY`, the top-level key `read-only`) makes every store read-only, and `read-only = true` in a `[storages.NAME]` table makes one store read-only (`ServeOptions::read_only` and `StorageOptions::read_only` in Rust). The server opens a read-only store with the read-only open of the core: the store must exist, the server changes no byte of it, and it holds the lock of the store, so no writer opens the store while the server runs. The open takes the blob directory of the store, the `blob-dir` of its `[storages.NAME]` table, and the server checks it as `zoe verify` does: a store with blobs whose blob directory has no layout file does not start, and the message names that directory. A read-only store that a killed writer left open does not start either: the read-only open fails with `NotClosedCleanly` ("the store was not closed cleanly: open it once with a writer, which rebuilds the free-space map of its database"). Open it once for writes first, for example with `zoe serve` without `--read-only`; `zoe verify` opens the store read-only, so it fails the same way. `register(storage_id, false)` on a read-only store fails with `ReadOnlyError` and the connection stays open, so a client with `read_only_fallback` registers again read-only, and a client without it does not connect. On a read-only store, `tpc_begin` fails the vote with `ReadOnlyError`, `new_oids` and `pack` fail at once with `ReadOnlyError`, and the reads work as on another store. A follower being promoted serves read-only until it holds the lease, so reads continue through a failover (ZEO's `read_only_fallback` on the client side works as today). Maintenance mode (`zoe admin drain`) stops accepting new transactions, lets in-flight `tpc_finish` complete, sends every client a clean close and reports when the store is quiet, which is how a pack with a full stop, a format migration or a restore is run.
 
 **Connection handling.** One tokio task per client; frames are length-prefixed msgpack as ZEO 5 defines them (`[message_id, async_flag, method, args]`). Requests on one connection are handled concurrently and replies carry the message id, so `prefetch` and pipelined loads return out of order. Loads run on a blocking pool (`spawn_blocking`) because the core is synchronous; the pool size is configurable and defaults to the core count. Writes from one client are serialised per transaction by the coordinator.
@@ -456,7 +475,7 @@ An option on the command line wins over its twin, and both win over the file. Th
 
 **Traces.** Every request, lock wait, fsync and pack step is an OpenTelemetry span, exported over OTLP when `ZOE_OTLP_ENDPOINT` is set. A client that negotiated the `trace_context` extension sends its W3C traceparent with each request, so a slow Plone request and the server work it caused appear in one trace in Jaeger or Tempo; the `zoe.zeo` client sends it when `opentelemetry` is installed in the Zope process.
 
-**Configuration** is flags or environment variables (`ZOE_PATH`, `ZOE_STORAGE`, `ZOE_CONFIG`, `ZOE_LISTEN`, `ZOE_MAX_FRAME_SIZE`, `ZOE_SHUTDOWN_TIMEOUT`, `ZOE_IDLE_TIMEOUT`, `ZOE_ADMIN_LISTEN`, `ZOE_BACKEND`, `ZOE_BLOB_STORE`, `ZOE_LOCK_TIMEOUT`, `ZOE_EARLY_LOCKS`, `ZOE_TLS_CERT`/`_KEY`), the TOML configuration file of `--config`, plus a ZConfig `<zoe-server>` section for buildout users. TLS uses rustls; ZEO's `ssl` client option works against it.
+**Configuration** is flags or environment variables (`ZOE_PATH`, `ZOE_STORAGE`, `ZOE_CONFIG`, `ZOE_LISTEN`, `ZOE_MAX_FRAME_SIZE`, `ZOE_SHUTDOWN_TIMEOUT`, `ZOE_IDLE_TIMEOUT`, `ZOE_ADMIN_LISTEN`, `ZOE_BACKEND`, `ZOE_BLOB_STORE`, `ZOE_LOCK_TIMEOUT`, `ZOE_EARLY_LOCKS`, `ZOE_TLS_CERT`/`_KEY`), the TOML configuration file of `--config`, plus a ZConfig `<zoe-server>` section for buildout users, which `python -m zoe.serve` runs (see "The `<zoe-server>` section"). TLS uses rustls; ZEO's `ssl` client option works against it.
 
 **Extension negotiation.** A client declares `extensions: ["lock_intent"]` in `register`; the server echoes what it accepted in `get_info`. A stock ZEO client declares nothing and gets vote-time locking. The Plone-side piece is a `ZEO.ClientStorage` subclass (or a monkey patch shipped by `zoe.zeo`) that sends `lock_intent` from `Connection.register` hooks; section 9 has the mechanics.
 

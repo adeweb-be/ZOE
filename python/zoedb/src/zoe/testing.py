@@ -9,7 +9,8 @@ This module needs the test extra of ZODB.
   that class.
 - `StorageTestCase` is the base class of the storage suites of ZODB.
 - `ZoeServer` runs the `zoe` binary as `zoe serve`, for the tests of the
-  server. `ZOE_BINARY` gives the path of the binary.
+  server. `ZoeServer.binary()` gives the path of the binary, from
+  `ZOE_BINARY` or the debug build of the repository.
 - `ZEO_LAYER` is a layer of zope.testrunner. Between its `setUp` and its
   `tearDown`, the test forker of ZEO starts `zoe serve` in place of a ZEO
   server. It needs ZEO.
@@ -156,8 +157,8 @@ class ZoeServer:
         self._process = None
 
     @staticmethod
-    def _binary():
-        """Return the path of the `zoe` binary.
+    def binary():
+        """Return the path of the `zoe` binary that the tests run.
 
         `ZOE_BINARY` gives it. Else the debug build of the repository. The
         console script `zoe` of the wheel has no server.
@@ -181,7 +182,7 @@ class ZoeServer:
         listen = "127.0.0.1:0"
         if self.address is not None:
             listen = f"{self.address[0]}:{self.address[1]}"
-        command = [self._binary(), "serve"]
+        command = [self.binary(), "serve"]
         if self.path is not None:
             command += ["--path", str(self.path)]
         command += ["--listen", listen, *self.args]
