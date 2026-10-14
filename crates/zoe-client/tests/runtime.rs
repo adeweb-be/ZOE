@@ -696,3 +696,103 @@ async fn disconnect_fails_the_later_calls() {
     let _peer = server.await.unwrap();
     client.close().await;
 }
+
+/// Read one message of `peer` with all its elements.
+async fn recv_parts(peer: &mut Peer) -> Vec<Value> {
+    let payload = peer.recv_raw().await;
+    let Value::Array(items) = rmpv::decode::read_value(&mut payload.as_slice()).unwrap() else {
+        panic!("not an array");
+    };
+    items
+}
+
+/// Answer the protocol, `register` and `get_info`, and accept the
+/// extensions `accepted`.
+async fn open_with(peer: &mut Peer, accepted: &[&str]) {
+    peer.send_raw(b"M5").await;
+    assert_eq!(peer.recv_raw().await, b"M5");
+    let (id, _, method, _) = peer.recv().await;
+    assert_eq!(method, "register");
+    peer.reply(id, bin8(1)).await;
+    let (id, _, method, _) = peer.recv().await;
+    assert_eq!(method, "get_info");
+    let names = accepted.iter().map(|name| Value::from(*name)).collect();
+    let info = Value::Map(vec![("extensions".into(), Value::Array(names))]);
+    peer.reply(id, info).await;
+}
+
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// The options of a client that declares `trace_context`.
+fn tracing() -> Options {
+    Options {
+        read_only: false,
+        extensions: vec!["trace_context".to_owned()],
+    }
+}
+
+#[tokio::test]
+async fn a_call_inside_traced_carries_the_traceparent() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        open_with(&mut peer, &["trace_context"]).await;
+        let context = Value::Map(vec![("traceparent".into(), TRACEPARENT.into())]);
+        // A load inside `traced`.
+        let parts = recv_parts(&mut peer).await;
+        assert_eq!(parts[2], Value::from("loadBefore"));
+        assert_eq!(parts.get(4), Some(&context));
+        peer.reply(parts[0].clone(), Value::Nil).await;
+        // A load outside `traced`.
+        let parts = recv_parts(&mut peer).await;
+        assert_eq!(parts[2], Value::from("loadBefore"));
+        assert_eq!(parts.len(), 4);
+        peer.reply(parts[0].clone(), Value::Nil).await;
+        // A load inside `traced` with no traceparent.
+        let parts = recv_parts(&mut peer).await;
+        assert_eq!(parts.len(), 4);
+        peer.reply(parts[0].clone(), Value::Nil).await;
+        // A call without a reply inside `traced`.
+        let parts = recv_parts(&mut peer).await;
+        assert_eq!(parts[2], Value::from("tpc_begin"));
+        assert_eq!(parts.get(4), Some(&context));
+        peer
+    });
+    let client = Client::open(runtime, addr(), "1", &tracing())
+        .await
+        .unwrap();
+    assert_eq!(client.extensions(), ["trace_context".to_owned()]);
+    let traced = Some(TRACEPARENT.to_owned());
+    let load = client.load_before(Oid(1), Tid(9));
+    let loaded = zoe_client::traced(traced.clone(), load).await;
+    assert_eq!(loaded.unwrap(), None);
+    assert_eq!(client.load_before(Oid(1), Tid(9)).await.unwrap(), None);
+    let load = client.load_before(Oid(1), Tid(9));
+    assert_eq!(zoe_client::traced(None, load).await.unwrap(), None);
+    let begin = client.begin(b"u", b"d", b"");
+    let txn = zoe_client::traced(traced, begin).await.unwrap();
+    let _peer = server.await.unwrap();
+    drop(txn);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_call_carries_no_traceparent_when_the_server_did_not_accept_it() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        open_with(&mut peer, &[]).await;
+        let parts = recv_parts(&mut peer).await;
+        assert_eq!(parts[2], Value::from("loadBefore"));
+        assert_eq!(parts.len(), 4);
+        peer.reply(parts[0].clone(), Value::Nil).await;
+        peer
+    });
+    let client = Client::open(runtime, addr(), "1", &tracing())
+        .await
+        .unwrap();
+    assert!(client.extensions().is_empty());
+    let load = client.load_before(Oid(1), Tid(9));
+    let traced = zoe_client::traced(Some(TRACEPARENT.to_owned()), load);
+    assert_eq!(traced.await.unwrap(), None);
+    let _peer = server.await.unwrap();
+    client.close().await;
+}

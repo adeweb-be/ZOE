@@ -13,7 +13,7 @@ pub mod runtime;
 
 pub use client::{
     BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
-    Transaction,
+    Transaction, traced,
 };
 pub use error::Error;
 pub use runtime::{Runtime, Tokio};

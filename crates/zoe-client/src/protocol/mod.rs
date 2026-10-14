@@ -3,7 +3,10 @@
 //!
 //! A frame is a 4-byte big-endian length, then the bytes of the frame. The
 //! first frame of each side is the protocol, `M5`, as raw bytes. Each later
-//! frame is a msgpack array `[id, flags, method, args]`.
+//! frame is a msgpack array `[id, flags, method, args]`. On a connection
+//! that got the extension `trace_context`, a call can have a fifth element:
+//! its trace context, a map whose key `traceparent` holds a W3C
+//! traceparent.
 
 use std::io;
 
@@ -79,9 +82,23 @@ fn frame(payload: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(frame)
 }
 
-/// Return the frame of the message `[id, flags, method, args]`.
-fn message(id: i64, flags: Value, method: &str, args: Value) -> Result<Vec<u8>, Error> {
-    let message = Value::Array(vec![id.into(), flags, method.into(), args]);
+/// The key of the W3C traceparent in the trace context of a call.
+const TRACEPARENT: &str = "traceparent";
+
+/// Return the frame of the message `[id, flags, method, args]`. With a
+/// `traceparent`, the message has a fifth element: the trace context.
+fn message(
+    id: i64,
+    flags: Value,
+    method: &str,
+    args: Value,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    let mut parts = vec![id.into(), flags, method.into(), args];
+    if let Some(traceparent) = traceparent {
+        parts.push(Value::Map(vec![(TRACEPARENT.into(), traceparent.into())]));
+    }
+    let message = Value::Array(parts);
     let mut payload = Vec::new();
     rmpv::encode::write_value(&mut payload, &message)
         .map_err(|e| Error::Invalid(format!("{method}: {e}")))?;
@@ -89,20 +106,29 @@ fn message(id: i64, flags: Value, method: &str, args: Value) -> Result<Vec<u8>, 
 }
 
 /// Return the frame of a call that waits for its reply. A stock client
-/// sends `false` as its flags.
-pub(crate) fn call(id: i64, method: &str, args: Vec<Value>) -> Result<Vec<u8>, Error> {
-    message(id, false.into(), method, Value::Array(args))
+/// sends `false` as its flags. With a `traceparent`, the call carries it.
+pub(crate) fn call(
+    id: i64,
+    method: &str,
+    args: Vec<Value>,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    message(id, false.into(), method, Value::Array(args), traceparent)
 }
 
 /// Return the frame of a call without a reply: the id 0 and the flags
-/// `true`.
-pub(crate) fn notify(method: &str, args: Vec<Value>) -> Result<Vec<u8>, Error> {
-    message(0, true.into(), method, Value::Array(args))
+/// `true`. With a `traceparent`, the call carries it.
+pub(crate) fn notify(
+    method: &str,
+    args: Vec<Value>,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    message(0, true.into(), method, Value::Array(args), traceparent)
 }
 
 /// Return the frame of the heartbeat: `[-1, 0, ".reply", nil]`.
 pub(crate) fn heartbeat() -> Vec<u8> {
-    message(-1, 0.into(), ".reply", Value::Nil).expect("the heartbeat encodes")
+    message(-1, 0.into(), ".reply", Value::Nil, None).expect("the heartbeat encodes")
 }
 
 /// A message from the server.
@@ -246,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_call_has_an_int_id_and_false_flags() {
-        let frame = call(7, "lastTransaction", vec![]).unwrap();
+        let frame = call(7, "lastTransaction", vec![], None).unwrap();
         let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
         assert_eq!(
             value,
@@ -261,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_notification_has_the_id_0_and_true_flags() {
-        let frame = notify("storea", vec![bin8(1)]).unwrap();
+        let frame = notify("storea", vec![bin8(1)], None).unwrap();
         let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
         assert_eq!(
             value,
@@ -272,6 +298,28 @@ mod tests {
                 Value::Array(vec![Value::Binary(vec![0, 0, 0, 0, 0, 0, 0, 1])])
             ])
         );
+    }
+
+    #[test]
+    fn a_traceparent_is_a_fifth_element() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let context = Value::Map(vec![("traceparent".into(), traceparent.into())]);
+        let frame = call(7, "loadBefore", vec![bin8(1)], Some(traceparent)).unwrap();
+        let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                7.into(),
+                false.into(),
+                "loadBefore".into(),
+                Value::Array(vec![bin8(1)]),
+                context.clone(),
+            ])
+        );
+        let frame = notify("storea", vec![], Some(traceparent)).unwrap();
+        let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 5);
+        assert_eq!(value.as_array().unwrap()[4], context);
     }
 
     #[test]

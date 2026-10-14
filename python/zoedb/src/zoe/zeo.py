@@ -29,8 +29,10 @@ OpenTelemetry.
 client of ZEO. It is still an instance of `ZEO.ClientStorage.ClientStorage`,
 and no thread of ZEO starts. It has the thinnest slice of a client yet: one
 TCP address, one connection, one transaction at a time, no cache, no blob
-and no reconnect. It declares `sequences` only, and speaks only the msgpack
-protocol `M5`: a stock ZEO server needs `msgpack true`. `_NOT_BUILT` names
+and no reconnect. It declares `sequences`, and `trace_context` when the
+package `opentelemetry` is installed, and sends the traceparent as the
+client of ZEO does. It speaks only the msgpack protocol `M5`: a stock ZEO
+server needs `msgpack true`. `_NOT_BUILT` names
 the arguments whose feature it does not have yet. `native` is false by
 default.
 """
@@ -344,8 +346,9 @@ _NOT_BUILT = {
     "server_sync": False,
 }
 
-# The extensions that the native client declares.
-_NATIVE_EXTENSIONS = ("sequences",)
+# The extensions that the native client declares: those of the client of
+# ZEO.
+_NATIVE_EXTENSIONS = EXTENSIONS
 
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
@@ -460,6 +463,7 @@ class _NativeClientStorage(ClientStorage):
             read_only=self._is_read_only,
             extensions=list(_NATIVE_EXTENSIONS),
             wait_timeout=float(wait_timeout or 30),
+            traceparent=_traceparent,
         )
         try:
             self._last_tid = self._native.opened_at()
