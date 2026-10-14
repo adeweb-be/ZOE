@@ -22,6 +22,7 @@ import ctypes
 import io
 import itertools
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -335,6 +336,11 @@ def _zeo_options(section):
             address = _address(value)
         elif key == "invalidation-queue-size":
             args += ["--invalidation-queue-size", value]
+        elif key == "invalidation-age":
+            # ZEO takes a float. zoe serve takes whole seconds, so round up.
+            # A negative age replays nothing in ZEO, as 0 does here.
+            seconds = max(0, math.ceil(float(value)))
+            args += ["--invalidation-age", str(seconds)]
         elif key == "client-conflict-resolution":
             # zoe serve has no such option. It resolves the simple
             # conflicts itself and sends the others to the client in the

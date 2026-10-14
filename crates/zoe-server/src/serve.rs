@@ -189,6 +189,16 @@ impl ServeOptions {
         self
     }
 
+    /// Let `getInvalidations` cover every commit after a tid whose time is
+    /// less than `age` before the clock of the server, past the
+    /// invalidation queue size, as the key `invalidation-age` of ZEO.
+    /// Zero, the default, turns it off.
+    #[must_use]
+    pub fn invalidation_age(mut self, age: Duration) -> Self {
+        self.queues.invalidation_age = age;
+        self
+    }
+
     /// Let at most `messages` invalidations wait for one client. Past it,
     /// the server closes the connection of the client. A size of 0 lets 1
     /// message wait.

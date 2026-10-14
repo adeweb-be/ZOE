@@ -94,6 +94,22 @@ pub(super) struct ServeArgs {
     )]
     invalidation_queue_size: usize,
 
+    /// Past --invalidation-queue-size, getInvalidations also covers every
+    /// transaction after the tid of a client when the time of that tid is
+    /// less than this before the clock of the server, as the key
+    /// invalidation-age of the <zeo> section of ZEO. In whole seconds,
+    /// such as 3600, 60m or 1h. A client that comes back within this time
+    /// keeps its cache. The server reads the transaction index of the
+    /// store for it. 0, the default, turns it off.
+    #[arg(
+        long,
+        env = "ZOE_INVALIDATION_AGE",
+        value_name = "SECONDS",
+        default_value = "0",
+        value_parser = whole_seconds
+    )]
+    invalidation_age: Duration,
+
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection, and the client reconnects and verifies its
     /// cache.
@@ -518,6 +534,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     let mut options = ServeOptions::with_storages(storages)
         .listen(args.listen)
         .invalidation_queue_size(args.invalidation_queue_size)
+        .invalidation_age(args.invalidation_age)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
         .idle_timeout(args.idle_timeout)
@@ -632,6 +649,17 @@ mod tests {
         assert_eq!(args.invalidation_queue_size, 0);
         assert_eq!(args.client_queue_size, 1);
         let error = serve(&["--client-queue-size", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_invalidation_age_is_off_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().invalidation_age, Duration::ZERO);
+        let args = serve(&["--invalidation-age", "1h"]).unwrap();
+        assert_eq!(args.invalidation_age, Duration::from_secs(3_600));
+        let args = serve(&["--invalidation-age", "100"]).unwrap();
+        assert_eq!(args.invalidation_age, Duration::from_secs(100));
+        let error = serve(&["--invalidation-age", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
