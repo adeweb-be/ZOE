@@ -27,7 +27,7 @@ use zoe_core::{Oid, Store, Tid};
 
 /// A `PersistentMapping` record with no reference.
 const PICKLE: &[u8] =
-    b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
+    b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datah\x01s.";
 
 const ROOT: Oid = Oid(0);
 
