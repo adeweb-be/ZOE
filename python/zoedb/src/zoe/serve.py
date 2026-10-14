@@ -41,6 +41,7 @@ KEYS = (
     "admin-listen",
     "invalidation-queue-size",
     "client-queue-size",
+    "cache-size",
     "lock-timeout",
     "max-frame-size",
     "shutdown-timeout",
