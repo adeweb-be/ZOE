@@ -37,6 +37,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`, once 
 - A staged blob stays with its oid when the pickle of the oid spills.
 - Every spill file operation goes through the `Vfs`, so the crash simulation covers it.
 - The lock table has an entry only for an oid that a transaction holds or waits for.
+- `Store::lock_table_is_empty` is a documented public method. It gives true when no transaction holds or waits for a lock, and it changes nothing. The lock table of a store that the process just opened is empty, so the readiness of `zoe serve` reads the method once after the open of each store. It tells nothing about other processes, because the lock table lives in the memory of one process.
 - No conflict tier runs Python on the server.
 - One backend write transaction holds the records, their keys in the transaction index, the blob records, the transaction row and the meta update of a commit. It is durable before the client gets the acknowledgement, except for a deferred restore (below). In a commit batch, one backend write transaction holds all of this for every member of the batch.
 - `finish` joins a commit batch (`commit::group`). A finish that finds no leader becomes the leader: it takes every finish that waits, writes them all under the commit sequencer in one backend write transaction, and commits it with one sync. Finishes that arrive while the leader writes wait and form the next batch. A member returns only after its batch is durable or failed.

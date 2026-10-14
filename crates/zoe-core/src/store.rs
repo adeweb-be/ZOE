@@ -532,9 +532,15 @@ impl Store {
         self.backend.remove_record_for_test(oid, tid)
     }
 
-    /// Tell if no transaction holds or waits for a lock. A test of a skin
-    /// uses it to show that every lock is released.
-    #[doc(hidden)]
+    /// Tell if no transaction holds or waits for a lock. The method changes
+    /// nothing.
+    ///
+    /// The lock table of a store that the process just opened is empty, so
+    /// it holds no stale entry. For this reason, the readiness of
+    /// `zoe serve` reads the method once after the open of each store. A
+    /// running transaction holds locks, and these locks are not stale. The
+    /// lock table lives in the memory of one process, so the method tells
+    /// nothing about other processes.
     pub fn lock_table_is_empty(&self) -> bool {
         self.locks.is_empty()
     }
