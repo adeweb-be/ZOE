@@ -1,6 +1,6 @@
 # 0026. The transaction index: a `(tid, oid)` key space
 
-Status: proposed. The choice of a key space over an oid list in the `txns` row was made while the human was away. The human confirms it at merge, with the signature change of `Backend::txn_records` below.
+Status: accepted. The human confirmed the choice of a key space over an oid list in the `txns` row, with the signature change of `Backend::txn_records` below.
 
 ## Context
 
@@ -25,7 +25,7 @@ The value is empty. The value type of the table is the unit type `()` of redb, w
 
 **Writes.** `WriteTxn::put_record` stages the record and its index key in the same backend write transaction. A normal commit and a restore both write their records through it in `finish`. So both index each record, and a crash leaves a record and its key together, or neither. The signature of `put_record` does not change: its contract now includes the key. A blob record (ADR 0023) has no index key of its own. The core stages each blob record with the record of the same `(oid, tid)`, and that record has the key.
 
-**Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. The iterator reads the rows and the index keys of its range first. Then `Backend::txn_records(tid)` reads the row of each transaction, the index keys of its tid and their records, in one snapshot. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
+**Reads.** `Backend::txn_oids(from, to)` scans the index keys from `(from, 0)` to `(to, u64::MAX)`, both included, and reads nothing else. `Backend::indexed_tids(from, to, limit)` scans the same keys and gives each tid once, at most `limit` of them. The iterator reads the rows of its range a slice at a time (`Backend::iter_txns`). Then it reads the tids of the index that these rows cover, a slice at a time (`Backend::indexed_tids`). A slice holds at most 1,024 tids, and each slice is one snapshot. The iterator never reads the index of a tid before the rows of that tid. Then `Backend::txn_records(tid)` reads the row of each transaction, the index keys of its tid and their records, in one snapshot. No read path scans `records` to find the oids of a transaction. `load`, `loadBefore` and `history` do not read the index.
 
 **A trait signature changes.** `Backend::txn_records(tid, oids)` becomes `Backend::txn_records(tid)`. It reads the oids of the transaction from the index, in the snapshot of the row and the records, and no longer takes the oids of an earlier read. Pack added the method, and nothing outside `zoe-core` implements `Backend`. The rule of the crate makes every change of an existing signature a decision of the human, so the human confirms this one at merge.
 
@@ -35,6 +35,7 @@ The value is empty. The value type of the table is the unit type `()` of redb, w
 - Each index key must have its record. An index key without its record is `CorruptTxn` for its transaction, never `NotFound`. The row, the keys and the records of a transaction come from one snapshot. So a key that a removal left behind is `CorruptTxn` also when the oid count of its row went down with the record.
 - Index keys of a tid that has no row give `CorruptTxn` for that tid, when the range of the iterator has a row.
 - Each scan of the index checks that each key is inside its range and after the key before it. A damaged branch page of redb can move the seek of a scan, and the scan then gives a key of another transaction, or a key twice. Such a key is `CorruptTxn` with its tid.
+- A failed scan of the index gives its error once. The iterator then gives the transactions of the rest of its range without the check for index keys of a tid that has no row. `txn_records` still checks the index keys of each transaction.
 
 A record that no row counts and that no index key names is outside what the iterator reads. Only a scan of `records` finds it. A scrub that reads every record can check the index key of each record at the same time.
 
@@ -62,8 +63,8 @@ The other choice was to write the oids of a transaction into the payload of its 
 - A read of one transaction, or of a tid range, reads the index keys, the rows and the records of the range. It reads nothing that grows with the rest of the store, except a deeper tree. In the acceptance test, a read of one commit of 8 records reads 124 KiB in a store, and 160 KiB in a store with 8 times more records.
 - Each record costs 16 bytes more in a leaf page, and its part of the branch pages. In a measured store of 500,000 records of about 270 bytes of pickle each, the index takes 2,003 pages of 4 KiB: 13% more pages than the store without it.
 - A commit writes one more key for each record, in the same write transaction.
-- The iterator holds the tids of its range in memory, and the records of one transaction at a time. The memory grows with the range, not with the store.
+- The iterator holds one transaction with its records, one slice of the tids of the rows and one slice of the tids of the index. Its memory does not grow with the range or with the store. A slice of rows ends only after a row that reads, so a run of rows that do not read stays in one slice. Only then does the memory grow, with the length of that run.
 - The iterator does not see a record that no row counts and that no index key names.
 - A pack removes one index key with each record.
-- Every backend writes the key in `put_record`, removes it in `remove_record`, and reads the index in `txn_oids` and `txn_records`.
+- Every backend writes the key in `put_record`, removes it in `remove_record`, and reads the index in `txn_oids`, `indexed_tids` and `txn_records`. The trait default of `indexed_tids` goes through `txn_oids`, which holds every oid of the range. So a backend overrides `indexed_tids` to bound the memory of the iterator. The redb backend does.
 - A store written without the index does not open. No such store exists outside the tests.

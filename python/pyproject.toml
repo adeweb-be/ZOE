@@ -17,6 +17,8 @@ dev = [
     "ZODB[test]",
     # The tests of the zoe:// URI. zoedb takes it through its uri extra.
     "zodburi>=3",
+    # The ZEO client speaks the msgpack protocol M5 of zoe serve.
+    "msgpack",
 ]
 
 [tool.uv]
@@ -36,7 +38,7 @@ zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1
 # Its C extensions declare that they can run without the GIL, so that a
 # ZODB application that uses BTrees keeps the GIL off on 3.14t. The pickled
 # states and the conflict-resolution results do not change.
-BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "5f863e0ea6757b4720e568a4c929321e1b6e8ebc" }
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "f7dfacc28befc038263390fa448df0b8e772f2f0" }
 
 [tool.uv.workspace]
 members = ["zoedb"]
