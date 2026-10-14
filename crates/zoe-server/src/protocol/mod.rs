@@ -37,12 +37,14 @@ mod status;
 pub mod fuzz;
 
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
@@ -51,7 +53,7 @@ use crate::runtime::{Runtime, Tokio};
 
 use invalidation::Invalidations;
 use metrics::{Exported, Metrics};
-use outbox::Outbox;
+use outbox::{Closing, Outbox};
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
 use status::Stats;
@@ -78,6 +80,18 @@ const RUOK: &[u8] = b"ruok";
 /// own connection: its replies fill the session queue, then the reader
 /// waits for room. A stock client reads its replies while it sends.
 const QUEUE: usize = 4;
+
+/// The longest time that a connection reads and drops bytes at a stop,
+/// after its writer sent its last frame and shut down its side. A stock
+/// client closes its side when it reads the end of the connection, and
+/// that ends the wait sooner. The wait keeps the socket open while the
+/// client can still send. So a byte that the client sends in that time
+/// causes no reset, and the kernel sends every frame that waits.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// The size of the buffer into which a connection reads the bytes that it
+/// drops at a stop.
+const DROPPED: usize = 8 * 1024;
 
 /// The name of the storage that `--path` gives. It is the default of ZEO.
 pub(crate) const STORAGE_NAME: &str = "1";
@@ -308,12 +322,13 @@ async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
 /// hub is: the writer stops at once, and each call ends at the first reply
 /// that it cannot queue. `None` closes no idle connection.
 ///
-/// At a stop, the reader reads no more frames. The calls that the reader
+/// At a stop, the reader reads no more calls. The calls that the reader
 /// already started run, so a `tpc_finish` that the server received commits
 /// and gets its reply. A pack that runs stops between two of its batches.
 /// Then the transaction ends, and that aborts it if it is still open. The
-/// writer sends the frames that wait, and closes the
-/// connection.
+/// writer sends the frames that wait, and shuts down its side of the
+/// connection. The bytes that the client sends after the stop are read and
+/// dropped until the close (see `linger`), so the close is not a reset.
 pub(crate) async fn serve_connection(
     stream: TcpStream,
     storages: Arc<Storages>,
@@ -445,6 +460,7 @@ pub(crate) async fn serve_stream(
         }));
     }
 
+    let mut stopped = false;
     loop {
         // An end of the connection or a stop wins over a frame that waits.
         // A frame that arrived wins over the idle timeout. The idle time
@@ -456,7 +472,10 @@ pub(crate) async fn serve_stream(
             biased;
             () = ended.wait() => break,
             () = closing.wait() => break,
-            () = stopping.wait() => break,
+            () = stopping.wait() => {
+                stopped = true;
+                break;
+            }
             read = frame::read(&mut reader, max_frame_size) => read,
             () = async {
                 quiet.await;
@@ -508,8 +527,68 @@ pub(crate) async fn serve_stream(
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.
     drop(outbox);
-    calls.finish().await;
-    let _ = writer_ended.await;
+    let finished = async move {
+        calls.finish().await;
+        let _ = writer_ended.await;
+    };
+    if stopped {
+        linger(&mut reader, finished, &*runtime, &mut closing).await;
+    } else {
+        finished.await;
+    }
+}
+
+/// Wait for `finished` at a stop of the server. Then keep the connection
+/// open for `LINGER` at most, so that a late byte of the client causes no
+/// reset.
+///
+/// The reader reads no more calls. It reads the bytes that arrive and
+/// drops them. It never decodes them, so they take no ticket and get no
+/// reply. Each read fills at most a buffer of `DROPPED` bytes. Linux
+/// resets a connection that closes with bytes that it did not read, or
+/// that gets bytes after its close. A reset deletes the frames that the
+/// kernel did not send yet, the reply of a `tpc_finish` among them.
+///
+/// `finished` ends when each call ended and the writer sent its last frame
+/// and shut down its side. Then the reader drops bytes for `LINGER` at
+/// most. The wait ends sooner when the client closes its side or the
+/// connection fails, because no byte of the client can arrive after that.
+/// When the hub closed the connection, the writer stopped at once, and no
+/// wait follows. The forced close of the stop bounds the whole wait.
+async fn linger(
+    reader: &mut (impl AsyncRead + Unpin),
+    finished: impl Future<Output = ()>,
+    runtime: &dyn Runtime,
+    closing: &mut Closing,
+) {
+    let mut dropped = vec![0u8; DROPPED];
+    let mut finished = pin!(finished);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut finished => break,
+            read = reader.read(&mut dropped) => match read {
+                Ok(n) if n > 0 => {}
+                // The client closed its side, or the connection failed.
+                _ => {
+                    finished.await;
+                    return;
+                }
+            },
+        }
+    }
+    let mut deadline = runtime.sleep(LINGER);
+    loop {
+        tokio::select! {
+            biased;
+            () = closing.wait() => return,
+            () = &mut deadline => return,
+            read = reader.read(&mut dropped) => match read {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +938,63 @@ mod tests {
             (b"pickle".to_vec(), tid)
         );
         assert!(store.load(zoe_core::Oid(2)).is_err());
+    }
+
+    #[test]
+    fn a_stop_drops_the_bytes_that_arrive_and_closes_without_a_reset() {
+        let storage = storage("linger");
+        let storages = Arc::new(Storages::new(
+            vec![Arc::clone(&storage)],
+            Queues::DEFAULT.client,
+        ));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopping) = Stopping::new();
+        let served = runtime.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
+            serve_connection(stream, storages, max, None, stopping).await;
+        });
+        let mut client = registered(addr);
+
+        // The stop comes before the bytes. So the reader sees the stop
+        // first, and it reads no call from these bytes.
+        stop.send_replace(true);
+        for _ in 0..16 {
+            send(&mut client, 2, "ping", vec![]);
+        }
+        client.write_all(&[7; 100_000]).unwrap();
+
+        // The client gets the end of the connection, not a reset, and no
+        // reply.
+        let mut rest = Vec::new();
+        let read = client.read_to_end(&mut rest);
+        assert!(read.is_ok(), "{read:?}");
+        assert!(rest.is_empty(), "{} bytes after the stop", rest.len());
+
+        // The client sends again while the server waits after its FIN. The
+        // connection ends within the wait, while the client keeps its side
+        // open.
+        let fin = Instant::now();
+        let lingering = !served.is_finished();
+        client.write_all(&[7; 100_000]).unwrap();
+        wait_until("the connection did not end", || served.is_finished());
+        let waited = fin.elapsed();
+        assert!(waited < Duration::from_secs(5), "the wait took {waited:?}");
+        // The server read the late bytes before its close. So the close
+        // is not a reset.
+        if lingering {
+            let read = client.read(&mut [0; 16]);
+            assert!(matches!(read, Ok(0)), "{read:?}");
+        }
+        drop(client);
+        drop(runtime);
     }
 
     #[test]
