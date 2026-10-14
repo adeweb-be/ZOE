@@ -26,7 +26,7 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 
 **Stage 2 keeps the lock of ZEO.** A private cache file takes an exclusive `flock`, so a second process on the same file fails at the open, as with `zc.lockfile`. The file has its own name, `{client}-{storage}.zoec`, so a native client never takes or overwrites the `.zec` file of a stock client.
 
-**Stage 3 shares the file.** Each process holds a shared `flock`; a private open and a shared open of the same file exclude each other. Writers exclude each other with an open-file-description lock on byte 0 of the file, which the kernel releases when the process dies, and a mutex inside the process. Each process keeps its own last tid, which is its `lastTransaction`; `applied` belongs to the node. A process applies a transaction to the file only when `applied` is below its tid, under the writer lock, and moves `applied` after the ends: so each invalidation is applied once per node, and each process still gives it to its own DB. A process stores a current entry from a load only when `applied` is not above the tid up to which it read its stream. A process that lags gets more misses, never a stale entry. `clear` drops every entry of the node and keeps `applied`.
+**Stage 3 shares the file.** Each process holds a shared `flock`; a private open and a shared open of the same file exclude each other. Writers exclude each other with an open-file-description lock on byte 0 of the file, which the kernel releases when the process dies, and a mutex inside the process. Each process keeps its own last tid, which is its `lastTransaction`; `applied` belongs to the node. A process applies a transaction to the file only when `applied` is below its tid, under the writer lock, and moves `applied` after the ends: so each invalidation is applied once per node, and each process still gives it to its own DB. A process stores a current entry from a load only when `applied` is not above the tid up to which it had read its stream when the reply arrived; a store that runs later keeps that tid, not the tid of its own time. A verification that finds the cache too old clears it and moves `applied` in one hold of the writer lock, never in two. A process that lags gets more misses, never a stale entry. `clear` drops every entry of the node and keeps `applied`.
 
 **The file is never the only copy of anything.** It holds only what the server gave or what a commit sent to the server, and the server confirmed it first.
 
@@ -36,8 +36,14 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 - A hit costs a few hundred nanoseconds in the cache. Through ZODB, the rest of ZODB costs more than the cache: the finding gives the numbers.
 - A crash of the machine drops a cache that was open. A clean close keeps it across a restart.
 - The `end` of an entry and its head checksum change together. A reader that sees one change without the other misses once.
-- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, and the check against another history uses `lastTransaction`.
+- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, so ZEO's `AssertionError` for a cache newer than the server stays for a private file only. How a shared file detects another history is open (below).
 - The layout is an on-disk format of the client. It is not the format of the store, so it is not a red zone, but a change of it changes the magic.
+
+## Open questions
+
+- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. Candidates: a storage identity in the header (ZOE-162 asks for the format version and the storage there; this header has neither yet), an extension that names the store at `register` (a wire-protocol change), or both.
+- **Reconnects** with a shared file: a process compares the tid of its new `register` with its own last tid, and its DB needs `getInvalidations` from its own last tid, not from `applied`. The verification after a reconnect is ZOE-159.
+- **Compression** against F28 ("compressed") and ZOE-162 ("compressed entries"): this draft proposes raw entries by default.
 
 ## Alternatives
 
