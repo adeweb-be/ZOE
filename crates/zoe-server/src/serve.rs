@@ -12,7 +12,8 @@
 //! A stop takes at most the shutdown timeout. The server stops accepting
 //! connections, and each connection reads no more calls. The calls that
 //! the server already received run, so a `tpc_finish` that the
-//! server received commits and gets its reply. Then the open transaction of
+//! server received commits and gets its reply. A running pack stops between
+//! two of its batches. Then the open transaction of
 //! each connection aborts, and each connection sends the frames that wait
 //! and closes. Then the stores close.
 

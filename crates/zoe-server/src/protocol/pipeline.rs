@@ -40,7 +40,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use super::message::Call;
 use super::outbox::{Outbox, Room};
 use super::session::{self, Reply, Session, Transaction};
-use super::{QUEUE, Storages};
+use super::{QUEUE, Stopping, Storages};
 use crate::runtime::{Runtime, block_on};
 
 /// The read pool: the threads that run the calls that read. At most its
@@ -323,6 +323,8 @@ pub(crate) struct Calls {
     runtime: Arc<dyn Runtime>,
     /// The client, as the log lines name it until it gives a label.
     peer: Arc<str>,
+    /// The stop of the server, for the pack of the session.
+    stopping: Stopping,
     lane: Arc<Lane>,
     /// The slots of the calls that run or wait.
     slots: Arc<Semaphore>,
@@ -335,11 +337,14 @@ impl Calls {
     /// The calls of a connection to one of `storages`, whose frames go to
     /// `outbox`. The calls run on `runtime`, and the calls that read on the
     /// read pool of `storages`. `peer` names the client in the log lines.
+    /// When `stopping` tells that the server stops, a pack of the session
+    /// stops between two batches.
     pub(crate) fn new(
         storages: Arc<Storages>,
         outbox: Outbox,
         runtime: Arc<dyn Runtime>,
         peer: String,
+        stopping: Stopping,
     ) -> Self {
         Self {
             pool: storages.pool.clone(),
@@ -348,6 +353,7 @@ impl Calls {
             outbox,
             runtime,
             peer: peer.into(),
+            stopping,
             lane: Arc::new(Lane::new()),
             slots: Arc::new(Semaphore::new(QUEUE)),
             running: Running::new(),
@@ -438,6 +444,7 @@ impl Calls {
         let outbox = self.outbox.clone();
         let ended = self.ended.clone();
         let peer = Arc::clone(&self.peer);
+        let stopping = self.stopping.clone();
         let registered = self
             .pool
             .run(&*self.runtime, move || {
@@ -445,7 +452,7 @@ impl Calls {
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
-                        let session = Session::new(storage, outbox.clone());
+                        let session = Session::new(storage, outbox.clone(), stopping);
                         let _entered = tracing::info_span!("connection", client = &*peer).entered();
                         let outcome = session.call(&call, &mut reply);
                         (outcome, Some(session).filter(Session::is_registered))
@@ -499,8 +506,8 @@ mod tests {
 
     use super::*;
     use crate::protocol::session::p64;
-    use crate::runtime::Tokio;
     use crate::protocol::{NamedStorage, Queues};
+    use crate::runtime::Tokio;
 
     /// Return the storages of a new store for the test `name`.
     fn storages(name: &str) -> (Arc<Storages>, Arc<Store>) {
@@ -586,7 +593,13 @@ mod tests {
         let (storages, store) = storages("lane-ends");
         let (outbox, _inbox, _closing) = Outbox::new(100, 100);
         runtime().block_on(async {
-            let mut connection = Calls::new(storages, outbox.clone(), Arc::new(Tokio), "test".into());
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
             let register = vec![Value::from("1"), Value::Boolean(false)];
             start(&mut connection, vec![call(1, "register", register)]).await;
             for (txn, oid) in [(7, 1), (8, 2)] {
@@ -619,7 +632,13 @@ mod tests {
         let (storages, store) = storages("lane-stops");
         let (outbox, _inbox, _closing) = Outbox::new(100, 100);
         runtime().block_on(async {
-            let mut connection = Calls::new(storages, outbox.clone(), Arc::new(Tokio), "test".into());
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
             let ended = connection.ended();
             let register = vec![Value::from("1"), Value::Boolean(false)];
             // The store names another transaction, so it closes the

@@ -31,7 +31,7 @@ use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::outbox::{Outbox, Place, Room};
 use super::status::Stats;
-use super::{NamedStorage, Storages};
+use super::{NamedStorage, Stopping, Storages};
 
 /// The longest client label that a log line takes, in characters.
 const MAX_LABEL: usize = 200;
@@ -152,7 +152,8 @@ impl Fault {
 
     /// Return the exception of ZODB for an error of a pack, as
     /// `zoe.Storage.pack` raises it. A record that fails its checksum or
-    /// does not decode stops the pack with `StorageSystemError`.
+    /// does not decode stops the pack with `StorageSystemError`. A pack
+    /// that the stop of the server stopped fails with `StorageError`.
     fn of_pack(error: &ZoeError) -> Self {
         match error {
             ZoeError::CorruptRecord { .. } => Self::new(
@@ -163,6 +164,7 @@ impl Fault {
                 "ZODB.POSException.StorageSystemError",
                 format!("pack stopped: {text}"),
             ),
+            ZoeError::Closed => Self::storage("pack stopped: the server stops"),
             _ => Self::of(error),
         }
     }
@@ -428,6 +430,9 @@ pub(crate) struct Session {
     /// The label that the client gave with `set_client_label`, for the log
     /// lines of the calls that start after it.
     label: Mutex<Option<String>>,
+    /// The stop of the server. A pack stops between two batches when the
+    /// server stops.
+    stopping: Stopping,
 }
 
 /// The open transaction of one connection. One thread holds it and runs
@@ -467,8 +472,8 @@ fn storage_name(value: &Value) -> String {
 
 impl Session {
     /// Return the session of a connection to `storage`, whose frames go to
-    /// `outbox`.
-    pub(crate) fn new(storage: Arc<NamedStorage>, outbox: Outbox) -> Self {
+    /// `outbox`. `stopping` is the stop of the server.
+    pub(crate) fn new(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
         Self {
             store: Arc::clone(&storage.store),
             storage,
@@ -476,6 +481,7 @@ impl Session {
             registration: OnceLock::new(),
             iterators: Mutex::new(Iterators::default()),
             label: Mutex::new(None),
+            stopping,
         }
     }
 
@@ -1041,6 +1047,10 @@ impl Session {
     /// A read-only connection packs, as in ZEO: `zeopack` connects
     /// read-only. A store that the server opened read-only refuses the pack
     /// with `ReadOnlyError`.
+    ///
+    /// When the server stops, the pack stops between two batches and fails
+    /// with `StorageError`. It does not stop during the mark. The store
+    /// keeps what the pack did not remove, and the next pack removes it.
     fn pack(&self, args: &[Value]) -> Result<Value, Fault> {
         let time = match args {
             [time] | [time, _] => time,
@@ -1059,8 +1069,9 @@ impl Session {
         // published tid can remove a record that such a read needs.
         let invalidations = &self.storage.invalidations;
         let tid = tid.min(invalidations.published());
+        let stopping = &self.stopping;
         self.store
-            .pack(tid)
+            .pack_until(tid, || stopping.is_set())
             .map_err(|error| Fault::of_pack(&error))?;
         // `info` gives the sizes of the store. Sizes that do not read leave it
         // out, as for a commit.
@@ -1610,7 +1621,12 @@ mod tests {
 
     impl Client {
         fn new(storage: Arc<NamedStorage>, outbox: Outbox) -> Self {
-            let session = Arc::new(Session::new(storage, outbox));
+            Self::stopping(storage, outbox, never_stops())
+        }
+
+        /// A connection whose pack stops when `stopping` tells it.
+        fn stopping(storage: Arc<NamedStorage>, outbox: Outbox, stopping: Stopping) -> Self {
+            let session = Arc::new(Session::new(storage, outbox, stopping));
             Self {
                 txn: Transaction::new(Arc::clone(&session)),
                 session,
@@ -1655,7 +1671,13 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let mut connection = Calls::new(storages, outbox.clone(), Arc::new(Tokio), "test".into());
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                never_stops(),
+            );
             let ended = connection.ended();
             loop {
                 let call = tokio::select! {
@@ -1672,6 +1694,11 @@ mod tests {
             drop(outbox);
             connection.finish().await;
         });
+    }
+
+    /// Return a signal that never tells a stop: its sender is gone.
+    fn never_stops() -> Stopping {
+        Stopping::new().1
     }
 
     /// Return an outbox whose frames go nowhere.
@@ -4329,5 +4356,42 @@ mod tests {
         for (method, args) in [("new_oids", vec![]), ("pack", vec![Value::F64(1e9)])] {
             assert_eq!(failed(call(&mut s, method, args)), Fault::read_only());
         }
+    }
+
+    #[test]
+    fn the_stop_of_the_server_stops_a_pack_between_two_batches() {
+        let storage = storage("pack-stop", Queues::DEFAULT);
+        let (stop, stopping) = Stopping::new();
+        let (outbox, _frames, _closing) = Outbox::new(10, 10);
+        let mut s = Client::stopping(Arc::clone(&storage), outbox, stopping);
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        done(call(&mut s, "register", register));
+        // The root refers to nothing. The 1,500 other objects make two
+        // batches of the pack.
+        let oids: Vec<(u64, u64)> = (0..=1_500).map(|oid| (oid, 0)).collect();
+        let tid = commit_with(&mut s, 1, Value::Map(vec![]), &oids, MAPPING);
+
+        // The stop comes before the pack. The pack still runs its first
+        // batch, which removes the oldest 1,000 keys, then stops.
+        stop.send_replace(true);
+        let pack = vec![Value::F64(4_102_444_799.0), Value::from(1)];
+        let fault = failed(call(&mut s, "pack", pack.clone()));
+        assert_eq!(fault, Fault::storage("pack stopped: the server stops"));
+        let load = |s: &mut Client, oid: u64| call(s, "loadSerial", vec![p64(oid), p64(tid)]);
+        assert_eq!(
+            failed(load(&mut s, 1_000)),
+            Fault::from(ZoeError::NotFound { oid: Oid(1_000) })
+        );
+        assert_eq!(done(load(&mut s, 1_001)), Value::Binary(MAPPING.to_vec()));
+        drop(s);
+
+        // A session that no stop reaches removes what the pack left.
+        let (mut s, _frames) = connected(&storage);
+        assert_eq!(done(call(&mut s, "pack", pack)), Value::Nil);
+        assert_eq!(
+            failed(load(&mut s, 1_500)),
+            Fault::from(ZoeError::NotFound { oid: Oid(1_500) })
+        );
+        assert_eq!(done(load(&mut s, 0)), Value::Binary(MAPPING.to_vec()));
     }
 }

@@ -254,6 +254,12 @@ impl Stopping {
         (sender, Self(signal))
     }
 
+    /// Tell if the server stops. It does not wait, so a thread of the
+    /// blocking pool can call it, as a pack does between two batches.
+    pub(crate) fn is_set(&self) -> bool {
+        *self.0.borrow()
+    }
+
     /// Wait until the server stops. When the sender drops and sent no
     /// stop, wait forever.
     pub(crate) async fn wait(&mut self) {
@@ -288,8 +294,9 @@ async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
 ///
 /// At a stop, the reader reads no more frames. The calls that the reader
 /// already started run, so a `tpc_finish` that the server received commits
-/// and gets its reply. Then the transaction ends, and that aborts it if it
-/// is still open. The writer sends the frames that wait, and closes the
+/// and gets its reply. A pack that runs stops between two of its batches.
+/// Then the transaction ends, and that aborts it if it is still open. The
+/// writer sends the frames that wait, and closes the
 /// connection.
 pub(crate) async fn serve_connection(
     stream: TcpStream,
@@ -384,6 +391,7 @@ pub(crate) async fn serve_stream(
         outbox.clone(),
         Arc::clone(&runtime),
         peer.clone(),
+        stopping.clone(),
     );
     let ended = calls.ended();
     // The receiver gets an error when the task of the writer ends, also
