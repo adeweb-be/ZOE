@@ -193,7 +193,7 @@ pub trait Backend: Send + Sync {
     /// the number of distinct oids that have at least one record, a
     /// deletion included. The value is the count of the last write that
     /// changed records. A store without a count gives `None`. This default
-    /// gives `None`, so a backend that keeps no count needs no change.
+    /// gives `None`. A backend that keeps no count uses this default.
     fn object_count(&self) -> Option<u64> {
         None
     }
