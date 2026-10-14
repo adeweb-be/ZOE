@@ -158,6 +158,39 @@ def test_the_native_client_ignores_what_zeo_ignores(tmp_path):
             storage.close()
 
 
+def test_the_ssl_section_gives_zeos_client_a_context_without_native(tmp_path):
+    from unittest import mock
+
+    import ZEO.ClientStorage
+
+    import zoe.zeo
+
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    certificate, key = str(tmp_path / "c.pem"), str(tmp_path / "k.pem")
+    text = (
+        "%import zoe\n<zoeclient>\nserver 127.0.0.1:1\nnative false\n"
+        f"<ssl>\ncertificate {certificate}\nkey {key}\n"
+        f"authenticate {tmp_path / 'ca.pem'}\nserver-hostname db\n"
+        "</ssl>\n</zoeclient>\n"
+    )
+    config, _ = ZConfig.loadConfigFile(schema, io.StringIO(text))
+    # As the tests of ZEO.tests.testssl, the test mocks the context and the
+    # client of ZEO.
+    with (
+        mock.patch("ssl.create_default_context") as factory,
+        mock.patch.object(ZEO.ClientStorage.ClientStorage, "__init__") as init,
+    ):
+        init.return_value = None
+        storage = config.storage.open()
+    assert not isinstance(storage, zoe.zeo._NativeClientStorage)
+    given = init.call_args.kwargs
+    context = factory.return_value
+    assert given["ssl"] is context
+    assert given["ssl_server_hostname"] == "db"
+    context.load_cert_chain.assert_called_with(certificate, key, None)
+    assert context.check_hostname is True
+
+
 def test_an_ssl_context_fails_the_native_open_and_names_it():
     import ssl
 

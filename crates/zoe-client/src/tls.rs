@@ -4,21 +4,27 @@
 //! The client speaks TLS with rustls and its ring provider, as `zoe serve`
 //! does. It checks the certificate chain of the server against the CA
 //! certificates of `authenticate`. With `check_hostname`, it also checks
-//! that the certificate is valid for the name of the server. It sends its
-//! own certificate to the server.
+//! that the certificate is valid for the name of the server: the webpki
+//! verifier of rustls does both. Without it, the chain check of rustls
+//! runs alone, and no name check runs. It sends its own certificate to the
+//! server.
+//!
+//! The certificate of the server must chain to a CA certificate of
+//! `authenticate`. A self-signed server certificate in `authenticate` does
+//! not match it by its bytes, as OpenSSL does.
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{WebPkiServerVerifier, verify_server_cert_signed_by_trust_anchor};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{
-    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
-};
+use rustls::server::ParsedCertificate;
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_rustls::TlsConnector;
 
 use crate::runtime::Stream;
@@ -95,19 +101,21 @@ impl Tls {
                 .add(cert)
                 .map_err(|error| format!("{}: {error}", authenticate.display()))?;
         }
-        let webpki =
-            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
-                .build()
-                .map_err(|error| format!("{}: {error}", authenticate.display()))?;
-        let builder = rustls::ClientConfig::builder_with_provider(provider)
+        let roots = Arc::new(roots);
+        let algorithms = provider.signature_verification_algorithms;
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|error| format!("the ring provider: {error}"))?;
         let builder = if options.check_hostname {
+            let webpki = WebPkiServerVerifier::builder_with_provider(roots, provider)
+                .build()
+                .map_err(|error| format!("{}: {error}", authenticate.display()))?;
             builder.with_webpki_verifier(webpki)
         } else {
+            let verifier = ChainOnly { roots, algorithms };
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AnyName(webpki)))
+                .with_custom_certificate_verifier(Arc::new(verifier))
         };
         let config = builder
             .with_client_auth_cert(certs, key)
@@ -143,33 +151,42 @@ fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     Ok(certs)
 }
 
-/// A verifier that checks the chain of the server certificate, and not the
-/// name of the server.
+/// A verifier that checks the chain of the server certificate against
+/// `roots`, and not the name of the server.
 ///
-/// webpki checks the name after the chain and the validity period. So a
-/// name error tells that every other check passed, and this verifier
-/// accepts the certificate then.
-#[derive(Debug)]
-struct AnyName<V: ?Sized>(Arc<V>);
+/// It runs the chain check of rustls itself and never runs the name check.
+/// So no name error can hide an error of the chain.
+struct ChainOnly {
+    roots: Arc<RootCertStore>,
+    algorithms: WebPkiSupportedAlgorithms,
+}
 
-impl<V: ServerCertVerifier + ?Sized> ServerCertVerifier for AnyName<V> {
+impl fmt::Debug for ChainOnly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChainOnly")
+            .field("roots", &self.roots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerCertVerifier for ChainOnly {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let verified =
-            self.0
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
-        match verified {
-            Err(rustls::Error::InvalidCertificate(
-                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
-            )) => Ok(ServerCertVerified::assertion()),
-            verified => verified,
-        }
+        let cert = ParsedCertificate::try_from(end_entity)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.algorithms.all,
+        )?;
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -178,7 +195,7 @@ impl<V: ServerCertVerifier + ?Sized> ServerCertVerifier for AnyName<V> {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls12_signature(message, cert, dss)
+        verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -187,19 +204,11 @@ impl<V: ServerCertVerifier + ?Sized> ServerCertVerifier for AnyName<V> {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls13_signature(message, cert, dss)
+        verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.supported_verify_schemes()
-    }
-
-    fn requires_raw_public_keys(&self) -> bool {
-        self.0.requires_raw_public_keys()
-    }
-
-    fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
-        self.0.root_hint_subjects()
+        self.algorithms.supported_schemes()
     }
 }
 
@@ -246,86 +255,29 @@ mod tests {
         assert!(error.contains("empty.pem"), "{error}");
     }
 
-    /// A verifier that fails each certificate with `error`, or accepts it.
-    #[derive(Debug)]
-    struct Fixed(Option<CertificateError>);
-
-    impl ServerCertVerifier for Fixed {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            match &self.0 {
-                Some(error) => Err(error.clone().into()),
-                None => Ok(ServerCertVerified::assertion()),
-            }
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Err(CertificateError::BadSignature.into())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Err(CertificateError::BadSignature.into())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![SignatureScheme::ED25519]
+    fn chain_only() -> ChainOnly {
+        ChainOnly {
+            roots: Arc::new(RootCertStore::empty()),
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
 
-    fn verify(error: Option<CertificateError>) -> Result<(), rustls::Error> {
-        let verifier = AnyName(Arc::new(Fixed(error)));
+    #[test]
+    fn without_the_name_check_a_certificate_that_does_not_parse_fails() {
         let name = ServerName::try_from("example.org").unwrap();
         let cert = CertificateDer::from(vec![1, 2, 3]);
-        verifier
-            .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
-            .map(|_| ())
+        let verified = chain_only().verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        assert!(verified.is_err());
     }
 
     #[test]
-    fn without_the_name_check_only_a_name_error_passes() {
-        assert!(verify(None).is_ok());
-        assert!(verify(Some(CertificateError::NotValidForName)).is_ok());
-        let context = CertificateError::NotValidForNameContext {
-            expected: ServerName::try_from("example.org").unwrap(),
-            presented: vec!["localhost".to_owned()],
-        };
-        assert!(verify(Some(context)).is_ok());
-        for error in [
-            CertificateError::UnknownIssuer,
-            CertificateError::Expired,
-            CertificateError::NotValidYet,
-            CertificateError::BadSignature,
-            CertificateError::Revoked,
-        ] {
-            assert_eq!(
-                verify(Some(error.clone())),
-                Err(rustls::Error::InvalidCertificate(error))
-            );
-        }
-    }
-
-    #[test]
-    fn the_verifier_without_the_name_check_keeps_the_schemes() {
-        let verifier = AnyName(Arc::new(Fixed(None)));
+    fn the_verifier_without_the_name_check_keeps_the_schemes_of_the_provider() {
+        let provider = rustls::crypto::ring::default_provider();
         assert_eq!(
-            verifier.supported_verify_schemes(),
-            vec![SignatureScheme::ED25519]
+            chain_only().supported_verify_schemes(),
+            provider
+                .signature_verification_algorithms
+                .supported_schemes()
         );
     }
 }
