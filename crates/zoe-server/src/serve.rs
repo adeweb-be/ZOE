@@ -29,6 +29,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use zoe_core::{Options, Store, ZoeError};
 
+use crate::admin::{self, Health, StoreHealth};
 use crate::protocol::{self, NamedStorage, Queues, Stopping, Storages};
 
 /// The default of `--max-frame-size`: 256 MiB. A `storea` or `restorea`
@@ -100,6 +101,7 @@ impl StorageOptions {
 pub struct ServeOptions {
     storages: Vec<StorageOptions>,
     listen: SocketAddr,
+    admin_listen: Option<SocketAddr>,
     queues: Queues,
     lock_timeout: Option<Duration>,
     max_frame_size: NonZeroU32,
@@ -125,6 +127,7 @@ impl ServeOptions {
         Self {
             storages: storages.into_iter().collect(),
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            admin_listen: None,
             queues: Queues::DEFAULT,
             lock_timeout: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -138,6 +141,15 @@ impl ServeOptions {
     #[must_use]
     pub fn listen(mut self, addr: SocketAddr) -> Self {
         self.listen = addr;
+        self
+    }
+
+    /// Open the admin port on `addr`: an HTTP port with `/healthz` and
+    /// `/readyz`. A port of 0 takes a free port. Without this call, the
+    /// server opens no admin port.
+    #[must_use]
+    pub fn admin_listen(mut self, addr: SocketAddr) -> Self {
+        self.admin_listen = Some(addr);
         self
     }
 
@@ -249,6 +261,8 @@ pub enum Error {
     Storages(String),
     /// The server cannot listen on the address.
     Listen(SocketAddr, io::Error),
+    /// The server cannot listen on the address of the admin port.
+    AdminListen(SocketAddr, io::Error),
     /// The store does not open.
     Store(PathBuf, ZoeError),
     /// The async runtime does not start.
@@ -260,6 +274,9 @@ impl fmt::Display for Error {
         match self {
             Self::Storages(message) => f.write_str(message),
             Self::Listen(addr, error) => write!(f, "cannot listen on {addr}: {error}"),
+            Self::AdminListen(addr, error) => {
+                write!(f, "cannot listen on the admin address {addr}: {error}")
+            }
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
         }
@@ -273,6 +290,8 @@ pub struct Server {
     runtime: Option<Runtime>,
     storages: Option<Arc<Storages>>,
     addr: SocketAddr,
+    /// The address of the admin port, when the server has one.
+    admin: Option<SocketAddr>,
     /// The sender of the stop to the accept loop and to each connection.
     stop_signal: watch::Sender<bool>,
     /// The accept loop and the connections that run.
@@ -314,9 +333,28 @@ impl Server {
         let addr = listener
             .local_addr()
             .map_err(|error| Error::Listen(options.listen, error))?;
+        let (stop_signal, stopping) = Stopping::new();
+        // The admin port answers from now on, 503 until the stores are
+        // open. It is not a task of the stop: it stays open until the
+        // runtime stops.
+        let health = Health::new(stop_signal.subscribe());
+        let admin = match options.admin_listen {
+            Some(admin_listen) => {
+                let _enter = runtime.enter();
+                let listener =
+                    bind(admin_listen).map_err(|error| Error::AdminListen(admin_listen, error))?;
+                let admin = listener
+                    .local_addr()
+                    .map_err(|error| Error::AdminListen(admin_listen, error))?;
+                runtime.spawn(admin::serve(listener, Arc::clone(&health)));
+                Some(admin)
+            }
+            None => None,
+        };
         // This thread is not a thread of the runtime. Each store has its
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
+        let mut stores = Vec::with_capacity(options.storages.len());
         for storage in &options.storages {
             let read_only = options.is_read_only(storage);
             let store = if read_only {
@@ -324,11 +362,14 @@ impl Server {
             } else {
                 open(&storage.name, &storage.path, options.store_options(storage))?
             };
+            stores.push(StoreHealth {
+                name: storage.name.clone(),
+                no_stale_locks: store.lock_table_is_empty(),
+            });
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
             storages.push(Arc::new(named.read_only(read_only)));
         }
         let storages = Arc::new(Storages::new(storages, options.queues.client));
-        let (stop_signal, stopping) = Stopping::new();
         let tasks = Arc::new(Tasks::default());
         // The accept loop counts as a task from now on, so a stop waits for
         // it.
@@ -345,10 +386,13 @@ impl Server {
             accept.await;
             drop(accepting);
         });
+        // Each open loaded the last tid of its store.
+        health.opened(stores);
         Ok(Self {
             runtime: Some(runtime),
             storages: Some(storages),
             addr,
+            admin,
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
@@ -358,6 +402,11 @@ impl Server {
     /// The address that the server listens on.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The address of the admin port, when the server has one.
+    pub fn admin_addr(&self) -> Option<SocketAddr> {
+        self.admin
     }
 
     /// Stop the server within its shutdown timeout. Accept no more
@@ -570,6 +619,58 @@ mod tests {
         });
         // The lock of the store is free again.
         Store::open(&dir).unwrap();
+    }
+
+    /// Send `GET path` to the admin port `addr`. Return the status.
+    fn admin_get(addr: SocketAddr, path: &str) -> io::Result<u16> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: zoe\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response[9..12].parse().unwrap())
+    }
+
+    #[test]
+    fn the_admin_port_is_not_ready_from_the_stop_on_and_closes_at_its_end() {
+        let dir = fresh_dir("admin-stop");
+        let options = ServeOptions::new(&dir)
+            .admin_listen(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .shutdown_timeout(Duration::from_secs(30));
+        let server = Server::start(options).unwrap();
+        let admin = server.admin_addr().unwrap();
+        assert_eq!(admin_get(admin, "/readyz").unwrap(), 200);
+
+        // A task that runs holds the stop. The admin port is not one.
+        let holding = server.tasks.start();
+        let stop = std::thread::spawn(move || server.stop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while admin_get(admin, "/readyz").unwrap() != 503 {
+            assert!(Instant::now() < deadline, "/readyz stays 200 in the stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The stores are open until the end of the stop.
+        assert_eq!(admin_get(admin, "/healthz").unwrap(), 200);
+        assert!(!stop.is_finished());
+
+        drop(holding);
+        stop.join().unwrap();
+        assert!(admin_get(admin, "/healthz").is_err());
+        Store::open_read_only(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_that_cannot_open_its_admin_port_creates_no_store() {
+        let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dir = fresh_dir("admin-taken");
+        let options = ServeOptions::new(&dir).admin_listen(taken.local_addr().unwrap());
+        let error = Server::start(options).err().unwrap();
+        assert!(matches!(error, Error::AdminListen(..)), "{error}");
+        assert!(error.to_string().contains("admin address"), "{error}");
+        assert!(!dir.exists());
     }
 
     #[test]
