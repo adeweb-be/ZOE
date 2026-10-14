@@ -18,10 +18,11 @@ check:
     cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
     cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    ruff check python ci/src
-    ruff format --check python ci/src
+    ruff check python ci/src deploy
+    ruff format --check python ci/src deploy
 
-# Run the Rust tests, then the Python tests on every interpreter.
+# Run the Rust tests, then the Python tests on every interpreter, then the
+# checks of the deployment files.
 test:
     cargo test --workspace --locked
     # The bit-flip harness runs in release too. The debug assertions of redb
@@ -34,6 +35,7 @@ test:
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
     done
+    just deploy check
 
 # Run the zoe-core tests and the race canary under ThreadSanitizer.
 tsan:
@@ -528,6 +530,24 @@ loupe command="run":
             ;;
         *)
             echo "just loupe: unknown command {{ command }}. Use run, dev, check or e2e." >&2
+            exit 2
+            ;;
+    esac
+
+# Check the deployment files in deploy/. `just deploy check` runs the
+# tests of deploy/tests on CPython 3.13: the Tier 1 manifests, the systemd
+# unit, the supervisor program and the Grafana dashboard. Its environment
+# goes to target/deploy/venv.
+deploy command="check":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ command }}" in
+        check)
+            export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/deploy/venv"
+            uv run --locked --project deploy --python 3.13 pytest -q deploy/tests
+            ;;
+        *)
+            echo "just deploy: unknown command {{ command }}. Use check." >&2
             exit 2
             ;;
     esac
