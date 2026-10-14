@@ -10,8 +10,13 @@
 //!
 //! The value of each step must be a persistent reference. Each step reads
 //! the record of the next object as of the tid of the view.
+//!
+//! [`items`] lists the segments that lead on from one object, by the same
+//! rules. The space screen uses them for the size of each item.
 
-use zoe_core::Oid;
+use std::collections::{HashMap, HashSet};
+
+use zoe_core::{Oid, ZoeError};
 use zoe_pickle::{Node, Resolver, Tree};
 
 use crate::state::{dict_entries, target};
@@ -59,6 +64,202 @@ fn step(view: &Snapshot<'_>, oid: Oid, name: &str) -> Result<Option<Oid>> {
         }
     }
     Ok(attribute(&resolver, state, name).and_then(|value| reference(&resolver, value)))
+}
+
+/// Return the items of the object `oid` in the view `view`: each name that
+/// a path segment can take from the object, with the oid that it leads
+/// to, in the order of the records. The items follow the rules of a step:
+///
+/// - a BTree gives each key and its value, in key order;
+/// - a mapping gives each key and its value;
+/// - another object gives the items of its `_tree`, then each attribute
+///   that holds a reference and that no item of `_tree` hides.
+///
+/// Each name is one segment: it is not empty and holds no `/`. A key of
+/// another type than the keys that a segment matches is not an item. A
+/// value that is not a reference is not an item. An object or a BTree node
+/// that does not decode, or that has no record, gives no items. `read`
+/// runs before the call reads each BTree node after the first, and its
+/// error stops the call.
+pub(crate) fn items(
+    view: &Snapshot<'_>,
+    oid: Oid,
+    read: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<(String, Oid)>> {
+    let mut items = Named::default();
+    let Some(tree) = readable_tree(view, oid)? else {
+        return Ok(Vec::new());
+    };
+    if let Some(kind) = btree_kind(&tree) {
+        btree_items(view, oid, tree, kind, &mut items, read)?;
+        return Ok(items.into_items());
+    }
+    let resolver = tree.resolver();
+    let Some(state) = resolver.resolve(tree.state()) else {
+        return Ok(Vec::new());
+    };
+    if let Some(data) = mapping_data(&resolver, state) {
+        for (key, value) in dict_entries(data) {
+            if let Some(name) = text(&resolver, key) {
+                items.set(name, reference(&resolver, value));
+            }
+        }
+        return Ok(items.into_items());
+    }
+    let folder = attribute(&resolver, state, "_tree").and_then(|value| reference(&resolver, value));
+    if let Some(folder) = folder {
+        read()?;
+        if let Some(folder_tree) = readable_tree(view, folder)?
+            && let Some(kind) = btree_kind(&folder_tree)
+        {
+            btree_items(view, folder, folder_tree, kind, &mut items, read)?;
+        }
+    }
+    // A later entry of a name replaces an earlier one, as `attribute`
+    // reads them: the dict, then the slots of an object with slots.
+    let mut attributes = Named::default();
+    let parts = match state {
+        Node::Tuple(pair) => pair
+            .items
+            .iter()
+            .filter_map(|part| resolver.resolve(part))
+            .collect(),
+        _ => vec![state],
+    };
+    for part in parts {
+        for (key, value) in dict_entries(part) {
+            if let Some(name) = text(&resolver, key) {
+                attributes.set(name, reference(&resolver, value));
+            }
+        }
+    }
+    for (name, oid) in attributes.list {
+        if !items.leads_on(&name) {
+            items.set(name, oid);
+        }
+    }
+    Ok(items.into_items())
+}
+
+/// Names and the oids that they lead to, in the order of the first entry
+/// of each name. A value that is not a reference leads to no oid.
+#[derive(Default)]
+struct Named {
+    list: Vec<(String, Option<Oid>)>,
+    index: HashMap<String, usize>,
+}
+
+impl Named {
+    /// Set the oid of `name`. A name that is in the list keeps its place.
+    fn set(&mut self, name: String, oid: Option<Oid>) {
+        match self.index.get(&name) {
+            Some(&at) => self.list[at].1 = oid,
+            None => {
+                self.index.insert(name.clone(), self.list.len());
+                self.list.push((name, oid));
+            }
+        }
+    }
+
+    /// Tell if `name` is in the list.
+    fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// Tell if `name` leads to an oid.
+    fn leads_on(&self, name: &str) -> bool {
+        self.index
+            .get(name)
+            .is_some_and(|&at| self.list[at].1.is_some())
+    }
+
+    /// Return each name that is one segment and that leads to an oid.
+    fn into_items(self) -> Vec<(String, Oid)> {
+        self.list
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty() && !name.contains('/'))
+            .filter_map(|(name, oid)| Some((name, oid?)))
+            .collect()
+    }
+}
+
+/// Return the record of `oid`, decoded, or `None` when it does not decode
+/// or when `oid` has no record in the view.
+fn readable_tree(view: &Snapshot<'_>, oid: Oid) -> Result<Option<Tree>> {
+    match view.tree(oid) {
+        Ok(tree) => Ok(Some(tree)),
+        Err(
+            Error::Refused { .. }
+            | Error::NoRecordAsOf { .. }
+            | Error::Store(ZoeError::NotFound { .. }),
+        ) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Add the keys and the values of the BTree whose root is the record
+/// `oid`, decoded as `tree`, to `items`, in key order. The first entry of
+/// a key wins, as in a lookup. Each node is read once, so a cycle in a
+/// damaged tree ends.
+fn btree_items(
+    view: &Snapshot<'_>,
+    oid: Oid,
+    tree: Tree,
+    (kind, int_keys): (Kind, bool),
+    items: &mut Named,
+    read: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut seen = HashSet::from([oid]);
+    let mut first = Some((tree, kind));
+    let mut pending: Vec<Oid> = Vec::new();
+    loop {
+        let (tree, kind) = match first.take() {
+            Some(first) => first,
+            None => {
+                let Some(next) = pending.pop() else {
+                    return Ok(());
+                };
+                if !seen.insert(next) {
+                    continue;
+                }
+                read()?;
+                match readable_tree(view, next)? {
+                    Some(tree) => match btree_kind(&tree) {
+                        Some((kind, _)) => (tree, kind),
+                        None => continue,
+                    },
+                    None => continue,
+                }
+            }
+        };
+        let resolver = tree.resolver();
+        match contents(&resolver, &tree, kind) {
+            Some(Contents::Pairs(pairs)) => {
+                for pair in pairs.chunks(2) {
+                    let [k, value] = pair else {
+                        continue;
+                    };
+                    let name = match Key::read(&resolver, k) {
+                        Some(Key::Int(key)) if int_keys => key.to_string(),
+                        Some(Key::Text(key)) if !int_keys => key,
+                        _ => continue,
+                    };
+                    if !items.contains(&name) {
+                        items.set(name, reference(&resolver, value));
+                    }
+                }
+            }
+            Some(Contents::Children(children)) => {
+                let children: Vec<Oid> = children
+                    .iter()
+                    .step_by(2)
+                    .filter_map(|child| reference(&resolver, child))
+                    .collect();
+                pending.extend(children.into_iter().rev());
+            }
+            None => {}
+        }
+    }
 }
 
 /// The two kinds of BTree node.
@@ -119,12 +320,8 @@ impl Key {
 }
 
 /// Return the oid of the value of `key` in the BTree whose root is the
-/// record `oid`, decoded as `tree` of the kind `kind`.
-///
-/// The state of a tree is `((child, key, child, ...), first_bucket)`. A
-/// small tree keeps its one bucket inside: `(((key, value, ...),),)`. The
-/// state of a bucket is `((key, value, ...), next_bucket)`. An empty tree
-/// has no state.
+/// record `oid`, decoded as `tree` of the kind `kind`. `contents` gives
+/// the forms of the state.
 fn btree_get(
     view: &Snapshot<'_>,
     oid: Oid,
@@ -158,48 +355,68 @@ fn btree_get(
             }
         };
         let resolver = tree.resolver();
-        let state = resolver.resolve(tree.state());
-        let Some(Node::Tuple(state)) = state else {
-            continue;
-        };
-        let items = state
-            .items
-            .first()
-            .and_then(|items| resolver.resolve(items));
-        let Some(Node::Tuple(items)) = items else {
-            continue;
-        };
-        let pairs = match (kind, &state.items[..], &items.items[..]) {
-            (Kind::Bucket, _, _) => Some(&items.items[..]),
-            // A small tree: the state of its one bucket is inside.
-            (Kind::Tree, [_], [bucket]) => match resolver.resolve(bucket) {
-                Some(Node::Tuple(bucket)) => {
-                    match bucket.items.first().map(|i| resolver.resolve(i)) {
-                        Some(Some(Node::Tuple(pairs))) => Some(&pairs.items[..]),
-                        _ => None,
+        match contents(&resolver, &tree, kind) {
+            Some(Contents::Pairs(pairs)) => {
+                for pair in pairs.chunks(2) {
+                    if let [k, value] = pair
+                        && Key::read(&resolver, k).as_ref() == Some(&key)
+                    {
+                        return Ok(reference(&resolver, value));
                     }
                 }
-                _ => None,
-            },
-            (Kind::Tree, _, children) => {
+            }
+            Some(Contents::Children(children)) => {
                 pending.extend(children_for(&resolver, children, &key).into_iter().rev());
-                None
             }
-        };
-        if let Some(pairs) = pairs {
-            for pair in pairs.chunks(2) {
-                if let [k, value] = pair
-                    && Key::read(&resolver, k).as_ref() == Some(&key)
-                {
-                    return Ok(reference(&resolver, value));
-                }
-            }
+            None => {}
         }
     }
     Err(Error::NoObject {
         path: format!("BTree {}", crate::oid_repr(oid)),
         segment: segment.to_owned(),
     })
+}
+
+/// What a BTree node holds.
+enum Contents<'t> {
+    /// The keys and the values of a bucket: `(key, value, key, value, ...)`.
+    Pairs(&'t [Node]),
+    /// The children and the separating keys of an inner node:
+    /// `(child, key, child, key, child, ...)`.
+    Children(&'t [Node]),
+}
+
+/// Return what the BTree node `tree` of the kind `kind` holds, or `None`
+/// for an empty tree or a state of another form.
+///
+/// The state of a tree is `((child, key, child, ...), first_bucket)`. A
+/// small tree keeps the state of its one bucket inside:
+/// `((((key, value, ...),),),)`. The state of a bucket is
+/// `((key, value, ...), next_bucket)`, or `((key, value, ...),)` for the
+/// last bucket. An empty tree has no state.
+fn contents<'t>(resolver: &Resolver<'t>, tree: &'t Tree, kind: Kind) -> Option<Contents<'t>> {
+    let Some(Node::Tuple(state)) = resolver.resolve(tree.state()) else {
+        return None;
+    };
+    let items = state
+        .items
+        .first()
+        .and_then(|items| resolver.resolve(items));
+    let Some(Node::Tuple(items)) = items else {
+        return None;
+    };
+    match (kind, &state.items[..], &items.items[..]) {
+        (Kind::Bucket, _, _) => Some(Contents::Pairs(&items.items)),
+        // A small tree: the state of its one bucket is inside.
+        (Kind::Tree, [_], [bucket]) => match resolver.resolve(bucket) {
+            Some(Node::Tuple(bucket)) => match bucket.items.first().map(|i| resolver.resolve(i)) {
+                Some(Some(Node::Tuple(pairs))) => Some(Contents::Pairs(&pairs.items)),
+                _ => None,
+            },
+            _ => None,
+        },
+        (Kind::Tree, _, children) => Some(Contents::Children(children)),
+    }
 }
 
 /// Return the children of an inner tree node that can hold `key`. The
@@ -356,5 +573,198 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A text in a pickle.
+    fn text(value: &str) -> Vec<u8> {
+        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
+        [&b"X"[..], &length, value.as_bytes()].concat()
+    }
+
+    /// A dict state with the text keys and the pickled values of
+    /// `entries`, in order.
+    fn dict(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut state = b"}".to_vec();
+        for (key, value) in entries {
+            state.extend(text(key));
+            state.extend(value);
+            state.extend(b"s");
+        }
+        state
+    }
+
+    /// The pairs of a bucket: a tuple of the keys and the pickled values.
+    fn pairs(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut state = b"(".to_vec();
+        for (key, value) in entries {
+            state.extend(text(key));
+            state.extend(value);
+        }
+        state.extend(b"t");
+        state
+    }
+
+    /// Write a store whose application holds a folder with a BTree of two
+    /// buckets, a mapping, an `IOBTree` and a record that does not decode.
+    fn items_store() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zoe-loupe-items-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let item = |oid| reference(oid, "m", "Item");
+        let bucket = |oid| reference(oid, "BTrees.OOBTree", "OOBucket");
+        let mapping = |state: &[u8]| record("persistent.mapping", "PersistentMapping", state);
+        let mut records = vec![
+            (
+                0,
+                mapping(&dict(&[("data", dict(&[("Application", item(1))]))])),
+            ),
+            (
+                1,
+                record(
+                    "m",
+                    "App",
+                    &dict(&[
+                        ("folder", item(2)),
+                        ("map", item(3)),
+                        ("ids", reference(4, "BTrees.IOBTree", "IOBTree")),
+                        ("bad", item(5)),
+                    ]),
+                ),
+            ),
+            (
+                2,
+                record(
+                    "m",
+                    "Folder",
+                    &dict(&[
+                        ("_tree", reference(6, "BTrees.OOBTree", "OOBTree")),
+                        ("a", item(21)),
+                        ("b", item(27)),
+                        ("c", item(22)),
+                        ("x/y", item(23)),
+                        ("", item(24)),
+                        ("n", b"K\x05".to_vec()),
+                    ]),
+                ),
+            ),
+            // A mapping with the key `k1` twice: the last entry wins.
+            (
+                3,
+                mapping(&dict(&[(
+                    "data",
+                    dict(&[("k1", item(30)), ("k2", text("v")), ("k1", item(31))]),
+                )])),
+            ),
+            (
+                4,
+                record(
+                    "BTrees.IOBTree",
+                    "IOBTree",
+                    &[&b"K\x07"[..], &item(40), b"\x86\x85\x85\x85"].concat(),
+                ),
+            ),
+            (5, b"\x80\x03cm\nC\n.\x80\x03\xff.".to_vec()),
+            // The tree: two buckets and the key `m` between them.
+            (
+                6,
+                record(
+                    "BTrees.OOBTree",
+                    "OOBTree",
+                    &[
+                        &b"("[..],
+                        &bucket(10),
+                        &text("m"),
+                        &bucket(11),
+                        b"t",
+                        &bucket(10),
+                        b"\x86",
+                    ]
+                    .concat(),
+                ),
+            ),
+            // The value of `b` is not a reference, so the attribute `b`
+            // is not hidden.
+            (
+                10,
+                record(
+                    "BTrees.OOBTree",
+                    "OOBucket",
+                    &[
+                        &pairs(&[("a", item(20)), ("b", b"K\x07".to_vec())])[..],
+                        &bucket(11),
+                        b"\x86",
+                    ]
+                    .concat(),
+                ),
+            ),
+            (
+                11,
+                record(
+                    "BTrees.OOBTree",
+                    "OOBucket",
+                    &[&pairs(&[("m", item(25)), ("q/r", item(26))])[..], b"\x85"].concat(),
+                ),
+            ),
+        ];
+        for oid in [20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 40] {
+            records.push((oid, record("m", "Item", b"}")));
+        }
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin_restore(Tid(1), b"", b"", b"").unwrap();
+        for (oid, data) in &records {
+            txn.restore(Oid(*oid), Some(data)).unwrap();
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_items_follow_the_steps_of_a_path() {
+        let dir = items_store();
+        let folder = Folder::open(&dir).unwrap();
+        let view = folder.as_of(folder.last_tid());
+        let reads = std::cell::Cell::new(0);
+        let items_at = |path: &str| {
+            let oid = resolve(&view, path).unwrap();
+            let found = items(&view, oid, &mut || {
+                reads.set(reads.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            // Each item resolves as a segment of the path.
+            for (name, item) in &found {
+                let at = format!("{path}/{name}");
+                assert_eq!(resolve(&view, &at).unwrap(), *item, "{at}");
+            }
+            found
+                .into_iter()
+                .map(|(name, oid)| (name, oid.0))
+                .collect::<Vec<_>>()
+        };
+        let named = |items: &[(&str, u64)]| -> Vec<(String, u64)> {
+            items.iter().map(|(n, o)| ((*n).to_owned(), *o)).collect()
+        };
+        // The items of `_tree` in key order, then the attributes. The item
+        // `a` hides the attribute `a`. A name with `/` and an empty name
+        // are not segments.
+        assert_eq!(
+            items_at("/folder"),
+            named(&[("a", 20), ("b", 27), ("m", 25), ("_tree", 6), ("c", 22)])
+        );
+        // The tree, and its two buckets.
+        assert_eq!(reads.get(), 3);
+        assert_eq!(items_at("/map"), named(&[("k1", 31)]));
+        assert_eq!(items_at("/ids"), named(&[("7", 40)]));
+        assert_eq!(
+            items_at(""),
+            named(&[("folder", 2), ("map", 3), ("ids", 4), ("bad", 5)])
+        );
+        // A record that does not decode has no items.
+        let bad = resolve(&view, "/bad").unwrap();
+        assert!(items(&view, bad, &mut || Ok(())).unwrap().is_empty());
+        // An error of `read` stops the call.
+        let folder_oid = resolve(&view, "/folder").unwrap();
+        let stopped = items(&view, folder_oid, &mut || Err(Error::Stopped));
+        assert!(matches!(stopped, Err(Error::Stopped)));
     }
 }
