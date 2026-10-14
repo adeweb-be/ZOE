@@ -59,3 +59,30 @@ python3 summarize.py results/ab-tmpfs.jsonl
 ## Results
 
 `results/` holds the raw JSON lines of the runs that the comment of #132 reports. They come from a laptop, not the reference machine: Intel Core Ultra 7 155H, 30 GB, a consumer NVMe, CPython 3.13. The label `zoe-base` is a build of `main` without the toggles. The `strace-*.txt` files are the `strace -c` summaries of threads `update` runs. The `pyspy/` files are the samples of the threads client, without the process frames.
+
+## ZOE-151: several transactions at once in one client process
+
+**Not for merge either.** The finding is `docs/spikes/concurrent-commits.md` on the branch `card/ZOE-151`.
+
+`zoeclientx` takes `rule on` (`ZoeClientStorage(..., rule=True)`): one listener connection reads the invalidations and does not commit, and the client delivers the invalidations and the `f(tid)` of the pool's own finishes in the tid order of the listener's stream. `rule off` is the pool above, unchanged. The docstring of `zoeclientx/__init__.py` states the rule.
+
+| Script | Runs |
+| --- | --- |
+| `racex.py` | ZODB's `RaceTests`, unchanged, against `zoeclientx` on a new `zoe serve` for each run; plus the POC model `T2ObjectsIncOrTouch` on ZODB's checker. One JSON line per run |
+| `race-matrix.sh` | The race tests with and without the rule, pools of 1, 4 and 16. Each batch takes `POC_LOCK` shared |
+| `race_summary.py` | Runs and failures for each cell of the JSON lines of `racex.py` |
+| `ab-concurrent.sh` | The threads cells `add` and `update` at concurrency 16 and 64: one connection, the pool without the rule, the pool with the rule. Each round takes `POC_LOCK` exclusive |
+
+The bench environments come from the lock of `bench/shootout`, without `zoedb`, RelStorage and psycopg2, plus `zope.testing` for the test helpers of ZODB:
+
+```sh
+for py in 3.13 3.14t; do
+  UV_PROJECT_ENVIRONMENT=$PWD/target/bench/venv-$py uv sync --locked --project bench/shootout \
+    --python python$py --no-install-package zoedb --no-install-package psycopg2-binary \
+    --no-install-package relstorage
+  uv pip install --python target/bench/venv-$py/bin/python zope.testing
+  POC_PYTHON=$PWD/target/bench/venv-$py/bin/python bench/poc/ZOE-077/rustclient/build.sh
+done
+```
+
+`results/race-*-v1.jsonl` are the runs of version 1 of the rule (commit `02c0e70`), `results/race-3.13.jsonl` and `results/race-3.14t.jsonl` those of version 2, and `results/ab-concurrent.jsonl` the cost runs.
