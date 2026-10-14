@@ -65,7 +65,8 @@ pub(crate) struct StoreRef(Arc<Owned>);
 struct Owned {
     store: Store,
     /// The fields drop in the order of their declaration. So this flag is
-    /// set after the database is closed.
+    /// set after the store drops. A read through a weak handle of the core,
+    /// such as an iterator, can still hold the database then.
     _closed: SetOnDrop,
 }
 
@@ -186,8 +187,8 @@ pub(crate) struct Shared {
     /// signal.
     store: RwLock<Option<StoreRef>>,
     table: Mutex<Table>,
-    /// True when the database of the store is closed: the last share of
-    /// the store dropped.
+    /// True when the last share of the store dropped. A read through a
+    /// weak handle of the core can still hold the database then.
     database_closed: Arc<AtomicBool>,
 }
 
@@ -247,7 +248,7 @@ impl Shared {
         drop(idle);
     }
 
-    /// Tell if the database of the store is closed.
+    /// Tell if the last share of the store dropped.
     pub(crate) fn database_closed(&self) -> bool {
         self.database_closed.load(Ordering::Acquire)
     }

@@ -43,6 +43,10 @@ A signal handler is a policy of the whole process, and the application can have 
 - Each process that opens a store has one more thread, `zoe-signals`. On CPython 3.12 and later, `os.fork()` in a process with more than one thread gives a `DeprecationWarning`. A fork after the open of a store is unsafe for the store anyway.
 - The check does not see a handler that C code installs without Python after the start of the interpreter. signal-hook then calls that handler before the watcher closes the stores.
 - On a free-threaded build, the check and the install are two steps. A handler that the main thread sets between them does not stop the close.
-- A call that does not return, such as a running pack, holds its store past the bound, so that store stays unclean. A read of an iterator or of a blob file that ends after the bound does the same. The repair on open covers them, as it covers SIGKILL and a power loss.
+- A call that does not return, such as a running pack, holds its store past the bound, so that store stays unclean.
+- The watcher does not wait for a read through a weak handle of the core: a read of the iterator of `_iterator` or of a blob file. Such a read holds the redb database for the length of the read, but it holds no share of the store. When the store drops while such a read is in progress, the watcher raises the signal at once, and the process ends while the read holds the database open. That store stays unclean, also when the read would end well before the bound. A full fix needs an API of the core.
+- A store that opens after the watcher took its list of the open storages is not closed.
+- A `close` or a drop of the storage that runs after the watcher took the store returns without a wait for the close of the watcher. So a normal exit that races the signal can end the process during that close.
+- The repair on open (ZOE-128) covers each store that these cases leave unclean, as it covers SIGKILL and a power loss.
 - A child of `os.fork()` that opens a store gets no handler: a signal ends it with the default action.
 - The writer commands of the console script (`zoe pack`, `zoe convert --from-data-fs`, `zoe restore`) open no `zoe.Storage`, so a signal stops them at once (ADR 0028).
