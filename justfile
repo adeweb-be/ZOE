@@ -164,15 +164,15 @@ conformance:
 # foreground, `just plone zoe build` only builds it, and `just plone zoe
 # check` creates a Plone site by script, starts the instance and reads the
 # site over HTTP. The other scenarios are filestorage, zeo, zeoclient and
-# zeoclient-mount; their instances need a server. `just plone zeoclient
-# check` builds the `zoe` binary, starts `zoe serve` on
-# target/plone/zeoclient/var/zoe and stops it at the end. `just plone
-# zeoclient-mount check` starts one `zoe serve` with the two named storages
-# main and content, and puts the site in the mount point /content. The
-# build goes to target/plone. ZOE_PLONE_ADMIN gives the admin user as
-# user:password. Without it, the recipe makes a random password once, in
-# target/plone/admin. The instance listens on 127.0.0.1, on the port
-# ZOE_PLONE_PORT or 8080.
+# zeoclient-mount. The instances of zeo, zeoclient and zeoclient-mount need
+# their server. `just plone zeoclient check` builds the `zoe` binary,
+# starts `zoe serve` on target/plone/zeoclient/var/zoe and stops it at the
+# end. `just plone zeoclient-mount check` starts one `zoe serve` with the
+# two named storages main and content, and puts the site in the mount
+# point /content. The build goes to target/plone. ZOE_PLONE_ADMIN gives the
+# admin user as user:password. Without it, the recipe makes a random
+# password once, in target/plone/admin. The instance listens on 127.0.0.1,
+# on the port ZOE_PLONE_PORT or 8080.
 plone scenario="zoe" command="start":
     #!/usr/bin/env bash
     set -euo pipefail

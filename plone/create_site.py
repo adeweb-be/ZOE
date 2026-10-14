@@ -27,7 +27,10 @@ SITE_ID = "Plone"
 # The instance runs the script with exec. sys.argv holds the path of the
 # script, then the arguments of the script.
 SCRIPT = sys._getframe().f_code.co_filename
-MARK, *MOUNT = sys.argv[sys.argv.index(SCRIPT) + 1 :]
+ARGS = sys.argv[sys.argv.index(SCRIPT) + 1 :]
+if not 1 <= len(ARGS) <= 2:
+    sys.exit("usage: bin/instance run create_site.py MARK [MOUNT]")
+MARK, *MOUNT = ARGS
 TITLE = f"Check site {MARK}"
 
 
