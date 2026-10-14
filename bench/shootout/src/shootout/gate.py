@@ -4,9 +4,19 @@
 Python build and set (quick or full), it keeps the last result of each
 storage. It then divides the `ops_per_second` of the storage by the one of
 the baseline in each scenario and cell of the baseline. The gate passes
-when every ratio is at least the ratio of the gate. A cell of the baseline
-without a counterpart in the storage fails the gate, and so does a tree
-without a result of the baseline.
+when every ratio that counts is at least the ratio of the gate. A cell of
+the baseline without a counterpart in the storage fails the gate, and so
+does a tree without a result of the baseline. With a Python build, only
+the groups of that build count. The report prints the other groups beside
+them.
+
+`default_ratio` gives the default ratio of a storage, and `left_out` the
+scenarios that the gate leaves out for it. Both read constants of this
+module, not options. The gate leaves out the scenarios of `LEFT_OUT` for
+each storage but those of `COUNTS_EVERY_SCENARIO`, because no read of
+these scenarios reaches the server through `ZEO.ClientStorage`. The report
+prints their cells with the verdict `left out`. These cells count neither
+as below nor as missing.
 """
 
 import datetime
@@ -18,21 +28,62 @@ from shootout.environment import python_tag
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
+# The scenarios that the gate leaves out, each with its reason.
+LEFT_OUT = {
+    "read_hot": "it empties the object cache of the connection, then reads "
+    "the objects from the cache of ZEO.ClientStorage, so no read reaches "
+    "the server",
+}
 
-def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -> int:
-    """Write the gate report to out. Return 0 when the gate passes, else 1."""
+# The storages for which every scenario counts. The native client of
+# zoe-native has a cache of its own, so its read_hot is a number of ZOE.
+COUNTS_EVERY_SCENARIO = frozenset({"zoe-native"})
+
+# The default ratio of each storage: 3 for the phase 3 gate. Any other
+# storage gets parity, the phase 2 gate.
+RATIOS = {"zoe-native": 3.0}
+PARITY = 1.0
+
+
+def default_ratio(storage: str) -> float:
+    """Return the default ratio of the gate of a storage."""
+    return RATIOS.get(storage, PARITY)
+
+
+def left_out(storage: str) -> dict[str, str]:
+    """Return the scenarios that the gate leaves out for a storage."""
+    return {} if storage in COUNTS_EVERY_SCENARIO else LEFT_OUT
+
+
+def report(
+    root: Path,
+    storage: str,
+    baseline: str,
+    ratio: float,
+    out: TextIO,
+    python: str | None = None,
+) -> int:
+    """Write the gate report to out. Return 0 when the gate passes, else 1.
+
+    With python, such as cp314t, only the groups of that Python build count.
+    """
     last = _last_results(root)
     groups = sorted({group for group, name in last if name == baseline})
-    if not groups:
-        print(f"gate: no result of {baseline} under {root}", file=out)
+    counted = [group for group in groups if python in (None, group[1])]
+    if not counted:
+        where = f" on {python}" if python else ""
+        print(f"gate: no result of {baseline}{where} under {root}", file=out)
         return 1
+    skipped = left_out(storage)
 
-    below = missing = total = 0
-    for group in groups:
-        machine, python, kind = group
+    below = missing = left = total = 0
+    for group in counted + [g for g in groups if g not in counted]:
+        machine, build, kind = group
+        counts = group in counted
         base = last[group, baseline]
         other = last.get((group, storage))
-        print(f"== {machine} {python} {kind}", file=out)
+        beside = "" if counts else f" (beside {python}, does not count)"
+        print(f"== {machine} {build} {kind}{beside}", file=out)
         print(f"{baseline}: {_name(base)}", file=out)
         print(f"{storage}: {_name(other) if other else 'no result'}", file=out)
         print(
@@ -41,28 +92,42 @@ def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -
         )
         cells = _cells(other) if other else {}
         for cell, base_ops in sorted(_cells(base).items()):
-            total += 1
             ops = cells.get(cell)
-            if ops is None:
-                missing += 1
-                print(
-                    ROW.format(*cell, "-", f"{base_ops:.0f}", "-", "missing"), file=out
-                )
-                continue
-            value = ops / base_ops
-            verdict = "pass" if value >= ratio else "FAIL"
-            if value < ratio:
-                below += 1
+            value = None if ops is None else ops / base_ops
+            if cell[0] in skipped:
+                verdict = "left out"
+            elif value is None:
+                verdict = "missing"
+            elif value < ratio:
+                verdict = "FAIL"
+            else:
+                verdict = "pass"
+            if counts:
+                total += 1
+                left += verdict == "left out"
+                missing += verdict == "missing"
+                below += verdict == "FAIL"
+            else:
+                # A row beside the gate gives its verdict in lower case.
+                verdict = verdict.lower()
             row = ROW.format(
-                *cell, f"{ops:.0f}", f"{base_ops:.0f}", f"{value:.2f}", verdict
+                *cell,
+                "-" if ops is None else f"{ops:.0f}",
+                f"{base_ops:.0f}",
+                "-" if value is None else f"{value:.2f}",
+                verdict,
             )
             print(row, file=out)
 
+    for name, reason in skipped.items():
+        print(f"left out: {name}, because {reason}", file=out)
     passed = below == 0 and missing == 0
+    cells = f"each cell but {', '.join(skipped)}" if skipped else "each cell"
+    where = f" on {python}" if python else ""
     print(
-        f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}, "
-        f"at least {ratio:g}x in each cell; {total} cells, {below} below, "
-        f"{missing} missing",
+        f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}"
+        f"{where}, at least {ratio:g}x in {cells}; "
+        f"{total} cells, {below} below, {missing} missing, {left} left out",
         file=out,
     )
     return 0 if passed else 1

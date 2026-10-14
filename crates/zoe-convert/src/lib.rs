@@ -34,7 +34,9 @@ mod writer;
 pub use backup::{Backup, BackupCheck, Restored, backup, restore, verify_backup};
 pub use datafs::from_datafs;
 pub use to_datafs::to_datafs;
-pub use verify::{BlobProblem, Dangling, FrameProblem, PickleProblem, Verification, verify};
+pub use verify::{
+    BlobProblem, CountProblem, Dangling, FrameProblem, PickleProblem, Verification, verify,
+};
 
 /// The report of a conversion.
 ///
