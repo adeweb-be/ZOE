@@ -155,8 +155,13 @@ class Ci:
 
     @function
     async def plone(self, source: Source) -> str:
-        """Build the Plone instances and run the Plone suites. Not built yet."""
-        return await self.recipe(source, "plone").stdout()
+        """Run the Plone suites on ZOE in-process, then through zoe serve."""
+        # The second run starts from the first one, so it reuses its eggs.
+        zoe = self.recipe(source, "plone", ("zoe", "suites"))
+        zeoclient = zoe.with_exec(
+            ["devenv", "shell", "--", "just", "plone", "zeoclient", "suites"]
+        )
+        return await zoe.stdout() + await zeoclient.stdout()
 
     @function
     def bench(
