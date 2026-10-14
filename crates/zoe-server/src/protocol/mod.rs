@@ -85,7 +85,9 @@ const QUEUE: usize = 4;
 
 /// The longest time that a connection reads and drops bytes at a stop,
 /// after its writer sent its last frame and shut down its side, when it
-/// cannot read the send queue of its socket. A stock client closes its
+/// cannot read the send queue of its socket. It is also the longest time
+/// that a connection reads and drops bytes after the bytes of the client
+/// ended it (see `drain`). A stock client closes its
 /// side when it reads the end of the connection, and that ends the wait
 /// sooner. The wait keeps the socket open while the client can still
 /// send. So a byte that the client sends in that time causes no reset,
@@ -93,11 +95,13 @@ const QUEUE: usize = 4;
 const LINGER: Duration = Duration::from_millis(500);
 
 /// The pause between two reads of the send queue of a socket while the
-/// connection waits at a stop for the queue to become empty.
+/// connection waits at a stop for the queue to become empty. A client
+/// whose bytes ended the connection is quiet when it sends nothing for
+/// this time.
 const DRAIN_PAUSE: Duration = Duration::from_millis(50);
 
 /// The size of the buffer into which a connection reads the bytes that it
-/// drops at a stop.
+/// drops.
 const DROPPED: usize = 8 * 1024;
 
 /// The name of the storage that `--path` gives. It is the default of ZEO.
@@ -543,6 +547,9 @@ pub(crate) async fn serve_stream(
     // A stop lets a vote that waits for a lock go on waiting: the other
     // sessions abort their transactions, and a finish that arrived commits.
     let mut stopped = false;
+    // True when the bytes of the client end the connection: a frame that
+    // is not a call, or a call that ends the connection.
+    let mut refused = false;
     loop {
         // An end of the connection or a stop wins over a frame that waits.
         // A frame that arrived wins over the idle timeout. The idle time
@@ -552,7 +559,10 @@ pub(crate) async fn serve_stream(
         let quiet = calls.quiet();
         let read = tokio::select! {
             biased;
-            () = ended.wait() => break,
+            () = ended.wait() => {
+                refused = true;
+                break;
+            }
             () = closing.wait() => break,
             () = stopping.wait() => {
                 stopped = true;
@@ -587,6 +597,7 @@ pub(crate) async fn serve_stream(
             Ok(call) => call,
             Err(error) => {
                 tracing::warn!(client = peer.as_str(), "a frame is not a call: {error}");
+                refused = true;
                 break;
             }
         };
@@ -597,6 +608,7 @@ pub(crate) async fn serve_stream(
                 client = peer.as_str(),
                 "a frame is not a call: it has a trace context, and the connection did not declare trace_context"
             );
+            refused = true;
             break;
         }
         if call.is_heartbeat() {
@@ -608,7 +620,10 @@ pub(crate) async fn serve_stream(
         let ticket = tokio::select! {
             biased;
             ticket = calls.ticket(&call) => ticket,
-            () = ended.wait() => break,
+            () = ended.wait() => {
+                refused = true;
+                break;
+            }
             () = closing.wait() => break,
         };
         if ticket.is_closed() {
@@ -620,6 +635,9 @@ pub(crate) async fn serve_stream(
     // gone client holds no lock.
     if !stopped {
         calls.end_lock_wait();
+    }
+    if refused {
+        drain(&mut reader, &*runtime, &mut closing).await;
     }
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.
@@ -640,6 +658,35 @@ pub(crate) async fn serve_stream(
         .await;
     } else {
         finished.await;
+    }
+}
+
+/// Read and drop the bytes of the client after its bytes ended the
+/// connection, until the client sends nothing for `DRAIN_PAUSE`, until it
+/// closes its side, or for `LINGER` at most. The connection closes only
+/// after that. So the calls that the client sent before it saw the end
+/// arrive before the close, and the close is not a reset. A reset makes a
+/// write of the client fail, and the asyncio of CPython 3.12 then can lose
+/// the next connection of the client. When the hub closed the connection,
+/// the writer stopped at once, and no wait follows.
+async fn drain(
+    reader: &mut (impl AsyncRead + Unpin),
+    runtime: &dyn Runtime,
+    closing: &mut Closing,
+) {
+    let mut dropped = vec![0u8; DROPPED];
+    let mut deadline = runtime.sleep(LINGER);
+    loop {
+        tokio::select! {
+            biased;
+            () = closing.wait() => return,
+            () = &mut deadline => return,
+            () = runtime.sleep(DRAIN_PAUSE) => return,
+            read = reader.read(&mut dropped) => match read {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            },
+        }
     }
 }
 
@@ -924,6 +971,52 @@ mod tests {
         let data = Value::Binary(b"pickle".to_vec());
         let store = vec![session::p64(oid), session::p64(0), data, Value::from(7)];
         send(client, 0, "storea", store);
+    }
+
+    /// Encode a call. The id 0 is a call without a reply.
+    fn call_bytes(id: i64, method: &str, args: Vec<Value>) -> Vec<u8> {
+        let call = Value::Array(vec![
+            Value::from(id),
+            Value::Boolean(id == 0),
+            Value::from(method),
+            Value::Array(args),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &call).unwrap();
+        bytes
+    }
+
+    /// Send the frame `first`, then the calls of a transaction and more
+    /// bytes, in one write, as a client sends a burst before it sees the
+    /// end of the connection. The client gets the end of the connection,
+    /// not a reset, and no reply.
+    fn burst_ends_without_a_reset(name: &str, first: &[u8]) {
+        let storage = storage(name);
+        let (runtime, addr) = serve(&storage);
+        let mut client = registered(addr);
+        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+        let mut burst = frame::encode(first).unwrap();
+        burst.extend(frame::encode(&call_bytes(0, "tpc_begin", begin)).unwrap());
+        burst.extend(frame::encode(&call_bytes(2, "vote", vec![Value::from(7)])).unwrap());
+        burst.extend([7; 100_000]);
+        client.write_all(&burst).unwrap();
+        let mut replies = Vec::new();
+        let read = client.read_to_end(&mut replies);
+        assert!(read.is_ok(), "{read:?}");
+        assert!(replies.is_empty(), "{} bytes after the end", replies.len());
+        drop(client);
+        drop(runtime);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_call_ends_without_a_reset() {
+        burst_ends_without_a_reset("not-a-call", b"salty");
+    }
+
+    #[test]
+    fn an_unknown_method_ends_without_a_reset() {
+        let unknown = call_bytes(0, "foo", vec![]);
+        burst_ends_without_a_reset("unknown-method", &unknown);
     }
 
     /// Wait until `done` is true. Fail after 30 seconds.

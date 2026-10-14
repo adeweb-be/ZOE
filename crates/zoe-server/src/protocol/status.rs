@@ -301,12 +301,12 @@ mod tests {
         let Value::Map(items) = status.to_value() else {
             panic!("a status is a map");
         };
-        assert!(items.contains(&(
-            Value::from("timeout-thread-is-alive"),
-            Value::Boolean(true)
-        )));
+        assert!(items.contains(&(Value::from("timeout-thread-is-alive"), Value::Boolean(true))));
         let json = ruok(&[("1", status)]);
-        assert!(json.contains(r#""timeout-thread-is-alive": true, "#), "{json}");
+        assert!(
+            json.contains(r#""timeout-thread-is-alive": true, "#),
+            "{json}"
+        );
     }
 
     #[test]
