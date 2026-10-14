@@ -32,7 +32,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - The verification reads the file again, up to where the copy stopped. It compares the file with every transaction of the store: the tids, the user, the description, the extension and every pickle, byte for byte. It checks that the store has every blob, with the size of its blob file. It compares the first blob and then one blob in 16 byte for byte, and this read also checks the BLAKE3 hash of the store.
 - Each difference is one line in `Report.problems`. The lines about the whole source come first, and no cap hides them: where the conversion stopped before the end of the file, and the blob records without a blob directory. At most 100 other lines follow, and a last line counts the others. An empty list means that the store holds the whole file.
 - A conversion never gives an empty list when it stopped before the end of the file, except for a commit in progress at the end.
-- The verification uses the transaction iterator of the store. That iterator holds the transaction rows and the record keys of the whole store in memory.
+- The verification uses the transaction iterator of the store. That iterator holds one transaction and a slice of tids at a time, whatever the size of the store.
 
 ## ZOE to `Data.fs`
 
