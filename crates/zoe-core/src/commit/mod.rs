@@ -54,7 +54,7 @@ use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
-use crate::lock::{Held, Mode, Refused};
+use crate::lock::{Held, LockCancel, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub(crate) use group::GroupCommit;
@@ -122,6 +122,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     began: SystemTime,
     /// The tid of the commit, after a `finish` that succeeded.
     committed: Option<Tid>,
+    /// The handle that ends the lock wait of a vote from another thread.
+    lock_cancel: Option<LockCancel>,
 }
 
 /// What the serial check of a vote found.
@@ -165,6 +167,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             stored_bytes: 0,
             began,
             committed: None,
+            lock_cancel: None,
         }
     }
 
@@ -208,6 +211,19 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let mut txn = Self::begin_restore(store, tid, user, description, extension)?;
         txn.deferred = true;
         Ok(txn)
+    }
+
+    /// Let `cancel` end the lock wait of the votes of this transaction from
+    /// another thread. A vote that waits for a lock when `cancel` is
+    /// cancelled, or that starts to wait after it, leaves the queue,
+    /// releases each lock that it took and fails with `Conflict` on the oid
+    /// that it waits for. `conflict_serials` then gives `None`.
+    ///
+    /// A cancel does nothing to a vote that takes its locks without a wait,
+    /// or that has its locks: the transaction keeps them until `finish`,
+    /// `abort` or a drop.
+    pub fn set_lock_cancel(&mut self, cancel: LockCancel) {
+        self.lock_cancel = Some(cancel);
     }
 
     /// Tell if a vote holds the locks of the transaction.
@@ -569,7 +585,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// other transaction changed them since their serial.
     ///
     /// The vote waits for a lock that another transaction holds, at most
-    /// the lock timeout of the store. A longer wait fails with `Conflict`.
+    /// the lock timeout of the store. A longer wait fails with `Conflict`,
+    /// and so does a wait that the cancel of `set_lock_cancel` ends.
     /// A failed vote releases every lock that it took. On a read-only store
     /// the vote fails with `ReadOnly` and takes no lock.
     ///
@@ -630,9 +647,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // measured on the monotonic time of the store clock, as the lock
         // timeout is, so a simulator gives it on simulated time.
         let started = store.observer().map(|_| store.clock.monotonic());
-        let acquired = store
-            .locks
-            .acquire(&requests, store.lock_timeout, &*store.clock);
+        let acquired = store.locks.acquire_cancellable(
+            &requests,
+            store.lock_timeout,
+            &*store.clock,
+            self.lock_cancel.as_ref(),
+        );
         if let (Some(observer), Some(started)) = (store.observer(), started) {
             observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
         }
@@ -679,7 +699,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// read. These are the `serials` of a ZODB `ConflictError`.
     ///
     /// Return `None` when the last vote did not fail on a stale serial, for
-    /// example when it waited past the lock timeout.
+    /// example when it waited past the lock timeout or a cancel ended its
+    /// wait.
     pub fn conflict_serials(&self) -> Option<(Tid, Tid)> {
         self.conflict
     }
@@ -1250,6 +1271,55 @@ mod tests {
         waiter.store(oid, Tid::ZERO, b"b").unwrap();
         assert!(matches!(waiter.vote(), Err(ZoeError::Conflict { .. })));
         assert_eq!(waiter.conflict_serials(), None);
+    }
+
+    #[test]
+    fn a_cancel_ends_the_lock_wait_of_a_vote_from_another_thread() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let low = store.new_oid().unwrap();
+        let high = store.new_oid().unwrap();
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(high, Tid::ZERO, b"held").unwrap();
+        holder.vote().unwrap();
+        let cancel = LockCancel::new();
+        thread::scope(|scope| {
+            let voter = scope.spawn(|| {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.set_lock_cancel(cancel.clone());
+                txn.store(low, Tid::ZERO, b"gone").unwrap();
+                txn.store(high, Tid::ZERO, b"gone").unwrap();
+                let voted = txn.vote();
+                (voted, txn.conflict_serials())
+            });
+            // The voter holds the lock of `low` and waits for `high`.
+            while store.locks.waiting(high) == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            cancel.cancel();
+            let (voted, serials) = voter.join().unwrap();
+            assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == high));
+            assert_eq!(serials, None);
+        });
+        // The vote released the lock of `low`.
+        commit(&store, low, Tid::ZERO, b"after");
+        holder.finish().unwrap();
+        assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn a_cancel_does_nothing_to_a_vote_that_passed() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let oid = store.new_oid().unwrap();
+        let cancel = LockCancel::new();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.set_lock_cancel(cancel.clone());
+        txn.store(oid, Tid::ZERO, b"a").unwrap();
+        txn.vote().unwrap();
+        cancel.cancel();
+        assert!(!store.lock_table_is_empty());
+        let tid = txn.finish().unwrap();
+        assert_eq!(store.load(oid).unwrap(), (b"a".to_vec(), tid));
+        assert!(store.lock_table_is_empty());
     }
 
     #[test]
