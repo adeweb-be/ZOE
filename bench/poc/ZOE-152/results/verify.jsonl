@@ -1,0 +1,7 @@
+{"step": "first open", "verify_result": "empty cache"}
+{"step": "reopen, no change", "verify_result": "Cache up to date", "opened": "Reused", "hits": 52, "misses": 0, "newest_values": true}
+{"step": "reopen after 1 commit by another client", "verify_result": "quick verification", "opened": "Reused", "hits": 49, "misses": 6, "newest_values": true}
+{"step": "reopen after 20 commits, queue of 5", "verify_result": "cache too old, clearing", "opened": "Reused", "hits": 2, "misses": 100, "newest_values": true}
+{"step": "second private open", "result": "OSError: the cache file is locked"}
+{"step": "shared open of a private file", "result": "OSError: the cache file is locked"}
+{"step": "cache newer than the server", "verify_result": "Cache newer than server"}
