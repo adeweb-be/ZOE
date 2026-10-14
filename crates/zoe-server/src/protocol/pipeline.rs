@@ -503,6 +503,15 @@ impl Calls {
         }
     }
 
+    /// End the lock wait of the vote of the session, and each later one:
+    /// the vote fails at once and releases the locks that it took. The end
+    /// of the connection calls it, except at a stop of the server.
+    pub(crate) fn end_lock_wait(&self) {
+        if let Some(session) = &self.session {
+            session.end_lock_wait();
+        }
+    }
+
     /// Wait until each call that started ends. The thread of the
     /// transaction runs the calls that wait, then ends, and that aborts the
     /// open transaction.
@@ -516,9 +525,13 @@ impl Calls {
 
 impl Drop for Calls {
     /// The thread of the transaction ends also when the task of the
-    /// connection drops before `finish`, as at the stop of the runtime: it
-    /// runs the calls that wait, then ends and aborts the open transaction.
+    /// connection drops before `finish`, as at the stop of the runtime. A
+    /// drop before `finish` ends the lock wait of the session. A drop
+    /// inside `finish`, as at the forced close of a stop, ends no lock
+    /// wait, because `finish` removes the session first. Then the thread
+    /// runs the calls that wait, ends and aborts the open transaction.
     fn drop(&mut self) {
+        self.end_lock_wait();
         self.lane.end();
     }
 }
@@ -691,6 +704,46 @@ mod tests {
             connection.finish().await;
         });
         assert!(store.lock_table_is_empty());
+    }
+
+    #[test]
+    fn the_end_of_the_connection_ends_the_lock_wait_of_its_vote() {
+        let (storages, store) = storages("lock-wait-ends");
+        // Another transaction holds the lock of oid 2 for the whole test.
+        let mut holder = store.tpc_begin(b"", b"", b"").unwrap();
+        holder.store(zoe_core::Oid(2), Tid::ZERO, b"held").unwrap();
+        holder.vote().unwrap();
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        let ended = runtime().block_on(async {
+            let mut connection = Calls::new(
+                storages,
+                outbox.clone(),
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
+            let register = vec![Value::from("1"), Value::Boolean(false)];
+            // The vote takes the lock of oid 1 and waits for oid 2, longer
+            // than the test when nothing ends the wait.
+            let calls = vec![
+                call(1, "register", register),
+                begin(7),
+                storea(1, 7),
+                storea(2, 7),
+                call(2, "vote", vec![Value::from(7)]),
+            ];
+            start(&mut connection, calls).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let started = Instant::now();
+            connection.end_lock_wait();
+            connection.finish().await;
+            started.elapsed()
+        });
+        assert!(ended < Duration::from_secs(5), "the end took {ended:?}");
+        // Only the holder holds a lock.
+        holder.abort();
+        assert!(store.lock_table_is_empty());
+        assert_eq!(store.last_transaction(), Tid::ZERO);
     }
 
     #[test]
