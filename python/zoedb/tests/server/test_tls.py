@@ -39,6 +39,7 @@ def make_ca(directory, name):
     openssl(
         "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
         "-subj", f"/CN={name}", "-keyout", f"{name}.key", "-out", f"{name}.pem",
+        "-addext", "keyUsage = critical, keyCertSign, cRLSign",
         cwd=directory,
     )  # fmt: skip
 
