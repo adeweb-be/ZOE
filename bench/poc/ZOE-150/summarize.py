@@ -77,7 +77,7 @@ def per_call_objects(r):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("results")
-    p.add_argument("--foreign-limit", type=float, default=1.0)
+    p.add_argument("--foreign-limit", type=float, default=1.5)
     p.add_argument("--json", help="write the per-cell numbers here")
     args = p.parse_args()
     runs, picked = load(args.results, args.foreign_limit)
@@ -85,7 +85,7 @@ def main():
     main_ = cells(picked, "main", "poc-main")
     proto = cells(picked, "main", "poc-proto")
     floor = cells(picked, "floor", "floor")
-    spans = {**cells(picked, "spans", "poc-proto"), **{}}
+    spans = cells(picked, "spans", "poc-proto")
     spans_main = cells(picked, "spans", "poc-main")
     keys = sorted(set(zeo) & set(proto), key=key_order)
 
@@ -105,14 +105,12 @@ def main():
         m = main_.get(k)
         f = floor.get(k)
         dist = sum(r["disturbed"] for r in zeo[k] + proto[k] + (m or []))
+        main_cells = f"{med(m):,.0f} | {med(m) / z:.2f} | {spread(m):.0f} %" if m else "- | - | -"
+        floor_cell = f"{med(f):,.0f}" if f else "-"
         print(
             f"| {sc} | {mode} | {c} | {size_text(size)} | {py} | {len(zeo[k])}/{len(proto[k])}/{len(m or [])} "
-            f"| {spread(zeo[k]):.0f} % | {spread(proto[k]):.0f} % "
-            f"| {med(m):,.0f} | {med(m) / z:.2f} | {spread(m):.0f} % " if m else "| - | - | - "
-            f"| {med(f):,.0f} | " if f else "| - | ",
-            end="",
+            f"| {spread(zeo[k]):.0f} % | {spread(proto[k]):.0f} % | {main_cells} | {floor_cell} | {dist} |"
         )
-        print(f"{dist} |")
         row = {
             "zeo_ops": z, "poc_ops": med(proto[k]), "main_ops": med(m) if m else None,
             "floor_ops": med(f) if f else None,

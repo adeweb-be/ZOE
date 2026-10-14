@@ -31,7 +31,8 @@ target/bench/venv-3.13/bin/python bench/poc/ZOE-150/summarize.py bench/poc/ZOE-1
 | --- | --- |
 | `setup.sh` | builds `zoe-main` and `zoe-proto` into `target/zoe150`, the environments `target/bench/venv-3.13` and `venv-3.14t` from the lock of `bench/shootout` (without zoedb and RelStorage), the POC client for each interpreter, and py-spy |
 | `driver.py` | one run: the server pinned to `--server-cpus`, zodbshootout pinned to `--client-cpus`, one JSON line with ops/s, the samples, the CPU of the server and of the client, the CPU of everything else (`foreign_cores`), the governor and the frequency of each CPU before and after, the `/metrics` deltas of `zoe serve`, the size of the store, and the modules that turned the GIL back on; with `--spans`, the OTLP spans of `zoe serve` summed by name; with `--profile`, the counters of the prototypes |
-| `run.py` | the full run; a run with more than `--foreign-limit` cores of other load runs again, and both lines stay |
+| `run.py` | the full run; a run with more than `--foreign-limit` cores of other load (1.5 by default) runs again, and both lines stay. A cell that does not fit the disk is skipped, and a later start runs it |
+| `full.sh` | starts `run.py` from the root of the worktree |
 | `rtt.py` | the round trip of one call: loopback TCP between two Python processes, `new_oids(1)` and `ping` through `ZEO.ClientStorage`, `new_oids(1)` through the POC client |
 | `gil.py` | imports the stacks of the runs and says whether the GIL is on |
 | `wrap-pyspy.sh` | a prefix of zodbshootout: py-spy samples the client |

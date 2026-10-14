@@ -68,6 +68,13 @@ def key(tag, python, config, mode, c, size, scenario, rnd):
     return (tag, python, config, mode, c, size, names.get(scenario, scenario), rnd)
 
 
+def disk_needed(c, size):
+    """The bound of the harness for one value of a cell (shootout.disk_needed)."""
+    n, loops = 100, (100 if c <= 10 else 30)
+    records = (c * n + n) + (c + 3) + 2 * c * loops * (n + 1)
+    return records * (size + 8 * KB) + 64 * KB * KB
+
+
 def python_label(py):
     out = subprocess.run(
         [venv_python(py), "-c", "import sys, sysconfig; print(sys.version.split()[0] + ('t' if sysconfig.get_config_var('Py_GIL_DISABLED') else ''))"],
@@ -91,6 +98,12 @@ class Runner:
         k = key(tag, self.labels[py], config, mode, c, size, scenario, rnd)
         if k in self.done:
             return None
+        needed, free = disk_needed(c, size), shutil.disk_usage(a.work).free
+        if free < needed:
+            # The run goes on with the other cells. A later start of run.py
+            # runs this one when the disk has room.
+            log(f"SKIPPED, not enough free disk: {k}: {needed} bytes needed, {free} free")
+            return None
         attempt = 0
         while True:
             attempt += 1
@@ -100,7 +113,7 @@ class Runner:
                 "--attempt", str(attempt), "--tag", tag, "--pool", str(a.pool),
                 "--server-cpus", a.server_cpus, "--client-cpus", a.client_cpus,
                 "--zeo-python", venv_python("3.13"), "--work", str(a.work), "--results", str(a.out),
-                *extra,
+                "--warmups", str(a.warmups), *extra,
             ]
             done = subprocess.run(cmd, capture_output=True, text=True)
             line = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else done.stderr[-500:]
@@ -133,9 +146,14 @@ def phase_machine(r):
         "commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
     }
     sys.path.insert(0, str(HERE))
-    from driver import cpu_state
+    from driver import busy_seconds, cpu_state, kernel_seconds
 
     info["cpu"] = cpu_state()
+    # The load of the machine with no run: the base of foreign_cores.
+    b0, k0 = busy_seconds(), kernel_seconds()
+    time.sleep(10)
+    info["idle_cores"] = round(((busy_seconds() - b0) - (kernel_seconds() - k0)) / 10, 2)
+    log(f"idle load: {info['idle_cores']} cores")
     (a.out.parent / "machine.json").write_text(json.dumps(info, indent=1) + "\n")
     log("machine.json written")
 
@@ -212,6 +230,8 @@ def phase_main(r):
             for scenario in SCENARIOS:
                 for rnd in range(1, a.rounds + 1):
                     for config in a.configs:
+                        if config == "poc-main" and rnd > a.main_rounds:
+                            continue
                         r.driver(py, config, mode, c, size, scenario, rnd)
 
 
@@ -230,14 +250,18 @@ def main():
     p.add_argument("--pythons", nargs="+", default=["3.13", "3.14t"])
     p.add_argument("--configs", nargs="+", default=CONFIGS)
     p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--main-rounds", type=int, help="the rounds of poc-main (default: --rounds)")
     p.add_argument("--cells", nargs="*", help="cells as MODE:CONCURRENCY:KB, for example threads:4:1 (default: the full set)")
     p.add_argument("--phases", nargs="+", default=PHASES, choices=PHASES)
     p.add_argument("--pool", type=int, default=16)
+    p.add_argument("--warmups", type=int, default=1, help="the warmups of each value; the harness runs 1")
     p.add_argument("--server-cpus", default="0-5")
     p.add_argument("--client-cpus", default="6-19")
-    p.add_argument("--foreign-limit", type=float, default=1.0, help="the cores of other load that make a run disturbed")
+    p.add_argument("--foreign-limit", type=float, default=1.5, help="the cores of other load that make a run disturbed")
     p.add_argument("--attempts", type=int, default=2)
     args = p.parse_args()
+    if args.main_rounds is None:
+        args.main_rounds = args.rounds
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.work.mkdir(parents=True, exist_ok=True)
     r = Runner(args)
