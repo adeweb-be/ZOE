@@ -256,8 +256,10 @@ pub(super) struct ServeArgs {
     blocking_threads: Option<NonZeroUsize>,
 
     /// Serve every store for reads only. The server opens each store
-    /// read-only: it changes no byte of the store, and holds its lock, so
-    /// no writer opens the store meanwhile. The store must exist, and a
+    /// read-only, and holds its lock, so no writer opens the store
+    /// meanwhile. It changes no byte of a store that was closed cleanly. It
+    /// writes zoe.redb only when it repairs a store that a writer left
+    /// open, and then logs a warning. The store must exist, and a
     /// store with blobs must get its blob directory. A client that
     /// registers to write gets ReadOnlyError; a client with
     /// read_only_fallback then registers read-only. A transaction fails at
