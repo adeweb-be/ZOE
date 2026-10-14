@@ -11,7 +11,7 @@ NIX_IMAGE = "nixos/nix:2.35.2"
 POSTGRES_IMAGE = "postgres:17.10-alpine"
 
 # The devenv release that reads devenv.yaml and devenv.lock. Keep it equal
-# to the devenv version of the developers.
+# to require_version in devenv.yaml.
 DEVENV = "github:cachix/devenv/v2.4.0"
 
 NIX_CONF = """\
