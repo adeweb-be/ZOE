@@ -538,8 +538,9 @@ pub(crate) async fn serve_stream(
     }
 }
 
-/// Wait for `finished` at a stop of the server, and keep the connection
-/// open after it as long as a byte of the client can still cause a reset.
+/// Wait for `finished` at a stop of the server. Then keep the connection
+/// open for `LINGER` at most, so that a late byte of the client causes no
+/// reset.
 ///
 /// The reader reads no more calls. It reads the bytes that arrive and
 /// drops them. It never decodes them, so they take no ticket and get no
@@ -560,7 +561,7 @@ async fn linger(
     runtime: &dyn Runtime,
     closing: &mut Closing,
 ) {
-    let mut dropped = [0u8; DROPPED];
+    let mut dropped = vec![0u8; DROPPED];
     let mut finished = pin!(finished);
     loop {
         tokio::select! {
@@ -971,12 +972,27 @@ mod tests {
         client.write_all(&[7; 100_000]).unwrap();
 
         // The client gets the end of the connection, not a reset, and no
-        // reply. The connection ends while the client keeps its side open.
+        // reply.
         let mut rest = Vec::new();
         let read = client.read_to_end(&mut rest);
         assert!(read.is_ok(), "{read:?}");
         assert!(rest.is_empty(), "{} bytes after the stop", rest.len());
+
+        // The client sends again while the server waits after its FIN. The
+        // connection ends within the wait, while the client keeps its side
+        // open.
+        let fin = Instant::now();
+        let lingering = !served.is_finished();
+        client.write_all(&[7; 100_000]).unwrap();
         wait_until("the connection did not end", || served.is_finished());
+        let waited = fin.elapsed();
+        assert!(waited < Duration::from_secs(5), "the wait took {waited:?}");
+        // The server read the late bytes before its close. So the close
+        // is not a reset.
+        if lingering {
+            let read = client.read(&mut [0; 16]);
+            assert!(matches!(read, Ok(0)), "{read:?}");
+        }
         drop(client);
         drop(runtime);
     }
