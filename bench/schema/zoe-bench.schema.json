@@ -1,0 +1,439 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/zoe-bench.schema.json",
+  "title": "zoe-bench result",
+  "description": "One run of zoe-bench load or zoe-bench saturate against a ZEO server. Results are numbers about a synthetic corpus, never data. The document holds no host name, user name or path.",
+  "type": "object",
+  "oneOf": [
+    {
+      "required": [
+        "schema_version",
+        "command",
+        "version",
+        "machine",
+        "run",
+        "settings"
+      ],
+      "properties": {
+        "schema_version": {
+          "$ref": "#/$defs/schema_version"
+        },
+        "command": {
+          "const": "load"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "machine": {
+          "$ref": "#/$defs/machine"
+        },
+        "run": {
+          "$ref": "#/$defs/run"
+        },
+        "settings": {
+          "$ref": "#/$defs/load_settings"
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/measure"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    {
+      "required": [
+        "schema_version",
+        "command",
+        "version",
+        "machine",
+        "run",
+        "settings",
+        "steps",
+        "loads_per_second_under_ceiling",
+        "clients_under_ceiling"
+      ],
+      "properties": {
+        "schema_version": {
+          "$ref": "#/$defs/schema_version"
+        },
+        "command": {
+          "const": "saturate"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "machine": {
+          "$ref": "#/$defs/machine"
+        },
+        "run": {
+          "$ref": "#/$defs/run"
+        },
+        "settings": {
+          "$ref": "#/$defs/saturate_settings"
+        },
+        "steps": {
+          "description": "The steps, with more clients at each step: 1, 2, 4 and on, then max_clients. The last step is the first one over the ceiling, or the step of max_clients.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        },
+        "loads_per_second_under_ceiling": {
+          "description": "loads_per_second of the last step whose load_p99_seconds is at most the ceiling, or null when no step is under it.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "clients_under_ceiling": {
+          "description": "The clients of the same step, or null.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  ],
+  "$defs": {
+    "schema_version": {
+      "description": "The version of this schema. A change that a reader of the previous version cannot read increments it.",
+      "const": 1
+    },
+    "version": {
+      "description": "The version of zoe-bench.",
+      "type": "string",
+      "minLength": 1
+    },
+    "machine": {
+      "description": "The machine that runs the clients. The server can run on another machine. It holds no host name, user name or path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "cpu",
+        "logical_cpus",
+        "memory_bytes",
+        "os",
+        "kernel",
+        "arch"
+      ],
+      "properties": {
+        "name": {
+          "description": "A slug of ZOE_BENCH_MACHINE, or a slug of the CPU model.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "cpu": {
+          "description": "The CPU model.",
+          "type": "string",
+          "minLength": 1
+        },
+        "logical_cpus": {
+          "description": "The CPUs that the process can use.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "memory_bytes": {
+          "description": "The physical memory, or 0 when the system does not show it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "os": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kernel": {
+          "description": "The kernel release.",
+          "type": "string",
+          "minLength": 1
+        },
+        "arch": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started",
+        "commit"
+      ],
+      "properties": {
+        "started": {
+          "description": "When the run started, in UTC.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "commit": {
+          "description": "ZOE_BENCH_COMMIT when it is a commit id, else null.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{7,40}$"
+        }
+      }
+    },
+    "workload": {
+      "description": "The workload of each client.",
+      "type": "object",
+      "required": [
+        "storage",
+        "pipeline",
+        "objects",
+        "txn_size",
+        "write_ratio",
+        "zipf",
+        "seed",
+        "object_size"
+      ],
+      "properties": {
+        "storage": {
+          "description": "The storage name that each client gives to register.",
+          "type": "string"
+        },
+        "pipeline": {
+          "description": "The most loadBefore calls in flight for one client.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "objects": {
+          "description": "The number of objects that the run creates first.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "txn_size": {
+          "description": "The number of different objects that each transaction reads.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "write_ratio": {
+          "description": "The probability that a transaction writes back its objects.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "zipf": {
+          "description": "The exponent of the Zipf law that picks the objects. 0 is uniform; 1.0 is the hot-spot case.",
+          "type": "number",
+          "minimum": 0
+        },
+        "seed": {
+          "description": "The seed of the schedules of the clients. The same seed gives the same schedules.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "object_size": {
+          "description": "The size of the pickle of each object, in bytes.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "load_settings": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/workload"
+        }
+      ],
+      "required": [
+        "clients",
+        "transactions"
+      ],
+      "properties": {
+        "clients": {
+          "description": "The number of clients, each with its own connection.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "transactions": {
+          "description": "The number of transactions of each client.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "saturate_settings": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/workload"
+        }
+      ],
+      "required": [
+        "max_clients",
+        "p99_ceiling_seconds",
+        "warmup_seconds",
+        "step_seconds",
+        "transactions"
+      ],
+      "properties": {
+        "max_clients": {
+          "description": "The most clients of a step.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "p99_ceiling_seconds": {
+          "description": "The ceiling of the p99 of loadBefore, in seconds. The default is the number of N3, but a run on a small store is not an N3 verdict: N3 is a cache miss on a 10 GB store.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "warmup_seconds": {
+          "description": "The time at the start of each step that does not count.",
+          "type": "number",
+          "minimum": 0
+        },
+        "step_seconds": {
+          "description": "The time of each step after the warm-up.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "transactions": {
+          "description": "The most transactions of each client in a step after the warm-up, or null for no limit. A step ends at the end of its time or at this limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "measure": {
+      "description": "The numbers of one run of the workload by a number of clients. A retry runs a transaction again after a conflict at its vote, and each retry counts.",
+      "type": "object",
+      "required": [
+        "transactions",
+        "read_only",
+        "commits",
+        "conflicts",
+        "retries",
+        "conflicts_per_1000_commits",
+        "loads",
+        "elapsed_seconds",
+        "loads_per_second",
+        "commits_per_second",
+        "load_p50_seconds",
+        "load_p99_seconds",
+        "load_max_seconds",
+        "lock_wait_p50_seconds",
+        "lock_wait_p99_seconds"
+      ],
+      "properties": {
+        "transactions": {
+          "description": "The transactions of all clients that count: each one commits or only reads. The warm-up of a saturate step does not count.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "read_only": {
+          "description": "The transactions that only read.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "commits": {
+          "description": "The transactions that wrote and committed.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "conflicts": {
+          "description": "The votes that failed with a conflict.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "retries": {
+          "description": "The attempts after the first one of each transaction.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "conflicts_per_1000_commits": {
+          "description": "conflicts times 1,000, divided by commits; null without a commit.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "loads": {
+          "description": "The loadBefore calls, retries included.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsed_seconds": {
+          "description": "The time from the start of the clients, or from the end of the warm-up of a saturate step, to the end of the last client.",
+          "type": "number",
+          "minimum": 0
+        },
+        "loads_per_second": {
+          "description": "loads divided by elapsed_seconds.",
+          "type": "number",
+          "minimum": 0
+        },
+        "commits_per_second": {
+          "description": "commits divided by elapsed_seconds.",
+          "type": "number",
+          "minimum": 0
+        },
+        "load_p50_seconds": {
+          "description": "The median time of a loadBefore call, from the send of the call to its reply.",
+          "type": "number",
+          "minimum": 0
+        },
+        "load_p99_seconds": {
+          "description": "The 99th percentile of the same times, by the nearest rank.",
+          "type": "number",
+          "minimum": 0
+        },
+        "load_max_seconds": {
+          "description": "The longest of the same times.",
+          "type": "number",
+          "minimum": 0
+        },
+        "lock_wait_p50_seconds": {
+          "description": "The median time of a vote, where the server takes the locks of the oids and waits for them; null without a vote.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "lock_wait_p99_seconds": {
+          "description": "The 99th percentile of the same times; null without a vote.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "step": {
+      "description": "One step of a saturate run: its clients and its numbers.",
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/measure"
+        }
+      ],
+      "required": [
+        "clients"
+      ],
+      "properties": {
+        "clients": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  }
+}

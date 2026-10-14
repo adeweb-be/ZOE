@@ -1,7 +1,7 @@
 //! Tests of the configuration file of `zoe serve` beside its acceptance
-//! test: the twin of an option wins over the file, and the stores of the
-//! file add to the stores of the command line, and the twin and the key
-//! of `--read-only`.
+//! test: the twin of an option wins over the file, the stores of the file
+//! add to the stores of the command line, the twin and the key of
+//! `--read-only`, and the file opens the admin port.
 
 mod wire;
 
@@ -91,4 +91,20 @@ fn the_twin_and_the_key_of_read_only_make_every_store_read_only() {
         assert_eq!(fault.class, "ZODB.POSException.ReadOnlyError", "{args:?}");
         conn.register("1", true).unwrap();
     }
+}
+
+#[test]
+fn the_file_gives_the_admin_port() {
+    let dir = fresh_dir("config-admin");
+    let config = dir.join("zoe.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "path = \"{}\"\nadmin-listen = \"127.0.0.1:0\"\n",
+            s(&dir.join("store"))
+        ),
+    )
+    .unwrap();
+    let server = Server::start(&["--config", s(&config)], &[]);
+    assert!(server.admin.is_some(), "the file opened no admin port");
 }
