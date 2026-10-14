@@ -100,6 +100,11 @@ pub struct Options {
     /// same one. A writer open refuses a store with blob records whose
     /// blob directory has no layout file, with `MissingBlobDir`.
     pub blob_dir: Option<PathBuf>,
+    /// The most bytes that the page cache of the database holds: the pages
+    /// that reads keep, and the pages that a write buffers before it goes
+    /// to the file. `None`, the default, keeps the default of redb, 1 GiB.
+    /// This is `cache-size` in the configuration.
+    pub cache_size: Option<usize>,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -118,6 +123,7 @@ impl Default for Options {
             lock_warn: None,
             transaction_warn: None,
             blob_dir: None,
+            cache_size: None,
             _more: (),
         }
     }
@@ -247,7 +253,7 @@ impl Store {
     }
 
     /// Open the store as `open_full` does. `cache_size` sets the page cache
-    /// of the database in bytes. `None` keeps the default of redb.
+    /// of the database in bytes. `None` keeps `options.cache_size`.
     fn open_cached<V: Vfs>(
         vfs: V,
         clock: impl Clock + 'static,
@@ -283,7 +289,7 @@ impl Store {
         vfs.sync_dir()?;
 
         let mut builder = redb::Builder::new();
-        if let Some(bytes) = cache_size {
+        if let Some(bytes) = cache_size.or(options.cache_size) {
             builder.set_cache_size(bytes);
         }
         let db = builder
@@ -330,7 +336,11 @@ impl Store {
             None => None,
         };
         let dir = OsVfs::existing(dir.as_ref(), DATABASE)?;
-        let db = redb::Builder::new()
+        let mut builder = redb::Builder::new();
+        if let Some(bytes) = options.cache_size {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder
             .open_read_only(dir.path(DATABASE))
             .map_err(|e| match e {
                 redb::DatabaseError::RepairAborted => ZoeError::NotClosedCleanly,
@@ -493,9 +503,15 @@ impl Store {
         self.backend.remove_record_for_test(oid, tid)
     }
 
-    /// Tell if no transaction holds or waits for a lock. A test of a skin
-    /// uses it to show that every lock is released.
-    #[doc(hidden)]
+    /// Tell if no transaction holds or waits for a lock. The method changes
+    /// nothing.
+    ///
+    /// The lock table of a store that the process just opened is empty, so
+    /// it holds no stale entry. For this reason, the readiness of
+    /// `zoe serve` reads the method once after the open of each store. A
+    /// running transaction holds locks, and these locks are not stale. The
+    /// lock table lives in the memory of one process, so the method tells
+    /// nothing about other processes.
     pub fn lock_table_is_empty(&self) -> bool {
         self.locks.is_empty()
     }
@@ -1510,5 +1526,34 @@ mod tests {
         }
         assert_eq!(tree(&root), before);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_cache_size_bounds_the_page_cache_of_the_database() {
+        let vfs = MemVfs::new();
+        {
+            let store = Store::open_vfs(vfs.clone()).unwrap();
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(Oid(1), Tid::ZERO, &[7; 4096]).unwrap();
+            txn.vote().unwrap();
+            txn.finish().unwrap();
+        }
+        // Return the bytes that a second load of the same record reads
+        // from the file, after an open with `cache_size`.
+        let second_load = |cache_size| {
+            let options = Options {
+                cache_size,
+                ..Options::default()
+            };
+            let store = Store::open_full(vfs.clone(), SystemClock, options).unwrap();
+            store.load(Oid(1)).unwrap();
+            let before = vfs.bytes_read();
+            store.load(Oid(1)).unwrap();
+            vfs.bytes_read() - before
+        };
+        assert_eq!(Options::default().cache_size, None);
+        assert_eq!(second_load(None), 0);
+        assert_eq!(second_load(Some(1 << 20)), 0);
+        assert!(second_load(Some(0)) > 0);
     }
 }

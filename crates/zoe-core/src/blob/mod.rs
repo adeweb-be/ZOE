@@ -17,7 +17,11 @@
 //! file without its blob record, but then the intent file is on disk.
 //! Opening a store reads only `blobs/tmp/`: it removes the blob files that
 //! an intent file names and that have no blob record, then the intent
-//! files and the temporary files.
+//! files and the temporary files. In `blobs/tmp/` it removes only the
+//! regular files whose names the store owns: `<digits>.tmp`, the intent
+//! files, `layout.tmp` and `upload-<digits>`. Every other file stays. With
+//! a shared blob directory, `blobs/tmp/` is also the temporary directory of
+//! each ZEO client, so the files of the clients stay.
 //!
 //! Pack uses the same intent files. Before it commits the removal of blob
 //! records, it writes and syncs an intent file for each tid of them. After
@@ -367,8 +371,10 @@ impl BlobStore {
     ///
     /// Then a writer removes the leftovers of a crash in `blobs/tmp/`: the
     /// blob files that an intent file names and that `backend` has no blob
-    /// record for, the intent files and the temporary files. It does this
-    /// only when the layout file exists. The first blob writes the layout
+    /// record for, then the intent files and the temporary files. In
+    /// `blobs/tmp/` it removes only the regular files whose names the store
+    /// owns (`is_owned_name`). Other files stay. It does this only when the
+    /// layout file exists. The first blob writes the layout
     /// file before any intent file or temporary file, so a directory
     /// without it holds none, and its other files are never removed.
     ///
@@ -478,7 +484,7 @@ impl BlobStore {
     }
 
     /// Remove the leftovers of a crash in `blobs/tmp/`. Only regular
-    /// files with a name that the server owns are removed there. Other
+    /// files with a name that the store owns are removed there. Other
     /// files stay: with a shared blob directory, a ZEO client keeps its
     /// temporary files in `blobs/tmp/`.
     fn recover(&self, backend: &dyn Backend) -> Result<()> {
@@ -902,10 +908,11 @@ fn is_temp_name(file: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Tell if `file`, a name in `blobs/tmp/`, is a name that the server owns:
+/// Tell if `file`, a name in `blobs/tmp/`, is a name that the store owns:
 /// a temporary file of the core, an intent file, the new layout file, or
-/// `upload-` and one or more ASCII digits. A writer open removes only these
-/// files in `blobs/tmp/`.
+/// `upload-` and one or more ASCII digits. A store can hold a file with
+/// this last name from an upload of `zoe serve`. A writer open removes
+/// only these files in `blobs/tmp/`.
 fn is_owned_name(file: &str) -> bool {
     is_temp_name(file)
         || intent_tid(file).is_some()
@@ -1895,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn the_server_owns_only_its_names_in_tmp() {
+    fn the_store_owns_only_its_names_in_tmp() {
         for name in [
             "0.tmp",
             "7.tmp",
@@ -1933,7 +1940,7 @@ mod tests {
         }
     }
 
-    /// A writer open removes the files of the server in `blobs/tmp/`, syncs
+    /// A writer open removes the files of the store in `blobs/tmp/`, syncs
     /// the directory, and keeps every other file with its bytes.
     #[test]
     fn an_open_keeps_a_file_of_a_client_in_tmp() {
