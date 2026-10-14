@@ -8,6 +8,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
+- `src/signals.rs`: the handlers of SIGTERM and SIGHUP, the watcher thread that closes the open storages of the process at a signal, and the at-fork hook. ADR 0031 records the design.
 - `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>`, `<zoeclient>` and `<zoe-server>` sections of ZConfig and the `zoe://` URI of zodburi.
 - `python/zoedb/src/zoe/zeo.py`: `zoe.zeo.ClientStorage`, the client of a ZOE server, in Python.
 - `python/zoedb/src/zoe/serve.py`: `python -m zoe.serve`, which runs the `zoe` binary with the `<zoe-server>` section.
@@ -21,9 +22,9 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `import zoe` does not import ZODB. `zoe.Storage` and `zoe.WrongThread` load `zoe.storage` at first use. The extension imports an exception class of ZODB only when it raises it.
 - Every call into the core runs inside `py.detach`: it releases the GIL, and on a free-threaded build it holds nothing.
 - No mutex of the core or of this module is held while Python code runs. A lookup under a mutex binds its result to a local before it builds an exception, because building an exception runs Python code. A mutex that can wait, such as the mutex of a transaction entry during a vote, is taken only inside `py.detach`. A Python reference is dropped outside every mutex. The per-OID locks of a vote are not mutexes: they stay held while `_p_resolveConflict` runs.
-- The last reference to the store drops inside `py.detach`, so the database closes without the GIL: each call moves its reference into the detached closure, `close` drops the store there, and a storage that Python frees without `close` closes its store detached too.
+- The last reference to the store drops without the GIL, so the database closes without it: each call moves its reference into the detached closure, `close` drops the store there, a storage that Python frees without `close` closes its store detached too, and the watcher of the signals, which never attaches, drops it in its thread.
 - `zoe.Storage` is thread-safe and all Connections of a process share it.
-- A table keyed by the address of the ZODB transaction object holds one core transaction (`Txn<Arc<Store>>`) per `tpc_begin`. The entry keeps the object alive, so no other object gets its address while the entry exists.
+- A table keyed by the address of the ZODB transaction object holds one core transaction (`Txn<StoreRef>`, which shares the store) per `tpc_begin`. The entry keeps the object alive, so no other object gets its address while the entry exists.
 - A second `tpc_begin` of a transaction, or a call with a transaction that the storage did not begin, raises `StorageTransactionError`. `tpc_abort` of an unknown transaction does nothing.
 - The thread that calls `tpc_begin` drives the transaction. `store`, `deleteObject`, `restore`, `storeBlob`, `restoreBlob`, `checkCurrentSerialInTransaction` and `tpc_vote` from another thread raise `zoe.WrongThread`, a subclass of `StorageTransactionError`. The core checks the thread, so a refused call changes nothing. `tpc_finish` and `tpc_abort` work from any thread.
 - `temporaryDirectory()` is `tmp` in the blob directory, the `blobs/tmp/` of the core. The call creates the blob store when it does not exist.
@@ -67,6 +68,23 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - The command writes its report and its messages to the file descriptors 1 and 2 of the process, not to `sys.stdout` and `sys.stderr`.
 - A change to a public Python API is a stop-and-ask.
 - `_lock_table_is_empty()` tells if no transaction of the core holds or waits for a lock. It is a private hook for the tests, not a public API.
+
+## The close at SIGTERM and SIGHUP
+
+- When `zoe.Storage` opens a store, read-only too, the extension installs a handler of SIGTERM and one of SIGHUP, each only when `signal.getsignal` gives `signal.SIG_DFL` for that signal. A return of `None`, a handler that Python did not install, is not the default: the extension then installs nothing for that signal. zoe-py has no `unsafe` code and no `libc` for this check. An ignored signal and a handler of the application keep their action.
+- The extension installs each handler at most once per process. Each later open checks again a signal that has no handler of the extension yet.
+- The handler of signal-hook only writes to a pipe. The first install registers the at-fork hook, then starts one watcher thread per process, `zoe-signals`, which reads the pipe.
+- The watcher never attaches to the interpreter: it runs no Python code, takes no GIL and drops no Python reference.
+- The store and the table of a storage live in `Shared`, which the storage holds in an `Arc`. The process keeps a list of `Weak<Shared>`, one for each storage that opened. The store is a `StoreRef`: a share of the store, whose drop sets the flag `database_closed` of `Shared` after the database closes.
+- At a signal, the watcher closes each open storage of the process. It marks the table closed, moves the entries of the open transactions into `Table::closing` and takes the store. So, as after `close`, `tpc_begin` and each call on the store raise `StorageError`, and a call with a transaction of before the signal raises `StorageTransactionError`. The entries hold Python references, so they stay in `closing`. The watcher aborts each transaction there that no call uses: it takes the transaction of the core out of the entry. When no call holds the store (`Arc::try_unwrap`), it drops the store in its thread, so the database closes cleanly. A `tpc_finish` takes its entry out of the table before its commit, so a commit that started before the signal ends and is durable before the database closes.
+- The store closes once: in `close`, in the drop or in the watcher, whichever takes it first. When `close` or the drop took it first, the watcher waits for the flag `database_closed`.
+- The wait lasts at most 5 seconds from the signal, for all the storages together. A store that a call still holds at the bound stays open, and the others close. After the bound, the watcher starts no close and drops no share of a store.
+- After the close, or at the bound, the watcher calls `emulate_default_handler`: it restores the default action of the signal and raises it, so the process ends with the status of the signal. This holds also when no storage is open, when a close fails and when a close panics. A second signal during the close changes nothing.
+- `close` and the drop of a storage remove the entries of the table, `closing` too. The drop removes them, so that their Python references drop there, never in the watcher, which can hold the last `Arc<Shared>`.
+- A handler that the application sets later with `signal.signal` replaces the handler of the extension. The extension never puts its handler back.
+- The at-fork hook gives the child of `os.fork()` the default action of each signal of the extension whose action Python still sees as `SIG_DFL`. The child has no watcher, and the pipe of the handler is the pipe of the parent. A handler of the application stays in the child. The child does not install the handlers again.
+- No option and no ZConfig key turns the handlers off or sets the bound.
+- `signal-hook` is the only crate that the close adds.
 
 ## The `<zoe>` stanza and the `zoe://` URI
 
@@ -135,4 +153,5 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 - `python/zoedb/tests/server/test_sequences_over_zeo.py` is the acceptance test of `zoe.zeo.ClientStorage`, of sequences over the protocol and of `<zoeclient>`. `python/zoedb/tests/server/test_zoe_client.py` holds their unit tests.
 - `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
+- `python/zoedb/tests/acceptance/test_signal_close.py` is the acceptance test of the close at SIGTERM and SIGHUP. `python/zoedb/tests/test_zoe_signals.py` holds its unit tests. Each runs child interpreters, because the handlers stay in a process.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.

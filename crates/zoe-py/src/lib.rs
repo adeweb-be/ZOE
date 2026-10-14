@@ -7,11 +7,15 @@
 //!
 //! `main` runs the `zoe` command. The console script `zoe` of the wheel
 //! calls it through `zoe.__main__`.
+//!
+//! The open of a store installs the handlers of SIGTERM and SIGHUP that
+//! close the stores of the process (`signals`).
 
 mod cli;
 mod errors;
 mod publish;
 mod sequence;
+mod signals;
 mod storage;
 
 /// The extension module.
