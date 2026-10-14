@@ -145,7 +145,7 @@ fn count_objects(records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>)
 fn decode_object_count(value: Option<&[u8]>) -> Result<u64> {
     value
         .and_then(format::decode_u64)
-        .ok_or_else(|| ZoeError::Format("no object count".to_owned()))
+        .ok_or_else(|| ZoeError::Format("the object count is missing or is not 8 bytes".to_owned()))
 }
 
 /// The redb database of a store.
