@@ -11,7 +11,8 @@
 //! and the oids, renames each blob file into its place, and syncs each
 //! directory. The blob record holds the hash and the size, in the same
 //! backend write transaction as the record. After the commit, `finish`
-//! removes the intent file.
+//! removes the intent file. A deferred commit has no sync, so it keeps its
+//! intent file until a durable commit covers it.
 //!
 //! So a durable blob record always has its file. A crash can leave a blob
 //! file without its blob record, but then the intent file is on disk.
@@ -338,6 +339,10 @@ pub(crate) struct BlobStore {
     dir_lock: Mutex<Option<DirLock>>,
     /// The number of the next temporary file.
     next_temp: AtomicU64,
+    /// The intent files of the deferred commits that no durable commit
+    /// covers yet. Only a holder of the commit sequencer takes this
+    /// mutex, and it takes no other lock while it holds it.
+    kept: Mutex<Vec<String>>,
 }
 
 impl BlobStore {
@@ -349,6 +354,7 @@ impl BlobStore {
             ready: Mutex::new(false),
             dir_lock: Mutex::new(None),
             next_temp: AtomicU64::new(0),
+            kept: Mutex::new(Vec::new()),
         }
     }
 
@@ -801,6 +807,28 @@ impl BlobStore {
         if let Some(intent) = intent {
             let _ = self.dir.remove(&intent);
         }
+    }
+
+    /// Keep the intent file of a deferred commit after its backend commit.
+    /// A crash before a durable commit leaves the file, and the next open
+    /// removes the blob files of the lost commit.
+    pub(crate) fn keep(&self, intent: Option<String>) {
+        if let Some(intent) = intent {
+            self.lock_kept().push(intent);
+        }
+    }
+
+    /// Remove the kept intent files after a durable commit that covers
+    /// their commits. A file that a pack removed already is not an error.
+    pub(crate) fn release_kept(&self) {
+        let kept = std::mem::take(&mut *self.lock_kept());
+        for intent in kept {
+            self.finished(Some(intent));
+        }
+    }
+
+    fn lock_kept(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Write the intent file of `tid` before a pack commits the removal of

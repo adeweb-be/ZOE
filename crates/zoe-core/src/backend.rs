@@ -325,6 +325,15 @@ pub trait WriteTxn {
 
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;
+
+    /// Commit the staged writes without a sync. The writes are visible
+    /// when this returns. They become durable with the next `commit`. A
+    /// crash before it loses them, and the store then ends at the last
+    /// durable commit. A backend that cannot defer a sync keeps this
+    /// default, which calls `commit`.
+    fn commit_deferred(self: Box<Self>) -> Result<()> {
+        self.commit()
+    }
 }
 
 #[cfg(test)]

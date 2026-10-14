@@ -945,6 +945,15 @@ impl WriteTxn for RedbWrite<'_> {
         }
         Ok(())
     }
+
+    fn commit_deferred(mut self: Box<Self>) -> Result<()> {
+        // redb does not sync a commit without durability. The next
+        // durable commit makes it durable.
+        self.txn
+            .set_durability(redb::Durability::None)
+            .map_err(backend)?;
+        self.commit()
+    }
 }
 
 #[cfg(test)]

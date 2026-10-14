@@ -456,6 +456,45 @@ impl Store {
         Txn::begin_restore(self, tid, user, description, extension)
     }
 
+    /// Begin a restore transaction that borrows the store, as
+    /// `tpc_begin_restore` does, whose finish commits without a sync of
+    /// the database file. `Txn::begin_restore_deferred` tells what the
+    /// finish does. `sync` makes the commit durable.
+    pub fn tpc_begin_restore_deferred(
+        &self,
+        tid: Tid,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Txn<&Self>> {
+        self.writable()?;
+        Txn::begin_restore_deferred(self, tid, user, description, extension)
+    }
+
+    /// Make every commit before this call durable.
+    ///
+    /// The call commits one backend write transaction under the commit
+    /// sequencer, with a sync. It writes no record, no transaction row and
+    /// no last tid, so the last tid does not change. Then it removes the
+    /// intent files that the deferred commits kept in `blobs/tmp/`.
+    ///
+    /// A read-only store fails with `ReadOnly`, and a halted store with
+    /// `Halted`. Another error leaves the store halted, as a failed
+    /// `finish` does.
+    pub fn sync(&self) -> Result<()> {
+        self.writable()?;
+        let mut sequencer = self.lock_sequencer();
+        let Some(last) = *sequencer else {
+            return Err(ZoeError::Halted);
+        };
+        // The sequencer stays empty if the commit below fails.
+        *sequencer = None;
+        self.backend.begin_write()?.commit()?;
+        *sequencer = Some(last);
+        self.blobs().release_kept();
+        Ok(())
+    }
+
     /// Return the current pickle of `oid` and its serial.
     pub fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid)> {
         match self.backend.load_before(oid, Tid::MAX)? {
@@ -992,6 +1031,21 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_sync_halts_the_store() {
+        let (store, faults) = faulty_store();
+        let oid = store.new_oid().unwrap();
+        let first = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        faults.write.store(true, Ordering::Relaxed);
+        assert!(matches!(store.sync(), Err(ZoeError::Backend(_))));
+        faults.write.store(false, Ordering::Relaxed);
+
+        assert!(matches!(store.sync(), Err(ZoeError::Halted)));
+        let error = commit(&store, oid, first, b"b");
+        assert!(matches!(error, Err(ZoeError::Halted)), "{error:?}");
+        assert_eq!(store.last_transaction(), first);
+    }
+
+    #[test]
     fn a_halted_store_refuses_a_pack() {
         let (store, faults) = faulty_store();
         let oid = store.new_oid().unwrap();
@@ -1339,6 +1393,11 @@ mod tests {
             store.backend.begin_write(),
             Err(ZoeError::ReadOnly)
         ));
+        assert!(matches!(
+            store.tpc_begin_restore_deferred(Tid(tid.0 + 1), b"", b"", b""),
+            Err(ZoeError::ReadOnly)
+        ));
+        assert!(matches!(store.sync(), Err(ZoeError::ReadOnly)));
         assert!(matches!(
             store.sequence("intids").next(),
             Err(ZoeError::ReadOnly)
