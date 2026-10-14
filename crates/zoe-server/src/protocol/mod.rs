@@ -107,6 +107,9 @@ pub(crate) struct NamedStorage {
     queues: Queues,
     /// True when the server opened the store for reads only.
     read_only: bool,
+    /// True when the clients share the blob directory of the store, so
+    /// that `storeBlobShared` is accepted.
+    shared_blob_dir: bool,
 }
 
 impl NamedStorage {
@@ -121,6 +124,7 @@ impl NamedStorage {
             stats: Stats::new(SystemTime::now()),
             queues,
             read_only: false,
+            shared_blob_dir: false,
         }
     }
 
@@ -128,6 +132,14 @@ impl NamedStorage {
     /// then be open for reads only. A `register` that asks to write fails.
     pub(crate) fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Accept `storeBlobShared` when `shared` is true. The blob directory
+    /// of the store must then have its layout file, so that a client can
+    /// create the directory of an oid there.
+    pub(crate) fn shared_blob_dir(mut self, shared: bool) -> Self {
+        self.shared_blob_dir = shared;
         self
     }
 

@@ -45,6 +45,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::{self, ThreadId};
 use std::time::SystemTime;
 
@@ -380,6 +381,39 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.check_store(oid, data)?;
         let stored_bytes = self.check_size(oid, data)?;
         let blob = self.store.take_blob_file(path)?;
+        if !self.is_restore() {
+            self.store
+                .guardrails
+                .check(SizeLimit::Blob, oid, blob.record().size)?;
+        }
+        self.stage_blob(oid, serial, data, false, stored_bytes, blob)
+    }
+
+    /// Stage a new version of `oid` with the blob in the file `name` of the
+    /// directory of `oid` in the blob directory, as `store_blob_at` does,
+    /// with the same checks. This is the `storeBlobShared` of ZEO: a client
+    /// that shares the blob directory writes the file there, and gives its
+    /// name.
+    ///
+    /// `name` is a name, not a path: it has no `/`, and it ends in `.tmp` or
+    /// `.tmp-`. Another name is refused with `Protocol`. The call syncs the
+    /// levels of the oid directory and the file, then takes the file by
+    /// rename, as `store_blob_at` does. A refused call leaves the file in
+    /// its place, and a file that the transaction took belongs to it.
+    pub fn store_blob_shared(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        name: &str,
+    ) -> Result<()> {
+        self.check_store(oid, data)?;
+        let stored_bytes = self.check_size(oid, data)?;
+        self.store.writable()?;
+        let blob =
+            self.store
+                .blobs()
+                .take_shared(Arc::downgrade(&self.store.backend), oid, name)?;
         if !self.is_restore() {
             self.store
                 .guardrails
