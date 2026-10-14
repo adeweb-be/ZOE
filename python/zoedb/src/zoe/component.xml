@@ -131,6 +131,12 @@
         The most invalidations that wait for one client.
       </description>
     </key>
+    <key name="cache-size" datatype="string">
+      <description>
+        The most bytes that the page cache of each store holds, such as
+        512MB or 1GB. The default is 1GB.
+      </description>
+    </key>
     <key name="lock-timeout" datatype="string">
       <description>
         The longest time that a vote waits for the lock of an object, in
