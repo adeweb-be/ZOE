@@ -207,18 +207,25 @@ class Ci:
         seed: Annotated[
             int | None, Doc("The seed of the kill loop. The default is a random seed")
         ] = None,
+        seeds: Annotated[
+            int, Doc("The seeds of the kill loop under the simulator")
+        ] = 10_000,
     ) -> str:
-        """Run the process kill loop against zoe serve, 10,000 rounds by default.
+        """Run the process kill loop, then the kill loop under the simulator.
 
-        The output gives the seed. The traceback of a failure shows the
-        round. 10,000 rounds need about 3 GB in TMPDIR. The simulated kill
-        loop and the power-loss emulation are not built yet.
+        The process kill loop runs 10,000 rounds against zoe serve by
+        default. The output gives the seed. The traceback of a failure
+        shows the round. 10,000 rounds need about 3 GB in TMPDIR. The kill
+        loop under the simulator runs `ZOE_SIM_SEEDS=10000` by default,
+        with power-loss crash images at each phase of a commit. A failing
+        seed prints `ZOE_SIM_SEED=<seed>`.
         """
         # The cache policy "never" makes each call run this body. A new seed
         # for each call also gives a new exec, so the exec cache misses too.
         if seed is None:
             seed = random.randrange(1 << 30)
-        return await self.recipe(source, "crash", (str(runs), str(seed))).stdout()
+        args = (str(runs), str(seed), str(seeds))
+        return await self.recipe(source, "crash", args).stdout()
 
     @function
     def zoe_binary(self, source: Source) -> dagger.File:

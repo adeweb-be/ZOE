@@ -4,6 +4,8 @@ Every storage runs with its default settings.
 """
 
 import contextlib
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -19,6 +21,7 @@ class Storage:
 
     name: str
     # FileStorage and zoe lock their files, so only one process can open them.
+    # A server takes the connections of several processes.
     multi_process: bool
     needs_dsn: bool
 
@@ -30,6 +33,7 @@ STORAGES = {
         Storage("zeo", multi_process=True, needs_dsn=False),
         Storage("relstorage", multi_process=True, needs_dsn=True),
         Storage("zoe", multi_process=False, needs_dsn=False),
+        Storage("zoe-server", multi_process=True, needs_dsn=False),
     )
 }
 
@@ -66,12 +70,23 @@ def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
         yield "%import zoe\n" + _section(
             storage.name, "<zoe>", f"path {workdir / 'store'}", "</zoe>"
         )
+    elif storage.name == "zoe-server":
+        with _zoe_server(workdir) as address:
+            yield _section(
+                storage.name, "<zeoclient>", f"server {address}", "</zeoclient>"
+            )
     else:
         raise ValueError(f"unknown storage {storage.name!r}")
 
 
 def server_versions(storage: Storage, dsn: str | None) -> dict[str, str]:
     """Return the versions of the servers that the storage talks to."""
+    if storage.name == "zoe-server":
+        done = subprocess.run(
+            [zoe_binary(), "--version"], capture_output=True, text=True, check=True
+        )
+        # clap prints "zoe <version>".
+        return {"zoe": done.stdout.split()[-1]}
     if storage.name != "relstorage":
         return {}
     import psycopg2
@@ -115,6 +130,77 @@ def _zeo_server(workdir: Path) -> Iterator[int]:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
+
+
+def zoe_binary() -> str:
+    """Return the `zoe` binary that the harness runs as `zoe serve`.
+
+    `ZOE_BINARY` gives it. Else it is `target/release/zoe` of the
+    repository, under `CARGO_TARGET_DIR` when it is set. When that binary
+    is missing, cargo builds it.
+    """
+    if binary := os.environ.get("ZOE_BINARY"):
+        return binary
+    root = Path(__file__).resolve().parents[4]
+    # cargo runs in the repository, so a relative target directory starts
+    # there.
+    target = root / (os.environ.get("CARGO_TARGET_DIR") or "target")
+    binary = target / "release" / "zoe"
+    if not binary.exists():
+        print(f"building {binary}", file=sys.stderr, flush=True)
+        command = ["cargo", "build", "--release", "--locked"]
+        subprocess.run(
+            command + ["-p", "zoe-server", "--bin", "zoe"], cwd=root, check=True
+        )
+    return str(binary)
+
+
+@contextlib.contextmanager
+def _zoe_server(workdir: Path) -> Iterator[str]:
+    """Run `zoe serve` on a store in workdir and yield its address.
+
+    The server runs with its default settings: no `ZOE_*` variable of the
+    environment reaches it.
+    """
+    out = workdir / "zoe-serve.out"
+    log = workdir / "zoe-serve.log"
+    environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
+    command = [zoe_binary(), "serve", "--path", str(workdir / "store")]
+    # The port 0 takes a free port. `zoe serve` writes `listening <address>`
+    # to stdout once it accepts connections.
+    command += ["--listen", "127.0.0.1:0"]
+    with out.open("wb") as stdout, log.open("wb") as stderr:
+        server = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            env=environ,
+        )
+    try:
+        yield _wait_for_listening(out, server, log)
+    finally:
+        # SIGTERM stops the server cleanly.
+        server.send_signal(signal.SIGTERM)
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+
+
+def _wait_for_listening(out: Path, server: subprocess.Popen, log: Path) -> str:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        for line in out.read_text(errors="replace").splitlines():
+            if line.startswith("listening "):
+                return line.split()[1]
+        if server.poll() is not None:
+            raise RuntimeError(f"zoe serve stopped:\n{log.read_text()}")
+        time.sleep(0.1)
+    server.kill()
+    server.wait()
+    raise RuntimeError(f"zoe serve did not listen:\n{log.read_text()}")
 
 
 def _free_port() -> int:

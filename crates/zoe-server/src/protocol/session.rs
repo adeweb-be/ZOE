@@ -21,14 +21,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use rmpv::Value;
-use zoe_core::{Finished, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Finished, Oid, Store, Tid, Txn, ZoeError};
 
-use super::blob::{Download, Upload};
+use super::blob::Download;
 use super::clock;
 use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
+use super::negotiation;
 use super::outbox::{Outbox, Place, Room};
 use super::status::Stats;
 use super::{NamedStorage, Stopping, Storages};
@@ -391,10 +392,10 @@ struct Open {
     /// The number of conflicts that the last vote listed for the client to
     /// resolve. When it is not 0, the next vote is the second vote.
     listed: u64,
-    /// The blob that the client uploads, from `storeBlobStart` to
+    /// The blob file that the client uploads, from `storeBlobStart` to
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
-    upload: Option<Upload>,
+    upload: Option<BlobFile>,
 }
 
 impl Open {
@@ -414,6 +415,9 @@ struct Registration {
     /// The id of the connection in the invalidations of the storage.
     client: ClientId,
     read_only: bool,
+    /// The extensions that the server accepted from the declaration of
+    /// the client, or none when the client declared nothing.
+    extensions: Option<Vec<&'static str>>,
 }
 
 /// The state of one connection that all its calls share. The calls that
@@ -454,12 +458,23 @@ pub(crate) fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorag
     if call.method != "register" {
         return Err(Outcome::Close(format!("{} before register", call.method)));
     }
-    let [name, _] = arity::<2>(&call.args, "register").map_err(Outcome::Failed)?;
+    let (name, _, _) = register_args(&call.args).map_err(Outcome::Failed)?;
     let name = storage_name(name);
     storages
         .get(&name)
         .cloned()
         .ok_or_else(|| Outcome::Failed(Fault::value_error(format!("unknown storage: {name}"))))
+}
+
+/// Return the arguments of `register`: the storage name, the read-only
+/// flag and the declaration of the extensions. A stock client gives no
+/// declaration.
+fn register_args(args: &[Value]) -> Result<(&Value, &Value, Option<&Value>), Fault> {
+    match args {
+        [storage, read_only] => Ok((storage, read_only, None)),
+        [storage, read_only, declaration] => Ok((storage, read_only, Some(declaration))),
+        _ => Err(Fault::type_error("register takes 2 or 3 arguments")),
+    }
 }
 
 /// Return the storage name that a client gives to `register`.
@@ -510,6 +525,16 @@ impl Session {
     /// Tell if the client registered read-only.
     fn read_only(&self) -> bool {
         self.registration.get().is_some_and(|r| r.read_only)
+    }
+
+    /// Return the error of a call to a method of an extension that the
+    /// connection did not declare. The connection stays open.
+    fn undeclared(&self, method: &str) -> Option<Fault> {
+        let accepted = self
+            .registration
+            .get()
+            .and_then(|r| r.extensions.as_deref());
+        negotiation::refused(method, accepted, negotiation::SERVED).map(Fault::value_error)
     }
 
     /// The id of the connection in the invalidations of the storage.
@@ -566,6 +591,9 @@ impl Session {
                 method => Outcome::Close(format!("{method} before register")),
             };
         }
+        if let Some(fault) = self.undeclared(&call.method) {
+            return Outcome::Failed(fault);
+        }
         let result = match call.method.as_str() {
             "register" => Err(Fault::value_error("duplicate register() call")),
             "lastTransaction" => Ok(p64(self.storage.invalidations.published().0)),
@@ -603,12 +631,21 @@ impl Session {
         result.into()
     }
 
+    /// Register the connection with its storage. A ZOE client declares the
+    /// extensions that it wants in a third argument. The server keeps the
+    /// names that it serves and leaves out the other names.
     fn register(&self, args: &[Value]) -> Result<Value, Fault> {
-        let [storage, read_only] = arity::<2>(args, "register")?;
+        let (storage, read_only, declaration) = register_args(args)?;
         let storage = storage_name(storage);
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
+        let extensions = declaration
+            .map(|value| {
+                let names = negotiation::declared(value).map_err(Fault::type_error)?;
+                Ok::<_, Fault>(negotiation::accept(&names, negotiation::SERVED))
+            })
+            .transpose()?;
         // A client that asks to write a read-only storage gets
         // `ReadOnlyError`, as from ZEO. The connection stays open, so a
         // client with `read_only_fallback` registers again read-only.
@@ -618,7 +655,11 @@ impl Session {
         }
         // The client gets the invalidation of each commit after this tid.
         let (client, published) = self.storage.invalidations.subscribe(self.outbox.clone());
-        let registration = Registration { client, read_only };
+        let registration = Registration {
+            client,
+            read_only,
+            extensions,
+        };
         if self.registration.set(registration).is_err() {
             self.storage.invalidations.unsubscribe(client);
             return Err(Fault::value_error("duplicate register() call"));
@@ -716,7 +757,9 @@ impl Session {
 
     /// The information that a stock client asks for after `register`. The
     /// name is the directory of the store, as `zoe.Storage.getName` gives
-    /// it.
+    /// it. The key `extensions` holds the extensions that the server
+    /// accepted from the declaration of the client. A client that declared
+    /// nothing gets no such key.
     fn info(&self) -> Result<Value, Fault> {
         let interfaces = INTERFACES
             .iter()
@@ -735,6 +778,11 @@ impl Session {
             ),
             (Value::from("interfaces"), Value::Array(interfaces)),
         ]);
+        let accepted = self.registration.get().and_then(|r| r.extensions.as_ref());
+        if let Some(accepted) = accepted {
+            let names = accepted.iter().map(|name| Value::from(*name)).collect();
+            items.push((Value::from("extensions"), Value::Array(names)));
+        }
         Ok(Value::Map(items))
     }
 
@@ -1190,6 +1238,9 @@ impl Transaction {
         if !self.session.is_registered() {
             return Outcome::Close(format!("{} before register", call.method));
         }
+        if let Some(fault) = self.session.undeclared(&call.method) {
+            return Outcome::Failed(fault);
+        }
         let result = match call.method.as_str() {
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
@@ -1429,9 +1480,17 @@ impl Transaction {
         if open.upload.is_some() {
             return Err(Fault::value_error("storeBlobStart: an upload is open"));
         }
-        let dir = self.session.store.blob_temp_dir()?;
-        let upload = Upload::create(&dir)
-            .map_err(|error| Fault::storage(format!("cannot create an upload file: {error}")))?;
+        // The blob file of the core goes through the `Vfs` of the store.
+        let upload = self
+            .session
+            .store
+            .new_blob_file()
+            .map_err(|error| match error {
+                ZoeError::Io(error) => {
+                    Fault::storage(format!("cannot create an upload file: {error}"))
+                }
+                error => Fault::from(error),
+            })?;
         open.upload = Some(upload);
         Ok(Value::Nil)
     }
@@ -1452,14 +1511,13 @@ impl Transaction {
             .upload
             .as_mut()
             .ok_or_else(|| Fault::value_error("storeBlobChunk: no upload is open"))?;
-        upload
-            .write(chunk)
+        std::io::Write::write_all(upload, chunk)
             .map_err(|error| Fault::storage(format!("cannot write an upload file: {error}")))?;
         Ok(Value::Nil)
     }
 
-    /// Stage the uploaded blob with `data` for `oid`. `Txn::store_blob_at`
-    /// takes the file by rename. A stock client sent `storea` for the oid
+    /// Stage the uploaded blob with `data` for `oid` with `Txn::store_blob`,
+    /// which syncs the file. A stock client sent `storea` for the oid
     /// before, and this store keeps the pickle and adds the blob. An error
     /// of the stage fails the vote, as an error of `storea` does.
     fn store_blob_end(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -1470,14 +1528,13 @@ impl Transaction {
         if open.txn.is_err() {
             return Ok(Value::Nil);
         }
-        let mut upload =
-            upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
+        let upload = upload.ok_or_else(|| Fault::value_error("storeBlobEnd: no upload is open"))?;
         open.stage(|txn| {
             let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
-            Ok(txn.store_blob_at(oid, serial, data, upload.close())?)
+            Ok(txn.store_blob(oid, serial, data, upload)?)
         });
         Ok(Value::Nil)
     }
@@ -1903,6 +1960,15 @@ mod tests {
             vec![Value::Binary(b"b".to_vec()), Value::Boolean(false)],
         );
         assert_eq!(select(&storages, &by_bytes).ok().unwrap().name, "b");
+        let declaring = request(
+            "register",
+            vec![
+                Value::from("a"),
+                Value::Boolean(false),
+                Value::Array(vec![]),
+            ],
+        );
+        assert_eq!(select(&storages, &declaring).ok().unwrap().name, "a");
         let fault = failed(select(&storages, &register("1")).err().unwrap());
         assert_eq!(fault.class, "builtins.ValueError");
         let fault = failed(
@@ -2672,6 +2738,31 @@ mod tests {
     }
 
     #[test]
+    fn get_info_gives_back_the_accepted_extensions_of_a_declaration() {
+        let mut s = session("declared");
+        let register =
+            |declaration: Value| vec![Value::from("1"), Value::Boolean(false), declaration];
+        // A declaration that is not a list of names fails, and the client
+        // can register again.
+        let fault = failed(call(&mut s, "register", register(Value::from("a"))));
+        assert_eq!(fault.class, "builtins.TypeError");
+        assert!(!s.session.is_registered());
+        let declaration = Value::Array(vec![Value::from("unknown"), Value::from("unknown")]);
+        assert_eq!(
+            done(call(&mut s, "register", register(declaration))),
+            p64(0)
+        );
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(keys(&info).last(), Some(&"extensions"));
+        assert_eq!(get(&info, "extensions"), &Value::Array(vec![]));
+        let again = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(
+            failed(call(&mut s, "register", again)).class,
+            "builtins.ValueError"
+        );
+    }
+
+    #[test]
     fn ping_answers_nil_and_set_client_label_takes_one_label() {
         let mut s = registered("ping");
         assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
@@ -3304,7 +3395,7 @@ mod tests {
         let none = Vec::<std::path::PathBuf>::new();
         let mut s = registered("blob-refused");
         upload(&mut s, 1, 1, b"the blob");
-        // The core refuses an empty pickle, and leaves the file in place.
+        // The core refuses an empty pickle, and the drop of the file removes it.
         done(store_blob_end(&mut s, 1, 1, b""));
         assert_eq!(blob_tree(&s.storage), none);
         let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
