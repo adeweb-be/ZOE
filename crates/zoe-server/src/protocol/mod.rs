@@ -29,6 +29,7 @@ pub(crate) mod metrics;
 mod negotiation;
 mod outbox;
 mod pipeline;
+mod send_queue;
 mod session;
 mod status;
 
@@ -39,6 +40,7 @@ pub mod fuzz;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
@@ -49,7 +51,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
 
-use crate::runtime::{Runtime, Tokio};
+use crate::runtime::{BoxFuture, Runtime, Tokio};
 
 use invalidation::Invalidations;
 use metrics::{Exported, Metrics};
@@ -82,12 +84,17 @@ const RUOK: &[u8] = b"ruok";
 const QUEUE: usize = 4;
 
 /// The longest time that a connection reads and drops bytes at a stop,
-/// after its writer sent its last frame and shut down its side. A stock
-/// client closes its side when it reads the end of the connection, and
-/// that ends the wait sooner. The wait keeps the socket open while the
-/// client can still send. So a byte that the client sends in that time
-/// causes no reset, and the kernel sends every frame that waits.
+/// after its writer sent its last frame and shut down its side, when it
+/// cannot read the send queue of its socket. A stock client closes its
+/// side when it reads the end of the connection, and that ends the wait
+/// sooner. The wait keeps the socket open while the client can still
+/// send. So a byte that the client sends in that time causes no reset,
+/// and the kernel sends every frame that waits.
 const LINGER: Duration = Duration::from_millis(500);
+
+/// The pause between two reads of the send queue of a socket while the
+/// connection waits at a stop for the queue to become empty.
+const DRAIN_PAUSE: Duration = Duration::from_millis(50);
 
 /// The size of the buffer into which a connection reads the bytes that it
 /// drops at a stop.
@@ -342,6 +349,7 @@ pub(crate) async fn serve_connection(
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
+    let socket = Some(stream.as_raw_fd());
     let (reader, writer) = stream.into_split();
     let connection = Connection {
         peer,
@@ -349,6 +357,7 @@ pub(crate) async fn serve_connection(
         max_frame_size,
         idle_timeout,
         read_only: false,
+        socket,
     };
     serve_stream(reader, writer, connection, storages, stopping).await;
 }
@@ -368,6 +377,10 @@ pub(crate) struct Connection {
     /// True when the client may register read-only only, as the holder of
     /// a certificate of the read-only client CA.
     pub(crate) read_only: bool,
+    /// The descriptor of the TCP socket under the stream, or `None` for a
+    /// stream without a socket. The reader of the stream holds the socket
+    /// open. The close at a stop reads the send queue of this socket.
+    pub(crate) socket: Option<RawFd>,
 }
 
 /// Serve one client on the two halves of its stream, as
@@ -385,6 +398,7 @@ pub(crate) async fn serve_stream(
         max_frame_size,
         idle_timeout,
         read_only,
+        socket,
     } = connection;
     if frame::write(&mut writer, PROTOCOL).await.is_err() {
         return;
@@ -550,15 +564,23 @@ pub(crate) async fn serve_stream(
         let _ = writer_ended.await;
     };
     if stopped {
-        linger(&mut reader, finished, &*runtime, &mut closing).await;
+        linger(
+            &mut reader,
+            &peer,
+            socket,
+            finished,
+            &*runtime,
+            &mut closing,
+        )
+        .await;
     } else {
         finished.await;
     }
 }
 
 /// Wait for `finished` at a stop of the server. Then keep the connection
-/// open for `LINGER` at most, so that a late byte of the client causes no
-/// reset.
+/// open until the send queue of `socket` is empty, so that a late byte of
+/// the client causes no reset.
 ///
 /// The reader reads no more calls. It reads the bytes that arrive and
 /// drops them. It never decodes them, so they take no ticket and get no
@@ -568,13 +590,24 @@ pub(crate) async fn serve_stream(
 /// kernel did not send yet, the reply of a `tpc_finish` among them.
 ///
 /// `finished` ends when each call ended and the writer sent its last frame
-/// and shut down its side. Then the reader drops bytes for `LINGER` at
-/// most. The wait ends sooner when the client closes its side or the
+/// and shut down its side. Then the reader drops bytes until the send
+/// queue of `socket` is empty. The queue holds the bytes that the client
+/// did not acknowledge, the FIN included. When it is empty, the client
+/// has every frame and the FIN, and a reset deletes nothing of them. The
+/// connection reads the queue at once, then after each pause of
+/// `DRAIN_PAUSE`. The check of the queue comes before the drop of the
+/// bytes, so a client that sends without end does not delay the close.
+/// Without a socket, or when a read of the queue fails, the reader drops
+/// bytes for `LINGER` at most.
+///
+/// The wait ends sooner when the client closes its side or the
 /// connection fails, because no byte of the client can arrive after that.
 /// When the hub closed the connection, the writer stopped at once, and no
 /// wait follows. The forced close of the stop bounds the whole wait.
 async fn linger(
     reader: &mut (impl AsyncRead + Unpin),
+    peer: &str,
+    mut socket: Option<RawFd>,
     finished: impl Future<Output = ()>,
     runtime: &dyn Runtime,
     closing: &mut Closing,
@@ -595,12 +628,31 @@ async fn linger(
             },
         }
     }
-    let mut deadline = runtime.sleep(LINGER);
+    // With a socket, the timer is the pause before the next read of the
+    // queue. Without a socket, it is the end of the wait.
+    let mut timer: BoxFuture<()> = match socket {
+        Some(_) => Box::pin(std::future::ready(())),
+        None => runtime.sleep(LINGER),
+    };
     loop {
         tokio::select! {
             biased;
             () = closing.wait() => return,
-            () = &mut deadline => return,
+            () = &mut timer => {
+                let Some(fd) = socket else { return };
+                match send_queue::unacked(fd) {
+                    Ok(0) => return,
+                    Ok(_) => timer = runtime.sleep(DRAIN_PAUSE),
+                    Err(error) => {
+                        tracing::debug!(
+                            client = peer,
+                            "cannot read the send queue of the socket: {error}"
+                        );
+                        socket = None;
+                        timer = runtime.sleep(LINGER);
+                    }
+                }
+            }
             read = reader.read(&mut dropped) => match read {
                 Ok(n) if n > 0 => {}
                 _ => return,
