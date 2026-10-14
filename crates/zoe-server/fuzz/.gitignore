@@ -1,0 +1,4 @@
+# What cargo fuzz writes here. `just fuzz` writes to target/fuzz instead.
+target/
+artifacts/
+coverage/
