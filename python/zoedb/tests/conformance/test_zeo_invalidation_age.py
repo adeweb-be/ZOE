@@ -18,14 +18,14 @@ ZEO_TESTS = [
 ]
 
 
-def tests_and_layers(suite, layers=()):
+def cases_and_layers(suite, layers=()):
     """Yield each test of suite with the layers of the suites around it."""
     layer = getattr(suite, "layer", None)
     if layer is not None and layer not in layers:
         layers = layers + (layer,)
     if isinstance(suite, unittest.TestSuite):
         for item in suite:
-            yield from tests_and_layers(item, layers)
+            yield from cases_and_layers(item, layers)
     else:
         yield suite, layers
 
@@ -36,7 +36,7 @@ def test_the_doctest_invalidation_age_passes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     selected = [
         (test, layers)
-        for test, layers in tests_and_layers(testZEO.test_suite())
+        for test, layers in cases_and_layers(testZEO.test_suite())
         if test.id() in ZEO_TESTS
     ]
     assert [test.id() for test, _ in selected] == ZEO_TESTS
