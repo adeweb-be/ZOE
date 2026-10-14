@@ -153,8 +153,10 @@ impl Iterators {
     ///
     /// The record comes from the transaction that the connection read
     /// last, or else from `store`. The data of a deletion is `None`. The
-    /// iterator skips a record that a pack removed. An error of the core
-    /// leaves the iterator at its place.
+    /// iterator skips a record that a pack removed. A record that is gone
+    /// at a tid after the pack watermark gives `CorruptTxn` once, as the
+    /// core iterator does, and the iterator moves past it. Another error of
+    /// the core leaves the iterator at its place.
     pub(crate) fn next_record(
         &mut self,
         store: &Store,
@@ -166,11 +168,11 @@ impl Iterators {
         let tid = *tid;
         while let Some(&oid) = oids.get(*next) {
             let found = match self.read.as_deref() {
-                Some(txn) if txn.tid == tid => Ok(txn
+                Some(txn) if txn.tid == tid => txn
                     .records
                     .binary_search_by_key(&oid, |record| record.oid)
-                    .ok()
-                    .map(|at| txn.records[at].clone())),
+                    .map(|at| Some(txn.records[at].clone()))
+                    .or_else(|_| gone(store, tid)),
                 _ => read_record(store, oid, tid),
             };
             match found {
@@ -180,6 +182,10 @@ impl Iterators {
                 }
                 // A pack removed the record.
                 Ok(None) => *next += 1,
+                Err(error @ ZoeError::CorruptTxn { .. }) => {
+                    *next += 1;
+                    return Ok(Some(Err(error)));
+                }
                 Err(error) => return Ok(Some(Err(error))),
             }
         }
@@ -213,8 +219,7 @@ impl Iterators {
 }
 
 /// Read the record that `tid` wrote for `oid` from `store`. The data of a
-/// deletion is `None`. Return `None` when the record does not exist, as
-/// after a pack that removed it.
+/// deletion is `None`. A record that does not exist is `gone`.
 fn read_record(store: &Store, oid: Oid, tid: Tid) -> Result<Option<RecordInfo>, ZoeError> {
     let data = match store.load_serial(oid, tid) {
         Ok(data) => Some(data),
@@ -222,12 +227,24 @@ fn read_record(store: &Store, oid: Oid, tid: Tid) -> Result<Option<RecordInfo>, 
         // deletion has a stored record.
         Err(ZoeError::NotFound { .. }) => match store.record_info(oid, tid) {
             Ok(_) => None,
-            Err(ZoeError::NotFound { .. }) => return Ok(None),
+            Err(ZoeError::NotFound { .. }) => return gone(store, tid),
             Err(error) => return Err(error),
         },
         Err(error) => return Err(error),
     };
     Ok(Some(RecordInfo { oid, tid, data }))
+}
+
+/// Tell why a record of the transaction `tid` that the index named is
+/// gone. A pack removes only records at or before the pack watermark, so
+/// such a record gives `None`. A record after it gives `CorruptTxn`, as the
+/// core iterator gives for an index key without its record.
+fn gone(store: &Store, tid: Tid) -> Result<Option<RecordInfo>, ZoeError> {
+    if tid <= store.pack_watermark()? {
+        Ok(None)
+    } else {
+        Err(ZoeError::CorruptTxn { tid })
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +477,32 @@ mod tests {
         ));
         assert_eq!(rest(&mut iterators, &store, rid), []);
         assert_eq!(iterators.len(), 1);
+    }
+
+    #[test]
+    fn a_record_that_no_pack_removed_is_corrupt() {
+        let store = store("corrupt", 2);
+        let mut iterators = Iterators::default();
+        let id = iterators
+            .start(store.iterator(None, None).unwrap())
+            .unwrap();
+        let first = next(&mut iterators, id).unwrap().tid;
+        let rid = records(&mut iterators, &store, id, first);
+        // The connection reads another transaction, so the record iterator
+        // reads from the store.
+        next(&mut iterators, id).unwrap();
+        // The index keeps the key of the removed record.
+        store.remove_record_for_test(Oid(1), first).unwrap();
+        assert!(matches!(
+            iterators.next_record(&store, rid),
+            Ok(Some(Err(ZoeError::CorruptTxn { tid }))) if tid == first
+        ));
+        // The iterator moves past the damaged record.
+        let oids: Vec<_> = rest(&mut iterators, &store, rid)
+            .into_iter()
+            .map(|record| record.oid)
+            .collect();
+        assert_eq!(oids, [Oid(2)]);
     }
 
     #[test]
