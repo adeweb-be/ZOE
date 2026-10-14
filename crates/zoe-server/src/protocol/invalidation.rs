@@ -13,9 +13,14 @@
 //! for it. So no thread waits for the commit of another thread. A finish that
 //! fails gives no tid, and no commit waits for it.
 //!
-//! The hub never waits for room in the queue of a connection: a frame that
-//! does not fit closes the connection, and the client connects again and
-//! asks `getInvalidations`. So a slow or dead client never stops a commit or
+//! The hub queue of a connection holds messages. An invalidation is one
+//! message. The `info` and the reply of a commit, for the client that
+//! committed, are one message too: they go in together. So a hub queue of
+//! one message lets a client commit.
+//!
+//! The hub never waits for room in the queue of a connection: a message
+//! that does not fit closes the connection, and the client connects again
+//! and asks `getInvalidations`. So a slow or dead client never stops a commit or
 //! the other clients. The hub holds its mutex while it puts frames in the
 //! queues, never while a frame goes out to the network.
 //!
@@ -38,7 +43,7 @@
 //!
 //! `send_to_all` puts a frame that is not a commit, the `info` after a
 //! pack, in the queue of every connection, under the same mutex. So it
-//! takes its place among the frames of the commits.
+//! takes its place among the frames of the commits. It is one message.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -72,7 +77,7 @@ pub(crate) struct Commit {
     /// The outbox of the connection that committed.
     pub(crate) outbox: Outbox,
     /// The frames for the connection that committed: `info`, then the
-    /// reply of `tpc_finish`.
+    /// reply of `tpc_finish`. They are one message of its hub queue.
     pub(crate) own: Vec<Vec<u8>>,
     /// What the other clients get.
     pub(crate) others: Others,
@@ -158,7 +163,7 @@ impl Invalidations {
         (id, state.published)
     }
 
-    /// Return the most frames that wait in the hub queue of one
+    /// Return the most messages that wait in the hub queue of one
     /// connection.
     pub(crate) fn deepest_queue(&self) -> usize {
         let state = self.lock();
@@ -290,14 +295,13 @@ impl State {
         if let Some(frame) = invalidation {
             overflows += self.push_all(&frame, origin, &mut gone);
         }
-        for frame in own {
-            let pushed = outbox.push(Arc::new(frame));
+        if !own.is_empty() {
+            let pushed = outbox.push_message(own.into_iter().map(Arc::new).collect());
             if pushed == Pushed::Overflow {
                 overflows += 1;
             }
             if pushed != Pushed::Queued {
                 gone.extend(origin);
-                break;
             }
         }
         for id in gone {
@@ -436,11 +440,14 @@ mod tests {
         let _b = Client::new(&hub, 10);
         hub.publish(a.commit(0, 1));
         hub.send_to_all(b"info".to_vec());
-        // The committer holds `info`, its reply and the frame for all. The
-        // other connection holds the invalidation and the frame for all.
-        assert_eq!(hub.deepest_queue(), 3);
+        // The committer holds two messages: `info` with its reply, and the
+        // frame for all. The other connection holds the invalidation and
+        // the frame for all.
+        assert_eq!(hub.deepest_queue(), 2);
         assert_eq!(a.take().len(), 3);
         assert_eq!(hub.deepest_queue(), 2);
+        hub.send_to_all(b"more".to_vec());
+        assert_eq!(hub.deepest_queue(), 3);
     }
 
     #[test]
@@ -466,20 +473,37 @@ mod tests {
     }
 
     #[test]
+    fn the_own_frames_of_a_commit_are_one_message() {
+        let hub = Invalidations::new(Tid(0));
+        let mut writer = Client::new(&hub, 1);
+        let mut other = Client::new(&hub, 1);
+        for tid in 1..=3 {
+            hub.publish(writer.commit(tid - 1, tid));
+            let (info, reply) = (format!("info {tid}"), format!("reply {tid}"));
+            assert_eq!(writer.take(), [info, reply]);
+            assert_eq!(other.take(), [format!("inv {tid}")]);
+        }
+        assert!(!writer.closing.is_closed() && !other.closing.is_closed());
+    }
+
+    #[test]
     fn the_own_frames_of_a_full_outbox_close_it() {
         let hub = Invalidations::new(Tid(0));
         let mut writer = Client::new(&hub, 1);
         let mut other = Client::new(&hub, 10);
-        hub.publish(writer.commit(0, 1));
+        hub.publish(other.commit(0, 1));
+        // The invalidation fills the queue of the writer. Its own frames do
+        // not fit, and neither goes in.
+        hub.publish(writer.commit(1, 2));
         assert!(writer.closing.is_closed());
-        assert_eq!(writer.take(), text(&["info 1"]));
-        assert_eq!(other.take(), text(&["inv 1"]));
+        assert_eq!(writer.take(), text(&["inv 1"]));
+        assert_eq!(other.take(), text(&["info 1", "reply 1", "inv 2"]));
         // The hub publishes the commit all the same, and the closed connection
         // left the hub.
-        assert_eq!(hub.published(), Tid(1));
-        hub.publish(other.commit(1, 2));
+        assert_eq!(hub.published(), Tid(2));
+        hub.publish(other.commit(2, 3));
         assert!(writer.take().is_empty());
-        assert_eq!(other.take(), text(&["info 2", "reply 2"]));
+        assert_eq!(other.take(), text(&["info 3", "reply 3"]));
     }
 
     #[test]

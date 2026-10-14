@@ -29,6 +29,7 @@ use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
+use super::negotiation;
 use super::outbox::{Outbox, Place, Room};
 use super::status::Stats;
 use super::{NamedStorage, Stopping, Storages};
@@ -414,6 +415,9 @@ struct Registration {
     /// The id of the connection in the invalidations of the storage.
     client: ClientId,
     read_only: bool,
+    /// The extensions that the server accepted from the declaration of
+    /// the client, or none when the client declared nothing.
+    extensions: Option<Vec<&'static str>>,
 }
 
 /// The state of one connection that all its calls share. The calls that
@@ -454,12 +458,23 @@ pub(crate) fn select(storages: &Storages, call: &Call) -> Result<Arc<NamedStorag
     if call.method != "register" {
         return Err(Outcome::Close(format!("{} before register", call.method)));
     }
-    let [name, _] = arity::<2>(&call.args, "register").map_err(Outcome::Failed)?;
+    let (name, _, _) = register_args(&call.args).map_err(Outcome::Failed)?;
     let name = storage_name(name);
     storages
         .get(&name)
         .cloned()
         .ok_or_else(|| Outcome::Failed(Fault::value_error(format!("unknown storage: {name}"))))
+}
+
+/// Return the arguments of `register`: the storage name, the read-only
+/// flag and the declaration of the extensions. A stock client gives no
+/// declaration.
+fn register_args(args: &[Value]) -> Result<(&Value, &Value, Option<&Value>), Fault> {
+    match args {
+        [storage, read_only] => Ok((storage, read_only, None)),
+        [storage, read_only, declaration] => Ok((storage, read_only, Some(declaration))),
+        _ => Err(Fault::type_error("register takes 2 or 3 arguments")),
+    }
 }
 
 /// Return the storage name that a client gives to `register`.
@@ -510,6 +525,16 @@ impl Session {
     /// Tell if the client registered read-only.
     fn read_only(&self) -> bool {
         self.registration.get().is_some_and(|r| r.read_only)
+    }
+
+    /// Return the error of a call to a method of an extension that the
+    /// connection did not declare. The connection stays open.
+    fn undeclared(&self, method: &str) -> Option<Fault> {
+        let accepted = self
+            .registration
+            .get()
+            .and_then(|r| r.extensions.as_deref());
+        negotiation::refused(method, accepted, negotiation::SERVED).map(Fault::value_error)
     }
 
     /// The id of the connection in the invalidations of the storage.
@@ -566,6 +591,9 @@ impl Session {
                 method => Outcome::Close(format!("{method} before register")),
             };
         }
+        if let Some(fault) = self.undeclared(&call.method) {
+            return Outcome::Failed(fault);
+        }
         let result = match call.method.as_str() {
             "register" => Err(Fault::value_error("duplicate register() call")),
             "lastTransaction" => Ok(p64(self.storage.invalidations.published().0)),
@@ -603,12 +631,21 @@ impl Session {
         result.into()
     }
 
+    /// Register the connection with its storage. A ZOE client declares the
+    /// extensions that it wants in a third argument. The server keeps the
+    /// names that it serves and leaves out the other names.
     fn register(&self, args: &[Value]) -> Result<Value, Fault> {
-        let [storage, read_only] = arity::<2>(args, "register")?;
+        let (storage, read_only, declaration) = register_args(args)?;
         let storage = storage_name(storage);
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
+        let extensions = declaration
+            .map(|value| {
+                let names = negotiation::declared(value).map_err(Fault::type_error)?;
+                Ok::<_, Fault>(negotiation::accept(&names, negotiation::SERVED))
+            })
+            .transpose()?;
         // A client that asks to write a read-only storage gets
         // `ReadOnlyError`, as from ZEO. The connection stays open, so a
         // client with `read_only_fallback` registers again read-only.
@@ -618,7 +655,11 @@ impl Session {
         }
         // The client gets the invalidation of each commit after this tid.
         let (client, published) = self.storage.invalidations.subscribe(self.outbox.clone());
-        let registration = Registration { client, read_only };
+        let registration = Registration {
+            client,
+            read_only,
+            extensions,
+        };
         if self.registration.set(registration).is_err() {
             self.storage.invalidations.unsubscribe(client);
             return Err(Fault::value_error("duplicate register() call"));
@@ -716,7 +757,9 @@ impl Session {
 
     /// The information that a stock client asks for after `register`. The
     /// name is the directory of the store, as `zoe.Storage.getName` gives
-    /// it.
+    /// it. The key `extensions` holds the extensions that the server
+    /// accepted from the declaration of the client. A client that declared
+    /// nothing gets no such key.
     fn info(&self) -> Result<Value, Fault> {
         let interfaces = INTERFACES
             .iter()
@@ -735,6 +778,11 @@ impl Session {
             ),
             (Value::from("interfaces"), Value::Array(interfaces)),
         ]);
+        let accepted = self.registration.get().and_then(|r| r.extensions.as_ref());
+        if let Some(accepted) = accepted {
+            let names = accepted.iter().map(|name| Value::from(*name)).collect();
+            items.push((Value::from("extensions"), Value::Array(names)));
+        }
         Ok(Value::Map(items))
     }
 
@@ -1189,6 +1237,9 @@ impl Transaction {
         let args = call.args.as_slice();
         if !self.session.is_registered() {
             return Outcome::Close(format!("{} before register", call.method));
+        }
+        if let Some(fault) = self.session.undeclared(&call.method) {
+            return Outcome::Failed(fault);
         }
         let result = match call.method.as_str() {
             "tpc_begin" => self.tpc_begin(args),
@@ -1903,6 +1954,15 @@ mod tests {
             vec![Value::Binary(b"b".to_vec()), Value::Boolean(false)],
         );
         assert_eq!(select(&storages, &by_bytes).ok().unwrap().name, "b");
+        let declaring = request(
+            "register",
+            vec![
+                Value::from("a"),
+                Value::Boolean(false),
+                Value::Array(vec![]),
+            ],
+        );
+        assert_eq!(select(&storages, &declaring).ok().unwrap().name, "a");
         let fault = failed(select(&storages, &register("1")).err().unwrap());
         assert_eq!(fault.class, "builtins.ValueError");
         let fault = failed(
@@ -2669,6 +2729,31 @@ mod tests {
         assert_eq!(get(&sizes, "size"), get(&info, "size"));
         let fault = failed(call(&mut s, "get_info", vec![Value::Nil]));
         assert_eq!(fault.class, "builtins.TypeError");
+    }
+
+    #[test]
+    fn get_info_gives_back_the_accepted_extensions_of_a_declaration() {
+        let mut s = session("declared");
+        let register =
+            |declaration: Value| vec![Value::from("1"), Value::Boolean(false), declaration];
+        // A declaration that is not a list of names fails, and the client
+        // can register again.
+        let fault = failed(call(&mut s, "register", register(Value::from("a"))));
+        assert_eq!(fault.class, "builtins.TypeError");
+        assert!(!s.session.is_registered());
+        let declaration = Value::Array(vec![Value::from("unknown"), Value::from("unknown")]);
+        assert_eq!(
+            done(call(&mut s, "register", register(declaration))),
+            p64(0)
+        );
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(keys(&info).last(), Some(&"extensions"));
+        assert_eq!(get(&info, "extensions"), &Value::Array(vec![]));
+        let again = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(
+            failed(call(&mut s, "register", again)).class,
+            "builtins.ValueError"
+        );
     }
 
     #[test]
