@@ -213,6 +213,32 @@
         trust of the user of the server, as with ZEO. The default is false.
       </description>
     </key>
+    <key name="tls-cert" datatype="string">
+      <description>
+        The certificate chain of the server, as PEM. With tls-key, the ZEO
+        port speaks TLS. A leading ~ is the home directory.
+      </description>
+    </key>
+    <key name="tls-key" datatype="string">
+      <description>
+        The private key of tls-cert, as PEM. A leading ~ is the home
+        directory.
+      </description>
+    </key>
+    <key name="tls-client-ca" datatype="string">
+      <description>
+        The CA certificates of the clients, as PEM. The server then requires
+        a client certificate that chains to one of them. A leading ~ is the
+        home directory.
+      </description>
+    </key>
+    <key name="tls-read-only-client-ca" datatype="string">
+      <description>
+        The CA certificates of the read-only clients, as PEM. The holder of
+        a certificate that chains to one of them registers read-only only.
+        A leading ~ is the home directory.
+      </description>
+    </key>
     <multisection type="storage" name="+" attribute="storages">
       <description>
         The named stores. The name of each section is its storage name.

@@ -66,7 +66,7 @@ enum Command {
     Pack(pack::PackArgs),
     /// Serve stores with the ZEO 6 msgpack protocol until SIGTERM, each
     /// under its own storage name.
-    Serve(serve::ServeArgs),
+    Serve(Box<serve::ServeArgs>),
     /// Serve the read-only ops tools of a store to an agent, over MCP on
     /// stdin and stdout.
     Mcp(mcp::McpArgs),
@@ -103,6 +103,12 @@ impl fmt::Display for Failure {
 impl From<io::Error> for Failure {
     fn from(error: io::Error) -> Self {
         Self::Report(error)
+    }
+}
+
+impl From<zoe_convert::Error> for Failure {
+    fn from(error: zoe_convert::Error) -> Self {
+        Self::Message(error.to_string())
     }
 }
 
@@ -292,7 +298,7 @@ mod tests {
         let expected: [(&str, &[&str]); 3] = [
             ("backup", &["ZOE_PATH", "ZOE_TO"]),
             ("restore", &["ZOE_FROM", "ZOE_PATH"]),
-            ("verify", &["ZOE_PATH", "ZOE_BACKUP"]),
+            ("verify", &["ZOE_PATH", "ZOE_BACKUP", "ZOE_SCRATCH"]),
         ];
         let mut command = Cli::command();
         for (name, twins) in expected {
