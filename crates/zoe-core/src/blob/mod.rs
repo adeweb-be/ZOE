@@ -113,6 +113,102 @@ impl<V: Vfs> BlobDir for V {
     }
 }
 
+/// A directory that the blob store only reads: the directory that holds
+/// the blob directory of a read-only store.
+///
+/// It reads through `std::fs`, as the read-only open of the store does.
+/// Each call that writes, syncs or locks fails with `ReadOnlyFilesystem`.
+/// So a read-only open changes no byte and creates nothing there. The
+/// directory need not exist.
+pub(crate) struct ReadOnlyDir {
+    dir: PathBuf,
+}
+
+impl ReadOnlyDir {
+    /// Return the directory `dir`. This reads nothing and creates nothing.
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// Return the error of a call that would change `name`.
+    fn refused(&self, name: &str) -> io::Error {
+        let message = format!("read-only: {}", self.dir.join(name).display());
+        io::Error::new(io::ErrorKind::ReadOnlyFilesystem, message)
+    }
+}
+
+impl BlobDir for ReadOnlyDir {
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        std::fs::exists(self.dir.join(name))
+    }
+
+    fn rename(&self, from: &str, _to: &str) -> io::Result<()> {
+        Err(self.refused(from))
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        Err(self.refused(name))
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        Err(self.refused(dir))
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        Err(self.refused(name))
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(self.dir.join(dir))? {
+            let entry = entry?;
+            // The file type of an entry does not follow a symbolic link.
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            // A name that is not UTF-8 is not a name of the core.
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(self.dir.join(dir))? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        Err(self.refused(name))
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(std::fs::File::open(self.dir.join(name))?))
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        Err(self.refused(name))
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        Err(self.refused(name))
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        Err(self.refused(name))
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
 /// The blob directory of a store whose blob files live outside the store
 /// directory: the directory `name` in `parent`.
 ///
@@ -299,19 +395,32 @@ impl BlobStore {
             return Ok(());
         }
         if !layout {
-            if backend.has_blobs()? {
-                // The first blob of a store makes its layout file durable
-                // before any blob record.
-                return Err(ZoeError::MissingBlobDir {
-                    path: self.dir.path(BLOB_DIR),
-                });
-            }
+            self.check_present(backend)?;
             return self.check_new();
         }
         if self.dir.exists(TMP_DIR)? {
             self.recover(backend)?;
         }
         Ok(())
+    }
+
+    /// Fail with `MissingBlobDir` when `backend` has blob records and the
+    /// blob directory has no layout file. The first blob of a store makes
+    /// its layout file durable before any blob record. So such a directory
+    /// is not the blob directory of the store. The call changes nothing.
+    pub(crate) fn check_present(&self, backend: &dyn Backend) -> Result<()> {
+        if !self.dir.exists(LAYOUT_FILE)? && backend.has_blobs()? {
+            return Err(ZoeError::MissingBlobDir {
+                path: self.dir.path(BLOB_DIR),
+            });
+        }
+        Ok(())
+    }
+
+    /// Tell if the blob file of `oid` at `tid` exists. This reads no byte
+    /// of the file.
+    pub(crate) fn has_file(&self, oid: Oid, tid: Tid) -> Result<bool> {
+        Ok(self.dir.exists(&blob_name(oid, tid))?)
     }
 
     /// Take the lock on the blob directory itself, when this store does not
