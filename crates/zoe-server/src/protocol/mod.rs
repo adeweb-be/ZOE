@@ -361,16 +361,17 @@ pub(crate) async fn serve_connection(
         if call.is_heartbeat() {
             continue;
         }
-        // The reader waits while `QUEUE` calls run or wait for the client.
-        let room = tokio::select! {
-            room = outbox.room() => room,
+        // The reader waits while `QUEUE` calls run or wait, and while the
+        // session queue is full.
+        let ticket = tokio::select! {
+            ticket = calls.ticket() => ticket,
             () = ended.wait() => break,
             () = closing.wait() => break,
         };
-        if room.is_closed() {
+        if ticket.is_closed() {
             break;
         }
-        calls.start(call, room).await;
+        calls.start(call, ticket).await;
     }
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.
@@ -784,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_time_does_not_count_while_the_call_queue_is_full() {
+    fn the_idle_time_does_not_count_while_the_calls_of_the_connection_wait() {
         use crate::serve::{ServeOptions, Server};
 
         let dir = std::env::temp_dir().join(format!("zoe-protocol-idle-{}", std::process::id()));

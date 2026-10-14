@@ -109,7 +109,9 @@ pub(crate) struct Invalidations {
     state: Mutex<State>,
 }
 
-/// The state of the hub. Its mutex is held with no other lock.
+/// The state of the hub. Under its mutex, only a `loadBefore` place takes
+/// another lock: the lock of the outbox of its connection, which no holder
+/// keeps while it waits for the hub.
 struct State {
     /// The tid of the last published commit.
     published: Tid,

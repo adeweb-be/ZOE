@@ -608,11 +608,13 @@ impl Session {
             .unwrap_or_else(|| self.outbox.blocking_room());
         for _ in 0..LOAD_TRIES {
             let seen = invalidations.published();
-            let value = read(seen)?;
+            // An error takes its place too, so it goes out in the room of
+            // the call and never waits for the client.
+            let value = read(seen);
             match invalidations.place_since(seen, room) {
                 Ok(place) => {
                     reply.place = Some(place);
-                    return Ok(value);
+                    return value;
                 }
                 Err(back) => room = back,
             }
@@ -1521,11 +1523,11 @@ mod tests {
                     () = ended.wait() => None,
                 };
                 let Some(call) = call else { break };
-                let room = outbox.room().await;
-                if room.is_closed() {
+                let ticket = connection.ticket().await;
+                if ticket.is_closed() {
                     break;
                 }
-                connection.start(call, room).await;
+                connection.start(call, ticket).await;
             }
             drop(outbox);
             connection.finish().await;
@@ -3805,5 +3807,52 @@ mod tests {
         assert_eq!(fault, Fault::from(ZoeError::NotFound { oid: Oid(0) }));
         let load = done(call(&mut packer, "loadSerial", vec![p64(0), p64(new)]));
         assert_eq!(load, Value::Binary(MAPPING.to_vec()));
+    }
+    #[test]
+    fn a_failed_load_puts_its_error_in_its_room_and_never_waits_for_the_client() {
+        // A session queue of 2 frames that no writer drains.
+        let (outbox, mut frames, _closing) = Outbox::new(2, 100);
+        let mut s = Client::new(storage("failed-load-room", Queues::DEFAULT), outbox.clone());
+        let register = vec![Value::from("1"), Value::Boolean(false)];
+        done(call(&mut s, "register", register));
+        // One reply waits in the queue: the client reads nothing.
+        let waiting = message::reply(Value::from(1), Value::Nil);
+        assert!(outbox.blocking_room().put(Some(waiting)));
+        // The load takes the last room before it starts.
+        let room = outbox.blocking_room();
+        // The reader waits for room for the next call.
+        let reader = outbox.clone();
+        let next = std::thread::spawn(move || reader.blocking_room());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let session = Arc::clone(&s.session);
+        let load = std::thread::spawn(move || {
+            let call = Call {
+                id: Value::from(5),
+                oneway: false,
+                method: "loadBefore".into(),
+                args: vec![p64(42), p64(u64::MAX >> 1)],
+            };
+            let mut reply = Reply::new(room);
+            let outcome = session.call(&call, &mut reply);
+            reply.send(&call, outcome, session.outbox())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !load.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed load waits for the client"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(load.join().unwrap());
+        // The error went into the room of the load, so the reader still
+        // waits. It gets room when the client reads.
+        assert!(!next.is_finished());
+        let taken = messages(&mut frames);
+        assert!(next.join().unwrap().put(None));
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        let class = taken[1].1.as_array().map(|error| error[0].clone());
+        assert_eq!(class, Some(Value::from("ZODB.POSException.POSKeyError")));
+        drop(s);
     }
 }

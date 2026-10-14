@@ -1,11 +1,13 @@
 //! The calls of one connection run concurrently.
 //!
 //! The reader of a connection gives each call to `Calls` in the order of
-//! arrival. Each call takes room for its reply in the session queue before
-//! it starts. So the replies that wait for a client stay bounded, and a
-//! call never waits to put its reply. Each reply carries the message id of
-//! its call and goes out when its call ends, so the replies can go out in
-//! another order than their calls.
+//! arrival. Each call takes a `Ticket` before it starts: a slot among the
+//! calls of its connection that run or wait, and room for its reply in the
+//! session queue. A connection has `QUEUE` slots. So at most `QUEUE` calls
+//! of a connection run or wait, the replies that wait for a client stay
+//! bounded, and a call never waits to put its reply. Each reply carries the
+//! message id of its call and goes out when its call ends, so the replies
+//! can go out in another order than their calls.
 //!
 //! - `register` runs first, alone. The reader gives no other call before
 //!   it ends.
@@ -13,7 +15,8 @@
 //!   `tpc_begin` to the end of the transaction (`Lane`). A vote that waits
 //!   for a lock stops only the calls of the transaction behind it.
 //! - `sendBlob` and `pack` run on a thread of their own, because they wait
-//!   for the client or run for a long time.
+//!   for the client or run for a long time. A download keeps its slot until
+//!   it ends, and gives back its room after its first frame.
 //! - The other calls run on the read pool: at most `--blocking-threads`
 //!   calls of all the connections run at once.
 //!
@@ -24,13 +27,13 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use super::Storages;
 use super::message::Call;
 use super::outbox::{Outbox, Room};
 use super::session::{self, Reply, Session, Transaction};
+use super::{QUEUE, Storages};
 
 /// The read pool: the threads that run the calls that read. At most its
 /// number of threads run these calls at once, on threads of the blocking
@@ -93,6 +96,32 @@ impl Ended {
     }
 }
 
+/// What a call takes before it starts: a slot among the calls of its
+/// connection that run or wait, and room for its reply in the session
+/// queue. The call gives back its slot when it ends.
+pub(crate) struct Ticket {
+    slot: OwnedSemaphorePermit,
+    room: Room,
+}
+
+impl Ticket {
+    /// Tell if the connection was closed when the call took its room.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.room.is_closed()
+    }
+}
+
+/// End the connection when the thread panics.
+struct EndOnPanic<'a>(&'a Ended);
+
+impl Drop for EndOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.end();
+        }
+    }
+}
+
 /// The calls of the transaction of a connection that wait for its thread.
 struct Lane {
     state: Mutex<LaneState>,
@@ -101,8 +130,8 @@ struct Lane {
 }
 
 struct LaneState {
-    /// The calls that wait, each with its room, in the order of arrival.
-    calls: VecDeque<(Call, Room)>,
+    /// The calls that wait, each with its ticket, in the order of arrival.
+    calls: VecDeque<(Call, Ticket)>,
     /// A thread runs the calls.
     running: bool,
     /// The reader gives no more calls. The thread runs the calls that wait,
@@ -128,12 +157,12 @@ impl Lane {
 
     /// Add a call. Return true when no thread runs the calls: the caller
     /// starts one. After the end, drop the call.
-    fn push(&self, call: Call, room: Room) -> bool {
+    fn push(&self, call: Call, ticket: Ticket) -> bool {
         let mut state = self.lock();
         if state.ended {
             return false;
         }
-        state.calls.push_back((call, room));
+        state.calls.push_back((call, ticket));
         self.ready.notify_one();
         !std::mem::replace(&mut state.running, true)
     }
@@ -141,7 +170,7 @@ impl Lane {
     /// Return the next call. Wait for it while a transaction is open
     /// (`open`). Return `None` when no call waits and no transaction is
     /// open, or at the end: then the thread ends.
-    fn next(&self, open: bool) -> Option<(Call, Room)> {
+    fn next(&self, open: bool) -> Option<(Call, Ticket)> {
         let mut state = self.lock();
         loop {
             if let Some(next) = state.calls.pop_front() {
@@ -194,7 +223,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended) {
 
     let _guard = Guard(lane, ended);
     let mut transaction = Transaction::new(Arc::clone(session));
-    while let Some((call, room)) = lane.next(transaction.is_open()) {
+    while let Some((call, Ticket { slot: _slot, room })) = lane.next(transaction.is_open()) {
         if ended.is_set() {
             lane.stop();
             break;
@@ -209,7 +238,10 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended) {
 }
 
 /// Run a call that is not a call of the transaction, and put its reply.
-fn run_call(session: &Session, call: &Call, room: Room, ended: &Ended) {
+/// A panic ends the connection.
+fn run_call(session: &Session, call: &Call, ticket: Ticket, ended: &Ended) {
+    let _guard = EndOnPanic(ended);
+    let Ticket { slot: _slot, room } = ticket;
     if ended.is_set() {
         return;
     }
@@ -229,6 +261,8 @@ pub(crate) struct Calls {
     outbox: Outbox,
     pool: Pool,
     lane: Arc<Lane>,
+    /// The slots of the calls that run or wait.
+    slots: Arc<Semaphore>,
     /// The calls that run, and the thread of the transaction.
     running: JoinSet<()>,
     ended: Ended,
@@ -244,6 +278,7 @@ impl Calls {
             outbox,
             pool,
             lane: Arc::new(Lane::new()),
+            slots: Arc::new(Semaphore::new(QUEUE)),
             running: JoinSet::new(),
             ended: Ended::new(),
         }
@@ -254,30 +289,44 @@ impl Calls {
         self.ended.clone()
     }
 
-    /// Start `call`, which took `room` for its reply. Wait only for
-    /// `register`.
-    pub(crate) async fn start(&mut self, call: Call, room: Room) {
+    /// Wait for the ticket of the next call: first a slot, then room for
+    /// its reply. The future holds no borrow of `self`.
+    pub(crate) fn ticket(&self) -> impl Future<Output = Ticket> + Send + 'static {
+        let slots = Arc::clone(&self.slots);
+        let outbox = self.outbox.clone();
+        async move {
+            let slot = slots
+                .acquire_owned()
+                .await
+                .expect("the slots of a connection never close");
+            let room = outbox.room().await;
+            Ticket { slot, room }
+        }
+    }
+
+    /// Start `call`, which took `ticket`. Wait only for `register`.
+    pub(crate) async fn start(&mut self, call: Call, ticket: Ticket) {
         while self.running.try_join_next().is_some() {}
         let Some(session) = self.session.clone() else {
-            self.register(call, room).await;
+            self.register(call, ticket).await;
             return;
         };
         let ended = self.ended.clone();
         if session::in_transaction(&call.method) {
-            if self.lane.push(call, room) {
+            if self.lane.push(call, ticket) {
                 let lane = Arc::clone(&self.lane);
                 self.running
                     .spawn_blocking(move || run_lane(&session, &lane, &ended));
             }
         } else if session::runs_long(&call.method) {
             self.running
-                .spawn_blocking(move || run_call(&session, &call, room, &ended));
+                .spawn_blocking(move || run_call(&session, &call, ticket, &ended));
         } else {
             let pool = self.pool.clone();
             self.running.spawn(async move {
                 let work = {
                     let ended = ended.clone();
-                    move || run_call(&session, &call, room, &ended)
+                    move || run_call(&session, &call, ticket, &ended)
                 };
                 if pool.run(work).await.is_none() {
                     ended.end();
@@ -290,7 +339,7 @@ impl Calls {
     /// storage. After that, the connection keeps only that storage, so a
     /// session that runs past the shutdown timeout keeps only its own store
     /// open.
-    async fn register(&mut self, call: Call, room: Room) {
+    async fn register(&mut self, call: Call, ticket: Ticket) {
         let Some(storages) = self.storages.clone() else {
             return;
         };
@@ -299,6 +348,7 @@ impl Calls {
         let registered = self
             .pool
             .run(move || {
+                let Ticket { slot: _slot, room } = ticket;
                 let mut reply = Reply::new(room);
                 let (outcome, session) = match session::select(&storages, &call) {
                     Ok(storage) => {
@@ -332,6 +382,15 @@ impl Calls {
         self.storages = None;
         self.session = None;
         while self.running.join_next().await.is_some() {}
+    }
+}
+
+impl Drop for Calls {
+    /// The thread of the transaction ends also when the task of the
+    /// connection drops before `finish`, as at the stop of the runtime: it
+    /// runs the calls that wait, then ends and aborts the open transaction.
+    fn drop(&mut self) {
+        self.lane.end();
     }
 }
 
@@ -376,11 +435,11 @@ mod tests {
         call(0, "storea", vec![p64(oid), p64(0), data, Value::from(txn)])
     }
 
-    /// Start `calls` on `connection`, each with its room.
-    async fn start(connection: &mut Calls, outbox: &Outbox, calls: Vec<Call>) {
+    /// Start `calls` on `connection`, each with its ticket.
+    async fn start(connection: &mut Calls, calls: Vec<Call>) {
         for call in calls {
-            let room = outbox.room().await;
-            connection.start(call, room).await;
+            let ticket = connection.ticket().await;
+            connection.start(call, ticket).await;
         }
     }
 
@@ -433,12 +492,7 @@ mod tests {
         runtime().block_on(async {
             let mut connection = Calls::new(storages, outbox.clone(), pool);
             let register = vec![Value::from("1"), Value::Boolean(false)];
-            start(
-                &mut connection,
-                &outbox,
-                vec![call(1, "register", register)],
-            )
-            .await;
+            start(&mut connection, vec![call(1, "register", register)]).await;
             for (txn, oid) in [(7, 1), (8, 2)] {
                 let calls = vec![
                     begin(txn),
@@ -446,7 +500,7 @@ mod tests {
                     call(2, "vote", vec![Value::from(txn)]),
                     call(3, "tpc_finish", vec![Value::from(txn)]),
                 ];
-                start(&mut connection, &outbox, calls).await;
+                start(&mut connection, calls).await;
                 // The transaction commits, then its thread ends, while the
                 // connection stays open.
                 wait_until("the transaction did not commit", || {
@@ -482,7 +536,7 @@ mod tests {
                 call(2, "vote", vec![Value::from(7)]),
                 call(3, "tpc_finish", vec![Value::from(7)]),
             ];
-            start(&mut connection, &outbox, calls).await;
+            start(&mut connection, calls).await;
             tokio::time::timeout(Duration::from_secs(30), ended.wait())
                 .await
                 .unwrap();
