@@ -547,8 +547,11 @@ pub(crate) async fn serve_stream(
     // A stop lets a vote that waits for a lock go on waiting: the other
     // sessions abort their transactions, and a finish that arrived commits.
     let mut stopped = false;
-    // True when the bytes of the client end the connection: a frame that
-    // is not a call, or a call that ends the connection.
+    // True when the reader stops for a reason other than a stop, a close
+    // of the hub, the idle timeout or the end of the client's side: a frame
+    // that is too long or is not a call, a call that ends the connection,
+    // or a connection that failed. The reader then drains the bytes of the
+    // client before the close.
     let mut refused = false;
     loop {
         // An end of the connection or a stop wins over a frame that waits.
@@ -585,7 +588,10 @@ pub(crate) async fn serve_stream(
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
             Err(error) => {
+                // A frame longer than the limit, or a failed read. After a
+                // failed read, the drain ends at its first read.
                 tracing::warn!(client = peer.as_str(), "{error}");
+                refused = true;
                 break;
             }
         };
@@ -637,7 +643,14 @@ pub(crate) async fn serve_stream(
         calls.end_lock_wait();
     }
     if refused {
-        drain(&mut reader, &*runtime, &mut closing).await;
+        // The calls end and the transaction aborts while the reader drops
+        // the bytes of the client, so the locks go at once. The outbox of
+        // the reader keeps the writer open until both end, so the FIN comes
+        // after the drain.
+        tokio::join!(calls.finish(), drain(&mut reader, &*runtime, &mut closing));
+        drop(outbox);
+        let _ = writer_ended.await;
+        return;
     }
     // The writer ends when every outbox is gone: the outbox of the reader,
     // of the calls and of the session.
@@ -986,37 +999,48 @@ mod tests {
         bytes
     }
 
-    /// Send the frame `first`, then the calls of a transaction and more
-    /// bytes, in one write, as a client sends a burst before it sees the
-    /// end of the connection. The client gets the end of the connection,
-    /// not a reset, and no reply.
+    /// Send `first`, then 10 heartbeats, one each 5 ms, as a client that
+    /// goes on sending before it sees the end of the connection. The
+    /// server drops the heartbeats until the client is quiet, then closes.
+    /// So each write succeeds, and the client gets the end of the
+    /// connection, not a reset, and no reply. A server that closes at once
+    /// closes with bytes that it did not read, which resets the
+    /// connection, and a later write fails.
     fn burst_ends_without_a_reset(name: &str, first: &[u8]) {
         let storage = storage(name);
         let (runtime, addr) = serve(&storage);
         let mut client = registered(addr);
-        let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
-        let mut burst = frame::encode(first).unwrap();
-        burst.extend(frame::encode(&call_bytes(0, "tpc_begin", begin)).unwrap());
-        burst.extend(frame::encode(&call_bytes(2, "vote", vec![Value::from(7)])).unwrap());
-        burst.extend([7; 100_000]);
-        client.write_all(&burst).unwrap();
+        client.write_all(first).unwrap();
+        let heartbeat = frame::encode(&call_bytes(-1, "ping", vec![])).unwrap();
+        for n in 0..10 {
+            std::thread::sleep(Duration::from_millis(5));
+            let written = client.write_all(&heartbeat);
+            assert!(written.is_ok(), "write {n}: {written:?}");
+        }
         let mut replies = Vec::new();
         let read = client.read_to_end(&mut replies);
         assert!(read.is_ok(), "{read:?}");
         assert!(replies.is_empty(), "{} bytes after the end", replies.len());
+        assert!(client.take_error().unwrap().is_none());
         drop(client);
         drop(runtime);
     }
 
     #[test]
     fn a_frame_that_is_not_a_call_ends_without_a_reset() {
-        burst_ends_without_a_reset("not-a-call", b"salty");
+        burst_ends_without_a_reset("not-a-call", &frame::encode(b"salty").unwrap());
     }
 
     #[test]
     fn an_unknown_method_ends_without_a_reset() {
-        let unknown = call_bytes(0, "foo", vec![]);
+        let unknown = frame::encode(&call_bytes(0, "foo", vec![])).unwrap();
         burst_ends_without_a_reset("unknown-method", &unknown);
+    }
+
+    #[test]
+    fn a_frame_that_is_too_long_ends_without_a_reset() {
+        let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
+        burst_ends_without_a_reset("too-long", &(max + 1).to_be_bytes());
     }
 
     /// Wait until `done` is true. Fail after 30 seconds.
