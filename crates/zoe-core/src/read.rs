@@ -574,6 +574,12 @@ impl Store {
         self.backend.sequence_end(name)
     }
 
+    /// Return the tid of the last pack. A pack removes records at or before
+    /// it, never after it. A store that was never packed gives `Tid::ZERO`.
+    pub fn pack_watermark(&self) -> Result<Tid> {
+        self.backend.pack_watermark()
+    }
+
     /// Return the first oid at or after `from` whose current record is not
     /// a deletion, with that record.
     fn current_at_or_after(&self, mut from: Oid) -> Result<Option<(Oid, Record)>> {
@@ -637,6 +643,20 @@ mod tests {
             serial: Tid(serial),
             next: next.map(Tid),
         })
+    }
+
+    #[test]
+    fn the_pack_watermark_is_the_tid_of_the_last_pack() {
+        // Pack reads the references of each record, so the records are
+        // pickles of an empty mapping.
+        let mapping = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        for tid in [100, 200, 300] {
+            restore(&store, tid, &[(Oid(1), Some(mapping.to_vec()))]);
+        }
+        assert_eq!(store.pack_watermark().unwrap(), Tid::ZERO);
+        store.pack(Tid(250)).unwrap();
+        assert_eq!(store.pack_watermark().unwrap(), Tid(250));
     }
 
     #[test]

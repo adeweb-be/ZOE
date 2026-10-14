@@ -9,7 +9,8 @@
 //!
 //! The command writes the line `listening <address>` to stdout once it
 //! accepts connections, so a port of 0 gives a free port. The logs go to
-//! stderr. SIGTERM closes the stores, and the command exits with 0.
+//! stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
+//! the command closes the connections and the stores, and exits with 0.
 //!
 //! The console script of the wheel has no server: its extension never
 //! links tokio. There, the command fails with 1 and names the `zoe` binary.
@@ -107,6 +108,23 @@ pub(super) struct ServeArgs {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     max_frame_size: Option<u32>,
+
+    /// The longest time that a stop on SIGTERM or SIGINT takes, in whole
+    /// seconds, such as 30, 30s or 1m. The server stops accepting
+    /// connections, commits each tpc_finish that it received and sends its
+    /// reply, aborts the other transactions, closes each connection and
+    /// closes the stores. Near the end of the time, it closes the
+    /// connections that remain at once. When a call still runs at the end,
+    /// such as a running pack, the store of that session does not close
+    /// cleanly, and the other stores close. The command exits with 0.
+    #[arg(
+        long,
+        env = "ZOE_SHUTDOWN_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "30",
+        value_parser = whole_seconds
+    )]
+    shutdown_timeout: Duration,
 
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
@@ -251,7 +269,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
     Ok(storages)
 }
 
-/// Serve until SIGTERM. Write the line `listening <address>` to `out`.
+/// Serve until SIGTERM or SIGINT, then stop. Write the line
+/// `listening <address>` to `out`.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -268,7 +287,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     let mut options = ServeOptions::with_storages(storages)
         .listen(args.listen)
         .invalidation_queue_size(args.invalidation_queue_size)
-        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX));
+        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
+        .shutdown_timeout(args.shutdown_timeout);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
@@ -316,6 +336,20 @@ mod tests {
         assert_eq!(args.invalidation_queue_size, 0);
         assert_eq!(args.client_queue_size, 1);
         let error = serve(&["--client-queue-size", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_shutdown_timeout_is_30_seconds_by_default_and_takes_whole_seconds() {
+        assert_eq!(
+            serve(&[]).unwrap().shutdown_timeout,
+            Duration::from_secs(30)
+        );
+        let args = serve(&["--shutdown-timeout", "2m"]).unwrap();
+        assert_eq!(args.shutdown_timeout, Duration::from_secs(120));
+        let args = serve(&["--shutdown-timeout", "0"]).unwrap();
+        assert_eq!(args.shutdown_timeout, Duration::ZERO);
+        let error = serve(&["--shutdown-timeout", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
