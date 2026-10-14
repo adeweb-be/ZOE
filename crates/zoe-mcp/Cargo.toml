@@ -9,6 +9,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+zoe-convert.workspace = true
+zoe-core.workspace = true
+zoe-loupe.workspace = true
+zoe-pickle.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "rt", "time"] }
 
 [lints]
 workspace = true
