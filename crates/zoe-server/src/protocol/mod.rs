@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{oneshot, watch};
 use zoe_core::Store;
 
@@ -367,6 +367,43 @@ pub(crate) async fn serve_connection(
     serve_stream(reader, writer, connection, storages, stopping).await;
 }
 
+/// Serve one client on `stream`, a connection on the unix domain socket at
+/// `path`, as `serve_connection` does. The label of the client is
+/// `unix_peer`.
+pub(crate) async fn serve_unix_connection(
+    stream: UnixStream,
+    path: Arc<Path>,
+    storages: Arc<Storages>,
+    max_frame_size: u32,
+    idle_timeout: Option<Duration>,
+    stopping: Stopping,
+) {
+    let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let peer = unix_peer(&path, pid);
+    let socket = Some(stream.as_raw_fd());
+    let (reader, writer) = stream.into_split();
+    let connection = Connection {
+        peer,
+        runtime: Arc::new(Tokio),
+        max_frame_size,
+        idle_timeout,
+        read_only: false,
+        socket,
+    };
+    serve_stream(reader, writer, connection, storages, stopping).await;
+}
+
+/// Return the label of a client on the unix domain socket at `path`, as
+/// the log lines name it in place of an address: the path as the options
+/// give it, then the process id of the client, `pid`. The kernel gives the
+/// process id (`SO_PEERCRED`). Without it, the label is the path only.
+fn unix_peer(path: &Path, pid: Option<i32>) -> String {
+    match pid {
+        Some(pid) => format!("{} pid {pid}", path.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// The settings of one connection.
 pub(crate) struct Connection {
     /// The client, as the messages of the log name it.
@@ -382,9 +419,10 @@ pub(crate) struct Connection {
     /// True when the client may register read-only only, as the holder of
     /// a certificate of the read-only client CA.
     pub(crate) read_only: bool,
-    /// The descriptor of the TCP socket under the stream, or `None` for a
-    /// stream without a socket. The reader of the stream holds the socket
-    /// open. The close at a stop reads the send queue of this socket.
+    /// The descriptor of the TCP or unix domain socket under the stream,
+    /// or `None` for a stream without a socket. The reader of the stream
+    /// holds the socket open. The close at a stop reads the send queue of
+    /// this socket.
     pub(crate) socket: Option<RawFd>,
 }
 
@@ -598,8 +636,9 @@ pub(crate) async fn serve_stream(
 /// and shut down its side. Then the reader drops bytes until the send
 /// queue of `socket` is empty. The queue holds the bytes that the client
 /// did not acknowledge, the FIN included. When it is empty, the client
-/// has every frame and the FIN, and a reset deletes nothing of them. The
-/// connection reads the queue at once, then after each pause of
+/// has every frame and the FIN, and a reset deletes nothing of them. On a
+/// unix domain socket, the queue holds the bytes that the client did not
+/// read. The connection reads the queue at once, then after each pause of
 /// `DRAIN_PAUSE`. The check of the queue comes before the drop of the
 /// bytes, so a client that sends without end does not delay the close.
 /// Without a socket, or when a read of the queue fails, the reader drops
@@ -694,6 +733,15 @@ mod tests {
     /// Return a signal that never tells a stop: its sender is gone.
     fn never_stops() -> Stopping {
         Stopping::new().1
+    }
+
+    #[test]
+    fn a_client_on_a_unix_domain_socket_is_the_path_and_its_process_id() {
+        assert_eq!(
+            unix_peer(Path::new("./zeo.sock"), Some(42)),
+            "./zeo.sock pid 42"
+        );
+        assert_eq!(unix_peer(Path::new("/run/zeo.sock"), None), "/run/zeo.sock");
     }
 
     #[test]
