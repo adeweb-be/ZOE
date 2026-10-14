@@ -1147,6 +1147,14 @@ version = "0.0.0"
 [[package]]
 name = "zoe-client"
 version = "0.0.0"
+dependencies = [
+ "futures",
+ "rmpv",
+ "thiserror",
+ "tokio",
+ "zoe-core",
+ "zoe-server",
+]
 
 [[package]]
 name = "zoe-convert"
