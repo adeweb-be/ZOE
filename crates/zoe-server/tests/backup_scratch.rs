@@ -154,11 +154,7 @@ fn backup(name: &str) -> Backup {
     }
     let output = zoe(&["backup", "--path", s(&source), "--to", s(&dumps)], &[]);
     assert_exit(&output, 0, "backup");
-    Backup {
-        dir,
-        source,
-        dumps,
-    }
+    Backup { dir, source, dumps }
 }
 
 #[test]
