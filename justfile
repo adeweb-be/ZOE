@@ -18,10 +18,11 @@ check:
     cargo fmt --manifest-path crates/zoe-server/fuzz/Cargo.toml --check
     cargo metadata --locked --format-version 1 --manifest-path crates/zoe-server/fuzz/Cargo.toml >/dev/null
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    ruff check python ci/src
-    ruff format --check python ci/src
+    ruff check python ci/src deploy
+    ruff format --check python ci/src deploy
 
-# Run the Rust tests, then the Python tests on every interpreter.
+# Run the Rust tests, then the Python tests on every interpreter, then the
+# checks of the deployment files.
 test:
     cargo test --workspace --locked
     # The bit-flip harness runs in release too. The debug assertions of redb
@@ -34,6 +35,7 @@ test:
         echo "== CPython $py"; \
         UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q; \
     done
+    just deploy check
 
 # Run the zoe-core tests and the race canary under ThreadSanitizer.
 tsan:
@@ -163,15 +165,21 @@ conformance:
     done
 
 # Run the process kill loop against `zoe serve` for `runs` rounds, on
-# CPython 3.13. Each round kills the server with SIGKILL while several
-# writers commit objects and blobs, restarts it, stops it cleanly, runs
-# `zoe verify` and loads every acknowledged commit. `just test` does not
-# collect it. Without a seed, the recipe takes a random one. It prints the
-# seed. The traceback of a failure shows its local variables, so it gives
-# the round. `just crash RUNS SEED` repeats the kill times of a run, but not
-# the order of the threads. The store and the blob caches go to TMPDIR:
-# 10,000 rounds need about 3 GB there.
-crash runs="200" seed="":
+# CPython 3.13, then the kill loop under the simulator for `seeds` seeds.
+# Each round of the process kill loop kills the server with SIGKILL while
+# several writers commit objects and blobs, restarts it, stops it cleanly,
+# runs `zoe verify` and loads every acknowledged commit. Without a seed, the
+# recipe takes a random one. It prints the seed. The traceback of a failure
+# shows its local variables, so it gives the round. `just crash RUNS SEED`
+# repeats the kill times of a run, but not the order of the threads. The
+# store and the blob caches go to TMPDIR: 10,000 rounds need about 3 GB
+# there. The simulated kill loop (`tests/simulated_kill_loop.rs` of
+# zoe-server, in release) crashes the simulated server with a power loss
+# at each phase of a commit. A failing seed prints `ZOE_SIM_SEED=<seed>`,
+# and `ZOE_SIM_SEED` runs that seed alone. `just test` runs the simulated
+# kill loop with its default seeds, and does not collect the process kill
+# loop.
+crash runs="200" seed="" seeds="200":
     #!/usr/bin/env bash
     set -euo pipefail
     seed="{{ seed }}"
@@ -188,6 +196,15 @@ crash runs="200" seed="":
         pytest -q --showlocals zoedb/tests/crash || status=$?
     if [ "$status" -ne 0 ]; then
         echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
+    fi
+    echo "just crash: the simulated kill loop, {{ seeds }} seeds"
+    simulated=0
+    ZOE_SIM_SEEDS="{{ seeds }}" cargo test --release --locked -p zoe-server \
+        --test simulated_kill_loop || simulated=$?
+    if [ "$simulated" -ne 0 ]; then
+        echo "just crash: the simulated kill loop failed. Run the seed that it names with:" \
+            "ZOE_SIM_SEED=<seed> cargo test --release -p zoe-server --test simulated_kill_loop" >&2
+        status=$simulated
     fi
     exit "$status"
 
@@ -536,6 +553,24 @@ loupe command="run":
             ;;
         *)
             echo "just loupe: unknown command {{ command }}. Use run, dev, check or e2e." >&2
+            exit 2
+            ;;
+    esac
+
+# Check the deployment files in deploy/. `just deploy check` runs the
+# tests of deploy/tests on CPython 3.13: the Tier 1 manifests, the systemd
+# unit, the supervisor program and the Grafana dashboard. Its environment
+# goes to target/deploy/venv.
+deploy command="check":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ command }}" in
+        check)
+            export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/deploy/venv"
+            uv run --locked --project deploy --python 3.13 pytest -q deploy/tests
+            ;;
+        *)
+            echo "just deploy: unknown command {{ command }}. Use check." >&2
             exit 2
             ;;
     esac
