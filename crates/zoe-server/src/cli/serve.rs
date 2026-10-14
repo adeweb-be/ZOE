@@ -9,8 +9,8 @@
 //!
 //! The command writes the line `listening <address>` to stdout once it
 //! accepts connections, so a port of 0 gives a free port. With
-//! `--admin-listen`, it writes the line `admin <address>` before it. The logs go to
-//! stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
+//! `--admin-listen`, it writes the line `admin <address>` before it. The
+//! logs go to stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
 //! the command closes the connections and the stores, and exits with 0.
 //!
 //! The console script of the wheel has no server: its extension never
@@ -152,6 +152,27 @@ pub(super) struct ServeArgs {
     )]
     idle_timeout: Duration,
 
+    /// Serve every store for reads only. The server opens each store
+    /// read-only: it changes no byte of the store, and holds its lock, so
+    /// no writer opens the store meanwhile. The store must exist, and a
+    /// store with blobs must get its blob directory. A client that
+    /// registers to write gets ReadOnlyError; a client with
+    /// read_only_fallback then registers read-only. A transaction fails at
+    /// its vote, and new_oids and pack fail, with ReadOnlyError. The key
+    /// read-only of a [storages.NAME] table makes one store read-only.
+    #[arg(
+        long,
+        env = "ZOE_READ_ONLY",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    read_only: bool,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
@@ -167,6 +188,8 @@ pub(super) struct Storage {
     /// The directory of the blob files. `None` is `blobs` in the store
     /// directory.
     pub(super) blob_dir: Option<PathBuf>,
+    /// True when the server serves the store for reads only.
+    pub(super) read_only: bool,
 }
 
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
@@ -177,6 +200,7 @@ fn named_storage(value: &str) -> Result<Storage, String> {
             name: name.to_owned(),
             path: PathBuf::from(path),
             blob_dir: None,
+            read_only: false,
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
@@ -276,6 +300,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
         name: crate::protocol::STORAGE_NAME.to_owned(),
         path: path.clone(),
         blob_dir: None,
+        read_only: false,
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())
@@ -305,7 +330,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     use crate::serve::{ServeOptions, Server, StorageOptions};
 
     let storages = args.storages.iter().map(|storage| {
-        let options = StorageOptions::new(&storage.name, &storage.path);
+        let options =
+            StorageOptions::new(&storage.name, &storage.path).read_only(storage.read_only);
         match &storage.blob_dir {
             Some(dir) => options.blob_dir(dir),
             None => options,
@@ -316,7 +342,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .invalidation_queue_size(args.invalidation_queue_size)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
-        .idle_timeout(args.idle_timeout);
+        .idle_timeout(args.idle_timeout)
+        .read_only(args.read_only);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }
@@ -395,6 +422,16 @@ mod tests {
         let args = serve(&["--idle-timeout", "0"]).unwrap();
         assert_eq!(args.idle_timeout, Duration::ZERO);
         let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn read_only_is_false_by_default_and_takes_a_boolean() {
+        assert!(!serve(&[]).unwrap().read_only);
+        assert!(serve(&["--read-only"]).unwrap().read_only);
+        assert!(serve(&["--read-only=true"]).unwrap().read_only);
+        assert!(!serve(&["--read-only=false"]).unwrap().read_only);
+        let error = serve(&["--read-only=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

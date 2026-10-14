@@ -518,7 +518,14 @@ impl Session {
         if storage != self.storage.name {
             return Err(Fault::value_error(format!("unknown storage: {storage}")));
         }
-        self.read_only = truth(read_only);
+        // A client that asks to write a read-only storage gets
+        // `ReadOnlyError`, as from ZEO. The connection stays open, so a
+        // client with `read_only_fallback` registers again read-only.
+        let read_only = truth(read_only);
+        if !read_only && self.storage.read_only {
+            return Err(Fault::read_only());
+        }
+        self.read_only = read_only;
         self.registered = true;
         // The client gets the invalidation of each commit after this tid.
         let (client, published) = self.storage.invalidations.subscribe(self.outbox.clone());
@@ -3539,6 +3546,23 @@ mod tests {
             ));
             let fault = failed(call(&mut s, "pack", vec![Value::F64(1e9)]));
             assert_eq!(fault, Fault::from(ZoeError::ReadOnly));
+        }
+    }
+
+    #[test]
+    fn a_read_only_storage_refuses_a_writing_register_and_takes_a_read_only_one() {
+        let dir = storage("register-read-only", Queues::DEFAULT).path.clone();
+        let store = Arc::new(Store::open_read_only(&dir).unwrap());
+        let storage = NamedStorage::new("1", &dir, store, Queues::DEFAULT).read_only(true);
+        let mut s = Session::new(Arc::new(storage), outbox());
+        let write = vec![Value::from("1"), Value::Boolean(false)];
+        assert_eq!(failed(call(&mut s, "register", write)), Fault::read_only());
+        // The connection stays open, and the client registers again.
+        let read = vec![Value::from("1"), Value::Boolean(true)];
+        assert_eq!(done(call(&mut s, "register", read)), p64(0));
+        assert_eq!(done(call(&mut s, "lastTransaction", vec![])), p64(0));
+        for (method, args) in [("new_oids", vec![]), ("pack", vec![Value::F64(1e9)])] {
+            assert_eq!(failed(call(&mut s, method, args)), Fault::read_only());
         }
     }
 
