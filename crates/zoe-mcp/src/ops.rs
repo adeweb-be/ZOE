@@ -77,12 +77,11 @@ pub(crate) enum ToolError {
     #[error("tid {0}: no transaction")]
     NoTransaction(String),
 
-    /// The store has blob records, but the blob directory in the store
-    /// folder has no layout file. The blob directory of the store is
-    /// elsewhere.
+    /// The store has blob records, but the blob directory of the open has
+    /// no layout file. The blob directory of the store is elsewhere.
     #[error(
         "the store has blobs, but the blob directory {0} has no layout file: \
-         zoe mcp reads the blob directory in the store folder only"
+         give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)"
     )]
     BlobDir(String),
 
@@ -404,8 +403,9 @@ fn space_json(folder: &Folder, args: &SpaceArgs) -> Result<Value, ToolError> {
     Ok(value)
 }
 
-/// Check the store of `folder` with `zoe_convert::verify`. A store whose
-/// blob directory is not in the folder is an error, as for `zoe verify`.
+/// Check the store of `folder` with `zoe_convert::verify`. A store with
+/// blob records whose blob directory has no layout file is an error, as
+/// for `zoe verify`.
 fn verify_json(folder: &Folder) -> Result<Value, ToolError> {
     let store = folder.store();
     store.check_blob_dir().map_err(|error| match error {
@@ -1025,5 +1025,6 @@ mod tests {
         assert!(matches!(error, ToolError::BlobDir(_)), "{error:?}");
         let message = error.to_string();
         assert!(message.contains("has no layout file"), "{message}");
+        assert!(message.contains("--blob-dir"), "{message}");
     }
 }

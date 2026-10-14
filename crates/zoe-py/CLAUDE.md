@@ -8,7 +8,8 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
-- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>` and `<zoe-server>` sections of ZConfig and the `zoe://` URI of zodburi.
+- `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>`, `<zoeclient>` and `<zoe-server>` sections of ZConfig and the `zoe://` URI of zodburi.
+- `python/zoedb/src/zoe/zeo.py`: `zoe.zeo.ClientStorage`, the client of a ZOE server, in Python.
 - `python/zoedb/src/zoe/serve.py`: `python -m zoe.serve`, which runs the `zoe` binary with the `<zoe-server>` section.
 - `src/cli.rs`: `zoe._zoe.main`, the `zoe` command of the console script.
 - `python/zoedb/src/zoe/__main__.py`: `zoe.__main__.main`, the entry point of the console script `zoe` and of `python -m zoe`.
@@ -80,6 +81,15 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `zoe.config` imports ZODB and ZConfig. `import zoe` does not import `zoe.config`. ZConfig and zodburi import it when they need it.
 - `just plone zoe` builds a Plone instance from `plone/zoe.cfg`, whose `zope.conf` has the `<zoe>` stanza alone, and `just plone zoe check` creates a Plone site on it. No command line and no file of the build holds the admin password: see `plone/README.md`.
 
+## `zoe.zeo.ClientStorage` and the `<zoeclient>` section
+
+- `zoe.zeo.ClientStorage` is a Python subclass of `ZEO.ClientStorage.ClientStorage`, with the same arguments. The native client of F28 replaces its inside later, under the same name. It links no Rust: `zoe.zeo` imports ZEO, not the extension.
+- Each connection declares `zoe.zeo.EXTENSIONS` (`sequences`) in a third argument of `register`. It never sends `None` there: a ZOE server refuses a third argument that is not a list of strings with `TypeError`. A stock ZEO server refuses the third argument with `TypeError`, and its connection stays open and unregistered: the connection then registers again with two arguments, and the client works as `ZEO.ClientStorage` does. The stock server logs that `TypeError` once for each connection, and the client logs it once as an error from the server. The read-only fallback keeps the declaration.
+- The client gets the accepted names in `_info["extensions"]` from `get_info`. `notify_connected` updates `_info` first, then removes the `extensions` key when the new `get_info` has none. So a reconnection to a stock server leaves no `extensions` key, and a reconnection to a ZOE server never removes the key for a moment.
+- The classes `_Protocol`, `_ClientIO` and `_ClientThread` copy three short methods of ZEO 6 (`Protocol.verify_connection`, `ClientIO.try_connecting`, `ClientRunner.setup_delegation`), each with one class changed. A new release of ZEO that changes these methods needs the same change here.
+- `sequence(name)` takes a `str` (else `TypeError`) and returns a `zoe.zeo.Sequence`. Its `next()` returns an `int` from `sequence_next(name)`, with the rules of `zoe.Storage.sequence`. When the connection did not get `sequences` accepted, `next()` raises `ZODB.POSException.Unsupported` and sends no call. A read-only connection gets `ReadOnlyError` from the server.
+- `%import zoe` declares `<zoeclient>`. It extends ZODB's `<zeoclient>`, so it takes each of its keys with the same datatypes and defaults, and adds `wait-timeout` (an integer, 30 by default), as ZEO's `<clientstorage>` has it. `zoe.config.ZoeClient.open` gives the keys to `zoe.zeo.ClientStorage` as `ZODB.config.ZEOClient` gives them to `ZEO.ClientStorage`, and `wait-timeout` as `wait_timeout`. The section has no environment twins, as `<zeoclient>` has none. A unit test checks that its keys are those of `<zeoclient>` and `wait-timeout`.
+
 ## The `<zoe-server>` section and `zoe.serve`
 
 - `component.xml` also declares the `<zoe-server>` section and its `<storage NAME>` subsections. `python -m zoe.serve -C FILE` reads the section with the schema `zoe.serve.SCHEMA` and runs `zoe serve` with it. ADR 0028 records this.
@@ -122,6 +132,7 @@ A pack maps two errors in its own way. Each stops the pack and raises `StorageSy
 - `python/zoedb/tests/acceptance/test_console_script.py` is the acceptance test of the console script `zoe`.
 - `python/zoedb/tests/acceptance/test_free_threaded_commits.py` is the acceptance test of commits from many threads. It reports the GIL state after its imports.
 - `python/zoedb/tests/server/test_zoe_server_section.py` is the acceptance test of the `<zoe-server>` section and `zoe.serve`. `python/zoedb/tests/server/test_zoe_serve.py` holds their unit tests.
+- `python/zoedb/tests/server/test_sequences_over_zeo.py` is the acceptance test of `zoe.zeo.ClientStorage`, of sequences over the protocol and of `<zoeclient>`. `python/zoedb/tests/server/test_zoe_client.py` holds their unit tests.
 - `python/zoedb/tests/acceptance/test_config.py` is the acceptance test of the stanza, the twins and the URI. `python/zoedb/tests/test_zoe_config.py` holds their unit tests.
 - `python/zoedb/tests/test_zoe_storage.py` runs the storage suites of ZODB and the unit tests of this crate.
 - On CPython 3.14t, ZODB loads the stock `persistent`, which turns the GIL back on in the test process. The test that the extension keeps the GIL off runs in a new interpreter that imports only `zoe`. The parallel-commit test runs in a child interpreter with `-X gil=0`.
