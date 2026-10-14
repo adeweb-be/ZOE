@@ -259,3 +259,13 @@ def test_a_traceparent_that_is_not_a_str_raises_type_error(tmp_path):
                 client.new_oids(1)
         finally:
             client.close()
+
+
+def test_native_on_another_subclass_raises_type_error():
+    import zoe.zeo
+
+    class Mine(zoe.zeo.ClientStorage):
+        pass
+
+    with pytest.raises(TypeError, match="native=True"):
+        Mine(("127.0.0.1", 1), native=True)
