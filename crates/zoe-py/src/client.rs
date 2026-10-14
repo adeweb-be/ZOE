@@ -56,6 +56,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// call starts it. A child of `os.fork()` gets a runtime of its own: the
 /// threads of the runtime of the parent do not exist in the child. The
 /// runtime of the parent stays allocated there and is never dropped.
+///
+/// A fork while another thread of the parent holds the mutex of this
+/// function leaves it locked in the child: the first open of the child
+/// then waits for ever. The mutex is held only while the runtime builds,
+/// at the first open of a process, so the window is short.
 fn runtime() -> std::io::Result<&'static Runtime> {
     static RUNTIME: Mutex<Option<(u32, &'static Runtime)>> = Mutex::new(None);
     let pid = std::process::id();
