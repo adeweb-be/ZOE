@@ -19,6 +19,6 @@ export PYTHONDONTWRITEBYTECODE=1
   "$bin/micro" lock "$out"
   "$py" hit.py --objects 1000 --rounds 30 --threads 1
   "$py" hit.py --objects 100 --rounds 30 --threads 16
-  "$py" hit.py --objects 1000 --rounds 15 --threads 1 --size 102400 --kinds zeo,proto-shared,proto-shared-zstd
+  "$py" hit.py --rounds 15 --threads 1 --size 102400 --cache-mb 256 --objects 200 --kinds zeo,proto-shared,proto-shared-zstd
   uptime | sed 's/^/# /'
 } > "$out/timing.jsonl" 2>&1

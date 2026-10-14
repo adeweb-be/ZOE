@@ -61,21 +61,22 @@ class Proto:
         self.inner.close()
 
 
-def make_cache(kind, tmp):
+def make_cache(kind, tmp, mb=20):
+    size = mb * MB
     if kind == "zeo":
-        return ZEO.cache.ClientCache(None, 20 * MB)
+        return ZEO.cache.ClientCache(None, size)
     if kind == "zeo-file":
-        return ZEO.cache.ClientCache(os.path.join(tmp, "zeo.zec"), 20 * MB)
+        return ZEO.cache.ClientCache(os.path.join(tmp, "zeo.zec"), size)
     if kind == "proto-memory":
-        return Proto(size=20 * MB)
+        return Proto(size=size)
     if kind == "proto-file":
-        return Proto(path=os.path.join(tmp, "private.zoec"), size=20 * MB)
+        return Proto(path=os.path.join(tmp, "private.zoec"), size=size)
     if kind == "proto-shared":
-        return Proto(path=os.path.join(tmp, "shared.zoec"), size=20 * MB, shared=True)
+        return Proto(path=os.path.join(tmp, "shared.zoec"), size=size, shared=True)
     if kind == "proto-shared-zstd":
         return Proto(
             path=os.path.join(tmp, "sharedz.zoec"),
-            size=20 * MB,
+            size=size,
             shared=True,
             compress_min=0,
             level=1,
@@ -112,8 +113,10 @@ def round_one(db, t, n):
 
 
 def run_threads(db, threads, n, kind):
-    """Every thread reads its own objects; returns the wall time."""
-    barrier = threading.Barrier(threads + 1)
+    """Every thread reads its own objects. Returns the wall time from the
+    first start to the last end, and the mean time of one thread, which is
+    what zodbshootout counts."""
+    barrier = threading.Barrier(threads)
     times = []
 
     def work(t):
@@ -121,21 +124,21 @@ def run_threads(db, threads, n, kind):
         objs = conn.root()[f"{kind}-{t}"]
         conn.cacheMinimize()
         barrier.wait()
+        begin = time.perf_counter()
         got = 0
         for o in objs:
             got += o.attr
         assert got == n
-        times.append(time.perf_counter())
+        times.append((begin, time.perf_counter()))
         conn.close()
 
     ts = [threading.Thread(target=work, args=(t,)) for t in range(threads)]
     for x in ts:
         x.start()
-    barrier.wait()
-    begin = time.perf_counter()
     for x in ts:
         x.join()
-    return max(times) - begin
+    wall = max(e for _, e in times) - min(b for b, _ in times)
+    return wall, sum(e - b for b, e in times) / len(times)
 
 
 def bare(cache, oids, before):
@@ -152,6 +155,7 @@ def main():
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--rounds", type=int, default=30)
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--cache-mb", type=int, default=20)
     ap.add_argument(
         "--kinds",
         default="zeo,zeo-file,proto-memory,proto-file,proto-shared,proto-shared-zstd,mapping",
@@ -165,10 +169,10 @@ def main():
         if k == "mapping":
             from ZODB.MappingStorage import MappingStorage
 
-            db = ZODB.DB(MappingStorage())
+            db = ZODB.DB(MappingStorage(), pool_size=a.threads + 4)
         else:
-            cs = ClientStorage(addr, cache=make_cache(k, tmp), wait=True)
-            db = ZODB.DB(cs)
+            cs = ClientStorage(addr, cache=make_cache(k, tmp, a.cache_mb), wait=True)
+            db = ZODB.DB(cs, pool_size=a.threads + 4)
         populate(db, a.objects, a.size, a.threads, k)
         dbs[k] = db
     # Warm every cache once: the populate commits wrote the root again.
@@ -176,13 +180,15 @@ def main():
         for t in range(a.threads):
             round_one(db, f"{k}-{t}", a.objects)
     per_hit = {k: [] for k in kinds}
+    per_thread = {k: [] for k in kinds}
     bare_hit = {k: [] for k in kinds}
     for _ in range(a.rounds):
         for k, db in dbs.items():
             if a.threads == 1:
                 s = round_one(db, f"{k}-0", a.objects)
             else:
-                s = run_threads(db, a.threads, a.objects, k)
+                s, mean_thread = run_threads(db, a.threads, a.objects, k)
+                per_thread[k].append(mean_thread / a.objects * 1e6)
             per_hit[k].append(s / (a.objects * a.threads) * 1e6)
             if k != "mapping":
                 cache = db.storage._cache
@@ -203,7 +209,13 @@ def main():
             "us_per_hit_median": round(statistics.median(v), 3),
             "us_per_hit_min": round(min(v), 3),
             "us_per_hit_max": round(max(v), 3),
+            "cache_mb": a.cache_mb,
         }
+        if per_thread[k]:
+            t = per_thread[k]
+            out["us_per_hit_one_thread_median"] = round(statistics.median(t), 3)
+            out["us_per_hit_one_thread_min"] = round(min(t), 3)
+            out["us_per_hit_one_thread_max"] = round(max(t), 3)
         if bare_hit[k]:
             b = bare_hit[k]
             out["us_bare_loadBefore_median"] = round(statistics.median(b), 3)
