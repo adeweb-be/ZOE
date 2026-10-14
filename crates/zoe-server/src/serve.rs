@@ -358,6 +358,8 @@ pub struct Server {
     /// The accept loop and the connections that run.
     tasks: Arc<Tasks>,
     shutdown_timeout: Duration,
+    /// SIGTERM and SIGINT, when the start handled them.
+    signals: Option<Signals>,
 }
 
 impl Server {
@@ -365,11 +367,18 @@ impl Server {
     /// accepts connections. When a store does not open, close the stores
     /// that opened and fail.
     pub fn start(options: ServeOptions) -> Result<Self, Error> {
-        Self::start_with(options, |_, path, store_options| {
-            Store::open_with(path, store_options)
-                .map(Arc::new)
-                .map_err(|error| Error::Store(path.to_path_buf(), error))
-        })
+        Self::start_with(options, open_writer)
+    }
+
+    /// Start as [`Server::start`] does, but handle SIGTERM and SIGINT
+    /// before the start creates anything on disk. A signal during the
+    /// start does not stop the start: each store open ends, and the start
+    /// ends or fails. Then [`Server::serve_until_signal`] stops at once.
+    pub(crate) fn start_with_signals(options: ServeOptions) -> Result<Self, Error> {
+        options.check_storages()?;
+        let runtime = new_runtime()?;
+        let signals = Signals::handle(&runtime).map_err(Error::Runtime)?;
+        Self::start_on(runtime, Some(signals), options, open_writer)
     }
 
     /// Start as [`Server::start`] does, but open the store of each storage
@@ -377,14 +386,20 @@ impl Server {
     /// store directory and the options of the store.
     pub(crate) fn start_with(
         options: ServeOptions,
-        mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
+        open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
     ) -> Result<Self, Error> {
         options.check_storages()?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("zoe-serve")
-            .build()
-            .map_err(Error::Runtime)?;
+        Self::start_on(new_runtime()?, None, options, open)
+    }
+
+    /// Start in `runtime`, with the signals that the server keeps for
+    /// [`Server::serve_until_signal`], as [`Server::start_with`] does.
+    fn start_on(
+        runtime: Runtime,
+        signals: Option<Signals>,
+        options: ServeOptions,
+        mut open: impl FnMut(&str, &Path, Options) -> Result<Arc<Store>, Error>,
+    ) -> Result<Self, Error> {
         // Listen first: a server that cannot listen changes nothing on
         // disk.
         let listener = {
@@ -470,6 +485,7 @@ impl Server {
             stop_signal,
             tasks,
             shutdown_timeout: options.shutdown_timeout,
+            signals,
         })
     }
 
@@ -492,29 +508,19 @@ impl Server {
     }
 
     /// Call `ready` with the address, then serve until SIGTERM or SIGINT.
-    /// Then stop.
+    /// Then stop. A signal that came after the start handled the signals
+    /// stops the server at once.
     pub(crate) fn serve_until_signal(
         mut self,
         ready: impl FnOnce(SocketAddr) -> io::Result<()>,
     ) -> io::Result<()> {
-        use tokio::signal::unix::{SignalKind, signal};
-
         let runtime = self.runtime.as_ref().expect("the server runs");
-        let (mut term, mut interrupt) = {
-            let _enter = runtime.enter();
-            (
-                signal(SignalKind::terminate())?,
-                signal(SignalKind::interrupt())?,
-            )
+        let mut signals = match self.signals.take() {
+            Some(signals) => signals,
+            None => Signals::handle(runtime)?,
         };
         ready(self.addr)?;
-        runtime.block_on(async {
-            tokio::select! {
-                biased;
-                _ = term.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-        });
+        signals.wait(runtime);
         self.shutdown();
         Ok(())
     }
@@ -559,6 +565,56 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Build the multi-thread runtime of a server.
+fn new_runtime() -> Result<Runtime, Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("zoe-serve")
+        .build()
+        .map_err(Error::Runtime)
+}
+
+/// Open the store in `path` for writes with `options`. Create a store that
+/// does not exist.
+fn open_writer(_name: &str, path: &Path, options: Options) -> Result<Arc<Store>, Error> {
+    Store::open_with(path, options)
+        .map(Arc::new)
+        .map_err(|error| Error::Store(path.to_path_buf(), error))
+}
+
+/// SIGTERM and SIGINT, handled through the runtime of the server. The
+/// process keeps the handlers until it exits, so a later signal never
+/// kills it.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    /// Handle SIGTERM and SIGINT from now on. A signal that comes after
+    /// this call waits until [`Signals::wait`] reads it.
+    fn handle(runtime: &Runtime) -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _enter = runtime.enter();
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait in `runtime` for the first SIGTERM or SIGINT.
+    fn wait(&mut self, runtime: &Runtime) {
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.term.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        });
     }
 }
 

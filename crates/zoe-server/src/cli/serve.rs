@@ -12,6 +12,9 @@
 //! `--admin-listen`, it writes the line `admin <address>` before it. The
 //! logs go to stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
 //! the command closes the connections and the stores, and exits with 0.
+//! The command handles both signals before it creates anything on disk. A
+//! signal during the start stops the server when the start ends, so a
+//! store that the start creates is complete and closes cleanly.
 //!
 //! The console script of the wheel has no server: its extension never
 //! links tokio. There, the command fails with 1 and names the `zoe` binary.
@@ -422,7 +425,8 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 
 /// Serve until SIGTERM or SIGINT, then stop. Write the line
 /// `admin <address>` when the server has an admin port, then the line
-/// `listening <address>`, to `out`.
+/// `listening <address>`, to `out`. Handle both signals from before the
+/// start: a signal during the start stops the server when the start ends.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -464,7 +468,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(threads) = args.blocking_threads {
         options = options.blocking_threads(threads);
     }
-    let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
+    let server =
+        Server::start_with_signals(options).map_err(|error| Failure::Message(error.to_string()))?;
     if let Some(admin) = server.admin_addr() {
         writeln!(out, "admin {admin}")?;
     }
