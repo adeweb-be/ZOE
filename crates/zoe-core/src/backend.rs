@@ -206,7 +206,10 @@ pub trait Backend: Send + Sync {
     /// The caller compares the records with the oid count of the row.
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;
 
-    /// Make all committed writes durable. Group commit uses this barrier.
+    /// Make all committed writes durable, the commits of
+    /// `WriteTxn::commit_deferred` included. `Store::sync` calls this
+    /// barrier under the commit sequencer. A read-only backend has nothing
+    /// to make durable.
     fn sync(&self) -> Result<()>;
 
     /// Return the bytes stored under `key`, as stored. Only the test hook

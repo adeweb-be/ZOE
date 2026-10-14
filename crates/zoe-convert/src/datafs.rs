@@ -848,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn an_error_of_the_copy_pass_keeps_the_restores_before_it() {
+        let mut file = FileBuilder::new();
+        file.txn(10, b' ', NO_META, &[(1, Data::Bytes(b"a"))]);
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"b"))]);
+        // A tid that does not increase stops the copy pass with `Corrupt`.
+        file.txn(20, b' ', NO_META, &[(1, Data::Bytes(b"c"))]);
+        let vfs = MemVfs::new();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let error = from_datafs(&file.write("copy-error"), None, &store).unwrap_err();
+        assert!(matches!(error, Error::Corrupt { .. }), "{error:?}");
+
+        // The copy pass synced the store before it returned the error, so
+        // a crash keeps both restores.
+        let image = vfs.crash_now(|_| 0);
+        let reopened = Store::open_vfs(image).unwrap();
+        assert_eq!(reopened.last_transaction(), Tid(20));
+        assert_eq!(reopened.load(Oid(1)).unwrap(), (b"b".to_vec(), Tid(20)));
+        drop(store);
+    }
+
+    #[test]
     fn a_tail_of_zeros_is_a_problem_on_every_run() {
         let mut file = FileBuilder::new();
         file.txn(10, b' ', NO_META, &[(1, Data::Bytes(b"a"))]);

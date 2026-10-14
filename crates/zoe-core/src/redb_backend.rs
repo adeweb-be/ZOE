@@ -637,9 +637,13 @@ impl Backend for RedbBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        // Every commit is durable when it returns, so there is nothing to
-        // flush.
-        Ok(())
+        let Db::ReadWrite(db) = &self.db else {
+            return Ok(());
+        };
+        // An empty write transaction with the default durability syncs
+        // the file. So the commits without durability before it become
+        // durable too.
+        db.begin_write().map_err(backend)?.commit().map_err(backend)
     }
 
     #[cfg(feature = "testing")]

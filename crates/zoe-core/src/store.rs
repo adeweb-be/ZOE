@@ -473,8 +473,9 @@ impl Store {
 
     /// Make every commit before this call durable.
     ///
-    /// The call commits one backend write transaction under the commit
-    /// sequencer, with a sync. It writes no record, no transaction row and
+    /// The call runs the barrier `Backend::sync` under the commit
+    /// sequencer: one backend write transaction of its own, committed with
+    /// a sync. It writes no record, no transaction row and
     /// no last tid, so the last tid does not change. Then it removes the
     /// intent files that the deferred commits kept in `blobs/tmp/`.
     ///
@@ -489,7 +490,7 @@ impl Store {
         };
         // The sequencer stays empty if the commit below fails.
         *sequencer = None;
-        self.backend.begin_write()?.commit()?;
+        self.backend.sync()?;
         *sequencer = Some(last);
         self.blobs().release_kept();
         Ok(())
@@ -838,6 +839,9 @@ mod tests {
         }
 
         fn sync(&self) -> Result<()> {
+            if self.faults.write.load(Ordering::Relaxed) {
+                return Err(injected());
+            }
             self.inner.sync()
         }
 

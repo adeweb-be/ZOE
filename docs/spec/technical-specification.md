@@ -13,7 +13,7 @@ ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use un
 1. Drop-in for Plone 6: the only configuration change is the storage stanza in `zope.conf` (`<zoe>` or a `<zeoclient>` pointed at the Rust server). No change to application code, `persistent`, `BTrees` or `transaction`. A `<zeoclient>` against `zoe serve` needs the `msgpack` package, because the server speaks only the msgpack protocol `M5` (F2); `zoedb[plone]` installs it.
 2. Fastest measured Plone storage: beats `FileStorage`, ZEO and RelStorage on Postgres on the same `zodbshootout` harness, cold, warm and hot.
 3. Async where it pays: the server is fully asynchronous (tokio), handles pipelined requests per connection, and exposes an async storage interface for future async clients. The ZODB object model stays synchronous.
-4. ACID by construction: atomic two-phase commit, durable on `tpc_finish` (fsync or replicated acknowledgement), snapshot isolation through MVCC keyed by `(oid, tid)`, and crash recovery without a repair step.
+4. ACID by construction: atomic two-phase commit, durable on `tpc_finish` (fsync or replicated acknowledgement; the one exception is the deferred restore of the `Data.fs` converter, durable at its next batch sync, see **Tids**), snapshot isolation through MVCC keyed by `(oid, tid)`, and crash recovery without a repair step.
 5. Fewer ConflictErrors under heavy writes: per-OID commit locks, optional early write-intent locks, and conflict resolution in Rust for structures and for fields, with Python only on the client for the long tail.
 6. Two deployment shapes from one crate: in-process (no server) and clustered (server), same on-disk format, switchable by restarting.
 7. Cloud-native on Kubernetes in three tiers: single-replica StatefulSet, leader/follower with automatic failover, stateless fronts over FoundationDB or TiKV.
@@ -294,7 +294,7 @@ pub trait Backend: Send + Sync {
     fn pack_watermark(&self) -> Result<Tid>;                                                 // the tid of the last pack, 0 before the first
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>>;              // the record keys of whole oids from `from`, for the pack scan
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;                          // a transaction row, its index keys and their records, one snapshot
-    fn sync(&self) -> Result<()>;                         // fsync barrier used by group commit
+    fn sync(&self) -> Result<()>;                         // fsync barrier: makes deferred commits durable; Store::sync calls it
 }
 
 pub trait WriteTxn {
