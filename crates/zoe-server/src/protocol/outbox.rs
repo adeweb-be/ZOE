@@ -38,10 +38,11 @@
 //! while more than `WAITING` bytes wait closes it to one call.
 //!
 //! So the frames of the session that wait for one client, the frame that
-//! the writer sends included, hold at most `WAITING` bytes beyond one
-//! frame for each call of its window. The writer has written a frame when
-//! the socket took it, whether the client reads or not. A large frame
-//! fills the buffers of the socket, so large replies open the window only
+//! the writer sends included, hold at most `WAITING` bytes plus one frame
+//! for each call of its window. The writer has written a frame when the
+//! socket took it, whether the client reads or not. Here a large frame is
+//! larger than the buffers of the socket, and a small frame is smaller. A
+//! large frame fills the buffers, so large replies open the window only
 //! for a client that reads. A small frame fits in the buffers, so small
 //! replies open it also for a client that does not read. Limit: a client
 //! that got small replies and then stops reading can hold one large reply
