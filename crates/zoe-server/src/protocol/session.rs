@@ -379,6 +379,13 @@ pub(crate) fn runs_long(method: &str) -> bool {
     matches!(method, "sendBlob" | "pack")
 }
 
+/// Tell if `method` runs on the read pool, once the connection is
+/// registered: a call that is not `set_client_label`, not a call of the
+/// transaction and does not run long.
+pub(crate) fn on_read_pool(method: &str) -> bool {
+    method != "set_client_label" && !in_transaction(method) && !runs_long(method)
+}
+
 /// The open transaction of a connection.
 struct Open {
     /// The id that the client gave to the transaction.
@@ -771,8 +778,10 @@ impl Session {
     /// reply, never as a chunk.
     ///
     /// The first frame takes the room of the call. Each later frame waits
-    /// for room in the session queue, without holding room. So many
-    /// downloads of one connection never wait for each other in a circle.
+    /// while more than `outbox::WAITING` bytes of frames of the session
+    /// wait, then for room in the session queue, without holding room. So
+    /// many downloads of one connection never wait for each other in a
+    /// circle.
     fn send_blob(&self, args: &[Value], reply: &mut Reply) -> Outcome {
         let download = arity::<2>(args, "sendBlob").and_then(|[oid, serial]| {
             let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
@@ -1831,7 +1840,7 @@ mod tests {
                     () = ended.wait() => None,
                 };
                 let Some(call) = call else { break };
-                let ticket = connection.ticket().await;
+                let ticket = connection.ticket(&call).await;
                 if ticket.is_closed() {
                     break;
                 }
@@ -3706,6 +3715,26 @@ mod tests {
         let tid = vote_and_finish(&mut s, 1).unwrap();
         let outcome = call(&mut s, "sendBlob", vec![p64(1), p64(tid)]);
         assert!(matches!(outcome, Outcome::Gone), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_calls_of_the_read_pool_are_the_calls_that_read() {
+        for method in [
+            "loadBefore",
+            "loadSerial",
+            "history",
+            "new_oids",
+            "iterator_next",
+            "sequence_next",
+        ] {
+            assert!(on_read_pool(method), "{method}");
+        }
+        for method in TRANSACTION_CALLS {
+            assert!(!on_read_pool(method), "{method}");
+        }
+        for method in ["set_client_label", "sendBlob", "pack"] {
+            assert!(!on_read_pool(method), "{method}");
+        }
     }
 
     #[test]

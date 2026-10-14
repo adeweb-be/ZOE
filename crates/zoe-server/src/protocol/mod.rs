@@ -462,6 +462,7 @@ pub(crate) async fn serve_stream(
                 if written.is_err() {
                     break;
                 }
+                frame.sent();
             }
             // A call that waits for room in the session queue stops.
             drop(inbox);
@@ -522,11 +523,12 @@ pub(crate) async fn serve_stream(
         if call.is_heartbeat() {
             continue;
         }
-        // The reader waits while `QUEUE` calls run or wait, and while the
-        // session queue is full.
+        // The reader waits while `QUEUE` calls run or wait, while more
+        // than `outbox::WAITING` bytes of replies wait, while the window
+        // of the read pool is full, and while the session queue is full.
         let ticket = tokio::select! {
             biased;
-            ticket = calls.ticket() => ticket,
+            ticket = calls.ticket(&call) => ticket,
             () = ended.wait() => break,
             () = closing.wait() => break,
         };

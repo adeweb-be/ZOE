@@ -25,29 +25,202 @@
 //! place goes into the session queue at once, and the call fills it later.
 //! The writer waits for that frame. A place that gets no frame holds no
 //! frame, and the writer skips it.
+//!
+//! A frame of the session counts from the time it goes into the queue
+//! until the writer has written it. A call starts only while at most
+//! `WAITING` bytes of these frames wait, and a download sends its next
+//! frame only then. A frame larger than `WAITING` goes out whole. The size
+//! of a reply is known only after its call ran, so a window limits the
+//! calls of the read pool that run at once (`Turn`). The window of a new
+//! connection holds one call. Each frame of the session that the writer
+//! has written, while at most `WAITING` bytes of other frames wait, opens
+//! the window by one call, up to `QUEUE`. A frame that goes into the queue
+//! while more than `WAITING` bytes wait closes it to one call.
+//!
+//! So the frames of the session that wait for one client, the frame that
+//! the writer sends included, hold at most `WAITING` bytes plus one frame
+//! for each call of its window. The writer has written a frame when the
+//! socket took it, whether the client reads or not. Here a large frame is
+//! larger than the buffers of the socket, and a small frame is smaller. A
+//! large frame fills the buffers, so large replies open the window only
+//! for a client that reads. A small frame fits in the buffers, so small
+//! replies open it also for a client that does not read. Limit: a client
+//! that got small replies and then stops reading can hold one large reply
+//! for each call of its window, up to `QUEUE`, once, until the window
+//! closes.
+//!
+//! The waits on the count end when the writer is gone. A frame that a call
+//! puts after that can stay counted, so only the end of the writer ends
+//! these waits.
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc::{self, OwnedPermit, error::TrySendError};
 use tokio::sync::{Semaphore, oneshot, watch};
 
+use super::QUEUE;
 use crate::runtime::block_on;
+
+/// The most bytes of the frames of the session that wait for one client
+/// when a call starts or a download sends its next frame.
+pub(crate) const WAITING: usize = 1 << 20;
 
 /// The bytes of one message. All the connections that get the message
 /// share them.
 pub(crate) type Frame = Arc<Vec<u8>>;
 
+/// A frame that goes out. A frame of the session holds its bytes in the
+/// count of its connection until it drops.
+pub(crate) struct Outgoing {
+    frame: Frame,
+    charge: Option<Charge>,
+}
+
+impl Outgoing {
+    /// A frame of the hub. It does not count.
+    fn hub(frame: Frame) -> Self {
+        Self {
+            frame,
+            charge: None,
+        }
+    }
+
+    /// Tell that the writer wrote the frame. Its bytes no longer count.
+    /// When at most `WAITING` bytes of other frames wait, the window of
+    /// the read pool opens by one call.
+    pub(crate) fn sent(mut self) {
+        if let Some(charge) = self.charge.as_mut() {
+            charge.sent = true;
+        }
+    }
+}
+
+impl Deref for Outgoing {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.frame
+    }
+}
+
+impl std::fmt::Debug for Outgoing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.frame.fmt(f)
+    }
+}
+
+/// The count of the frames of the session that wait for one connection,
+/// and the window of its calls of the read pool.
+#[derive(Debug, Clone, Copy)]
+struct Count {
+    /// The bytes of the frames of the session that wait, the frame that
+    /// the writer sends included.
+    waiting: usize,
+    /// The most calls of the read pool that run at once: 1 to `QUEUE`.
+    window: usize,
+    /// The calls of the read pool that hold a turn.
+    reading: usize,
+}
+
+/// The count of one connection. All its outboxes share it.
+#[derive(Debug)]
+struct Flow(watch::Sender<Count>);
+
+impl Flow {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(watch::Sender::new(Count {
+            waiting: 0,
+            window: 1,
+            reading: 0,
+        })))
+    }
+
+    /// Count a frame of `bytes` that goes into the session queue. When
+    /// more than `WAITING` bytes wait, close the window to one call.
+    fn charge(self: &Arc<Self>, bytes: usize) -> Charge {
+        self.0.send_modify(|count| {
+            if count.waiting > WAITING {
+                count.window = 1;
+            }
+            count.waiting += bytes;
+        });
+        Charge {
+            flow: Arc::clone(self),
+            bytes,
+            sent: false,
+        }
+    }
+
+    /// Return `frame` as a frame of the session, counted.
+    fn charged(self: &Arc<Self>, frame: Vec<u8>) -> Outgoing {
+        Outgoing {
+            charge: Some(self.charge(frame.len())),
+            frame: Arc::new(frame),
+        }
+    }
+
+    /// Wait while more than `WAITING` bytes wait.
+    async fn below(&self) {
+        let mut count = self.0.subscribe();
+        // `self` holds the sender, so the wait cannot fail.
+        let _ = count.wait_for(|count| count.waiting <= WAITING).await;
+    }
+
+    /// Wait for a turn of the read pool: while more than `WAITING` bytes
+    /// wait, and while the calls of the window hold their turns.
+    async fn turn(self: &Arc<Self>) -> Turn {
+        let mut count = self.0.subscribe();
+        let free = |count: &Count| count.waiting <= WAITING && count.reading < count.window;
+        let _ = count.wait_for(free).await;
+        // The check and the count are two steps. That is correct because
+        // only the reader of the connection takes turns, one at a time.
+        self.0.send_modify(|count| count.reading += 1);
+        Turn(Arc::clone(self))
+    }
+}
+
+/// The bytes of one frame of the session in the count of its connection.
+/// Dropping it takes them out.
+struct Charge {
+    flow: Arc<Flow>,
+    bytes: usize,
+    /// The writer wrote the frame.
+    sent: bool,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.flow.0.send_modify(|count| {
+            count.waiting -= self.bytes;
+            if self.sent && count.waiting <= WAITING {
+                count.window = (count.window + 1).min(QUEUE);
+            }
+        });
+    }
+}
+
+/// The turn of one call of the read pool in the window of its connection.
+/// Dropping it gives the turn back.
+pub(crate) struct Turn(Arc<Flow>);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|count| count.reading -= 1);
+    }
+}
+
 /// What a place holds.
 enum Slot {
     /// The frame, or none for an empty place.
-    Ready(Option<Frame>),
+    Ready(Option<Outgoing>),
     /// The frames of one message of the hub, in their order.
     Message(Vec<Frame>),
     /// A frame that the call gives later. A closed channel is an empty
     /// place.
-    Pending(oneshot::Receiver<Vec<u8>>),
+    Pending(oneshot::Receiver<Outgoing>),
 }
 
 /// A place in the order of its connection and what it holds.
@@ -68,6 +241,8 @@ pub(crate) struct Outbox {
     /// A frame of the session takes its place and goes into the session
     /// queue under this lock.
     order: Arc<Mutex<()>>,
+    /// The count of the frames of the session that wait.
+    flow: Arc<Flow>,
     closing: Arc<watch::Sender<bool>>,
 }
 
@@ -98,6 +273,7 @@ impl Outbox {
             hub,
             next: Arc::new(AtomicU64::new(0)),
             order: Arc::new(Mutex::new(())),
+            flow: Flow::new(),
             closing: Arc::new(closing),
         };
         let inbox = Inbox {
@@ -128,6 +304,27 @@ impl Outbox {
         }
     }
 
+    /// Wait while more than `WAITING` bytes of frames of the session wait.
+    /// Stop when the writer is gone: then a room holds nothing.
+    pub(crate) async fn below(&self) {
+        tokio::select! {
+            biased;
+            () = self.session.closed() => {}
+            () = self.flow.below() => {}
+        }
+    }
+
+    /// Wait for a turn in the window of the calls of the read pool, while
+    /// at most `WAITING` bytes of frames of the session wait. Return `None`
+    /// when the writer is gone.
+    pub(crate) async fn turn(&self) -> Option<Turn> {
+        tokio::select! {
+            biased;
+            () = self.session.closed() => None,
+            turn = self.flow.turn() => Some(turn),
+        }
+    }
+
     /// Wait for room for one frame in the session queue, on a thread that
     /// is not a thread of the async runtime.
     pub(crate) fn blocking_room(&self) -> Room {
@@ -148,11 +345,13 @@ impl Outbox {
         place.fill(frame)
     }
 
-    /// Put a frame of the session at the next place. Wait while the session
-    /// queue is full. Return false when the connection is closed.
+    /// Put a frame of the session at the next place. Wait while more than
+    /// `WAITING` bytes of frames of the session wait, then while the
+    /// session queue is full. Return false when the connection is closed.
     ///
     /// Call this only on a thread that is not a thread of the async runtime.
     pub(crate) fn send(&self, frame: Vec<u8>) -> bool {
+        block_on(self.below());
         self.blocking_room().put(Some(frame))
     }
 
@@ -162,7 +361,7 @@ impl Outbox {
     /// The hub calls this under its mutex, so its frames take their places
     /// in the order of the queue.
     pub(crate) fn push(&self, frame: Frame) -> Pushed {
-        self.push_slot(Slot::Ready(Some(frame)))
+        self.push_slot(Slot::Ready(Some(Outgoing::hub(frame))))
     }
 
     /// Put the frames of one message of the hub at the next place, and do
@@ -242,9 +441,10 @@ impl Room {
     /// false when the connection is closed.
     pub(crate) fn put(self, frame: Option<Vec<u8>>) -> bool {
         match self.permit {
-            Some(permit) => self
-                .outbox
-                .put_slot(permit, Slot::Ready(frame.map(Arc::new))),
+            Some(permit) => {
+                let frame = frame.map(|frame| self.outbox.flow.charged(frame));
+                self.outbox.put_slot(permit, Slot::Ready(frame))
+            }
             None => false,
         }
     }
@@ -257,7 +457,7 @@ impl Room {
         };
         let (frame, slot) = oneshot::channel();
         if self.outbox.put_slot(permit, Slot::Pending(slot)) {
-            Place(Some(frame))
+            Place(Some((frame, Arc::clone(&self.outbox.flow))))
         } else {
             Place(None)
         }
@@ -268,15 +468,15 @@ impl Room {
 /// later. Dropping it leaves the place empty.
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct Place(Option<oneshot::Sender<Vec<u8>>>);
+pub(crate) struct Place(Option<(oneshot::Sender<Outgoing>, Arc<Flow>)>);
 
 impl Place {
     /// Put `frame` at the place, or leave the place empty. Return false
     /// when the connection is closed.
     pub(crate) fn fill(self, frame: Option<Vec<u8>>) -> bool {
         match (self.0, frame) {
-            (Some(place), Some(frame)) => place.send(frame).is_ok(),
-            (Some(place), None) => !place.is_closed(),
+            (Some((place, flow)), Some(frame)) => place.send(flow.charged(frame)).is_ok(),
+            (Some((place, _)), None) => !place.is_closed(),
             (None, _) => false,
         }
     }
@@ -294,7 +494,7 @@ pub(crate) struct Inbox {
     from_hub: Option<Placed>,
     /// The frame of the last place that went out, when its call did not
     /// give it yet.
-    pending: Option<oneshot::Receiver<Vec<u8>>>,
+    pending: Option<oneshot::Receiver<Outgoing>>,
     /// The frames of the last place that went out, after its first frame.
     rest: VecDeque<Frame>,
     /// The queue still has a sender.
@@ -305,7 +505,7 @@ pub(crate) struct Inbox {
 /// What the inbox needs to give its next frame.
 enum Step {
     /// This frame is next.
-    Frame(Frame),
+    Frame(Outgoing),
     /// The next frame comes from its call: wait for it.
     Pending,
     /// The next frame is not read yet: read ahead in these queues.
@@ -318,7 +518,7 @@ impl Inbox {
     /// Return the next frame in the order of the connection. Return `None`
     /// when both queues are closed and empty. The call is cancel safe: a
     /// frame that it read ahead, or waits for, stays in the inbox.
-    pub(crate) async fn recv(&mut self) -> Option<Frame> {
+    pub(crate) async fn recv(&mut self) -> Option<Outgoing> {
         loop {
             match self.step() {
                 Step::Frame(frame) => return Some(frame),
@@ -328,7 +528,7 @@ impl Inbox {
                     let frame = pending.await;
                     self.pending = None;
                     if let Ok(frame) = frame {
-                        return Some(Arc::new(frame));
+                        return Some(frame);
                     }
                 }
                 Step::Read { session, hub } => tokio::select! {
@@ -348,7 +548,7 @@ impl Inbox {
 
     /// Return the next frame if it waits now, and do not wait.
     #[cfg(test)]
-    pub(crate) fn try_recv(&mut self) -> Option<Frame> {
+    pub(crate) fn try_recv(&mut self) -> Option<Outgoing> {
         use mpsc::error::TryRecvError;
 
         loop {
@@ -360,7 +560,7 @@ impl Inbox {
                     match pending.try_recv() {
                         Ok(frame) => {
                             self.pending = None;
-                            return Some(Arc::new(frame));
+                            return Some(frame);
                         }
                         Err(oneshot::error::TryRecvError::Empty) => return None,
                         Err(oneshot::error::TryRecvError::Closed) => {
@@ -396,7 +596,7 @@ impl Inbox {
     /// what to read or to wait for.
     fn step(&mut self) -> Step {
         if let Some(frame) = self.rest.pop_front() {
-            return Step::Frame(frame);
+            return Step::Frame(Outgoing::hub(frame));
         }
         if self.pending.is_some() {
             return Step::Pending;
@@ -419,7 +619,7 @@ impl Inbox {
                     Slot::Message(frames) => {
                         self.rest = frames.into();
                         match self.rest.pop_front() {
-                            Some(frame) => return Step::Frame(frame),
+                            Some(frame) => return Step::Frame(Outgoing::hub(frame)),
                             None => continue,
                         }
                     }
@@ -618,6 +818,170 @@ mod tests {
         drop(inbox);
         assert_eq!(outbox.push(frame("three")), Pushed::Gone);
         assert!(!outbox.send(b"four".to_vec()));
+    }
+
+    /// The bytes of the frames of the session that wait, and the window.
+    fn count(outbox: &Outbox) -> (usize, usize) {
+        let count = *outbox.flow.0.borrow();
+        (count.waiting, count.window)
+    }
+
+    /// Tell if a turn is free now. Give it back at once.
+    fn turn_is_free(outbox: &Outbox) -> bool {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _turn = outbox.turn() => true,
+                () = std::future::ready(()) => false,
+            }
+        })
+    }
+
+    #[test]
+    fn a_frame_of_the_session_counts_until_the_writer_drops_it() {
+        let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
+        assert!(outbox.send(vec![1; 100]));
+        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
+        let place = outbox.place();
+        assert!(place.fill(Some(vec![2; 50])));
+        // A frame of the hub does not count.
+        assert_eq!(count(&outbox).0, 150);
+        let first = inbox.try_recv().unwrap();
+        // The writer sends the frame: it still counts.
+        assert_eq!(count(&outbox).0, 150);
+        drop(first);
+        assert_eq!(count(&outbox).0, 50);
+        assert_eq!(take(&mut inbox).len(), 2);
+        assert_eq!(count(&outbox).0, 0);
+        // The frames of a closed connection drop with its queue.
+        assert!(outbox.send(vec![3; 10]));
+        drop(inbox);
+        assert_eq!(count(&outbox).0, 0);
+    }
+
+    #[test]
+    fn the_window_opens_when_the_writer_sends_and_closes_when_much_waits() {
+        let (outbox, mut inbox, _closing) = Outbox::new(100, 10);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // A new connection runs one call of the read pool at a time.
+        assert_eq!(count(&outbox), (0, 1));
+        let first = runtime.block_on(outbox.turn()).unwrap();
+        assert!(!turn_is_free(&outbox));
+        // A frame that the writer does not send opens nothing.
+        assert!(outbox.send(b"reply".to_vec()));
+        assert_eq!(count(&outbox).1, 1);
+        // Each frame that the writer sends while little waits opens the
+        // window by one call.
+        inbox.try_recv().unwrap().sent();
+        assert_eq!(count(&outbox), (0, 2));
+        for window in 3..=QUEUE + 1 {
+            assert!(outbox.send(b"reply".to_vec()));
+            inbox.try_recv().unwrap().sent();
+            assert_eq!(count(&outbox), (0, window.min(QUEUE)));
+        }
+        let second = runtime.block_on(outbox.turn()).unwrap();
+        // A large frame goes in whole. Then no call starts.
+        assert!(outbox.send(vec![0; 2 * WAITING]));
+        assert!(!turn_is_free(&outbox));
+        // A frame that goes in while much waits closes the window.
+        assert!(outbox.send(b"reply".to_vec()));
+        assert_eq!(count(&outbox).1, 1);
+        // The frames drop unsent, as at a close. The two calls still hold
+        // their turns.
+        take(&mut inbox);
+        assert_eq!(count(&outbox), (0, 1));
+        assert!(!turn_is_free(&outbox));
+        drop(first);
+        assert!(!turn_is_free(&outbox));
+        drop(second);
+        assert!(turn_is_free(&outbox));
+    }
+
+    #[test]
+    fn a_large_frame_that_the_writer_sends_opens_the_window_when_little_else_waits() {
+        let (outbox, mut inbox, _closing) = Outbox::new(100, 10);
+        assert!(outbox.send(vec![0; 2 * WAITING]));
+        assert!(outbox.send(vec![0; 2 * WAITING]));
+        // Another large frame waits: the window stays closed.
+        inbox.try_recv().unwrap().sent();
+        assert_eq!(count(&outbox), (2 * WAITING, 1));
+        inbox.try_recv().unwrap().sent();
+        assert_eq!(count(&outbox), (0, 2));
+        // A frame of the hub opens nothing.
+        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
+        inbox.try_recv().unwrap().sent();
+        assert_eq!(count(&outbox), (0, 2));
+    }
+
+    #[test]
+    fn the_waits_on_the_count_end_when_the_writer_is_gone() {
+        let (outbox, inbox, _closing) = Outbox::new(10, 10);
+        let room = outbox.blocking_room();
+        // The writer stops, as at a reset of the client. A call then puts
+        // a large frame, and the frame stays counted.
+        drop(inbox);
+        let _ = room.put(Some(vec![0; 2 * WAITING]));
+        // A download stops.
+        let session = outbox.clone();
+        let sent = std::thread::spawn(move || session.send(b"chunk".to_vec()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !sent.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the download waits");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!sent.join().unwrap());
+        // The next call takes a room that holds nothing.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let limit = std::time::Duration::from_secs(30);
+            let turn = tokio::time::timeout(limit, outbox.turn()).await.unwrap();
+            assert!(turn.is_none());
+            tokio::time::timeout(limit, outbox.below()).await.unwrap();
+            assert!(outbox.room().await.is_closed());
+        });
+    }
+
+    #[test]
+    fn a_download_stops_when_the_hub_closes_the_connection() {
+        let (outbox, inbox, closing) = Outbox::new(10, 1);
+        let room = outbox.blocking_room();
+        // The hub queue overflows, and the writer stops.
+        assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
+        assert_eq!(outbox.push(frame("inv 2")), Pushed::Overflow);
+        assert!(closing.is_closed());
+        drop(inbox);
+        // A load puts its large reply after that.
+        let _ = room.put(Some(vec![0; 2 * WAITING]));
+        let session = outbox.clone();
+        let sent = std::thread::spawn(move || session.send(b"chunk".to_vec()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !sent.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the download waits");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!sent.join().unwrap());
+    }
+
+    #[test]
+    fn a_download_waits_while_much_waits() {
+        let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
+        assert!(outbox.send(vec![0; WAITING + 1]));
+        let session = outbox.clone();
+        let sent = std::thread::spawn(move || session.send(b"chunk".to_vec()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!sent.is_finished());
+        // The writer sends the large frame. Then the chunk goes in.
+        drop(inbox.try_recv().unwrap());
+        assert!(sent.join().unwrap());
+        assert_eq!(take(&mut inbox), ["chunk"]);
     }
 
     #[test]
