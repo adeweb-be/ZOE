@@ -4,11 +4,13 @@ It has no client cache, no blobs, no undo and no conflict resolution. It is
 enough for zodbshootout: `%import zoeclientx`, then a `<zoeclientx>` section
 with `server HOST:PORT`.
 
-With `pool N`, the storage opens N connections. Each transaction takes a
-free connection, so N transactions of one process can commit at the same
-time. The first connection reads the invalidations. The POC does not order
-the invalidations of the other connections against the commits of this
-process: a real client needs that.
+With `pool N`, the storage opens up to N connections. Each transaction
+takes a free connection, so N transactions of one process can commit at the
+same time. The storage opens a new connection only when a transaction finds
+no free one, so a process with one thread keeps one connection. The first
+connection reads the invalidations. The POC does not order the
+invalidations of the other connections against the commits of this process:
+a real client needs that.
 """
 
 import queue
@@ -28,11 +30,12 @@ class ZoeClientStorage:
         self._server = server
         self._name = name
         self._client = ZClient(server)
-        self._clients = [self._client] + [ZClient(server) for _ in range(pool - 1)]
+        self._clients = [self._client]
+        self._pool = pool
+        self._pool_lock = threading.Lock()
         self._free = queue.SimpleQueue()
-        for client in self._clients:
-            self._free.put(client)
-        self._ltid = max(c.last_transaction() for c in self._clients)
+        self._free.put(self._client)
+        self._ltid = self._client.last_transaction()
         # The tids of the commits of this process on the other connections
         # of the pool. The first connection gets their invalidations too.
         self._own = set()
@@ -107,7 +110,8 @@ class ZoeClientStorage:
             return self._oids.pop()
 
     def loadBefore(self, oid, tid):
-        client = self._clients[threading.get_ident() % len(self._clients)]
+        clients = self._clients
+        client = clients[threading.get_ident() % len(clients)]
         try:
             return client.load_before(oid, tid)
         except KeyError:
@@ -119,8 +123,20 @@ class ZoeClientStorage:
             raise POSKeyError(oid)
         return record[:2]
 
+    def _take(self):
+        try:
+            return self._free.get_nowait()
+        except queue.Empty:
+            pass
+        with self._pool_lock:
+            if len(self._clients) < self._pool:
+                client = ZClient(self._server)
+                self._clients = self._clients + [client]
+                return client
+        return self._free.get()
+
     def tpc_begin(self, transaction, tid=None, status=" "):
-        client = self._free.get()
+        client = self._take()
         try:
             self._txns[id(transaction)] = (client, client.begin())
         except BaseException:
