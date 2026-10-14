@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use super::staging::Staging;
-use super::{Finished, check_restore_tid, next_tid};
+use super::{Finished, Observer, check_restore_tid, next_tid};
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::blob::PendingBlob;
 use crate::clock::timestamp;
@@ -66,6 +66,9 @@ pub(crate) struct GroupCommit {
     queue: Mutex<Queue>,
     /// Signals the end of a batch.
     changed: Condvar,
+    /// The observer of the store. A leader tells it the size of each
+    /// batch that it made durable.
+    pub(super) observer: OnceLock<Arc<dyn Observer>>,
 }
 
 impl GroupCommit {
@@ -159,6 +162,8 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
     };
     let now = timestamp(store.clock.now());
     let mut last = start;
+    // The number of commits that the sync of the batch made durable.
+    let mut synced = 0;
     let mut members: Vec<(Member, Result<Finished>)> = batch
         .into_iter()
         .map(|(_, member)| {
@@ -190,11 +195,17 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
                     }
                 }
                 *sequencer = Some(last);
+                synced = members.iter().filter(|(_, f)| f.is_ok()).count();
             }
             Err(error) => fail(&mut members, error),
         }
     }
     drop(sequencer);
+    if synced > 0
+        && let Some(observer) = store.observer()
+    {
+        observer.batch_synced(synced);
+    }
     members
         .into_iter()
         .map(|(member, finished)| (Some(member), finished))

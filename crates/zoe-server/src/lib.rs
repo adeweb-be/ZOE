@@ -13,10 +13,16 @@
 //! The feature `fuzz` adds the module `fuzz`, the entry of the fuzz
 //! targets in `fuzz/`.
 
+#[cfg(feature = "serve")]
+mod admin;
 pub mod cli;
 #[cfg(all(feature = "serve", any(test, feature = "fuzz")))]
 pub use protocol::fuzz;
 #[cfg(feature = "serve")]
 mod protocol;
 #[cfg(feature = "serve")]
+mod runtime;
+#[cfg(feature = "serve")]
 pub mod serve;
+#[cfg(feature = "sim")]
+pub mod sim;

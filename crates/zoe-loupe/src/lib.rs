@@ -183,6 +183,12 @@ impl Folder {
         Ok(Self { store })
     }
 
+    /// Return the store of the folder. It is open for reads only, so each
+    /// write call fails with `ReadOnly`.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// Return the tid of the last transaction of the store.
     pub fn last_tid(&self) -> Tid {
         self.store.last_transaction()
