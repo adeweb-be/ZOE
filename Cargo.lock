@@ -2374,6 +2374,7 @@ name = "zoe-convert"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "redb",
  "thiserror",
  "zoe-core",
  "zoe-pickle",
@@ -2441,6 +2442,7 @@ name = "zoe-server"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

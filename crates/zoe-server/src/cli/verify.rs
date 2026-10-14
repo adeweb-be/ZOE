@@ -3,8 +3,9 @@
 //! the store.
 //!
 //! `zoe_convert::verify` and `zoe_convert::verify_backup` do the work. The
-//! command opens the store read-only, so it changes no byte. It fails with
-//! a report that lists a finding.
+//! command opens the store read-only, so it changes no byte. With
+//! `--backup`, it opens the store only after it built its copy of the
+//! dumps. It fails with a report that lists a finding.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -61,10 +62,11 @@ pub(super) struct VerifyArgs {
     /// Compare the dumps of this backup directory with the store, in place
     /// of the check of the store.
     ///
-    /// The command restores the dumps into a scratch directory in the
-    /// temporary directory (TMPDIR), compares them with the store up to the
-    /// last tid of the dumps, and removes the scratch directory. A
-    /// difference is a finding. A damaged dump fails the command.
+    /// The command restores the dumps into a copy in the scratch directory
+    /// before it opens the store. Then it opens the store read-only,
+    /// compares the copy with the store up to the last tid of the dumps,
+    /// and removes the copy. A difference is a finding. A dump that does
+    /// not restore fails the command before the open.
     #[arg(
         long,
         env = "ZOE_BACKUP",
@@ -72,6 +74,15 @@ pub(super) struct VerifyArgs {
         conflicts_with = "classes"
     )]
     backup: Option<PathBuf>,
+
+    /// The directory of the copy of --backup, on a filesystem with room for
+    /// the whole store. The default is the temporary directory (TMPDIR).
+    ///
+    /// The command writes the copy only there, and removes it at the end,
+    /// also when the check fails. It removes a copy that a killed check
+    /// left there.
+    #[arg(long, env = "ZOE_SCRATCH", value_name = "SCRATCH", requires = "backup")]
+    scratch: Option<PathBuf>,
 }
 
 /// Run `zoe verify` and write its report to `out`.
@@ -99,10 +110,12 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
 /// report to `out`.
 fn run_backup(args: &VerifyArgs, dumps: &Path, out: &mut dyn Write) -> Result<(), Failure> {
     let path = &args.path;
-    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
-    let check = zoe_convert::verify_backup(&store, dumps, &std::env::temp_dir())
-        .map_err(|error| Failure::Message(error.to_string()))?;
-    drop(store);
+    let scratch = args.scratch.clone().unwrap_or_else(std::env::temp_dir);
+    // The check builds its copy before it opens the store, and drops the
+    // store before it returns.
+    let check = zoe_convert::verify_backup(dumps, &scratch, || {
+        open_with_blobs(path, args.blob_dir.as_deref())
+    })?;
     let written = match args.format {
         Format::Text => write_backup_text(out, path, dumps, &check),
         Format::Json => write_backup_json(out, &check),

@@ -206,7 +206,10 @@ pub trait Backend: Send + Sync {
     /// The caller compares the records with the oid count of the row.
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>>;
 
-    /// Make all committed writes durable. Group commit uses this barrier.
+    /// Make all committed writes durable, the commits of
+    /// `WriteTxn::commit_deferred` included. `Store::sync` calls this
+    /// barrier under the commit sequencer. A read-only backend has nothing
+    /// to make durable.
     fn sync(&self) -> Result<()>;
 
     /// Return the bytes stored under `key`, as stored. Only the test hook
@@ -325,6 +328,15 @@ pub trait WriteTxn {
 
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;
+
+    /// Commit the staged writes without a sync. The writes are visible
+    /// when this returns. They become durable with the next `commit`. A
+    /// crash before it loses them, and the store then ends at the last
+    /// durable commit. A backend that cannot defer a sync keeps this
+    /// default, which calls `commit`.
+    fn commit_deferred(self: Box<Self>) -> Result<()> {
+        self.commit()
+    }
 }
 
 #[cfg(test)]

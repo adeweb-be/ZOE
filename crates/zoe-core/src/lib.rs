@@ -35,6 +35,7 @@ pub use commit::{Finished, Observer, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
+pub use lock::LockCancel;
 pub use pack::{ClassTotals, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use sequence::Sequence;

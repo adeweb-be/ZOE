@@ -14,6 +14,7 @@ default = ["serve"]
 # extension module turns it off, so it never links tokio.
 serve = [
     "dep:tokio",
+    "dep:libc",
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:rmpv",
@@ -45,6 +46,7 @@ clap.workspace = true
 serde_json.workspace = true
 zoe-convert.workspace = true
 zoe-core.workspace = true
+libc = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }

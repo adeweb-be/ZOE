@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use rmpv::Value;
-use zoe_core::{BlobFile, Finished, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
 
 use super::blob::Download;
 use super::clock;
@@ -380,6 +380,13 @@ pub(crate) fn runs_long(method: &str) -> bool {
     matches!(method, "sendBlob" | "pack")
 }
 
+/// Tell if `method` runs on the read pool, once the connection is
+/// registered: a call that is not `set_client_label`, not a call of the
+/// transaction and does not run long.
+pub(crate) fn on_read_pool(method: &str) -> bool {
+    method != "set_client_label" && !in_transaction(method) && !runs_long(method)
+}
+
 /// The open transaction of a connection.
 struct Open {
     /// The id that the client gave to the transaction.
@@ -439,6 +446,9 @@ pub(crate) struct Session {
     /// The stop of the server. A pack stops between two batches when the
     /// server stops.
     stopping: Stopping,
+    /// The end of the connection ends the lock wait of each transaction of
+    /// the session, also a wait that starts after the end.
+    lock_cancel: LockCancel,
     /// True when the client may register read-only only, as the holder of
     /// a certificate of the read-only client CA.
     read_only_client: bool,
@@ -502,8 +512,16 @@ impl Session {
             iterators: Mutex::new(Iterators::default()),
             label: Mutex::new(None),
             stopping,
+            lock_cancel: LockCancel::new(),
             read_only_client: false,
         }
+    }
+
+    /// End the lock wait of the vote of the session, and each later one.
+    /// The vote then fails, and its transaction releases the locks that it
+    /// took. The end of the connection calls it.
+    pub(crate) fn end_lock_wait(&self) {
+        self.lock_cancel.cancel();
     }
 
     /// Let the client register read-only only, when `read_only` is true.
@@ -768,8 +786,10 @@ impl Session {
     /// reply, never as a chunk.
     ///
     /// The first frame takes the room of the call. Each later frame waits
-    /// for room in the session queue, without holding room. So many
-    /// downloads of one connection never wait for each other in a circle.
+    /// while more than `outbox::WAITING` bytes of frames of the session
+    /// wait, then for room in the session queue, without holding room. So
+    /// many downloads of one connection never wait for each other in a
+    /// circle.
     fn send_blob(&self, args: &[Value], reply: &mut Reply) -> Outcome {
         let download = arity::<2>(args, "sendBlob").and_then(|[oid, serial]| {
             let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
@@ -1348,13 +1368,15 @@ impl Transaction {
         let description = text_bytes(&args[2])?;
         let ext = extension::pickle(&args[3]).map_err(Fault::type_error)?;
         let store = Arc::clone(&self.session.store);
-        match args.get(4).filter(|tid| !tid.is_nil()) {
-            None => Ok(Txn::begin(store, &user, &description, &ext)),
+        let mut txn = match args.get(4).filter(|tid| !tid.is_nil()) {
+            None => Txn::begin(store, &user, &description, &ext),
             Some(tid) => {
                 let tid = Tid(u64_of(tid)?);
-                Ok(Txn::begin_restore(store, tid, &user, &description, &ext)?)
+                Txn::begin_restore(store, tid, &user, &description, &ext)?
             }
-        }
+        };
+        txn.set_lock_cancel(self.session.lock_cancel.clone());
+        Ok(txn)
     }
 
     /// Return the open transaction with the id `id`. Another id fails with
@@ -1826,7 +1848,7 @@ mod tests {
                     () = ended.wait() => None,
                 };
                 let Some(call) = call else { break };
-                let ticket = connection.ticket().await;
+                let ticket = connection.ticket(&call).await;
                 if ticket.is_closed() {
                     break;
                 }
@@ -3701,6 +3723,26 @@ mod tests {
         let tid = vote_and_finish(&mut s, 1).unwrap();
         let outcome = call(&mut s, "sendBlob", vec![p64(1), p64(tid)]);
         assert!(matches!(outcome, Outcome::Gone), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_calls_of_the_read_pool_are_the_calls_that_read() {
+        for method in [
+            "loadBefore",
+            "loadSerial",
+            "history",
+            "new_oids",
+            "iterator_next",
+            "sequence_next",
+        ] {
+            assert!(on_read_pool(method), "{method}");
+        }
+        for method in TRANSACTION_CALLS {
+            assert!(!on_read_pool(method), "{method}");
+        }
+        for method in ["set_client_label", "sendBlob", "pack"] {
+            assert!(!on_read_pool(method), "{method}");
+        }
     }
 
     #[test]
