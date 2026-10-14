@@ -526,11 +526,14 @@ class _Store:
         read_only=False,
         temporary=False,
         data_fs=None,
+        pack_gc=True,
     ):
         self.name = name
         self.path = path
         self.blob_dir = blob_dir
         self.read_only = read_only
+        # False packs the store without garbage collection.
+        self.pack_gc = pack_gc
         # A store in place of a mapping storage goes at each stop.
         self.temporary = temporary
         # The FileStorage file that the store gets its content from.
@@ -561,6 +564,8 @@ class _Store:
             lines.append(f"blob-dir = {json.dumps(self.blob_dir)}")
         if self.read_only:
             lines.append("read-only = true")
+        if not self.pack_gc:
+            lines.append("pack-gc = false")
         return "\n".join(lines) + "\n"
 
 
@@ -594,13 +599,13 @@ def _store(section):
     """Return the `_Store` of a storage section.
 
     The store has the name of the section, or 1 for a section without a
-    name, as ZEO does. A <filestorage> becomes a store at its path, a
-    <mappingstorage> a store in a new directory. A <filestorage> whose
-    path is a FileStorage file becomes a store beside the file, at the
-    path with the suffix `.zoe`. A <blobstorage> around either one gives
-    its blob directory. Relative paths are relative to the current
-    directory. Raise `ValueError` that names the first key or section
-    that `zoe serve` lacks.
+    name, as ZEO does. A <filestorage> becomes a store at its path, with its
+    `pack-gc`, a <mappingstorage> a store in a new directory. A
+    <filestorage> whose path is a FileStorage file becomes a store beside
+    the file, at the path with the suffix `.zoe`. A <blobstorage> around
+    either one gives its blob directory. Relative paths are relative to the
+    current directory. Raise `ValueError` that names the first key or
+    section that `zoe serve` lacks.
     """
     name = section.name or "1"
     blob_dir = None
@@ -625,6 +630,7 @@ def _store(section):
     path = None
     create = False
     read_only = False
+    pack_gc = True
     for key, values in base.items():
         key, value = key.lower(), values[-1]
         if key == "path":
@@ -635,6 +641,8 @@ def _store(section):
             create = ZConfig.datatypes.asBoolean(value)
         elif key == "read-only":
             read_only = ZConfig.datatypes.asBoolean(value)
+        elif key == "pack-gc":
+            pack_gc = ZConfig.datatypes.asBoolean(value)
         else:
             raise _no_option(f"{key} {value} in <filestorage>")
     if path is None:
@@ -649,8 +657,10 @@ def _store(section):
         # The conversion copies no blob.
         if blob_dir is not None:
             raise _no_option(f"blob-dir {blob_dir} with the FileStorage file {path}")
-        return _Store(name, path + ".zoe", read_only=read_only, data_fs=path)
-    return _Store(name, path, blob_dir, read_only)
+        return _Store(
+            name, path + ".zoe", read_only=read_only, data_fs=path, pack_gc=pack_gc
+        )
+    return _Store(name, path, blob_dir, read_only, pack_gc=pack_gc)
 
 
 class ZeoLayer:

@@ -4,7 +4,7 @@ The file is a ZConfig file with one `<zoe-server>` section, which
 `%import zoe` declares. The keys of the section, except `binary`, are the
 options of `zoe serve` without `--`, as in its TOML configuration file.
 Each `<storage NAME>` subsection is a `[storages.NAME]` table, with the
-keys `path`, `blob-dir` and `read-only`.
+keys `path`, `blob-dir`, `read-only` and `pack-gc`.
 
 The module writes the settings as a TOML file into a memory file, which
 has no path on disk, and replaces itself with `zoe serve --config` on
@@ -53,6 +53,7 @@ KEYS = (
     "transaction-warn",
     "log-format",
     "read-only",
+    "pack-gc",
     "shared-blob-dir",
     "tls-cert",
     "tls-key",
@@ -61,7 +62,7 @@ KEYS = (
 )
 
 # The keys whose value is a boolean.
-BOOLEANS = ("read-only", "shared-blob-dir")
+BOOLEANS = ("read-only", "pack-gc", "shared-blob-dir")
 
 # The keys whose leading ~ is the home directory.
 PATHS = (
@@ -112,9 +113,9 @@ def toml_string(text):
 def settings(section):
     """Return the keys of `zoe serve` that the section sets.
 
-    An empty value counts as not set. `read-only` and `shared-blob-dir`
-    become booleans, and the other values stay text, which `zoe serve`
-    checks.
+    An empty value counts as not set. `read-only`, `pack-gc` and
+    `shared-blob-dir` become booleans, and the other values stay text, which
+    `zoe serve` checks.
     """
     values = {}
     for key in KEYS:
@@ -151,6 +152,9 @@ def toml(section):
                 f"blob-dir = {toml_string(os.path.expanduser(storage.blob_dir))}"
             )
         lines.append(f"read-only = {str(storage.read_only).lower()}")
+        # The key is true by default, so only false goes to the table.
+        if not storage.pack_gc:
+            lines.append("pack-gc = false")
     return "\n".join(lines) + "\n"
 
 

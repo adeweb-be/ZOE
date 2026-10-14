@@ -37,6 +37,26 @@ pub(super) struct PackArgs {
     #[arg(long, env = "ZOE_DAYS", value_name = "N")]
     days: u64,
 
+    /// Collect garbage, the default.
+    ///
+    /// With --pack-gc=false the pack removes old revisions only, as the
+    /// pack-gc of FileStorage does: of the revisions at or before the pack
+    /// time, it keeps the newest one of each object, also when no reader
+    /// can reach the object. An object whose newest revision there is a
+    /// deletion goes. A dry run reports what such a pack would remove.
+    #[arg(
+        long,
+        env = "ZOE_PACK_GC",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true",
+        value_parser = BoolishValueParser::new(),
+        action = ArgAction::Set
+    )]
+    pack_gc: bool,
+
     /// Report what the pack would remove, by class, and change nothing.
     ///
     /// With --dry-run=false the command packs, also when the twin asks for a
@@ -59,10 +79,14 @@ pub(super) struct PackArgs {
 pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Result<(), Failure> {
     let path = &args.path;
     let at = days_ago(clock.now(), args.days);
+    let options = Options {
+        pack_gc: args.pack_gc,
+        ..Options::default()
+    };
     let (report, title) = if args.dry_run {
         // A dry run only reads. A read-only open changes no byte of a
         // clean store. It repairs a store that a writer left open.
-        let store = open_read_only(path, Options::default())?;
+        let store = open_read_only(path, options)?;
         let report = store.pack_dry_run(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
             "A pack of the store {} as of tid {:#018x} would remove:",
@@ -71,7 +95,7 @@ pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Re
         );
         (report, title)
     } else {
-        let store = open_existing(path)?;
+        let store = open_existing(path, options)?;
         let report = store.pack(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
             "Packed the store {} as of tid {:#018x}. It removed:",
@@ -92,13 +116,13 @@ fn days_ago(now: SystemTime, days: u64) -> Tid {
     timestamp(now.checked_sub(back).unwrap_or(UNIX_EPOCH))
 }
 
-/// Open the existing store in `path` for writes. A directory without a
-/// store fails, and the call creates nothing.
-fn open_existing(path: &Path) -> Result<Store, Failure> {
+/// Open the existing store in `path` for writes, with `options`. A
+/// directory without a store fails, and the call creates nothing.
+fn open_existing(path: &Path, options: Options) -> Result<Store, Failure> {
     if !path.join(DATABASE).is_file() {
         return Err(Failure::Message(format!("no store in {}", path.display())));
     }
-    Store::open(path).map_err(|e| store_failure(path, e))
+    Store::open_with(path, options).map_err(|e| store_failure(path, e))
 }
 
 /// Write the report of a pack: the totals, then a line for each class.
