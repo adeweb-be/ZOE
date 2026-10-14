@@ -16,8 +16,9 @@ pub(crate) enum Failure {
     NoStore { path: String },
     /// Another process holds the lock of the store.
     Locked,
-    /// The store was not closed cleanly. A writer must open it once.
-    NotClosedCleanly,
+    /// The store was not closed cleanly, and its repair failed. `message`
+    /// is the text of the error, with the error of the system.
+    NotRepaired { message: String },
     /// The oid has no record.
     NoRecord { oid: String },
     /// The oid has no record at or before the tid of the view.
@@ -48,7 +49,9 @@ impl From<Error> for Failure {
         match error {
             Error::NoStore { path } => Failure::NoStore { path },
             Error::Store(ZoeError::Locked) => Failure::Locked,
-            Error::Store(ZoeError::NotClosedCleanly) => Failure::NotClosedCleanly,
+            Error::Store(error @ ZoeError::RepairFailed(_)) => Failure::NotRepaired {
+                message: error.to_string(),
+            },
             Error::Store(ZoeError::NotFound { oid }) => Failure::NoRecord { oid: oid_repr(oid) },
             Error::NoObject { path, segment } => Failure::NoObject { path, segment },
             Error::Refused { oid, source } => Failure::Refused {
@@ -87,10 +90,15 @@ mod tests {
             serde_json::to_value(failure).unwrap(),
             serde_json::json!({"kind": "noRecordAsOf", "oid": "0x08", "tid": "0x0100"})
         );
-        let failure = Failure::from(Error::Store(ZoeError::NotClosedCleanly));
+        let system = std::io::Error::from_raw_os_error(30);
+        let failure = Failure::from(Error::Store(ZoeError::RepairFailed(Box::new(system))));
         assert_eq!(
             serde_json::to_value(failure).unwrap(),
-            serde_json::json!({"kind": "notClosedCleanly"})
+            serde_json::json!({
+                "kind": "notRepaired",
+                "message": "the store was not closed cleanly, and its repair failed: \
+                            Read-only file system (os error 30)",
+            })
         );
         let failure = Failure::from(Error::Stopped);
         assert_eq!(

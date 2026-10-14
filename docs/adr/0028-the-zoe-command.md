@@ -49,7 +49,7 @@ The twins are `ZOE_PATH`, `ZOE_BLOB_DIR`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, 
 
 **The pack tid.** `--days N` gives the tid of the time of the clock minus N days of 86,400 seconds, by ZODB's `TimeStamp` rule (`zoe_core::timestamp`), as ZODB's `DB.pack(days=N)` computes it. The command reads the system clock through the `Clock` trait, not the clock of the store, which is not public. A test gives its own clock. A time before the Unix epoch gives the tid of the epoch.
 
-**The opens.** A command that only reads opens the store read-only: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, `zoe backup` and `zoe mcp`. `zoe mcp` opens it through Loupe's `Folder`, and holds the lock of the store while it runs. Such an open changes no byte and creates nothing. `zoe convert --from-data-fs` opens the store for writes and creates it, after it checks that the source is a regular file that starts with `FS30`. So a wrong source creates no store. `zoe pack` opens an existing store for writes: a directory without `zoe.redb` fails, and the command creates nothing. `zoe restore` creates a store only in a new or an empty directory, and checks every dump before it writes anything.
+**The opens.** A command that only reads opens the store read-only: `zoe convert --to-data-fs`, `zoe pack --dry-run`, `zoe verify`, `zoe backup` and `zoe mcp`. `zoe mcp` opens it through Loupe's `Folder`, and holds the lock of the store while it runs. On a store that was closed cleanly, such an open changes no byte and creates nothing. A store that a writer left open gets its repair first, and the command says so on stderr: ADR 0032 records it, and supersedes this part of the decision. `zoe convert --from-data-fs` opens the store for writes and creates it, after it checks that the source is a regular file that starts with `FS30`. So a wrong source creates no store. `zoe pack` opens an existing store for writes: a directory without `zoe.redb` fails, and the command creates nothing. `zoe restore` creates a store only in a new or an empty directory, and checks every dump before it writes anything.
 
 ## Consequences
 
@@ -59,7 +59,7 @@ The twins are `ZOE_PATH`, `ZOE_BLOB_DIR`, `ZOE_FROM_DATA_FS`, `ZOE_TO_DATA_FS`, 
 - A workspace build, such as `cargo test --workspace`, unifies the features, so there `zoe-py` compiles with `serve`. maturin builds `zoe-py` alone, without it.
 - The console script writes to the file descriptors of the process, not to `sys.stdout` and `sys.stderr`. A Python caller that replaces `sys.stdout` does not capture the report.
 - Ctrl-C stops a conversion or a pack at once. The converters resume after the last copied transaction, and a pack that stops leaves a store that opens without repair (ADR 0025).
-- A store that a crash left open does not open read-only: `zoe convert --to-data-fs`, the dry run, `zoe verify`, `zoe verify --backup` and `zoe backup` fail with `NotClosedCleanly` until a writer opens the store once.
+- A store that a crash left open gets its repair at the read-only open of `zoe convert --to-data-fs`, the dry run, `zoe verify`, `zoe verify --backup`, `zoe backup` and `zoe mcp`, which say so on stderr. ADR 0032 records it, and supersedes the refusal with `NotClosedCleanly` that this record gave.
 
 ## Alternatives
 

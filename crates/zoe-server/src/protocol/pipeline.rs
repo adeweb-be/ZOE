@@ -11,7 +11,9 @@
 //!
 //! - `register` runs first, alone. The reader gives no other call before
 //!   it ends. The same holds for `set_client_label`, so each call that
-//!   comes after it logs with the label.
+//!   comes after it logs with the label, and for `iterator_gc`, so a later
+//!   call for an iterator that it removed fails with `KeyError`. The calls
+//!   that started before these two still run.
 //! - The calls of the transaction run in order on one thread, from
 //!   `tpc_begin` to the end of the transaction (`Lane`). A vote that waits
 //!   for a lock stops only the calls of the transaction behind it.
@@ -396,6 +398,14 @@ impl Calls {
         self.ended.clone()
     }
 
+    /// Tell if a call of the connection can have a trace context: the
+    /// connection registered, and the server accepted `trace_context`.
+    pub(crate) fn traces(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.traces())
+    }
+
     /// Wait for the ticket of `call`: first a slot, then a turn in the
     /// window for a call of the read pool, or else until at most
     /// `outbox::WAITING` bytes wait, then room for its reply. The future
@@ -436,7 +446,8 @@ impl Calls {
         }
     }
 
-    /// Start `call`, which took `ticket`. Wait only for `register`.
+    /// Start `call`, which took `ticket`. Wait for the end of `register`
+    /// and of each call of `session::ends_before_next`.
     pub(crate) async fn start(&mut self, call: Call, ticket: Ticket) {
         let Some(session) = self.session.clone() else {
             self.register(call, ticket).await;
@@ -444,9 +455,10 @@ impl Calls {
         };
         let ended = self.ended.clone();
         let peer = Arc::clone(&self.peer);
-        if call.method == "set_client_label" {
-            // The calls that start after the label log with it, and so
-            // does the end of the transaction.
+        if session::ends_before_next(&call.method) {
+            // The calls that start after a label log with it, and so does
+            // the end of the transaction. The calls that start after
+            // `iterator_gc` do not find the iterators that it removed.
             let ran = self
                 .pool
                 .run(&*self.runtime, move || {
@@ -599,6 +611,7 @@ mod tests {
             oneway: id == 0,
             method: method.into(),
             args,
+            context: None,
         }
     }
 

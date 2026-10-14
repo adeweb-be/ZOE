@@ -144,8 +144,10 @@ fn to_data_fs(
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     // The conversion only reads the store. A read-only open changes no
-    // byte of it, and fails on a directory without a store. A wrong blob
-    // directory fails here, before the conversion writes anything.
+    // byte of a clean store. It writes `zoe.redb` only when it repairs a
+    // store that a writer left open. It fails on a directory without a
+    // store. A wrong blob directory fails here, before the conversion
+    // writes anything.
     let store = open_with_blobs(path, blob_dir)?;
     let report = zoe_convert::to_datafs(&store, data_fs, data_fs_blobs)
         .map_err(|e| convert_failure(path, e))?;
