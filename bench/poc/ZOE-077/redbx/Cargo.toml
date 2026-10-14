@@ -1,0 +1,28 @@
+# A workspace of its own: the micro-benchmarks of the ZOE-077 POC.
+[workspace]
+
+[package]
+name = "poc-077-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+redb = "=4.3.0"
+zstd = "=0.14.2"
+xxhash-rust = { version = "=0.8.19", features = ["xxh3"] }
+
+[[bin]]
+name = "redbx"
+path = "src/main.rs"
+
+[[bin]]
+name = "codecx"
+path = "src/codecx.rs"
+
+[[bin]]
+name = "readx"
+path = "src/readx.rs"
+
+[profile.release]
+debug = false

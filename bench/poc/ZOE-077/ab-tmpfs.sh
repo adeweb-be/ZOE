@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Interleaved A/B on tmpfs, two rounds.
+set -u
+cd "$(dirname "$0")"
+source ./common.sh
+# Each store goes to tmpfs, where a sync costs nothing.
+export POC_WORK=${POC_WORK:-/dev/shm/zoe-poc-077} POC_CLEANUP=1
+OUT=results/ab-tmpfs.jsonl
+one() {  # label server binary mode scenario envs...
+  local label=$1 server=$2 bin=$3 mode=$4 sc=$5; shift 5
+  local envs=()
+  for e in "$@"; do envs+=(--env "$e"); done
+  $V driver.py --server "$server" ${bin:+--binary "$bin"} --label "$label" "${envs[@]}" \
+    --mode $mode -c 16 --values 3 --scenarios $sc --results "$OUT" >/dev/null 2>>"$OUT.err" \
+    || echo "FAILED $label $mode $sc" >> "$OUT.err"
+}
+for round in 1 2; do
+  for mode in threads processes; do
+    for sc in add update; do
+      one zeo zeo "" $mode $sc
+      one base zoe "$ZOE" $mode $sc $P
+      one storecompress zoe "$ZOE" $mode $sc $P ZOE_POC_STORECOMPRESS=1
+      one storecompress+tidonly zoe "$ZOE" $mode $sc $P ZOE_POC_STORECOMPRESS=1 ZOE_POC_TIDONLY=1
+      one nocompress zoe "$ZOE" $mode $sc $P ZOE_POC_COMPRESSION=none
+    done
+  done
+done
+echo DONE
