@@ -70,6 +70,13 @@ Then write `docs/handoffs/<card>.md`: the state, what you tried, what failed, th
 4. The builder opens a draft pull request and marks it ready when the acceptance test is green. The description ends with the claims-and-evidence section of `.github/pull_request_template.md`.
 5. A reviewer agent reviews. CI and the verifier post the numbers.
 6. Merge is a squash merge, after reviewer approval, a green verifier, and the human's approval when a red zone is touched. No force pushes.
+
+Stack the pull requests when you can. When several PRs are open at once, they form one merge train in a fixed order: dependencies first, then the order they became ready.
+
+- Before a builder marks its PR ready, it merges the tail of the train into its branch, not `main`. So it resolves each conflict once, with the context of its own card, and CI tests the combination.
+- A reviewer reviews only the delta of its own PR: `git diff <previous branch>...<branch>`.
+- PRs merge in train order. After each squash merge, merge `main` into the next branch. Where a file of `main` is the same as on the previous branch of the train, take the side of the next branch: the conflict comes only from the squash. Any other conflict goes back to the builder.
+- A PR that goes red or waits for the human leaves the train. The PRs after it merge the PR before it instead.
 7. The documenter updates `docs/` after the merge.
 
 Definition of Ready: a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, no dependency on an unmerged card.
