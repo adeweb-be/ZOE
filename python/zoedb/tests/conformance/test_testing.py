@@ -275,3 +275,55 @@ def test_teardown_kills_the_servers_and_restores_the_forker(tmp_path, monkeypatc
     assert all(process.returncode is not None for process in servers)
     assert layer._servers == []
     assert (forker.start_zeo_server, _forker.start_zeo_server) == originals
+
+
+def test_the_protocol_5_starts_and_another_fails_with_its_name(layer):
+    addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config(), protocol=b"5")
+    stop()
+    with pytest.raises(ValueError, match="protocol b'4'"):
+        layer.start_zeo_server(FILESTORAGE, zeo_config(), protocol=b"4")
+
+
+def test_an_unknown_argument_fails_the_start_with_its_name(layer):
+    with pytest.raises(TypeError, match="colour"):
+        layer.start_zeo_server(FILESTORAGE, zeo_config(), colour="blue")
+    assert layer._servers == []
+
+
+def test_the_keys_of_a_storage_section_have_any_case(layer, tmp_path):
+    storage_conf = "<FileStorage>\nPATH Data.fs\nBlob-Dir blobs\n</FileStorage>\n"
+    addr, stop = layer.start_zeo_server(storage_conf, zeo_config(), keep=True)
+    stop()
+    assert (tmp_path / "Data.fs").is_dir()
+
+
+def test_a_server_that_does_not_listen_in_time_fails_the_start(
+    layer, tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "pid"
+    binary = tmp_path / "silent"
+    binary.write_text(f"#!/bin/sh\necho $$ > {pid_file}\nexec sleep 60\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("ZOE_BINARY", str(binary))
+    with pytest.raises(RuntimeError, match="did not listen within 1 seconds"):
+        layer.start_zeo_server(FILESTORAGE, zeo_config(), start_timeout=1)
+    assert layer._servers == []
+    # The start killed the process and waited for it.
+    assert not os.path.exists(f"/proc/{pid_file.read_text().strip()}")
+
+
+def test_teardown_restores_the_forker_when_a_kill_fails(tmp_path, monkeypatch):
+    from ZEO.tests import forker
+
+    class Broken:
+        def kill(self):
+            raise OSError("the kill fails")
+
+    monkeypatch.chdir(tmp_path)
+    original = forker.start_zeo_server
+    layer = zoe.testing.ZeoLayer("TEST_ZEO_LAYER")
+    layer.setUp()
+    layer._servers.append(Broken())
+    with pytest.raises(OSError, match="the kill fails"):
+        layer.tearDown()
+    assert forker.start_zeo_server is original

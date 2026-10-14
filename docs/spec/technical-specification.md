@@ -717,7 +717,7 @@ Speed and durability are the product, so the harness is part of the first milest
 | --- | --- | --- |
 | `ZODB.tests`: `BasicStorage`, `MTStorage`, `Synchronization`, `ConflictResolution`, `PackableStorage`, `RevisionStorage`, `HistoryStorage`, `IteratorStorage`, `PersistentStorage`, `ReadOnlyStorage`, blob tests | `IStorage` semantics, MVCC, pack, iteration, blobs | in-process and server |
 | full `ZODB` test suite through a `zoe.testing` layer | Connection, DB pool, invalidations, `MVCCAdapter` behaviour | in-process |
-| `ZEO.tests` with the forker launching `zoe serve` | protocol, reconnect, cache verification, invalidation delivery, blob transfer, `getInvalidations` replay | server |
+| `ZEO.tests` with the forker launching `zoe serve` (`zoe.testing.ZEO_LAYER`) | protocol, reconnect, cache verification, invalidation delivery, blob transfer, `getInvalidations` replay | server |
 | differential conflict tests: property-generated bucket, set and `Length` conflicts resolved natively and by `ZODB.ConflictResolution`, pickles compared byte for byte | native merges equal Python merges | core |
 | Plone 6 suites (`Products.CMFPlone`, `plone.app.contenttypes`, `plone.restapi`, `plone.app.upgrade` on a copied production store) through a `plone.testing` layer | drop-in claim | both modes |
 | `zodbconvert` round trip `Data.fs` → ZOE → `Data.fs` on a production copy, pickles and blobs compared | migration and tooling | in-process |

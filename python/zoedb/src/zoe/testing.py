@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 
 import transaction
 import ZConfig.datatypes
@@ -168,10 +169,12 @@ class ZoeServer:
         target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
         return str(target / "debug" / "zoe")
 
-    def start(self):
+    def start(self, timeout=None):
         """Start the server. Return once it accepts connections.
 
         A later start listens on the same port, so a client reconnects.
+        A server that does not listen within `timeout` seconds is killed,
+        and the start fails.
         """
         if self._process is not None:
             raise RuntimeError("the server runs")
@@ -191,13 +194,35 @@ class ZoeServer:
             env=environ,
             text=True,
         )
-        for line in process.stdout:
-            if line.startswith("listening "):
-                host, port = line.split()[1].rsplit(":", 1)
-                self.address = (host.strip("[]"), int(port))
-                self._process = process
-                return self
+        # The kill closes stdout, so the read below ends.
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            process.kill()
+
+        timer = threading.Timer(timeout, expire) if timeout else None
+        if timer is not None:
+            timer.start()
+        address = None
+        try:
+            for line in process.stdout:
+                if line.startswith("listening "):
+                    host, port = line.split()[1].rsplit(":", 1)
+                    address = (host.strip("[]"), int(port))
+                    break
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+        if address is not None and not expired.is_set():
+            self.address = address
+            self._process = process
+            return self
         code = process.wait()
+        process.stdout.close()
+        if expired.is_set():
+            raise RuntimeError(f"zoe serve did not listen within {timeout} seconds")
         raise RuntimeError(f"zoe serve stopped with {code} before it listened")
 
     def kill(self):
@@ -262,16 +287,18 @@ def _zeo_options(section):
     address = None
     args = []
     for key, values in section.items():
-        value = values[-1]
+        key, value = key.lower(), values[-1]
         if key == "address":
             address = _address(value)
         elif key == "invalidation-queue-size":
             args += ["--invalidation-queue-size", value]
         elif key == "client-conflict-resolution":
-            # zoe serve resolves the conflicts that it can, and sends the
-            # others to the client in the vote reply, as ZEO does with
-            # client-conflict-resolution. A stock client accepts this
-            # reply for both values.
+            # zoe serve has no such option. It resolves the simple
+            # conflicts itself and sends the others to the client in the
+            # vote reply. With true, a ZEO server resolves nothing. With
+            # false, it resolves with its own classes and fails the vote
+            # when it cannot. When the client and the server have the same
+            # classes, as in ZEO's tests, the result is the same.
             ZConfig.datatypes.asBoolean(value)
         elif key == "msgpack" and ZConfig.datatypes.asBoolean(value):
             # zoe serve speaks only the msgpack protocol.
@@ -326,7 +353,7 @@ def _store(section):
     base = section
     if section.type == "blobstorage":
         for key, values in section.items():
-            if key != "blob-dir":
+            if key.lower() != "blob-dir":
                 raise _no_option(f"{key} {values[-1]} in <blobstorage>")
             blob_dir = os.path.abspath(values[-1])
         if len(section.sections) != 1:
@@ -345,7 +372,7 @@ def _store(section):
     create = False
     read_only = False
     for key, values in base.items():
-        value = values[-1]
+        key, value = key.lower(), values[-1]
         if key == "path":
             path = os.path.abspath(value)
         elif key == "blob-dir":
@@ -372,6 +399,10 @@ class ZeoLayer:
     the first one. `tearDown` kills every server that the layer started
     and puts back the functions of ZEO.
 
+    A module that binds the function at import, as `ZEO.tests.testConfig`
+    does with `from .forker import start_zeo_server`, keeps the server of
+    ZEO.
+
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
 
@@ -393,11 +424,13 @@ class ZeoLayer:
             module.start_zeo_server = self.start_zeo_server
 
     def tearDown(self):
-        while self._servers:
-            self._servers.pop().kill()
-        while self._patches:
-            module, function = self._patches.pop()
-            module.start_zeo_server = function
+        try:
+            while self._servers:
+                self._servers.pop().kill()
+        finally:
+            while self._patches:
+                module, function = self._patches.pop()
+                module.start_zeo_server = function
 
     def start_zeo_server(
         self,
@@ -408,21 +441,28 @@ class ZeoLayer:
         path="Data.fs",
         protocol=None,
         blob_dir=None,
+        suicide=True,
+        debug=False,
+        threaded=False,
+        start_timeout=33,
+        name=None,
+        log=None,
         show_config=False,
-        **ignored,
     ):
         """Start `zoe serve` as ZEO's `start_zeo_server` starts a server.
 
-        The arguments are those of ZEO's function. The arguments in
-        `ignored` control the process of a ZEO server, such as `debug`,
-        `threaded` and `log`. They do not apply to `zoe serve`, which logs
-        to stderr. Return the address and a stop function. The stop
+        The arguments are those of ZEO's function. `suicide`, `debug`,
+        `threaded`, `name` and `log` control the process of a ZEO server.
+        They do not apply to `zoe serve`, which logs to stderr. A server
+        that does not listen within `start_timeout` seconds is killed, and
+        the start fails. Return the address and a stop function. The stop
         function takes the argument `stop_timeout`. Without `keep`, it
         removes the stores of the server.
         """
         from ZEO._forker import ZEOConfig
 
-        if protocol is not None and protocol != b"M5":
+        # ZEO gives the version of the protocol without its prefix.
+        if protocol is not None and protocol not in (b"5", b"M5"):
             raise _no_option(f"the protocol {protocol!r}: it speaks only M5")
         if not storage_conf:
             storage_conf = f"<filestorage>\npath {path}\n</filestorage>"
@@ -461,7 +501,7 @@ class ZeoLayer:
         server = ZoeServer(args=["--config", os.path.abspath(file), *args])
         server.address = address
         try:
-            server.start()
+            server.start(start_timeout)
         finally:
             # zoe serve reads the file before it listens.
             os.remove(file)
