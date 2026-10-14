@@ -34,6 +34,14 @@ let
   # compiles against the musl headers, not against the glibc headers of
   # the shell.
   musl-cc = pkgs.pkgsCross.musl64.stdenv.cc;
+
+  # Put only setpriv on PATH. The other tools of util-linux, such as mount
+  # and su, must not hide the tools of the host. CI runs the conformance
+  # suites through setpriv.
+  setpriv = pkgs.runCommand "zoe-setpriv" { } ''
+    mkdir -p $out/bin
+    ln -s ${pkgs.lib.getExe' pkgs.util-linuxMinimal "setpriv"} $out/bin/setpriv
+  '';
 in
 {
   languages.rust = {
@@ -55,6 +63,7 @@ in
     pkgs.nodejs_24
     pkgs.git
     dagger
+    setpriv
 
     # Libraries that the Plone instances need when buildout builds an
     # egg from source.
