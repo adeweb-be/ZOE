@@ -106,9 +106,9 @@ The work goes through interactive sessions: the human and an agent, with no auto
 
 ## Roadmap
 
-Ten phases, each closed by a measurable gate from the specification's testing harness; the in-process storage ships first because it needs no server and already proves the core. There are no durations: the work is done by agents, and a phase starts as soon as the gates it needs are green, so phases 3, 4 and 5 run in parallel once the server gate is passed.
+Eleven phases, each closed by a measurable gate from the specification's testing harness; the in-process storage ships first because it needs no server and already proves the core. There are no durations: the work is done by agents, and a phase starts as soon as the gates it needs are green, so phases 4, 5 and 6 run in parallel once the server gate is passed.
 
-&#91;embedded content: roadmap · ten phases and their gates\]
+&#91;embedded content: roadmap · eleven phases and their gates\]
 
 Each diamond is a gate from the testing harness; nothing moves to the next band until its gate is green.
 
@@ -117,50 +117,50 @@ Each diamond is a gate from the testing harness; nothing moves to the next band 
 | 0 Groundwork | `Py_mod_gil_not_used` and thread-safety audit upstream in `persistent`, `BTrees`, `zodbpickle`; ConflictError ranking from production logs; reference machine and `zodbshootout` baseline for `FileStorage`, ZEO 6 and RelStorage; repository scaffold for agentic work (devenv, justfile, uv workspace, buildout for the Plone instances, Dagger pipeline, Actions workflows, CLAUDE.md files, ADRs, CONTEXT.md, the board) and the walking-skeleton card | baseline published; upstream PRs opened; top-ten conflict classes known | nothing; starts first |
 | 1 Core and in-process | `zoe-core` with redb backend, 2PC, per-OID locks, pack, blobs, `Vfs` crash simulation; PyO3 `Storage`; `zope.conf` stanza; `zodbconvert` round trip; conformance suites; Loupe v0 (folder mode, browser, time travel); `Data.fs` converter in Rust; record and blob checksums and zstd compression in the on-disk format, size guardrails, pack dry-run; the sequences primitive; clock and I/O traits for deterministic simulation; a codec byte, a branch id and typed field slots reserved per record | `ZODB.tests` green; crash simulation 0 losses; every injected bit flip detected; in-process beats `FileStorage` on `zodbshootout` | phase 0 baseline |
 | 2 Server | tokio server, full protocol matrix, invalidations, blob streaming and shared blob directories, health and metrics, graceful shutdown, `zoe-bench`, ZEO and Plone suites, Tier 1 manifests, named storages for mount points, read-only mode, repozo-style backup and zoe verify, OpenTelemetry traces; the Loupe space screen; MCP ops tools and prompts, read-only, on a store folder over stdio; sequences over the protocol with zoe.plone wiring for the history ids of `portal_uidgenerator`; the deterministic simulator over clock and network, with the kill loop run under it | a Plone 6 site runs on `<zeoclient>`; ZEO tests green; ≥ 3× ZEO on `zodbshootout`; a site with a mount point runs on one server; kill loop 0 losses; 0 conflicts on id allocation with 50 concurrent creators | phase 1 gate |
-| 3 Conflicts | structural and field-level merges, the merge policy derived from Dexterity schemas, shadow mode, early write-intent locks with the client hook, log-replay harness, undo on top of the merge tiers; Loupe full CRUD and undo-a-transaction and the optional `zoe.plone` reindex hook; append-only fields, CRDT sets and registers, the ephemeral TTL namespace and the registry as durable KV, each with a zoe.plone behaviour; the writes-on-GET report, then incidental writes | differential tests green; ZODB and ZEO undo suites green; ≤ 10% of ZEO's ConflictErrors on replay; 0 on a hot `Length` with early locks; 0 conflicts on workflow\_history and session writes on replay | phase 2 gate; parallel with 4, 5 and 6 |
-| 4 High availability | Tier 2: log shipping, Lease election, follower reads, `kind` cluster tests, Helm chart; read-only fallback during failover; RelStorage converter | failover under 10 s with no acknowledged loss | phase 2 gate; parallel with 3, 5 and 6 |
-| 5 Catalog | `zoe-catalog` mirror (bitmaps, sort arrays, path trie, metadata table, per-tid versions), `catalog_query` protocol extension, `zoe.plone.catalog` hook on `Catalog.search`, native BM25 text index on tantivy with `ZoeTextIndex` and the delta record type, query translator and compatibility switch, `zoe-bench` catalog scenarios; the incremental security index, traversal prefetch from the path trie, the reference index, the order index for ordered folders and shadow rebuilds | differential suite identical on the Plone test suites and a production query log; 5-index intersection with sort on 1M objects under 5 ms p99 warm; mirror ready within 60 s cold; text query under 20 ms p99; security bitmaps identical to reindexObjectSecurity on the corpus; a shadow rebuild with no query downtime | phase 2 gate; the field-store spike verdict; parallel with 3, 4 and 6 |
-| 6 Operations and data tools | copy-on-write forks (zoe fork: a native DemoStorage for test layers and upgrade rehearsals), the change feed (a resumable stream of commits from any tid on the admin port), encryption at rest with keys from file, environment or KMS, scheduled scrub, pack retention window and incremental pack, zoe rename-class, Parquet export, maintenance mode and per-storage quotas; the transactional outbox feeding the feed, derivations keyed (oid, tid, kind) with plone.scale as first consumer, zoe.testing layers on forks, zoe replay with sampled read sets, the versioning behaviour backed by history over the retention window; Loupe server mode, the live tail and the operations screen, with a Loupe screen for each feature; `zoe mcp` inside `zoe serve` and against a server, with the `tail` resource and streamable HTTP | a rehearsal upgrade runs on a fork of a production copy; an external indexer driven by the feed misses no commit through the kill loop; scrub finds every injected fault; conformance green on an encrypted store; plone.scale writes nothing on GET once on derivations; a production conflict replays on a fork | phase 2 gate; parallel with 3, 4 and 5 |
-| 7 AI-native | MCP content tools, chunking with per-type policies, local ONNX embedding provider behind a build flag plus remote opt-ins, `VectorIndex` trait with the builtin in-store backend and the Qdrant backend, hybrid search through `catalog_query`, `@search` and MCP, security pre-filtering by the roles bitmap, rebuild-vectors; embeddings as a derivation; the tid-stamped answer cache invalidated by the feed | security suite green on every mode and backend; builtin and qdrant agree on top-k; hybrid beats BM25 alone on the labelled query set; lag under 30 s at p99 under write load | phase 5 gate |
-| 8 Scale-out and fast paths | Tier 3 backend on FoundationDB or TiKV, S3 blob store, append-only log backend if phase 2 numbers demand it; the native Rust client with a persistent cache as a ZEO.ClientStorage drop-in; one shared host cache per node for that client; signed blob URLs and blob dedup by hash on the S3 store | conformance green on FDB; stateless fronts serve a cluster; log backend wins its benchmark or is dropped; the native client beats ZEO.ClientStorage on the client benchmark | phase 4 gate |
-| 9 Catalog projection | delta records for every index type, persisted delta log with snapshots, proxy index classes in `zoe.plone`, one-time rebuild migration, catalog BTrees and `Length` counters leave the store | a production site runs on the projection with zero bucket conflicts and identical query results over a full release cycle; started only after the mirror has answered production queries identically for a full release cycle | phase 5 gate plus production use of the mirror |
+| 4 Conflicts | structural and field-level merges, the merge policy derived from Dexterity schemas, shadow mode, early write-intent locks with the client hook, log-replay harness, undo on top of the merge tiers; Loupe full CRUD and undo-a-transaction and the optional `zoe.plone` reindex hook; append-only fields, CRDT sets and registers, the ephemeral TTL namespace and the registry as durable KV, each with a zoe.plone behaviour; the writes-on-GET report, then incidental writes | differential tests green; ZODB and ZEO undo suites green; ≤ 10% of ZEO's ConflictErrors on replay; 0 on a hot `Length` with early locks; 0 conflicts on workflow\_history and session writes on replay | phase 2 gate; parallel with 5, 6 and 7 |
+| 5 High availability | Tier 2: log shipping, Lease election, follower reads, `kind` cluster tests, Helm chart; read-only fallback during failover; RelStorage converter | failover under 10 s with no acknowledged loss | phase 2 gate; parallel with 4, 6 and 7 |
+| 6 Catalog | `zoe-catalog` mirror (bitmaps, sort arrays, path trie, metadata table, per-tid versions), `catalog_query` protocol extension, `zoe.plone.catalog` hook on `Catalog.search`, native BM25 text index on tantivy with `ZoeTextIndex` and the delta record type, query translator and compatibility switch, `zoe-bench` catalog scenarios; the incremental security index, traversal prefetch from the path trie, the reference index, the order index for ordered folders and shadow rebuilds | differential suite identical on the Plone test suites and a production query log; 5-index intersection with sort on 1M objects under 5 ms p99 warm; mirror ready within 60 s cold; text query under 20 ms p99; security bitmaps identical to reindexObjectSecurity on the corpus; a shadow rebuild with no query downtime | phase 2 gate; the field-store spike verdict; parallel with 4, 5 and 7 |
+| 7 Operations and data tools | copy-on-write forks (zoe fork: a native DemoStorage for test layers and upgrade rehearsals), the change feed (a resumable stream of commits from any tid on the admin port), encryption at rest with keys from file, environment or KMS, scheduled scrub, pack retention window and incremental pack, zoe rename-class, Parquet export, maintenance mode and per-storage quotas; the transactional outbox feeding the feed, derivations keyed (oid, tid, kind) with plone.scale as first consumer, zoe.testing layers on forks, zoe replay with sampled read sets, the versioning behaviour backed by history over the retention window; Loupe server mode, the live tail and the operations screen, with a Loupe screen for each feature; `zoe mcp` inside `zoe serve` and against a server, with the `tail` resource and streamable HTTP | a rehearsal upgrade runs on a fork of a production copy; an external indexer driven by the feed misses no commit through the kill loop; scrub finds every injected fault; conformance green on an encrypted store; plone.scale writes nothing on GET once on derivations; a production conflict replays on a fork | phase 2 gate; parallel with 4, 5 and 6 |
+| 8 AI-native | MCP content tools, chunking with per-type policies, local ONNX embedding provider behind a build flag plus remote opt-ins, `VectorIndex` trait with the builtin in-store backend and the Qdrant backend, hybrid search through `catalog_query`, `@search` and MCP, security pre-filtering by the roles bitmap, rebuild-vectors; embeddings as a derivation; the tid-stamped answer cache invalidated by the feed | security suite green on every mode and backend; builtin and qdrant agree on top-k; hybrid beats BM25 alone on the labelled query set; lag under 30 s at p99 under write load | phase 6 gate |
+| 9 Scale-out and fast paths | Tier 3 backend on FoundationDB or TiKV, S3 blob store, append-only log backend if phase 2 numbers demand it; the native Rust client with a persistent cache as a ZEO.ClientStorage drop-in; one shared host cache per node for that client; signed blob URLs and blob dedup by hash on the S3 store | conformance green on FDB; stateless fronts serve a cluster; log backend wins its benchmark or is dropped; the native client beats ZEO.ClientStorage on the client benchmark | phase 5 gate |
+| 10 Catalog projection | delta records for every index type, persisted delta log with snapshots, proxy index classes in `zoe.plone`, one-time rebuild migration, catalog BTrees and `Length` counters leave the store | a production site runs on the projection with zero bucket conflicts and identical query results over a full release cycle; started only after the mirror has answered production queries identically for a full release cycle | phase 6 gate plus production use of the mirror |
 | Later | `IMVCCStorage` fast path, async Python client, Rust `persistent` and `BTrees` sharing the merge code; macOS and Windows for the wheels, the server binary and Loupe | — | — |
 
 First usable release: the server gate; the in-process storage is usable from the core gate.
 
 ## Feature triage
 
-58 candidate features were triaged against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the ten phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
+58 candidate features were triaged against the phase 2 gate: 1 Must, 1 spike, 24 Should, 16 Could, 16 Won't. Must = needed for the phase 2 gate. Should = inside the eleven phases, in the phase named. Could = after the roadmap. Won't = out of scope. `zoe.plone` may ship opt-in behaviours that change how Plone stores things; stock Plone keeps working unchanged. The on-disk format reserves room from phase 1 for Should features not yet built: typed field slots, a branch id, a codec byte and a blob hash per record.
 
 | Feature | Verdict | Lands in | Note |
 | --- | --- | --- | --- |
 | Server-side sequences | Must | phase 1 primitive, phase 2 protocol | replaces the shared id counter `portal_uidgenerator`; `zoe.plone` wires it |
-| Field-addressable objects | Spike | spike before phase 5 design | conflicts and write amplification, throughput, ergonomics; weighting decided when the numbers exist |
+| Field-addressable objects | Spike | spike before phase 6 design | conflicts and write amplification, throughput, ergonomics; weighting decided when the numbers exist |
 | Deterministic simulation testing | Should | phase 1 traits, phase 2 simulator | clock and I/O traits in `zoe-core` from the walking skeleton |
 | Compression, zstd now, deltas and dictionaries later | Should | phase 1 zstd; deltas after the bench | codec byte per record |
-| Blob content hashes, dedup later | Should | phase 1 hash; phase 8 dedup | BLAKE3 per blob record |
-| Append-only fields | Should | phase 3 | `workflow_history` first; append primitive in the protocol |
-| CRDT sets and registers | Should | phase 3 | shipped with append-only fields; counters are sequences |
-| Ephemeral namespace with TTL | Should | phase 3 | sessions, CSRF keys, locks; `zoe.plone` session data manager and locking backend |
-| Registry as durable KV | Should | phase 3 | same primitive, durable flavour; `plone.app.registry` storage swap |
-| Incidental writes | Should | phase 3 report; async path after the outbox | writes-on-GET report first |
-| Incremental security index | Should | phase 5 | inherited bitmap pointers; equality with `reindexObjectSecurity` is the test |
-| Traversal pushdown | Should | phase 5 | the client prefetches the chain from the path trie |
-| Reference index | Should | phase 5 | back-references from the mirror's decode pass; link integrity and relations |
-| Ordered folders | Should | phase 5 | order index in the mirror; `zoe.plone` ordering adapter |
-| Shadow indexes | Should | phase 5 | background rebuild, atomic swap |
-| Branches (forks) | Should | phase 6 | branch id reserved in the key layout from phase 1 |
-| Snapshot test fixtures | Should | phase 6 | `zoe.testing` layer on forks; first fork consumer |
-| Commit forensics | Should | phase 6 | `zoe replay`; read sets behind a sampling flag |
-| Transactional outbox | Should | phase 6 | at-least-once post-commit delivery; the feed becomes a consumer |
-| Derivations | Should | phase 6 | keyed (oid, tid, kind); `plone.scale` first, embeddings in phase 7 |
-| Retention rules | Should | phase 6 | `pack --keep`; versioning's prerequisite |
-| Versioning from history | Should | phase 6 | `zoe.plone` behaviour replacing CMFEditions storage; CMFEditions stays available |
-| RAG answer cache | Should | phase 7 | tid-stamped, cited oids, invalidated by the feed |
-| In-process embeddings | Should | phase 7 | the ONNX provider behind a build flag; default build calls an endpoint |
-| Shared host cache | Should | phase 8 | one mmap per node for the native client |
-| Signed blob URLs | Should | phase 8 | `blob_url(oid, ttl)`; `zoe.plone` redirects downloads on the S3 store |
-| Time travel: open at a tid, object diff | Could |  | retention stays in phase 6 |
+| Blob content hashes, dedup later | Should | phase 1 hash; phase 9 dedup | BLAKE3 per blob record |
+| Append-only fields | Should | phase 4 | `workflow_history` first; append primitive in the protocol |
+| CRDT sets and registers | Should | phase 4 | shipped with append-only fields; counters are sequences |
+| Ephemeral namespace with TTL | Should | phase 4 | sessions, CSRF keys, locks; `zoe.plone` session data manager and locking backend |
+| Registry as durable KV | Should | phase 4 | same primitive, durable flavour; `plone.app.registry` storage swap |
+| Incidental writes | Should | phase 4 report; async path after the outbox | writes-on-GET report first |
+| Incremental security index | Should | phase 6 | inherited bitmap pointers; equality with `reindexObjectSecurity` is the test |
+| Traversal pushdown | Should | phase 6 | the client prefetches the chain from the path trie |
+| Reference index | Should | phase 6 | back-references from the mirror's decode pass; link integrity and relations |
+| Ordered folders | Should | phase 6 | order index in the mirror; `zoe.plone` ordering adapter |
+| Shadow indexes | Should | phase 6 | background rebuild, atomic swap |
+| Branches (forks) | Should | phase 7 | branch id reserved in the key layout from phase 1 |
+| Snapshot test fixtures | Should | phase 7 | `zoe.testing` layer on forks; first fork consumer |
+| Commit forensics | Should | phase 7 | `zoe replay`; read sets behind a sampling flag |
+| Transactional outbox | Should | phase 7 | at-least-once post-commit delivery; the feed becomes a consumer |
+| Derivations | Should | phase 7 | keyed (oid, tid, kind); `plone.scale` first, embeddings in phase 8 |
+| Retention rules | Should | phase 7 | `pack --keep`; versioning's prerequisite |
+| Versioning from history | Should | phase 7 | `zoe.plone` behaviour replacing CMFEditions storage; CMFEditions stays available |
+| RAG answer cache | Should | phase 8 | tid-stamped, cited oids, invalidated by the feed |
+| In-process embeddings | Should | phase 8 | the ONNX provider behind a build flag; default build calls an endpoint |
+| Shared host cache | Should | phase 9 | one mmap per node for the native client |
+| Signed blob URLs | Should | phase 9 | `blob_url(oid, ttl)`; `zoe.plone` redirects downloads on the S3 store |
+| Time travel: open at a tid, object diff | Could |  | retention stays in phase 7 |
 | Live queries | Could |  | incremental view maintenance; simple queries first |
 | Write-stream anomaly rules | Could |  | thresholds on the feed, auto-fork, alert |
 | Zope-less anonymous read path | Could |  | needs derivations and the security index proven |
@@ -168,19 +168,19 @@ First usable release: the server gate; the in-process storage is usable from the
 | Admission control and QoS | Could |  | interactive and batch classes |
 | Hot-set snapshots | Could |  | warm a cold client from the server's working set |
 | Containment-clustered layout | Could |  | only with the log backend |
-| Generational pack | Could |  | incremental pack in phase 6 stays single-generation |
-| Continuous backup and point-in-time restore | Could |  | removed from phase 4; repozo-style backup from phase 2 is the roadmap answer |
+| Generational pack | Could |  | incremental pack in phase 7 stays single-generation |
+| Continuous backup and point-in-time restore | Could |  | removed from phase 5; repozo-style backup from phase 2 is the roadmap answer |
 | Hash-chained log, TSA anchoring, legal hold | Could |  |  |
-| Crypto-shredding | Could |  | encryption at rest in phase 6 stays |
+| Crypto-shredding | Could |  | encryption at rest in phase 7 stays |
 | Public anchoring | Could |  | inherits the chain |
 | Inclusion proofs | Could |  | inherits anchoring |
 | Signed commits | Could |  | optional per-connection key |
-| SQL façade | Could |  | waits on the field-store spike; Parquet export in phase 6 stays |
+| SQL façade | Could |  | waits on the field-store spike; Parquet export in phase 7 stays |
 | Native multi-tenancy | Won't |  | isolation by process and named storages; per-storage quotas stay |
 | Anonymising clone | Won't |  |  |
 | Agent branches with merge-back | Won't |  | agents commit to main |
 | Permission explainer in Loupe | Won't |  |  |
-| Read replicas with session tokens | Won't |  | plain follower reads with bounded staleness stay in phase 4 |
+| Read replicas with session tokens | Won't |  | plain follower reads with bounded staleness stay in phase 5 |
 | Online backend swap | Won't |  | `zoe convert` with a maintenance window |
 | EUDI wallet attestations | Won't |  |  |
 | Actor-tagged transactions | Won't |  |  |
@@ -200,7 +200,7 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 | Thing | Decision | Rule |
 | --- | --- | --- |
 | owner | adeweb; the GitHub organisation is `adeweb-be` | nothing from an adopting site (data, credentials, code) enters the repositories; contributions from adopters or anyone else arrive as pull requests under the repository licence |
-| repositories | `adeweb-be/ZOE`, the monorepo: `crates/`, `python/zoedb/`, `apps/loupe/`, `deploy/`, `docs/`, `bench/`, `loops/`; `adeweb-be/zoe-bench-results` for the nightly JSON and the dashboard on GitHub Pages | Loupe stays in the monorepo through phase 3 and splits at phase 4 only if frontend contributors need their own cadence; the phase 0 patches to `persistent`, `BTrees` and `zodbpickle` go upstream to zopefoundation from forks in the `adeweb-be` organisation |
+| repositories | `adeweb-be/ZOE`, the monorepo: `crates/`, `python/zoedb/`, `apps/loupe/`, `deploy/`, `docs/`, `bench/`, `loops/`; `adeweb-be/zoe-bench-results` for the nightly JSON and the dashboard on GitHub Pages | Loupe stays in the monorepo through phase 4 and splits at phase 5 only if frontend contributors need their own cadence; the phase 0 patches to `persistent`, `BTrees` and `zodbpickle` go upstream to zopefoundation from forks in the `adeweb-be` organisation |
 | tags and versions | `v0.3.0` for the Cargo workspace and the `zoedb` wheel together; `loupe-v0.1.0` for Loupe | semantic versioning; the on-disk format version is independent of the release version |
 | licences | Apache-2.0 for everything, the Plone extra included | the Rust ecosystem's norm; keeps the door open to the Plone Foundation and to any adopter |
 | documentation site | GitHub Pages of `adeweb-be/ZOE`, built with mdBook from `docs/` by the Dagger `docs` function on every merge to trunk; the bench dashboard is the Pages site of `adeweb-be/zoe-bench-results` | `docs/` in git is the source of truth: the technical specification, this document and the ADRs are exported there once and maintained in git from then on, kept current by the documenter; nothing is hosted on a private domain |
@@ -219,7 +219,7 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 
 **Open questions**
 
-- [ ] Which conflict classes dominate the production logs of a real site? A one-week log sample decides the native-merge list before phase 3.
+- [ ] Which conflict classes dominate the production logs of a real site? A one-week log sample decides the native-merge list before phase 4.
 - [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
 - [ ] Should the async Python client ship with the server in phase 2 for collective.starlette, or later?
-- [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 5 design.
+- [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 6 design.
