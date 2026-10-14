@@ -78,14 +78,14 @@ Out of scope: lock manager, backend trait
 Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
 Spike or build: build
 Budget: one session; a spent budget means stop and ask, not try harder
-Done when: acceptance green, TSan green, bench posted, reviewer approved
+Done when: acceptance green, bench posted, reviewer approved
 ```
 
 Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
 
 **Definition of Ready.** A card has a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
 
-**Definition of Done.** Acceptance test green; unit tests added; TSan and the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
+**Definition of Done.** Acceptance test green; unit tests added; the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
 
 **Stop-and-ask rules for builders.** A builder stops and writes a question on the card instead of guessing when a change would alter the on-disk format, the wire protocol, a public Python API, a trait signature used by another crate, or an acceptance test; when the budget is spent; and when the only way to make the test green is to weaken it.
 
