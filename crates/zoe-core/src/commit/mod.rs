@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::thread::{self, ThreadId};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
@@ -567,13 +567,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let requests = self.lock_requests();
-        // A store without an observer does not read the clock.
-        let started = store.observer().map(|_| Instant::now());
+        // A store without an observer does not read the clock. The wait is
+        // measured on the monotonic time of the store clock, as the lock
+        // timeout is, so a simulator gives it on simulated time.
+        let started = store.observer().map(|_| store.clock.monotonic());
         let acquired = store
             .locks
             .acquire(&requests, store.lock_timeout, &*store.clock);
         if let (Some(observer), Some(started)) = (store.observer(), started) {
-            observer.locks_acquired(started.elapsed());
+            observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
         }
         match acquired {
             Ok(locks) => {

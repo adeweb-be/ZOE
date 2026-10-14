@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{Semaphore, watch};
 
+use crate::runtime::block_on;
+
 /// The bytes of one message. All the connections that get the message
 /// share them.
 pub(crate) type Frame = Arc<Vec<u8>>;
@@ -107,7 +109,7 @@ impl Outbox {
             place: place.0,
             frame: frame.map(Arc::new),
         };
-        self.session.blocking_send(placed).is_ok()
+        block_on(self.session.send(placed)).is_ok()
     }
 
     /// Put a frame of the session at the next place.
@@ -182,6 +184,7 @@ impl Inbox {
                 Step::Frame(frame) => return Some(frame),
                 Step::End => return None,
                 Step::Read { session, hub } => tokio::select! {
+                    biased;
                     placed = self.session.recv(), if session => match placed {
                         Some(placed) => self.from_session = Some(placed),
                         None => self.session_open = false,

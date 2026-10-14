@@ -30,6 +30,7 @@ use super::message::{self, Call};
 use super::outbox::{Outbox, Place};
 use super::status::Stats;
 use super::{NamedStorage, Storages};
+use crate::runtime::block_on;
 
 /// The longest client label that a log line takes, in characters.
 const MAX_LABEL: usize = 200;
@@ -350,7 +351,7 @@ pub(crate) fn run(storages: Arc<Storages>, mut calls: Receiver<Call>, outbox: Ou
     let mut storages = Some(storages);
     let mut session: Option<Session> = None;
     let mut span = tracing::info_span!("connection", client = peer);
-    while let Some(call) = calls.blocking_recv() {
+    while let Some(call) = block_on(calls.recv()) {
         let entered = span.clone().entered();
         let outcome = match (&mut session, &storages) {
             (Some(session), _) => session.call(&call),

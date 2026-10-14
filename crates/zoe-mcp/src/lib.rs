@@ -3,9 +3,13 @@
 //!
 //! [`serve_stdio`] opens a store folder for reads only and speaks MCP on
 //! stdin and stdout, with the `rmcp` SDK. It offers the read-only ops
-//! tools `object_get`, `history`, `diff` and `references`. They are the
-//! functions of Loupe with an agent face: each tool calls `zoe-loupe`, and
-//! its result is the JSON of `zoe-loupe`.
+//! tools `object_get`, `history`, `diff`, `references`, `space`, `verify`
+//! and `explain_conflict`, and the prompts `explain_transaction`,
+//! `why_conflict` and `summarise_changes`. The tools are the functions of
+//! Loupe with an agent face: most call `zoe-loupe` and give its JSON.
+//! `verify` calls `zoe_convert::verify`, and `explain_conflict` reads the
+//! transactions with the iterator of the core. Each prompt carries the
+//! data that its tools give.
 //!
 //! The server runs as the ops principal of the local operator: the user
 //! who starts the process. That principal has the read-only role. So the
@@ -16,6 +20,8 @@
 //! on.
 
 mod ops;
+mod prompts;
+mod txn;
 
 use std::path::{Path, PathBuf};
 

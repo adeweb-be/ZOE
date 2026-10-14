@@ -23,7 +23,8 @@ pub trait Observer: Send + Sync {
     }
 
     /// A vote spent `wait` to take its locks, measured on the monotonic
-    /// clock. A vote that waited past the lock timeout calls it too.
+    /// time of the store clock (`Clock::monotonic`). A vote that waited
+    /// past the lock timeout calls it too.
     fn locks_acquired(&self, wait: Duration) {
         let _ = wait;
     }
