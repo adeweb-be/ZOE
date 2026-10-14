@@ -12,7 +12,7 @@ use clap::{ArgGroup, Args};
 use zoe_convert::Report;
 use zoe_core::{Options, Store};
 
-use super::{Failure, open_with_blobs, store_failure};
+use super::{Failure, blob_dir_failure, open_with_blobs, store_failure};
 
 /// The first bytes of a FileStorage file.
 const MAGIC: &[u8] = b"FS30";
@@ -100,7 +100,7 @@ fn from_data_fs(
         blob_dir: blob_dir.map(Path::to_path_buf),
         ..Options::default()
     };
-    let store = Store::open_with(path, options).map_err(|e| store_failure(path, e))?;
+    let store = Store::open_with(path, options).map_err(|e| blob_dir_failure(path, e))?;
     let report = zoe_convert::from_datafs(data_fs, data_fs_blobs, &store)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("{} into the store {}", data_fs.display(), path.display());

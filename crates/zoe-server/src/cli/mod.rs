@@ -124,15 +124,24 @@ fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failur
         ..Options::default()
     };
     let store = Store::open_read_only_with(path, options).map_err(|e| store_failure(path, e))?;
-    match store.check_blob_dir() {
-        Ok(()) => Ok(store),
-        Err(ZoeError::MissingBlobDir { path: blobs }) => Err(Failure::Message(format!(
+    store
+        .check_blob_dir()
+        .map_err(|e| blob_dir_failure(path, e))?;
+    Ok(store)
+}
+
+/// Return the failure of the store in `path`, for a command that takes
+/// `--blob-dir`. The message of `MissingBlobDir` names the blob directory
+/// and `--blob-dir`.
+fn blob_dir_failure(path: &Path, error: ZoeError) -> Failure {
+    match error {
+        ZoeError::MissingBlobDir { path: blobs } => Failure::Message(format!(
             "{}: the store has blobs, but the blob directory {} has no layout file: \
              give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
             path.display(),
             blobs.display()
-        ))),
-        Err(e) => Err(store_failure(path, e)),
+        )),
+        e => store_failure(path, e),
     }
 }
 
@@ -261,6 +270,21 @@ mod tests {
     #[test]
     fn the_command_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_wrong_blob_directory_names_the_option() {
+        let blobs = PathBuf::from("elsewhere");
+        let error = ZoeError::MissingBlobDir { path: blobs };
+        let Failure::Message(message) = blob_dir_failure(Path::new("store"), error) else {
+            panic!("not a message");
+        };
+        assert!(message.starts_with("store: "), "{message}");
+        assert!(message.contains(" elsewhere "), "{message}");
+        assert!(message.contains("--blob-dir (ZOE_BLOB_DIR)"), "{message}");
+
+        let other = blob_dir_failure(Path::new("store"), ZoeError::ReadOnly);
+        assert!(matches!(other, Failure::Message(m) if !m.contains("--blob-dir")));
     }
 
     #[test]
