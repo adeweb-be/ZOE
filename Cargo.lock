@@ -1263,8 +1263,10 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "zoe-convert",
  "zoe-core",
  "zoe-loupe",
+ "zoe-pickle",
 ]
 
 [[package]]
