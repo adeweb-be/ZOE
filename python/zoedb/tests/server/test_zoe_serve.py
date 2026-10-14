@@ -64,6 +64,8 @@ def test_the_section_becomes_the_configuration_file(tmp_path):
         tmp_path,
         "listen 127.0.0.1:0",
         "lock-timeout 2m",
+        "lock-warn 5s",
+        "log-format json",
         "read-only on",
         "<storage main>",
         "  path /var/zoe/main",
@@ -77,6 +79,8 @@ def test_the_section_becomes_the_configuration_file(tmp_path):
     assert tomllib.loads(serve.toml(found)) == {
         "listen": "127.0.0.1:0",
         "lock-timeout": "2m",
+        "lock-warn": "5s",
+        "log-format": "json",
         "read-only": True,
         "storages": {
             "main": {

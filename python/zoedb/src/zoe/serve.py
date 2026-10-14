@@ -45,6 +45,9 @@ KEYS = (
     "max-frame-size",
     "shutdown-timeout",
     "idle-timeout",
+    "lock-warn",
+    "transaction-warn",
+    "log-format",
     "read-only",
 )
 

@@ -147,6 +147,24 @@
         seconds. 0 closes no idle connection.
       </description>
     </key>
+    <key name="lock-warn" datatype="string">
+      <description>
+        Log each lock held longer than this, in whole seconds. 0 logs no
+        lock.
+      </description>
+    </key>
+    <key name="transaction-warn" datatype="string">
+      <description>
+        Log each transaction open longer than this, in whole seconds. 0
+        logs no transaction.
+      </description>
+    </key>
+    <key name="log-format" datatype="string">
+      <description>
+        The format of the log lines on stderr: text, or json for one JSON
+        object on each line.
+      </description>
+    </key>
     <key name="read-only" datatype="string">
       <description>
         If true, the server serves every store for reads only. The default
