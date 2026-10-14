@@ -9,8 +9,8 @@
 //! The copy pass holds one record at a time. The store holds the records of
 //! a restore transaction in memory until its finish. The verification pass
 //! holds one transaction of the file and one of the store. The transaction
-//! iterator of the store also holds the transaction rows and the record
-//! keys of the whole store.
+//! iterator of the store holds one transaction and a slice of tids at a
+//! time, whatever the size of the store.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -21,7 +21,7 @@ use zoe_core::{Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::blobs::{BlobDir, is_blob_record};
 use crate::filestorage::{Cut, DataRecord, End, Reader, TxnHeader, hex};
-use crate::{Error, Report};
+use crate::{Error, ProblemKind, Report};
 
 /// The verification compares the first blob, then one blob in this many,
 /// byte for byte. It checks the size of every other blob. The copy hashes
@@ -166,11 +166,15 @@ fn current_serial(store: &Store, oid: Oid) -> Result<Tid, Error> {
 /// A summary problem is about the whole source. The summary problems come
 /// first, and the list keeps all of them. The list keeps `MAX_PROBLEMS`
 /// other problems, and a last line counts the others.
+///
+/// `add` and `add_summary` count each problem under its kind, with no
+/// cap. `push` and `summary` give a problem without a kind.
 #[derive(Default)]
 pub(crate) struct Problems {
     summary: Vec<String>,
     list: Vec<String>,
     more: u64,
+    counts: BTreeMap<ProblemKind, u64>,
 }
 
 impl Problems {
@@ -186,12 +190,30 @@ impl Problems {
         }
     }
 
+    /// Add a summary problem of the kind `kind`.
+    pub(crate) fn add_summary(&mut self, kind: ProblemKind, problem: String) {
+        *self.counts.entry(kind).or_default() += 1;
+        self.summary(problem);
+    }
+
+    /// Add a problem of the kind `kind`.
+    pub(crate) fn add(&mut self, kind: ProblemKind, problem: String) {
+        *self.counts.entry(kind).or_default() += 1;
+        self.push(problem);
+    }
+
     pub(crate) fn finish(mut self) -> Vec<String> {
         self.summary.append(&mut self.list);
         if self.more > 0 {
             self.summary.push(format!("{} more problems", self.more));
         }
         self.summary
+    }
+
+    /// Put the lines and the counts of the problems into `report`.
+    pub(crate) fn finish_into(mut self, report: &mut Report) {
+        report.counts = std::mem::take(&mut self.counts);
+        report.problems = self.finish();
     }
 }
 
@@ -204,17 +226,10 @@ fn verify(
     blobs: Option<&BlobDir>,
     target: &Store,
 ) -> Result<Report, Error> {
-    let mut report = Report {
-        transactions: 0,
-        copied: 0,
-        records: 0,
-        blobs: 0,
-        last_tid: Tid::ZERO,
-        problems: Vec::new(),
-    };
+    let mut report = Report::empty();
     let mut problems = Problems::default();
     if let Some(problem) = stop_problem(stop) {
-        problems.summary(problem);
+        problems.add_summary(ProblemKind::Stopped, problem);
     }
     // The blob records of the file when no blob directory is given.
     let mut without_dir = 0u64;
@@ -230,7 +245,8 @@ fn verify(
         while let Some(extra) =
             stored.next_if(|txn| !txn.as_ref().is_ok_and(|txn| txn.tid >= header.tid))
         {
-            problems.push(not_in_file(extra));
+            let (kind, problem) = not_in_file(extra);
+            problems.add(kind, problem);
         }
         let txn = stored.next_if(|txn| txn.as_ref().is_ok_and(|txn| txn.tid == header.tid));
         let in_store = match txn {
@@ -239,7 +255,10 @@ fn verify(
                 true
             }
             _ => {
-                problems.push(format!("the store lacks transaction {}", hex(header.tid.0)));
+                problems.add(
+                    ProblemKind::MissingTransaction,
+                    format!("the store lacks transaction {}", hex(header.tid.0)),
+                );
                 false
             }
         };
@@ -260,10 +279,13 @@ fn verify(
             let size = match fs::metadata(&source) {
                 Ok(meta) => meta.len(),
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    problems.push(format!(
-                        "{at}: the blob directory has no blob file {}",
-                        source.display()
-                    ));
+                    problems.add(
+                        ProblemKind::MissingBlobFile,
+                        format!(
+                            "{at}: the blob directory has no blob file {}",
+                            source.display()
+                        ),
+                    );
                     continue;
                 }
                 Err(source_error) => {
@@ -276,28 +298,30 @@ fn verify(
             let sample = report.blobs.is_multiple_of(BLOB_SAMPLE_STRIDE);
             report.blobs += 1;
             if in_store
-                && let Some(problem) =
+                && let Some((kind, problem)) =
                     check_blob(target, record.oid, header.tid, &source, size, sample)?
             {
-                problems.push(format!("{at}: {problem}"));
+                problems.add(kind, format!("{at}: {problem}"));
             }
         }
     }
     for extra in stored {
-        problems.push(not_in_file(extra));
+        let (kind, problem) = not_in_file(extra);
+        problems.add(kind, problem);
     }
 
     if without_dir > 0 {
-        problems.summary(format!(
-            "the Data.fs has {without_dir} blob records, and no blob directory was given"
-        ));
+        problems.add_summary(
+            ProblemKind::NoBlobDirectory,
+            format!("the Data.fs has {without_dir} blob records, and no blob directory was given"),
+        );
     }
     // The verification reads only up to where the copy stopped. So it
     // stops early only when the file changed between the two passes.
     if let Some(problem) = reader.end().and_then(stop_problem) {
-        problems.summary(problem);
+        problems.add_summary(ProblemKind::Stopped, problem);
     }
-    report.problems = problems.finish();
+    problems.finish_into(&mut report);
     Ok(report)
 }
 
@@ -322,14 +346,20 @@ pub(crate) fn stop_problem(end: End) -> Option<String> {
 }
 
 /// Describe a transaction of the store that the file does not have, or an
-/// error of the transaction iterator.
-fn not_in_file(txn: Result<TxnInfo, ZoeError>) -> String {
+/// error of the transaction iterator. Return the kind and the text.
+fn not_in_file(txn: Result<TxnInfo, ZoeError>) -> (ProblemKind, String) {
     match txn {
-        Ok(txn) => format!(
-            "the store has transaction {}, which the Data.fs does not have",
-            hex(txn.tid.0)
+        Ok(txn) => (
+            ProblemKind::MissingTransaction,
+            format!(
+                "the store has transaction {}, which the Data.fs does not have",
+                hex(txn.tid.0)
+            ),
         ),
-        Err(error) => format!("the store does not read: {error}"),
+        Err(error) => (
+            ProblemKind::UnreadableStore,
+            format!("the store does not read: {error}"),
+        ),
     }
 }
 
@@ -348,7 +378,10 @@ pub(crate) fn compare_txn(
         ("extension", &header.extension, &txn.extension),
     ] {
         if file != store {
-            problems.push(format!("transaction {tid}: the {name} differs"));
+            problems.add(
+                ProblemKind::MetadataDiffers,
+                format!("transaction {tid}: the {name} differs"),
+            );
         }
     }
 
@@ -365,26 +398,32 @@ pub(crate) fn compare_txn(
     for (oid, data) in &file {
         let oid_hex = hex(oid.0);
         match store.get(oid) {
-            None => problems.push(format!(
-                "transaction {tid}: the store lacks the record of oid {oid_hex}"
-            )),
-            Some(stored) if stored != data => problems.push(format!(
-                "transaction {tid}: the record of oid {oid_hex} differs"
-            )),
+            None => problems.add(
+                ProblemKind::MissingRecord,
+                format!("transaction {tid}: the store lacks the record of oid {oid_hex}"),
+            ),
+            Some(stored) if stored != data => problems.add(
+                ProblemKind::RecordDiffers,
+                format!("transaction {tid}: the record of oid {oid_hex} differs"),
+            ),
             Some(_) => {}
         }
     }
     for oid in store.keys().filter(|oid| !file.contains_key(oid)) {
-        problems.push(format!(
-            "transaction {tid}: the store has a record of oid {}, which the Data.fs does not have",
-            hex(oid.0)
-        ));
+        problems.add(
+            ProblemKind::MissingRecord,
+            format!(
+                "transaction {tid}: the store has a record of oid {}, which the Data.fs does not have",
+                hex(oid.0)
+            ),
+        );
     }
 }
 
 /// Check that `target` holds the blob of `oid` at `tid` with `size`
 /// bytes. When `sample` is true, also compare it byte for byte with the
-/// blob file `source`, and check its hash. Return the problem found.
+/// blob file `source`, and check its hash. Return the kind and the text of
+/// the problem found.
 pub(crate) fn check_blob(
     target: &Store,
     oid: Oid,
@@ -392,21 +431,30 @@ pub(crate) fn check_blob(
     source: &Path,
     size: u64,
     sample: bool,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<(ProblemKind, String)>, Error> {
+    let unreadable = |text: String| Ok(Some((ProblemKind::UnreadableBlob, text)));
     let path = match target.blob_path(oid, tid) {
         Ok(path) => path,
-        Err(ZoeError::NotFound { .. }) => return Ok(Some("the store has no blob".into())),
-        Err(error) => return Ok(Some(format!("the store does not read the blob: {error}"))),
+        Err(ZoeError::NotFound { .. }) => {
+            return Ok(Some((
+                ProblemKind::MissingBlob,
+                "the store has no blob".into(),
+            )));
+        }
+        Err(error) => return unreadable(format!("the store does not read the blob: {error}")),
     };
     match fs::metadata(&path) {
         Ok(meta) if meta.len() == size => {}
         Ok(meta) => {
-            return Ok(Some(format!(
-                "the sizes differ: {} bytes in the store, {size} in the blob file",
-                meta.len()
+            return Ok(Some((
+                ProblemKind::BlobDiffers,
+                format!(
+                    "the sizes differ: {} bytes in the store, {size} in the blob file",
+                    meta.len()
+                ),
             )));
         }
-        Err(error) => return Ok(Some(format!("the blob file of the store: {error}"))),
+        Err(error) => return unreadable(format!("the blob file of the store: {error}")),
     }
     if !sample {
         return Ok(None);
@@ -419,7 +467,7 @@ pub(crate) fn check_blob(
     let mut original = File::open(source).map_err(io)?;
     let mut copy = match target.open_blob(oid, tid) {
         Ok(copy) => copy,
-        Err(error) => return Ok(Some(format!("the store does not open the blob: {error}"))),
+        Err(error) => return unreadable(format!("the store does not open the blob: {error}")),
     };
     let (mut want, mut got) = (vec![0; CHUNK], vec![0; CHUNK]);
     loop {
@@ -428,12 +476,13 @@ pub(crate) fn check_blob(
         // reaches the end.
         let m = match fill(&mut copy, &mut got) {
             Ok(m) => m,
-            Err(error) => return Ok(Some(format!("the blob of the store: {error}"))),
+            Err(error) => return unreadable(format!("the blob of the store: {error}")),
         };
         if want[..n] != got[..m] {
-            return Ok(Some(
+            return Ok(Some((
+                ProblemKind::BlobDiffers,
                 "the blob of the store differs from the blob file".into(),
-            ));
+            )));
         }
         if n == 0 {
             return Ok(None);
@@ -562,6 +611,16 @@ mod tests {
                 ),
             ]
         );
+        let counts: Vec<_> = report.counts().collect();
+        assert_eq!(
+            counts,
+            [
+                (ProblemKind::MetadataDiffers, 1),
+                (ProblemKind::MissingRecord, 2),
+                (ProblemKind::RecordDiffers, 1),
+            ]
+        );
+        assert_eq!(report.problem_count(), 4);
     }
 
     #[test]
@@ -605,6 +664,9 @@ mod tests {
             report.problems,
             ["the Data.fs has 2 blob records, and no blob directory was given"]
         );
+        // The line is one problem, whatever the number of blob records.
+        assert_eq!(report.count(ProblemKind::NoBlobDirectory), 1);
+        assert_eq!(report.problem_count(), 1);
     }
 
     #[test]
@@ -761,6 +823,18 @@ mod tests {
             "the Data.fs has 1 blob records, and no blob directory was given"
         );
         assert_eq!(report.problems.last().unwrap(), "5 more problems");
+        // The counts have no cap, and they add up to the number of
+        // problems.
+        let counts: Vec<_> = report.counts().collect();
+        assert_eq!(
+            counts,
+            [
+                (ProblemKind::Stopped, 1),
+                (ProblemKind::NoBlobDirectory, 1),
+                (ProblemKind::RecordDiffers, 105),
+            ]
+        );
+        assert_eq!(report.problem_count(), 107);
     }
 
     #[test]
@@ -803,5 +877,7 @@ mod tests {
         let report = from_datafs(&path, Some(&blobs), &store).unwrap();
         assert_eq!(report.problems.len(), MAX_PROBLEMS + 1);
         assert_eq!(report.problems.last().unwrap(), "5 more problems");
+        assert_eq!(report.count(ProblemKind::MissingBlobFile), 105);
+        assert_eq!(report.problem_count(), 105);
     }
 }

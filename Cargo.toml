@@ -11,20 +11,34 @@ repository = "https://github.com/adeweb-be/ZOE"
 publish = false
 
 [workspace.dependencies]
+zoe-client = { path = "crates/zoe-client" }
 zoe-convert = { path = "crates/zoe-convert" }
 zoe-core = { path = "crates/zoe-core" }
+zoe-loupe = { path = "crates/zoe-loupe" }
+zoe-mcp = { path = "crates/zoe-mcp" }
 zoe-pickle = { path = "crates/zoe-pickle" }
 # Without `serve`. A member that serves turns the feature on.
 zoe-server = { path = "crates/zoe-server", default-features = false }
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
+futures = { version = "0.3.34", default-features = false, features = ["alloc"] }
 libc = "0.2"
 pyo3 = "0.29"
 redb = "4.3"
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
+# The msgpack values of the ZEO protocol.
+rmpv = "1.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# The configuration file of `zoe serve`.
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+# Never in zoe-core, and never linked by the extension module (zoe-py).
+# Only zoe-server, zoe-client, zoe-bench, zoe-mcp and Loupe's server mode use it.
+tokio = { version = "1.53", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# The log lines of `zoe serve`, as text or as JSON. Only zoe-server uses it.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = { version = "0.14", default-features = false }
 
@@ -34,3 +48,8 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# With its debug assertions, redb reads every page of the database at each
+# open. The tests then start a large store slowly, as no release build does.
+[profile.dev.package.redb]
+debug-assertions = false
