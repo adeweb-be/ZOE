@@ -18,6 +18,7 @@ from ZODB.blob import BlobFile, is_blob_record
 from ZODB.ConflictResolution import ConflictResolvingStorage
 from ZODB.interfaces import (
     IBlobStorageRestoreable,
+    IExternalGC,
     IStorageCurrentRecordIteration,
     IStorageIteration,
 )
@@ -38,16 +39,22 @@ class WrongThread(StorageTransactionError):
 
 
 # `IBlobStorageRestoreable` extends `IBlobStorage` and
-# `IStorageRestoreable`, and `IStorageCurrentRecordIteration` extends
-# `IStorage`.
+# `IStorageRestoreable`, and `IStorageCurrentRecordIteration` and
+# `IExternalGC` extend `IStorage`. `INTERFACES` of `zoe serve` lists these
+# interfaces in the order of `__iro__`. A change here needs the same change
+# there.
 @zope.interface.implementer(
-    IBlobStorageRestoreable, IStorageCurrentRecordIteration, IStorageIteration
+    IBlobStorageRestoreable,
+    IStorageCurrentRecordIteration,
+    IStorageIteration,
+    IExternalGC,
 )
 class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
-    `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None)`
-    opens the store in `path` and creates the directory when it is missing.
+    `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
+    pack_gc=True)` opens the store in `path` and creates the directory when
+    it is missing.
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
     lock of an object. A longer wait raises `ConflictError`. `None` keeps the
     default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
@@ -76,7 +83,14 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `ConflictResolvingStorage` does.
 
     `pack` runs the online pack of the store, with garbage collection.
-    Reads and commits go on while it runs.
+    Reads and commits go on while it runs. With `pack_gc=False`, a pack
+    removes old revisions only, as the `pack-gc` of FileStorage does: it
+    keeps the newest record at or before the pack time of each object, also
+    when no reader can reach the object. An object whose newest record at or
+    before the pack time is a deletion goes. The store does not record
+    `pack_gc`, so each open gives it.
+
+    `deleteObject` writes a deletion, so the class declares `IExternalGC`.
 
     `sequence(name).next()` returns the next value of the sequence `name` of
     the store: an `int`, unique and strictly increasing per store and per
@@ -264,6 +278,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         storages: the `TimeStamp` of the time in UTC. The store finds the
         references in the records itself, so the pack ignores `referencesf`
         and never calls it.
+
+        With `pack_gc=False`, the pack reads no reference. It keeps the
+        newest record at or before `pack_time` of each object, also when no
+        reader can reach the object, except a deletion: then the object
+        goes.
 
         The whole pack runs without the GIL. Other threads read and commit
         while it runs. A pack at a time before the last pack does nothing.

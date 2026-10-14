@@ -48,7 +48,9 @@ def main(argv: list[str] | None = None) -> int:
         "--workdir",
         type=Path,
         default=Path("target/bench/work"),
-        help="where the storages write their files (default: %(default)s)",
+        help="where the storages write their files: each value of a cell runs on "
+        "a fresh store there, and the harness removes it when the value ends "
+        "(default: %(default)s)",
     )
 
     index_cmd = commands.add_parser(
@@ -71,8 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     gate_cmd.add_argument(
         "--ratio",
         type=_ratio,
-        default=3.0,
-        help="the smallest ratio of ops/s in each cell (default: %(default)s)",
+        default=1.0,
+        help="the smallest ratio of ops/s in each cell but "
+        f"{', '.join(gate.LEFT_OUT)} (default: %(default)g, parity)",
     )
     gate_cmd.add_argument("root", type=Path, help="the root of a results tree")
 
