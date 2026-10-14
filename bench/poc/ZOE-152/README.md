@@ -18,3 +18,21 @@ A proof of concept for the spike ZOE-152. Not for merge. The finding is
 Build in `devenv shell`: `cachex/build.sh` (it uses `target/bench/venv-3.13`
 from `just bench test`, or `POC_PYTHON`). Canaries: `CACHEX_NO_SEEN_RULE=1`
 turns off the rule for current stores, `CACHEX_NO_BOOT_RULE=1` the boot rule.
+
+## After the review
+
+- `Session::clear_and_apply`: a verification that finds the cache too old
+  clears it and moves `applied` in one hold of the writer lock.
+  `CACHEX_TWO_HOLDS=1` makes `sim run` use two holds instead (a canary).
+- `Session::store_seen`: a reply is stored with the tid up to which the
+  process had read its stream when the reply arrived. In `sim run`, one reply
+  in four is stored after the worker read up to 4 more tids.
+  `CACHEX_SEEN_AT_STORE=1` takes the tid of the store instead (a canary).
+- `sim run` counts the branch of each verification, the kills that landed
+  while the victim held the writer lock (`--kill-in-lock 1` waits up to 5 ms
+  for that before each kill), and the bad entries that readers met.
+  `--too-old 0` sends every joiner with a gap through the too-old branch.
+- `sim race`: the two races of the review, in a fixed order, with and without
+  the rule (`results/race.jsonl`).
+- `hit.py`: `Proto.getLastTid` and `setLastTid` take `_lock`, as ZEO's do.
+- `results/sim2.jsonl`: the runs after these changes, 40,000 tids each.

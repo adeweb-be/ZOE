@@ -117,6 +117,15 @@ struct Shared {
     bad_open: AtomicU64,
     refused: AtomicU64,
     lag_max: AtomicU64,
+    verify_equal: AtomicU64,
+    verify_quick: AtomicU64,
+    verify_too_old: AtomicU64,
+    verify_ahead: AtomicU64,
+    delayed_stores: AtomicU64,
+    bad_entries: AtomicU64,
+    kills_in_lock: AtomicU64,
+    /// One word per slot: 1 while the worker of the slot holds the writer lock.
+    in_lock: [AtomicU64; 64],
 }
 
 fn shared() -> &'static Shared {
@@ -172,6 +181,8 @@ struct RunArgs {
     kill_ms: u64,
     ring: u64,
     seed: u64,
+    too_old: u64,
+    kill_in_lock: bool,
 }
 
 fn worker(slot: u64, a: &RunArgs, h: &History, sh: &Shared) {
@@ -185,27 +196,53 @@ fn worker(slot: u64, a: &RunArgs, h: &History, sh: &Shared) {
         }
     };
     sh.opens.fetch_add(1, Ordering::Relaxed);
+    cachex::cache::WRITE_FLAG.store(
+        &sh.in_lock[slot as usize] as *const AtomicU64 as *mut AtomicU64,
+        Ordering::Relaxed,
+    );
     let s = Session::new(cache);
-    // Verification at the open: `register` gives `r`.
-    let r = sh.published.load(Ordering::Acquire);
-    let a0 = s.cache.applied();
+    // Verification at the open: `register` gives `r`. Half of the opens read
+    // `applied` first, as a client that opens its file before it connects;
+    // the other half read it a moment after `register`, so `a0 > r` happens.
+    let (r, a0) = if rng.below(2) == 0 {
+        let a0 = s.cache.applied();
+        (sh.published.load(Ordering::Acquire), a0)
+    } else {
+        let r = sh.published.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(2));
+        (r, s.cache.applied())
+    };
     if a0 < r {
-        if a0 == 0 || r - a0 > 300 {
-            // getInvalidations answers None: the cache is too old.
-            s.clear();
+        if a0 == 0 || r - a0 > a.too_old {
+            // getInvalidations answers None: the cache is too old. The clear
+            // and the move of `applied` are one hold of the writer lock.
+            sh.verify_too_old.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("CACHEX_TWO_HOLDS").is_some() {
+                s.clear();
+                s.set_last_tid(r);
+            } else {
+                s.clear_and_apply(r);
+            }
         } else {
+            sh.verify_quick.fetch_add(1, Ordering::Relaxed);
             for t in a0 + 1..=r {
                 for &oid in &h.txs[t as usize] {
                     s.invalidate(oid, None);
                 }
             }
+            s.set_last_tid(r);
         }
-        s.set_last_tid(r);
     } else {
-        // `a0 > r`: another process is ahead. `lastTransaction` is at least
-        // `a0` here; a lower one would mean another history, and a drop.
+        // `a0 >= r`: up to date, or another process is ahead. The model has
+        // one history, so `lastTransaction` is at least `a0`.
+        if a0 == r {
+            sh.verify_equal.fetch_add(1, Ordering::Relaxed);
+        } else {
+            sh.verify_ahead.fetch_add(1, Ordering::Relaxed);
+        }
         s.start_at(r);
     }
+    let mut bad_seen = 0;
     let mut x = r;
     let nslots = a.workers + 3;
     while sh.stop.load(Ordering::Relaxed) == 0 {
@@ -256,12 +293,48 @@ fn worker(slot: u64, a: &RunArgs, h: &History, sh: &Shared) {
                 None => {
                     sh.misses.fetch_add(1, Ordering::Relaxed);
                     let (start, end) = h.reply(oid, before, x);
-                    if s.store(oid, start, end, &data(oid, start)) {
+                    let seen = x;
+                    // One reply in four is stored late, after the process
+                    // read more of its stream, as a client whose reply goes
+                    // to another task. The store keeps the tid of the reply.
+                    let late = !laggard && rng.below(4) == 0;
+                    if late {
+                        let g = sh.published.load(Ordering::Acquire);
+                        for _ in 0..4 {
+                            if x >= g {
+                                break;
+                            }
+                            let t = x + 1;
+                            let mine = t % nslots == slot;
+                            for &o in &h.txs[t as usize] {
+                                s.invalidate(o, Some(t));
+                                if mine {
+                                    s.store(o, t, 0, &data(o, t));
+                                }
+                            }
+                            match s.set_last_tid(t) {
+                                Applied::Applied => sh.applied.fetch_add(1, Ordering::Relaxed),
+                                Applied::Skipped => sh.skipped.fetch_add(1, Ordering::Relaxed),
+                                Applied::Dropped => sh.dropped.fetch_add(1, Ordering::Relaxed),
+                            };
+                            x = t;
+                        }
+                        sh.delayed_stores.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let stored = if late && std::env::var_os("CACHEX_SEEN_AT_STORE").is_some() {
+                        s.store(oid, start, end, &data(oid, start))
+                    } else {
+                        s.store_seen(oid, start, end, &data(oid, start), seen)
+                    };
+                    if stored {
                         sh.stored.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
         }
+        let bad_now = s.cache.stats.bad.load(Ordering::Relaxed);
+        sh.bad_entries.fetch_add(bad_now - bad_seen, Ordering::Relaxed);
+        bad_seen = bad_now;
         if rng.below(30_000) == 0 {
             s.clear();
             sh.clears.fetch_add(1, Ordering::Relaxed);
@@ -302,8 +375,22 @@ fn run(a: RunArgs) {
         if a.kill_ms > 0 && last_kill.elapsed() >= Duration::from_millis(a.kill_ms) {
             // Never the laggard: it must stay behind.
             let slot = 1 + rng.below(a.workers - 1) as usize;
+            if a.kill_in_lock {
+                // Wait up to 5 ms for the victim to hold the writer lock.
+                let t = Instant::now();
+                while sh.in_lock[slot].load(Ordering::SeqCst) == 0
+                    && t.elapsed() < Duration::from_millis(5)
+                {
+                    std::hint::spin_loop();
+                }
+            }
             unsafe {
                 libc::kill(pids[slot], libc::SIGKILL);
+            }
+            if sh.in_lock[slot].swap(0, Ordering::SeqCst) == 1 {
+                sh.kills_in_lock.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe {
                 libc::waitpid(pids[slot], std::ptr::null_mut(), 0);
             }
             kills += 1;
@@ -334,7 +421,7 @@ fn run(a: RunArgs) {
     }
     let l = |x: &AtomicU64| x.load(Ordering::Relaxed);
     println!(
-        "{{\"mode\":\"run\",\"seconds\":{:.1},\"workers\":{},\"published\":{},\"kills\":{},\"opens\":{},\"bad_open\":{},\"reads\":{},\"hits\":{},\"current_hits\":{},\"misses\":{},\"stored\":{},\"refused\":{},\"applied\":{},\"skipped\":{},\"dropped\":{},\"clears\":{},\"lag_max\":{},\"stale\":{},\"wrong_data\":{},\"reopen\":\"{:?}\",\"final_applied\":{},\"final_hits\":{},\"final_bad\":{}}}",
+        "{{\"mode\":\"run\",\"seconds\":{:.1},\"workers\":{},\"published\":{},\"kills\":{},\"opens\":{},\"bad_open\":{},\"reads\":{},\"hits\":{},\"current_hits\":{},\"misses\":{},\"stored\":{},\"refused\":{},\"applied\":{},\"skipped\":{},\"dropped\":{},\"clears\":{},\"lag_max\":{},\"stale\":{},\"wrong_data\":{},\"verify_equal\":{},\"verify_quick\":{},\"verify_too_old\":{},\"verify_ahead\":{},\"delayed_stores\":{},\"bad_entries\":{},\"kills_in_lock\":{},\"reopen\":\"{:?}\",\"final_applied\":{},\"final_hits\":{},\"final_bad\":{}}}",
         t0.elapsed().as_secs_f64(),
         a.workers,
         l(&sh.published),
@@ -354,6 +441,13 @@ fn run(a: RunArgs) {
         l(&sh.lag_max),
         l(&sh.stale),
         l(&sh.wrong_data),
+        l(&sh.verify_equal),
+        l(&sh.verify_quick),
+        l(&sh.verify_too_old),
+        l(&sh.verify_ahead),
+        l(&sh.delayed_stores),
+        l(&sh.bad_entries),
+        l(&sh.kills_in_lock),
         c.opened,
         applied,
         final_hits,
@@ -532,6 +626,73 @@ fn damage(dir: &Path, trials: u64, seed: u64) {
     );
 }
 
+/// Two races in a fixed order, each with the rule and without it. Oid 7 has
+/// revisions at tids 1 and 5. A reader at snapshot 5 or 6 must get tid 5.
+///
+/// Race 1, the verification of a cache too old: a process P, whose stream is
+/// at tid 3, stores the reply of a load of oid 7 (start 1, current up to 3)
+/// while a joiner J clears the cache and moves `applied` to its `register`
+/// tid 6. With two holds of the lock, the store can come between them.
+///
+/// Race 2, a reply stored late: P gets the reply (start 1, current up to 3),
+/// then reads and applies the invalidation of tid 5 for oid 7, then stores
+/// the reply. The rule takes the tid of the reply (3), not the tid of the
+/// store (5).
+fn race(dir: &Path) {
+    let path = dir.join("race.zoec");
+    let open = || Session::new(Cache::open(Some(&path), &cfg(1 << 20, Mode::Shared)).unwrap());
+    let rev = |t: u64| format!("revision {t}").into_bytes();
+    let line = |name: &str, rule: bool, stored: bool, hit: Option<u64>| {
+        println!(
+            "{{\"mode\":\"race\",\"race\":\"{name}\",\"rule\":{rule},\"reply_stored\":{stored},\"hit_start\":{},\"stale\":{}}}",
+            hit.map_or("null".to_string(), |t| t.to_string()),
+            hit == Some(1)
+        );
+    };
+    for (name, one_hold, store_first) in [
+        ("too-old verification, store between the holds", false, false),
+        ("too-old verification, store before the hold", true, true),
+        ("too-old verification, store after the hold", true, false),
+    ] {
+        let _ = std::fs::remove_file(&path);
+        let p = open();
+        p.set_last_tid(3);
+        let j = open();
+        let mut stored = false;
+        if store_first {
+            stored = p.store_seen(7, 1, 0, &rev(1), 3);
+        }
+        if one_hold {
+            j.clear_and_apply(6);
+        } else {
+            j.clear();
+        }
+        if !store_first {
+            stored = p.store_seen(7, 1, 0, &rev(1), 3);
+        }
+        if !one_hold {
+            j.set_last_tid(6);
+        }
+        let hit = j.load_before(7, 7).map(|(_, h)| h.start);
+        line(name, one_hold, stored, hit);
+    }
+    for seen_at_reply in [false, true] {
+        let _ = std::fs::remove_file(&path);
+        let p = open();
+        p.set_last_tid(3);
+        p.invalidate(7, Some(5));
+        p.set_last_tid(5);
+        let stored = if seen_at_reply {
+            p.store_seen(7, 1, 0, &rev(1), 3)
+        } else {
+            p.store(7, 1, 0, &rev(1))
+        };
+        // A reader at snapshot 5, which is `applied`: the truth is tid 5.
+        let hit = p.load_before(7, 6).map(|(_, h)| h.start);
+        line("a reply stored after the invalidation of its oid", seen_at_reply, stored, hit);
+    }
+}
+
 fn arg(args: &[String], name: &str, default: u64) -> u64 {
     args.iter()
         .position(|a| a == name)
@@ -560,7 +721,10 @@ fn main() {
             kill_ms: arg(&args, "--kill-ms", 200),
             ring: arg(&args, "--ring", 4 << 20),
             seed: arg(&args, "--seed", 1),
+            too_old: arg(&args, "--too-old", 300),
+            kill_in_lock: arg(&args, "--kill-in-lock", 0) == 1,
         }),
+        Some("race") => race(&dir),
         Some("damage") => damage(&dir, arg(&args, "--trials", 500), arg(&args, "--seed", 1)),
         _ => eprintln!("usage: sim run|damage [--dir DIR] [options]"),
     }

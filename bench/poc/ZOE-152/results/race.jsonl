@@ -1,0 +1,5 @@
+{"mode":"race","race":"too-old verification, store between the holds","rule":false,"reply_stored":true,"hit_start":1,"stale":true}
+{"mode":"race","race":"too-old verification, store before the hold","rule":true,"reply_stored":true,"hit_start":null,"stale":false}
+{"mode":"race","race":"too-old verification, store after the hold","rule":true,"reply_stored":false,"hit_start":null,"stale":false}
+{"mode":"race","race":"a reply stored after the invalidation of its oid","rule":false,"reply_stored":true,"hit_start":1,"stale":true}
+{"mode":"race","race":"a reply stored after the invalidation of its oid","rule":true,"reply_stored":false,"hit_start":null,"stale":false}

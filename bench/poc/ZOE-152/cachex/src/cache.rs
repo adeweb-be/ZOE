@@ -251,6 +251,18 @@ pub struct Cache {
     pub stats: Stats,
 }
 
+/// When set, the writer lock stores 1 in this word while a process holds
+/// it, and 0 before it releases it. The kill loop of `sim` reads it.
+pub static WRITE_FLAG: std::sync::atomic::AtomicPtr<AtomicU64> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn write_flag(v: u64) {
+    let p = WRITE_FLAG.load(Ordering::Relaxed);
+    if !p.is_null() {
+        unsafe { (*p).store(v, Ordering::SeqCst) };
+    }
+}
+
 pub struct WriteGuard<'a> {
     cache: &'a Cache,
     _inner: MutexGuard<'a, ()>,
@@ -258,6 +270,7 @@ pub struct WriteGuard<'a> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        write_flag(0);
         if let Some(f) = &self.cache.file
             && self.cache.mode == Mode::Shared
         {
@@ -630,6 +643,7 @@ impl Cache {
         {
             ofd(f, libc::F_OFD_SETLKW, libc::F_WRLCK as libc::c_short);
         }
+        write_flag(1);
         WriteGuard {
             cache: self,
             _inner: inner,
@@ -644,6 +658,7 @@ impl Cache {
         {
             return None;
         }
+        write_flag(1);
         Some(WriteGuard {
             cache: self,
             _inner: inner,
@@ -1030,6 +1045,30 @@ impl Session {
         let seen = l.last;
         drop(l);
         self.cache.store(oid, start, end, data, seen)
+    }
+
+    /// Store the reply of a load with `seen`, the tid up to which the
+    /// process had read its stream when the reply arrived. A store that runs
+    /// later must not take the tid of that later time.
+    pub fn store_seen(&self, oid: u64, start: u64, end: u64, data: &[u8], seen: u64) -> bool {
+        self.cache.store(oid, start, end, data, seen)
+    }
+
+    /// The verification found a cache too old: drop every entry and move
+    /// `applied` to `tid` in one hold of the writer lock. Between two holds,
+    /// another process could store an entry that is current only up to the
+    /// old `applied`.
+    pub fn clear_and_apply(&self, tid: u64) {
+        let mut l = self.local.lock().unwrap();
+        l.pending.clear();
+        let c = &self.cache;
+        let g = c.lock();
+        c.clear_locked();
+        if c.applied() < tid {
+            c.set_applied_locked(tid);
+        }
+        drop(g);
+        l.last = tid.max(l.last);
     }
 
     /// ZEO's `setLastTid`: apply the pending transaction once per node, then

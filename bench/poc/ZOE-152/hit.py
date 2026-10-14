@@ -48,11 +48,20 @@ class Proto:
         self.loadBefore = c.loadBefore
         self.store = c.store
         self.invalidate = c.invalidate
-        self.setLastTid = c.setLastTid
-        self.getLastTid = c.getLastTid
         self.clear = c.clear
         self.contents = c.contents
         self._lock = threading.RLock()
+
+    # ZEO's tpc_finish_co holds `_lock` across `setLastTid` and the call that
+    # gives the invalidations to the DB, and ZEO's `getLastTid` takes the same
+    # lock. So `lastTransaction` never gives T before the DB got T.
+    def setLastTid(self, tid):
+        with self._lock:
+            self.inner.setLastTid(tid)
+
+    def getLastTid(self):
+        with self._lock:
+            return self.inner.getLastTid()
 
     def __len__(self):
         return len(self.inner)
