@@ -3,16 +3,20 @@
 //! A connection has two queues. The calls of the connection put their
 //! replies in the session queue. A call takes room in that queue before it
 //! runs, so it never waits to put its reply. The hub of the invalidations
-//! puts its frames in the hub queue: the invalidations, and the `info` and
-//! the reply of each `tpc_finish`. The hub never waits: a hub queue that is
-//! full closes the connection. So a client that downloads a blob, and keeps
-//! the session queue full, does not stop a commit.
+//! puts its messages in the hub queue: each invalidation, the `info` of a
+//! pack, and the frames of each commit for its own client. A message is
+//! one frame, except for a commit: its `info` and the reply of its
+//! `tpc_finish` are one message of two frames. So a hub queue of one
+//! message holds them. The hub never waits: a hub queue that is full closes
+//! the connection. So a client that downloads a blob, and keeps the session
+//! queue full, does not stop a commit.
 //!
 //! Each frame takes a place in the order of the connection when it goes
-//! into its queue: one counter gives the places of both queues. The writer
-//! task sends the frames strictly in the order of their places. So the
-//! client gets the frames in the order in which the server queued them, as
-//! from one queue. The calls of a connection run on many threads. A frame
+//! into its queue: one counter gives the places of both queues. The frames
+//! of one message share one place. The writer task sends the frames
+//! strictly in the order of their places, and the frames of one place in
+//! their order. So the client gets the frames in the order in which the
+//! server queued them, as from one queue. The calls of a connection run on many threads. A frame
 //! of the session takes its place and goes into the session queue under one
 //! lock, so that queue holds its frames in the order of their places.
 //!
@@ -22,6 +26,7 @@
 //! The writer waits for that frame. A place that gets no frame holds no
 //! frame, and the writer skips it.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -38,6 +43,8 @@ pub(crate) type Frame = Arc<Vec<u8>>;
 enum Slot {
     /// The frame, or none for an empty place.
     Ready(Option<Frame>),
+    /// The frames of one message of the hub, in their order.
+    Message(Vec<Frame>),
     /// A frame that the call gives later. A closed channel is an empty
     /// place.
     Pending(oneshot::Receiver<Vec<u8>>),
@@ -54,7 +61,7 @@ struct Placed {
 pub(crate) struct Outbox {
     /// The replies of the calls. A call takes room before it runs.
     session: mpsc::Sender<Placed>,
-    /// The frames of the hub. The hub never waits.
+    /// The messages of the hub. The hub never waits.
     hub: mpsc::Sender<Placed>,
     /// The place of the next frame.
     next: Arc<AtomicU64>,
@@ -67,7 +74,7 @@ pub(crate) struct Outbox {
 /// What a push into the hub queue did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pushed {
-    /// The frame waits in the queue.
+    /// The message waits in the queue.
     Queued,
     /// The queue was full. The push closed the connection.
     Overflow,
@@ -77,9 +84,9 @@ pub(crate) enum Pushed {
 
 impl Outbox {
     /// Return the queues of a connection: a session queue of at most
-    /// `session` frames and a hub queue of at most `hub` frames. Also
+    /// `session` frames and a hub queue of at most `hub` messages. Also
     /// return the receiving side for the writer task, and the signal of the
-    /// close. A size of 0 holds 1 frame. A size above the bound of tokio
+    /// close. A size of 0 holds 1 entry. A size above the bound of tokio
     /// holds that bound.
     pub(crate) fn new(session: usize, hub: usize) -> (Self, Inbox, Closing) {
         let size = |n: usize| n.clamp(1, Semaphore::MAX_PERMITS);
@@ -100,6 +107,7 @@ impl Outbox {
             from_session: None,
             from_hub: None,
             pending: None,
+            rest: VecDeque::new(),
             session_open: true,
             hub_open: true,
         };
@@ -154,9 +162,24 @@ impl Outbox {
     /// The hub calls this under its mutex, so its frames take their places
     /// in the order of the queue.
     pub(crate) fn push(&self, frame: Frame) -> Pushed {
+        self.push_slot(Slot::Ready(Some(frame)))
+    }
+
+    /// Put the frames of one message of the hub at the next place, and do
+    /// not wait. The frames count as one message: they go in together, or
+    /// the queue is full and the push closes the connection.
+    ///
+    /// The hub calls this under its mutex, as `push`.
+    pub(crate) fn push_message(&self, frames: Vec<Frame>) -> Pushed {
+        self.push_slot(Slot::Message(frames))
+    }
+
+    /// Put `slot` in the hub queue at the next place, and do not wait.
+    /// When the hub queue is full, close the connection.
+    fn push_slot(&self, slot: Slot) -> Pushed {
         let placed = Placed {
             place: self.next_place(),
-            slot: Slot::Ready(Some(frame)),
+            slot,
         };
         match self.hub.try_send(placed) {
             Ok(()) => Pushed::Queued,
@@ -168,7 +191,7 @@ impl Outbox {
         }
     }
 
-    /// Return the number of frames that wait in the hub queue.
+    /// Return the number of messages that wait in the hub queue.
     pub(crate) fn hub_len(&self) -> usize {
         self.hub.max_capacity() - self.hub.capacity()
     }
@@ -272,6 +295,8 @@ pub(crate) struct Inbox {
     /// The frame of the last place that went out, when its call did not
     /// give it yet.
     pending: Option<oneshot::Receiver<Vec<u8>>>,
+    /// The frames of the last place that went out, after its first frame.
+    rest: VecDeque<Frame>,
     /// The queue still has a sender.
     session_open: bool,
     hub_open: bool,
@@ -370,6 +395,9 @@ impl Inbox {
     /// Give the frame of the next place when it is read ahead, or tell
     /// what to read or to wait for.
     fn step(&mut self) -> Step {
+        if let Some(frame) = self.rest.pop_front() {
+            return Step::Frame(frame);
+        }
         if self.pending.is_some() {
             return Step::Pending;
         }
@@ -388,6 +416,13 @@ impl Inbox {
                     Slot::Ready(Some(frame)) => return Step::Frame(frame),
                     // An empty place.
                     Slot::Ready(None) => continue,
+                    Slot::Message(frames) => {
+                        self.rest = frames.into();
+                        match self.rest.pop_front() {
+                            Some(frame) => return Step::Frame(frame),
+                            None => continue,
+                        }
+                    }
                     Slot::Pending(frame) => {
                         self.pending = Some(frame);
                         return Step::Pending;
@@ -529,6 +564,35 @@ mod tests {
         assert_eq!(outbox.push(frame("inv 3")), Pushed::Overflow);
         assert!(closing.is_closed());
         assert_eq!(take(&mut inbox), ["inv 1", "inv 2"]);
+    }
+
+    #[test]
+    fn the_frames_of_one_message_count_as_one_and_keep_their_order() {
+        let (outbox, mut inbox, closing) = Outbox::new(10, 1);
+        assert!(outbox.send(b"reply 1".to_vec()));
+        let message = vec![frame("info"), frame("finish")];
+        assert_eq!(outbox.push_message(message), Pushed::Queued);
+        assert!(outbox.send(b"reply 2".to_vec()));
+        assert!(!closing.is_closed());
+        assert_eq!(take(&mut inbox), ["reply 1", "info", "finish", "reply 2"]);
+        // The queue holds one message again.
+        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
+        assert_eq!(take(&mut inbox), ["inv"]);
+    }
+
+    #[test]
+    fn a_message_that_does_not_fit_puts_none_of_its_frames() {
+        let (outbox, mut inbox, closing) = Outbox::new(10, 1);
+        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
+        let message = vec![frame("info"), frame("finish")];
+        assert_eq!(outbox.push_message(message), Pushed::Overflow);
+        assert!(closing.is_closed());
+        assert_eq!(take(&mut inbox), ["inv"]);
+        // An empty message is an empty place.
+        let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
+        assert_eq!(outbox.push_message(Vec::new()), Pushed::Queued);
+        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
+        assert_eq!(take(&mut inbox), ["inv"]);
     }
 
     #[test]
