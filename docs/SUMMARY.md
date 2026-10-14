@@ -39,6 +39,7 @@
   - [0027. The blob directory](adr/0027-blob-directory.md)
   - [0028. The zoe command](adr/0028-the-zoe-command.md)
   - [0029. The frame checksum covers the key space](adr/0029-key-space-in-the-checksum.md)
+  - [0030. Dump files: a format of ZOE's own, one file per tid range](adr/0030-dump-files.md)
 
 # Reference
 

@@ -40,6 +40,11 @@
 //! the commit and the removal leaves the intent file, and the next open
 //! removes the files that have no blob record.
 //!
+//! `Store::pack_until` stops a pack between two batches. It checks its
+//! stop after each batch only, never during the mark or inside a batch.
+//! So each batch stays one backend write, whole or absent, and a later
+//! pack at the same tid removes what the stopped pack left.
+//!
 //! A dry run (`Store::pack_dry_run`) runs the mark and the selection of a
 //! pack. It adds each selected record to the report and removes nothing.
 //! It writes nothing. With no commit between them, the report of the dry
@@ -181,6 +186,34 @@ impl Store {
         batch: usize,
         mut between: impl FnMut(),
     ) -> Result<PackReport> {
+        self.pack_or_stop(at, batch, || {
+            between();
+            false
+        })
+    }
+
+    /// Pack the store at `at`, as `pack` does, and stop between two
+    /// batches when `stop` returns true. `stop` runs after each batch,
+    /// as `between` of `pack_in_batches` runs. It does not run during the
+    /// mark, so a stop during the mark waits for the mark and the first
+    /// batch. At most one batch runs after the stop.
+    ///
+    /// A stopped pack ends with `Closed` and removes no more records. Each
+    /// batch is one backend write, so the store keeps the records of the
+    /// batches that did not run, and it opens without repair. A later
+    /// pack at the same tid removes what the stopped pack left.
+    pub fn pack_until(&self, at: Tid, stop: impl FnMut() -> bool) -> Result<PackReport> {
+        self.pack_or_stop(at, BATCH, stop)
+    }
+
+    /// Pack the store at `at` in batches of at most `batch` records. After
+    /// each batch, stop with `Closed` when `stop` returns true.
+    fn pack_or_stop(
+        &self,
+        at: Tid,
+        batch: usize,
+        mut stop: impl FnMut() -> bool,
+    ) -> Result<PackReport> {
         self.writable()?;
         let _running = lock(&self.packing.running);
         let (tid, last, watermark) = {
@@ -205,7 +238,9 @@ impl Store {
                 break;
             }
             pack.remove(removals)?;
-            between();
+            if stop() {
+                return Err(ZoeError::Closed);
+            }
         }
         Ok(pack.report)
     }
@@ -951,6 +986,43 @@ mod tests {
                 "batch {batch}"
             );
         }
+    }
+
+    #[test]
+    fn a_stopped_pack_ends_between_two_batches_and_a_later_pack_ends_it() {
+        let built = MemVfs::new();
+        let store = revisions(built.clone(), 5);
+        let last = store.last_transaction();
+        drop(store);
+        let packed = Store::open_vfs(built.durable_copy()).unwrap();
+        let full = packed.pack(last).unwrap();
+        assert_eq!(full.records, 10, "{full:?}");
+
+        // The stop runs after each batch. It stops after the second batch.
+        let vfs = built.durable_copy();
+        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let mut batches = 0;
+        let stopped = store.pack_or_stop(last, 2, || {
+            batches += 1;
+            batches == 2
+        });
+        assert!(matches!(stopped, Err(ZoeError::Closed)), "{stopped:?}");
+        assert_eq!(batches, 2);
+        assert_eq!(store.backend.pack_watermark().unwrap(), last);
+        assert_indexed(&store, "stopped");
+
+        // The store opens without repair. A later pack at the same tid
+        // removes what the stopped pack left.
+        drop(store);
+        let store = Store::open_vfs(vfs.durable_copy()).unwrap();
+        assert_eq!(store.pack(last).unwrap().records, 6);
+        assert_eq!(transactions(&store), transactions(&packed));
+        assert_indexed(&store, "packed again");
+
+        // A stop that never fires lets the pack end.
+        let store = Store::open_vfs(built.durable_copy()).unwrap();
+        assert_eq!(store.pack_until(last, || false).unwrap(), full);
+        assert_eq!(transactions(&store), transactions(&packed));
     }
 
     #[test]

@@ -437,6 +437,18 @@ mod tests {
             Self::register(stream)
         }
 
+        /// Connect, do the handshake, then register read-only for the
+        /// storage `1`.
+        fn connect_read_only(addr: SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut client = Self { stream, next: 1 };
+            assert_eq!(client.read_frame(), b"M5");
+            client.write_frame(b"M5");
+            client.call("register", vec![Value::from("1"), Value::Boolean(true)]);
+            client
+        }
+
         /// Do the handshake on `stream`, then register for the storage `1`.
         fn register(stream: TcpStream) -> Self {
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -598,6 +610,48 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_storage_serves_the_blobs_of_its_blob_directory() {
+        let dir = fresh_dir("read-only-blob-dir");
+        let (path, blobs) = (dir.join("store"), dir.join("blobs-elsewhere"));
+        let options = zoe_core::Options {
+            blob_dir: Some(blobs.clone()),
+            ..zoe_core::Options::default()
+        };
+        let data = b"the bytes of the blob";
+        let tid = commit_blob(&Store::open_with(&path, options).unwrap(), Oid(1), data);
+
+        // Without its blob directory, the store does not start. The error
+        // names the directory that has no layout file.
+        let wrong = StorageOptions::new("1", &path).read_only(true);
+        let error = Server::start(ServeOptions::with_storages([wrong]))
+            .err()
+            .expect("a wrong blob directory fails the start");
+        let named = path.join("blobs").display().to_string();
+        assert!(error.to_string().contains(&named), "{error}");
+
+        let storage = StorageOptions::new("1", &path)
+            .blob_dir(&blobs)
+            .read_only(true);
+        let server = Server::start(ServeOptions::with_storages([storage])).unwrap();
+        let mut client = Client::connect_read_only(server.addr());
+        let id = client.send("sendBlob", vec![p64(1), p64(tid.0)]);
+        let mut frames = Vec::new();
+        loop {
+            let frame = client.read_frame();
+            let (got, flags, method, args) = decode(&frame);
+            if method == ".reply" {
+                assert_eq!((got, flags, args), (id, Value::from(0), Value::Nil));
+                break;
+            }
+            frames.push(frame);
+        }
+        assert_eq!(check_download(&frames, Oid(1), tid, data), [data.len()]);
+        server.stop();
+        assert!(!path.join("blobs").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_disconnect_during_an_upload_leaves_no_file() {
         let dir = fresh_dir("disconnect");
         let server = Server::start(ServeOptions::new(&dir)).unwrap();
@@ -608,9 +662,9 @@ mod tests {
         client.send_async("storea", vec![p64(1), p64(0), pickle, txn]);
         client.send_async("storeBlobStart", vec![]);
         client.send_async("storeBlobChunk", vec![Value::Binary(vec![1; 59_000])]);
-        // The session runs the calls of a connection in order. So after the
-        // reply to ping, the upload file holds the chunk.
-        client.call("ping", vec![]);
+        // The calls of a transaction run in order. So after the reply to an
+        // abort of another transaction, the upload file holds the chunk.
+        client.call("tpc_abort", vec![Value::from(99)]);
         let names = uploads(&dir);
         assert_eq!(names.len(), 1, "{names:?}");
         let file = dir.join("blobs/tmp").join(&names[0]);
@@ -728,13 +782,16 @@ mod tests {
     fn the_server_stops_during_a_download_that_the_client_does_not_read() {
         let dir = fresh_dir("stop-download");
         let tid = commit_blob(&Store::open(&dir).unwrap(), Oid(1), &vec![3; 256 * CHUNK]);
-        let server = Server::start(ServeOptions::new(&dir)).unwrap();
+        let timeout = Duration::from_secs(2);
+        let server = Server::start(ServeOptions::new(&dir).shutdown_timeout(timeout)).unwrap();
         let mut reader = Client::connect_slow(server.addr());
         reader.send("sendBlob", vec![p64(1), p64(tid.0)]);
         let (_, _, method, _) = decode(&reader.read_frame());
         assert_eq!(method, "receiveBlobStart");
-        // The session waits for room in its queue. The stop ends it.
+        // The session waits for room in its queue. The stop waits for the
+        // client until the forced close, which ends the session.
         let (stopped, wait) = std::sync::mpsc::channel();
+        let started = Instant::now();
         std::thread::spawn(move || {
             server.stop();
             let _ = stopped.send(());
@@ -743,6 +800,10 @@ mod tests {
             wait.recv_timeout(TIMEOUT).is_ok(),
             "the server did not stop"
         );
+        assert!(started.elapsed() <= timeout, "{:?}", started.elapsed());
+        // The session ended before the stop closed the store.
+        Store::open_read_only(&dir).unwrap();
+        drop(reader);
         let _ = fs::remove_dir_all(&dir);
     }
 

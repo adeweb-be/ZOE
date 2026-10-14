@@ -671,6 +671,34 @@ impl MemVfs {
         });
     }
 
+    /// Return the state that a crash now leaves on disk, as a filesystem
+    /// whose files and directories are all durable, with an empty record.
+    ///
+    /// Every synced operation lands, as in `crash_images`. `lands` gets the
+    /// number of pending operations and returns how many of them land, in
+    /// their recorded order: a crash that keeps the order of the writes. A
+    /// count above the number of pending operations lands them all. This
+    /// filesystem does not change: the caller drops it.
+    pub fn crash_now(&self, lands: impl FnOnce(usize) -> usize) -> MemVfs {
+        let state = self.lock();
+        let (synced, pending) = split_at_syncs(&state.log);
+        let n = lands(pending.len()).min(pending.len());
+        let mut which: Vec<usize> = synced
+            .into_iter()
+            .chain(pending[..n].iter().copied())
+            .collect();
+        which.sort_unstable();
+        let (files, dirs) = apply(
+            &state.initial,
+            &state.initial_dirs,
+            &state.log,
+            &which,
+            None,
+        );
+        drop(state);
+        MemVfs::with_tree(files, dirs)
+    }
+
     /// Return the states that a crash can leave on disk.
     ///
     /// A crash point comes before the first operation and after each
@@ -1389,6 +1417,36 @@ mod tests {
                 .iter()
                 .any(|i| contents(i, "f").unwrap() == b"synced+pending")
         );
+    }
+
+    #[test]
+    fn a_crash_now_keeps_the_synced_writes_and_a_prefix_of_the_others() {
+        let (vfs, file) = with_file();
+        file.write(0, b"synced").unwrap();
+        file.sync_data().unwrap();
+        file.write(6, b"+a").unwrap();
+        file.write(8, b"+b").unwrap();
+        let read = |image: &MemVfs| {
+            let file = image.open("f").unwrap();
+            let mut bytes = vec![0; usize::try_from(file.len().unwrap()).unwrap()];
+            file.read(0, &mut bytes).unwrap();
+            bytes
+        };
+
+        let mut seen = 0;
+        let none = vfs.crash_now(|pending| {
+            seen = pending;
+            0
+        });
+        assert_eq!(seen, 2);
+        assert_eq!(read(&none), b"synced");
+        assert_eq!(read(&vfs.crash_now(|_| 1)), b"synced+a");
+        assert_eq!(read(&vfs.crash_now(|_| 99)), b"synced+a+b");
+        // The image is durable: a crash of the image keeps all of it.
+        let image = vfs.crash_now(|_| 1);
+        assert_eq!(read(&image.crash_now(|_| 0)), b"synced+a");
+        // The filesystem itself does not change.
+        assert_eq!(read(&vfs), b"synced+a+b");
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! `zoe verify`: check the checksums, the blob files, the references and
-//! the classes of a store.
+//! the classes of a store, or compare the dumps of a backup directory with
+//! the store.
 //!
-//! `zoe_convert::verify` does the work. The command opens the store
-//! read-only, so it changes no byte. It fails with a report that lists a
-//! finding.
+//! `zoe_convert::verify` and `zoe_convert::verify_backup` do the work. The
+//! command opens the store read-only, so it changes no byte. It fails with
+//! a report that lists a finding.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -11,10 +12,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use zoe_convert::Verification;
-use zoe_core::Store;
+use zoe_convert::{BackupCheck, Verification};
 
-use super::{Failure, closed_by_reader, store_failure};
+use super::{Failure, closed_by_reader, open_with_blobs};
 
 /// The format of the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -32,6 +32,15 @@ pub(super) struct VerifyArgs {
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: PathBuf,
 
+    /// The blob directory of the store, the key blob-dir of the <zoe>
+    /// section. The default is blobs in the store directory.
+    ///
+    /// The store does not record its blob directory. A store with blobs
+    /// whose blob directory has no layout file fails the command before
+    /// the check.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
+
     /// The format of the report.
     #[arg(
         long,
@@ -48,15 +57,34 @@ pub(super) struct VerifyArgs {
     /// A class of the store that the file does not name is a finding.
     #[arg(long, env = "ZOE_CLASSES", value_name = "FILE")]
     classes: Option<PathBuf>,
+
+    /// Compare the dumps of this backup directory with the store, in place
+    /// of the check of the store.
+    ///
+    /// The command restores the dumps into a scratch directory in the
+    /// temporary directory (TMPDIR), compares them with the store up to the
+    /// last tid of the dumps, and removes the scratch directory. A
+    /// difference is a finding. A damaged dump fails the command.
+    #[arg(
+        long,
+        env = "ZOE_BACKUP",
+        value_name = "DIR",
+        conflicts_with = "classes"
+    )]
+    backup: Option<PathBuf>,
 }
 
 /// Run `zoe verify` and write its report to `out`.
 pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure> {
+    if let Some(dumps) = &args.backup {
+        return run_backup(args, dumps, out);
+    }
     let known = args.classes.as_deref().map(read_classes).transpose()?;
     let path = &args.path;
     // A read-only open changes no byte of the store, and fails on a
-    // directory without a store.
-    let store = Store::open_read_only(path).map_err(|e| store_failure(path, e))?;
+    // directory without a store. A wrong blob directory fails here, so the
+    // report does not list each blob.
+    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
     let report = zoe_convert::verify(&store, known.as_ref());
     drop(store);
     let written = match args.format {
@@ -65,6 +93,69 @@ pub(super) fn run(args: &VerifyArgs, out: &mut dyn Write) -> Result<(), Failure>
     }
     .and_then(|()| out.flush());
     found(path, report.problems(), written)
+}
+
+/// Compare the dumps in `dumps` with the store of `args`, and write the
+/// report to `out`.
+fn run_backup(args: &VerifyArgs, dumps: &Path, out: &mut dyn Write) -> Result<(), Failure> {
+    let path = &args.path;
+    let store = open_with_blobs(path, args.blob_dir.as_deref())?;
+    let check = zoe_convert::verify_backup(&store, dumps, &std::env::temp_dir())
+        .map_err(|error| Failure::Message(error.to_string()))?;
+    drop(store);
+    let written = match args.format {
+        Format::Text => write_backup_text(out, path, dumps, &check),
+        Format::Json => write_backup_json(out, &check),
+    }
+    .and_then(|()| out.flush());
+    found(path, check.differences.len(), written)
+}
+
+/// Return the comparison of the dumps as one JSON value.
+fn backup_to_json(check: &BackupCheck) -> Value {
+    let restored = &check.restored;
+    json!({
+        "dumps": restored.dumps,
+        "last_tid": restored.last_tid.0,
+        "transactions": restored.transactions,
+        "records": restored.records,
+        "blobs": restored.blobs,
+        "sequences": restored.sequences,
+        "differences": check.differences,
+    })
+}
+
+/// Write the comparison of the dumps as one JSON document.
+fn write_backup_json(out: &mut dyn Write, check: &BackupCheck) -> io::Result<()> {
+    serde_json::to_writer_pretty(&mut *out, &backup_to_json(check)).map_err(io::Error::from)?;
+    writeln!(out)
+}
+
+/// Write the comparison of the dumps for a person.
+fn write_backup_text(
+    out: &mut dyn Write,
+    path: &Path,
+    dumps: &Path,
+    check: &BackupCheck,
+) -> io::Result<()> {
+    let restored = &check.restored;
+    writeln!(
+        out,
+        "Compared the dumps in {} with the store {}",
+        dumps.display(),
+        path.display()
+    )?;
+    writeln!(out, "  dumps            {}", restored.dumps)?;
+    writeln!(out, "  last tid         {}", hex(restored.last_tid.0))?;
+    writeln!(out, "  transactions     {}", restored.transactions)?;
+    writeln!(out, "  records          {}", restored.records)?;
+    writeln!(out, "  blobs            {}", restored.blobs)?;
+    writeln!(out, "  sequences        {}", restored.sequences)?;
+    writeln!(out, "Differences: {}", check.differences.len())?;
+    for difference in &check.differences {
+        writeln!(out, "  {difference}")?;
+    }
+    Ok(())
 }
 
 /// Return the result of a verification that found `n` findings in the
@@ -267,6 +358,50 @@ mod tests {
         assert!(found(path, 0, Ok(())).is_ok());
         let full = io::Error::from(io::ErrorKind::StorageFull);
         assert!(matches!(found(path, 0, Err(full)), Err(Failure::Report(_))));
+    }
+
+    fn backup_check() -> BackupCheck {
+        BackupCheck {
+            restored: zoe_convert::Restored {
+                dumps: 2,
+                transactions: 8,
+                records: 12,
+                blobs: 2,
+                sequences: 1,
+                last_tid: Tid(0x10),
+            },
+            differences: vec!["the store lacks transaction 0x0000000000000010".to_owned()],
+        }
+    }
+
+    #[test]
+    fn the_comparison_of_the_dumps_lists_each_difference() {
+        let mut out = Vec::new();
+        write_backup_text(
+            &mut out,
+            Path::new("store"),
+            Path::new("dumps"),
+            &backup_check(),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Compared the dumps in dumps with the store store\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  last tid         0x0000000000000010\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Differences: 1\n  the store lacks transaction"),
+            "{text}"
+        );
+
+        let json = backup_to_json(&backup_check());
+        assert_eq!(json["last_tid"], 16);
+        assert_eq!(json["dumps"], 2);
+        assert_eq!(json["differences"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

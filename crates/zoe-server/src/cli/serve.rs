@@ -8,14 +8,17 @@
 //! file of `--config`.
 //!
 //! The command writes the line `listening <address>` to stdout once it
-//! accepts connections, so a port of 0 gives a free port. The logs go to
-//! stderr. SIGTERM closes the stores, and the command exits with 0.
+//! accepts connections, so a port of 0 gives a free port. With
+//! `--admin-listen`, it writes the line `admin <address>` before it. The
+//! logs go to stderr. SIGTERM or SIGINT stops the server within `--shutdown-timeout`:
+//! the command closes the connections and the stores, and exits with 0.
 //!
 //! The console script of the wheel has no server: its extension never
 //! links tokio. There, the command fails with 1 and names the `zoe` binary.
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +33,14 @@ pub(super) struct ServeArgs {
     /// ZEO. The server creates a store that does not exist.
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: Option<PathBuf>,
+
+    /// The blob directory of the store of --path, the key blob-dir of the
+    /// <zoe> section. The default is blobs in the store directory. The
+    /// store does not record its blob directory, so give the same one at
+    /// each start. The key blob-dir of a [storages.NAME] table sets the
+    /// blob directory of that store.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
 
     /// A store that the server serves under the storage name NAME, which a
     /// client gives to register. Repeat the option to serve more stores.
@@ -60,6 +71,15 @@ pub(super) struct ServeArgs {
         default_value = "127.0.0.1:8100"
     )]
     listen: SocketAddr,
+
+    /// The address of the admin port, as HOST:PORT: an HTTP port for the
+    /// probes. GET /healthz gives 200 while every store is open. GET
+    /// /readyz gives 200 when every store is open and ready, and 503
+    /// before and from a stop on. GET /metrics gives the metrics in the
+    /// Prometheus text format. The port does not speak ZEO. A port of 0
+    /// takes a free port. Without it, the server opens no admin port.
+    #[arg(long, env = "ZOE_ADMIN_LISTEN", value_name = "HOST:PORT")]
+    admin_listen: Option<SocketAddr>,
 
     /// The most transactions that getInvalidations covers. A client that
     /// reconnects further behind gets nil and verifies its cache.
@@ -94,6 +114,41 @@ pub(super) struct ServeArgs {
     )]
     lock_timeout: Option<Duration>,
 
+    /// Log each lock held longer than this, in whole seconds, such as 5,
+    /// 5s or 1m, when the lock is released: at the finish, the abort or the
+    /// end of the connection. The log line gives the oid, the client and
+    /// the storage. 0 or no value logs no lock.
+    #[arg(
+        long,
+        env = "ZOE_LOCK_WARN",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    lock_warn: Option<Duration>,
+
+    /// Log each transaction open longer than this, in whole seconds, such
+    /// as 30, 30s or 1m, when it ends. The log line gives the client and
+    /// the storage. 0 or no value logs no transaction.
+    #[arg(
+        long,
+        env = "ZOE_TRANSACTION_WARN",
+        value_name = "SECONDS",
+        value_parser = whole_seconds
+    )]
+    transaction_warn: Option<Duration>,
+
+    /// The format of the log lines on stderr: text, or json for one JSON
+    /// object on each line. Each log line of a connection gives its client
+    /// (the label of set_client_label, or the address) and its storage.
+    #[arg(
+        long,
+        env = "ZOE_LOG_FORMAT",
+        value_name = "FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
+
     /// The longest frame that a client can send, in bytes. A longer frame
     /// closes its connection before the server reserves memory for it. A
     /// storea or restorea frame holds a whole record, so keep this limit
@@ -108,11 +163,114 @@ pub(super) struct ServeArgs {
     )]
     max_frame_size: Option<u32>,
 
+    /// The longest time that a stop on SIGTERM or SIGINT takes, in whole
+    /// seconds, such as 30, 30s or 1m. The server stops accepting
+    /// connections, commits each tpc_finish that it received and sends its
+    /// reply, aborts the other transactions, closes each connection and
+    /// closes the stores. Near the end of the time, it closes the
+    /// connections that remain at once. When a call still runs at the end,
+    /// such as a running pack, the store of that session does not close
+    /// cleanly, and the other stores close. The command exits with 0.
+    #[arg(
+        long,
+        env = "ZOE_SHUTDOWN_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "30",
+        value_parser = whole_seconds
+    )]
+    shutdown_timeout: Duration,
+
+    /// The longest time that a connection sends no frame, in whole seconds,
+    /// such as 300, 300s or 5m. A heartbeat is a frame, and a stock client
+    /// sends one every 60 seconds. The server closes a connection that is
+    /// idle for longer: its open transaction aborts and its locks go, as
+    /// when the client closes. So a client that stalls during a commit, or
+    /// a host that dies, holds its locks at most this long. The time while
+    /// the server reads no calls of the connection, because 4 calls wait,
+    /// does not count. 0 closes no idle connection.
+    #[arg(
+        long,
+        env = "ZOE_IDLE_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = whole_seconds
+    )]
+    idle_timeout: Duration,
+
+    /// The number of threads that run the calls that read, such as
+    /// loadBefore, for all the connections together. The default is the
+    /// number of cores. A transaction, a download and a pack each run on a
+    /// thread outside this pool, so a vote that waits for a lock never
+    /// stops the loads.
+    #[arg(
+        long,
+        env = "ZOE_BLOCKING_THREADS",
+        value_name = "THREADS",
+        value_parser = clap::value_parser!(NonZeroUsize)
+    )]
+    blocking_threads: Option<NonZeroUsize>,
+
+    /// Serve every store for reads only. The server opens each store
+    /// read-only: it changes no byte of the store, and holds its lock, so
+    /// no writer opens the store meanwhile. The store must exist, and a
+    /// store with blobs must get its blob directory. A client that
+    /// registers to write gets ReadOnlyError; a client with
+    /// read_only_fallback then registers read-only. A transaction fails at
+    /// its vote, and new_oids and pack fail, with ReadOnlyError. The key
+    /// read-only of a [storages.NAME] table makes one store read-only.
+    #[arg(
+        long,
+        env = "ZOE_READ_ONLY",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    read_only: bool,
+
+    /// Accept storeBlobShared: the server and its clients share the blob
+    /// directory of each store, as with the option shared-blob-dir of a ZEO
+    /// client. A client writes the blob file in the directory of its oid
+    /// and sends only its name, which ends in .tmp or .tmp-. The server
+    /// takes the file into the transaction by rename, and the client reads
+    /// each committed blob file in place. At the start, the server writes
+    /// the layout file of each blob directory. A blob directory without a
+    /// layout file that holds other entries, such as the directories of an
+    /// oid that a client made, fails the start. The clients have the trust
+    /// of the user of the server, as with ZEO: run them as the same user. A
+    /// client can put a symbolic link in place of a blob file after the
+    /// check of the server. Without the option, storeBlobShared fails the
+    /// vote with an error that names shared-blob-dir.
+    #[arg(
+        long,
+        env = "ZOE_SHARED_BLOB_DIR",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    shared_blob_dir: bool,
+
     /// The stores to serve: the store of `--path`, then the stores of
     /// `--storage`, then the stores of the configuration file.
     /// [`configure`] sets them.
     #[arg(skip)]
     storages: Vec<Storage>,
+}
+
+/// The format of the log lines of `zoe serve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum LogFormat {
+    /// One line of text for each event.
+    Text,
+    /// One JSON object on each line.
+    Json,
 }
 
 /// A store that the server serves under a storage name.
@@ -123,6 +281,8 @@ pub(super) struct Storage {
     /// The directory of the blob files. `None` is `blobs` in the store
     /// directory.
     pub(super) blob_dir: Option<PathBuf>,
+    /// True when the server serves the store for reads only.
+    pub(super) read_only: bool,
 }
 
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
@@ -133,6 +293,7 @@ fn named_storage(value: &str) -> Result<Storage, String> {
             name: name.to_owned(),
             path: PathBuf::from(path),
             blob_dir: None,
+            read_only: false,
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
@@ -228,10 +389,18 @@ fn usage_error(message: String) -> clap::Error {
 /// `file`. Fail when there is no store, or when a name comes twice.
 #[cfg(feature = "serve")]
 fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String> {
+    if args.path.is_none() && args.blob_dir.is_some() {
+        return Err(
+            "--blob-dir is the blob directory of the store of --path: give --path too, \
+             or the key blob-dir of a [storages.NAME] table"
+                .to_owned(),
+        );
+    }
     let path = args.path.iter().map(|path| Storage {
         name: crate::protocol::STORAGE_NAME.to_owned(),
         path: path.clone(),
-        blob_dir: None,
+        blob_dir: args.blob_dir.clone(),
+        read_only: false,
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())
@@ -251,7 +420,9 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
     Ok(storages)
 }
 
-/// Serve until SIGTERM. Write the line `listening <address>` to `out`.
+/// Serve until SIGTERM or SIGINT, then stop. Write the line
+/// `admin <address>` when the server has an admin port, then the line
+/// `listening <address>`, to `out`.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
@@ -259,7 +430,8 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     use crate::serve::{ServeOptions, Server, StorageOptions};
 
     let storages = args.storages.iter().map(|storage| {
-        let options = StorageOptions::new(&storage.name, &storage.path);
+        let options =
+            StorageOptions::new(&storage.name, &storage.path).read_only(storage.read_only);
         match &storage.blob_dir {
             Some(dir) => options.blob_dir(dir),
             None => options,
@@ -268,19 +440,59 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     let mut options = ServeOptions::with_storages(storages)
         .listen(args.listen)
         .invalidation_queue_size(args.invalidation_queue_size)
-        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX));
+        .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
+        .shutdown_timeout(args.shutdown_timeout)
+        .idle_timeout(args.idle_timeout)
+        .read_only(args.read_only)
+        .shared_blob_dir(args.shared_blob_dir);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
+    }
+    if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
+        options = options.lock_warn(threshold);
+    }
+    if let Some(threshold) = args.transaction_warn.filter(|t| !t.is_zero()) {
+        options = options.transaction_warn(threshold);
+    }
+    init_logs(args.log_format);
+    if let Some(addr) = args.admin_listen {
+        options = options.admin_listen(addr);
     }
     if let Some(bytes) = args.max_frame_size.and_then(NonZeroU32::new) {
         options = options.max_frame_size(bytes);
     }
+    if let Some(threads) = args.blocking_threads {
+        options = options.blocking_threads(threads);
+    }
     let server = Server::start(options).map_err(|error| Failure::Message(error.to_string()))?;
+    if let Some(admin) = server.admin_addr() {
+        writeln!(out, "admin {admin}")?;
+    }
     server.serve_until_signal(|addr| {
         writeln!(out, "listening {addr}")?;
         out.flush()
     })?;
     Ok(())
+}
+
+/// Send the log lines of the process to stderr, in `format`, from the
+/// level INFO on. A JSON line holds the fields of the event and of its
+/// spans. A process that has a subscriber already keeps it.
+#[cfg(feature = "serve")]
+fn init_logs(format: LogFormat) {
+    use tracing::Level;
+
+    let builder = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(Level::INFO);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .try_init(),
+    };
 }
 
 /// Fail: this build has no server.
@@ -317,6 +529,100 @@ mod tests {
         assert_eq!(args.client_queue_size, 1);
         let error = serve(&["--client-queue-size", "0"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_shutdown_timeout_is_30_seconds_by_default_and_takes_whole_seconds() {
+        assert_eq!(
+            serve(&[]).unwrap().shutdown_timeout,
+            Duration::from_secs(30)
+        );
+        let args = serve(&["--shutdown-timeout", "2m"]).unwrap();
+        assert_eq!(args.shutdown_timeout, Duration::from_secs(120));
+        let args = serve(&["--shutdown-timeout", "0"]).unwrap();
+        assert_eq!(args.shutdown_timeout, Duration::ZERO);
+        let error = serve(&["--shutdown-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_idle_timeout_is_300_seconds_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().idle_timeout, Duration::from_secs(300));
+        let args = serve(&["--idle-timeout", "2m"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::from_secs(120));
+        let args = serve(&["--idle-timeout", "0"]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::ZERO);
+        let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_blocking_threads_are_the_cores_by_default_and_never_0() {
+        assert_eq!(serve(&[]).unwrap().blocking_threads, None);
+        let args = serve(&["--blocking-threads", "1"]).unwrap();
+        assert_eq!(args.blocking_threads, NonZeroUsize::new(1));
+        let error = serve(&["--blocking-threads", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_logs_are_text_by_default_and_the_warnings_are_off() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.log_format, LogFormat::Text);
+        assert_eq!((args.lock_warn, args.transaction_warn), (None, None));
+        let args = serve(&[
+            "--log-format",
+            "json",
+            "--lock-warn",
+            "5",
+            "--transaction-warn",
+            "1m",
+        ])
+        .unwrap();
+        assert_eq!(args.log_format, LogFormat::Json);
+        assert_eq!(args.lock_warn, Some(Duration::from_secs(5)));
+        assert_eq!(args.transaction_warn, Some(Duration::from_secs(60)));
+        let error = serve(&["--log-format", "xml"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn read_only_is_false_by_default_and_takes_a_boolean() {
+        assert!(!serve(&[]).unwrap().read_only);
+        assert!(serve(&["--read-only"]).unwrap().read_only);
+        assert!(serve(&["--read-only=true"]).unwrap().read_only);
+        assert!(!serve(&["--read-only=false"]).unwrap().read_only);
+        let error = serve(&["--read-only=maybe"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn shared_blob_dir_is_false_by_default_and_takes_a_boolean() {
+        assert!(!serve(&[]).unwrap().shared_blob_dir);
+        assert!(serve(&["--shared-blob-dir"]).unwrap().shared_blob_dir);
+        assert!(serve(&["--shared-blob-dir=true"]).unwrap().shared_blob_dir);
+        assert!(!serve(&["--shared-blob-dir=false"]).unwrap().shared_blob_dir);
+        let error = serve(&["--shared-blob-dir=maybe"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn blob_dir_is_the_blob_directory_of_the_store_of_path() {
+        let args = serve(&["--blob-dir", "elsewhere"]).unwrap();
+        let stores = storages(&args, Vec::new()).unwrap();
+        assert_eq!(stores[0].blob_dir, Some(PathBuf::from("elsewhere")));
+        assert_eq!(
+            storages(&serve(&[]).unwrap(), Vec::new()).unwrap()[0].blob_dir,
+            None
+        );
+
+        let line = ["zoe", "serve", "--storage", "a=a", "--blob-dir", "b"];
+        let Command::Serve(args) = Cli::try_parse_from(line).unwrap().command else {
+            panic!("not serve");
+        };
+        let error = storages(&args, Vec::new()).unwrap_err();
+        assert!(error.contains("--path"), "{error}");
     }
 
     #[test]

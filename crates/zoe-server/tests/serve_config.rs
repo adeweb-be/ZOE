@@ -1,10 +1,11 @@
 //! Tests of the configuration file of `zoe serve` beside its acceptance
-//! test: the twin of an option wins over the file, and the stores of the
-//! file add to the stores of the command line.
+//! test: the twin of an option wins over the file, the stores of the file
+//! add to the stores of the command line, the twin and the key of
+//! `--read-only`, and the file opens the admin port.
 
 mod wire;
 
-use wire::{Server, commit, fresh_dir, load, new_oids, record, s};
+use wire::{Server, commit, fresh_dir, load, new_oids, open_store, record, s};
 
 #[test]
 fn the_twin_wins_over_the_file() {
@@ -71,4 +72,39 @@ fn the_stores_of_the_file_add_to_the_stores_of_the_command_line() {
     for name in ["one", "main", "catalog"] {
         assert!(dir.join(name).join("zoe.redb").exists(), "{name}");
     }
+}
+
+#[test]
+fn the_twin_and_the_key_of_read_only_make_every_store_read_only() {
+    let dir = fresh_dir("config-read-only");
+    let store = dir.join("store");
+    drop(open_store(&store));
+    let config = dir.join("zoe.toml");
+    std::fs::write(&config, "read-only = true\n").unwrap();
+    for (args, env) in [
+        (vec!["--path", s(&store)], vec![("ZOE_READ_ONLY", "true")]),
+        (vec!["--path", s(&store), "--config", s(&config)], vec![]),
+    ] {
+        let server = Server::start(&args, &env);
+        let mut conn = server.connect();
+        let fault = conn.register("1", false).unwrap_err();
+        assert_eq!(fault.class, "ZODB.POSException.ReadOnlyError", "{args:?}");
+        conn.register("1", true).unwrap();
+    }
+}
+
+#[test]
+fn the_file_gives_the_admin_port() {
+    let dir = fresh_dir("config-admin");
+    let config = dir.join("zoe.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "path = \"{}\"\nadmin-listen = \"127.0.0.1:0\"\n",
+            s(&dir.join("store"))
+        ),
+    )
+    .unwrap();
+    let server = Server::start(&["--config", s(&config)], &[]);
+    assert!(server.admin.is_some(), "the file opened no admin port");
 }
