@@ -9,8 +9,8 @@
 //! `http/json`. Without `ZOE_OTLP_ENDPOINT`, no exporter starts.
 //!
 //! Each call of a session runs in a span `request`, which the traces name
-//! after the method of the call (`otel.name`). `tag` puts the name of the
-//! storage in the OpenTelemetry context of that span. Each span under it
+//! after the method of the call (`otel.name`). `request` puts the name of
+//! the storage in the OpenTelemetry context of that span. Each span under it
 //! gets that context, the spans of the core too. `StorageAttribute` then
 //! gives each span the attribute `zoe.storage`. So the core never names a
 //! storage.
@@ -61,14 +61,11 @@ impl Telemetry {
         let Some(endpoint) = std::env::var(ENDPOINT).ok().filter(|e| !e.is_empty()) else {
             return Ok(None);
         };
-        let traces = std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL).ok();
-        let any = std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_PROTOCOL).ok();
-        let protocol = protocol(
-            traces
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .or(any.as_deref()),
-        )?;
+        // An empty variable counts as no variable.
+        let read = |name| std::env::var(name).ok().filter(|p: &String| !p.is_empty());
+        let name = read(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+            .or_else(|| read(opentelemetry_otlp::OTEL_EXPORTER_OTLP_PROTOCOL));
+        let protocol = protocol(name.as_deref())?;
         let failed = |error: opentelemetry_otlp::ExporterBuildError| format!("{ENDPOINT}: {error}");
         let (exporter, runtime) = if protocol == Protocol::Grpc {
             // The gRPC client needs a tokio runtime. The server runtime
