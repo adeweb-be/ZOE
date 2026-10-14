@@ -28,7 +28,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 
 use serde::{Serialize, Serializer};
-use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
+use zoe_core::{Oid, Options, PackReport, Store, Tid, ZoeError};
 
 pub use diff::Change;
 pub use space::{
@@ -173,8 +173,22 @@ impl Folder {
     /// that was not closed cleanly fails with `NotClosedCleanly`. The call
     /// writes nothing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_blob_dir(path, None)
+    }
+
+    /// Open the store in the folder `path` for reads only, as
+    /// [`Folder::open`] does, with the blob directory `blob_dir`.
+    ///
+    /// The store does not record its blob directory. With `None`, the blob
+    /// directory is `blobs` in the folder. The call writes nothing, also
+    /// in the blob directory and in its parent.
+    pub fn open_with_blob_dir(path: impl AsRef<Path>, blob_dir: Option<&Path>) -> Result<Self> {
         let path = path.as_ref();
-        let store = Store::open_read_only(path).map_err(|e| match e {
+        let options = Options {
+            blob_dir: blob_dir.map(Path::to_path_buf),
+            ..Options::default()
+        };
+        let store = Store::open_read_only_with(path, options).map_err(|e| match e {
             ZoeError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => Error::NoStore {
                 path: path.display().to_string(),
             },
@@ -797,5 +811,40 @@ mod tests {
                 "error": null,
             })
         );
+    }
+
+    #[test]
+    fn a_folder_opens_with_the_blob_directory_of_the_store() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("zoe-loupe-blobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, blobs) = (root.join("store"), root.join("elsewhere"));
+        let options = Options {
+            blob_dir: Some(blobs.clone()),
+            ..Options::default()
+        };
+        let store = Store::open_with(&dir, options).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let mut file = store.new_blob_file().unwrap();
+        file.write_all(b"blob").unwrap();
+        let blob = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+        txn.store_blob(Oid(1), Tid(0), blob, file).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        drop(store);
+
+        // The folder reads the blob directory that the call gives.
+        let folder = Folder::open_with_blob_dir(&dir, Some(&blobs)).unwrap();
+        folder.store().check_blob_dir().unwrap();
+        drop(folder);
+
+        // Without it, the blob directory is `blobs` in the folder, and the
+        // open creates nothing there.
+        let folder = Folder::open(&dir).unwrap();
+        assert!(matches!(
+            folder.store().check_blob_dir(),
+            Err(ZoeError::MissingBlobDir { .. })
+        ));
+        assert!(!dir.join("blobs").exists());
     }
 }

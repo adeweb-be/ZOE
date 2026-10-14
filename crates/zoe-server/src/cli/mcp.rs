@@ -23,12 +23,22 @@ pub(super) struct McpArgs {
     /// The directory of the store. The command opens it for reads only.
     #[arg(long, env = "ZOE_PATH", value_name = "STORE")]
     path: PathBuf,
+
+    /// The blob directory of the store, the key blob-dir of the <zoe>
+    /// section. The default is blobs in the store directory.
+    ///
+    /// The store does not record its blob directory. The `verify` and
+    /// `space` tools read the blob files there. For a store with blobs
+    /// whose blob directory has no layout file, `verify` is a tool error.
+    #[arg(long, env = "ZOE_BLOB_DIR", value_name = "DIR")]
+    blob_dir: Option<PathBuf>,
 }
 
 /// Run `zoe mcp` until the client closes stdin.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: &McpArgs) -> Result<(), Failure> {
-    zoe_mcp::serve_stdio(&args.path).map_err(|error| Failure::Message(error.to_string()))
+    zoe_mcp::serve_stdio(&args.path, args.blob_dir.as_deref())
+        .map_err(|error| Failure::Message(error.to_string()))
 }
 
 /// Fail: this build has no MCP server.
@@ -50,6 +60,12 @@ mod tests {
     fn mcp_needs_a_path() {
         assert!(Cli::try_parse_from(["zoe", "mcp"]).is_err());
         assert!(Cli::try_parse_from(["zoe", "mcp", "--path", "store"]).is_ok());
+    }
+
+    #[test]
+    fn mcp_takes_a_blob_directory() {
+        let args = ["zoe", "mcp", "--path", "store", "--blob-dir", "elsewhere"];
+        assert!(Cli::try_parse_from(args).is_ok());
     }
 
     #[test]
