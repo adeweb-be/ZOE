@@ -437,8 +437,8 @@ mod tests {
             Self::register(stream)
         }
 
-        /// Do the handshake on `stream`, then register for the storage `1`.
-        /// Connect and register read-only.
+        /// Connect, do the handshake, then register read-only for the
+        /// storage `1`.
         fn connect_read_only(addr: SocketAddr) -> Self {
             let stream = TcpStream::connect(addr).unwrap();
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -449,6 +449,7 @@ mod tests {
             client
         }
 
+        /// Do the handshake on `stream`, then register for the storage `1`.
         fn register(stream: TcpStream) -> Self {
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
             let mut client = Self { stream, next: 1 };
