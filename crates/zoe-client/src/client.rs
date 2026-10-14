@@ -1,0 +1,716 @@
+//! The connection of a client: its calls, its replies and the calls of the
+//! server.
+//!
+//! Three tasks serve one connection. The writer sends the frames of the
+//! calls in the order of a channel. The reader gives each reply to its
+//! call by the message id, and gives each invalidation to the receivers
+//! of invalidations. The heartbeat task sends a heartbeat every 60
+//! seconds. When one of the tasks stops, the connection closes: each call
+//! that waits for its reply fails with `Error::Disconnected`, and so does
+//! each later call.
+
+use std::collections::HashMap;
+use std::mem;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use rmpv::Value;
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use zoe_core::{Oid, Tid};
+
+use crate::Error;
+use crate::protocol::{self, Message, bin8, get, p64};
+use crate::runtime::{Runtime, Stream, Tokio};
+
+/// The time between two heartbeats, as `ZEO.ClientStorage` sends them.
+pub const HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// The number of frames that wait for the writer. A call waits while the
+/// channel is full.
+const OUTGOING: usize = 64;
+
+/// The number of invalidations that wait for a slow receiver. A receiver
+/// that falls further behind gets `Error::Lagged`.
+const INVALIDATIONS: usize = 1024;
+
+/// The most oids that one `new_oids` call of the protocol gives.
+const OIDS_PER_CALL: usize = 100;
+
+/// A client of one storage of a ZEO 6 server.
+///
+/// Its methods take `&self`, so many calls of one client can wait for
+/// their replies at once. The server answers the calls of one connection
+/// in order, but each reply goes to its call by its message id, whatever
+/// the order.
+pub struct Client {
+    inner: Arc<Inner>,
+    /// Each task of the connection holds a sender. `close` waits until
+    /// every sender is gone.
+    tasks: mpsc::Receiver<()>,
+}
+
+/// One version of an object, as `loadBefore` gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// The pickle of the record.
+    pub data: Vec<u8>,
+    /// The tid that wrote the record: its serial.
+    pub tid: Tid,
+    /// The tid of the next record of the object, or `None` when this
+    /// record is current.
+    pub end: Option<Tid>,
+}
+
+/// One entry of the history of an object, newest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEntry {
+    /// The tid of the transaction that wrote the record.
+    pub tid: Tid,
+    /// The time of the transaction, in seconds since the epoch.
+    pub time: f64,
+    /// The user of the transaction.
+    pub user_name: Vec<u8>,
+    /// The description of the transaction.
+    pub description: Vec<u8>,
+    /// The size of the pickle, in bytes.
+    pub size: u64,
+}
+
+/// An invalidation: the oids that a transaction of another client wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invalidation {
+    /// The tid of the transaction.
+    pub tid: Tid,
+    /// The oids that the transaction wrote.
+    pub oids: Vec<Oid>,
+}
+
+/// A receiver of the invalidations of a client.
+pub struct Invalidations(broadcast::Receiver<Invalidation>);
+
+impl Invalidations {
+    /// Wait for the next invalidation. It fails with `Error::Lagged` when
+    /// the receiver missed invalidations, and with `Error::Disconnected`
+    /// after the last invalidation of a closed connection.
+    pub async fn recv(&mut self) -> Result<Invalidation, Error> {
+        match self.0.recv().await {
+            Ok(invalidation) => Ok(invalidation),
+            Err(broadcast::error::RecvError::Closed) => Err(Error::Disconnected),
+            Err(broadcast::error::RecvError::Lagged(missed)) => Err(Error::Lagged(missed)),
+        }
+    }
+}
+
+/// The state that the client, its transactions and its tasks share.
+struct Inner {
+    runtime: Arc<dyn Runtime>,
+    calls: Mutex<Calls>,
+    /// The frames for the writer.
+    outgoing: mpsc::Sender<Vec<u8>>,
+    /// `true` once the connection closes. Each task stops then.
+    closing: watch::Sender<bool>,
+    /// The last tid that the client knows: from `register`, from each
+    /// invalidation, and from each commit of the client.
+    last_tid: AtomicU64,
+    /// The sender of invalidations, until the connection closes.
+    invalidations: Mutex<Option<broadcast::Sender<Invalidation>>>,
+    /// One transaction at a time, as the commit lock of `ZEO.ClientStorage`.
+    commit: Arc<tokio::sync::Mutex<()>>,
+    /// The id of the next transaction.
+    next_txn: AtomicU64,
+}
+
+/// The calls that wait for their replies.
+struct Calls {
+    closed: bool,
+    next_id: i64,
+    pending: HashMap<i64, oneshot::Sender<Result<Value, Error>>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Client {
+    /// Connect to the ZEO 6 server at `addr` on the tokio runtime, and
+    /// register with the storage `storage`, as `"1"`.
+    pub async fn connect(addr: SocketAddr, storage: &str) -> Result<Client, Error> {
+        Client::connect_with(Arc::new(Tokio), addr, storage).await
+    }
+
+    /// Connect to the ZEO 6 server at `addr` through `runtime`, and register
+    /// with the storage `storage`.
+    pub async fn connect_with(
+        runtime: Arc<dyn Runtime>,
+        addr: SocketAddr,
+        storage: &str,
+    ) -> Result<Client, Error> {
+        let mut stream = runtime.connect(addr).await?;
+        match protocol::read_frame(&mut stream).await? {
+            Some(theirs) if theirs == protocol::PROTOCOL => {}
+            Some(theirs) => {
+                return Err(Error::Protocol(format!(
+                    "the server speaks the protocol {}",
+                    String::from_utf8_lossy(&theirs)
+                )));
+            }
+            None => return Err(Error::Disconnected),
+        }
+        protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
+
+        let client = Client::start(runtime, stream);
+        let last = match client
+            .inner
+            .call("register", vec![storage.into(), false.into()])
+            .await?
+        {
+            Value::Nil => client.inner.call("lastTransaction", vec![]).await?,
+            last => last,
+        };
+        let last = tid(&last, "register")?;
+        client.inner.last_tid.fetch_max(last.0, Ordering::SeqCst);
+        Ok(client)
+    }
+
+    /// Start the tasks of the connection on `stream`.
+    fn start(runtime: Arc<dyn Runtime>, stream: Box<dyn Stream>) -> Client {
+        let (outgoing, frames) = mpsc::channel(OUTGOING);
+        let (closing, _) = watch::channel(false);
+        let (invalidations, _) = broadcast::channel(INVALIDATIONS);
+        let inner = Arc::new(Inner {
+            runtime: runtime.clone(),
+            calls: Mutex::new(Calls {
+                closed: false,
+                next_id: 1,
+                pending: HashMap::new(),
+            }),
+            outgoing,
+            closing,
+            last_tid: AtomicU64::new(0),
+            invalidations: Mutex::new(Some(invalidations)),
+            commit: Arc::new(tokio::sync::Mutex::new(())),
+            next_txn: AtomicU64::new(1),
+        });
+        let (alive, tasks) = mpsc::channel(1);
+        let (reader, writer) = tokio::io::split(stream);
+        runtime.spawn(Box::pin(read(inner.clone(), reader, alive.clone())));
+        runtime.spawn(Box::pin(write(
+            inner.clone(),
+            writer,
+            frames,
+            alive.clone(),
+        )));
+        runtime.spawn(Box::pin(beat(inner.clone(), alive)));
+        Client { inner, tasks }
+    }
+
+    /// Return the last tid that the client knows: the tid of `register`,
+    /// of the last invalidation, or of the last commit of this client.
+    pub fn last_transaction(&self) -> Tid {
+        Tid(self.inner.last_tid.load(Ordering::SeqCst))
+    }
+
+    /// Return `n` new oids.
+    pub async fn new_oids(&self, n: usize) -> Result<Vec<Oid>, Error> {
+        let mut oids = Vec::with_capacity(n);
+        while oids.len() < n {
+            let ask = (n - oids.len()).min(OIDS_PER_CALL);
+            let reply = self
+                .inner
+                .call("new_oids", vec![(ask as u64).into()])
+                .await?;
+            let Value::Array(items) = reply else {
+                return Err(bad("new_oids", &reply));
+            };
+            if items.is_empty() {
+                return Err(Error::Protocol("new_oids gave no oid".into()));
+            }
+            for item in &items {
+                oids.push(oid(item, "new_oids")?);
+            }
+        }
+        oids.truncate(n);
+        Ok(oids)
+    }
+
+    /// Load the current record of `oid`: its pickle and its serial. An oid
+    /// without a record fails with the `POSKeyError` of the server.
+    pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
+        match self.load_before(oid, protocol::MAX_TID).await? {
+            Some(record) => Ok((record.data, record.tid)),
+            None => Err(Error::Server {
+                class: "ZODB.POSException.POSKeyError".into(),
+                message: format!("{oid:?}"),
+            }),
+        }
+    }
+
+    /// Load the record of `oid` that was current just before `tid`, or
+    /// `None` when no record of `oid` is older than `tid`.
+    pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>, Error> {
+        let reply = self
+            .inner
+            .call("loadBefore", vec![bin8(oid.0), bin8(tid.0)])
+            .await?;
+        if reply.is_nil() {
+            return Ok(None);
+        }
+        let Some([data, start, end]) = reply
+            .as_array()
+            .and_then(|items| <&[Value; 3]>::try_from(items.as_slice()).ok())
+        else {
+            return Err(bad("loadBefore", &reply));
+        };
+        let Some(data) = data.as_slice() else {
+            return Err(bad("loadBefore", &reply));
+        };
+        Ok(Some(Record {
+            data: data.to_vec(),
+            tid: self::tid(start, "loadBefore")?,
+            end: match end {
+                Value::Nil => None,
+                end => Some(self::tid(end, "loadBefore")?),
+            },
+        }))
+    }
+
+    /// Return at most `size` entries of the history of `oid`, newest first.
+    pub async fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>, Error> {
+        let reply = self
+            .inner
+            .call("history", vec![bin8(oid.0), (size as u64).into()])
+            .await?;
+        let Value::Array(items) = &reply else {
+            return Err(bad("history", &reply));
+        };
+        items
+            .iter()
+            .map(|item| {
+                let bytes = |key| get(item, key).and_then(Value::as_slice).map(<[u8]>::to_vec);
+                Some(HistoryEntry {
+                    tid: Tid(get(item, "tid").and_then(p64)?),
+                    time: get(item, "time").and_then(Value::as_f64)?,
+                    user_name: bytes("user_name")?,
+                    description: bytes("description")?,
+                    size: get(item, "size").and_then(Value::as_u64)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| bad("history", &reply))
+    }
+
+    /// Begin a transaction. `extension` is the msgpack encoding of the map
+    /// of the transaction extension, or empty for an empty map. A client
+    /// has one transaction at a time: a second `begin` waits until the
+    /// first transaction ends.
+    pub async fn begin(
+        &self,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+    ) -> Result<Transaction, Error> {
+        let extension = extension_map(extension)?;
+        let guard = self.inner.commit.clone().lock_owned().await;
+        let id = self.inner.next_txn.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .notify(
+                "tpc_begin",
+                vec![
+                    id.into(),
+                    user.into(),
+                    description.into(),
+                    extension,
+                    Value::Nil,
+                    " ".into(),
+                ],
+            )
+            .await?;
+        Ok(Transaction {
+            inner: self.inner.clone(),
+            id,
+            open: true,
+            _guard: guard,
+        })
+    }
+
+    /// Return a receiver of the invalidations that the server sends from
+    /// now on: the commits of the other clients of the storage. The
+    /// commits of this client give no invalidation.
+    pub fn invalidations(&self) -> Invalidations {
+        match &*lock(&self.inner.invalidations) {
+            Some(sender) => Invalidations(sender.subscribe()),
+            None => Invalidations(broadcast::channel(1).1),
+        }
+    }
+
+    /// Close the connection, and wait until its tasks stop.
+    pub async fn close(mut self) {
+        self.inner.closing.send_replace(true);
+        while self.tasks.recv().await.is_some() {}
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.inner.closing.send_replace(true);
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("last_transaction", &self.last_transaction())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An open transaction of a client: `store`, then `vote`, then `finish`.
+/// A transaction that is dropped before `finish` or `abort` sends
+/// `tpc_abort` and does not wait for its reply.
+pub struct Transaction {
+    inner: Arc<Inner>,
+    id: u64,
+    /// `false` after a finish, an abort or a failed vote.
+    open: bool,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Transaction {
+    /// Store `data` for `oid`. `serial` is the serial that the client read,
+    /// or `Tid(0)` for a new object. The server reports an error of the
+    /// store at the vote.
+    pub async fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<(), Error> {
+        self.inner
+            .notify(
+                "storea",
+                vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()],
+            )
+            .await
+    }
+
+    /// Vote. A stale serial fails with `Error::Conflict`, both when the
+    /// server fails the vote and when it lists the conflict for the client
+    /// to resolve: this client resolves no conflict. A failed vote aborts
+    /// the transaction.
+    pub async fn vote(&mut self) -> Result<(), Error> {
+        let result = match self.inner.call("vote", vec![self.id.into()]).await {
+            // A stock server lists the oids that it resolved, and a server
+            // with conflict resolution in the client lists the conflicts.
+            Ok(Value::Array(items)) => match items.iter().find(|item| item.is_map()) {
+                Some(item) => Err(protocol::conflict(item).unwrap_or_else(|| bad("vote", item))),
+                None => Ok(()),
+            },
+            Ok(other) => Err(bad("vote", &other)),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.open = false;
+            // The server keeps the locks of a listed conflict until the
+            // abort. The abort of a failed vote gets nil.
+            let _ = self.inner.call("tpc_abort", vec![self.id.into()]).await;
+        }
+        result
+    }
+
+    /// Finish the transaction after a vote, and return its tid. The server
+    /// replies when the commit is durable.
+    pub async fn finish(mut self) -> Result<Tid, Error> {
+        let reply = self.inner.call("tpc_finish", vec![self.id.into()]).await?;
+        let tid = tid(&reply, "tpc_finish")?;
+        self.open = false;
+        self.inner.last_tid.fetch_max(tid.0, Ordering::SeqCst);
+        Ok(tid)
+    }
+
+    /// Abort the transaction, and wait for the reply of the server.
+    pub async fn abort(mut self) -> Result<(), Error> {
+        self.open = false;
+        self.inner.call("tpc_abort", vec![self.id.into()]).await?;
+        Ok(())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.open {
+            self.inner.abort_later(self.id);
+        }
+    }
+}
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transaction")
+            .field("id", &self.id)
+            .field("open", &self.open)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Inner {
+    /// Call `method` and wait for its reply.
+    async fn call(&self, method: &str, args: Vec<Value>) -> Result<Value, Error> {
+        let (sender, reply) = oneshot::channel();
+        let id = {
+            let mut calls = lock(&self.calls);
+            if calls.closed {
+                return Err(Error::Disconnected);
+            }
+            let id = calls.next_id;
+            calls.next_id += 1;
+            calls.pending.insert(id, sender);
+            id
+        };
+        // The guard forgets the call when its future is dropped.
+        let _forget = Forget { inner: self, id };
+        let frame = protocol::call(id, method, args)?;
+        self.outgoing
+            .send(frame)
+            .await
+            .map_err(|_| Error::Disconnected)?;
+        reply.await.unwrap_or(Err(Error::Disconnected))
+    }
+
+    /// Send `method` as a call without a reply.
+    async fn notify(&self, method: &str, args: Vec<Value>) -> Result<(), Error> {
+        if lock(&self.calls).closed {
+            return Err(Error::Disconnected);
+        }
+        let frame = protocol::notify(method, args)?;
+        self.outgoing
+            .send(frame)
+            .await
+            .map_err(|_| Error::Disconnected)
+    }
+
+    /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
+    /// reply. The reader drops the reply, because no call waits for its id.
+    fn abort_later(&self, txn: u64) {
+        let id = {
+            let mut calls = lock(&self.calls);
+            if calls.closed {
+                return;
+            }
+            let id = calls.next_id;
+            calls.next_id += 1;
+            id
+        };
+        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()]) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(frame)) = self.outgoing.try_send(frame) {
+            let outgoing = self.outgoing.clone();
+            self.runtime.spawn(Box::pin(async move {
+                let _ = outgoing.send(frame).await;
+            }));
+        }
+    }
+
+    /// Handle one message from the server.
+    fn dispatch(&self, message: Message) {
+        match message {
+            Message::Reply { id, result } => {
+                let sender = lock(&self.calls).pending.remove(&id);
+                if let Some(sender) = sender {
+                    let _ = sender.send(result);
+                }
+            }
+            Message::Call { method, args } if method == "invalidateTransaction" => {
+                let Some(invalidation) = invalidation(&args) else {
+                    return;
+                };
+                self.last_tid
+                    .fetch_max(invalidation.tid.0, Ordering::SeqCst);
+                if let Some(sender) = &*lock(&self.invalidations) {
+                    let _ = sender.send(invalidation);
+                }
+            }
+            // `info` and the other calls of the server change nothing here.
+            Message::Call { .. } | Message::Other => {}
+        }
+    }
+
+    /// Close the connection: stop the tasks, and fail each call that waits.
+    fn shut(&self) {
+        self.closing.send_replace(true);
+        let pending = {
+            let mut calls = lock(&self.calls);
+            calls.closed = true;
+            mem::take(&mut calls.pending)
+        };
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(Error::Disconnected));
+        }
+        lock(&self.invalidations).take();
+    }
+}
+
+/// Removes a call from the pending calls when its future ends.
+struct Forget<'a> {
+    inner: &'a Inner,
+    id: i64,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.calls).pending.remove(&self.id);
+    }
+}
+
+/// Wait until the connection closes.
+async fn closed(closing: &mut watch::Receiver<bool>) {
+    let _ = closing.wait_for(|closing| *closing).await;
+}
+
+/// The reader task: read the frames of the server until the end of the
+/// stream, an error, a bad frame or the close of the connection.
+async fn read(inner: Arc<Inner>, mut stream: ReadHalf<Box<dyn Stream>>, _alive: mpsc::Sender<()>) {
+    let mut closing = inner.closing.subscribe();
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = closed(&mut closing) => break,
+            frame = protocol::read_frame(&mut stream) => frame,
+        };
+        let Ok(Some(payload)) = frame else { break };
+        match protocol::decode(&payload) {
+            Ok(message) => inner.dispatch(message),
+            Err(_) => break,
+        }
+    }
+    inner.shut();
+}
+
+/// The writer task: write the frames of the channel in order until the
+/// close of the connection or an error.
+async fn write(
+    inner: Arc<Inner>,
+    mut stream: WriteHalf<Box<dyn Stream>>,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    _alive: mpsc::Sender<()>,
+) {
+    let mut closing = inner.closing.subscribe();
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = closed(&mut closing) => break,
+            frame = frames.recv() => frame,
+        };
+        let Some(frame) = frame else { break };
+        let written = tokio::select! {
+            biased;
+            () = closed(&mut closing) => break,
+            written = stream.write_all(&frame) => written,
+        };
+        if written.is_err() {
+            break;
+        }
+    }
+    inner.shut();
+    let _ = stream.shutdown().await;
+}
+
+/// The heartbeat task: send a heartbeat every `HEARTBEAT`, busy or idle,
+/// as a stock client does.
+async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
+    let mut closing = inner.closing.subscribe();
+    loop {
+        tokio::select! {
+            biased;
+            () = closed(&mut closing) => break,
+            () = inner.runtime.sleep(HEARTBEAT) => {}
+        }
+        let sent = tokio::select! {
+            biased;
+            () = closed(&mut closing) => break,
+            sent = inner.outgoing.send(protocol::heartbeat()) => sent,
+        };
+        if sent.is_err() {
+            break;
+        }
+    }
+}
+
+/// Read the args `[tid, [oid, ...]]` of `invalidateTransaction`.
+fn invalidation(args: &Value) -> Option<Invalidation> {
+    let [tid, oids] = <&[Value; 2]>::try_from(args.as_array()?.as_slice()).ok()?;
+    Some(Invalidation {
+        tid: Tid(p64(tid)?),
+        oids: oids
+            .as_array()?
+            .iter()
+            .map(|oid| p64(oid).map(Oid))
+            .collect::<Option<_>>()?,
+    })
+}
+
+/// Return the map of the extension: empty for no bytes, else the one
+/// msgpack map that `bytes` encode.
+fn extension_map(bytes: &[u8]) -> Result<Value, Error> {
+    if bytes.is_empty() {
+        return Ok(Value::Map(vec![]));
+    }
+    let mut rest = bytes;
+    match rmpv::decode::read_value(&mut rest) {
+        Ok(map @ Value::Map(_)) if rest.is_empty() => Ok(map),
+        _ => Err(Error::Invalid(
+            "the extension is not the msgpack encoding of one map".into(),
+        )),
+    }
+}
+
+/// Read a tid, or fail with a protocol error of `method`.
+fn tid(value: &Value, method: &str) -> Result<Tid, Error> {
+    p64(value).map(Tid).ok_or_else(|| bad(method, value))
+}
+
+/// Read an oid, or fail with a protocol error of `method`.
+fn oid(value: &Value, method: &str) -> Result<Oid, Error> {
+    p64(value).map(Oid).ok_or_else(|| bad(method, value))
+}
+
+/// The protocol error of a reply of `method` that has the wrong shape.
+fn bad(method: &str, value: &Value) -> Error {
+    Error::Protocol(format!("{method} gave {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_extension_is_an_empty_map() {
+        assert_eq!(extension_map(b"").unwrap(), Value::Map(vec![]));
+    }
+
+    #[test]
+    fn an_extension_is_one_msgpack_map() {
+        let mut map = Vec::new();
+        let value = Value::Map(vec![("note".into(), "x".into())]);
+        rmpv::encode::write_value(&mut map, &value).unwrap();
+        assert_eq!(extension_map(&map).unwrap(), value);
+        for bad in [
+            b"\x90".to_vec(),
+            [map.clone(), vec![0]].concat(),
+            b"\xc1".to_vec(),
+        ] {
+            assert!(matches!(extension_map(&bad), Err(Error::Invalid(_))));
+        }
+    }
+
+    #[test]
+    fn an_invalidation_reads_its_tid_and_oids() {
+        let args = Value::Array(vec![bin8(9), Value::Array(vec![bin8(1), bin8(2)])]);
+        assert_eq!(
+            invalidation(&args),
+            Some(Invalidation {
+                tid: Tid(9),
+                oids: vec![Oid(1), Oid(2)]
+            })
+        );
+        assert_eq!(invalidation(&Value::Array(vec![bin8(9)])), None);
+    }
+}
