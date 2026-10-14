@@ -362,6 +362,13 @@ pub(crate) async fn serve_connection(
         .map_or_else(|_| "a client".to_owned(), |addr| addr.to_string());
     let socket = Some(stream.as_raw_fd());
     let (reader, writer) = stream.into_split();
+    // POC: a buffered reader, from ZOE_POC_BUFREAD.
+    let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+        if std::env::var("ZOE_POC_BUFREAD").is_ok_and(|v| v == "1") {
+            Box::new(tokio::io::BufReader::with_capacity(65536, reader))
+        } else {
+            Box::new(reader)
+        };
     let connection = Connection {
         peer,
         runtime: Arc::new(Tokio),
