@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Tid, TxnInfo, ZoeError};
-use zoe_loupe::{Folder, Revision, oid_repr, tid_repr};
+use zoe_loupe::{Folder, HISTORY_LIMIT, Revision, oid_repr, tid_repr};
 
 use crate::ops::ToolError;
 
@@ -86,51 +86,57 @@ fn transaction(folder: &Folder, tid: Tid) -> Result<TxnInfo, ToolError> {
 }
 
 /// The revisions of an object just before and just after a transaction.
+#[derive(Debug, PartialEq, Eq)]
 struct Neighbours {
+    /// The revision just before the transaction, or `None`.
     before: Option<Revision>,
+    /// The revision just after the transaction, or `None`.
     after: Option<Revision>,
+    /// The history stops before it reaches the revision before the
+    /// transaction. Then a neighbour that is `None` is not known.
+    cut: bool,
 }
 
-/// Return the revisions of `oid` just before and just after `tid`, from
-/// Loupe's history. Return `None` when the history does not hold `tid`:
-/// the object has more than [`HISTORY_LIMIT`] newer revisions.
+/// Return the revisions just before and just after `tid` in `revisions`,
+/// a history of one object, newest first. The history holds at most
+/// `limit` revisions.
 ///
-/// [`HISTORY_LIMIT`]: zoe_loupe::HISTORY_LIMIT
-fn neighbours(folder: &Folder, oid: Oid, tid: Tid) -> Result<Option<Neighbours>, ToolError> {
-    // The history is newest first.
-    let revisions = folder.history(oid)?;
+/// When the history does not hold `tid`, both neighbours are not known.
+/// When `tid` is the last revision of a full history, the revision before
+/// it is not known. In these two cases, `cut` is true.
+fn neighbours(revisions: &[Revision], tid: Tid, limit: usize) -> Neighbours {
     let Some(at) = revisions.iter().position(|revision| revision.tid == tid) else {
-        return Ok(None);
+        return Neighbours {
+            before: None,
+            after: None,
+            cut: true,
+        };
     };
-    Ok(Some(Neighbours {
+    Neighbours {
         before: revisions.get(at + 1).cloned(),
         after: at.checked_sub(1).map(|newer| revisions[newer].clone()),
-    }))
+        cut: at + 1 == revisions.len() && revisions.len() >= limit,
+    }
 }
 
 /// Return the transaction of `tid` with each object that it wrote, and for
 /// each object the revisions just before and just after it. List at most
 /// [`OBJECT_LIMIT`] objects, in oid order. `records` gives their number.
 ///
-/// An object whose history does not hold `tid` has `history_cut`, and no
-/// neighbours: it has more than [`HISTORY_LIMIT`] newer revisions.
-///
-/// [`HISTORY_LIMIT`]: zoe_loupe::HISTORY_LIMIT
+/// Loupe's history holds the newest [`HISTORY_LIMIT`] revisions only. When
+/// it does not reach the revision before `tid`, the object has
+/// `history_cut`, and a neighbour that is null is not known.
 pub(crate) fn explain(folder: &Folder, tid: Tid) -> Result<Value, ToolError> {
     let txn = transaction(folder, tid)?;
     let mut objects = Vec::new();
     for record in txn.records.iter().take(OBJECT_LIMIT) {
         let mut object = object_json(record.oid, record.data.as_deref());
-        match neighbours(folder, record.oid, tid)? {
-            Some(Neighbours { before, after }) => {
-                object["before"] = serde_json::to_value(before)?;
-                object["after"] = serde_json::to_value(after)?;
-            }
-            None => {
-                object["before"] = Value::Null;
-                object["after"] = Value::Null;
-                object["history_cut"] = Value::Bool(true);
-            }
+        let revisions = folder.history(record.oid)?;
+        let found = neighbours(&revisions, tid, HISTORY_LIMIT);
+        object["before"] = serde_json::to_value(found.before)?;
+        object["after"] = serde_json::to_value(found.after)?;
+        if found.cut {
+            object["history_cut"] = Value::Bool(true);
         }
         objects.push(object);
     }
@@ -202,17 +208,15 @@ fn summary(txn: &TxnInfo) -> Value {
 /// Return the newest revisions of `oid`, at most [`REVISION_LIMIT`] of
 /// them, with the class of its current record. `revisions` gives the
 /// number of revisions in Loupe's history, at most [`HISTORY_LIMIT`].
-///
-/// [`HISTORY_LIMIT`]: zoe_loupe::HISTORY_LIMIT
 pub(crate) fn recent_writers(folder: &Folder, oid: Oid) -> Result<Value, ToolError> {
     let mut revisions = folder.history(oid)?;
     let count = revisions.len();
     revisions.truncate(REVISION_LIMIT);
     // A deletion has no current record, so it has no class.
-    let class = match folder.object(oid) {
-        Ok(object) => object.class,
-        Err(zoe_loupe::Error::Store(ZoeError::NotFound { .. })) => None,
-        Err(error) => return Err(error.into()),
+    let class = match folder.store().load(oid) {
+        Ok((data, _)) => class_of(&data),
+        Err(ZoeError::NotFound { .. }) => None,
+        Err(error) => return Err(zoe_loupe::Error::from(error).into()),
     };
     Ok(json!({
         "oid": oid_repr(oid),
@@ -441,5 +445,77 @@ mod tests {
         let folder = Folder::open(&dir).unwrap();
         let error = recent_writers(&folder, Oid(9)).unwrap_err();
         assert_eq!(error.to_string(), "oid 0x09: no record");
+    }
+
+    /// A revision of `tid`.
+    fn revision(tid: u64) -> Revision {
+        Revision {
+            tid: Tid(tid),
+            user: String::new(),
+            description: String::new(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn the_neighbours_are_the_revisions_around_the_tid() {
+        // Newest first.
+        let history = [revision(9), revision(7), revision(5)];
+        let found = neighbours(&history, Tid(7), 4);
+        assert_eq!(found.before, Some(revision(5)));
+        assert_eq!(found.after, Some(revision(9)));
+        assert!(!found.cut);
+        // The oldest revision of a history that is not full has nothing
+        // before it: the transaction created the object.
+        let found = neighbours(&history, Tid(5), 4);
+        assert_eq!(found.before, None);
+        assert_eq!(found.after, Some(revision(7)));
+        assert!(!found.cut);
+    }
+
+    #[test]
+    fn a_full_history_does_not_know_what_comes_before_its_last_revision() {
+        let history = [revision(9), revision(7), revision(5)];
+        let found = neighbours(&history, Tid(5), 3);
+        assert_eq!(found.before, None);
+        assert_eq!(found.after, Some(revision(7)));
+        assert!(found.cut);
+        // A revision before the last one still has a known neighbour.
+        assert!(!neighbours(&history, Tid(7), 3).cut);
+    }
+
+    #[test]
+    fn a_tid_that_the_history_does_not_hold_has_no_known_neighbours() {
+        let history = [revision(9), revision(7)];
+        let found = neighbours(&history, Tid(3), 2);
+        assert_eq!(
+            found,
+            Neighbours {
+                before: None,
+                after: None,
+                cut: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_class_of_the_writers_comes_from_the_class_pickle() {
+        let dir = std::env::temp_dir().join(format!("zoe-mcp-txn-class-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid(0), &document("root")).unwrap();
+        // The class pickle decodes, the state does not.
+        txn.store(Oid(1), Tid(0), b"\x80\x03cm\nDoc\n.not a pickle")
+            .unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        drop(store);
+        let folder = Folder::open(&dir).unwrap();
+        assert!(folder.object(Oid(1)).unwrap().error.is_some());
+        let writers = recent_writers(&folder, Oid(1)).unwrap();
+        assert_eq!(writers["class"], "m.Doc");
+        let explained = explain(&folder, tid).unwrap();
+        assert_eq!(explained["objects"][1]["class"], "m.Doc");
     }
 }

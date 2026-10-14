@@ -38,18 +38,25 @@ struct SinceArgs {
     since: String,
 }
 
-/// Return one user message: `request`, then `data` as JSON.
+/// Return one user message: `request`, then `data` as JSON in a fenced
+/// block.
+///
+/// The fence is longer than each run of backticks in the JSON. So a text
+/// of the store, such as a description, cannot close the block.
 fn message(request: &str, data: &Value) -> Vec<PromptMessage> {
     let data = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
+    let longest = data.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
     let text = format!(
-        "{request}\n\nThe data, from the read-only tools of the store:\n\n```json\n{data}\n```"
+        "{request}\n\nThe data, from the read-only tools of the store:\n\n{fence}json\n{data}\n{fence}"
     );
     vec![PromptMessage::new_text(Role::User, text)]
 }
 
 impl Ops {
     /// Run `work` on the folder in the blocking pool. Return its JSON, or
-    /// its error as a JSON-RPC error.
+    /// its error as a JSON-RPC error: -32602 for a bad argument, -32603
+    /// for the other errors.
     async fn data<F>(&self, work: F) -> Result<Value, ErrorData>
     where
         F: FnOnce(&Folder) -> Result<Value, ToolError> + Send + 'static,
@@ -57,7 +64,10 @@ impl Ops {
         let folder = Arc::clone(&self.folder);
         match tokio::task::spawn_blocking(move || work(&folder)).await {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(ErrorData::invalid_params(error.to_string(), None)),
+            Ok(Err(error)) if error.is_bad_argument() => {
+                Err(ErrorData::invalid_params(error.to_string(), None))
+            }
+            Ok(Err(error)) => Err(ErrorData::internal_error(error.to_string(), None)),
             Err(error) => Err(ErrorData::internal_error(
                 format!("the prompt stopped: {error}"),
                 None,
@@ -229,6 +239,27 @@ mod tests {
             got.contains("rename") && !got.contains("\"create\""),
             "{got}"
         );
+    }
+
+    #[test]
+    fn a_text_of_the_store_cannot_close_the_fence() {
+        let data = serde_json::json!({"description": "a ``` b ```` c"});
+        let got = text(&message("Explain.", &data));
+        let body = got.split_once("store:\n\n").unwrap().1;
+        assert!(body.starts_with("`````json\n"), "{got}");
+        assert!(body.ends_with("\n`````"), "{got}");
+        let plain = text(&message("Explain.", &serde_json::json!({})));
+        assert!(plain.ends_with("```json\n{}\n```"), "{plain}");
+    }
+
+    #[test]
+    fn a_store_error_is_an_internal_error() {
+        let (ops, _, _) = ops("internal");
+        let work = |_: &Folder| -> Result<Value, ToolError> {
+            Err(zoe_loupe::Error::from(zoe_core::ZoeError::CorruptTxn { tid: Tid(5) }).into())
+        };
+        let error = block_on(ops.data(work)).unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
     }
 
     #[test]

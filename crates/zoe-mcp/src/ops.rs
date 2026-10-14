@@ -133,6 +133,30 @@ struct DiffArgs {
     tid_b: String,
 }
 
+impl ToolError {
+    /// Tell if the error comes from an argument: an id that is not in
+    /// ZODB form, an oid without a record, or a tid without a
+    /// transaction. Each other error comes from the store or the server.
+    pub(crate) fn is_bad_argument(&self) -> bool {
+        matches!(
+            self,
+            ToolError::Loupe(
+                zoe_loupe::Error::BadId(_)
+                    | zoe_loupe::Error::NoObject { .. }
+                    | zoe_loupe::Error::NoRecordAsOf { .. }
+                    | zoe_loupe::Error::Store(ZoeError::NotFound { .. })
+            ) | ToolError::OidOrPath
+                | ToolError::NoTransaction(_)
+        )
+    }
+}
+
+/// The arguments of `verify`: none.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
 /// The arguments of `space`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -256,7 +280,7 @@ impl Ops {
                        reads the whole store.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn verify(&self) -> CallToolResult {
+    async fn verify(&self, Parameters(NoArgs {}): Parameters<NoArgs>) -> CallToolResult {
         self.run(verify_json).await
     }
 
@@ -787,6 +811,11 @@ mod tests {
                 let reply = client.call("history", arguments.clone()).await;
                 assert_eq!(reply["result"]["isError"], true, "{arguments}: {reply}");
             }
+            // verify takes no argument, so it takes no list of classes.
+            let reply = client.call("verify", json!({"classes": ["m.C"]})).await;
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let reply = client.call("verify", json!({})).await;
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
             // A tool that the server does not offer is a protocol error.
             let pack = client.call("pack", json!({})).await;
             assert_eq!(pack["error"]["code"], -32602, "{pack}");
