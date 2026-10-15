@@ -4,7 +4,7 @@ Status: accepted. The human accepted the layout and decided the questions that t
 
 ## Context
 
-F28 asks for a native client with "an mmap'd compressed persistent cache", and F38 asks for "one shared mmap'd cache per node", where two workers on one node share one cache and apply each invalidation once. N4 asks for 3× ZEO 6 in phase 3, `read_hot` included, and `read_hot` reads only from the cache of the client. The build comes in three stages: a cache in memory in one process (ZOE-156), a persistent file (ZOE-162), and one file that the client processes of a node map together (F38).
+F28 asks for a native client with an mmap'd persistent cache, with compression as a setting, and F38 asks for "one shared mmap'd cache per node", where two workers on one node share one cache and apply each invalidation once. N4 asks for 3× ZEO 6 in phase 3 in every cell but `read_hot` at 1 KB, and `read_hot` reads only from the cache of the client. The build comes in three stages: a cache in memory in one process (ZOE-156), a persistent file (ZOE-162), and one file that the client processes of a node map together (F38).
 
 `ZEO.cache.ClientCache` is the reference for the semantics. It keeps one entry per revision of an oid, with a start tid and an end tid (none for a current entry). `loadBefore` serves the entry whose interval holds the snapshot. `invalidate` ends the current entry at the tid of a new revision. The last tid of the cache is `lastTransaction` of `ZEO.ClientStorage`. Its file is a ring of blocks that it writes in FIFO order. At the open, it reads the whole file to build its index in Python dicts and BTrees. A lock file `<file>.lock` (`zc.lockfile`) stops a second process on the same file. It has no checksum, and it moves its last tid forward without a sync.
 
@@ -12,7 +12,7 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 
 **One layout for the three stages.** A cache is one mapping: an anonymous mapping in memory (stage 1), or a file that one process maps (stage 2) or that the processes of a node map together (stage 3). The same code reads and writes all three. The mapping holds:
 
-- a header page: magic, size of the ring, number of index slots and their checksum; the boot id of the kernel; a clean flag; `applied`, the tid up to which the cache applied the invalidations; `head`, the logical write position of the ring; a checksum of these words that a clean close writes;
+- a header page: magic, the format version, an identity of the storage, size of the ring, number of index slots and their checksum; the boot id of the kernel; a clean flag; `applied`, the tid up to which the cache applied the invalidations; `head`, the logical write position of the ring; a checksum of these words that a clean close writes;
 - an index of slots `(oid + 1, position)`, open addressing with linear probes. A slot points at the newest entry of its oid;
 - a ring of entries. An entry holds its own logical position, the oid, the start tid, the end tid (0 for a current entry), the position of the older entry of the same oid, the stored and the raw length, the codec, a checksum of the data and a checksum of the head. Logical positions never repeat, so an entry that the ring overwrote fails its position check.
 
@@ -42,7 +42,7 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 ## Decided with the ADR
 
 - **Compression.** Entries are raw by default. zstd per entry is a setting for sites that need capacity more than hit speed.
-- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. The header of the cache file holds the format version and an identity of the storage, as ZOE-162 asks. There is no extension at `register`, so the wire protocol does not change. A cache whose identity differs from the identity of the storage that it meets is dropped.
+- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. The header of the cache file holds the format version and an identity of the storage, as ZOE-162 asks. There is no extension at `register`, so the wire protocol does not change. A cache whose format version or storage identity differs from what the client expects is dropped: the client starts with an empty cache.
 - **Reconnects** with a shared file: a process compares the tid of its new `register` with its own last tid, and its DB needs `getInvalidations` from its own last tid, not from `applied`. The verification after a reconnect is ZOE-159.
 
 ## Alternatives
