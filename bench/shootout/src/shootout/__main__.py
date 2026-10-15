@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd = commands.add_parser("run", help="run the baseline and write the results")
     run_cmd.add_argument("--quick", action="store_true", help="run the quick set only")
     run_cmd.add_argument(
+        "--gate",
+        action="store_true",
+        help="run the gate set: 6 cells, 3 values each",
+    )
+    run_cmd.add_argument(
         "--storage",
         nargs="+",
         choices=sorted(STORAGES),
@@ -171,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run(
             storage,
             quick=args.quick,
+            gate=args.gate,
             workdir=args.workdir,
             dsn=args.dsn,
             machine=args.machine,

@@ -1,7 +1,8 @@
 """The layout of the results repository.
 
-A full run goes to `results/<machine>/<python>/<storage>/<run>.json` and a
-quick run to the same path under `quick/`. `index.json` lists the full runs.
+A full run goes to `results/<machine>/<python>/<storage>/<run>.json`, a
+quick run to the same path under `quick/` and a gate run under `gate/`.
+`index.json` lists the full runs.
 """
 
 import json
@@ -12,6 +13,12 @@ from shootout.environment import python_tag
 INDEX_VERSION = 1
 
 
+def run_set(run: dict) -> str:
+    """Return the set of a run: quick, gate or full. A result without the
+    key `set` is quick or full."""
+    return run.get("set") or ("quick" if run["quick"] else "full")
+
+
 def result_path(root: Path, result: dict) -> Path:
     """Return the path of a result document under the repository root."""
     run = result["run"]
@@ -19,7 +26,7 @@ def result_path(root: Path, result: dict) -> Path:
     name = f"{stamp}-{run['commit'][:12]}" if run["commit"] else stamp
     return (
         root
-        / ("quick" if run["quick"] else "results")
+        / {"quick": "quick", "gate": "gate"}.get(run_set(run), "results")
         / result["machine"]["name"]
         / python_tag(result["python"])
         / result["storage"]
