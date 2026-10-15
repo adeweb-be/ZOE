@@ -507,6 +507,59 @@ async fn lose(pool: &Pool) {
 }
 
 #[tokio::test]
+async fn an_iterator_id_of_a_lost_listener_never_reaches_the_new_listener() {
+    let server = start("iterator-generation");
+    let (gate, opened) = watch::channel(false);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (_, _, first) = cached_pair(&pool).await;
+    let nil = rmpv::Value::Nil;
+    let start = vec![nil.clone(), nil];
+    let (old, before) = pool
+        .call_on(None, "iterator_start", start.clone())
+        .await
+        .unwrap();
+    lose(&pool).await;
+    gate.send_replace(true);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    let (new, after) = pool.call_on(None, "iterator_start", start).await.unwrap();
+    assert_ne!(before, after);
+    // The server numbers the iterators of each connection from 0: the new
+    // iterator has the id of the old one.
+    assert_eq!(old, new);
+
+    // The id of the old listener names no iterator of the new one.
+    let refused = pool
+        .call_on(Some(before), "iterator_next", vec![old.clone()])
+        .await;
+    match refused {
+        Err(Error::Server { class, value, .. }) => {
+            assert_eq!(class, "builtins.KeyError");
+            assert_eq!(value, rmpv::Value::Array(vec![old.clone()]));
+        }
+        other => panic!("{other:?}"),
+    }
+    // iterator_gc of the old id sends nothing to the new listener.
+    pool.notify_on(
+        Some(before),
+        "iterator_gc",
+        vec![rmpv::Value::Array(vec![old])],
+    )
+    .await
+    .unwrap();
+    // So the new iterator is whole: it gives the commit of the pair first.
+    let (next, served) = pool
+        .call_on(Some(after), "iterator_next", vec![new])
+        .await
+        .unwrap();
+    assert_eq!(served, after);
+    assert_eq!(next.as_array().unwrap()[0], bin8(first.0));
+}
+
+#[tokio::test]
 async fn a_pool_connects_again_and_verifies_its_cache_through_get_invalidations() {
     let server = start("reconnect-quick");
     let (gate, opened) = watch::channel(false);
