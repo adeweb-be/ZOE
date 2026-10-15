@@ -16,7 +16,9 @@
 //! of the database file, and `finish` less its syncs. Each number is the
 //! median, the 90th percentile and the mean of the transactions, in µs.
 //! It also prints the syncs, the writes and the bytes written of each
-//! finish.
+//! finish, and the CPU time of the thread that finishes, user and system,
+//! per finish: the sum over the transactions, from `/proc/thread-self/stat`,
+//! so a busy disk weighs less on it than on the times.
 //!
 //! `ZOE_FINISH_TXNS` sets the number of transactions of each scenario,
 //! 500 by default. `ZOE_FINISH_SIZE` sets the size of a record in bytes,
@@ -321,6 +323,23 @@ struct Samples {
     syncs: u64,
     writes: u64,
     written: u64,
+    /// The CPU time of the thread of the test in all its finishes.
+    cpu: Duration,
+}
+
+/// The CPU time of the finishes since the last `take`, in nanoseconds.
+static FINISH_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// Return the CPU time of the calling thread, user and system.
+fn thread_cpu() -> Duration {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+    // The name of the command is in parentheses and can hold spaces.
+    let rest = &stat[stat.rfind(')').unwrap() + 2..];
+    let fields: Vec<&str> = rest.split(' ').collect();
+    // `utime` and `stime` are the fields 14 and 15 of the line, so 11 and
+    // 12 after the state, in clock ticks of 10 ms.
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    Duration::from_millis(ticks * 10)
 }
 
 /// Return the median, the 90th percentile and the mean of `samples`, in
@@ -353,6 +372,8 @@ impl Samples {
             .map(|(finish, sync)| finish.saturating_sub(*sync))
             .collect();
         println!("  finish less sync  {}", summary(&rest));
+        let cpu = self.cpu.as_secs_f64() * 1e6 / txns as f64;
+        println!("  CPU of the thread {cpu:6.0} µs per finish");
     }
 }
 
@@ -379,9 +400,12 @@ fn commit(
     txn.vote().unwrap();
     let vote = start.elapsed();
     io.take();
+    let cpu = thread_cpu();
     let start = Instant::now();
     let tid = txn.finish().unwrap();
     let elapsed = start.elapsed();
+    let cpu = thread_cpu() - cpu;
+    FINISH_CPU.fetch_add(cpu.as_nanos() as u64, Ordering::SeqCst);
     (
         vote,
         elapsed,
@@ -422,6 +446,7 @@ fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Sam
             written.push(oids);
         }
         spans.take();
+        FINISH_CPU.store(0, Ordering::SeqCst);
         for i in 0..txns {
             let (vote, finish) = if scenario == "add" {
                 let (vote, finish, _) = commit(&store, &io, &new_oids(&store), 0);
@@ -443,6 +468,7 @@ fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Sam
             samples.writes += taken.writes;
             samples.written += taken.written;
         }
+        samples.cpu = Duration::from_nanos(FINISH_CPU.swap(0, Ordering::SeqCst));
     });
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
