@@ -495,3 +495,103 @@ async fn ready_returns_at_the_close() {
     pool.disconnect();
     tokio::time::timeout(TIMEOUT, pool.ready()).await.unwrap();
 }
+
+/// Return the word `index` of the bytes `image` of a file.
+fn word(image: &[u8], index: u64) -> u64 {
+    let at = index as usize * 8;
+    u64::from_le_bytes(image[at..at + 8].try_into().unwrap())
+}
+
+#[test]
+fn an_open_that_writes_nothing_leaves_the_clean_file_as_it_was() {
+    let path = dir("no-write").join("c-1.zoec");
+    fill(&path, 3);
+    let before = fs::read(&path).unwrap();
+    let cache = open(&path);
+    for oid in 1..=3 {
+        assert_eq!(cache.load(Oid(oid)).unwrap().0, data(oid));
+    }
+    // A crash now leaves the file of the last close, clean: it opens with
+    // its entries.
+    let image = fs::read(&path).unwrap();
+    assert!(image == before);
+    let copy = path.with_file_name("image.zoec");
+    fs::write(&copy, &image).unwrap();
+    let reopened = open(&copy);
+    assert_eq!(reopened.applied(), Tid(10));
+    assert_eq!(reopened.load(Oid(2)).unwrap().0, data(2));
+    // The close of a file that nothing wrote writes nothing.
+    cache.close();
+    assert!(fs::read(&path).unwrap() == before);
+}
+
+#[test]
+fn the_first_write_marks_the_file_before_it_changes_it() {
+    let path = dir("first-write").join("c-1.zoec");
+    fill(&path, 3);
+    let cache = open(&path);
+    assert_eq!(word(&fs::read(&path).unwrap(), H_CLEAN), 1);
+    assert!(cache.store(Oid(4), Tid(5), None, &data(4), Tid(10)));
+    // Any image that holds the write holds the mark too.
+    let image = fs::read(&path).unwrap();
+    assert!(place_of(&path, 4).is_some());
+    assert_eq!(word(&image, H_CLEAN), 0);
+    assert_ne!((word(&image, H_BOOT), word(&image, H_BOOT + 1)), (0, 0));
+    let copy = path.with_file_name("image.zoec");
+    fs::write(&copy, &image).unwrap();
+    // On the same boot, the image keeps its entries.
+    let same = open(&copy);
+    assert_eq!(same.load(Oid(4)).unwrap().0, data(4));
+    same.close();
+    // After a restart of the kernel, it is dropped.
+    fs::write(&copy, &image).unwrap();
+    poke(&copy, H_BOOT, 1);
+    let rebooted = Cache::open(&copy, SIZE, STORAGE).unwrap();
+    assert_eq!(rebooted.applied(), Tid(0));
+    cache.close();
+}
+
+#[test]
+fn a_failed_mark_disables_the_cache_and_leaves_the_file_clean() {
+    let path = dir("failed-mark").join("c-1.zoec");
+    fill(&path, 3);
+    let before = fs::read(&path).unwrap();
+    let cache = Cache::open(&path, SIZE, STORAGE).unwrap();
+    cache.fail_next_mark();
+    // The verification drops the current entry of the oid 1: a write.
+    cache.verify(Tid(12), Some(&[Oid(1)]));
+    assert!(cache.is_disabled());
+    assert!(!cache.verified());
+    assert_eq!(cache.load(Oid(2)), None);
+    assert!(!cache.store(Oid(5), Tid(5), None, b"five", Tid(12)));
+    cache.close();
+    assert!(fs::read(&path).unwrap() == before);
+}
+
+#[tokio::test]
+async fn a_failed_mark_ends_the_wait_of_ready_at_once() {
+    let name = "pool-failed-mark";
+    let server = start(name);
+    let path = dir(&format!("{name}-var")).join("c-1.zoec");
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oid = other.new_oids(1).await.unwrap()[0];
+    let first = commit(&other, oid, Tid(0), b"one").await;
+    load_all(open_pool(&server, &path).await, &[oid]).await;
+    // A commit while the pool is closed: the verification writes.
+    commit(&other, oid, first, b"two").await;
+
+    let addr = server.addr();
+    let listener = Client::connect(addr, "1").await.unwrap();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    let cache = Cache::open(&path, SIZE, STORAGE).unwrap();
+    cache.fail_next_mark();
+    let pool = Pool::with_cache(Arc::new(Tokio), listener, connect, 2, Some(cache));
+    tokio::time::timeout(Duration::from_secs(5), pool.ready())
+        .await
+        .expect("ready ends when the mark fails");
+    let cache = pool.cache().unwrap().clone();
+    assert!(cache.is_disabled());
+    assert_eq!(cache.load(oid), None);
+    assert_eq!(pool.load(oid).await.unwrap().0, b"two");
+    pool.disconnect();
+}

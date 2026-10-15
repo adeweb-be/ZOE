@@ -535,14 +535,15 @@ impl Pool {
     }
 
     /// Wait until the cache of the pool serves: a cache that a file gave
-    /// serves after its verification. Return at once without a cache, and
-    /// at the close.
+    /// serves after its verification. Return at once without a cache, at
+    /// the close, and when the cache is disabled, such as by a failed mark
+    /// of its file.
     pub async fn ready(&self) {
         let Some(cache) = &self.shared.cache else {
             return;
         };
         self.shared
-            .until(|state| (state.closed || cache.verified()).then_some(()))
+            .until(|state| (state.closed || cache.verified() || cache.is_disabled()).then_some(()))
             .await;
     }
 

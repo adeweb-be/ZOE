@@ -728,11 +728,12 @@ class _NativeClientStorage(ClientStorage):
             # server, so the client takes it once for each connection.
             if wait and self._native.is_connected():
                 self._take_server()
+                # The log gives the address: the canonical name comes later.
                 logger.info(
                     "%s native client connected to storage %r at %s",
                     self.__name__,
                     storage,
-                    self._server_addr,
+                    self._server_address,
                 )
             else:
                 logger.info(
@@ -762,15 +763,48 @@ class _NativeClientStorage(ClientStorage):
     def _take_server(self):
         """Take the info and the address of the server of the native client."""
         self._info.update(self._native.info())
-        # The client declares the interfaces of the server that ZEO
-        # declares.
-        for iface in _SERVER_INTERFACES:
-            if (iface.__module__, iface.__name__) in self._info["interfaces"]:
-                zope.interface.alsoProvides(self, iface)
+        # Of the interfaces of the server that ZEO declares, the client
+        # declares those that it does not have yet, in one call.
+        served = self._info["interfaces"]
+        declared = [
+            iface
+            for iface in _SERVER_INTERFACES
+            if (iface.__module__, iface.__name__) in served
+            and not iface.providedBy(self)
+        ]
+        if declared:
+            zope.interface.alsoProvides(self, *declared)
         address = self._native.address()
         if address is not None:
             self.set_server_addr(address)
         self._connection_generation += 1
+
+    def set_server_addr(self, addr):
+        """Keep the address of the server.
+
+        The first read of `_server_addr` gives the canonical name of the
+        server, as `set_server_addr` of ZEO makes it. The lookup of that
+        name is slow, so the open does not wait for it.
+        """
+        self.__dict__["_server_address"] = addr
+        self.__dict__["_canonical_addr"] = None
+
+    @property
+    def _server_addr(self):
+        """The address of the server with its canonical name, or None."""
+        canonical = self.__dict__.get("_canonical_addr")
+        if canonical is None:
+            address = self.__dict__.get("_server_address")
+            if address is None:
+                return None
+            # This sets `_server_addr`, through the setter below.
+            ZEOClientStorage.set_server_addr(self, address)
+            canonical = self.__dict__["_canonical_addr"]
+        return canonical
+
+    @_server_addr.setter
+    def _server_addr(self, value):
+        self.__dict__["_canonical_addr"] = value
 
     def _setup_blobs(self, blob_dir, shared, cache_size, cache_size_check):
         """Set the blob directory up as `ZEO.ClientStorage` does."""
