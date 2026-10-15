@@ -27,6 +27,11 @@
 //! `Transaction.finish` returns the tid of a commit at its turn, and
 //! `Transaction.done` ends the turn after the callback of `tpc_finish`.
 //!
+//! `call` and `call_async` send the other calls of `zoe.zeo`, its `_call`
+//! and `_async`, on the listener, and raise for an error reply what
+//! `ZEO.ClientStorage` raises. `prefetch` starts loads that fill the cache
+//! and does not wait for them. `sync` pings the listener.
+//!
 //! `Transaction.vote` resolves the conflicts that the vote lists with the
 //! callable that `zoe.zeo` gives, ZODB's `tryToResolveConflict`. The
 //! callable runs on the thread of the transaction, with no lock held.
@@ -446,7 +451,12 @@ impl NativeClient {
     /// at once, and return the number of loads. It does not wait for the
     /// replies: they fill the cache. Without a cache, it loads nothing.
     /// Without a server, it raises `ClientDisconnected`.
-    fn prefetch(&self, py: Python<'_>, oids: Vec<Bound<'_, PyAny>>, tid: &Bound<'_, PyAny>) -> PyResult<usize> {
+    fn prefetch(
+        &self,
+        py: Python<'_>,
+        oids: Vec<Bound<'_, PyAny>>,
+        tid: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
         let tid = Tid(u64_of(tid)?);
         let oids = oids
             .iter()
@@ -1654,7 +1664,12 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
 /// `ZEO.Exceptions.ServerException(class, value)`. Each other error raises
 /// as `client_error` gives it.
 fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
-    let Error::Server { class, value, message } = error else {
+    let Error::Server {
+        class,
+        value,
+        message,
+    } = error
+    else {
         return client_error(py, error);
     };
     let made = (|| -> PyResult<PyErr> {
@@ -1676,7 +1691,9 @@ fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
 fn args_of(args: &Bound<'_, PyAny>) -> PyResult<Vec<Value>> {
     match to_value(args, 0)? {
         Value::Array(items) => Ok(items),
-        _ => Err(PyTypeError::new_err("the args of a call are a list or a tuple")),
+        _ => Err(PyTypeError::new_err(
+            "the args of a call are a list or a tuple",
+        )),
     }
 }
 

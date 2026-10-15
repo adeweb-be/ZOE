@@ -619,23 +619,27 @@ impl Pool {
         self.shared.listener()?.notify(method, args).await
     }
 
-    /// Return the reply of `get_info` of the listener, with the map of the
-    /// last `info` call that the server sent on a connection of the pool
-    /// over it. Return `None` while the pool has no listener.
+    /// Return the map of the reply of `get_info` of the listener, with the
+    /// map of the last `info` call that the server sent on a connection of
+    /// the pool over it. Return `None` while the pool has no listener.
     pub fn info(&self) -> Option<Value> {
         let server = self.shared.server();
         let listener = server.listener.as_ref()?;
-        let mut info = listener.info().clone();
+        // A listener of `Client::connect` has no reply of `get_info`.
+        let mut info = match listener.info() {
+            Value::Map(entries) => entries.clone(),
+            _ => Vec::new(),
+        };
         let newest = server
             .conns
             .iter()
             .chain([listener])
             .filter_map(|client| client.pushed_info())
             .max_by_key(|(stamp, _)| *stamp);
-        if let (Value::Map(into), Some((_, Value::Map(pushed)))) = (&mut info, newest) {
-            merge(into, &pushed);
+        if let Some((_, Value::Map(pushed))) = newest {
+            merge(&mut info, &pushed);
         }
-        Some(info)
+        Some(Value::Map(info))
     }
 
     /// Load the current record of `oid` from the server, through any

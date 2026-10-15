@@ -1873,6 +1873,21 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_replaces_a_key_and_adds_a_new_one_at_the_end() {
+        let mut into = vec![("length".into(), 1.into()), ("size".into(), 2.into())];
+        merge(
+            &mut into,
+            &[("size".into(), 5.into()), ("name".into(), "x".into())],
+        );
+        let merged: Vec<(Value, Value)> = vec![
+            ("length".into(), 1.into()),
+            ("size".into(), 5.into()),
+            ("name".into(), "x".into()),
+        ];
+        assert_eq!(into, merged);
+    }
+
+    #[test]
     fn an_invalidation_reads_its_tid_and_oids() {
         let args = Value::Array(vec![bin8(9), Value::Array(vec![bin8(1), bin8(2)])]);
         assert_eq!(

@@ -1076,3 +1076,194 @@ async fn a_closed_pool_opens_no_listener() {
     assert_eq!(opens.load(Ordering::SeqCst), after);
     assert_eq!(pool.next_event().await, None);
 }
+
+/// Return the value of the str key `key` of the map `value`.
+fn key<'a>(value: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+fn bin8(n: u64) -> rmpv::Value {
+    rmpv::Value::Binary(n.to_be_bytes().to_vec())
+}
+
+#[tokio::test]
+async fn a_prefetch_loads_each_missing_oid_at_once_into_the_cache() {
+    let server = start("prefetch");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oids = other.new_oids(3).await.unwrap();
+    let mut tid = Tid(0);
+    for (n, oid) in oids.iter().enumerate() {
+        tid = commit_other(&other, *oid, Tid(0), &record(&[n as u8])).await;
+        assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+        pool.delivered();
+    }
+    let before = Tid(tid.0 + 1);
+    // An oid that comes twice gets one load.
+    let asked = [oids[0], oids[1], oids[2], oids[0]];
+    assert_eq!(pool.prefetch(&asked, before).unwrap(), 3);
+    for oid in &oids {
+        wait_until(
+            || cache.load_before(*oid, before).is_some(),
+            "prefetched record",
+        )
+        .await;
+    }
+    // The cache holds them now: a second prefetch loads nothing.
+    assert_eq!(pool.prefetch(&asked, before).unwrap(), 0);
+    // Without a cache, a prefetch loads nothing.
+    let uncached = open(&server, 1).await;
+    assert_eq!(uncached.prefetch(&oids, before).unwrap(), 0);
+    pool.disconnect();
+    assert!(matches!(
+        pool.prefetch(&oids, before),
+        Err(Error::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn sync_waits_for_the_delivery_of_the_commits_before_its_ping() {
+    let server = start("sync");
+    let pool = open(&server, 1).await;
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oid = other.new_oids(1).await.unwrap()[0];
+    let tid = commit_other(&other, oid, Tid(0), &record(b"a")).await;
+    // Without the wait, sync returns at the reply of its ping.
+    tokio::time::timeout(TIMEOUT, pool.sync(false))
+        .await
+        .unwrap()
+        .unwrap();
+    let waiting = pool.sync(true);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(BLOCKED, &mut waiting).await.is_err(),
+        "sync returned before the delivery of the commit"
+    );
+    assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+    pool.delivered();
+    tokio::time::timeout(TIMEOUT, waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pool.last_transaction(), tid);
+}
+
+#[tokio::test]
+async fn calls_on_the_listener_find_the_iterator_that_they_started() {
+    let server = start("calls");
+    let pool = open(&server, 1).await;
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let first = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    let second = commit(&pool, oid, first, &record(b"b"))
+        .await
+        .unwrap()
+        .tid();
+    let nil = rmpv::Value::Nil;
+    let iid = pool
+        .call("iterator_start", vec![nil.clone(), nil.clone()])
+        .await
+        .unwrap();
+    for tid in [first, second] {
+        let next = pool.call("iterator_next", vec![iid.clone()]).await.unwrap();
+        assert_eq!(next.as_array().unwrap()[0], bin8(tid.0));
+    }
+    let end = pool.call("iterator_next", vec![iid.clone()]).await.unwrap();
+    assert!(end.is_nil());
+    pool.notify("iterator_gc", vec![rmpv::Value::Array(vec![iid])])
+        .await
+        .unwrap();
+    // An error of the server keeps its value: the oid stays bytes.
+    let missing = pool.call("history", vec![bin8(99), 1.into()]).await;
+    match missing {
+        Err(Error::Server { class, value, .. }) => {
+            assert!(class.ends_with("POSKeyError"), "{class}");
+            assert_eq!(value, rmpv::Value::Array(vec![bin8(99)]));
+        }
+        other => panic!("{other:?}"),
+    }
+    // The listener never sends a call of a transaction.
+    for method in ["tpc_begin", "storea", "vote", "sendBlob"] {
+        assert!(matches!(
+            pool.call(method, vec![]).await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            pool.notify(method, vec![]).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn the_info_of_the_pool_has_the_sizes_of_the_last_commit() {
+    let server = start("info");
+    let pool = open_cached(&server, 2).await;
+    let length = |pool: &Pool| key(&pool.info().unwrap(), "length").and_then(rmpv::Value::as_u64);
+    // `Client::connect` calls no `get_info`: the info is only what the
+    // server sent.
+    assert_eq!(length(&pool), None);
+    let oids = pool.new_oids(2).await.unwrap();
+    for oid in oids {
+        commit(&pool, oid, Tid(0), &record(b"a")).await.unwrap();
+    }
+    // The server sends `info` before the reply of the finish.
+    assert_eq!(length(&pool), Some(2));
+}
+
+#[tokio::test]
+async fn a_deletion_ends_the_current_entry_of_its_oid() {
+    let server = start("delete");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let tid = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    assert!(cache.load(oid).is_some());
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.delete_object(oid, tid).await.unwrap();
+    txn.vote().await.unwrap();
+    drop(txn.finish().await.unwrap().turn().await.unwrap());
+    assert_eq!(cache.load(oid), None);
+    let gone = pool.load(oid).await;
+    assert!(
+        matches!(&gone, Err(Error::Server { class, .. }) if class.ends_with("POSKeyError")),
+        "{gone:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_commits_under_the_tid_of_its_transaction() {
+    let server = start("restore");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let first = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    let tid = Tid(first.0 + 1000);
+    let mut txn = pool
+        .begin_with(b"", b"", b"", Some(tid), " ")
+        .await
+        .unwrap();
+    txn.restore(oid, tid, Some(&record(b"b")), None)
+        .await
+        .unwrap();
+    txn.vote().await.unwrap();
+    let turn = txn.finish().await.unwrap().turn().await.unwrap();
+    assert_eq!(turn.tid(), tid);
+    drop(turn);
+    // The turn ended the entry of the first commit and added nothing.
+    assert_eq!(cache.load(oid), None);
+    assert_eq!(pool.load(oid).await.unwrap(), (record(b"b"), tid));
+}

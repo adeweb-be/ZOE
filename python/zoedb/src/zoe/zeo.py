@@ -451,6 +451,19 @@ def _native_tls(section, server_hostname):
     )
 
 
+def _serial(serial):
+    """Return the bytes of the serial of a store.
+
+    ZEO's tests give the serial of a new object as the str `'\\0' * 8`, and
+    ZEO's server takes the UTF-8 bytes of a str. No serial is the zero tid.
+    """
+    if not serial:
+        return z64
+    if isinstance(serial, str):
+        return serial.encode("utf-8")
+    return serial
+
+
 def _remove_files(blobs):
     """Remove the file of each (oid, file) of `blobs` that exists."""
     for _, filename in blobs:
@@ -847,7 +860,8 @@ class _NativeClientStorage(ClientStorage):
     # The calls of a transaction.
 
     def deleteObject(self, oid, serial, txn):
-        self._check_trans(txn, "deleteObject").delete_object(oid, serial)
+        native = self._check_trans(txn, "deleteObject")
+        native.delete_object(oid, _serial(serial))
 
     def restore(self, oid, serial, data, version, prev_txn, transaction):
         if version:
@@ -1104,11 +1118,11 @@ class _NativeClientStorage(ClientStorage):
     def store(self, oid, serial, data, version, txn):
         if version:
             raise Unsupported("versions are not supported")
-        self._check_trans(txn, "store").store(oid, serial or z64, data)
+        self._check_trans(txn, "store").store(oid, _serial(serial), data)
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
         native = self._check_trans(transaction, "checkCurrentSerialInTransaction")
-        native.check_current_serial(oid, serial)
+        native.check_current_serial(oid, _serial(serial))
 
     def tpc_vote(self, txn):
         # The native client resolves each conflict that the vote lists with
