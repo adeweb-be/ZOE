@@ -2,9 +2,8 @@
 //!
 //! This module holds the only `unsafe` code of the crate: the `mmap` and
 //! the `munmap` of the mapping, and the view of its bytes as `AtomicU64`.
-//! Every read and write of the cache goes through these atomics.
-
-#![allow(unsafe_code)]
+//! Every read and write of the cache goes through these atomics. Each
+//! item with `unsafe` code allows it on its own.
 
 use std::io;
 use std::ptr::{self, NonNull};
@@ -18,13 +17,16 @@ pub(crate) struct Mapping {
 
 // SAFETY: the mapping holds only atomics, and no thread owns it. The
 // pointer stays valid until the drop.
+#[allow(unsafe_code)]
 unsafe impl Send for Mapping {}
 // SAFETY: as above. A shared reference gives only `&[AtomicU64]`.
+#[allow(unsafe_code)]
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
     /// Map `words` words of private anonymous memory. The kernel gives
     /// them as zeros, and gives a page only when the cache first writes it.
+    #[allow(unsafe_code)]
     pub(crate) fn anonymous(words: usize) -> io::Result<Mapping> {
         let len = words
             .checked_mul(8)
@@ -51,9 +53,11 @@ impl Mapping {
     }
 
     /// Return the words of the mapping.
+    #[allow(unsafe_code)]
     pub(crate) fn words(&self) -> &[AtomicU64] {
         // SAFETY: the mapping holds `words` words of 8 bytes, aligned to a
-        // page, readable and writable, until the drop. `AtomicU64` has the
+        // page, readable and writable, until the drop. Its length is at
+        // most `isize::MAX` bytes: `mmap` gave a mapping of that length. `AtomicU64` has the
         // size and the alignment of `u64`, and every bit pattern is valid.
         // The code accesses the words only as atomics.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.words) }
@@ -61,11 +65,11 @@ impl Mapping {
 }
 
 impl Drop for Mapping {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         // SAFETY: the mapping came from `mmap` with this address and this
         // length. No reference to its words outlives `self`.
-        unsafe {
-            libc::munmap(self.ptr.as_ptr().cast(), self.words * 8);
-        }
+        let unmapped = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.words * 8) };
+        debug_assert_eq!(unmapped, 0, "munmap of the cache failed");
     }
 }
