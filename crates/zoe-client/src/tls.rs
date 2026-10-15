@@ -13,10 +13,20 @@
 //! as ZEO's client does without `certificate`.
 //!
 //! The certificate of the server must chain to a CA certificate of
-//! `authenticate`. A self-signed server certificate in `authenticate` does
-//! not match it by its bytes, as OpenSSL does. In a directory, the client
-//! reads each file, while OpenSSL reads only the files whose names are
-//! the hashes of `openssl rehash`.
+//! `authenticate`, or be byte for byte one of the certificates of
+//! `authenticate` (a pinned certificate), within its validity period, also
+//! when it is a CA certificate. OpenSSL accepts such a certificate as its
+//! own trust anchor, and ZEO's tests give the self-signed certificate of
+//! the server as `authenticate`. `zoe serve` matches the client
+//! certificates of its client CA file the same way. The certificates of
+//! the system store are never pinned. The handshake still proves that the
+//! server holds the key of a pinned certificate. With `check_hostname`, a
+//! pinned certificate must be valid for the name of the server: by its
+//! subjectAltName, as webpki checks it, or, when it has no subjectAltName,
+//! by a common name of its subject that is the DNS name, as OpenSSL checks
+//! it for Python's `ssl`. In a directory, the client reads each file,
+//! while OpenSSL reads only the files whose names are the hashes of
+//! `openssl rehash`.
 
 use std::fmt;
 use std::io;
@@ -24,15 +34,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::{WebPkiServerVerifier, verify_server_cert_signed_by_trust_anchor};
+use rustls::client::{
+    WebPkiServerVerifier, verify_server_cert_signed_by_trust_anchor, verify_server_name,
+};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
-use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{CertificateError, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_rustls::TlsConnector;
 
 use crate::runtime::Stream;
+
+mod der;
 
 /// The files and the checks of TLS to a server, as the `<ssl>` section of
 /// a ZEO client gives them. The files are PEM.
@@ -129,23 +143,27 @@ impl Tls {
             }
             None => None,
         };
-        let (roots, source) = roots(options.authenticate.as_deref())?;
+        let (roots, source, pinned) = roots(options.authenticate.as_deref())?;
         let roots = Arc::new(roots);
         let algorithms = provider.signature_verification_algorithms;
         let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|error| format!("the ring provider: {error}"))?;
-        let builder = if options.check_hostname {
-            let webpki = WebPkiServerVerifier::builder_with_provider(roots, provider)
+        let chain: Arc<dyn ServerCertVerifier> = if options.check_hostname {
+            WebPkiServerVerifier::builder_with_provider(roots, provider)
                 .build()
-                .map_err(|error| format!("{source}: {error}"))?;
-            builder.with_webpki_verifier(webpki)
+                .map_err(|error| format!("{source}: {error}"))?
         } else {
-            let verifier = ChainOnly { roots, algorithms };
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
+            Arc::new(ChainOnly { roots, algorithms })
         };
+        let verifier = ServerCa {
+            chain,
+            pinned: pinned_of(&pinned),
+            check_hostname: options.check_hostname,
+        };
+        let builder = builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier));
         let config = match client {
             Some((certs, key, key_file)) => builder
                 .with_client_auth_cert(certs, key)
@@ -172,33 +190,46 @@ impl Tls {
 /// The name of the system store in an error message.
 const SYSTEM: &str = "the system CA certificates";
 
-/// Return the CA certificates of `authenticate`, and the name of their
-/// source for an error message.
+/// The CA certificates of `authenticate`, the name of their source for an
+/// error message, and the certificates that a server certificate can match
+/// by its bytes.
+type Roots = (RootCertStore, String, Vec<CertificateDer<'static>>);
+
+/// Return the CA certificates of `authenticate`, the name of their source
+/// for an error message, and the certificates to pin.
 ///
-/// - A file: each certificate in it must fit.
+/// - A file: each certificate in it must fit. Each is pinned.
 /// - A directory: the certificates of each file in it. A certificate that
-///   does not fit is skipped, as is a file that does not read.
+///   does not fit is skipped, as is a file that does not read. Each
+///   certificate that reads is pinned.
 /// - `None`: the CA certificates of the system, with the same rules as a
-///   directory.
+///   directory. None is pinned.
 ///
 /// A directory or a system store without a certificate that fits fails.
-fn roots(authenticate: Option<&Path>) -> Result<(RootCertStore, String), String> {
+fn roots(authenticate: Option<&Path>) -> Result<Roots, String> {
     let mut roots = RootCertStore::empty();
-    let (found, source) = match authenticate {
+    let (found, source, pin) = match authenticate {
         Some(path) if !path.is_dir() => {
-            for cert in certificates(path)? {
+            let certs = certificates(path)?;
+            for cert in &certs {
                 roots
-                    .add(cert)
+                    .add(cert.clone())
                     .map_err(|error| format!("{}: {error}", path.display()))?;
             }
-            return Ok((roots, path.display().to_string()));
+            return Ok((roots, path.display().to_string(), certs));
         }
         Some(dir) => (
             rustls_native_certs::load_certs_from_paths(None, Some(dir)),
             dir.display().to_string(),
+            true,
         ),
-        None => (rustls_native_certs::load_native_certs(), SYSTEM.to_owned()),
+        None => (
+            rustls_native_certs::load_native_certs(),
+            SYSTEM.to_owned(),
+            false,
+        ),
     };
+    let pinned = if pin { found.certs.clone() } else { Vec::new() };
     roots.add_parsable_certificates(found.certs);
     if roots.is_empty() {
         let reason = match found.errors.first() {
@@ -207,7 +238,138 @@ fn roots(authenticate: Option<&Path>) -> Result<(RootCertStore, String), String>
         };
         return Err(format!("{source}: no CA certificate{reason}"));
     }
-    Ok((roots, source))
+    Ok((roots, source, pinned))
+}
+
+/// A certificate of `authenticate` that a server certificate can match by
+/// its bytes, with its validity period and its names.
+#[derive(Debug)]
+struct Pinned {
+    der: CertificateDer<'static>,
+    parts: der::Parts,
+}
+
+/// Return the certificates of `certs` that a server certificate can match
+/// by its bytes. A certificate whose parts do not read never matches.
+fn pinned_of(certs: &[CertificateDer<'static>]) -> Arc<[Pinned]> {
+    certs
+        .iter()
+        .filter_map(|der| {
+            Some(Pinned {
+                parts: der::parts(der)?,
+                der: der.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The verifier of the server certificate.
+///
+/// A server certificate that is byte for byte one of `pinned` is valid
+/// within its validity period, and, with `check_hostname`, for the name
+/// of the server (see the module). The checks of the chain do not apply to
+/// it, so it can be a CA certificate. `chain` checks each other server
+/// certificate: the webpki verifier of rustls with the name check, else
+/// `ChainOnly`. `chain` also checks the signature of the handshake for each
+/// certificate, so the server must hold the key of its certificate.
+#[derive(Debug)]
+struct ServerCa {
+    chain: Arc<dyn ServerCertVerifier>,
+    pinned: Arc<[Pinned]>,
+    check_hostname: bool,
+}
+
+impl ServerCertVerifier for ServerCa {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let pinned = self
+            .pinned
+            .iter()
+            .find(|pinned| pinned.der.as_ref() == end_entity.as_ref());
+        let Some(pinned) = pinned else {
+            return self.chain.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+        };
+        let parts = &pinned.parts;
+        if now < parts.not_before {
+            return Err(CertificateError::NotValidYetContext {
+                time: now,
+                not_before: parts.not_before,
+            }
+            .into());
+        }
+        if now > parts.not_after {
+            return Err(CertificateError::ExpiredContext {
+                time: now,
+                not_after: parts.not_after,
+            }
+            .into());
+        }
+        if self.check_hostname {
+            check_name(end_entity, parts, server_name)?;
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.chain.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.chain.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.chain.supported_verify_schemes()
+    }
+}
+
+/// Check that the pinned certificate `cert` is valid for `name`: by its
+/// subjectAltName, as webpki checks it. A certificate without a
+/// subjectAltName is valid for a DNS name that is one of its common names,
+/// without regard to case, as OpenSSL checks it.
+fn check_name(
+    cert: &CertificateDer<'_>,
+    parts: &der::Parts,
+    name: &ServerName<'_>,
+) -> Result<(), rustls::Error> {
+    let by_alt_names = verify_server_name(&ParsedCertificate::try_from(cert)?, name);
+    if by_alt_names.is_ok() || parts.has_alt_names {
+        return by_alt_names;
+    }
+    let ServerName::DnsName(dns) = name else {
+        return by_alt_names;
+    };
+    let dns = dns.as_ref();
+    if parts
+        .common_names
+        .iter()
+        .any(|common| common.eq_ignore_ascii_case(dns))
+    {
+        return Ok(());
+    }
+    by_alt_names
 }
 
 /// Read the certificates in the PEM file `path`. One at least is
@@ -367,6 +529,97 @@ mod tests {
             roots: Arc::new(RootCertStore::empty()),
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
+    }
+
+    /// Make a self-signed certificate `NAME.pem` in `dir` with the
+    /// subject `subject` and the openssl arguments `extra`, and return it.
+    fn self_signed(
+        dir: &Path,
+        name: &str,
+        subject: &str,
+        extra: &[&str],
+    ) -> CertificateDer<'static> {
+        let output = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt"])
+            .args(["ec_paramgen_curve:prime256v1", "-nodes", "-days", "2"])
+            .args(["-subj", subject, "-keyout", &format!("{name}.key")])
+            .args(["-out", &format!("{name}.pem")])
+            .args(extra)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        certificates(&dir.join(format!("{name}.pem")))
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn a_pinned_certificate_is_valid_only_within_its_validity_period_and_for_its_names() {
+        let dir = fresh_dir("pinned");
+        let cert = self_signed(&dir, "cn", "/CN=Db.Example", &[]);
+        let other = self_signed(&dir, "other", "/CN=db.example", &[]);
+        let verifier = |check_hostname| ServerCa {
+            chain: Arc::new(chain_only()),
+            pinned: pinned_of(std::slice::from_ref(&cert)),
+            check_hostname,
+        };
+        let name = ServerName::try_from("db.example").unwrap();
+        fn verify(
+            verifier: &ServerCa,
+            cert: &CertificateDer<'_>,
+            name: &ServerName<'_>,
+            now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            verifier.verify_server_cert(cert, &[], name, &[], now)
+        }
+        let now = UnixTime::now();
+        verify(&verifier(true), &cert, &name, now).unwrap();
+        let before = UnixTime::since_unix_epoch(std::time::Duration::from_secs(86_400));
+        let after = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1 << 40));
+        for time in [before, after] {
+            let refused = verify(&verifier(false), &cert, &name, time);
+            assert!(refused.is_err(), "{refused:?}");
+        }
+        // The name check reads the common name, but only for a DNS name.
+        for wrong in ["example.org", "sub.db.example", "127.0.0.1"] {
+            let wrong = ServerName::try_from(wrong).unwrap();
+            assert!(verify(&verifier(true), &cert, &wrong, now).is_err());
+            verify(&verifier(false), &cert, &wrong, now).unwrap();
+        }
+        // A certificate that is not byte for byte pinned goes to the chain
+        // check, with the same subject.
+        assert!(verify(&verifier(false), &other, &name, now).is_err());
+    }
+
+    #[test]
+    fn a_pinned_certificate_with_a_san_never_matches_by_its_common_name() {
+        let dir = fresh_dir("pinned-san");
+        let extra = ["-addext", "subjectAltName=DNS:alt.example"];
+        let cert = self_signed(&dir, "san", "/CN=db.example", &extra);
+        let verifier = ServerCa {
+            chain: Arc::new(chain_only()),
+            pinned: pinned_of(std::slice::from_ref(&cert)),
+            check_hostname: true,
+        };
+        let now = UnixTime::now();
+        let alt = ServerName::try_from("alt.example").unwrap();
+        verifier
+            .verify_server_cert(&cert, &[], &alt, &[], now)
+            .unwrap();
+        let common = ServerName::try_from("db.example").unwrap();
+        let refused = verifier.verify_server_cert(&cert, &[], &common, &[], now);
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    #[test]
+    fn a_file_and_a_directory_of_authenticate_pin_their_certificates() {
+        let dir = fresh_dir("pinned-dir");
+        self_signed(&dir, "a", "/CN=a", &[]);
+        let (_, _, pinned) = roots(Some(&dir.join("a.pem"))).unwrap();
+        assert_eq!(pinned.len(), 1);
+        let (_, _, pinned) = roots(Some(&dir)).unwrap();
+        assert_eq!(pinned.len(), 1);
     }
 
     #[test]
