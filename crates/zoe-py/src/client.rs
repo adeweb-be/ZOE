@@ -482,15 +482,52 @@ impl NativeClient {
         to_python(py, &reply, 0)
     }
 
-    /// Send `method` with `args` on the listener as a call without a reply,
-    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
-    fn call_async(&self, py: Python<'_>, method: String, args: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Call `method` as `call` does, on the listener of `generation`, and
+    /// return `(reply, generation)`: the generation of the listener that
+    /// answered. `None` takes the listener of now. The generation changes
+    /// at each loss of the listener. When the listener of `generation` is
+    /// gone, the call sends nothing and raises the `KeyError` of an id
+    /// that the server does not know, with the first arg.
+    #[pyo3(signature = (method, args, generation=None))]
+    fn call_on<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        args: &Bound<'py, PyAny>,
+        generation: Option<u64>,
+    ) -> PyResult<(Bound<'py, PyAny>, u64)> {
         let args = args_of(args)?;
         let pool = self.pool(py)?;
         let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
-        py.detach(move || runtime.block_on(traced(trace, pool.notify(&method, args))))
-            .map_err(|e| client_error(py, e))
+        let (reply, generation) = py
+            .detach(move || {
+                runtime.block_on(traced(trace, pool.call_on(generation, &method, args)))
+            })
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        Ok((to_python(py, &reply, 0)?, generation))
+    }
+
+    /// Send `method` with `args` on the listener as a call without a reply,
+    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
+    /// With `generation`, send it only on the listener of that generation
+    /// (see `call_on`), else send nothing.
+    #[pyo3(signature = (method, args, generation=None))]
+    fn call_async(
+        &self,
+        py: Python<'_>,
+        method: String,
+        args: &Bound<'_, PyAny>,
+        generation: Option<u64>,
+    ) -> PyResult<()> {
+        let args = args_of(args)?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        py.detach(move || {
+            runtime.block_on(traced(trace, pool.notify_on(generation, &method, args)))
+        })
+        .map_err(|e| client_error(py, e))
     }
 
     /// Load each of `oids` before `tid` that the cache does not hold, all

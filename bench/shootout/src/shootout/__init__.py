@@ -89,6 +89,21 @@ FULL = Profile(
     values=10,
 )
 
+# The gate set is the head-to-head of the phase gates of N4: one thread,
+# 16 threads in one process and 16 processes, at 1 KB and 100 KB, with 3
+# values each. One storage on one interpreter runs in about 15 minutes.
+GATE = Profile(
+    cells=_cells(["threads"], [1, 16], [KB, 100 * KB])
+    + _cells(["processes"], [16], [KB, 100 * KB]),
+    processes=1,
+    values=3,
+)
+
+
+def set_name(quick: bool, gate: bool) -> str:
+    """Return the name of the set of a run: quick, gate or full."""
+    return "quick" if quick else "gate" if gate else "full"
+
 
 def disk_needed(storage: str, cell: Cell) -> int:
     """Return an upper bound of the bytes that one value of a cell takes.
@@ -138,6 +153,7 @@ def check_cold_loads(storage: str, objects_read: int, server_loads: int) -> None
 def run(
     storage: str,
     quick: bool = False,
+    gate: bool = False,
     workdir: Path | None = None,
     dsn: str | None = None,
     machine: str | None = None,
@@ -151,7 +167,7 @@ def run(
     entry records the GIL of each worker process of its values.
     """
     store = STORAGES[storage]
-    profile = QUICK if quick else FULL
+    profile = QUICK if quick else GATE if gate else FULL
     cells = [c for c in profile.cells if c.mode == "threads" or store.multi_process]
     workdir = Path(workdir or tempfile.gettempdir())
     workdir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +205,7 @@ def run(
         "software": environment.software(software) | server_versions(store, dsn),
         "run": {
             "quick": quick,
+            "set": set_name(quick, gate),
             "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "commit": environment.commit(),
         },

@@ -5,8 +5,8 @@ test of `test_native_api.py` does not: the exceptions of `_call`, the
 calls that the listener refuses, the sizes of `len()` and `getSize()`,
 `record_iternext`, `history`, `pack`, `restore`, `server_status`, the
 interfaces that the client declares, the serial of a store, a call without
-`wait`, the iterators at the loss of the listener and at the close, and
-`load_current`, which the cache answers.
+`wait`, the iterators at the loss of the listener and at the close, an
+iterator id of a lost listener, and `load_current`, which the cache answers.
 """
 
 import socket
@@ -207,6 +207,38 @@ def test_the_loss_of_the_listener_forgets_the_iterators(tmp_path):
             assert iterator._iid == -1
             with pytest.raises(ClientDisconnected):
                 next(iterator)
+        finally:
+            storage.close()
+
+
+def test_an_iterator_id_of_a_lost_listener_never_reaches_the_new_one(tmp_path):
+    import gc
+
+    with ZoeServer(str(tmp_path / "store")) as server:
+        storage = zoe.testing.native_client(
+            server.address, storage="1", wait_timeout=TIMEOUT
+        )
+        try:
+            tids = [commit(storage, {storage.new_oid(): (z64, b"a")}) for _ in range(2)]
+            old = storage.iterator()
+            iid = old._iid
+            server.stop()
+            wait_until(lambda: old._iid == -1, "the loss kept the iterator")
+            server.start()
+            wait_until(storage.is_connected, "the client did not connect again")
+            # The reply of an iterator_start on the lost listener comes to a
+            # thread after the stale mark, which registers it.
+            late = storage._setup_iterator(type(old), iid)
+            new = storage.iterator()
+            # The new server numbers the iterators of the connection from 0.
+            assert int(new._iid) == int(iid)
+            with pytest.raises(KeyError):
+                next(late)
+            # The collection of the old id sends nothing to the new server.
+            del late
+            gc.collect()
+            storage._iterator_gc()
+            assert [info.tid for info in new] == tids
         finally:
             storage.close()
 
