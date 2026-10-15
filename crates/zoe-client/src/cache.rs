@@ -552,6 +552,29 @@ impl Cache {
         self.clear_locked();
     }
 
+    /// Verify the cache against a server whose last tid is `tid`, as
+    /// `verify` of ZEO does after a connection. `changed` gives the oids
+    /// that the commits after `applied` wrote: the current entry of each
+    /// goes, and the other entries stay. `None` drops every entry. Then
+    /// `applied` moves to `tid`. One hold of the writer lock does both, so
+    /// a store that runs after it refuses a current reply older than `tid`.
+    pub fn verify(&self, tid: Tid, changed: Option<&[Oid]>) {
+        let _counts = self.lock();
+        match changed {
+            Some(oids) => {
+                for oid in oids {
+                    for entry in self.chain(oid.0) {
+                        if entry.end == 0 {
+                            self.set_end(&entry, entry.start);
+                        }
+                    }
+                }
+            }
+            None => self.clear_locked(),
+        }
+        self.set_applied(tid.0);
+    }
+
     /// Drop every entry, and store nothing more. After the close, or after
     /// the loss of the order of the commits.
     pub fn disable(&self) {

@@ -642,6 +642,36 @@ impl Client {
         self.inner.send_blob(oid, serial, sink).await
     }
 
+    /// Return the commits after `tid`, as `getInvalidations` of the server
+    /// gives them: the last tid of the server and each oid that a commit
+    /// after `tid` wrote. Return `None` when the server does not keep the
+    /// commits after `tid`: the caller then drops its cache.
+    pub async fn get_invalidations(&self, tid: Tid) -> Result<Option<Invalidation>, Error> {
+        let reply = self
+            .inner
+            .call("getInvalidations", vec![bin8(tid.0)])
+            .await?;
+        if reply.is_nil() {
+            return Ok(None);
+        }
+        let Some([last, oids]) = reply
+            .as_array()
+            .and_then(|items| <&[Value; 2]>::try_from(items.as_slice()).ok())
+        else {
+            return Err(bad("getInvalidations", &reply));
+        };
+        let Some(oids) = oids.as_array() else {
+            return Err(bad("getInvalidations", &reply));
+        };
+        Ok(Some(Invalidation {
+            tid: self::tid(last, "getInvalidations")?,
+            oids: oids
+                .iter()
+                .map(|item| oid(item, "getInvalidations"))
+                .collect::<Result<_, _>>()?,
+        }))
+    }
+
     /// Return the next value of the sequence `name` of the store. It needs
     /// the extension `sequences`: without it, it fails with
     /// `Error::Unsupported` and sends nothing.

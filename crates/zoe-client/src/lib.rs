@@ -9,7 +9,9 @@
 //! `Pool` runs several transactions at once on a pool of connections, and
 //! delivers the tids of its listener connection in one order (ADR 0036).
 //! It can hold a `Cache`, the client cache of ADR 0034, with the semantics
-//! of the cache of ZEO.
+//! of the cache of ZEO. A pool of `Pool::with_reconnect` connects again
+//! after a lost connection, and verifies its cache, as `ZEO.ClientStorage`
+//! does.
 
 mod cache;
 mod client;
@@ -27,6 +29,9 @@ pub use client::{
 };
 pub use endpoint::{Address, Endpoint};
 pub use error::Error;
-pub use pool::{Connect, Counters, Delivery, Finished, Pool, PoolTransaction, Turn};
+pub use pool::{
+    Connect, Counters, Delivery, Event, Finished, Open, Pool, PoolTransaction, REFUSED_POLL,
+    Reconnect, Turn, Verification,
+};
 pub use runtime::{Runtime, Tokio};
 pub use tls::{Tls, TlsOptions};

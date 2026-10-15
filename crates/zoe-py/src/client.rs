@@ -5,7 +5,10 @@
 //! holds a pool of connections to one storage of a server (ADR 0036): the
 //! listener, and one connection for each transaction that runs. It
 //! connects over TCP or a unix domain socket, with TLS or without, to the
-//! first of its addresses that opens. It has no reconnect.
+//! first of its addresses that opens. When it loses its server, it
+//! connects again in the background, and verifies its cache, as
+//! `ZEO.ClientStorage` does. With the read-only fallback, it takes a
+//! writable server when one opens.
 //!
 //! `send_blob` downloads a blob into a file of the blob cache of
 //! `zoe.zeo`, and `Transaction.store_blob` uploads a blob file. With a blob
@@ -19,8 +22,8 @@
 //! reply.
 //!
 //! The pool delivers the tids of the listener in one order. A thread of
-//! `zoe.zeo` takes each commit of another client with `next_delivery` and
-//! confirms it with `delivered`. `Transaction.finish` returns the tid of a
+//! `zoe.zeo` takes each commit of another client, and each change of the
+//! connection, with `next_delivery`, and confirms it with `delivered`. `Transaction.finish` returns the tid of a
 //! commit at its turn, and `Transaction.done` ends the turn after the
 //! callback of `tpc_finish`.
 //!
@@ -57,8 +60,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Delivery, Endpoint, Error, Options, Pool, PoolTransaction, Tls,
-    TlsOptions, Tokio, Turn, traced,
+    Address, Cache, Connect, Delivery, Endpoint, Error, Event, Open, Options, Pool,
+    PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -69,6 +72,10 @@ const WORKERS: usize = 2;
 
 /// The time between two attempts to open a client, until `wait_timeout`.
 const RETRY: Duration = Duration::from_millis(100);
+
+/// The seconds between two attempts to connect again, when the open gives
+/// no `disconnect_poll`: the `connect_poll` of `ZEO.ClientStorage`.
+const DISCONNECT_POLL: f64 = 1.0;
 
 /// The most connections of a client that commit at once, when the open
 /// gives no `pool_bound`. `zoe.zeo._POOL_BOUND` has the same value.
@@ -150,13 +157,11 @@ pub(crate) struct NativeClient {
     opened_at: Tid,
     /// The last tid that the pool delivered before `close`.
     closed_at: AtomicU64,
-    /// The callable that returns the traceparent of the current span, when
-    /// the server accepted `trace_context`. Else `None`.
+    /// The callable that returns the traceparent of the current span. A
+    /// call calls it only when its server accepted `trace_context`.
     traceparent: Option<Py<PyAny>>,
-    /// `true` when the client registered read-only.
+    /// `true` when the open asked for a read-only client.
     read_only: bool,
-    /// The address of the server.
-    address: Address,
 }
 
 #[pymethods]
@@ -190,15 +195,25 @@ impl NativeClient {
     /// is the W3C traceparent that the call carries. `None` gives a call
     /// without one.
     ///
-    /// A connection that fails, or that the server closes before the
-    /// register, is tried again until `wait_timeout` seconds pass. Then
-    /// the open raises `ClientDisconnected`. Another error of the open
-    /// raises at once. A file of `tls` that does not read raises
-    /// `ValueError`.
+    /// With `wait`, a connection that fails, or that the server closes
+    /// before the register, is tried again until `wait_timeout` seconds
+    /// pass. Then the open raises `ClientDisconnected`. Another error of
+    /// the open raises at once. Without `wait`, the open does not connect:
+    /// the client connects in the background, and each call raises
+    /// `ClientDisconnected` until then. A file of `tls` that does not read
+    /// raises `ValueError`.
+    ///
+    /// When the client loses its server, it connects again in the
+    /// background: at once, then every `disconnect_poll` seconds, each
+    /// attempt for at most `wait_timeout` seconds. It verifies its cache
+    /// against the new server first. With `read_only_fallback`, a client on
+    /// a read-only server tries a writable server every `disconnect_poll`
+    /// seconds, and takes it.
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
-        pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None
+        pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
+        disconnect_poll=DISCONNECT_POLL
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -213,9 +228,15 @@ impl NativeClient {
         cache_size: u64,
         tls: Option<TlsArgs>,
         traceparent: Option<Py<PyAny>>,
+        wait: bool,
+        disconnect_poll: f64,
     ) -> PyResult<Self> {
-        let wait = Duration::try_from_secs_f64(wait_timeout)
+        let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
+        let poll = Duration::try_from_secs_f64(disconnect_poll)
+            .ok()
+            .filter(|poll| !poll.is_zero())
+            .ok_or_else(|| PyValueError::new_err("disconnect_poll is not a duration"))?;
         if pool_bound == 0 {
             return Err(PyValueError::new_err("pool_bound is at least 1"));
         }
@@ -240,34 +261,37 @@ impl NativeClient {
             read_only_fallback,
             extensions,
         };
+        let upgrade = read_only_fallback && !read_only;
         let opened = py.detach(move || -> Result<_, Opening> {
-            let secure = tls.as_ref().map(Secure::load).transpose()?;
+            let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
-            let open = open(&targets, secure.as_ref(), &storage, &options, wait);
-            let (listener, endpoint) = runtime.block_on(open)?;
-            // The other connections register as the listener did, on its
-            // server, without a fallback.
-            let options = Options {
-                read_only: listener.read_only(),
-                read_only_fallback: false,
-                ..options
-            };
-            let connect: Connect = Arc::new(move || {
-                let (endpoint, storage, options) =
-                    (endpoint.clone(), storage.clone(), options.clone());
-                Box::pin(async move {
-                    zoe_client::Client::open_endpoint(
-                        Arc::new(Tokio),
-                        &endpoint,
-                        &storage,
-                        &options,
-                    )
-                    .await
-                })
+            // A setting that does not fit an address fails the open, also
+            // without `wait`.
+            endpoints(&targets, secure.as_deref(), |_, port| {
+                Ok(SocketAddr::from(([127, 0, 0, 1], port)))
+            })?;
+            let servers = Arc::new(Servers {
+                targets,
+                secure,
+                storage,
+                options,
+                wait: timeout,
             });
-            // The pool starts its dispatcher on the runtime.
+            let first = match wait {
+                true => Some(runtime.block_on(servers.open(&servers.options, true))?),
+                false => None,
+            };
+            let open: Open = Arc::new(move |writable| {
+                let servers = servers.clone();
+                Box::pin(async move { servers.reopen(writable).await })
+            });
+            let reconnect = Reconnect {
+                upgrade,
+                ..Reconnect::new(open, poll)
+            };
+            // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
-            let pool = Pool::with_cache(Arc::new(Tokio), listener, connect, pool_bound, cache);
+            let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
             Ok((runtime, pool))
         });
         let (runtime, pool) = match opened {
@@ -278,22 +302,16 @@ impl NativeClient {
             Err(Opening::Runtime(error)) => return Err(error.into()),
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
-        let listener = pool.listener();
-        let traces = listener
-            .extensions()
-            .iter()
-            .any(|name| name == TRACE_CONTEXT);
         Ok(Self {
             pid: std::process::id(),
             runtime,
-            read_only: listener.read_only(),
-            address: listener.address().clone(),
+            read_only,
             opened_at: pool.last_transaction(),
             cache: pool.cache().cloned(),
             closed_at: AtomicU64::new(pool.last_transaction().0),
             pool: Mutex::new(Some(Arc::new(pool))),
             open: Mutex::new(Vec::new()),
-            traceparent: traceparent.filter(|_| traces),
+            traceparent,
         })
     }
 
@@ -306,21 +324,27 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Tell if the client registered read-only: as asked, or after a
-    /// read-only fallback.
+    /// Tell if the listener registered read-only: as asked, or after a
+    /// read-only fallback. Without a listener, tell if the open asked for
+    /// a read-only client.
     fn read_only(&self) -> bool {
-        self.read_only
+        self.listener()
+            .map_or(self.read_only, |listener| listener.read_only())
     }
 
     /// Return the address of the server: `(host, port)` with the IP address
-    /// of the server, or the path of a unix domain socket.
-    fn address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(match &self.address {
+    /// of the server, or the path of a unix domain socket. Return `None`
+    /// without a listener.
+    fn address<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(listener) = self.listener() else {
+            return Ok(None);
+        };
+        Ok(Some(match listener.address() {
             Address::Tcp(addr) => (addr.ip().to_string(), addr.port())
                 .into_pyobject(py)?
                 .into_any(),
             Address::Unix(path) => PyString::new(py, &path.to_string_lossy()).into_any(),
-        })
+        }))
     }
 
     /// Return the last tid that the client knew after the open: the tid
@@ -329,15 +353,23 @@ impl NativeClient {
         p64(py, self.opened_at.0)
     }
 
-    /// Return the reply of `get_info` at the open, as a dict.
+    /// Return the reply of `get_info` of the listener, as a dict. Without
+    /// a listener, return an empty dict.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let pool = self.pool(py)?;
-        to_python(py, pool.listener().info(), 0)
+        self.check_process()?;
+        match self.listener() {
+            Some(listener) => to_python(py, listener.info(), 0),
+            None => Ok(PyDict::new(py).into_any()),
+        }
     }
 
-    /// Return the extensions that the server accepted at the open.
-    fn extensions(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        Ok(self.pool(py)?.listener().extensions().to_vec())
+    /// Return the extensions that the server of the listener accepted.
+    fn extensions(&self) -> PyResult<Vec<String>> {
+        self.check_process()?;
+        Ok(self
+            .listener()
+            .map(|listener| listener.extensions().to_vec())
+            .unwrap_or_default())
     }
 
     /// Tell if the client is connected: not closed, and its listener is not
@@ -378,7 +410,7 @@ impl NativeClient {
     /// Return `n` new oids.
     fn new_oids<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let oids = py
             .detach(move || runtime.block_on(traced(trace, pool.new_oids(n))))
@@ -417,7 +449,7 @@ impl NativeClient {
             )));
         }
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
@@ -449,7 +481,7 @@ impl NativeClient {
             return Ok(Some((data, p64(py, start.0))));
         }
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
@@ -476,7 +508,7 @@ impl NativeClient {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let data = py
             .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
@@ -502,7 +534,7 @@ impl NativeClient {
     ) -> PyResult<u64> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         py.detach(move || {
             let partial = partial_name(&filename);
@@ -525,7 +557,7 @@ impl NativeClient {
     /// `Unsupported` when the server did not accept `sequences`.
     fn sequence_next(&self, py: Python<'_>, name: String) -> PyResult<u64> {
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         py.detach(move || runtime.block_on(traced(trace, pool.sequence_next(&name))))
             .map_err(|e| client_error(py, e))
@@ -551,7 +583,7 @@ impl NativeClient {
         rmpv::encode::write_value(&mut encoded, &to_value(extension, 0)?)
             .map_err(|e| PyValueError::new_err(format!("the extension does not encode: {e}")))?;
         let pool = self.pool(py)?;
-        let trace = self.traceparent(py)?;
+        let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
         let (user, description) = (user.to_vec(), description.to_vec());
         let txn = py
@@ -571,7 +603,11 @@ impl NativeClient {
             runtime,
             txn: slot,
             turn: Mutex::new(None),
-            traceparent: self.traceparent.as_ref().map(|t| t.clone_ref(py)),
+            traceparent: self
+                .traceparent
+                .as_ref()
+                .filter(|_| traces(&pool))
+                .map(|t| t.clone_ref(py)),
         })
     }
 
@@ -579,7 +615,11 @@ impl NativeClient {
     /// the replies of the server. Without one, do nothing.
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
         self.check_process()?;
-        let trace = self.traceparent(py)?;
+        let pool = lock(&self.pool).clone();
+        let trace = match &pool {
+            Some(pool) => self.traceparent(py, pool)?,
+            None => None,
+        };
         let runtime = self.runtime;
         let open: Vec<Arc<Slot>> = lock(&self.open)
             .drain(..)
@@ -602,21 +642,24 @@ impl NativeClient {
 
     /// Wait for the next delivery of the pool, and return it: `("invalidate",
     /// tid, oids)` for a commit of another client, `("stale",)` when the
-    /// client lost its listener, or `None` after the close. The caller
-    /// gives it to the DB, then calls `delivered`. The pool delivers
-    /// nothing more until then.
+    /// client lost its listener, `("connected", verification)` when it
+    /// connected again (`"kept"`, `"quick"` or `"dropped"`), `("refused",
+    /// text)` when it refused a server whose last tid is below its own, or
+    /// `None` after the close. The caller gives it to the DB, then calls
+    /// `delivered`. The pool delivers nothing more until then.
     fn next_delivery<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         self.check_process()?;
         let Some(pool) = lock(&self.pool).clone() else {
             return Ok(None);
         };
         let runtime = self.runtime;
-        let delivery = py.detach(move || runtime.block_on(pool.next_delivery()));
-        let Some(delivery) = delivery else {
+        let event = py.detach(move || runtime.block_on(pool.next_event()));
+        let Some(event) = event else {
             return Ok(None);
         };
-        let tuple = match delivery {
-            Delivery::Invalidate(invalidation) => {
+        let word = |text: &str| PyString::new(py, text).into_any();
+        let tuple = match event {
+            Event::Delivery(Delivery::Invalidate(invalidation)) => {
                 let oids: Vec<_> = invalidation.oids.iter().map(|oid| p64(py, oid.0)).collect();
                 let items = [
                     PyString::new(py, "invalidate").into_any(),
@@ -625,7 +668,16 @@ impl NativeClient {
                 ];
                 PyTuple::new(py, items)?
             }
-            Delivery::Stale => PyTuple::new(py, [PyString::new(py, "stale")])?,
+            Event::Delivery(Delivery::Stale) => PyTuple::new(py, [word("stale")])?,
+            Event::Connected(verification) => {
+                let verification = match verification {
+                    Verification::Kept => "kept",
+                    Verification::Quick => "quick",
+                    Verification::Dropped => "dropped",
+                };
+                PyTuple::new(py, [word("connected"), word(verification)])?
+            }
+            Event::Refused(text) => PyTuple::new(py, [word("refused"), word(&text)])?,
         };
         Ok(Some(tuple))
     }
@@ -676,9 +728,19 @@ impl NativeClient {
     }
 
     /// Return the W3C traceparent of the current span of the calling
-    /// thread, or `None`. Without the callable, it calls no Python code.
-    fn traceparent(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        traceparent(py, self.traceparent.as_ref())
+    /// thread, or `None`. Without the callable, or when the server of the
+    /// listener did not accept `trace_context`, it calls no Python code.
+    fn traceparent(&self, py: Python<'_>, pool: &Pool) -> PyResult<Option<String>> {
+        let callable = self.traceparent.as_ref().filter(|_| traces(pool));
+        traceparent(py, callable)
+    }
+
+    /// Return the listener of the pool, if the client is open and has one.
+    fn listener(&self) -> Option<Arc<zoe_client::Client>> {
+        if self.pid != std::process::id() {
+            return None;
+        }
+        lock(&self.pool).as_ref().and_then(|pool| pool.listener())
     }
 
     /// Raise `RuntimeError` in a child of `os.fork()`: the threads of the
@@ -929,6 +991,16 @@ fn bytes<'py>(
     .ok()
 }
 
+/// Tell if the server of the listener of `pool` accepted `trace_context`.
+fn traces(pool: &Pool) -> bool {
+    pool.listener().is_some_and(|listener| {
+        listener
+            .extensions()
+            .iter()
+            .any(|name| name == TRACE_CONTEXT)
+    })
+}
+
 /// Return the W3C traceparent of `traceparent()`, or `None` without the
 /// callable. Without the callable, it calls no Python code.
 fn traceparent(py: Python<'_>, traceparent: Option<&Py<PyAny>>) -> PyResult<Option<String>> {
@@ -964,6 +1036,80 @@ enum Opening {
 impl From<Error> for Opening {
     fn from(error: Error) -> Self {
         Self::Client(error)
+    }
+}
+
+impl Opening {
+    /// Return the error of the client for an attempt to connect again.
+    fn into_error(self) -> Error {
+        match self {
+            Opening::Address(text) | Opening::Tls(text) => Error::Invalid(text),
+            Opening::Runtime(error) => Error::Io(error),
+            Opening::Client(error) => error,
+        }
+    }
+}
+
+/// What a client connects to: its addresses, its TLS, its storage, the
+/// options of its `register` and the longest wait of one open.
+struct Servers {
+    targets: Vec<Target>,
+    secure: Option<Arc<Secure>>,
+    storage: String,
+    options: Options,
+    wait: Duration,
+}
+
+impl Servers {
+    /// Open a listener as `options` asks, and return it with the `Connect`
+    /// of its server. With `retry`, try again after failed connections
+    /// until the wait passes. Else make one round.
+    async fn open(
+        &self,
+        options: &Options,
+        retry: bool,
+    ) -> Result<(zoe_client::Client, Connect), Opening> {
+        let (listener, endpoint) = open(
+            &self.targets,
+            self.secure.as_deref(),
+            &self.storage,
+            options,
+            self.wait,
+            retry,
+        )
+        .await?;
+        // The other connections register as the listener did, on its
+        // server, without a fallback.
+        let options = Options {
+            read_only: listener.read_only(),
+            read_only_fallback: false,
+            ..options.clone()
+        };
+        let storage = self.storage.clone();
+        let connect: Connect = Arc::new(move || {
+            let (endpoint, storage, options) = (endpoint.clone(), storage.clone(), options.clone());
+            Box::pin(async move {
+                zoe_client::Client::open_endpoint(Arc::new(Tokio), &endpoint, &storage, &options)
+                    .await
+            })
+        });
+        Ok((listener, connect))
+    }
+
+    /// Open a new listener for the pool, in one round. With `writable`, open
+    /// only a writable one.
+    async fn reopen(&self, writable: bool) -> Result<(zoe_client::Client, Connect), Error> {
+        let options = match writable {
+            true => Options {
+                read_only: false,
+                read_only_fallback: false,
+                ..self.options.clone()
+            },
+            false => self.options.clone(),
+        };
+        self.open(&options, false)
+            .await
+            .map_err(Opening::into_error)
     }
 }
 
@@ -1097,14 +1243,15 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
 
 /// Open a client to the first server of `targets` that opens, on the
 /// runtime of the caller, and return it with its endpoint. Each round
-/// resolves the hosts again. Try again after failed connections until
-/// `wait` passes.
+/// resolves the hosts again. With `retry`, try again after failed
+/// connections until `wait` passes.
 async fn open(
     targets: &[Target],
     secure: Option<&Secure>,
     storage: &str,
     options: &Options,
     wait: Duration,
+    retry: bool,
 ) -> Result<(zoe_client::Client, Endpoint), Opening> {
     let deadline = Instant::now() + wait;
     loop {
@@ -1120,7 +1267,9 @@ async fn open(
             zoe_client::Client::open_first(runtime, &round.endpoints, storage, options, left).await
         };
         match opened {
-            Err(Error::Io(_) | Error::Disconnected) if Instant::now() + RETRY < deadline => {
+            Err(Error::Io(_) | Error::Disconnected)
+                if retry && Instant::now() + RETRY < deadline =>
+            {
                 tokio::time::sleep(RETRY).await;
             }
             Err(Error::Io(error)) => {
