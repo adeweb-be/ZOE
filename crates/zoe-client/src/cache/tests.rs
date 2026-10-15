@@ -353,6 +353,57 @@ fn the_data_of_any_length_comes_back() {
 }
 
 #[test]
+fn a_large_entry_comes_back_in_blocks() {
+    let cache = cache_at(1024 * KB, 100);
+    // Lengths around the block of 4 KiB, and a record of 100 KB with a tail
+    // that is not a whole word.
+    let lengths = [4095, 4096, 4097, 8191, 8192, 12_289, 100 * 1024 + 3];
+    let data = |len: usize| -> Vec<u8> { (0..len).map(|i| (i * 31 + len) as u8).collect() };
+    for (i, len) in lengths.iter().enumerate() {
+        assert!(cache.store(Oid(i as u64), Tid(5), None, &data(*len), Tid(100)));
+    }
+    for (i, len) in lengths.iter().enumerate() {
+        let oid = Oid(i as u64);
+        assert_eq!(cache.load(oid), Some((data(*len), Tid(5))));
+        // The copy gives whole blocks of 4 KiB, then the rest, in order.
+        let (blocks, _) = cache
+            .load_with(oid, |total, copy| {
+                let mut blocks = Vec::new();
+                copy(&mut |block| blocks.push(block.to_vec())).then_some((total, blocks))
+            })
+            .map(|((total, blocks), start)| {
+                assert_eq!((total, start), (*len, Tid(5)));
+                (blocks, start)
+            })
+            .unwrap();
+        let (last, whole) = blocks.split_last().unwrap();
+        assert!(whole.iter().all(|block| block.len() == 4096));
+        assert!(!last.is_empty() && last.len() <= 4096);
+        assert_eq!(blocks.concat(), data(*len));
+    }
+}
+
+#[test]
+fn a_copy_that_the_ring_overtakes_fails() {
+    let cache = Arc::new(cache_at(256 * KB, 10));
+    let data = vec![9u8; 100 * 1024 + 5];
+    assert!(cache.store(Oid(1), Tid(5), None, &data, Tid(10)));
+    let found = cache.load_with(Oid(1), |_, copy| {
+        // A writer overwrites the entry after the lookup found it, before
+        // the copy.
+        for i in 2..10 {
+            cache.store(Oid(i), Tid(5), None, &data, Tid(10));
+        }
+        let mut copied = 0;
+        let good = copy(&mut |block| copied += block.len());
+        assert_eq!(copied, data.len());
+        assert!(!good);
+        good.then_some(())
+    });
+    assert_eq!(found, None);
+}
+
+#[test]
 fn the_ring_holds_at_most_its_size() {
     let cache = cache_at(100 * KB, 10);
     let data = |i: u64| vec![i as u8; KB as usize];

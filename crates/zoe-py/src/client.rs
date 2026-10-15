@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::mem;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -70,9 +70,9 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open, Options,
-    Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification,
-    traced,
+    Address, Cache, Connect, Copier, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open,
+    Options, Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn,
+    Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -555,7 +555,9 @@ impl NativeClient {
 
     /// Wait at most `timeout` seconds until the cache serves: a cache file
     /// with entries serves after its verification against the server.
-    /// Return true when it serves, or when the client has no cache.
+    /// The wait also ends without a cache, at the close and when the cache
+    /// is disabled (`Pool::ready`). Return false when `timeout` passed
+    /// first.
     fn ready(&self, py: Python<'_>, timeout: f64) -> PyResult<bool> {
         let timeout = Duration::try_from_secs_f64(timeout.max(0.0))
             .map_err(|_| PyValueError::new_err("timeout is not a duration"))?;
@@ -1322,15 +1324,14 @@ impl Drop for NativeTransaction {
     }
 }
 
-/// The `out` of a lookup of the cache: a `bytes` of `len` bytes that `fill`
-/// fills and checks, or `None` when the check fails.
-fn bytes<'py>(
-    py: Python<'py>,
-    len: usize,
-    fill: &mut dyn FnMut(&mut [u8]) -> bool,
-) -> Option<Bound<'py, PyBytes>> {
-    PyBytes::new_with(py, len, |buf| {
-        if fill(buf) {
+/// The `out` of a lookup of the cache: a `bytes` of `len` bytes that
+/// `copy` writes and checks, or `None` when the check fails. The writer
+/// does not fill the bytes with zeros first, so the data takes one pass.
+fn bytes<'py>(py: Python<'py>, len: usize, copy: &mut Copier<'_>) -> Option<Bound<'py, PyBytes>> {
+    PyBytes::new_with_writer(py, len, |writer| {
+        let mut written = true;
+        let good = copy(&mut |block| written &= writer.write_all(block).is_ok());
+        if good && written {
             Ok(())
         } else {
             Err(PyValueError::new_err("the entry changed during the copy"))
@@ -1584,7 +1585,8 @@ fn endpoints(
 /// Resolve the host of each TCP address of `targets`, as `resolve` does,
 /// on the blocking threads of the runtime. A lookup of the system can wait
 /// for a long time: on a worker thread it would stop the connections of
-/// every client of the process.
+/// every client of the process. An IP address needs no lookup, so it does
+/// not go to a blocking thread.
 async fn resolve_hosts(targets: &[Target]) -> HashMap<(String, u16), Result<SocketAddr, String>> {
     let mut resolved = HashMap::new();
     for target in targets {
@@ -1595,12 +1597,25 @@ async fn resolve_hosts(targets: &[Target]) -> HashMap<(String, u16), Result<Sock
         if resolved.contains_key(&key) {
             continue;
         }
-        let (name, port) = key.clone();
-        let lookup = tokio::task::spawn_blocking(move || resolve(&name, port)).await;
-        let addr = lookup.unwrap_or_else(|e| Err(format!("the address {host}:{port}: {e}")));
+        let addr = match literal(host, *port) {
+            Some(addr) => Ok(addr),
+            None => {
+                let (name, port) = key.clone();
+                let lookup = tokio::task::spawn_blocking(move || resolve(&name, port)).await;
+                lookup.unwrap_or_else(|e| Err(format!("the address {host}:{port}: {e}")))
+            }
+        };
         resolved.insert(key, addr);
     }
     resolved
+}
+
+/// Return the socket address of `host` and `port` when `host` is an IP
+/// address, or `None` for a name.
+fn literal(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, port))
 }
 
 /// Return the first IP address of `host` and `port`.
@@ -2044,6 +2059,25 @@ mod tests {
     fn an_address_shows_as_zeo_gives_it() {
         assert_eq!(Target::Tcp("db".into(), 8100).to_string(), "db:8100");
         assert_eq!(Target::Unix("./zeo.sock".into()).to_string(), "./zeo.sock");
+    }
+
+    #[test]
+    fn an_ip_address_needs_no_lookup() {
+        assert_eq!(
+            literal("127.0.0.1", 8100),
+            Some("127.0.0.1:8100".parse().unwrap())
+        );
+        assert_eq!(literal("::1", 8100), Some("[::1]:8100".parse().unwrap()));
+        assert_eq!(literal("localhost", 8100), None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let targets = [Target::Tcp("127.0.0.1".into(), 8100)];
+        let resolved = runtime.block_on(resolve_hosts(&targets));
+        assert_eq!(
+            resolved[&("127.0.0.1".to_owned(), 8100)],
+            Ok("127.0.0.1:8100".parse().unwrap())
+        );
     }
 
     #[test]

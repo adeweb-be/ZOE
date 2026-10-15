@@ -34,7 +34,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 use zoe_core::{Oid, Tid};
 
 use crate::client::Record;
@@ -85,6 +85,9 @@ const HEAD_BYTES: u64 = 72;
 /// The codec of an entry whose data is raw.
 const CODEC_RAW: u64 = 0;
 
+/// The words of the data that a hit copies at a time: 4 KiB.
+const BLOCK_WORDS: usize = 512;
+
 /// The fewest index slots.
 const MIN_SLOTS: u64 = 1024;
 /// The bytes of the ring for each index slot.
@@ -107,6 +110,11 @@ pub struct CacheCounts {
     /// The entries that no index slot took. No lookup finds them.
     pub unindexed: u64,
 }
+
+/// The copy of the data of a hit. `copy(sink)` gives the data to `sink`
+/// in blocks, in order, then checks it. It returns false when the data is
+/// not good: the caller then drops what `sink` got.
+pub type Copier<'a> = dyn FnMut(&mut dyn FnMut(&[u8])) -> bool + 'a;
 
 /// The head of an entry, as a reader copied and checked it.
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +159,12 @@ pub struct Cache {
     /// The cache serves. A file with entries serves only after its
     /// verification against the server.
     verified: AtomicBool,
+    /// The file is marked not clean on the disk, so a writer may change the
+    /// mapping. An anonymous mapping is always marked. A file that the open
+    /// kept is marked at its first write, under the writer lock.
+    marked: AtomicBool,
+    /// The next mark fails: a hook of the tests.
+    fail_mark: AtomicBool,
 }
 
 /// The layout of a cache: the bytes of the ring, the number of slots, the
@@ -252,6 +266,7 @@ impl Cache {
             Some(file) => Mapping::shared(file, words)?,
             None => Mapping::anonymous(words)?,
         };
+        let anonymous = file.is_none();
         Ok(Cache {
             file: Mutex::new(file),
             map,
@@ -262,6 +277,8 @@ impl Cache {
             writer: Mutex::new(CacheCounts::default()),
             disabled: AtomicBool::new(false),
             verified: AtomicBool::new(true),
+            marked: AtomicBool::new(anonymous),
+            fail_mark: AtomicBool::new(false),
         })
     }
 
@@ -295,6 +312,19 @@ impl Cache {
     /// Return the counts of the writers.
     pub fn counts(&self) -> CacheCounts {
         *self.lock()
+    }
+
+    /// Tell if the cache was closed or disabled, or failed to mark its
+    /// file: it then serves and writes nothing more.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+
+    /// Make the next mark of the file fail, as an error of `msync` would.
+    /// A hook of the tests.
+    #[doc(hidden)]
+    pub fn fail_next_mark(&self) {
+        self.fail_mark.store(true, Ordering::Relaxed);
     }
 
     /// Tell if the cache serves: it is verified and not closed. A cache
@@ -367,18 +397,29 @@ impl Cache {
         })
     }
 
-    /// Copy the data of `entry` into `buf`, then check its checksum and
-    /// that the ring did not reach it during the copy.
-    fn copy(&self, entry: &Head, buf: &mut [u8]) -> bool {
-        if buf.len() as u64 != entry.len {
-            return false;
-        }
+    /// Give the data of `entry` to `sink` in blocks of `BLOCK_WORDS` words,
+    /// in one pass: load the words of a block into a local buffer, hash the
+    /// block, then give it to `sink`. Then check the checksum of the data and
+    /// that the ring did not reach the entry during the copy.
+    fn copy(&self, entry: &Head, sink: &mut dyn FnMut(&[u8])) -> bool {
+        let len = entry.len as usize;
         let at = self.at(entry.pos) + HEAD_WORDS;
-        for (i, chunk) in buf.chunks_mut(8).enumerate() {
-            let word = self.word(at + i).load(Ordering::Relaxed).to_le_bytes();
-            chunk.copy_from_slice(&word[..chunk.len()]);
+        let Some(words) = self.map.words().get(at..at + len.div_ceil(8)) else {
+            return false;
+        };
+        let mut hasher = Xxh3Default::new();
+        let mut block = [0u8; BLOCK_WORDS * 8];
+        let mut left = len;
+        for chunk in words.chunks(BLOCK_WORDS) {
+            for (bytes, word) in block.as_chunks_mut::<8>().0.iter_mut().zip(chunk) {
+                *bytes = word.load(Ordering::Relaxed).to_le_bytes();
+            }
+            let data = &block[..left.min(chunk.len() * 8)];
+            hasher.update(data);
+            sink(data);
+            left -= data.len();
         }
-        xxh3_64(buf) == entry.data_sum && self.intact(entry.pos)
+        hasher.digest() == entry.data_sum && self.intact(entry.pos)
     }
 
     fn hash(&self, oid: u64) -> u64 {
@@ -427,8 +468,9 @@ impl Cache {
     }
 
     /// Find the entry of `oid` that holds the revision of the snapshots
-    /// before `before`. `out(len, fill)` makes a buffer of `len` bytes and
-    /// calls `fill` on it, which copies the data and checks it. Return the
+    /// before `before`. `out(len, copy)` gets the `len` bytes of the data
+    /// from `copy` (see `Copier`), and returns `None` when `copy` fails.
+    /// Return the
     /// result of `out`, the start tid of the entry and its end tid, or
     /// `None` for a current entry. A current entry serves only `before`
     /// up to `applied + 1`.
@@ -436,7 +478,7 @@ impl Cache {
         &self,
         oid: Oid,
         before: Tid,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
         if !self.verified() {
             return None;
@@ -460,7 +502,7 @@ impl Cache {
     pub fn load_with<R>(
         &self,
         oid: Oid,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid)> {
         if !self.verified() {
             return None;
@@ -485,10 +527,10 @@ impl Cache {
     fn read<R>(
         &self,
         entry: &Head,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
-        let mut fill = |buf: &mut [u8]| self.copy(entry, buf);
-        let result = out(entry.len as usize, &mut fill)?;
+        let mut copy = |sink: &mut dyn FnMut(&[u8])| self.copy(entry, sink);
+        let result = out(entry.len as usize, &mut copy)?;
         if entry.end == 0 {
             self.refresh(entry);
         }
@@ -520,10 +562,15 @@ impl Cache {
         if entry.end != 0 || self.find_slot(entry.oid).map(|(_, pos)| pos) != Some(entry.pos) {
             return;
         }
-        let mut data = vec![0; entry.len as usize];
-        if !self.copy(&entry, &mut data) {
+        // The copy runs on the thread of the hit: it never pays the mark of
+        // the file. It waits until a write marked the file.
+        if !self.marked.load(Ordering::Relaxed) {
             return;
         }
+        let mut copy = |sink: &mut dyn FnMut(&[u8])| self.copy(&entry, sink);
+        let Some(data) = to_vec(entry.len as usize, &mut copy) else {
+            return;
+        };
         if let Some(pos) = self.append(entry.oid, entry.start, 0, entry.prev, &data)
             && self.link(&mut counts, entry.oid, pos)
         {
@@ -582,8 +629,7 @@ impl Cache {
             if entry.start == start {
                 // Keep an intact entry of the revision. Drop one whose data
                 // fails its checksum, and store the revision again.
-                let mut stored = vec![0; entry.len as usize];
-                if self.copy(&entry, &mut stored) {
+                if self.copy(&entry, &mut |_| {}) {
                     return false;
                 }
                 self.set_end(&entry, entry.start);
@@ -737,10 +783,15 @@ impl Cache {
                     "only a cache that does not serve moves applied down"
                 );
                 self.clear_locked();
-                self.word(H_APPLIED).store(tid.0, Ordering::Release);
+                if self.mark() {
+                    self.word(H_APPLIED).store(tid.0, Ordering::Release);
+                }
             }
         }
-        self.verified.store(true, Ordering::Release);
+        // A failed mark disabled the cache: it never serves.
+        if !self.disabled.load(Ordering::Relaxed) {
+            self.verified.store(true, Ordering::Release);
+        }
     }
 
     /// Drop every entry, and serve and write nothing more. After the loss
@@ -748,8 +799,12 @@ impl Cache {
     pub fn disable(&self) {
         let _counts = self.lock();
         if !self.disabled.load(Ordering::Relaxed) {
-            self.clear_locked();
-            self.disabled.store(true, Ordering::Relaxed);
+            // A file that no write marked keeps the state of its last clean
+            // close: the disabled cache never serves it.
+            if self.marked.load(Ordering::Relaxed) {
+                self.clear_locked();
+            }
+            self.disabled.store(true, Ordering::Release);
         }
     }
 
@@ -779,7 +834,31 @@ impl Cache {
         self.disabled.store(true, Ordering::Relaxed);
     }
 
+    /// Mark the file before the first write to the mapping: see `file.rs`.
+    /// Return false when the mark fails: the cache is then disabled, and
+    /// the caller writes nothing. The caller holds the writer lock.
+    fn mark(&self) -> bool {
+        if self.marked.load(Ordering::Relaxed) {
+            return true;
+        }
+        // After a failed mark, no writer tries again.
+        if self.disabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let failed = self.fail_mark.swap(false, Ordering::Relaxed);
+        if !failed && self.mark_file().is_ok() {
+            self.marked.store(true, Ordering::Relaxed);
+            return true;
+        }
+        self.verified.store(false, Ordering::Release);
+        self.disabled.store(true, Ordering::Release);
+        false
+    }
+
     fn clear_locked(&self) {
+        if !self.mark() {
+            return;
+        }
         let head = self.word(H_HEAD).load(Ordering::Relaxed);
         let next = (head / self.ring + 2) * self.ring;
         self.word(H_HEAD).store(next, Ordering::Release);
@@ -787,7 +866,7 @@ impl Cache {
 
     fn set_applied(&self, tid: u64) {
         let applied = self.word(H_APPLIED);
-        if tid > applied.load(Ordering::Relaxed) {
+        if tid > applied.load(Ordering::Relaxed) && self.mark() {
             applied.store(tid, Ordering::Release);
         }
     }
@@ -806,6 +885,9 @@ impl Cache {
     /// sees one without the other finds a bad checksum, and misses. The
     /// caller holds the writer lock.
     fn set_end(&self, entry: &Head, end: u64) {
+        if !self.mark() {
+            return;
+        }
         let mut words = entry.words;
         words[E_END] = end;
         let at = self.at(entry.pos);
@@ -820,7 +902,7 @@ impl Cache {
     fn append(&self, oid: u64, start: u64, end: u64, prev: u64, data: &[u8]) -> Option<u64> {
         let len = data.len() as u64;
         let total = align8(HEAD_BYTES + len);
-        if total > self.ring / 2 || len > u64::from(u32::MAX) {
+        if total > self.ring / 2 || len > u64::from(u32::MAX) || !self.mark() {
             return None;
         }
         let head = self.word(H_HEAD).load(Ordering::Relaxed);
@@ -908,9 +990,9 @@ impl std::fmt::Debug for Cache {
 }
 
 /// The `out` of a lookup that returns the data as a `Vec`.
-fn to_vec(len: usize, fill: &mut dyn FnMut(&mut [u8]) -> bool) -> Option<Vec<u8>> {
-    let mut data = vec![0; len];
-    fill(&mut data).then_some(data)
+fn to_vec(len: usize, copy: &mut Copier<'_>) -> Option<Vec<u8>> {
+    let mut data = Vec::with_capacity(len);
+    copy(&mut |block| data.extend_from_slice(block)).then_some(data)
 }
 
 #[cfg(test)]

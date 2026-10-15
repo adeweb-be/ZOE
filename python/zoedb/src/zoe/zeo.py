@@ -883,7 +883,7 @@ class _NativeClientStorage(ClientStorage):
             return self._read_only
         return native.read_only()
 
-    def _take_server(self, verify_result):
+    def _take_server(self, verify_result=None):
         """Take the server of the native client: call `notify_connected`
         with its connection and its info, as ZEO does at each connection."""
         conn = _NativeConnection(
@@ -896,7 +896,9 @@ class _NativeClientStorage(ClientStorage):
     def notify_connected(self, conn, info):
         """Take the info and the address of a new connection, as ZEO does.
 
-        The native client verified its cache before the call.
+        The native client verified its cache before the call. The log gives
+        the address: the canonical name comes at the first read of
+        `_server_addr`.
         """
         address = conn.get_peername()
         if address is not None:
@@ -906,21 +908,27 @@ class _NativeClientStorage(ClientStorage):
             "%s %s to storage: %s",
             self.__name__,
             "Reconnected" if self._connection_generation else "Connected",
-            self._server_addr,
+            self._server_address,
         )
         self._connection_generation += 1
         self._info.update(info)
-        # The client declares the interfaces of the server that ZEO
-        # declares.
-        for iface in _SERVER_INTERFACES:
-            if (iface.__module__, iface.__name__) in self._info["interfaces"]:
-                zope.interface.alsoProvides(self, iface)
+        # Of the interfaces of the server that ZEO declares, the client
+        # declares those that it does not have yet, in one call.
+        served = self._info["interfaces"]
+        declared = [
+            iface
+            for iface in _SERVER_INTERFACES
+            if (iface.__module__, iface.__name__) in served
+            and not iface.providedBy(self)
+        ]
+        if declared:
+            zope.interface.alsoProvides(self, *declared)
 
     def notify_disconnected(self):
         """The client lost its server: forget the iterators of the server,
         as ZEO does."""
         _zeo_logger.info(
-            "%s Disconnected from storage: %r", self.__name__, self._server_addr
+            "%s Disconnected from storage: %r", self.__name__, self._server_address
         )
         self._iterator_gc(True)
         self._connection_generation += 1
@@ -934,6 +942,38 @@ class _NativeClientStorage(ClientStorage):
         if not len(self._cache):
             return "empty cache"
         return _VERIFY_RESULTS.get(kind, "Cache up to date")
+
+    def set_server_addr(self, addr):
+        """Keep the address of the server.
+
+        The first read of `_server_addr` gives the canonical name of the
+        server, as `set_server_addr` of ZEO makes it. The lookup of that
+        name is slow, so the open does not wait for it.
+        """
+        self.__dict__["_server_address"] = addr
+        self.__dict__["_canonical_addr"] = None
+
+    @property
+    def _server_address(self):
+        """The address of the server as the client got it, or None."""
+        return self.__dict__.get("_server_address")
+
+    @property
+    def _server_addr(self):
+        """The address of the server with its canonical name, or None."""
+        canonical = self.__dict__.get("_canonical_addr")
+        if canonical is None:
+            address = self.__dict__.get("_server_address")
+            if address is None:
+                return None
+            # This sets `_server_addr`, through the setter below.
+            ZEOClientStorage.set_server_addr(self, address)
+            canonical = self.__dict__["_canonical_addr"]
+        return canonical
+
+    @_server_addr.setter
+    def _server_addr(self, value):
+        self.__dict__["_canonical_addr"] = value
 
     def _setup_blobs(self, blob_dir, shared, cache_size, cache_size_check):
         """Set the blob directory up as `ZEO.ClientStorage` does."""

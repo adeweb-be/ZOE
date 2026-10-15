@@ -492,6 +492,12 @@ plone scenario="zoe" command="start" *args:
 # disk has less free space than one value needs. Each result records the GIL
 # of each worker process. `run` and `test` build `zoe` in release for the
 # storages zoe-server and zoe-native, unless ZOE_BINARY names a binary.
+# `just bench test FILE...` runs only the tests of those files.
+# `just bench client` runs the client benchmark: ZEO.ClientStorage against
+# the native client, through the storage API, against zoe serve and a ZEO
+# server. It writes target/bench/client/<started>.json and prints the
+# rows, and builds `zoe` in release first. `just bench client report FILE`
+# prints the rows of a result and its verdict, and builds nothing.
 # `just bench load` and `just bench saturate` build `zoe` and `zoe-bench` in release, start
 # `zoe serve` on a new store in target/bench/work/zoe-bench, run
 # `zoe-bench load` or `zoe-bench saturate` with its default settings and the
@@ -502,6 +508,11 @@ bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
+    # `just bench client OPTIONS` stands for `just bench client run OPTIONS`.
+    if [ "${1:-}" = client ] && [ "${2:-}" != run ] && [ "${2:-}" != report ]; then
+        shift
+        set -- client run "$@"
+    fi
     if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
         command="$1"
         shift
@@ -545,15 +556,21 @@ bench *args="run":
         export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
     shootout=(uv run --locked --project bench/shootout)
-    if { [ "${1:-}" = run ] || [ "${1:-}" = test ]; } && [ -z "${ZOE_BINARY:-}" ]; then
+    builds=false
+    case "${1:-} ${2:-}" in
+        "client report") ;;
+        run\ * | test\ * | client\ *) builds=true ;;
+    esac
+    if [ "$builds" = true ] && [ -z "${ZOE_BINARY:-}" ]; then
         cargo build --release --locked -p zoe-server --bin zoe
         ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
         export ZOE_BINARY
     fi
-    if [ "{{ args }}" = test ]; then
-        exec "${shootout[@]}" pytest -q bench/shootout/tests
+    if [ "${1:-}" = test ]; then
+        shift
+        exec "${shootout[@]}" pytest -q "${@:-bench/shootout/tests}"
     fi
-    exec "${shootout[@]}" python -m shootout {{ args }}
+    exec "${shootout[@]}" python -m shootout "$@"
 
 # Build and run Loupe. `just loupe` builds a release app and runs it,
 # `just loupe dev` runs it on the Vite dev server, `just loupe check` lints

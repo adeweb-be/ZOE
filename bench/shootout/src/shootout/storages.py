@@ -218,10 +218,17 @@ def _section(name: str, *lines: str) -> str:
 
 
 @contextlib.contextmanager
-def _zeo_server(workdir: Path) -> Iterator[int]:
-    """Run a ZEO server on a FileStorage in workdir and yield its port."""
+def _zeo_server(workdir: Path, msgpack: bool = False) -> Iterator[int]:
+    """Run a ZEO server on a FileStorage in workdir and yield its port.
+
+    With msgpack, the server speaks the msgpack protocol M5 of ZEO, and
+    not the pickle protocol Z5.
+    """
     port = _free_port()
     log = workdir / "zeo.log"
+    environ = dict(os.environ)
+    if msgpack:
+        environ["ZEO_MSGPACK"] = "1"
     with log.open("wb") as out:
         server = subprocess.Popen(
             [
@@ -235,6 +242,7 @@ def _zeo_server(workdir: Path) -> Iterator[int]:
             ],
             stdout=out,
             stderr=subprocess.STDOUT,
+            env=environ,
         )
     try:
         _wait_for_port(port, server, log)
