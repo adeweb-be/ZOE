@@ -1,6 +1,8 @@
 # 0034. The client cache file
 
-Status: accepted. The human accepted the layout and decided the questions that the spike ZOE-152 left open (finding: `docs/spikes/client-cache.md`). The ADR of the parallel spike ZOE-151 is 0036.
+Status: accepted. The human accepted the layout and decided the questions that the spike ZOE-152 left open (finding: `docs/spikes/client-cache.md`). The ADR of the parallel spike ZOE-151 is 0036. Stage 1 is built (ZOE-156), and stage 2 (ZOE-162).
+
+Facts of the build of stage 2: the header page holds the name of the storage (its length in the word 10, at most 256 bytes, its bytes in the words 11 to 42), inside the static checksum, and the magic `ZOECACH` carries the version of the layout in its last byte (1). The state checksum covers the words 0 to 8. The open drops a file that it does not trust by making it zero in place and giving it the length of the layout, and reserves its disk space with `posix_fallocate` when its blocks do not cover its length. The order of the mark: the open marks a new or dropped file not clean at once; a kept file stays clean on the disk until its first write, and the mark (boot id, clean flag 0, state checksum 0, then `msync` of the header page) comes before any write to the mapping. The copy of a hit waits until a write marked the file. A failed mark disables the cache. The close of a file that no write marked writes nothing. It never changes a file that does not start with the magic of ZOE, such as a `.zec` file of ZEO. A file whose `applied` is above the last tid of the server at the open is dropped, not refused. Entries are raw, with the codec 0.
 
 ## Context
 
@@ -36,13 +38,13 @@ F28 asks for a native client with an mmap'd persistent cache, with compression a
 - A hit costs a few hundred nanoseconds in the cache. Through ZODB, the rest of ZODB costs more than the cache: the finding gives the numbers.
 - A crash of the machine drops a cache that was open. A clean close keeps it across a restart.
 - The `end` of an entry and its head checksum change together. A reader that sees one change without the other misses once.
-- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, so ZEO's `AssertionError` for a cache newer than the server stays for a private file only. A shared file detects another history with the identity of the storage in its header (see "Decided with the ADR").
+- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, so ZEO's `AssertionError` for a cache newer than the server stays for a private file only. A file detects another history with the check of its `applied` tid at the open (see "Decided with the ADR").
 - The layout is an on-disk format of the client. It is not the format of the store, so it is not a red zone, but a change of it changes the magic.
 
 ## Decided with the ADR
 
 - **Compression.** Entries are raw by default. zstd per entry is a setting for sites that need capacity more than hit speed.
-- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. The header of the cache file holds the format version and an identity of the storage, as ZOE-162 asks. There is no extension at `register`, so the wire protocol does not change. A cache whose format version or storage identity differs from what the client expects is dropped: the client starts with an empty cache.
+- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. The header of the cache file holds the format version and an identity of the storage, as ZOE-162 asks. There is no extension at `register`, so the wire protocol does not change. A cache whose format version or storage name differs from what the client expects is dropped: the client starts with an empty cache. The name alone does not find a restored server, which has the same name, so the identity of the history is checked at the open: when the last tid of the server is above `applied` of the file, the server must hold a commit at exactly `applied` (`iterator_start(applied, applied)`, then `iterator_next` and `iterator_gc`), else the client drops every entry. A stock ZEO 6 server and `zoe serve` both answer these calls, so neither the wire protocol nor the format of the store changes.
 - **Reconnects** with a shared file: a process compares the tid of its new `register` with its own last tid, and its DB needs `getInvalidations` from its own last tid, not from `applied`. The verification after a reconnect is ZOE-159.
 
 ## Alternatives

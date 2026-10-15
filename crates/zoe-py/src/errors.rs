@@ -1,6 +1,7 @@
 //! The exceptions that `zoe.Storage` raises: the exceptions of ZODB, and
 //! `zoe.WrongThread`. The native client also raises `ClientDisconnected`
-//! of ZEO.
+//! of ZEO, and `LockError` of `zc.lockfile` for a cache file that another
+//! open holds.
 //!
 //! The module imports ZODB and ZEO only when it raises an exception. So
 //! loading the extension does not load them.
@@ -57,6 +58,15 @@ pub(crate) fn conflict_class(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 /// Return the class `ReadConflictError` of ZODB.
 pub(crate) fn read_conflict_class(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     read_conflict_error(py)
+}
+
+exception!(lock_error, "zc.lockfile", "LockError");
+
+/// Return a `LockError` of `zc.lockfile` for the cache file `path`, which
+/// another open holds, with the text of `zc.lockfile`.
+pub(crate) fn lock_failure(py: Python<'_>, path: &std::path::Path) -> PyErr {
+    let text = format!("Couldn't lock '{}'", path.display());
+    raise(lock_error(py), (text,), None)
 }
 
 /// Return a `ClientDisconnected` of ZEO with the text `text`.

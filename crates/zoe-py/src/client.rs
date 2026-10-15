@@ -16,10 +16,10 @@
 //! only the name of the file. `zoe.zeo` keeps the blob cache: its layout,
 //! its locks and its pruning.
 //!
-//! With a `cache_size`, the pool holds a client cache in memory (ADR 0034).
-//! A hit runs on the calling thread: it takes no lock, sends nothing and
-//! does not release the GIL. A miss loads from the server and stores the
-//! reply.
+//! With a `cache_size`, the pool holds a client cache (ADR 0034): in
+//! memory, or in the file `cache_path`, which survives the process. A hit
+//! runs on the calling thread: it takes no lock, sends nothing and does not
+//! release the GIL. A miss loads from the server and stores the reply.
 //!
 //! The pool delivers the tids of the listener in one order. A thread of
 //! `zoe.zeo` takes each commit of another client, and each change of the
@@ -70,8 +70,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Copier, Delivery, Endpoint, Error, Event, Open, Options, Pool,
-    PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
+    Address, Cache, Connect, Copier, Delivery, Endpoint, Error, Event, FileCheck, Open, Options,
+    Pool, PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -195,6 +195,15 @@ impl NativeClient {
     /// `ValueError`. A mapping that the kernel does not give raises
     /// `MemoryError`.
     ///
+    /// With `cache_path`, the cache is that file, which the open creates
+    /// when it does not exist (ADR 0034, stage 2). The open takes the lock
+    /// of the file before it connects: a file that another open holds
+    /// raises `zc.lockfile.LockError`, as the cache of ZEO does. A name of
+    /// the storage longer than 256 bytes raises `ValueError`, and an error
+    /// of the file raises `OSError`. A file with entries serves only after
+    /// its verification against the server; with `wait`, the open waits
+    /// for it, at most `wait_timeout` seconds.
+    ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
     /// server: with `read_only_fallback`, a writable server before a
@@ -234,7 +243,7 @@ impl NativeClient {
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL, client_label=None
+        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -252,6 +261,7 @@ impl NativeClient {
         wait: bool,
         disconnect_poll: f64,
         client_label: Option<String>,
+        cache_path: Option<PathBuf>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -262,9 +272,9 @@ impl NativeClient {
         if pool_bound == 0 {
             return Err(PyValueError::new_err("pool_bound is at least 1"));
         }
-        let cache = match cache_size {
-            0 => None,
-            size => Some(Cache::new(size).map_err(|e| {
+        let cache = match (cache_size, cache_path) {
+            (0, _) => None,
+            (size, None) => Some(Cache::new(size).map_err(|e| {
                 let text = format!("cache_size {size}: {e}");
                 // A size that the cache refuses is a bad value. Any other
                 // error is a mapping that the kernel did not give.
@@ -273,6 +283,18 @@ impl NativeClient {
                     _ => PyMemoryError::new_err(text),
                 }
             })?),
+            (size, Some(path)) => {
+                let name = storage.as_bytes();
+                let opened = py.detach(|| Cache::open(&path, size, name));
+                Some(opened.map_err(|e| match e.kind() {
+                    io::ErrorKind::WouldBlock => errors::lock_failure(py, &path),
+                    io::ErrorKind::InvalidData => PyValueError::new_err(e.to_string()),
+                    io::ErrorKind::InvalidInput => {
+                        PyValueError::new_err(format!("cache_size {size}: {e}"))
+                    }
+                    _ => e.into(),
+                })?)
+            }
         };
         let targets = addresses
             .iter()
@@ -285,6 +307,8 @@ impl NativeClient {
             client_label,
         };
         let upgrade = read_only_fallback && !read_only;
+        // The connect and the verification of a cache file share one wait.
+        let deadline = Instant::now() + timeout;
         let opened = py.detach(move || -> Result<_, Opening> {
             let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
@@ -316,6 +340,12 @@ impl NativeClient {
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
+            // A cache file with entries serves after its verification. The
+            // open waits for it for what is left of `wait_timeout`.
+            if wait {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let _ = runtime.block_on(tokio::time::timeout(left, pool.ready()));
+            }
             Ok((runtime, pool, servers))
         });
         let (runtime, pool, servers) = match opened {
@@ -492,6 +522,37 @@ impl NativeClient {
             .listener()
             .map(|listener| listener.extensions().to_vec())
             .unwrap_or_default())
+    }
+
+    /// Return how the verification of the cache file ended, once: `None`
+    /// before its end, after the first call, and without a file with
+    /// entries. Else a tuple `(kind, text)`: `kind` is `"kept"`, `"quick"`,
+    /// `"dropped"`, `"failed"`, `"other"` or `"ahead"`, and `text` says more
+    /// for the last three.
+    fn take_cache_check(&self) -> Option<(&'static str, String)> {
+        let check = lock(&self.pool).as_ref()?.take_file_check()?;
+        Some(match check {
+            FileCheck::Kept => ("kept", String::new()),
+            FileCheck::Quick => ("quick", String::new()),
+            FileCheck::Dropped => ("dropped", String::new()),
+            FileCheck::Failed(text) => ("failed", text),
+            FileCheck::Other { applied } => (
+                "other",
+                format!(
+                    "the server holds no transaction {:016x}, the last transaction \
+                     of the cache file: its history is another one",
+                    applied.0
+                ),
+            ),
+            FileCheck::Ahead { applied, server } => (
+                "ahead",
+                format!(
+                    "the last transaction {:016x} of the server is before the last \
+                     transaction {:016x} of the cache file",
+                    server.0, applied.0
+                ),
+            ),
+        })
     }
 
     /// Tell if the client is connected: not closed, and its listener is not

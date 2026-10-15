@@ -37,13 +37,14 @@ or a directory, else against those of the system, as ZEO does. It
 takes no `ssl` context: TLS runs in Rust, and a context does not give back
 the files of its certificate and key. It runs several transactions at once,
 each on its own connection of a pool, with one more connection that orders
-the invalidations (ADR 0036). It keeps a client cache in memory, with the
-semantics of the cache of ZEO, of `cache_size` bytes (ADR 0034). It has
+the invalidations (ADR 0036). It keeps a client cache of `cache_size`
+bytes, with the semantics of the cache of ZEO (ADR 0034): in memory, or in
+a file with `client` and `var`, or `cache`. It has
 blobs in both modes of ZEO: a blob cache in `blob_dir`, or a blob directory
 that it shares with the server (`shared_blob_dir`). It resolves in the
 client the conflicts that a vote lists, as `ZEO.ClientStorage` does. When
 it loses its server, it connects again in the background and verifies its
-cache, as ZEO does. It has no cache file. It declares
+cache, as ZEO does. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It has the
 rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
@@ -379,11 +380,7 @@ _MB = 1024**2
 # The arguments of `ZEO.ClientStorage` whose feature the native client does
 # not have yet, each with the value that leaves its feature off. Any other
 # value fails the open with an error that names the argument.
-_NOT_BUILT = {
-    "cache": None,
-    "client": None,
-    "var": None,
-}
+_NOT_BUILT = {}
 
 # The extensions that the native client declares: those of the client of
 # ZEO.
@@ -472,6 +469,33 @@ def _remove_files(blobs):
             pass
 
 
+def _native_cache_path(cache, var, client, storage):
+    """Return the path of the cache file of the native client, or None.
+
+    With `client`, the name follows the name of ZEO, `<client>-<storage>`
+    in `var` (the current directory by default), with the extension `.zoec`
+    in place of `.zec`: the native client never reads or writes the cache
+    file of ZEO. A str `cache` is the path of the file of ZEO: its `.zec`
+    becomes `.zoec`, and a path without `.zec` or `.zoec` gets `.zoec`.
+    Without `client` and `cache`, the cache stays in memory. A cache object
+    raises `Unsupported`: the cache of the native client is in Rust.
+    """
+    if isinstance(cache, str):
+        if cache.endswith(".zoec"):
+            return cache
+        if cache.endswith(".zec"):
+            return cache[: -len(".zec")] + ".zoec"
+        return cache + ".zoec"
+    if cache is not None:
+        raise Unsupported(
+            "the native client takes the path of a cache file as cache, "
+            "not a cache object"
+        )
+    if client:
+        return os.path.join(var or os.getcwd(), f"{client}-{storage}.zoec")
+    return None
+
+
 def _native_address(addr):
     """Return an address for the native client.
 
@@ -529,9 +553,18 @@ class _NativeClientStorage(ClientStorage):
     that order. `lastTransaction()` gives a tid only after the DB got its
     invalidations or the callback of its commit ran.
 
-    The client cache holds `cache_size` bytes of records, 20 MB by default,
-    in memory. 0 turns it off. The client applies each tid to the cache
-    before the DB gets it. `_cache.clear()` empties it.
+    The client cache holds `cache_size` bytes of records, 20 MB by default.
+    0 turns it off. The client applies each tid to the cache before the DB
+    gets it. `_cache.clear()` empties it. Without `client` and `cache`, the
+    cache is in memory. With `client`, it is the file
+    `<client>-<storage>.zoec` in `var`, or in the current directory; a str
+    `cache` names the file of ZEO, whose `.zec` becomes `.zoec`. The open
+    never changes a file that is not a cache file of ZOE: it raises
+    `ValueError`. The file survives the process: at the open, the client
+    verifies it against the server as after a reconnect, and with `wait`
+    the open waits for that verification, inside the same `wait_timeout`.
+    A second open of the same file, in this process or another, raises
+    `zc.lockfile.LockError`, as for ZEO.
 
     The blobs work as in `ZEO.ClientStorage`, with its code for the blob
     cache. With `blob_dir` and no `shared_blob_dir`, `blob_dir` is a blob
@@ -616,6 +649,7 @@ class _NativeClientStorage(ClientStorage):
                 raise Unsupported(
                     f"the native client does not have {key} yet: leave {key} out"
                 )
+        cache_path = _native_cache_path(cache, var, client, storage)
         if ssl is not None:
             raise Unsupported(
                 "the native client takes no ssl context: give the files of "
@@ -684,6 +718,7 @@ class _NativeClientStorage(ClientStorage):
             wait=bool(wait),
             disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
             client_label=client_label,
+            cache_path=cache_path,
         )
         self._cache = _NativeCache(self._native)
         try:
@@ -704,6 +739,7 @@ class _NativeClientStorage(ClientStorage):
                     self.__name__,
                     storage,
                 )
+            self._check_cache_file()
             self._delivery = threading.Thread(
                 target=self._deliver_forever,
                 name=f"{self.__name__} zoe native client invalidations",
@@ -1069,13 +1105,51 @@ class _NativeClientStorage(ClientStorage):
         if verification == "dropped":
             # The server does not keep the commits after the last tid of
             # the client: its cache is empty, and any object can be stale.
-            try:
-                ZODB.event.notify(ZEO.interfaces.StaleCache(self))
-            except Exception:
-                logger.exception("%s sending StaleCache event", self.__name__)
+            self._stale_cache()
+        # A pool that opened without a server verifies its cache file at its
+        # first connection.
+        self._check_cache_file()
+
+    def _stale_cache(self, text=""):
+        """The client dropped its cache: notify `StaleCache` and log it as
+        ZEO does. Any object of the DB can be stale."""
+        try:
+            ZODB.event.notify(ZEO.interfaces.StaleCache(self))
+        except Exception:
+            logger.exception("%s sending StaleCache event", self.__name__)
+        if text:
+            logger.critical("%s dropping stale cache: %s", self.__name__, text)
+        else:
             logger.critical("%s dropping stale cache", self.__name__)
-            if self._db is not None:
-                self._db.invalidateCache()
+        if self._db is not None:
+            self._db.invalidateCache()
+
+    def _check_cache_file(self):
+        """Log how the verification of the cache file ended, once.
+
+        A server that does not keep the commits after the file, or a failed
+        `getInvalidations`, drops the file as ZEO drops a stale cache. A
+        file ahead of the server is dropped too, where ZEO refuses the
+        server: the DB has no state yet. So is a file whose last
+        transaction the server does not hold: the server has another
+        history. A verification that ends after the wait of the open is
+        logged at the next connection.
+        """
+        check = self._native.take_cache_check()
+        if check is None:
+            return
+        kind, text = check
+        if kind in ("ahead", "other"):
+            logger.critical(
+                "%s Client cache is out of sync with the server: the native "
+                "client drops its cache file. Verify that this is expected: %s",
+                self.__name__,
+                text,
+            )
+        elif kind == "dropped":
+            self._stale_cache()
+        elif kind == "failed":
+            self._stale_cache(f"getInvalidations failed: {text}")
 
     def _refused(self, text):
         """The native client refused a server that is behind it."""

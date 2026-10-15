@@ -259,6 +259,20 @@ fn a_disabled_cache_drops_every_entry_and_stores_nothing() {
 }
 
 #[test]
+fn a_closed_cache_serves_and_writes_nothing() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    cache.close();
+    assert!(!cache.verified());
+    assert_eq!(cache.load(Oid(1)), None);
+    assert!(!cache.store(Oid(2), Tid(5), None, b"five", Tid(10)));
+    cache.apply(Tid(12), &[Oid(1)]);
+    cache.verify(Tid(20), None);
+    assert_eq!(cache.applied(), Tid(10));
+    cache.close();
+}
+
+#[test]
 fn an_entry_larger_than_half_of_the_ring_is_never_cached() {
     let cache = cache_at(100 * KB, 10);
     let large = vec![7u8; (50 * KB) as usize];
