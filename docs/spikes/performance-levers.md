@@ -147,3 +147,9 @@ The changes touch `crates/zoe-core/src/format/` (codec.rs, mod.rs), a red zone, 
 - The core benchmarks run in one thread. A finish at concurrency 16 batches 16 members on the leader, so the gain of levers 1 and 2 there is per member, and lever 4 is what moves the leader.
 - No span of the server was measured. The end-to-end numbers come from `zoe-bench`, whose client is `zoe-client` and not a ZODB connection.
 - The vote change leaves a corrupt current record undetected at the vote. `zoe verify`, a load and the bit-flip harness still find it.
+
+## Tests run
+
+- `cargo test -p zoe-core`: every binary green, the bit-flip and crash tests included. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` pass.
+- `cargo test -p zoe-server`: 54 binaries green. The six tests of `tls_client_ca.rs` did not run: they call `openssl req` with `-not_before`, which the OpenSSL 3.0 of this machine does not have, and devenv pins a newer one. They do not reach the changed code.
+- The Python tests on CPython 3.13: `test_zoe_storage.py` (the storage suites of ZODB), `acceptance/test_storage.py`, `acceptance/test_conflict_resolution.py` and `test_zoe_iteration.py`: 127 passed, 8 skipped. The other interpreters and the rest of `just test` did not run here.
