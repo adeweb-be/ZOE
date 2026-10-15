@@ -53,6 +53,7 @@ stock ZEO server needs `msgpack true`. `_NOT_BUILT` names the arguments
 whose feature it does not have yet. `native` is false by default.
 """
 
+import concurrent.futures
 import contextvars
 import logging
 import os
@@ -819,6 +820,26 @@ class _NativeClientStorage(ClientStorage):
         # ZEO waits `timeout` for a connection. The native client raises
         # `ClientDisconnected` at once without one, so it ignores `timeout`.
         self._check_process()
+        if not wait:
+            # As ZEO, return a future of the reply. A thread waits for it,
+            # in the context of the caller, so the call keeps its span.
+            future = concurrent.futures.Future()
+            context = contextvars.copy_context()
+
+            def run():
+                if not future.set_running_or_notify_cancel():
+                    return
+                try:
+                    result = context.run(self._call, method, *args)
+                except BaseException as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(result)
+
+            threading.Thread(
+                target=run, name=f"{self.__name__} zoe native call", daemon=True
+            ).start()
+            return future
         # The code of ZEO for the blob cache downloads a blob with this
         # call, under the lock of the blob.
         if method == "sendBlob":
