@@ -12,6 +12,8 @@ publish.workspace = true
 rmpv.workspace = true
 # TLS to the server, with the TLS stack of zoe-server.
 rustls.workspace = true
+# The system CA certificates, when the client has no `authenticate`.
+rustls-native-certs.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls.workspace = true
