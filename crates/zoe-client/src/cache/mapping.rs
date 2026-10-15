@@ -2,7 +2,8 @@
 //!
 //! This module holds the only `unsafe` code of the crate: the `mmap`, the
 //! `msync` and the `munmap` of the mapping, the view of its bytes as
-//! `AtomicU64`, and the `posix_fallocate` of a cache file. Every read and
+//! `AtomicU64`, and the `fallocate` and `posix_fallocate` of a cache file.
+//! Every read and
 //! write of the cache goes through these atomics. Each item with `unsafe`
 //! code allows it on its own.
 
@@ -48,7 +49,14 @@ impl Mapping {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no size for the cache"))?;
         // SAFETY: a new mapping at an address that the kernel picks. It
         // overlaps no memory of the process. A file descriptor that is not
-        // valid makes `mmap` fail.
+        // valid makes `mmap` fail. A shared mapping of a file has two more
+        // preconditions. The file holds `len` bytes while the mapping
+        // lives: an access past its end raises SIGBUS, which kills the
+        // process but is not undefined behavior. The `flock` of the cache
+        // keeps the other clients of ZOE out, and the cut of the file by
+        // another program is a known limit. And every writer of the file
+        // writes through atomics: the writers of this crate do, and other
+        // programs are outside this contract.
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -72,9 +80,10 @@ impl Mapping {
     pub(crate) fn words(&self) -> &[AtomicU64] {
         // SAFETY: the mapping holds `words` words of 8 bytes, aligned to a
         // page, readable and writable, until the drop. Its length is at
-        // most `isize::MAX` bytes: `mmap` gave a mapping of that length. `AtomicU64` has the
-        // size and the alignment of `u64`, and every bit pattern is valid.
-        // The code accesses the words only as atomics.
+        // most `isize::MAX` bytes: `mmap` gave a mapping of that length.
+        // `AtomicU64` has the size and the alignment of `u64`, and every bit
+        // pattern is valid. The code accesses the words only as atomics,
+        // also when another mapping of the same file writes them.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.words) }
     }
 
@@ -107,6 +116,34 @@ pub(crate) fn allocate(file: &File, len: u64) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(error));
     }
     Ok(())
+}
+
+/// Make the first `len` bytes of `file` zero, in place: the length of the
+/// file does not change, so a mapping of it never finds its end moved.
+/// Without `FALLOC_FL_ZERO_RANGE` in the file system, punch a hole that
+/// keeps the size. Give the disk space back with `allocate` after it.
+#[allow(unsafe_code)]
+pub(crate) fn zero(file: &File, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = libc::off_t::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the cache is too large"))?;
+    for mode in [
+        libc::FALLOC_FL_ZERO_RANGE,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    ] {
+        // SAFETY: `fallocate` takes a file descriptor and three integers. A
+        // descriptor that is not valid makes it fail.
+        if unsafe { libc::fallocate(file.as_raw_fd(), mode, 0, len) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return Err(error);
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
 }
 
 impl Drop for Mapping {

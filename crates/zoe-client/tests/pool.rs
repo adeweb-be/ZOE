@@ -1267,3 +1267,52 @@ async fn a_restore_commits_under_the_tid_of_its_transaction() {
     assert_eq!(cache.load(oid), None);
     assert_eq!(pool.load(oid).await.unwrap(), (record(b"b"), tid));
 }
+
+/// Start a TCP proxy to `server` that closes each connection that it
+/// carries when `cut` takes a new value. It accepts new connections after.
+async fn cutter(server: SocketAddr, cut: watch::Receiver<u64>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let mut upstream = TcpStream::connect(server).await.unwrap();
+            let mut cut = cut.clone();
+            cut.borrow_and_update();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = cut.changed() => {}
+                    _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn the_info_of_the_pool_keeps_the_sizes_of_a_connection_that_left() {
+    let server = start("info-left");
+    let (cut, cuts) = watch::channel(0);
+    let proxied = cutter(server.addr(), cuts).await;
+    let listener = Client::connect(server.addr(), "1").await.unwrap();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(proxied, "1")));
+    let pool = Pool::new(Arc::new(Tokio), listener, connect, 1);
+    let length = |pool: &Pool| key(&pool.info().unwrap(), "length").and_then(rmpv::Value::as_u64);
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    commit(&pool, oid, Tid(0), &record(b"a")).await.unwrap();
+    assert_eq!(length(&pool), Some(1));
+    // The connection that got the sizes is lost. The next transaction
+    // closes it, and the pool forgets it.
+    cut.send_modify(|n| *n += 1);
+    tokio::time::sleep(BLOCKED).await;
+    // A begin that took the lost connection fails at its abort, and the
+    // drop of its lease forgets the connection.
+    loop {
+        let txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+        if txn.abort().await.is_ok() {
+            break;
+        }
+    }
+    assert_eq!(length(&pool), Some(1));
+}

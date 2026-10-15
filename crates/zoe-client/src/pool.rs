@@ -140,6 +140,31 @@ pub enum Verification {
     Dropped,
 }
 
+/// How the verification of a cache that a file gave ended, at the open of
+/// the pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileCheck {
+    /// The server had no commit after `applied` of the file.
+    Kept,
+    /// `getInvalidations` gave the commits after `applied`: the cache
+    /// dropped the current entry of each oid.
+    Quick,
+    /// The server does not keep the commits after `applied`: the cache
+    /// dropped every entry.
+    Dropped,
+    /// `getInvalidations` failed with this text: the cache dropped every
+    /// entry.
+    Failed(String),
+    /// `applied` of the file is above the last tid of the server: the
+    /// cache dropped every entry.
+    Ahead {
+        /// `applied` of the file.
+        applied: Tid,
+        /// The last tid of the server.
+        server: Tid,
+    },
+}
+
 /// What the pool gives to its consumer: a delivery, or a change of the
 /// connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +211,10 @@ struct Shared {
     state: Mutex<State>,
     /// A new value tells each waiter that the state changed.
     changed: watch::Sender<u64>,
+    /// The newest map of the `info` calls of a connection that left the
+    /// pool, with its stamp. So `Pool::info` never goes back to older
+    /// sizes when a connection goes. A new listener empties it.
+    pushed: Mutex<Option<(u64, Value)>>,
 }
 
 /// The connections to the server of the pool.
@@ -240,6 +269,9 @@ struct State {
     /// The last tid that the pool delivered.
     last: u64,
     counters: Counters,
+    /// How the verification of a cache file ended, until
+    /// `Pool::take_file_check` takes it.
+    file_check: Option<FileCheck>,
 }
 
 /// An event for the consumer.
@@ -375,9 +407,22 @@ impl Shared {
     /// Forget the connection `client`, which closed or which the pool
     /// closes.
     fn forget(&self, client: &Arc<Client>) {
+        self.keep_pushed(client);
         self.server_mut()
             .conns
             .retain(|conn| !Arc::ptr_eq(conn, client));
+    }
+
+    /// Keep the map of the `info` calls of `client`, which leaves the pool,
+    /// when it is newer than the map that the pool keeps.
+    fn keep_pushed(&self, client: &Client) {
+        let Some((stamp, map)) = client.pushed_info() else {
+            return;
+        };
+        let mut kept = lock(&self.pushed);
+        if kept.as_ref().is_none_or(|(old, _)| *old < stamp) {
+            *kept = Some((stamp, map));
+        }
     }
 }
 
@@ -468,6 +513,7 @@ impl Pool {
             next_load: AtomicUsize::new(0),
             state: Mutex::new(state),
             changed: watch::channel(0).0,
+            pushed: Mutex::new(None),
         });
         runtime.spawn(Box::pin(dispatch(shared.clone(), invalidations)));
         if upgrade {
@@ -498,6 +544,13 @@ impl Pool {
         self.shared
             .until(|state| (state.closed || cache.verified()).then_some(()))
             .await;
+    }
+
+    /// Return how the verification of a cache that a file gave ended, once.
+    /// Return `None` before its end, after the first call, and for a cache
+    /// that served at once.
+    pub fn take_file_check(&self) -> Option<FileCheck> {
+        self.shared.lock().file_check.take()
     }
 
     /// Return the client cache of the pool, if it has one. A hit there
@@ -598,10 +651,11 @@ impl Pool {
     /// Call `ping` on the listener, as `sync` of `ZEO.ClientStorage` does
     /// with `server_sync`, then wait until the pool delivered each tid that
     /// the listener read before the reply. So a read after `sync` sees each
-    /// commit that the server published before its reply. A lost listener
-    /// or the close ends the wait. A caller that runs a delivery must not
+    /// commit that the server published before its reply. A lost listener,
+    /// a new server or the close ends the wait. A caller that runs a delivery must not
     /// wait: with `wait` false, `sync` returns after the reply.
     pub async fn sync(&self, wait: bool) -> Result<(), Error> {
+        let generation = self.shared.lock().generation;
         let listener = self.shared.listener()?;
         listener.ping().await?;
         if !wait {
@@ -609,7 +663,10 @@ impl Pool {
         }
         let position = listener.last_transaction().0;
         self.shared
-            .until(|state| (state.last >= position || state.closed || state.lost).then_some(()))
+            .until(|state| {
+                let ended = state.closed || state.lost || state.generation != generation;
+                (state.last >= position || ended).then_some(())
+            })
             .await;
         Ok(())
     }
@@ -635,7 +692,8 @@ impl Pool {
 
     /// Return the map of the reply of `get_info` of the listener, with the
     /// map of the last `info` call that the server sent on a connection of
-    /// the pool over it. Return `None` while the pool has no listener.
+    /// the pool over it, also on a connection that left the pool since.
+    /// Return `None` while the pool has no listener.
     pub fn info(&self) -> Option<Value> {
         let server = self.shared.server();
         let listener = server.listener.as_ref()?;
@@ -649,6 +707,7 @@ impl Pool {
             .iter()
             .chain([listener])
             .filter_map(|client| client.pushed_info())
+            .chain(lock(&self.shared.pushed).clone())
             .max_by_key(|(stamp, _)| *stamp);
         if let Some((_, Value::Map(pushed))) = newest {
             merge(&mut info, &pushed);
@@ -1847,25 +1906,34 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// close.
 async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
     let base = cache.applied();
-    if base == server_tid {
+    let check = if base == server_tid {
         cache.verify(server_tid, Some(&[]));
-        return true;
-    }
-    if base > server_tid {
+        FileCheck::Kept
+    } else if base > server_tid {
         cache.verify(server_tid, None);
-        return true;
-    }
-    match shared.unless_closed(client.get_invalidations(base)).await {
-        None => false,
-        Some(Ok(Some(invalidation))) => {
-            cache.verify(invalidation.tid, Some(&invalidation.oids));
-            true
+        FileCheck::Ahead {
+            applied: base,
+            server: server_tid,
         }
-        Some(Ok(None) | Err(_)) => {
-            cache.verify(server_tid, None);
-            true
+    } else {
+        match shared.unless_closed(client.get_invalidations(base)).await {
+            None => return false,
+            Some(Ok(Some(invalidation))) => {
+                cache.verify(invalidation.tid, Some(&invalidation.oids));
+                FileCheck::Quick
+            }
+            Some(Ok(None)) => {
+                cache.verify(server_tid, None);
+                FileCheck::Dropped
+            }
+            Some(Err(error)) => {
+                cache.verify(server_tid, None);
+                FileCheck::Failed(error.to_string())
+            }
         }
-    }
+    };
+    shared.lock().file_check = Some(check);
+    true
 }
 
 /// Take the server of the new listener `client`: the pool is connected.
@@ -1879,6 +1947,9 @@ fn take(shared: &Shared, client: Client, connect: Connect) {
         }
         state.lost = false;
         state.connect = Some(connect);
+        // The `get_info` of the new listener is newer than any size of the
+        // server that the pool lost.
+        *lock(&shared.pushed) = None;
         shared.server_mut().listener = Some(Arc::new(client));
     }
     shared.bump();

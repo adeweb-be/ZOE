@@ -5,13 +5,14 @@
 //! directory. The pool tests run `zoe serve` in the test process.
 
 use std::fs::{self, OpenOptions};
-use std::io;
-use std::os::unix::fs::FileExt;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use zoe_client::{Cache, Client, Connect, Pool, Tokio};
+use zoe_client::{Cache, Client, Connect, Error, FileCheck, Open, Pool, Reconnect, Tokio};
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
 
@@ -71,14 +72,16 @@ fn poke(path: &Path, index: u64, value: u64) {
     file.write_all_at(&value.to_le_bytes(), index * 8).unwrap();
 }
 
-/// Return the offset of the data of `oid` in the file `path`.
-fn place(path: &Path, oid: u64) -> usize {
+/// Return the offset of the data of `oid` in the file `path`, if any.
+fn place_of(path: &Path, oid: u64) -> Option<usize> {
     let content = fs::read(path).unwrap();
     let window = &data(oid)[128..192];
-    content
-        .windows(window.len())
-        .position(|w| w == window)
-        .expect("the file holds the data of the entry")
+    content.windows(window.len()).position(|w| w == window)
+}
+
+/// Return the offset of the data of `oid` in the file `path`.
+fn place(path: &Path, oid: u64) -> usize {
+    place_of(path, oid).expect("the file holds the data of the entry")
 }
 
 #[test]
@@ -158,6 +161,58 @@ fn a_file_of_another_version_is_dropped() {
     let cache = Cache::open(&path, SIZE, STORAGE).unwrap();
     assert_eq!(cache.applied(), Tid(0));
     assert_eq!(cache.load(Oid(1)), None);
+}
+
+#[test]
+fn a_file_that_is_not_a_cache_file_of_zoe_is_left_as_it_is() {
+    let path = dir("foreign").join("c-1.zec");
+    let content: Vec<u8> = b"ZEC3".iter().copied().chain(data(1)).collect();
+    fs::write(&path, &content).unwrap();
+    let error = Cache::open(&path, SIZE, STORAGE).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path).unwrap(), content);
+}
+
+#[test]
+fn a_drop_zeroes_a_file_of_the_same_length_in_place() {
+    let path = dir("in-place").join("c-1.zoec");
+    fill(&path, 3);
+    let first = open(&path);
+    let len = fs::metadata(&path).unwrap().len();
+    first.close();
+    // Another storage drops the file. The closed cache still maps it, and
+    // the file keeps its length, so a read of the closed cache never
+    // faults.
+    let second = Cache::open(&path, SIZE, b"2").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), len);
+    assert_eq!(first.applied(), Tid(0));
+    assert_eq!(second.applied(), Tid(0));
+    assert!(place_of(&path, 1).is_none());
+}
+
+#[test]
+fn a_kept_sparse_file_gets_its_disk_space_again() {
+    let path = dir("sparse").join("c-1.zoec");
+    fill(&path, 3);
+    // Copy the file without its zero pages, as a copy tool can.
+    let content = fs::read(&path).unwrap();
+    let copy = path.with_extension("copy");
+    let mut file = fs::File::create(&copy).unwrap();
+    for (i, page) in content.chunks(4096).enumerate() {
+        if page.iter().any(|b| *b != 0) {
+            file.seek(SeekFrom::Start(i as u64 * 4096)).unwrap();
+            file.write_all(page).unwrap();
+        }
+    }
+    file.set_len(content.len() as u64).unwrap();
+    drop(file);
+    fs::rename(&copy, &path).unwrap();
+    let len = content.len() as u64;
+    assert!(fs::metadata(&path).unwrap().blocks() * 512 < len);
+
+    let cache = open(&path);
+    assert!(fs::metadata(&path).unwrap().blocks() * 512 >= len);
+    assert_eq!(cache.load(Oid(1)).unwrap().0, data(1));
 }
 
 #[test]
@@ -328,6 +383,8 @@ async fn a_pool_verifies_its_file_at_the_open() {
 
     // An up-to-date file serves every oid.
     let pool = open_pool(&server, &path).await;
+    assert_eq!(pool.take_file_check(), Some(FileCheck::Kept));
+    assert_eq!(pool.take_file_check(), None);
     let cache = pool.cache().unwrap().clone();
     for oid in &oids {
         assert!(cache.load(*oid).is_some());
@@ -337,6 +394,7 @@ async fn a_pool_verifies_its_file_at_the_open() {
     // A commit while the pool was closed drops its oid only.
     let tid = commit(&other, oids[0], serials[0], b"new").await;
     let pool = open_pool(&server, &path).await;
+    assert_eq!(pool.take_file_check(), Some(FileCheck::Quick));
     let cache = pool.cache().unwrap().clone();
     assert_eq!(cache.applied(), tid);
     assert_eq!(cache.load(oids[0]), None);
@@ -359,8 +417,81 @@ async fn a_pool_drops_a_file_ahead_of_its_server() {
     poke(&path, 7, tid.0 + 1000);
     poke(&path, H_CLEAN, 0);
     let pool = open_pool(&server, &path).await;
+    assert_eq!(
+        pool.take_file_check(),
+        Some(FileCheck::Ahead {
+            applied: Tid(tid.0 + 1000),
+            server: tid,
+        })
+    );
     let cache = pool.cache().unwrap().clone();
     assert_eq!(cache.applied(), tid);
     assert_eq!(cache.load(oid), None);
     pool.disconnect();
+}
+
+/// Return an `Open` to `server` that fails while `gate` is false.
+fn gated(server: std::net::SocketAddr, gate: Arc<AtomicBool>) -> Open {
+    Arc::new(move |_| {
+        let open = gate.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if !open {
+                return Err(Error::Disconnected);
+            }
+            let client = Client::connect(server, "1").await?;
+            let connect: Connect = Arc::new(move || Box::pin(Client::connect(server, "1")));
+            Ok((client, connect))
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_pool_without_a_server_at_the_open_verifies_its_file_at_its_first_connection() {
+    let name = "pool-fresh";
+    let server = start(name);
+    let path = dir(&format!("{name}-var")).join("c-1.zoec");
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oids = other.new_oids(2).await.unwrap();
+    let first = commit(&other, oids[0], Tid(0), b"zero").await;
+    commit(&other, oids[1], Tid(0), b"one").await;
+    load_all(open_pool(&server, &path).await, &oids).await;
+    let tid = commit(&other, oids[0], first, b"new").await;
+
+    let gate = Arc::new(AtomicBool::new(false));
+    let reconnect = Reconnect::new(
+        gated(server.addr(), gate.clone()),
+        Duration::from_millis(20),
+    );
+    let cache = Cache::open(&path, SIZE, STORAGE).unwrap();
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, Some(cache), reconnect);
+    // Without a server, the file waits for its verification: `ready` waits,
+    // and the file serves nothing.
+    let waited = tokio::time::timeout(Duration::from_millis(200), pool.ready()).await;
+    assert!(waited.is_err());
+    let cache = pool.cache().unwrap().clone();
+    assert!(!cache.verified());
+    assert_eq!(cache.load(oids[1]), None);
+    assert_eq!(pool.take_file_check(), None);
+
+    gate.store(true, Ordering::SeqCst);
+    tokio::time::timeout(TIMEOUT, pool.ready()).await.unwrap();
+    assert_eq!(pool.take_file_check(), Some(FileCheck::Quick));
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(oids[0]), None);
+    assert_eq!(cache.load(oids[1]).unwrap().0, b"one");
+    pool.disconnect();
+}
+
+#[tokio::test]
+async fn ready_returns_at_the_close() {
+    let name = "pool-closed";
+    let server = start(name);
+    let path = dir(&format!("{name}-var")).join("c-1.zoec");
+    fill(&path, 1);
+    let gate = Arc::new(AtomicBool::new(false));
+    let reconnect = Reconnect::new(gated(server.addr(), gate), Duration::from_millis(20));
+    let cache = Cache::open(&path, SIZE, STORAGE).unwrap();
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, Some(cache), reconnect);
+    pool.disconnect();
+    tokio::time::timeout(TIMEOUT, pool.ready()).await.unwrap();
 }

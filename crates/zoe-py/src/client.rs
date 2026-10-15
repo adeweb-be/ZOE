@@ -70,7 +70,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Delivery, Endpoint, Error, Event, Open, Options, Pool,
+    Address, Cache, Connect, Delivery, Endpoint, Error, Event, FileCheck, Open, Options, Pool,
     PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
@@ -286,6 +286,7 @@ impl NativeClient {
                 let opened = py.detach(|| Cache::open(&path, size, name));
                 Some(opened.map_err(|e| match e.kind() {
                     io::ErrorKind::WouldBlock => errors::lock_failure(py, &path),
+                    io::ErrorKind::InvalidData => PyValueError::new_err(e.to_string()),
                     io::ErrorKind::InvalidInput => {
                         PyValueError::new_err(format!("cache_size {size}: {e}"))
                     }
@@ -304,6 +305,8 @@ impl NativeClient {
             client_label,
         };
         let upgrade = read_only_fallback && !read_only;
+        // The connect and the verification of a cache file share one wait.
+        let deadline = Instant::now() + timeout;
         let opened = py.detach(move || -> Result<_, Opening> {
             let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
@@ -335,9 +338,11 @@ impl NativeClient {
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
-            // A cache file with entries serves after its verification.
+            // A cache file with entries serves after its verification. The
+            // open waits for it for what is left of `wait_timeout`.
             if wait {
-                let _ = runtime.block_on(tokio::time::timeout(timeout, pool.ready()));
+                let left = deadline.saturating_duration_since(Instant::now());
+                let _ = runtime.block_on(tokio::time::timeout(left, pool.ready()));
             }
             Ok((runtime, pool, servers))
         });
@@ -515,6 +520,29 @@ impl NativeClient {
             .listener()
             .map(|listener| listener.extensions().to_vec())
             .unwrap_or_default())
+    }
+
+    /// Return how the verification of the cache file ended, once: `None`
+    /// before its end, after the first call, and without a file with
+    /// entries. Else a tuple `(kind, text)`: `kind` is `"kept"`, `"quick"`,
+    /// `"dropped"`, `"failed"` or `"ahead"`, and `text` says more for the
+    /// last two.
+    fn take_cache_check(&self) -> Option<(&'static str, String)> {
+        let check = lock(&self.pool).as_ref()?.take_file_check()?;
+        Some(match check {
+            FileCheck::Kept => ("kept", String::new()),
+            FileCheck::Quick => ("quick", String::new()),
+            FileCheck::Dropped => ("dropped", String::new()),
+            FileCheck::Failed(text) => ("failed", text),
+            FileCheck::Ahead { applied, server } => (
+                "ahead",
+                format!(
+                    "the last transaction {:016x} of the server is before the last \
+                     transaction {:016x} of the cache file",
+                    server.0, applied.0
+                ),
+            ),
+        })
     }
 
     /// Tell if the client is connected: not closed, and its listener is not
