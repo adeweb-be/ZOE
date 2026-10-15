@@ -1,6 +1,6 @@
 # 0034. The client cache file
 
-Status: proposed. The spike ZOE-152 wrote it for the human (finding: `docs/spikes/client-cache.md`). The number follows 0033 of the parallel spike ZOE-151.
+Status: proposed. The spike ZOE-152 wrote it for the human (finding: `docs/spikes/client-cache.md`). The ADR of the parallel spike ZOE-151 is 0036.
 
 ## Context
 
