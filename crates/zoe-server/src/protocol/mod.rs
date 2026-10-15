@@ -976,19 +976,25 @@ mod tests {
     /// storage `name`.
     fn registered_as(addr: std::net::SocketAddr, name: &str) -> Client {
         let mut client = Client::connect(addr).unwrap();
+        register(&mut client, name);
+        client
+    }
+
+    /// Answer the protocol on `client` and register with the storage
+    /// `name`.
+    fn register(client: &mut Client, name: &str) {
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        assert_eq!(read_frame(&mut client), PROTOCOL);
-        write_frame(&mut client, PROTOCOL);
+        assert_eq!(read_frame(client), PROTOCOL);
+        write_frame(client, PROTOCOL);
         send(
-            &mut client,
+            client,
             1,
             "register",
             vec![Value::from(name), Value::Boolean(false)],
         );
-        read_frame(&mut client);
-        client
+        read_frame(client);
     }
 
     /// Begin the transaction 7 and store `oid` as a new object.
@@ -1237,38 +1243,69 @@ mod tests {
             let max = crate::serve::DEFAULT_MAX_FRAME_SIZE.get();
             serve_connection(stream, storages, max, None, stopping).await;
         });
-        let mut client = registered(addr);
+        // The client has a receive buffer of 4 KiB. So a reply of 1 MiB
+        // that it does not read stays in the send queue of the server, and
+        // the server keeps the connection open until the client reads it.
+        let stream = runtime.block_on(async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            socket.connect(addr).await.unwrap()
+        });
+        let mut client = stream.into_std().unwrap();
+        client.set_nonblocking(false).unwrap();
+        register(&mut client, "1");
+        let begin = vec![Value::from(1), Value::Nil, Value::Nil, Value::Map(vec![])];
+        send(&mut client, 0, "tpc_begin", begin);
+        let large = Value::Binary(vec![7; 1 << 20]);
+        let store = vec![session::p64(1), session::p64(0), large, Value::from(1)];
+        send(&mut client, 0, "storea", store);
+        send(&mut client, 2, "vote", vec![Value::from(1)]);
+        read_frame(&mut client);
+        send(&mut client, 3, "tpc_finish", vec![Value::from(1)]);
+        // The `info` of the commit, then the reply of the finish.
+        read_frame(&mut client);
+        read_frame(&mut client);
 
-        // The stop comes before the bytes. So the reader sees the stop
-        // first, and it reads no call from these bytes.
+        // The client loads the large record and reads nothing. The first
+        // bytes of the reply arrive, so the reader read the load before
+        // the stop.
+        let load = vec![session::p64(1), session::p64(u64::MAX >> 1)];
+        send(&mut client, 4, "loadBefore", load);
+        client.peek(&mut [0; 1]).unwrap();
         stop.send_replace(true);
+        // The session ends only after the reader left its loop at the
+        // stop. So the bytes below arrive after the reader saw the stop,
+        // and it reads no call from them.
+        wait_until("the session did not end", || {
+            storage.stats.connections.load(Ordering::Relaxed) == 0
+        });
         for _ in 0..16 {
-            send(&mut client, 2, "ping", vec![]);
+            send(&mut client, 5, "ping", vec![]);
         }
         client.write_all(&[7; 100_000]).unwrap();
 
-        // The client gets the end of the connection, not a reset, and no
-        // reply.
+        // The client gets the reply of the load, then the end of the
+        // connection, not a reset, and no other reply.
         let mut rest = Vec::new();
         let read = client.read_to_end(&mut rest);
         assert!(read.is_ok(), "{read:?}");
-        assert!(rest.is_empty(), "{} bytes after the stop", rest.len());
-
-        // The client sends again while the server waits after its FIN. The
-        // connection ends within the wait, while the client keeps its side
-        // open.
         let fin = Instant::now();
-        let lingering = !served.is_finished();
-        client.write_all(&[7; 100_000]).unwrap();
+        assert!(rest.len() >= 4, "no reply of the load: {rest:?}");
+        let (len, rest) = rest.split_at(4);
+        let (reply, rest) = rest.split_at(u32::from_be_bytes(len.try_into().unwrap()) as usize);
+        let reply = rmpv::decode::read_value(&mut &reply[..]).unwrap();
+        let Value::Array(parts) = reply else {
+            panic!("not a message: {reply:?}");
+        };
+        assert_eq!(parts[0], Value::from(4), "{parts:?}");
+        assert_eq!(parts[2], Value::from(".reply"), "{parts:?}");
+        assert!(rest.is_empty(), "{} bytes after the reply", rest.len());
+
+        // The connection ends within the wait, while the client keeps its
+        // side open.
         wait_until("the connection did not end", || served.is_finished());
         let waited = fin.elapsed();
         assert!(waited < Duration::from_secs(5), "the wait took {waited:?}");
-        // The server read the late bytes before its close. So the close
-        // is not a reset.
-        if lingering {
-            let read = client.read(&mut [0; 16]);
-            assert!(matches!(read, Ok(0)), "{read:?}");
-        }
         drop(client);
         drop(runtime);
     }
