@@ -1,6 +1,6 @@
 # 0034. The client cache file
 
-Status: proposed. The spike ZOE-152 wrote it for the human (finding: `docs/spikes/client-cache.md`). The ADR of the parallel spike ZOE-151 is 0036.
+Status: accepted. The human accepted the layout and decided the questions that the spike ZOE-152 left open (finding: `docs/spikes/client-cache.md`). The ADR of the parallel spike ZOE-151 is 0036.
 
 ## Context
 
@@ -20,13 +20,13 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 
 **A hit never takes a lock and never writes.** A reader loads `applied`, then the index slot, then the entry. It copies the entry, checks both checksums, then checks that the head of the ring stayed within one ring of the entry. A current entry serves only snapshots up to `applied`. A doubt is a miss.
 
-**Compression is per entry, and off by default.** The codec is a field of each entry. zstd 1 halves a 2.8 KB pickle and divides a 100 KB pickle by three, but its decompression makes a hit through ZODB two to four times slower (5.6 against 10.4 µs, 26 against 103 µs). So entries are raw by default, and zstd per entry above a size is a setting. F28 then reads "compression as a setting"; the human decides.
+**Compression is per entry, and off by default.** The codec is a field of each entry. zstd 1 halves a 2.8 KB pickle and divides a 100 KB pickle by three, but its decompression makes a hit through ZODB two to four times slower (5.6 against 10.4 µs, 26 against 103 µs). So entries are raw by default, and zstd per entry above a size is a setting. F28 reads "compression as a setting".
 
 **Crash safety: on any doubt, the cache drops.** A process that dies leaves the page cache intact: the checksums drop a torn entry, and every other entry stays. A machine that restarted lost the page cache in an unknown order: when the boot id in the header differs and the file was not closed cleanly, the open drops every entry. A bad header, a bad length, another size or a bad state checksum drops every entry too. A drop never deletes the file while another process maps it.
 
-**Stage 2 keeps the lock of ZEO.** A private cache file takes an exclusive `flock`, so a second process on the same file fails at the open, as with `zc.lockfile`. The file has its own name, `{client}-{storage}.zoec`, so a native client never takes or overwrites the `.zec` file of a stock client.
+**Stage 2 keeps the lock of ZEO.** A private cache file takes an exclusive `flock`, so a second process on the same file fails at the open, as with `zc.lockfile`. The file of the native client is named `{client}-{storage}.zoec`, so a native client never takes or overwrites the `.zec` file of a stock client.
 
-**Stage 3 shares the file.** Each process holds a shared `flock`; a private open and a shared open of the same file exclude each other. Writers exclude each other with an open-file-description lock on byte 0 of the file, which the kernel releases when the process dies, and a mutex inside the process. Each process keeps its own last tid, which is its `lastTransaction`; `applied` belongs to the node. A process applies a transaction to the file only when `applied` is below its tid, under the writer lock, and moves `applied` after the ends: so each invalidation is applied once per node, and each process still gives it to its own DB. A process stores a current entry from a load only when `applied` is not above the tid up to which it had read its stream when the reply arrived; a store that runs later keeps that tid, not the tid of its own time. A verification that finds the cache too old clears it and moves `applied` in one hold of the writer lock, never in two. A process that lags gets more misses, never a stale entry. `clear` drops every entry of the node and keeps `applied`.
+**Stage 3 shares the file.** The key `shared-cache true` turns it on for a client with `client`. It is never the default. Each process holds a shared `flock`; a private open and a shared open of the same file exclude each other. Writers exclude each other with an open-file-description lock on byte 0 of the file, which the kernel releases when the process dies, and a mutex inside the process. Each process keeps its own last tid, which is its `lastTransaction`; `applied` belongs to the node. A process applies a transaction to the file only when `applied` is below its tid, under the writer lock, and moves `applied` after the ends: so each invalidation is applied once per node, and each process still gives it to its own DB. A process stores a current entry from a load only when `applied` is not above the tid up to which it had read its stream when the reply arrived; a store that runs later keeps that tid, not the tid of its own time. A verification that finds the cache too old clears it and moves `applied` in one hold of the writer lock, never in two. A process that lags gets more misses, never a stale entry. `clear` drops every entry of the node and keeps `applied`.
 
 **The file is never the only copy of anything.** It holds only what the server gave or what a commit sent to the server, and the server confirmed it first.
 
@@ -36,14 +36,14 @@ F28 asks for a native client with "an mmap'd compressed persistent cache", and F
 - A hit costs a few hundred nanoseconds in the cache. Through ZODB, the rest of ZODB costs more than the cache: the finding gives the numbers.
 - A crash of the machine drops a cache that was open. A clean close keeps it across a restart.
 - The `end` of an entry and its head checksum change together. A reader that sees one change without the other misses once.
-- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, so ZEO's `AssertionError` for a cache newer than the server stays for a private file only. How a shared file detects another history is open (below).
+- With several processes, verification at the open departs from ZEO: `applied` above the tid of `register` is normal, so ZEO's `AssertionError` for a cache newer than the server stays for a private file only. A shared file detects another history with the identity of the storage in its header (see "Decided with the ADR").
 - The layout is an on-disk format of the client. It is not the format of the store, so it is not a red zone, but a change of it changes the magic.
 
-## Open questions
+## Decided with the ADR
 
-- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. Candidates: a storage identity in the header (ZOE-162 asks for the format version and the storage there; this header has neither yet), an extension that names the store at `register` (a wire-protocol change), or both.
+- **Compression.** Entries are raw by default. zstd per entry is a setting for sites that need capacity more than hit speed.
+- **Another history.** A server restored from an older copy, then committed to once, has tids above the `applied` of a shared file, so no comparison of tids finds it. The header of the cache file holds the format version and an identity of the storage, as ZOE-162 asks. There is no extension at `register`, so the wire protocol does not change. A cache whose identity differs from the identity of the storage that it meets is dropped.
 - **Reconnects** with a shared file: a process compares the tid of its new `register` with its own last tid, and its DB needs `getInvalidations` from its own last tid, not from `applied`. The verification after a reconnect is ZOE-159.
-- **Compression** against F28 ("compressed") and ZOE-162 ("compressed entries"): this draft proposes raw entries by default.
 
 ## Alternatives
 
