@@ -20,6 +20,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench client report FILE` | the rows of a result of the client benchmark and its verdict |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
 | `just bench gate DIR` | the parity gate of phase 2: `zoe-server` against `zeo` in each cell of a results tree but `read_hot` (see [The gate](#the-gate)) |
+| `just bench plone COMMAND` | the Plone end-to-end benchmark: Locust against a Plone site on ZEO and on ZOE (see [The Plone end-to-end benchmark](#the-plone-end-to-end-benchmark)) |
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -147,6 +148,58 @@ just bench client report target/bench/client/<started>.json
 **The disk.** For each server and record size, the work directory holds the load store, the cache files of both clients for one shape, and one commit store: `disk_needed` in `shootout/client.py` bounds it, and the harness checks the free space before it starts. With 1000 objects and records of 100 KB, and 20 commits per worker, that is about 10.1 GB; with records of 1 KB, about 0.7 GB. The native client allocates its whole cache file at the open.
 
 The full run belongs on the reference machine, on CPython 3.14t with the 3.13 run beside it, as for the gate.
+
+## The Plone end-to-end benchmark
+
+B5 of the specification: Locust against a Plone 6.1 site, ZEO against ZOE, same Plone, same hardware. zodbshootout and the client benchmark measure the storage; this benchmark measures what a Plone user gets: completed pages and saves per second, their latency, and what conflicts cost. The harness is the uv project `bench/plone` (package `plonebench`). The findings of the last campaign are in [`docs/findings/plone-end-to-end.md`](../docs/findings/plone-end-to-end.md).
+
+```sh
+just plone zeo build && just plone zoeclient build && just plone zeoclient build
+just bench plone prepare                       # the small fixture, once
+just bench plone run --stack zoe-native --scenario edit --steps 1:60,4:60,16:60
+just bench plone campaign --stacks zeo,zoe-native --scenarios browse,edit --reps 3
+just bench plone report target/bench/plone/runs/* --out report.md --json summary.json
+just bench plone serve --stack zeo             # a stack on a copy of the fixture, for a look
+just bench plone test                          # the tests of the harness
+```
+
+**The stacks.** Every setting but the storage section is the same: the runner writes `zope.conf` and `wsgi.ini` of each instance from one template (`plonebench/stack.py`), with the eggs of the buildout scenarios of `plone/`.
+
+| Stack | Server | Client | What differs from `zeo` |
+| --- | --- | --- | --- |
+| `zeo` | ZEO 6 (`runzeo`, FileStorage, pickle protocol Z5) | `<zeoclient>`: `ZEO.ClientStorage` | the baseline; the ZEO server resolves conflicts with ZODB's resolver |
+| `zoe-native` | `zoe serve` | `<zoeclient>`: `zoe.zeo.ClientStorage`, native client; `zoedb[plone]` | the production combination: the native client, the `sequences` extension and `zoe.plone`, which gives `portal_uidgenerator` its ids from a store sequence |
+| `zoe-asyncio` | `zoe serve` | `<zoeclient>` with `native false`; `zoedb[plone]` | ZEO's asyncio client with the ZOE extensions: the sequence without the native client |
+| `zoe-stock` | `zoe serve` | `<zeoclient>`: stock `ZEO.ClientStorage` over M5, no zoedb | the server alone, with no client extension |
+
+On `zoe serve` every client resolves conflicts through the vote (tier 3). The structural and field-level merges, shadow mode and early write-intent locks of phase 4 are not built, so no stack has them, and the harness has no switch for them. `zoe serve` always compresses records with zstd at level 3; it has no option to turn compression off, so the benchmark has no compression experiment.
+
+**The constants** (`stack.Settings`, recorded in each result): 2 Zope instances with 2 request threads each, a ZODB cache of 30,000 objects per connection and a pool of 7 connections, a storage client cache of 128 MB in memory for each instance (no persistent cache file, for either client), a blob cache per instance, the server on CPU 0, the instances on CPUs 1 and 2, Locust on CPU 3 (`taskset`). Both servers make a commit durable before `tpc_finish` returns: FileStorage calls `fsync` in `_finish_finish`, `zoe serve` syncs its group commit. The page cache of the store disk is shared and stays warm between runs: the container cannot drop it.
+
+**The fixture.** `prepare` builds a deterministic synthetic site (`plonebench/corpus.py`; presets `small`, `medium`, `large`, or `--spec FILE` with any field of `SiteSpec`): sections of nested folders, Documents and News Items with generated text and subjects, Files of 16 KB to 1 MB, collections, users with local roles through groups, three workflow states, and the folders `bench/inbox`, `bench/hot`, `bench/shared` and `bench/import` for the contention scenarios. It builds the site on a ZEO server, converts the `Data.fs` with `zoe convert`, then reads a logical digest of the site through each store (`inzope/digest.py`: every object with its fields, state, UID, local roles, View roles, dates, versions and workflow history; the users and groups; the catalog and fixed queries) and refuses the fixture when they differ. The text is made of generated words, never of a natural language. The fixture lives under `target/bench/plone/fixtures/<name>`, with the password of the accounts in a file only the user reads. A run never opens it: it copies the store first.
+
+**The scenarios** (`plonebench/workload.py`). Each simulated user has its own session and account: anonymous visitors, members, editors who hold local roles on one section, an importer and a maintainer. The UI scenarios go through the rendered pages and the forms of Plone, with the CSRF token of plone.protect; the REST scenarios go through plone.restapi with a JWT, and the report names the interface of each scenario.
+
+| Scenario | Users do |
+| --- | --- |
+| `browse` | folders, Documents, News Items, File views and downloads, up the breadcrumbs; anonymous and logged in |
+| `catalog` | `@@search` with text, filters, sorting and a second page; collections; REST `@search` with metadata |
+| `edit` | the edit form on Documents of their own section, a user per Document |
+| `create-spread` / `create-shared` | the add form in folders of their own section / all in `bench/inbox` |
+| `workflow` | publish and retract from the workflow menu, then an anonymous request that checks the visibility |
+| `mixed` | a weighted mix of the above, weights in the result |
+| `mixed-background` | `mixed`, beside one maintainer that reindexes `SearchableText` in a loop and one importer that posts Documents through REST |
+| `contention-folder` | the edit form, a Document each, all in one folder |
+| `contention-fields` | REST PATCH, two users on each Document: one writes the title, the other the description |
+| `contention-same` | REST PATCH, every user writes the title of one of four hot Documents |
+
+A run steps the users of a closed workload (`--steps users:seconds,...`, no think time by default): each user waits for its response before its next operation, so a slower server lowers the offered rate. The first seconds of each step stay out (`--trim`). Locust gets no retry: a write that fails is a failed operation, unless `--client-retries N` gives a bounded retry, whose latency runs from the first request to the final outcome.
+
+**The ledger and the verification.** Locust writes one record for each logical operation (`plonebench/ledger.py`): what it wrote and what the site acknowledged, with the outcome `ok` (the response showed the effect), `failed` (an HTTP error: Zope aborted the transaction), `ambiguous` (no complete answer: the write may have committed) or `rejected`. A write leaves a pending record before its request, so a run that ends during a request leaves an ambiguous one. After the run, the instances stop, and `inzope/observe.py` reads the site through a client of its own, read-only, before any repair. `plonebench/verification.py` then checks: each acknowledged creation exists, no object exists without its operation, a refused write did not commit, UIDs and history ids are unique, each edited field holds the last acknowledged value (with several writers, a value that no later acknowledged write superseded), each acknowledged edit added one CMFEditions version and each transition one workflow history entry, anonymous may View exactly the published objects, each object has one catalog entry with its title, state, date and security, and a search for the token of the current title finds the object while a superseded token does not. The verdict is in each result.
+
+**The instrumentation.** A WSGI filter in each Zope process (`probe/plonebench_probe.py`, first in the pipeline of `wsgi.ini`) writes one JSON line per request: the op id and attempt that Locust sends in headers (never a URL or a body), the attempts of the publisher, each `ConflictError` with the class of its object and whether the publisher retried, the commit time, the storage calls of the request (`loadBefore`, `store`, `tpc_vote`, `tpc_finish`, `tpc_abort`) with their time and bytes, the conflicts that ZODB's resolver resolved in the process, and the CPU time of the thread. The same filter runs on every stack. The ZEO server resolves conflicts in its own process, so a probe there (`probe/zeoserver`) counts them; on `zoe serve` the clients resolve, and the probe of the instances counts them. The runner reads `server_status` of both servers, and the Prometheus metrics of `zoe serve` (lock waits, vote and finish latency, fsync batch sizes), before and after the measured window, and samples `/proc` once a second: CPU, resident memory, I/O bytes, context switches and run-queue delay of each process, the CPUs (steal included) and the disk of the store (flushes included). A counter that a stack does not keep is absent from its result, never 0. `--no-probe` runs without the filter, to measure its cost.
+
+**The results.** Each run writes `target/bench/plone/runs/<started>-<scenario>-<stack>-r<n>/`: `result.json` (the machine, the software, the commit, the stack, the settings, the scenario and its mix, the steps, the fixture and its equivalence, the numbers of each step, the server counters, the resources and the verdict), the ledger, the probe files, the samples, the CSV files of Locust and the logs. The store copy goes at the end. `report` reads run directories and prints one table per scenario: per stack and step, the median rate of successful operations over the repetitions with its range, p50, p95 and p99 pooled over the repetitions (a p99 of fewer than 200 operations is marked `~`), failures, first-attempt successes, server attempts per operation, conflicts per 1,000 operations, exhausted retries, CPU per operation of Zope and of the server, bytes the server wrote per operation, the CPU of Locust and the verdicts. A campaign alternates the order of the stacks from one repetition to the next.
 
 ## The results repository
 
