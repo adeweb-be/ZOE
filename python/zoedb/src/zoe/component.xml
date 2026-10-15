@@ -94,8 +94,12 @@
     </key>
     <key name="authenticate" datatype="existing-dirpath">
       <description>
-        The PEM file of the CA certificates that the certificate of the
-        server must chain to. The native client needs it, as a file.
+        The PEM file or the directory of the CA certificates that the
+        certificate of the server must chain to. In a directory, the native
+        client reads every file. Without this key, the client uses the CA
+        certificates of the system. Then keep check-hostname true: without
+        the name check, any certificate that a CA of the system signed
+        passes.
       </description>
     </key>
     <key name="check-hostname" datatype="boolean" default="true">
