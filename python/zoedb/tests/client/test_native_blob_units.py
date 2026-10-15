@@ -131,6 +131,8 @@ def test_a_download_writes_again_a_partial_file_that_a_stopped_download_left(
         storage.fshelper.createPathForOID(oid)
         with open(filename + ".dl", "wb") as f:
             f.write(b"a partial file that is longer than the blob")
+        # A crash between the chmod and the rename leaves it read-only.
+        os.chmod(filename + ".dl", 0o400)
         assert storage.loadBlob(oid, tid) == filename
         with open(filename, "rb") as f:
             assert f.read() == b"the whole blob"
@@ -154,6 +156,40 @@ def test_an_abort_removes_the_blob_file_that_the_transaction_took(server, tmp_pa
         assert not os.path.exists(filename)
         storage.tpc_abort(txn)
         assert blob_files(cache) == []
+    finally:
+        storage.close()
+
+
+def test_a_callback_of_the_finish_that_raises_leaves_the_blob_in_the_cache(
+    server, tmp_path
+):
+    from ZODB.Connection import TransactionMetaData
+
+    class Refused(Exception):
+        pass
+
+    cache = tmp_path / "cache"
+    storage = native(server, cache)
+    try:
+        oid = storage.new_oid()
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        filename = blob_file(storage.temporaryDirectory(), b"committed")
+        storage.storeBlob(oid, z64, b"pickle", filename, "", txn)
+        storage.tpc_vote(txn)
+        tids = []
+
+        def callback(tid):
+            tids.append(tid)
+            raise Refused()
+
+        with pytest.raises(Refused):
+            storage.tpc_finish(txn, callback)
+        # The commit holds the blob: its file has its name in the cache,
+        # and no temporary file stays.
+        committed = storage.fshelper.getBlobFilename(oid, tids[0])
+        assert blob_files(cache) == [os.path.relpath(committed, cache)]
+        assert storage.loadBlob(oid, tids[0]) == committed
     finally:
         storage.close()
 

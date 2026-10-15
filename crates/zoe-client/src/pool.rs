@@ -194,6 +194,19 @@ impl Shared {
         self.listener.clone()
     }
 
+    /// Return a connection of the pool for a download, in turn: a
+    /// connection that commits and is not lost. When there is none, return
+    /// the listener.
+    fn download_connection(&self) -> Arc<Client> {
+        let conns = self.conns.read().unwrap_or_else(PoisonError::into_inner);
+        let start = self.next_load.fetch_add(1, Ordering::Relaxed);
+        (0..conns.len())
+            .map(|step| &conns[(start + step) % conns.len()])
+            .find(|conn| conn.is_connected())
+            .unwrap_or(&self.listener)
+            .clone()
+    }
+
     /// Forget the connection `client`, which closed or which the pool
     /// closes.
     fn forget(&self, client: &Arc<Client>) {
@@ -342,9 +355,14 @@ impl Pool {
     }
 
     /// Download the blob of `oid` that the transaction `serial` wrote into
-    /// `sink`, through any connection, as `Client::send_blob` does. The
-    /// pieces of the download come on the connection that carries its
-    /// `sendBlob`. Return the number of bytes.
+    /// `sink`, as `Client::send_blob` does, through a connection other than
+    /// the listener when one is open. So the delivery of the invalidations
+    /// never waits for the writes of a download. The pieces of the download
+    /// come on the connection that carries its `sendBlob`. Return the
+    /// number of bytes.
+    ///
+    /// The caller polls the future until it ends, or drops it: while the
+    /// download waits for the caller, its connection waits too.
     pub async fn send_blob<W: Write>(
         &self,
         oid: Oid,
@@ -352,7 +370,7 @@ impl Pool {
         sink: &mut W,
     ) -> Result<u64, Error> {
         self.shared
-            .any_connection()
+            .download_connection()
             .send_blob(oid, serial, sink)
             .await
     }

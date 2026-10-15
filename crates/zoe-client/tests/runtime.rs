@@ -1115,3 +1115,61 @@ async fn a_blob_from_a_reader_goes_out_in_full_chunks_and_a_shared_blob_by_its_n
     drop(txn);
     client.close().await;
 }
+
+/// A reader that gives one full chunk of a blob, then fails.
+struct Broken(bool);
+
+impl io::Read for Broken {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.0 {
+            return Err(io::Error::other("the file is gone"));
+        }
+        self.0 = true;
+        let n = buf.len().min(BLOB_CHUNK);
+        buf[..n].fill(1);
+        Ok(n)
+    }
+}
+
+#[tokio::test]
+async fn a_failed_read_of_a_blob_ends_the_transaction() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        let mut methods = Vec::new();
+        loop {
+            let (_, _, method, _) = peer.recv().await;
+            methods.push(method.clone());
+            if method == "tpc_abort" {
+                return methods;
+            }
+        }
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"", b"", b"").await.unwrap();
+    let failed = txn
+        .store_blob_from(Oid(1), Tid(0), b"p", &mut Broken(false))
+        .await;
+    assert!(matches!(failed, Err(Error::Io(_))), "{failed:?}");
+    // Only the abort may follow: the later calls send nothing.
+    let store = txn.store(Oid(2), Tid(0), b"q").await;
+    assert!(matches!(store, Err(Error::Invalid(_))), "{store:?}");
+    let vote = txn.vote().await;
+    assert!(matches!(vote, Err(Error::Invalid(_))), "{vote:?}");
+    drop(txn);
+    let methods = tokio::time::timeout(TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        methods,
+        [
+            "tpc_begin",
+            "storea",
+            "storeBlobStart",
+            "storeBlobChunk",
+            "tpc_abort"
+        ]
+    );
+    client.close().await;
+}

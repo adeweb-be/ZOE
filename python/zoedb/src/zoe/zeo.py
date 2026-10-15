@@ -931,10 +931,12 @@ class _NativeClientStorage(ClientStorage):
         finally:
             blobs = self._blobs_of(txn)
             self.tpc_end(txn)
+            # The commit holds the blobs once the finish gives a tid, also
+            # when the callback raises.
             if tid is None:
                 _remove_files(blobs)
-        if not self.shared_blob_dir:
-            self._cache_blobs(blobs, tid)
+            elif not self.shared_blob_dir:
+                self._cache_blobs(blobs, tid)
         return tid
 
     def tpc_abort(self, txn, timeout=None):
