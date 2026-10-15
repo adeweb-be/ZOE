@@ -449,26 +449,30 @@ def _as_bytes(value):
 def _native_tls(section, server_hostname):
     """Return the TLS of the native client from an `<ssl>` section.
 
-    The tuple holds the certificate, the key or None, the CA file or
-    directory of `authenticate` or None, `check-hostname`, and the server
-    name: `server_hostname`, else the `server-hostname` of the section,
-    else None. As in `ZEO.zconfig.ssl_config`, no `authenticate` and
-    `DYNAMIC` that is not a directory give None: the client then checks
-    the server against the CA certificates of the system. Raise
-    `Unsupported` for an encrypted key, which the native client does not
-    read.
+    The tuple holds the certificate or None, the key or None, the CA file
+    or directory of `authenticate` or None, `check-hostname`, and the
+    server name: `server_hostname`, else the `server-hostname` of the
+    section, else None. As in `ZEO.zconfig.ssl_config`, no `certificate`
+    gives a client without a certificate, which ignores `key` and
+    `password-function`. No `authenticate` and `DYNAMIC` that is not a
+    directory give None: the client then checks the server against the CA
+    certificates of the system. Raise `Unsupported` for an encrypted key,
+    which the native client does not read.
     """
-    if section.password_function:
-        raise Unsupported(
-            "the native client reads only a key that is not encrypted: "
-            "leave password-function out of <ssl>"
-        )
+    certificate = key = None
+    if section.certificate:
+        if section.password_function:
+            raise Unsupported(
+                "the native client reads only a key that is not encrypted: "
+                "leave password-function out of <ssl>"
+            )
+        certificate = os.path.abspath(section.certificate)
+        key = os.path.abspath(section.key) if section.key else None
     auth = section.authenticate
     if auth == "DYNAMIC" and not os.path.isdir(auth):
         auth = None
-    key = os.path.abspath(section.key) if section.key else None
     return (
-        os.path.abspath(section.certificate),
+        certificate,
         key,
         os.path.abspath(auth) if auth else None,
         bool(section.check_hostname),

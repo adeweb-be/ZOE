@@ -181,6 +181,35 @@ async fn a_tls_client_never_speaks_to_a_server_without_tls() {
     assert!(opened.is_err(), "{opened:?}");
 }
 
+#[tokio::test]
+async fn a_client_without_a_certificate_opens_when_the_server_asks_for_none() {
+    let certs = certs();
+    let tls =
+        zoe_server::serve::TlsOptions::new(certs.join("server.pem"), certs.join("server.key"));
+    let store = fresh_dir("anonymous").join("store");
+    let server = Server::start(ServeOptions::new(store).tls(tls)).unwrap();
+    let authenticate = certs.join("server-ca.pem");
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let client = open_with(server.addr(), options, "localhost")
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    client.close().await;
+    // A wrong name still fails the open.
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let refused = open_with(server.addr(), options, "example.org").await;
+    assert!(matches!(refused, Err(Error::Io(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_client_without_a_certificate_fails_the_open_when_the_server_asks_for_one() {
+    let server = serve("anonymous-refused");
+    let authenticate = certs().join("server-ca.pem");
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let refused = open_with(server.addr(), options, "localhost").await;
+    assert!(refused.is_err(), "{refused:?}");
+}
+
 /// Return a new directory `name` with a copy of the CA certificate of each
 /// of `cas`.
 fn ca_dir(name: &str, cas: &[&str]) -> PathBuf {
