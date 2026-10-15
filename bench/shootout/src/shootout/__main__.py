@@ -21,8 +21,9 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     run_cmd = commands.add_parser("run", help="run the baseline and write the results")
-    run_cmd.add_argument("--quick", action="store_true", help="run the quick set only")
-    run_cmd.add_argument(
+    sets = run_cmd.add_mutually_exclusive_group()
+    sets.add_argument("--quick", action="store_true", help="run the quick set only")
+    sets.add_argument(
         "--gate",
         action="store_true",
         help="run the gate set: 6 cells, 3 values each",
