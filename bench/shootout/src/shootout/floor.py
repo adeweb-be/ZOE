@@ -202,7 +202,7 @@ class FloorStorage:
         return sum(
             len(data) if data.__class__ is bytes else data.length
             # A copy, so that a commit can add a record during the sum.
-            for _, data, _ in tuple(self._store.records.values())
+            for _, data, _ in self._store.records.copy().values()
         )
 
     def history(self, oid, size=1):
