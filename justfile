@@ -37,10 +37,10 @@ test:
     done
     just deploy check
 
-# Run the zoe-core tests and the race canary under ThreadSanitizer.
-# `just tsan` runs the tests of zoe-core under ThreadSanitizer.
-# `just tsan zoe-server FILTER` runs the tests of the library of zoe-server
-# whose name holds FILTER instead. The canary test runs in both cases.
+# Run tests and the race canary under ThreadSanitizer. `just tsan` runs the
+# tests of zoe-core, and `just tsan zoe-core FILTER` only those whose name
+# holds FILTER. `just tsan zoe-server FILTER` runs the tests of the library
+# of zoe-server whose name holds FILTER. The canary test runs in each case.
 tsan crate="zoe-core" filter="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -61,7 +61,7 @@ tsan crate="zoe-core" filter="":
     tsan=(cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
         --target-dir target/tsan --locked)
     if [ "{{crate}}" = zoe-core ]; then
-        run=("${tsan[@]}" -p zoe-core)
+        run=("${tsan[@]}" -p zoe-core -- "{{filter}}")
     else
         run=("${tsan[@]}" -p "{{crate}}" --lib -- "{{filter}}")
     fi
