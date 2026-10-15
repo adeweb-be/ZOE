@@ -3,11 +3,14 @@
 import io
 import json
 
-from shootout import gate
+from shootout import KB, gate
 
 
-def write(root, storage, python, ops):
-    """Write a result of storage on python, such as cp314t, with ops per name."""
+def write(root, storage, python, ops, sizes=(KB,)):
+    """Write a result of storage on python, such as cp314t, with ops per name.
+
+    Each name has one cell in each object size of sizes.
+    """
     builds = {"cp313": ("3.13.0", False), "cp314t": ("3.14.0", True)}
     version, free_threaded = builds[python]
     result = {
@@ -24,10 +27,11 @@ def write(root, storage, python, ops):
                 "name": name,
                 "mode": "threads",
                 "concurrency": 16,
-                "object_size": 1024,
+                "object_size": size,
                 "ops_per_second": value,
             }
             for name, value in ops.items()
+            for size in sizes
         ],
     }
     path = root / "results" / "reference" / python / storage / "run.json"
@@ -48,20 +52,49 @@ def test_the_default_ratios_are_constants_of_the_gate():
     assert gate.default_ratio("zoe") == 1.0
 
 
-def test_only_zoe_native_counts_read_hot():
-    assert gate.left_out("zoe-native") == {}
+def test_only_zoe_native_counts_read_hot_at_100_kb():
+    assert set(gate.left_out("zoe-native")) == {("read_hot", KB)}
     assert gate.left_out("zoe-server") == gate.LEFT_OUT
     assert gate.left_out("zoe") == gate.LEFT_OUT
 
 
-def test_the_summary_of_zoe_native_names_every_cell(tmp_path):
-    write(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0})
-    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0, "read_hot": 3000.0})
+def verdicts(lines, scenario):
+    """Return the object size and the verdict of each row of scenario."""
+    return [
+        (int(line.split()[3]), " ".join(line.split()[7:]))
+        for line in lines
+        if line.startswith(f"{scenario} ")
+    ]
+
+
+def test_zoe_native_leaves_out_read_hot_at_1_kb_and_counts_it_at_100_kb(tmp_path):
+    sizes = (KB, 100 * KB)
+    write(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0}, sizes)
+    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0, "read_hot": 2900.0}, sizes)
     code, lines = report(tmp_path, "zoe-native")
+    assert code == 1
+    assert verdicts(lines, "read_hot") == [(KB, "left out"), (100 * KB, "FAIL")]
+    assert verdicts(lines, "add") == [(KB, "pass"), (100 * KB, "pass")]
+    assert [line for line in lines if line.startswith("left out: ")] == [
+        "left out: read_hot at 1 KB, because ZODB itself takes most of the "
+        "time of a hit there"
+    ]
+    assert "at least 3x in each cell but read_hot at 1 KB;" in lines[-1]
+    assert lines[-1].endswith("4 cells, 1 below, 0 missing, 1 left out")
+
+
+def test_zoe_server_leaves_out_read_hot_in_both_sizes(tmp_path):
+    sizes = (KB, 100 * KB)
+    write(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0}, sizes)
+    write(tmp_path, "zoe-server", "cp313", {"add": 1000.0, "read_hot": 500.0}, sizes)
+    code, lines = report(tmp_path, "zoe-server")
     assert code == 0
-    assert not any(line.startswith("left out: ") for line in lines)
-    assert "at least 3x in each cell;" in lines[-1]
-    assert lines[-1].endswith("2 cells, 0 below, 0 missing, 0 left out")
+    assert verdicts(lines, "read_hot") == [(KB, "left out"), (100 * KB, "left out")]
+    assert [line for line in lines if line.startswith("left out: ")] == [
+        f"left out: read_hot, because {gate.LEFT_OUT['read_hot', None]}"
+    ]
+    assert "at least 1x in each cell but read_hot;" in lines[-1]
+    assert lines[-1].endswith("4 cells, 0 below, 0 missing, 2 left out")
 
 
 def test_a_build_counts_and_the_other_prints_beside_it(tmp_path):
