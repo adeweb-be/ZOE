@@ -258,6 +258,16 @@ def test_the_native_tls_refuses_an_encrypted_key():
         zoe.zeo._native_tls(ssl_section(password_function="m.f"), None)
 
 
+def test_the_native_tls_without_a_certificate_ignores_the_key():
+    import zoe.zeo
+
+    # As ZEO.zconfig.ssl_config, the client then loads no key.
+    section = ssl_section(certificate=None, key="k.pem", password_function="m.f")
+    tls = zoe.zeo._native_tls(section, None)
+    assert tls[:2] == (None, None)
+    assert tls[2].endswith("ca.pem")
+
+
 def test_the_native_tls_takes_a_directory_or_the_system_store(tmp_path):
     import zoe.zeo
 
@@ -371,6 +381,40 @@ def test_without_authenticate_the_client_checks_the_server_with_the_system_store
     monkeypatch.setenv("SSL_CERT_FILE", str(certs / "other-ca.pem"))
     with pytest.raises(ClientDisconnected):
         open_tls(tls_server, certs, None, wait_timeout=2)
+
+
+def test_an_ssl_section_with_only_authenticate_opens_the_native_client(tmp_path, certs):
+    import ZODB
+    from ZODB.utils import z64
+
+    import zoe.testing
+
+    # The server certificate is valid for the address of the server, so
+    # the client checks the name with no other key.
+    for name in ["server-ca.pem", "server-ca.key"]:
+        shutil.copy(certs / name, tmp_path)
+    sign(tmp_path, "server", "server-ca", "subjectAltName = IP:127.0.0.1\n")
+    args = [
+        "--tls-cert", str(tmp_path / "server.pem"),
+        "--tls-key", str(tmp_path / "server.key"),
+    ]  # fmt: skip
+    # The keys that the section does not give have their defaults.
+    section = ssl_section(certificate=None, authenticate=str(certs / "server-ca.pem"))
+
+    def open_native(server):
+        return zoe.testing.native_client(
+            server.address, storage="1", wait_timeout=TIMEOUT, _ssl_section=section
+        )
+
+    with ZoeServer(str(tmp_path / "store"), args=args) as server:
+        ZODB.DB(open_native(server)).close()
+        # A second client loads the root from the server.
+        storage = open_native(server)
+        try:
+            data, tid = storage.load(z64)
+            assert data and tid != z64
+        finally:
+            storage.close()
 
 
 def test_an_empty_host_is_the_loopback_for_the_native_client():

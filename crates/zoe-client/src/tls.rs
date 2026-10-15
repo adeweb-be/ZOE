@@ -9,7 +9,8 @@
 //! also checks that the certificate is valid for the name of the server:
 //! the webpki verifier of rustls does both. Without it, the chain check of
 //! rustls runs alone, and no name check runs. It sends its own certificate
-//! to the server.
+//! to the server when it has one. Without a certificate, it sends none,
+//! as ZEO's client does without `certificate`.
 //!
 //! The certificate of the server must chain to a CA certificate of
 //! `authenticate`. A self-signed server certificate in `authenticate` does
@@ -37,7 +38,7 @@ use crate::runtime::Stream;
 /// a ZEO client gives them. The files are PEM.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsOptions {
-    certificate: PathBuf,
+    certificate: Option<PathBuf>,
     key: Option<PathBuf>,
     authenticate: Option<PathBuf>,
     check_hostname: bool,
@@ -63,9 +64,19 @@ impl TlsOptions {
     /// the default files of OpenSSL.
     pub fn system(certificate: impl AsRef<Path>) -> Self {
         Self {
-            certificate: certificate.as_ref().to_path_buf(),
+            certificate: Some(certificate.as_ref().to_path_buf()),
+            ..Self::without_certificate(None)
+        }
+    }
+
+    /// Send no certificate, and check the server against the CA
+    /// certificates in `authenticate`, or against those of the system when
+    /// `authenticate` is `None`. The client ignores [`TlsOptions::key`].
+    pub fn without_certificate(authenticate: Option<&Path>) -> Self {
+        Self {
+            certificate: None,
             key: None,
-            authenticate: None,
+            authenticate: authenticate.map(Path::to_path_buf),
             check_hostname: true,
         }
     }
@@ -87,8 +98,8 @@ impl TlsOptions {
     }
 }
 
-/// The TLS of a client: its certificate, its key and the checks of the
-/// server certificate. A clone shares the configuration.
+/// The TLS of a client: its certificate and its key, if any, and the
+/// checks of the server certificate. A clone shares the configuration.
 #[derive(Clone)]
 pub struct Tls {
     connector: TlsConnector,
@@ -108,10 +119,16 @@ impl Tls {
     /// too.
     pub fn load(options: &TlsOptions) -> Result<Self, String> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let certs = certificates(&options.certificate)?;
-        let key_file = options.key.as_deref().unwrap_or(&options.certificate);
-        let key = PrivateKeyDer::from_pem_file(key_file)
-            .map_err(|error| format!("{}: {error}", key_file.display()))?;
+        let client = match &options.certificate {
+            Some(certificate) => {
+                let certs = certificates(certificate)?;
+                let key_file = options.key.as_deref().unwrap_or(certificate);
+                let key = PrivateKeyDer::from_pem_file(key_file)
+                    .map_err(|error| format!("{}: {error}", key_file.display()))?;
+                Some((certs, key, key_file))
+            }
+            None => None,
+        };
         let (roots, source) = roots(options.authenticate.as_deref())?;
         let roots = Arc::new(roots);
         let algorithms = provider.signature_verification_algorithms;
@@ -129,9 +146,12 @@ impl Tls {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
         };
-        let config = builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|error| format!("{}: {error}", key_file.display()))?;
+        let config = match client {
+            Some((certs, key, key_file)) => builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|error| format!("{}: {error}", key_file.display()))?,
+            None => builder.with_no_client_auth(),
+        };
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
         })
@@ -280,7 +300,7 @@ mod tests {
     #[test]
     fn the_options_keep_their_files_and_check_the_name_by_default() {
         let options = TlsOptions::new("c.pem", "ca.pem");
-        assert_eq!(options.certificate, PathBuf::from("c.pem"));
+        assert_eq!(options.certificate, Some(PathBuf::from("c.pem")));
         assert_eq!(options.key, None);
         assert_eq!(options.authenticate, Some(PathBuf::from("ca.pem")));
         assert!(options.check_hostname);
@@ -290,6 +310,29 @@ mod tests {
         let options = TlsOptions::system("c.pem");
         assert_eq!(options.authenticate, None);
         assert!(options.check_hostname);
+        let options = TlsOptions::without_certificate(Some(Path::new("ca.pem")));
+        assert_eq!(options.certificate, None);
+        assert_eq!(options.key, None);
+        assert_eq!(options.authenticate, Some(PathBuf::from("ca.pem")));
+        assert!(options.check_hostname);
+        let options = TlsOptions::without_certificate(None);
+        assert_eq!(options.authenticate, None);
+    }
+
+    #[test]
+    fn without_a_certificate_the_load_reads_no_key() {
+        let dir = fresh_dir("anonymous");
+        let ca = dir.join("ca.pem");
+        let output = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt"])
+            .args(["ec_paramgen_curve:prime256v1", "-nodes", "-days", "2"])
+            .args(["-subj", "/CN=ca", "-keyout", "ca.key", "-out", "ca.pem"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let options = TlsOptions::without_certificate(Some(&ca)).key(dir.join("missing.key"));
+        Tls::load(&options).unwrap();
     }
 
     #[test]
