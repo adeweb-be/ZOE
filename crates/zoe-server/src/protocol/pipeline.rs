@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
+use super::compress::Compressor;
 use super::message::Call;
 use super::outbox::{Outbox, Room, Turn};
 use super::session::{self, Reply, Session, Transaction};
@@ -349,7 +350,7 @@ impl Lane {
 /// order, until no transaction is open and no call waits. The drop of the
 /// state at the end aborts a transaction that is still open, in the span
 /// of the connection, so its log lines name the client and the storage.
-fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
+fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, compress: Compress) {
     /// The end of the thread on a panic: the connection ends.
     struct Guard<'a>(&'a Lane, &'a Ended);
 
@@ -363,9 +364,10 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
     }
 
     let _guard = Guard(lane, ended);
-    let mut transaction = Transaction::new(Arc::clone(session));
+    let (compressor, runtime) = compress;
+    let mut transaction = Transaction::new(Arc::clone(session)).compressing(compressor, runtime);
     while let Some((
-        call,
+        mut call,
         Ticket {
             slot: _slot, room, ..
         },
@@ -377,7 +379,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
         }
         let _entered = session.span(peer).entered();
         let _request = session.request(&call).entered();
-        let outcome = transaction.call(&call);
+        let outcome = transaction.call(&mut call);
         if !Reply::new(room).send(&call, outcome, session.outbox()) {
             lane.stop();
             ended.end();
@@ -387,6 +389,9 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str) {
     let _entered = session.span(peer).entered();
     drop(transaction);
 }
+
+/// The compression pool and the runtime of the jobs of a transaction.
+type Compress = (Compressor, Arc<dyn Runtime>);
 
 /// Run a call that is not a call of the transaction, in the span of the
 /// connection, and put its reply. A panic ends the connection.
@@ -417,6 +422,8 @@ pub(crate) struct Calls {
     session: Option<Arc<Session>>,
     outbox: Outbox,
     pool: Pool,
+    /// The compression pool of the transactions.
+    compressor: Compressor,
     /// The tasks and the threads of the calls.
     runtime: Arc<dyn Runtime>,
     /// The client, as the log lines name it until it gives a label.
@@ -450,6 +457,7 @@ impl Calls {
     ) -> Self {
         Self {
             pool: storages.pool.clone(),
+            compressor: storages.compressor.clone(),
             storages: Some(storages),
             session: None,
             outbox,
@@ -618,9 +626,10 @@ impl Calls {
         if session::in_transaction(&call.method) {
             if self.lane.push(call, ticket) {
                 let lane = Arc::clone(&self.lane);
+                let compress = (self.compressor.clone(), Arc::clone(&self.runtime));
                 self.runtime.spawn_blocking(Box::new(move || {
                     let _mark = mark;
-                    run_lane(&session, &lane, &ended, &peer);
+                    run_lane(&session, &lane, &ended, &peer, compress);
                 }));
             }
         } else if session::runs_long(&call.method) {

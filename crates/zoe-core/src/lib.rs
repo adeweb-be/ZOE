@@ -26,12 +26,12 @@ mod types;
 pub mod vfs;
 
 pub use backend::{
-    Backend, BlobRecord, Bytes, NewRecord, PackStats, Record, RecordEncoding, RecordMeta, TxnIter,
-    TxnMeta, TxnRecords, TxnStatus, WriteTxn,
+    Backend, BlobRecord, Bytes, NewPayload, NewRecord, PackStats, Payload, Record, RecordEncoding,
+    RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
 pub use clock::{Clock, SystemClock, Waiter, timestamp};
-pub use commit::{Finished, Observer, Txn};
+pub use commit::{Encoded, Finished, Observer, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;

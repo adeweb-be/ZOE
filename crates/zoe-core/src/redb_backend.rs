@@ -26,8 +26,8 @@ use redb::{
 };
 
 use crate::backend::{
-    Backend, BlobRecord, Bytes, NewRecord, PackStats, Record, RecordEncoding, RecordMeta, TxnIter,
-    TxnMeta, TxnRecords, TxnStatus, WriteTxn,
+    Backend, BlobRecord, Bytes, NewPayload, NewRecord, PackStats, Payload, Record, RecordEncoding,
+    RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
@@ -1058,22 +1058,33 @@ impl WriteTxn for RedbWrite<'_> {
         tid: Tid,
         new: &mut dyn Iterator<Item = Result<NewRecord<'_>>>,
     ) -> Result<()> {
+        let mut payloads =
+            new.map(|record| record.map(|(oid, prev, data)| (oid, prev, Payload::Pickle(data))));
+        self.put_payloads(tid, &mut payloads)
+    }
+
+    fn put_payloads(
+        &mut self,
+        tid: Tid,
+        new: &mut dyn Iterator<Item = Result<NewPayload<'_>>>,
+    ) -> Result<()> {
         let fresh = self.fresh()?;
         // The two tables stay open for all the records of the call.
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
         for record in new {
-            let (oid, prev, data) = record?;
+            let (oid, prev, payload) = record?;
             Self::touch_put(&mut self.touched, &records, oid, prev, fresh, false)?;
             let key = format::record_key(oid, tid);
-            let frame = format::encode_frame_with(
-                KeySpace::Records,
-                &key,
-                format::MAIN_BRANCH,
-                prev,
-                &data,
-                self.compression,
-            );
+            let (space, branch) = (KeySpace::Records, format::MAIN_BRANCH);
+            let frame = match payload {
+                Payload::Pickle(data) => {
+                    format::encode_frame_with(space, &key, branch, prev, &data, self.compression)
+                }
+                Payload::Encoded(codec, stored) => {
+                    format::encode_frame_payload(space, &key, branch, prev, codec, &stored)
+                }
+            };
             records.insert(&key, frame.as_slice()).map_err(backend)?;
             index
                 .insert(&format::txn_oid_key(tid, oid), ())

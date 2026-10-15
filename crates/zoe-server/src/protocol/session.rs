@@ -16,16 +16,21 @@
 //! log lines of the core too. The client is the label of
 //! `set_client_label` when the call starts, or the address of the peer.
 //! Inside it, the call runs in the span of the traces (`Session::request`).
+//!
+//! A transaction of a connection encodes its staged pickles on the
+//! compression pool (`compress`): `storea` and `restorea` queue a job, and
+//! the first vote waits for the jobs before it takes a lock.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use rmpv::Value;
-use zoe_core::{BlobFile, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Compression, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
 
 use super::blob::Download;
 use super::clock;
+use super::compress::{Compressor, Failed, Job};
 use super::extension;
 use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
@@ -34,6 +39,7 @@ use super::negotiation;
 use super::outbox::{Outbox, Parts, Room};
 use super::status::Stats;
 use super::{NamedStorage, Stopping, Storages};
+use crate::runtime::Runtime;
 
 /// The longest client label that a log line takes, in characters.
 const MAX_LABEL: usize = 200;
@@ -446,6 +452,10 @@ struct Open {
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
     upload: Option<BlobFile>,
+    /// The jobs of the compression pool that encode the staged pickles,
+    /// until the first vote. The end of the transaction drops them, and
+    /// that cancels them.
+    jobs: Vec<Job>,
 }
 
 impl Open {
@@ -503,6 +513,9 @@ pub(crate) struct Session {
 pub(crate) struct Transaction {
     session: Arc<Session>,
     open: Option<Open>,
+    /// The compression pool and the runtime of its jobs. Without them, the
+    /// finish encodes each staged pickle.
+    compress: Option<(Compressor, Arc<dyn Runtime>)>,
 }
 
 /// Return the storage that `call` registers with, before the connection
@@ -1324,7 +1337,14 @@ impl Transaction {
         Self {
             session,
             open: None,
+            compress: None,
         }
+    }
+
+    /// Encode the staged pickles on `compressor`, with jobs on `runtime`.
+    pub(crate) fn compressing(mut self, compressor: Compressor, runtime: Arc<dyn Runtime>) -> Self {
+        self.compress = Some((compressor, runtime));
+        self
     }
 
     /// Tell if a transaction is open.
@@ -1333,8 +1353,9 @@ impl Transaction {
     }
 
     /// Run one call of the transaction, and count it in the status of the
-    /// storage.
-    pub(crate) fn call(&mut self, call: &Call) -> Outcome {
+    /// storage. `storea` and `restorea` take the pickle out of the args of
+    /// `call` for the compression pool.
+    pub(crate) fn call(&mut self, call: &mut Call) -> Outcome {
         let was_open = self.open.is_some();
         let listed = self.open.as_ref().map_or(0, |open| open.listed);
         let started = Instant::now();
@@ -1407,8 +1428,8 @@ impl Transaction {
     }
 
     /// Run one call of the transaction.
-    fn dispatch(&mut self, call: &Call) -> Outcome {
-        let args = call.args.as_slice();
+    fn dispatch(&mut self, call: &mut Call) -> Outcome {
+        let args = call.args.as_mut_slice();
         if !self.session.is_registered() {
             return Outcome::Close(format!("{} before register", call.method));
         }
@@ -1422,7 +1443,7 @@ impl Transaction {
             "checkCurrentSerialInTransaction" => self.check_current_serial(args),
             "deleteObject" => self.delete_object(args),
             "vote" => self.vote(args),
-            "tpc_finish" => return self.tpc_finish(call),
+            "tpc_finish" => return self.tpc_finish(&*call),
             "tpc_abort" => self.tpc_abort(args),
             "storeBlobStart" => self.store_blob_start(args),
             "storeBlobChunk" => self.store_blob_chunk(args),
@@ -1453,6 +1474,7 @@ impl Transaction {
                 txn,
                 listed: 0,
                 upload: None,
+                jobs: Vec::new(),
             });
         }
         Ok(Value::Nil)
@@ -1501,16 +1523,49 @@ impl Transaction {
         Ok(self.open.as_mut().expect("the open transaction"))
     }
 
-    fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, serial, data, id] = arity::<4>(args, "storea")?;
+    /// Stage a new version of an object, and queue the encode of its
+    /// pickle. The call does not wait for the encode.
+    fn storea(&mut self, args: &mut [Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, id] = arity_mut::<4>(args, "storea")?;
+        let mut staged = None;
         self.current(id)?.stage(|txn| {
             let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
             let Value::Binary(data) = data else {
                 return Err(Fault::type_error("data is not bytes"));
             };
-            Ok(txn.store(oid, serial, data)?)
+            txn.store(oid, serial, data)?;
+            staged = Some((oid, std::mem::take(data)));
+            Ok(())
         });
+        if let Some((oid, data)) = staged {
+            self.queue(oid, data);
+        }
         Ok(Value::Nil)
+    }
+
+    /// Queue on the compression pool the encode of `data`, the pickle that
+    /// the open transaction staged for `oid`.
+    ///
+    /// No job is queued without a pool, for a store without compression,
+    /// for a deletion, for a pickle in the spill file, and after a vote
+    /// that listed conflicts: the finish encodes these pickles. A pickle in
+    /// the spill file stays out of memory, and the second vote takes its
+    /// locks already.
+    fn queue(&mut self, oid: Oid, data: Vec<u8>) {
+        let (Some((compressor, runtime)), Some(open)) = (&self.compress, &mut self.open) else {
+            return;
+        };
+        let Ok(txn) = &open.txn else { return };
+        let compression = self.session.store.compression();
+        if open.listed > 0
+            || data.is_empty()
+            || compression == Compression::None
+            || !txn.stages_in_memory(oid)
+        {
+            return;
+        }
+        let job = compressor.queue(runtime, oid, data, compression);
+        open.jobs.push(job);
     }
 
     /// Stage a copy of a record in the restore transaction `id`, a
@@ -1519,17 +1574,24 @@ impl Transaction {
     /// transaction, not `serial`, and `prev_txn` is not used. In a
     /// transaction without a tid, the vote fails with
     /// `StorageTransactionError`.
-    fn restorea(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, _serial, data, _prev_txn, id] = arity::<5>(args, "restorea")?;
+    fn restorea(&mut self, args: &mut [Value]) -> Result<Value, Fault> {
+        let [oid, _serial, data, _prev_txn, id] = arity_mut::<5>(args, "restorea")?;
+        let mut staged = None;
         self.current(id)?.stage(|txn| {
             let oid = Oid(u64_of(oid)?);
-            let data = match data {
-                Value::Binary(data) => Some(data.as_slice()),
-                Value::Nil => None,
+            match data {
+                Value::Binary(data) => {
+                    txn.restore(oid, Some(data))?;
+                    staged = Some((oid, std::mem::take(data)));
+                }
+                Value::Nil => txn.restore(oid, None)?,
                 _ => return Err(Fault::type_error("data is not bytes or None")),
-            };
-            Ok(txn.restore(oid, data)?)
+            }
+            Ok(())
         });
+        if let Some((oid, data)) = staged {
+            self.queue(oid, data);
+        }
         Ok(Value::Nil)
     }
 
@@ -1568,6 +1630,11 @@ impl Transaction {
     /// takes no lock and checks every serial again. The server runs no
     /// resolution code.
     ///
+    /// Before it takes a lock, the first vote waits for each job of the
+    /// compression pool of the transaction, and attaches its payload to
+    /// the staged record. A job that failed fails the vote with
+    /// `StorageError`.
+    ///
     /// A failed vote ends the transaction, as in ZEO: the core transaction
     /// drops, which releases its locks. So the `tpc_abort` that follows
     /// finds no transaction.
@@ -1575,12 +1642,13 @@ impl Transaction {
         let [id] = arity::<1>(args, "vote")?;
         let open = self.current(id)?;
         let listed = std::mem::take(&mut open.listed);
+        let jobs = std::mem::take(&mut open.jobs);
         let voted = match &mut open.txn {
             Ok(txn) if listed > 0 => txn
                 .vote()
                 .map(|()| Vec::new())
                 .map_err(|error| Fault::of_vote(&error, txn)),
-            Ok(txn) => vote_resolving(txn),
+            Ok(txn) => attach(txn, jobs).and_then(|()| vote_resolving(txn)),
             Err(fault) => Err(fault.clone()),
         };
         match voted {
@@ -1765,6 +1833,23 @@ impl Drop for Transaction {
     }
 }
 
+/// Wait for each job in `jobs`, and attach its payload to the staged
+/// record of its oid in `txn`. A payload that does not match the staged
+/// pickle stays out, and the finish encodes the pickle. The first job that
+/// failed fails the call, and the drop of the other jobs cancels them.
+fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
+    for job in jobs {
+        let (oid, encoded) = job.wait().map_err(|Failed(oid)| {
+            Fault::storage(format!(
+                "the encode of the pickle of oid {:#x} failed",
+                oid.0
+            ))
+        })?;
+        txn.set_encoded(oid, encoded)?;
+    }
+    Ok(())
+}
+
 /// Vote with `vote_resolving` of the core. Return each stale written oid
 /// that the client can resolve, as ZEO 6 lists a conflict in the reply of
 /// `vote`: `{oid, serials: [committed, read], data}`. `data` is the pickle
@@ -1811,6 +1896,15 @@ fn client_label(value: &Value) -> String {
 }
 
 /// Return the `N` arguments of `method`.
+/// Return the args of `method` as an array of `N` values to change.
+fn arity_mut<'a, const N: usize>(
+    args: &'a mut [Value],
+    method: &str,
+) -> Result<&'a mut [Value; N], Fault> {
+    args.try_into()
+        .map_err(|_| Fault::type_error(format!("{method} takes {N} arguments")))
+}
+
 fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Value; N], Fault> {
     args.try_into()
         .map_err(|_| Fault::type_error(format!("{method} takes {N} arguments")))
@@ -1930,7 +2024,7 @@ mod tests {
         /// Run one call. Keep whether it put its reply itself.
         fn call(&mut self, call: &Call) -> Outcome {
             if self.session.is_registered() && in_transaction(&call.method) {
-                return self.txn.call(call);
+                return self.txn.call(&mut call.clone());
             }
             let mut reply = Reply::new(self.session.outbox.blocking_room());
             let outcome = self.session.call(call, &mut reply);
@@ -3086,7 +3180,10 @@ mod tests {
             let mut reply = Reply::new(s.session.outbox.blocking_room());
             let fault = failed(s.session.call(&next, &mut reply));
             assert_eq!(fault.class, "builtins.ValueError");
-            assert_eq!(failed(s.txn.call(&next)).class, "builtins.ValueError");
+            assert_eq!(
+                failed(s.txn.call(&mut next.clone())).class,
+                "builtins.ValueError"
+            );
             // The connection stays open, and the store gave no value.
             assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
             assert_eq!(s.store.sequence("intids").next().unwrap(), 1);
@@ -5049,5 +5146,374 @@ mod tests {
             Fault::from(ZoeError::NotFound { oid: Oid(1_500) })
         );
         assert_eq!(done(load(&mut s, 0)), Value::Binary(MAPPING.to_vec()));
+    }
+
+    /// The acceptance tests of the compression pool: a `storea` replies
+    /// before its encode ends, the vote waits for the encodes of its
+    /// transaction before it takes a lock, a failed encode fails the vote,
+    /// and an abort or a lost connection cancels the encodes that wait and
+    /// leaves no lock.
+    mod compression {
+        use std::num::NonZeroUsize;
+        use std::sync::Condvar;
+        use std::time::{Duration, Instant};
+
+        use zoe_core::{Codec, Encoded};
+
+        use super::*;
+        use crate::protocol::compress::{Compressor, Hook};
+        use crate::runtime::Tokio;
+
+        /// The gate of the jobs of a compression pool. It records the oid
+        /// of each job that starts. While it is closed, it holds the first
+        /// `hold` jobs. A job of the oid `fail` fails.
+        struct Gate {
+            state: Mutex<GateState>,
+            changed: Condvar,
+        }
+
+        struct GateState {
+            started: Vec<Oid>,
+            closed: bool,
+            hold: usize,
+            fail: Option<Oid>,
+        }
+
+        impl Gate {
+            fn new(hold: usize, fail: Option<Oid>) -> Arc<Self> {
+                Arc::new(Self {
+                    state: Mutex::new(GateState {
+                        started: Vec::new(),
+                        closed: hold > 0,
+                        hold,
+                        fail,
+                    }),
+                    changed: Condvar::new(),
+                })
+            }
+
+            fn lock(&self) -> MutexGuard<'_, GateState> {
+                self.state.lock().unwrap()
+            }
+
+            fn hook(self: &Arc<Self>) -> Hook {
+                let gate = Arc::clone(self);
+                Arc::new(move |oid| {
+                    let mut state = gate.lock();
+                    state.started.push(oid);
+                    let held = state.started.len() <= state.hold;
+                    gate.changed.notify_all();
+                    while held && state.closed {
+                        state = gate.changed.wait(state).unwrap();
+                    }
+                    state.fail != Some(oid)
+                })
+            }
+
+            /// Let the held jobs go on, and hold no later job.
+            fn open(&self) {
+                self.lock().closed = false;
+                self.changed.notify_all();
+            }
+
+            /// Wait until `n` jobs started. Fail after 30 seconds.
+            fn wait_started(&self, n: usize) {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut state = self.lock();
+                while state.started.len() < n {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    assert!(!left.is_zero(), "{n} jobs start: {:?}", state.started);
+                    state = self.changed.wait_timeout(state, left).unwrap().0;
+                }
+            }
+
+            fn started(&self) -> Vec<Oid> {
+                self.lock().started.clone()
+            }
+        }
+
+        /// A tokio runtime for the tasks of the jobs.
+        fn tokio() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        /// A storage whose votes wait at most 200 ms for a lock, so a test
+        /// sees a lock that stays.
+        fn storage(name: &str) -> Arc<NamedStorage> {
+            let dir = std::env::temp_dir().join(format!(
+                "zoe-session-compress-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let options = Options {
+                lock_timeout: Duration::from_millis(200),
+                ..Options::default()
+            };
+            let store = Arc::new(Store::open_with(&dir, options).unwrap());
+            Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT))
+        }
+
+        /// A registered connection of `storage` whose transactions encode
+        /// on `compressor`. Call it inside a tokio runtime.
+        fn client(storage: &Arc<NamedStorage>, compressor: &Compressor) -> Client {
+            let session = Arc::new(Session::new(Arc::clone(storage), outbox(), never_stops()));
+            let txn = Transaction::new(Arc::clone(&session))
+                .compressing(compressor.clone(), Arc::new(Tokio));
+            let mut s = Client {
+                session,
+                txn,
+                sent: None,
+            };
+            let register = vec![Value::from("1"), Value::Boolean(false)];
+            done(call(&mut s, "register", register));
+            s
+        }
+
+        /// A pickle of 100 KB that zstd compresses well.
+        fn large(oid: u64) -> Vec<u8> {
+            let mut data = format!("pickle of {oid} ").into_bytes();
+            while data.len() < 100 * 1024 {
+                data.extend_from_slice(b"X\x05\x00\x00\x00titleq\x02X\x04\x00\x00\x00text");
+            }
+            data
+        }
+
+        /// Run the transaction `id` of `s` on another thread, inside
+        /// `tokio`: it begins, stores `oid` with each pickle of `stores`
+        /// over the serial 0, tells the receiver that each `storea`
+        /// returned, then votes. The core takes the calls of a transaction
+        /// only from the thread that began it.
+        fn transaction_elsewhere(
+            tokio: &tokio::runtime::Runtime,
+            mut s: Client,
+            id: i64,
+            stores: Vec<(u64, Vec<u8>)>,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::thread::JoinHandle<(Client, Outcome)>,
+        ) {
+            let handle = tokio.handle().clone();
+            let (stored, returned) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _entered = handle.enter();
+                begin(&mut s, id, None);
+                for (oid, data) in &stores {
+                    store(&mut s, id, *oid, 0, data);
+                }
+                stored.send(()).unwrap();
+                let outcome = call(&mut s, "vote", vec![Value::from(id)]);
+                (s, outcome)
+            });
+            (returned, thread)
+        }
+
+        #[test]
+        fn a_storea_returns_before_its_encode_ends_and_the_vote_waits_for_it() {
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let gate = Gate::new(usize::MAX, None);
+            let compressor = Compressor::new(NonZeroUsize::new(2).unwrap()).with_hook(gate.hook());
+            let storage = storage("held");
+            let s = client(&storage, &compressor);
+            let stores = (1..=3).map(|oid| (oid, large(oid))).collect();
+            let (stored, voting) = transaction_elsewhere(&tokio, s, 1, stores);
+            // Each `storea` returns while the gate holds the encodes.
+            stored.recv_timeout(Duration::from_secs(30)).unwrap();
+            gate.wait_started(2);
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!voting.is_finished(), "the vote waits for the encodes");
+            gate.open();
+            let (mut s, vote) = voting.join().unwrap();
+            assert_eq!(done(vote), Value::Array(vec![]));
+            let tid = finish(&mut s, Value::from(1));
+            assert_eq!(gate.started().len(), 3);
+            for oid in 1..=3 {
+                let data = large(oid);
+                assert_eq!(s.store.load(Oid(oid)).unwrap(), (data.clone(), Tid(tid)));
+                let info = s.store.record_info(Oid(oid), Tid(tid)).unwrap();
+                let inline = Encoded::encode(&data, s.store.compression());
+                assert_eq!(info.codec, Codec::Zstd);
+                assert_eq!(info.stored_len, inline.stored_len() as u64);
+            }
+        }
+
+        #[test]
+        fn a_failed_encode_fails_the_vote_and_leaves_no_lock() {
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let gate = Gate::new(0, Some(Oid(2)));
+            let compressor = Compressor::new(NonZeroUsize::new(2).unwrap()).with_hook(gate.hook());
+            let storage = storage("failed");
+            let mut s = client(&storage, &compressor);
+            begin(&mut s, 1, None);
+            for oid in 1..=3 {
+                store(&mut s, 1, oid, 0, &large(oid));
+            }
+            let fault = failed(call(&mut s, "vote", vec![Value::from(1)]));
+            assert_eq!(fault.class, "ZODB.POSException.StorageError");
+            assert!(s.txn.open.is_none());
+            assert!(s.store.load(Oid(1)).is_err());
+            assert_eq!(count(&storage.status().to_value(), "active_txns"), 0);
+            // No lock stays: each oid commits at once.
+            for oid in [1, 3] {
+                commit(&mut s, 10 + oid as i64, oid, 0, &large(oid)).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_vote_that_waits_for_its_encodes_holds_no_lock() {
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let gate = Gate::new(1, None);
+            let compressor = Compressor::new(NonZeroUsize::new(2).unwrap()).with_hook(gate.hook());
+            let storage = storage("no-lock");
+            let waiting = client(&storage, &compressor);
+            let (stored, voting) = transaction_elsewhere(&tokio, waiting, 1, vec![(1, large(1))]);
+            stored.recv_timeout(Duration::from_secs(30)).unwrap();
+            gate.wait_started(1);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!voting.is_finished());
+
+            // Another transaction writes the oid and commits while the vote
+            // waits: the waiting vote holds no lock.
+            let mut other = client(&storage, &compressor);
+            let tid = commit(&mut other, 2, 1, 0, &large(1)).unwrap();
+            gate.open();
+            let (_, vote) = voting.join().unwrap();
+            let fault = failed(vote);
+            assert_eq!(fault.class, CONFLICT_ERROR);
+            assert_eq!(
+                item(&fault, "serials"),
+                Value::Array(vec![p64(tid), p64(0)])
+            );
+        }
+
+        #[test]
+        fn an_abort_cancels_the_encodes_that_wait_and_leaves_no_lock() {
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let gate = Gate::new(1, None);
+            let compressor = Compressor::new(NonZeroUsize::MIN).with_hook(gate.hook());
+            let storage = storage("abort");
+            let mut s = client(&storage, &compressor);
+            begin(&mut s, 1, None);
+            for oid in 1..=3 {
+                store(&mut s, 1, oid, 0, &large(oid));
+            }
+            gate.wait_started(1);
+            done(call(&mut s, "tpc_abort", vec![Value::from(1)]));
+            assert!(s.txn.open.is_none());
+            gate.open();
+            // The one thread of the pool runs the job of the oid 4 after
+            // the jobs that waited before it.
+            commit(&mut s, 2, 4, 0, &large(4)).unwrap();
+            assert_eq!(gate.started(), vec![Oid(1), Oid(4)]);
+            for oid in 1..=3 {
+                commit(&mut s, 2 + oid as i64, oid, 0, &large(oid)).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_lost_connection_cancels_the_encodes_that_wait_and_leaves_no_lock() {
+            let gate = Gate::new(1, None);
+            let compressor = Compressor::new(NonZeroUsize::MIN).with_hook(gate.hook());
+            let storage = storage("lost");
+            let storages = Arc::new(
+                Storages::new(vec![Arc::clone(&storage)], Queues::DEFAULT.client)
+                    .with_compressor(compressor.clone()),
+            );
+            let (calls, received) = tokio::sync::mpsc::channel(crate::protocol::QUEUE);
+            let (replies, _sent, _closing) = Outbox::new(1_000, 1_000);
+            let session = std::thread::spawn(move || run(storages, received, replies));
+            let send = |method: &str, args: Vec<Value>| {
+                let call = Call {
+                    id: Value::from(0),
+                    oneway: true,
+                    method: method.into(),
+                    args,
+                    context: None,
+                };
+                calls.blocking_send(call).unwrap();
+            };
+            send("register", vec![Value::from("1"), Value::Boolean(false)]);
+            let begin = vec![Value::from(7), Value::Nil, Value::Nil, Value::Map(vec![])];
+            send("tpc_begin", begin);
+            for oid in 1..=3 {
+                let data = Value::Binary(large(oid));
+                send("storea", vec![p64(oid), p64(0), data, Value::from(7)]);
+            }
+            gate.wait_started(1);
+            // The client goes. The end of the connection aborts the
+            // transaction while its first encode is held.
+            drop(calls);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while count(&storage.status().to_value(), "aborts") == 0 {
+                assert!(Instant::now() < deadline, "the transaction aborts");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gate.open();
+            session.join().unwrap();
+
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let mut s = client(&storage, &compressor);
+            commit(&mut s, 2, 4, 0, &large(4)).unwrap();
+            assert_eq!(gate.started(), vec![Oid(1), Oid(4)]);
+            for oid in 1..=3 {
+                commit(&mut s, 2 + oid as i64, oid, 0, &large(oid)).unwrap();
+            }
+        }
+
+        #[test]
+        fn the_pool_stores_the_records_of_an_inline_encode() {
+            let tokio = tokio();
+            let _entered = tokio.enter();
+            let compressor = Compressor::new(NonZeroUsize::new(2).unwrap());
+            let (pooled, inline) = (storage("pooled"), storage("inline"));
+            let mut a = client(&pooled, &compressor);
+            let mut b = Client::new(Arc::clone(&inline), outbox());
+            done(call(
+                &mut b,
+                "register",
+                vec![Value::from("1"), Value::Boolean(false)],
+            ));
+            let tid = 0x0300_0000_0000_0001;
+            let records: Vec<(u64, Vec<u8>)> = vec![
+                (1, large(1)),
+                (2, MAPPING.to_vec()),
+                (
+                    3,
+                    (0..5_000u64)
+                        .map(|i| ((i * 2_654_435_761) >> 13) as u8)
+                        .collect(),
+                ),
+            ];
+            for s in [&mut a, &mut b] {
+                begin(s, 1, Some(tid));
+                for (oid, data) in &records {
+                    let args = vec![
+                        p64(*oid),
+                        p64(0),
+                        Value::Binary(data.clone()),
+                        Value::Nil,
+                        Value::from(1),
+                    ];
+                    assert_eq!(done(call(s, "restorea", args)), Value::Nil);
+                }
+                assert_eq!(vote_and_finish(s, 1).unwrap(), tid);
+            }
+            for (oid, data) in &records {
+                let (oid, tid) = (Oid(*oid), Tid(tid));
+                assert_eq!(a.store.load(oid).unwrap(), (data.clone(), tid));
+                assert_eq!(
+                    a.store.record_info(oid, tid).unwrap(),
+                    b.store.record_info(oid, tid).unwrap()
+                );
+            }
+        }
     }
 }

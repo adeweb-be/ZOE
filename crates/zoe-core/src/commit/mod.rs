@@ -34,10 +34,16 @@
 //! `staging_memory` option of the store, and in a spill file under
 //! `staging/` beyond it. `staging` describes the buffer.
 //!
+//! `set_encoded` attaches to a staged record its payload, encoded on
+//! another thread with `Encoded::encode`. The finish writes an attached
+//! payload as it is, and encodes inline each record without one. The
+//! frames are the same either way.
+//!
 //! `store` and `store_blob` check the size limits of the store before
 //! they stage anything. A transaction logs its slow locks when it releases
 //! them, and logs itself when it ends, if it was slow.
 
+mod encoded;
 mod group;
 mod observer;
 mod staging;
@@ -57,6 +63,7 @@ use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, LockCancel, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
+pub use encoded::Encoded;
 pub(crate) use group::GroupCommit;
 use group::Member;
 pub use observer::Observer;
@@ -372,6 +379,33 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let (module, name) = zoe_pickle::decode_class_name(&pickle).ok()??;
         Some(format!("{module}.{name}"))
+    }
+
+    /// Attach `encoded` to the staged record of `oid`, so the finish writes
+    /// it and does not encode the pickle. Return true when it is attached.
+    ///
+    /// The call attaches `encoded` only when it encodes the staged pickle
+    /// of `oid` with the compression of the store: the length, the xxh3-64
+    /// hash and the compression must be the same. Else it returns false,
+    /// and the finish encodes the pickle inline. So the frame is always the
+    /// frame of an inline encode. A later `store`, `delete` or `restore` of
+    /// `oid` drops the payload.
+    ///
+    /// The call computes the hash of a pickle in memory. A call from
+    /// another thread fails with `WrongThread`.
+    pub fn set_encoded(&mut self, oid: Oid, encoded: Encoded) -> Result<bool> {
+        self.check_thread()?;
+        if encoded.compression != self.store.compression() {
+            return Ok(false);
+        }
+        Ok(self.staged.attach(oid, encoded))
+    }
+
+    /// Tell if the transaction keeps the staged pickle of `oid` in memory.
+    /// It is false for an oid that is not staged, and for a pickle in the
+    /// spill file.
+    pub fn stages_in_memory(&self, oid: Oid) -> bool {
+        self.staged.in_memory_of(oid)
     }
 
     /// Return the bytes of the staged pickles that the transaction keeps in

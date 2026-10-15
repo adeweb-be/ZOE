@@ -49,3 +49,11 @@ pub fn write_meta(store: &Store, key: &str, bytes: &[u8]) -> Result<()> {
 pub fn remove_meta(store: &Store, key: &str) -> Result<()> {
     store.backend.write_meta_stored(key, None)
 }
+
+/// Return the number of zstd compressions of records that this thread
+/// made. The finish of a transaction runs on the thread that calls it
+/// when no other finish leads a batch, so a test reads what its finish
+/// compressed.
+pub fn compressions() -> u64 {
+    crate::format::compressions()
+}

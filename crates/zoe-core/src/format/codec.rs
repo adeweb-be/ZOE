@@ -128,6 +128,8 @@ fn zstd_smaller(data: &[u8], level: i32) -> Option<Vec<u8>> {
     // smaller, because it needs some free space in the buffer. Then the
     // data is stored as it is. That costs a few bytes and is correct.
     let mut packed = Vec::with_capacity(data.len().checked_sub(1)?);
+    #[cfg(feature = "testing")]
+    COMPRESSIONS.with(|count| count.set(count.get() + 1));
     COMPRESSOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().map(|(kept, _)| *kept) != Some(level) {
@@ -148,6 +150,19 @@ pub(crate) fn decode(codec: Codec, stored: &[u8]) -> Result<Cow<'_, [u8]>, Frame
         Codec::None => Ok(Cow::Borrowed(stored)),
         Codec::Zstd => unzstd(stored).map(Cow::Owned),
     }
+}
+
+#[cfg(feature = "testing")]
+thread_local! {
+    /// The number of zstd compressions of this thread.
+    static COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Return the number of zstd compressions that this thread made. Only a
+/// test build has this count.
+#[cfg(feature = "testing")]
+pub(crate) fn compressions() -> u64 {
+    COMPRESSIONS.with(std::cell::Cell::get)
 }
 
 /// Decompress the zstd payload `stored`.

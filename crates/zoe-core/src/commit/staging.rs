@@ -11,6 +11,11 @@
 //! pickle, and each read checks it. So the bytes that a read gives are
 //! the bytes staged.
 //!
+//! A staged record can hold its payload, encoded before the finish
+//! (`Encoded`). The finish then writes that payload, and reads no spilled
+//! pickle for it. A later stage of the oid drops the payload with the
+//! record. The payload is not counted in `staging-memory`.
+//!
 //! A spill file is never part of the durable store. Nothing syncs it or
 //! `staging/`: the transaction reads the file in the same process, and a
 //! crash ends the transaction. A transaction removes its spill file when it
@@ -26,7 +31,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redb::StorageBackend;
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::Encoded;
+use crate::backend::{NewPayload, Payload};
 use crate::error::{Result, ZoeError};
+use crate::format::Codec;
 use crate::types::{Oid, Tid};
 use crate::vfs::Vfs;
 
@@ -184,6 +192,8 @@ pub(crate) struct Staged {
     /// so a conflict on it cannot be resolved.
     pub(crate) restored: bool,
     pickle: Pickle,
+    /// The payload of the pickle, encoded before the finish.
+    encoded: Option<Encoded>,
 }
 
 impl Staged {
@@ -246,6 +256,7 @@ impl Staging {
             serial,
             restored,
             pickle,
+            encoded: None,
         };
         self.records.insert(oid, staged);
         Ok(())
@@ -264,6 +275,32 @@ impl Staging {
             len: data.len(),
             hash: xxh3_64(data),
         })
+    }
+
+    /// Attach `encoded` to the staged record of `oid` when it encodes the
+    /// staged pickle: the length and the xxh3-64 hash of the pickle are
+    /// the same. Return true when it is attached. Else the record stays as
+    /// it is. The hash of a pickle in memory is computed here. A spilled
+    /// pickle has its hash, so the call reads no spill file.
+    pub(crate) fn attach(&mut self, oid: Oid, encoded: Encoded) -> bool {
+        let Some(staged) = self.records.get_mut(&oid) else {
+            return false;
+        };
+        let same = match &staged.pickle {
+            Pickle::Memory(bytes) => bytes.len() == encoded.len && xxh3_64(bytes) == encoded.hash,
+            Pickle::Spilled { len, hash, .. } => *len == encoded.len && *hash == encoded.hash,
+        };
+        if same {
+            staged.encoded = Some(encoded);
+        }
+        same
+    }
+
+    /// Tell if the staged pickle of `oid` is in memory.
+    pub(crate) fn in_memory_of(&self, oid: Oid) -> bool {
+        self.records
+            .get(&oid)
+            .is_some_and(|staged| matches!(staged.pickle, Pickle::Memory(_)))
     }
 
     /// Return the bytes of the pickles in memory.
@@ -304,10 +341,31 @@ impl Staging {
 
     /// Return each staged oid with its serial and its pickle, in ascending
     /// oid order. A spilled pickle is read when the iterator reaches it.
+    #[cfg(test)]
     pub(crate) fn records(&self) -> impl Iterator<Item = Result<(Oid, Tid, Cow<'_, [u8]>)>> + '_ {
         self.records
             .iter()
             .map(|(&oid, staged)| Ok((oid, staged.serial, self.read(&staged.pickle)?)))
+    }
+
+    /// Return each staged oid with its serial and its payload, in
+    /// ascending oid order: the attached payload of a record that has one,
+    /// else its pickle. A spilled pickle is read when the iterator reaches
+    /// it, only when its record needs it.
+    pub(crate) fn payloads(&self) -> impl Iterator<Item = Result<NewPayload<'_>>> + '_ {
+        self.records.iter().map(|(&oid, staged)| {
+            let payload = match &staged.encoded {
+                Some(Encoded {
+                    packed: Some(packed),
+                    ..
+                }) => Payload::Encoded(Codec::Zstd, Cow::Borrowed(&packed[..])),
+                Some(Encoded { packed: None, .. }) => {
+                    Payload::Encoded(Codec::None, self.read(&staged.pickle)?)
+                }
+                None => Payload::Pickle(self.read(&staged.pickle)?),
+            };
+            Ok((oid, staged.serial, payload))
+        })
     }
 
     /// Return the bytes of `pickle`. A spilled pickle whose bytes do not
