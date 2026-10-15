@@ -85,7 +85,7 @@ pub struct CurrentRecord {
     pub next: Option<Oid>,
 }
 
-/// The number of rows, and of tids of the transaction index, that the
+/// The number of rows, and of tids of the record keys, that the
 /// transaction iterator reads in one slice.
 const SLICE: usize = 1024;
 
@@ -96,8 +96,8 @@ const SLICE: usize = 1024;
 /// thread. It does not keep the store open: after the `Store` is dropped,
 /// the next call gives `Closed`, then the iterator ends.
 ///
-/// It reads the rows and the tids of the transaction index a slice at a
-/// time, as it goes. So it holds one transaction and one slice of each,
+/// It reads the rows and the tids of the record keys a slice at a time,
+/// as it goes. So it holds one transaction and one slice of each,
 /// whatever the length of its range. A slice of rows ends only after a row
 /// that reads. So a run of rows that do not read stays in one slice, and
 /// the iterator holds the error of each row of that run.
@@ -119,8 +119,8 @@ pub struct Transactions {
     covered: Option<Tid>,
     /// The range has a row. Only then does the iterator read the index.
     any_row: bool,
-    /// The slice of the tids that the transaction index gives. The
-    /// iterator uses them to find index keys of a tid that has no row.
+    /// The slice of the tids that the record keys give. The iterator uses
+    /// them to find records of a tid that has no row.
     indexed: VecDeque<Tid>,
     /// The first tid of the next slice of the index. It is `None` when
     /// the iterator reads no more of the index.
@@ -290,14 +290,15 @@ impl Iterator for Transactions {
     }
 }
 
-/// Read the transaction `tid`, its index keys and their records from
-/// `backend`, in one snapshot. The records must match the oid count of the
-/// row. Return `None` when a pack removed the transaction after the
-/// iterator read its row. A transaction that is gone with no pack to
-/// explain it raises `CorruptTxn`.
+/// Read the transaction `tid` and its records from `backend`, in one
+/// snapshot. The records must match the oid count of the row. Return
+/// `None` when a pack removed the transaction after the iterator read its
+/// row. A transaction that is gone with no pack to explain it raises
+/// `CorruptTxn`.
 ///
-/// A record without its index key leaves the records short of the count.
-/// The backend gives `CorruptTxn` for an index key without its record.
+/// A key of the object index without its record leaves the records short
+/// of the count. The backend gives `CorruptTxn` for a record without its
+/// key in the object index.
 fn txn_info(backend: &dyn Backend, tid: Tid) -> Result<Option<TxnInfo>> {
     let Some((row, records)) = backend.txn_records(tid)? else {
         // The scan of the rows gave this row. Only a pack can remove it
@@ -424,27 +425,28 @@ impl Store {
     /// The iterator stops at the last tid at the time of this call. The
     /// iterator leaves out a transaction that commits after this call.
     ///
-    /// The oids of each transaction come from the transaction index. The
-    /// iterator reads the rows of the range a slice at a time, then the
-    /// tids of the index that these rows cover, a slice at a time. Then it
-    /// reads each transaction with its index keys and its records in one
+    /// The records of each transaction come from a scan of `records` over
+    /// its tid. The iterator reads the rows of the range a slice at a time,
+    /// then the tids of the record keys that these rows cover, a slice at
+    /// a time. Then it reads each transaction with its records in one
     /// snapshot. Each slice is one snapshot. So the iterator holds one
     /// transaction and a slice of tids, whatever the length of the range.
     /// A slice ends only after a row that reads, so a run of rows that do
     /// not read stays in one slice, with the error of each row.
-    /// It never reads every record key, so a read of one transaction costs
-    /// the size of its result. A transaction that a pack removes after
+    /// It never reads every record, so a read of one transaction costs the
+    /// size of its result. A transaction that a pack removes after
     /// this call is left out.
     ///
-    /// A transaction whose index keys do not match the oid count of its row
-    /// gives `CorruptTxn`: a record without its index key does this. An
-    /// index key without its record gives `CorruptTxn` too. Index keys of a
-    /// tid that has no row give `CorruptTxn`, but only when the range has a
-    /// row. A row that does not read gives its own error once, and the
-    /// index keys before the next row that reads give no error. A failed
-    /// scan of the rows gives its error and ends the iterator. A failed
-    /// scan of the index gives its error once, and the iterator then gives
-    /// the transactions of the rest of the range without that check.
+    /// A transaction whose records do not match the oid count of its row
+    /// gives `CorruptTxn`: a key of the object index without its record
+    /// does this. A record without its key in the object index gives
+    /// `CorruptTxn` too. Records of a tid that has no row give
+    /// `CorruptTxn`, but only when the range has a row. A row that does not
+    /// read gives its own error once, and the records before the next row
+    /// that reads give no error. A failed scan of the rows gives its error
+    /// and ends the iterator. A failed scan of the record keys gives its
+    /// error once, and the iterator then gives the transactions of the rest
+    /// of the range without that check.
     pub fn iterator(&self, start: Option<Tid>, stop: Option<Tid>) -> Result<Transactions> {
         Ok(self.iterator_in_slices(start, stop, SLICE))
     }
@@ -466,11 +468,11 @@ impl Store {
     /// included, wrote: each oid once, in ascending order. Return `None`
     /// when more than `limit` transactions of the range wrote a record.
     ///
-    /// The oids come from the transaction index. The call reads no record
-    /// and no transaction row, so it costs the size of the index keys of
-    /// the range. A transaction that wrote no record has no index key, so
-    /// it does not count. The call reads the index a slice of transactions
-    /// at a time, and each slice is one snapshot. So it holds the oids of
+    /// The oids come from the record keys of the range. The call decodes
+    /// no record and reads no transaction row, so it costs the size of the
+    /// records of the range. A transaction that wrote no record has no
+    /// record key, so it does not count. The call reads the keys a slice of
+    /// transactions at a time, and each slice is one snapshot. So it holds the oids of
     /// its result and one slice.
     ///
     /// A pack between two slices can remove a record of the range: then
@@ -923,11 +925,11 @@ mod tests {
     /// The table of the transaction index.
     type Index<'a> = redb::Table<'a, &'static [u8; 16], ()>;
 
-    /// Give the `records` table and the transaction index of the closed
+    /// Give the `records` table and the object index of the closed
     /// store in `vfs` to `change`, and commit the change.
     fn change_tables(vfs: &MemVfs, change: impl FnOnce(&mut Records, &mut Index)) {
         let records: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
-        let index: TableDefinition<&[u8; 16], ()> = TableDefinition::new("txn_oids");
+        let index: TableDefinition<&[u8; 16], ()> = TableDefinition::new("object_index");
         let db = redb::Builder::new()
             .create_with_backend(vfs.file("zoe.redb"))
             .unwrap();
@@ -963,7 +965,7 @@ mod tests {
                 b"x",
             );
             records.insert(&key, frame.as_slice()).unwrap();
-            index.insert(&format::txn_oid_key(tid, oid), ()).unwrap();
+            index.insert(&format::object_key(oid, tid), ()).unwrap();
         });
     }
 
@@ -1052,7 +1054,7 @@ mod tests {
         let vfs = MemVfs::new();
         drop(three_records_in(&vfs));
         change_tables(&vfs, |_, index| {
-            let key = format::txn_oid_key(Tid(200), Oid(1));
+            let key = format::object_key(Oid(1), Tid(200));
             assert!(index.remove(&key).unwrap().is_some());
         });
         let store = Store::open_vfs(vfs).unwrap();
@@ -1093,14 +1095,15 @@ mod tests {
     }
 
     #[test]
-    fn an_index_key_that_a_removal_left_behind_is_corrupt() {
+    fn a_record_that_a_removal_left_behind_is_corrupt() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let both = [(Oid(1), Some(pickle(1))), (Oid(2), Some(pickle(1)))];
         restore(&store, 100, &both);
         restore(&store, 200, &[(Oid(1), Some(pickle(2)))]);
         // A removal of the record of oid 2 at 100 that lowers the oid count
-        // of its row, as a pack does, but keeps the index key.
-        store.remove_record_for_test(Oid(2), Tid(100)).unwrap();
+        // of its row, as a pack does, but keeps the record and removes only
+        // its key of the object index.
+        store.remove_index_key_for_test(Tid(100), Oid(2)).unwrap();
         let row = store
             .backend
             .iter_txns(Tid(100), Tid(100))

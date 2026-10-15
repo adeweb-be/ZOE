@@ -1229,11 +1229,12 @@ fn seal(key: &[u8], frame: &mut [u8]) {
     frame[24..32].copy_from_slice(&hasher.digest().to_le_bytes());
 }
 
-/// The record key of `oid` at `tid`: both big-endian.
+/// The record key of `oid` at `tid`: the tid, then the oid, both
+/// big-endian.
 fn record_key(oid: Oid, tid: Tid) -> [u8; 16] {
     let mut key = [0; 16];
-    key[..8].copy_from_slice(&oid.0.to_be_bytes());
-    key[8..].copy_from_slice(&tid.0.to_be_bytes());
+    key[..8].copy_from_slice(&tid.0.to_be_bytes());
+    key[8..].copy_from_slice(&oid.0.to_be_bytes());
     key
 }
 

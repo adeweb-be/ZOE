@@ -31,6 +31,10 @@ const TXNS: usize = 100;
 /// `(oid, tid)`, as this test measured them.
 const UPDATE_BYTES_BEFORE: u64 = 631_022;
 
+/// The bytes that an `add` commit wrote with the layout keyed by
+/// `(oid, tid)`, as this test measured them.
+const ADD_BYTES_BEFORE: u64 = 191_316;
+
 /// The name of the database file in the store directory.
 const DATABASE: &str = "zoe.redb";
 
@@ -221,7 +225,8 @@ fn an_update_commit_writes_about_half_the_bytes_of_the_layout_keyed_by_oid() {
     let bytes = measure();
     println!(
         "bytes written per commit of 100 records of 1 KB: add {}, update {} \
-         (update with the layout keyed by (oid, tid): {UPDATE_BYTES_BEFORE})",
+         (with the layout keyed by (oid, tid): add {ADD_BYTES_BEFORE}, \
+         update {UPDATE_BYTES_BEFORE})",
         bytes.add, bytes.update
     );
     assert!(
@@ -230,11 +235,12 @@ fn an_update_commit_writes_about_half_the_bytes_of_the_layout_keyed_by_oid() {
          wrote {UPDATE_BYTES_BEFORE}",
         bytes.update
     );
-    // A commit of new objects does not write more than before either.
+    // A commit of new objects writes no more than before, give or take
+    // the pages of the object index.
     assert!(
-        bytes.add <= bytes.update,
-        "an add commit writes {} bytes, more than an update commit, {}",
-        bytes.add,
-        bytes.update
+        bytes.add * 100 <= ADD_BYTES_BEFORE * 105,
+        "an add commit writes {} bytes, the layout keyed by (oid, tid) \
+         wrote {ADD_BYTES_BEFORE}",
+        bytes.add
     );
 }

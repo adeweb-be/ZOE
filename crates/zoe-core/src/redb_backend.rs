@@ -1,19 +1,17 @@
 //! The redb backend.
 //!
 //! Six tables hold the key spaces of the data model: `records`,
-//! `txn_oids`, `blobs`, `txns`, `sequences` and `meta`. `format` says how keys and
-//! values are written. `txn_oids` is the transaction index: `put_record`
-//! writes the index key of each record in the write transaction of the
-//! record, and `remove_record` removes the key with the record.
-//! `initialise` creates all six, so a new store has an empty `blobs`
-//! table and an empty `sequences` table. A store written before one of
-//! these tables has none until its first blob commit or its first
-//! reservation creates it. Until then it reads as a store without blob
-//! records or without sequences.
+//! `object_index`, `blobs`, `txns`, `sequences` and `meta`. `format` says
+//! how keys and values are written. `records` and `blobs` are keyed by
+//! `(tid, oid)`, so a commit appends its rows at the end of each table, and
+//! a scan over one tid gives the records of that transaction.
+//! `object_index` is keyed by `(oid, tid)` and gives the records of each
+//! oid: `put_records` writes the key of each record in the write
+//! transaction of the record, and `remove_record` removes the key with the
+//! record. `initialise` creates all six.
 //!
 //! The row `object_count` of `meta` counts the oids that have a record.
-//! Each write that puts or removes records updates it, and the first
-//! writer open of a store of format 1 writes it.
+//! Each write that puts or removes records updates it.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -34,7 +32,7 @@ use crate::format::{self, Compression, KeySpace};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
-const TXN_OIDS: TableDefinition<&[u8; 16], ()> = TableDefinition::new("txn_oids");
+const OBJECT_INDEX: TableDefinition<&[u8; 16], ()> = TableDefinition::new("object_index");
 const BLOBS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("blobs");
 const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
 const SEQUENCES: TableDefinition<&str, &[u8]> = TableDefinition::new("sequences");
@@ -63,25 +61,25 @@ fn refused(error: format::FrameError, row: &str, corrupt: ZoeError) -> ZoeError 
     }
 }
 
-/// Check that `key`, which a scan of `records` gave to a read of `oid`, is
-/// inside `range`. A key outside it raises `CorruptRecord` with `oid` and
-/// the tid of the key.
+/// Check that `key`, which a scan of the object index gave to a read of
+/// `oid`, is inside `range`. A key outside it raises `CorruptRecord` with
+/// `oid` and the tid of the key.
 ///
 /// redb seeks each end of a scan through the branch pages, and it checks
 /// only the bound of the other end. So a damaged branch page can move the
-/// seek and give a key outside the range. The frame of that key is intact
-/// and passes its checksum, so only this check stops it.
+/// seek and give a key outside the range. The key has no checksum, so
+/// only this check stops it.
 fn inside(oid: Oid, key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()> {
     if range.contains(key) {
         return Ok(());
     }
-    let (_, tid) = format::split_record_key(key);
+    let (_, tid) = format::split_object_key(key);
     Err(ZoeError::CorruptRecord { oid, tid })
 }
 
 /// Check that `key`, which a scan of `txns` gave, is inside `range`, as
-/// `inside` does for `records`. A key outside it raises `CorruptTxn` with
-/// the tid of the key.
+/// `inside` does for the object index. A key outside it raises
+/// `CorruptTxn` with the tid of the key.
 fn inside_txns(key: &[u8; 8], range: impl RangeBounds<[u8; 8]>) -> Result<()> {
     if range.contains(key) {
         return Ok(());
@@ -90,73 +88,80 @@ fn inside_txns(key: &[u8; 8], range: impl RangeBounds<[u8; 8]>) -> Result<()> {
     Err(ZoeError::CorruptTxn { tid })
 }
 
-/// Check that `key`, which a scan of the transaction index gave, is inside
-/// `range`, as `inside` does for `records`. A key outside it raises
-/// `CorruptTxn` with the tid of the key.
-fn inside_index(key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()> {
+/// Check that `key`, which a scan of `records` over a tid range gave, is
+/// inside `range`, as `inside` does for the object index. A key outside it
+/// raises `CorruptTxn` with the tid of the key.
+fn inside_records(key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()> {
     if range.contains(key) {
         return Ok(());
     }
-    let (tid, _) = format::split_txn_oid_key(key);
+    let (_, tid) = format::split_record_key(key);
     Err(ZoeError::CorruptTxn { tid })
 }
 
-/// Tell if `oid` has at least one record in `records`. `prev` is the
-/// serial of a record of `oid` that can exist, or `Tid::ZERO`. A point read
-/// of that record answers first, and the scan runs only when it finds
-/// none.
+/// Return the tid of the newest record of `oid` before `tid`, from the
+/// object index.
+fn tid_before(
+    index: &impl ReadableTable<&'static [u8; 16], ()>,
+    oid: Oid,
+    tid: Tid,
+) -> Result<Option<Tid>> {
+    let start = format::object_key(oid, Tid::ZERO);
+    let end = format::object_key(oid, tid);
+    let mut range = index.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
+    match range.next_back() {
+        Some(entry) => {
+            let (key, _) = entry.map_err(backend)?;
+            inside(oid, key.value(), start..end)?;
+            Ok(Some(format::split_object_key(key.value()).1))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Return the tid of the oldest record of `oid` at or after `tid`, from
+/// the object index.
+fn tid_from(
+    index: &impl ReadableTable<&'static [u8; 16], ()>,
+    oid: Oid,
+    tid: Tid,
+) -> Result<Option<Tid>> {
+    let start = format::object_key(oid, tid);
+    let end = format::object_key(oid, Tid::MAX);
+    let mut range = index.range::<&[u8; 16]>(&start..=&end).map_err(backend)?;
+    match range.next() {
+        Some(entry) => {
+            let (key, _) = entry.map_err(backend)?;
+            inside(oid, key.value(), start..=end)?;
+            Ok(Some(format::split_object_key(key.value()).1))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Tell if `oid` has at least one record, from the object index. `prev`
+/// is the serial of a record of `oid` that can exist, or `Tid::ZERO`. A
+/// point read of its key answers first, and the scan runs only when it
+/// finds none.
 fn has_records_from(
-    records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+    index: &impl ReadableTable<&'static [u8; 16], ()>,
     oid: Oid,
     prev: Tid,
 ) -> Result<bool> {
     if prev != Tid::ZERO
-        && records
-            .get(&format::record_key(oid, prev))
+        && index
+            .get(&format::object_key(oid, prev))
             .map_err(backend)?
             .is_some()
     {
         return Ok(true);
     }
-    has_records(records, oid)
+    has_records(index, oid)
 }
 
-/// Tell if `oid` has at least one record in `records`.
-fn has_records(
-    records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
-    oid: Oid,
-) -> Result<bool> {
-    let start = format::record_key(oid, Tid::ZERO);
-    let end = format::record_key(oid, Tid::MAX);
-    let mut scan = records.range::<&[u8; 16]>(&start..=&end).map_err(backend)?;
-    match scan.next() {
-        None => Ok(false),
-        Some(entry) => {
-            let (key, _) = entry.map_err(backend)?;
-            inside(oid, key.value(), start..=end)?;
-            Ok(true)
-        }
-    }
-}
-
-/// Return the number of distinct oids of the keys of `records`. The scan
-/// reads every key. Each key must come after the key before it, else the
-/// count fails with `CorruptRecord`.
-fn count_objects(records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>) -> Result<u64> {
-    let mut count = 0;
-    let mut previous: Option<[u8; 16]> = None;
-    for entry in records.iter().map_err(backend)? {
-        let (key, _) = entry.map_err(backend)?;
-        let key = *key.value();
-        let (oid, tid) = format::split_record_key(&key);
-        match previous {
-            Some(before) if key <= before => return Err(ZoeError::CorruptRecord { oid, tid }),
-            Some(before) if format::split_record_key(&before).0 == oid => {}
-            _ => count += 1,
-        }
-        previous = Some(key);
-    }
-    Ok(count)
+/// Tell if `oid` has at least one record, from the object index.
+fn has_records(index: &impl ReadableTable<&'static [u8; 16], ()>, oid: Oid) -> Result<bool> {
+    Ok(tid_from(index, oid, Tid::ZERO)?.is_some())
 }
 
 /// Decode the row `object_count` of `meta`. A store of the current format
@@ -166,6 +171,17 @@ fn decode_object_count(value: Option<&[u8]>) -> Result<u64> {
     value
         .and_then(format::decode_u64)
         .ok_or_else(|| ZoeError::Format("the object count is missing or is not 8 bytes".to_owned()))
+}
+
+/// The error of a store whose `format` row names `name` and not
+/// `format::FORMAT_NAME`.
+fn other_format(name: &[u8]) -> ZoeError {
+    let name = String::from_utf8_lossy(name);
+    let current = String::from_utf8_lossy(format::FORMAT_NAME);
+    ZoeError::Format(format!(
+        "the store is in {name:?}, and this build reads only {current:?}: \
+         no tool converts the store, so write it again from its source"
+    ))
 }
 
 /// The redb database of a store.
@@ -193,9 +209,6 @@ pub(crate) struct RedbBackend {
     /// writes under the commit sequencer change records, so they store
     /// it in their order.
     object_count: AtomicU64,
-    /// False only for a read-only open of a store of format 1, which has
-    /// no count.
-    counted: bool,
     /// How new records are written.
     compression: Compression,
 }
@@ -206,7 +219,7 @@ impl RedbBackend {
         let txn = db.begin_write().map_err(backend)?;
         {
             txn.open_table(RECORDS).map_err(backend)?;
-            txn.open_table(TXN_OIDS).map_err(backend)?;
+            txn.open_table(OBJECT_INDEX).map_err(backend)?;
             txn.open_table(BLOBS).map_err(backend)?;
             txn.open_table(TXNS).map_err(backend)?;
             txn.open_table(SEQUENCES).map_err(backend)?;
@@ -236,17 +249,15 @@ impl RedbBackend {
 
     /// Open the store in `db` and check its format.
     ///
-    /// A store without the transaction index is not in this format. Its
-    /// records have no index keys, so the open fails with `Format`.
+    /// A store with another format name in `meta` fails with `Format`, a
+    /// store of an earlier format too: its records have other keys. The
+    /// error names both formats. A store of this format without the
+    /// object index fails with `Format`.
     ///
     /// The last tid is the greater of `last_tid` in `meta` and the tid of
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
     /// a second time. The row counts only when its frame passes the
     /// checksum under its key. So a damaged key cannot raise the last tid.
-    ///
-    /// A store of the current format must have `object_count`. A store of
-    /// format 1 has none: a writer open upgrades it (`upgrade`), and a
-    /// read-only open reads it without a count.
     fn open_db(db: Db) -> Result<Self> {
         let (last_tid, object_count) = {
             let txn = db.begin_read().map_err(backend)?;
@@ -255,19 +266,14 @@ impl RedbBackend {
                 Ok(meta.get(key).map_err(backend)?.map(|v| v.value().to_vec()))
             };
             let format_name = read(META_FORMAT)?.unwrap_or_default();
-            let object_count = if format_name == format::FORMAT_NAME {
-                Some(decode_object_count(read(META_OBJECT_COUNT)?.as_deref())?)
-            } else if format_name == format::FORMAT_1_NAME {
-                None
-            } else {
-                return Err(ZoeError::Format(
-                    String::from_utf8_lossy(&format_name).into_owned(),
-                ));
-            };
-            match txn.open_table(TXN_OIDS) {
+            if format_name != format::FORMAT_NAME {
+                return Err(other_format(&format_name));
+            }
+            let object_count = decode_object_count(read(META_OBJECT_COUNT)?.as_deref())?;
+            match txn.open_table(OBJECT_INDEX) {
                 Ok(_) => {}
                 Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(ZoeError::Format("no transaction index".to_owned()));
+                    return Err(ZoeError::Format("no object index".to_owned()));
                 }
                 Err(e) => return Err(backend(e)),
             }
@@ -287,42 +293,12 @@ impl RedbBackend {
                 stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())));
             (last_tid, object_count)
         };
-        let object_count = match (object_count, &db) {
-            (Some(count), _) => Some(count),
-            (None, Db::ReadWrite(db)) => Some(Self::upgrade(db)?),
-            (None, Db::ReadOnly(_)) => None,
-        };
         Ok(Self {
             db,
             last_tid: AtomicU64::new(last_tid),
-            object_count: AtomicU64::new(object_count.unwrap_or(0)),
-            counted: object_count.is_some(),
+            object_count: AtomicU64::new(object_count),
             compression: Compression::default(),
         })
-    }
-
-    /// Upgrade a store of format 1 to the current format: count the
-    /// distinct oids of `records`, then write `object_count` and the
-    /// format name in one write transaction, with a sync. Return the
-    /// count.
-    ///
-    /// The count reads every key of `records`, so this open does not hold
-    /// N7. A crash before the commit leaves format 1, and the next writer
-    /// open counts again.
-    fn upgrade(db: &Database) -> Result<u64> {
-        let txn = db.begin_write().map_err(backend)?;
-        let count = {
-            let records = txn.open_table(RECORDS).map_err(backend)?;
-            let count = count_objects(&records)?;
-            let mut meta = txn.open_table(META).map_err(backend)?;
-            meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
-                .map_err(backend)?;
-            meta.insert(META_FORMAT, format::FORMAT_NAME)
-                .map_err(backend)?;
-            count
-        };
-        txn.commit().map_err(backend)?;
-        Ok(count)
     }
 
     /// Write new records with `compression`. The backend reads records of
@@ -353,6 +329,21 @@ impl RedbBackend {
             prev: frame.prev,
             data: frame.data.into_owned(),
         })
+    }
+
+    /// Read the record of `oid` at `tid`, which the object index gives. A
+    /// record that does not exist raises `CorruptRecord`.
+    fn indexed_record(
+        records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+        oid: Oid,
+        tid: Tid,
+    ) -> Result<Record> {
+        let key = format::record_key(oid, tid);
+        let value = records
+            .get(&key)
+            .map_err(backend)?
+            .ok_or(ZoeError::CorruptRecord { oid, tid })?;
+        Self::record(oid, &key, value.value())
     }
 
     /// Decode and verify the transaction row stored under `key`.
@@ -403,36 +394,22 @@ impl RedbBackend {
 impl Backend for RedbBackend {
     fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>> {
         let txn = self.db.begin_read().map_err(backend)?;
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        let Some(found) = tid_before(&index, oid, tid)? else {
+            return Ok(None);
+        };
         let records = txn.open_table(RECORDS).map_err(backend)?;
-        let start = format::record_key(oid, Tid::ZERO);
-        let end = format::record_key(oid, tid);
-        let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
-        match range.next_back() {
-            Some(entry) => {
-                let (key, value) = entry.map_err(backend)?;
-                inside(oid, key.value(), start..end)?;
-                Self::record(oid, key.value(), value.value()).map(Some)
-            }
-            None => Ok(None),
-        }
+        Self::indexed_record(&records, oid, found).map(Some)
     }
 
     fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
         // One read transaction serves every oid.
         let txn = self.db.begin_read().map_err(backend)?;
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;
-        oids.map(|oid| {
-            let start = format::record_key(oid, Tid::ZERO);
-            let end = format::record_key(oid, Tid::MAX);
-            let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
-            match range.next_back() {
-                Some(entry) => {
-                    let (key, value) = entry.map_err(backend)?;
-                    inside(oid, key.value(), start..end)?;
-                    Self::record(oid, key.value(), value.value()).map(Some)
-                }
-                None => Ok(None),
-            }
+        oids.map(|oid| match tid_before(&index, oid, Tid::MAX)? {
+            Some(found) => Self::indexed_record(&records, oid, found).map(Some),
+            None => Ok(None),
         })
         .collect()
     }
@@ -548,22 +525,24 @@ impl Backend for RedbBackend {
 
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
         let txn = self.db.begin_read().map_err(backend)?;
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;
-        let start = format::record_key(oid, Tid::ZERO);
-        let end = format::record_key(oid, Tid::MAX);
+        let start = format::object_key(oid, Tid::ZERO);
+        let end = format::object_key(oid, Tid::MAX);
         let mut history = Vec::new();
         // Each key is before the key before it.
         let mut before = Included(end);
-        for entry in records
+        for entry in index
             .range::<&[u8; 16]>(&start..=&end)
             .map_err(backend)?
             .rev()
             .take(limit)
         {
-            let (key, value) = entry.map_err(backend)?;
+            let (key, _) = entry.map_err(backend)?;
             inside(oid, key.value(), (Included(start), before))?;
             before = Excluded(*key.value());
-            let record = Self::record(oid, key.value(), value.value())?;
+            let (_, tid) = format::split_object_key(key.value());
+            let record = Self::indexed_record(&records, oid, tid)?;
             history.push(RecordMeta {
                 tid: record.tid,
                 prev: record.prev,
@@ -575,31 +554,25 @@ impl Backend for RedbBackend {
 
     fn load_before_next(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Option<Tid>)> {
         let txn = self.db.begin_read().map_err(backend)?;
-        let records = txn.open_table(RECORDS).map_err(backend)?;
-        let start = format::record_key(oid, Tid::ZERO);
-        let split = format::record_key(oid, tid);
-        let end = format::record_key(oid, Tid::MAX);
-        let before = match records
-            .range::<&[u8; 16]>(&start..&split)
-            .map_err(backend)?
-            .next_back()
-        {
-            Some(entry) => {
-                let (key, value) = entry.map_err(backend)?;
-                inside(oid, key.value(), start..split)?;
-                Some(Self::record(oid, key.value(), value.value())?)
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        let before = match tid_before(&index, oid, tid)? {
+            Some(found) => {
+                let records = txn.open_table(RECORDS).map_err(backend)?;
+                Some(Self::indexed_record(&records, oid, found)?)
             }
             None => None,
         };
-        let next = match records
-            .range::<&[u8; 16]>(&split..=&end)
-            .map_err(backend)?
-            .next()
-        {
-            Some(entry) => {
-                let (key, value) = entry.map_err(backend)?;
-                inside(oid, key.value(), split..=end)?;
-                Some(Self::frame(oid, key.value(), value.value())?.0)
+        // The next tid comes from a key of the object index, which has no
+        // checksum. So the read verifies the frame of the next record too.
+        let next = match tid_from(&index, oid, tid)? {
+            Some(next) => {
+                let records = txn.open_table(RECORDS).map_err(backend)?;
+                let key = format::record_key(oid, next);
+                let value = records
+                    .get(&key)
+                    .map_err(backend)?
+                    .ok_or(ZoeError::CorruptRecord { oid, tid: next })?;
+                Some(Self::frame(oid, &key, value.value())?.0)
             }
             None => None,
         };
@@ -612,18 +585,18 @@ impl Backend for RedbBackend {
             return Ok(oids);
         }
         let txn = self.db.begin_read().map_err(backend)?;
-        let index = txn.open_table(TXN_OIDS).map_err(backend)?;
-        // The scan reads only the index keys of the range, and no record.
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        // The scan reads the records of the range and decodes no frame.
         // Each key is inside the range and after the key before it, so no
         // oid comes twice.
-        let start = format::txn_oid_key(from, Oid(0));
-        let end = format::txn_oid_key(to, Oid(u64::MAX));
+        let start = format::record_key(Oid(0), from);
+        let end = format::record_key(Oid(u64::MAX), to);
         let mut after = Included(start);
-        for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
+        for entry in records.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
-            inside_index(key.value(), (after, Included(end)))?;
+            inside_records(key.value(), (after, Included(end)))?;
             after = Excluded(*key.value());
-            let (tid, oid) = format::split_txn_oid_key(key.value());
+            let (oid, tid) = format::split_record_key(key.value());
             oids.entry(tid).or_default().push(oid);
         }
         Ok(oids)
@@ -635,17 +608,17 @@ impl Backend for RedbBackend {
             return Ok(tids);
         }
         let txn = self.db.begin_read().map_err(backend)?;
-        let index = txn.open_table(TXN_OIDS).map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
         // The scan keeps only the tids. Each key is inside the range and
         // after the key before it, as in `txn_oids`.
-        let start = format::txn_oid_key(from, Oid(0));
-        let end = format::txn_oid_key(to, Oid(u64::MAX));
+        let start = format::record_key(Oid(0), from);
+        let end = format::record_key(Oid(u64::MAX), to);
         let mut after = Included(start);
-        for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
+        for entry in records.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
-            inside_index(key.value(), (after, Included(end)))?;
+            inside_records(key.value(), (after, Included(end)))?;
             after = Excluded(*key.value());
-            let (tid, _) = format::split_txn_oid_key(key.value());
+            let (_, tid) = format::split_record_key(key.value());
             if tids.last() != Some(&tid) {
                 if tids.len() == limit {
                     break;
@@ -658,30 +631,20 @@ impl Backend for RedbBackend {
 
     fn current_from(&self, from: Oid) -> Result<Option<(Oid, Record)>> {
         let txn = self.db.begin_read().map_err(backend)?;
-        let records = txn.open_table(RECORDS).map_err(backend)?;
-        let start = format::record_key(from, Tid::ZERO);
-        let oid = match records
-            .range::<&[u8; 16]>(&start..)
-            .map_err(backend)?
-            .next()
-        {
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        let start = format::object_key(from, Tid::ZERO);
+        let oid = match index.range::<&[u8; 16]>(&start..).map_err(backend)?.next() {
             Some(entry) => {
                 let key = *entry.map_err(backend)?.0.value();
                 inside(from, &key, start..)?;
-                format::split_record_key(&key).0
+                format::split_object_key(&key).0
             }
             None => return Ok(None),
         };
-        let first = format::record_key(oid, Tid::ZERO);
-        let last = format::record_key(oid, Tid::MAX);
-        let mut versions = records
-            .range::<&[u8; 16]>(&first..=&last)
-            .map_err(backend)?;
-        match versions.next_back() {
-            Some(entry) => {
-                let (key, value) = entry.map_err(backend)?;
-                inside(oid, key.value(), first..=last)?;
-                Ok(Some((oid, Self::record(oid, key.value(), value.value())?)))
+        match tid_before(&index, oid, Tid::MAX)? {
+            Some(tid) => {
+                let records = txn.open_table(RECORDS).map_err(backend)?;
+                Ok(Some((oid, Self::indexed_record(&records, oid, tid)?)))
             }
             None => Ok(None),
         }
@@ -705,20 +668,19 @@ impl Backend for RedbBackend {
     }
 
     fn object_count(&self) -> Option<u64> {
-        self.counted
-            .then(|| self.object_count.load(Ordering::Acquire))
+        Some(self.object_count.load(Ordering::Acquire))
     }
 
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
         let txn = self.db.begin_read().map_err(backend)?;
-        let records = txn.open_table(RECORDS).map_err(backend)?;
-        let start = format::record_key(from, Tid::ZERO);
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        let start = format::object_key(from, Tid::ZERO);
         let mut keys: Vec<(Oid, Tid)> = Vec::new();
         // Each key is at or after the start, and after the key before it.
         let mut after = Included(start);
-        for entry in records.range::<&[u8; 16]>(&start..).map_err(backend)? {
+        for entry in index.range::<&[u8; 16]>(&start..).map_err(backend)? {
             let (key, _) = entry.map_err(backend)?;
-            let (oid, tid) = format::split_record_key(key.value());
+            let (oid, tid) = format::split_object_key(key.value());
             inside(oid, key.value(), (after, Unbounded))?;
             after = Excluded(*key.value());
             if keys.len() >= limit && keys.last().is_some_and(|&(last, _)| last != oid) {
@@ -731,38 +693,38 @@ impl Backend for RedbBackend {
 
     fn txn_records(&self, tid: Tid) -> Result<Option<TxnRecords>> {
         let txn = self.db.begin_read().map_err(backend)?;
-        let index = txn.open_table(TXN_OIDS).map_err(backend)?;
-        let start = format::txn_oid_key(tid, Oid(0));
-        let end = format::txn_oid_key(tid, Oid(u64::MAX));
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        let index = txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        let start = format::record_key(Oid(0), tid);
+        let end = format::record_key(Oid(u64::MAX), tid);
         // Each key has the tid `tid` and comes after the key before it, so
-        // no oid of another transaction comes in, and no oid comes twice.
-        let mut oids = Vec::new();
+        // no record of another transaction comes in, and no oid comes
+        // twice. Each record must have its key in the object index.
+        let mut found = Vec::new();
         let mut after = Included(start);
-        for entry in index.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
-            let (key, _) = entry.map_err(backend)?;
-            inside_index(key.value(), (after, Included(end)))?;
+        for entry in records.range::<&[u8; 16]>(&start..=&end).map_err(backend)? {
+            let (key, value) = entry.map_err(backend)?;
+            inside_records(key.value(), (after, Included(end)))?;
             after = Excluded(*key.value());
-            oids.push(format::split_txn_oid_key(key.value()).1);
+            let (oid, _) = format::split_record_key(key.value());
+            let indexed = index
+                .get(&format::object_key(oid, tid))
+                .map_err(backend)?
+                .is_some();
+            if !indexed {
+                return Err(ZoeError::CorruptTxn { tid });
+            }
+            found.push((oid, Self::record(oid, key.value(), value.value())?.data));
         }
         let txns = txn.open_table(TXNS).map_err(backend)?;
         let key = format::txn_key(tid);
         let row = match txns.get(&key).map_err(backend)? {
             Some(value) => Self::txn_row(&key, value.value())?,
             // A pack removes a row in the write that removes its last
-            // index key.
-            None if oids.is_empty() => return Ok(None),
+            // record.
+            None if found.is_empty() => return Ok(None),
             None => return Err(ZoeError::CorruptTxn { tid }),
         };
-        let records = txn.open_table(RECORDS).map_err(backend)?;
-        let mut found = Vec::with_capacity(oids.len());
-        for oid in oids {
-            let key = format::record_key(oid, tid);
-            let value = records
-                .get(&key)
-                .map_err(backend)?
-                .ok_or(ZoeError::CorruptTxn { tid })?;
-            found.push((oid, Self::record(oid, &key, value.value())?.data));
-        }
         Ok(Some((row, found)))
     }
 
@@ -852,7 +814,7 @@ impl Backend for RedbBackend {
     }
 
     fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
-        self.remove_for_test(TXN_OIDS, &format::txn_oid_key(tid, oid), oid)
+        self.remove_for_test(OBJECT_INDEX, &format::object_key(oid, tid), oid)
     }
 
     fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
@@ -943,11 +905,11 @@ impl RedbWrite<'_> {
     /// the oid. The first note of an oid reads if the oid has a record.
     fn touch(
         touched: &mut BTreeMap<Oid, Touched>,
-        records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+        index: &impl ReadableTable<&'static [u8; 16], ()>,
         oid: Oid,
         removed: bool,
     ) -> Result<()> {
-        Self::touch_put(touched, records, oid, Tid::ZERO, None, removed)
+        Self::touch_put(touched, index, oid, Tid::ZERO, None, removed)
     }
 
     /// Note that the write touches `oid`, as `touch` does. `prev` is the
@@ -956,7 +918,7 @@ impl RedbWrite<'_> {
     /// note reads nothing for it.
     fn touch_put(
         touched: &mut BTreeMap<Oid, Touched>,
-        records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+        index: &impl ReadableTable<&'static [u8; 16], ()>,
         oid: Oid,
         prev: Tid,
         fresh: Option<Oid>,
@@ -967,7 +929,7 @@ impl RedbWrite<'_> {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let before = match fresh {
                     Some(fresh) if oid >= fresh => false,
-                    _ => has_records_from(records, oid, prev)?,
+                    _ => has_records_from(index, oid, prev)?,
                 };
                 entry.insert(Touched {
                     before,
@@ -995,11 +957,11 @@ impl RedbWrite<'_> {
     /// each touched oid that has a record now and had none before, less
     /// each touched oid that had a record before and has none now.
     fn count_after(&self, stored: u64) -> Result<u64> {
-        let records = self.txn.open_table(RECORDS).map_err(backend)?;
+        let index = self.txn.open_table(OBJECT_INDEX).map_err(backend)?;
         let mut count = stored;
         for (&oid, touched) in &self.touched {
             // A write that only put records of the oid leaves a record.
-            let after = !touched.removed || has_records(&records, oid)?;
+            let after = !touched.removed || has_records(&index, oid)?;
             // Only a damaged count can be lower than the oids that it
             // counts. `zoe verify` finds such a count, so the write does
             // not fail for it.
@@ -1027,10 +989,10 @@ impl WriteTxn for RedbWrite<'_> {
         let fresh = self.fresh()?;
         // The two tables stay open for all the records of the call.
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
-        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
+        let mut index = self.txn.open_table(OBJECT_INDEX).map_err(backend)?;
         for record in new {
             let (oid, prev, data) = record?;
-            Self::touch_put(&mut self.touched, &records, oid, prev, fresh, false)?;
+            Self::touch_put(&mut self.touched, &index, oid, prev, fresh, false)?;
             let key = format::record_key(oid, tid);
             let frame = format::encode_frame_with(
                 KeySpace::Records,
@@ -1042,7 +1004,7 @@ impl WriteTxn for RedbWrite<'_> {
             );
             records.insert(&key, frame.as_slice()).map_err(backend)?;
             index
-                .insert(&format::txn_oid_key(tid, oid), ())
+                .insert(&format::object_key(oid, tid), ())
                 .map_err(backend)?;
             self.max_oid = self.max_oid.max(Some(oid));
         }
@@ -1083,20 +1045,25 @@ impl WriteTxn for RedbWrite<'_> {
     }
 
     fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()> {
-        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
-        Self::touch(&mut self.touched, &records, oid, true)?;
-        records
-            .remove(&format::record_key(oid, tid))
-            .map_err(backend)?;
-        let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
-        let removed = index
-            .remove(&format::txn_oid_key(tid, oid))
+        let mut index = self.txn.open_table(OBJECT_INDEX).map_err(backend)?;
+        Self::touch(&mut self.touched, &index, oid, true)?;
+        let indexed = index
+            .remove(&format::object_key(oid, tid))
             .map_err(backend)?
             .is_some();
-        // A record without its index key is a damaged store. The removal
-        // fails, so the write does not erase the evidence.
-        if !removed {
+        let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        let stored = records
+            .remove(&format::record_key(oid, tid))
+            .map_err(backend)?
+            .is_some();
+        // A record without its key in the object index, or a key without
+        // its record, is a damaged store. The removal fails, so the write
+        // does not erase the evidence.
+        if !indexed {
             return Err(ZoeError::CorruptTxn { tid });
+        }
+        if !stored {
+            return Err(ZoeError::CorruptRecord { oid, tid });
         }
         Ok(())
     }
@@ -1268,6 +1235,10 @@ mod tests {
         txn.open_table(RECORDS)
             .unwrap()
             .insert(&key, frame_with_codec(&key, codec, payload).as_slice())
+            .unwrap();
+        txn.open_table(OBJECT_INDEX)
+            .unwrap()
+            .insert(&format::object_key(oid, tid), ())
             .unwrap();
         txn.commit().unwrap();
     }
@@ -1464,6 +1435,10 @@ mod tests {
                 .to_vec();
             records
                 .insert(&format::record_key(Oid(2), Tid(5)), frame.as_slice())
+                .unwrap();
+            let mut index = txn.open_table(OBJECT_INDEX).unwrap();
+            index
+                .insert(&format::object_key(Oid(2), Tid(5)), ())
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -1705,7 +1680,7 @@ mod tests {
             .unwrap();
         let txn = db.begin_write().unwrap();
         txn.open_table(RECORDS).unwrap();
-        txn.open_table(TXN_OIDS).unwrap();
+        txn.open_table(OBJECT_INDEX).unwrap();
         txn.open_table(TXNS).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();
@@ -1757,8 +1732,7 @@ mod tests {
         );
     }
 
-    /// The number of records of oid 1 that `many_records` writes, and of
-    /// rows that `many_rows` writes.
+    /// The number of rows that `many_rows` writes.
     const LAST: u64 = 120;
 
     /// Return the bytes of the database file `db` of `vfs`.
@@ -1835,14 +1809,17 @@ mod tests {
         early: usize,
     }
 
-    /// Write the records of oid 1 at the tids 1 to `LAST`, and one record of
-    /// oid 2, in the database file `db` of `vfs`. The records are large
-    /// enough that `records` has branch pages.
+    /// The number of records of oid 1 that `many_records` writes.
+    const VERSIONS: u64 = 400;
+
+    /// Write the records of oid 1 at the tids 1 to `VERSIONS`, and one
+    /// record of oid 2, in the database file `db` of `vfs`. The object
+    /// index then has branch pages.
     fn many_records(vfs: &MemVfs) {
         let backend = backend_in(vfs);
         let mut write = backend.begin_write().unwrap();
-        for tid in 1..=LAST {
-            let pickle = [tid as u8; 200];
+        for tid in 1..=VERSIONS {
+            let pickle = [tid as u8; 8];
             write
                 .put_record(Oid(1), Tid(tid), Tid(tid - 1), &pickle)
                 .unwrap();
@@ -1853,11 +1830,11 @@ mod tests {
         write.commit().unwrap();
     }
 
-    /// Run the scans of `records` for oid 1 at each tid. Record each key
-    /// outside its scan that a read gave, and count the ones that a check
-    /// caught.
+    /// Run the scans of the object index for oid 1 at each tid. Record each
+    /// key outside its scan that a read gave, and count the ones that a
+    /// check caught.
     fn check_records(backend: &RedbBackend, scans: &mut Scans) {
-        for t in 1..=LAST + 1 {
+        for t in 1..=VERSIONS + 1 {
             let tid = Tid(t);
             match backend.load_before(Oid(1), tid) {
                 Ok(Some(record)) if record.tid >= tid => {
@@ -1896,12 +1873,12 @@ mod tests {
         if let Ok(history) = backend.history(Oid(1), usize::MAX) {
             let tids: Vec<u64> = history.iter().map(|meta| meta.tid.0).collect();
             let newest_first = tids.windows(2).all(|pair| pair[0] > pair[1]);
-            if !newest_first || tids.iter().any(|&tid| !(1..=LAST).contains(&tid)) {
+            if !newest_first || tids.iter().any(|&tid| !(1..=VERSIONS).contains(&tid)) {
                 scans.wrong.push(format!("history: {tids:?}"));
             }
         }
         if let Ok(Some((oid, record))) = backend.current_from(Oid(1)) {
-            let last = if oid == Oid(1) { LAST } else { 1 };
+            let last = if oid == Oid(1) { VERSIONS } else { 1 };
             if !(1..=last).contains(&record.tid.0) {
                 scans
                     .wrong
@@ -1934,8 +1911,8 @@ mod tests {
         let vfs = MemVfs::new();
         many_records(&vfs);
         let file = file_of(&vfs);
-        let keys: Vec<Vec<u8>> = (1..=LAST)
-            .map(|tid| format::record_key(Oid(1), Tid(tid)).to_vec())
+        let keys: Vec<Vec<u8>> = (1..=VERSIONS)
+            .map(|tid| format::object_key(Oid(1), Tid(tid)).to_vec())
             .collect();
         let mut scans = Scans::default();
         for at in copies(&file, &keys) {
@@ -2127,7 +2104,7 @@ mod tests {
         many_index_keys(&vfs);
         let file = file_of(&vfs);
         let keys: Vec<Vec<u8>> = (1..=INDEXED)
-            .map(|n| format::txn_oid_key(row_tid(n), Oid(n)).to_vec())
+            .map(|n| format::record_key(Oid(n), row_tid(n)).to_vec())
             .collect();
         let mut scans = Scans::default();
         for at in copies(&file, &keys) {
@@ -2225,7 +2202,7 @@ mod tests {
         write.commit().unwrap();
 
         let txn = backend.db.begin_read().unwrap();
-        let index = txn.open_table(TXN_OIDS).unwrap();
+        let index = txn.open_table(OBJECT_INDEX).unwrap();
         let keys: Vec<[u8; 16]> = index
             .iter()
             .unwrap()
@@ -2235,14 +2212,14 @@ mod tests {
         assert_eq!(
             keys,
             [
-                format::txn_oid_key(Tid(5), Oid(1)),
-                format::txn_oid_key(Tid(5), Oid(2))
+                format::object_key(Oid(1), Tid(5)),
+                format::object_key(Oid(2), Tid(5))
             ]
         );
     }
 
     #[test]
-    fn txn_oids_reads_the_index_and_no_record() {
+    fn txn_oids_reads_the_keys_of_records() {
         let backend = empty();
         let mut write = backend.begin_write().unwrap();
         for oid in [1, 2, 3] {
@@ -2251,20 +2228,39 @@ mod tests {
                 .unwrap();
         }
         write.commit().unwrap();
-        let rest = BTreeMap::from([(Tid(5), vec![Oid(1), Oid(3)])]);
 
-        // A record without its index key is not in the map.
+        // A record without its key in the object index stays in the map,
+        // and loads do not see it.
         backend.remove_index_key_for_test(Tid(5), Oid(2)).unwrap();
         assert_eq!(
             backend.load_serial(Oid(2), Tid(5)).unwrap(),
             Some(b"pickle".to_vec())
         );
-        assert_eq!(backend.txn_oids(Tid(5), Tid(5)).unwrap(), rest);
+        assert_eq!(backend.load_before(Oid(2), Tid::MAX).unwrap(), None);
+        assert_eq!(
+            backend.txn_oids(Tid(5), Tid(5)).unwrap(),
+            BTreeMap::from([(Tid(5), vec![Oid(1), Oid(2), Oid(3)])])
+        );
 
-        // An index key without its record stays in the map.
+        // A key of the object index without its record is not in the map,
+        // and a load that follows the key raises `CorruptRecord`.
         backend.remove_record_for_test(Oid(3), Tid(5)).unwrap();
         assert_eq!(backend.load_serial(Oid(3), Tid(5)).unwrap(), None);
-        assert_eq!(backend.txn_oids(Tid(5), Tid(5)).unwrap(), rest);
+        let error = backend.load_before(Oid(3), Tid::MAX);
+        assert!(
+            matches!(
+                error,
+                Err(ZoeError::CorruptRecord {
+                    oid: Oid(3),
+                    tid: Tid(5)
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            backend.txn_oids(Tid(5), Tid(5)).unwrap(),
+            BTreeMap::from([(Tid(5), vec![Oid(1), Oid(2)])])
+        );
 
         // A hook that finds nothing to remove fails.
         let error = backend.remove_index_key_for_test(Tid(5), Oid(2));
@@ -2309,38 +2305,38 @@ mod tests {
     }
 
     #[test]
-    fn txn_records_reads_the_index_keys_of_its_tid() {
+    fn txn_records_reads_the_records_of_its_tid() {
         let backend = empty();
         commit_txn_of(&backend, Tid(5), &[3, 1, 2]);
         commit_txn_of(&backend, Tid(6), &[1]);
+        commit_txn_of(&backend, Tid(8), &[1, 2]);
         assert_eq!(
             records_of(&backend, Tid(5)).unwrap(),
             Some(vec![Oid(1), Oid(2), Oid(3)])
         );
-        // No row and no index key: a pack removed the transaction.
+        // No row and no record: a pack removed the transaction.
         assert_eq!(records_of(&backend, Tid(7)).unwrap(), None);
 
-        // A record without its index key is left out. The caller finds the
-        // records short of the oid count of the row.
+        // A record without its key in the object index is corrupt.
         backend.remove_index_key_for_test(Tid(5), Oid(2)).unwrap();
-        let (row, records) = backend.txn_records(Tid(5)).unwrap().unwrap();
-        assert_eq!((row.oid_count, records.len()), (3, 2));
-
-        // An index key without its record is corrupt.
-        backend.remove_record_for_test(Oid(3), Tid(5)).unwrap();
         let error = records_of(&backend, Tid(5));
         assert!(
             matches!(error, Err(ZoeError::CorruptTxn { tid: Tid(5) })),
             "{error:?}"
         );
 
-        // An index key of a tid that has no row is corrupt.
-        let txn = backend.database().begin_write().unwrap();
-        txn.open_table(TXN_OIDS)
-            .unwrap()
-            .insert(&format::txn_oid_key(Tid(7), Oid(1)), ())
+        // A key of the object index without its record leaves the records
+        // short of the oid count of the row, and the caller finds that.
+        backend.remove_record_for_test(Oid(2), Tid(8)).unwrap();
+        let (row, records) = backend.txn_records(Tid(8)).unwrap().unwrap();
+        assert_eq!((row.oid_count, records.len()), (2, 1));
+
+        // A record of a tid that has no row is corrupt.
+        let mut write = backend.begin_write().unwrap();
+        write
+            .put_record(Oid(1), Tid(7), Tid::ZERO, b"pickle")
             .unwrap();
-        txn.commit().unwrap();
+        write.commit().unwrap();
         let error = records_of(&backend, Tid(7));
         assert!(
             matches!(error, Err(ZoeError::CorruptTxn { tid: Tid(7) })),
@@ -2365,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_without_the_transaction_index_does_not_open() {
+    fn a_store_without_the_object_index_does_not_open() {
         let db = redb::Builder::new()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -2386,7 +2382,7 @@ mod tests {
 
         let error = RedbBackend::open(db).err();
         assert!(
-            matches!(&error, Some(ZoeError::Format(message)) if message.contains("transaction index")),
+            matches!(&error, Some(ZoeError::Format(message)) if message.contains("object index")),
             "{error:?}"
         );
     }
@@ -2407,11 +2403,14 @@ mod tests {
             })
             .collect();
         let index: BTreeSet<(Tid, Oid)> = txn
-            .open_table(TXN_OIDS)
+            .open_table(OBJECT_INDEX)
             .unwrap()
             .iter()
             .unwrap()
-            .map(|entry| format::split_txn_oid_key(entry.unwrap().0.value()))
+            .map(|entry| {
+                let (oid, tid) = format::split_object_key(entry.unwrap().0.value());
+                (tid, oid)
+            })
             .collect();
         assert_eq!(records, index, "{image:?}");
 
@@ -2515,7 +2514,7 @@ mod tests {
             .unwrap();
         let txn = db.begin_write().unwrap();
         txn.open_table(RECORDS).unwrap();
-        txn.open_table(TXN_OIDS).unwrap();
+        txn.open_table(OBJECT_INDEX).unwrap();
         txn.open_table(TXNS).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();

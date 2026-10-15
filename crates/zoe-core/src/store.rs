@@ -632,17 +632,17 @@ impl Store {
         self.backend.last_tid()
     }
 
-    /// Remove the key `(tid, oid)` of the transaction index and keep the
-    /// record. A test uses it to damage the store. Fail with `NotFound`
-    /// when the key does not exist.
+    /// Remove the key of the record of `oid` at `tid` in the object index
+    /// and keep the record. A test uses it to damage the store. Fail with
+    /// `NotFound` when the key does not exist.
     #[doc(hidden)]
     pub fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
         self.backend.remove_index_key_for_test(tid, oid)
     }
 
-    /// Remove the record of `oid` at `tid` and keep its key in the
-    /// transaction index. A test uses it to damage the store. Fail with
-    /// `NotFound` when the record does not exist.
+    /// Remove the record of `oid` at `tid` and keep its key in the object
+    /// index. A test uses it to damage the store. Fail with `NotFound`
+    /// when the record does not exist.
     #[doc(hidden)]
     pub fn remove_record_for_test(&self, oid: Oid, tid: Tid) -> Result<()> {
         self.backend.remove_record_for_test(oid, tid)

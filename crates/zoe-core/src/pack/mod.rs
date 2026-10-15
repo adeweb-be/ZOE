@@ -505,13 +505,14 @@ impl<'s> Pack<'s> {
 
     /// Tell if the record of `oid` at `tid` is a deletion. Only this pack
     /// removes records at or before T, so a record that the key scan gave
-    /// is there.
+    /// is there. A record that is not there is a key of the object index
+    /// without its record: `CorruptRecord`.
     fn is_deletion(&self, oid: Oid, tid: Tid) -> Result<bool> {
         let data = self
             .store
             .backend
             .load_serial(oid, tid)?
-            .ok_or(ZoeError::NotFound { oid })?;
+            .ok_or(ZoeError::CorruptRecord { oid, tid })?;
         Ok(data.is_empty())
     }
 
@@ -529,10 +530,11 @@ impl<'s> Pack<'s> {
     fn removal(&self, oid: Oid, tid: Tid, newest: bool, no_later: bool) -> Result<Removal> {
         let backend = &self.store.backend;
         // Only this pack removes records at or before T, so the record is
-        // there.
+        // there. A record that is not there is a key of the object index
+        // without its record.
         let data = backend
             .load_serial(oid, tid)?
-            .ok_or(ZoeError::NotFound { oid })?;
+            .ok_or(ZoeError::CorruptRecord { oid, tid })?;
         let blob = backend.load_blob(oid, tid)?.map(|blob| blob.size);
         Ok(Removal {
             oid,
@@ -795,22 +797,26 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_its_index_key_stops_the_pack_and_stays() {
+    fn a_key_of_the_object_index_without_its_record_stops_the_pack_and_stays() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let g = Oid(1);
         let t1 = commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
         let t2 = commit(&store, &[(ROOT, record(&[]))]);
-        store.remove_index_key_for_test(t1, g).unwrap();
+        store.remove_record_for_test(g, t1).unwrap();
 
         // The batch removes ROOT and g at t1. Its write fails, so it
         // removes neither.
         let error = store.pack(t2);
         assert!(
-            matches!(error, Err(ZoeError::CorruptTxn { tid }) if tid == t1),
+            matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
             "{error:?}"
         );
-        assert_eq!(store.load_serial(g, t1).unwrap(), record(&[]));
         assert_eq!(store.load_serial(ROOT, t1).unwrap(), record(&[g]));
+        let error = store.load_before(g, t2);
+        assert!(
+            matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == g && tid == t1),
+            "{error:?}"
+        );
     }
 
     #[test]

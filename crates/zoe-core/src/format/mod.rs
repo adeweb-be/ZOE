@@ -24,7 +24,7 @@
 //! bytes in this order: the tag of the key space (1 byte), the key of the
 //! row, header bytes 0 to 23, the slots, then the payload. `KeySpace`
 //! gives the tags. The key of a record and of a blob record is the 16
-//! bytes of `record_key`. The key of a transaction row and of an intent
+//! bytes of `record_key`: the tid, then the oid. The key of a transaction row and of an intent
 //! file is the 8 bytes of `txn_key`. The key of a sequence row is the
 //! UTF-8 bytes of the name of the sequence. So a frame that is read under
 //! another key, or in another key space, fails the check.
@@ -40,10 +40,12 @@
 //! of `meta` holds the number of distinct oids that have at least one
 //! record, a deletion included.
 //!
-//! The transaction index gives the oids of each transaction. It has one
-//! key for each record: the 16 bytes of `txn_oid_key`, the tid then the
-//! oid. Its value is empty. So a range scan over the keys of one tid gives
-//! the oids of that transaction in ascending order. The index has no
+//! A range scan of `records` over the keys of one tid gives the records
+//! of that transaction in oid order, and a commit appends its records at
+//! the end of the table. The object index gives the records of each oid.
+//! It has one key for each record: the 16 bytes of `object_key`, the oid
+//! then the tid. Its value is empty. So a range scan over the keys of one
+//! oid gives the tids of its records in ascending order. The index has no
 //! frame and no checksum of its own: the checksum of a record frame covers
 //! the oid and the tid of the record.
 
@@ -65,15 +67,10 @@ pub use codec::{Codec, Compression};
 #[cfg(test)]
 pub(crate) use codec::EMPTY_ZSTD_PAYLOADS;
 
-/// The name and version of the format, in the `format` row of `meta`.
-/// A store of this format has the row `object_count` in `meta`. An open
-/// refuses a store with a name other than this one and `FORMAT_1_NAME`.
-pub const FORMAT_NAME: &[u8] = b"ZOE format 2";
-
-/// The name of the format without the row `object_count`. A writer open
-/// counts the objects of such a store once, then writes the count and
-/// `FORMAT_NAME`. A read-only open reads such a store and has no count.
-pub const FORMAT_1_NAME: &[u8] = b"ZOE format 1";
+/// The name and version of the format, in the `format` row of `meta`. An
+/// open refuses a store with another name, an earlier format too: no tool
+/// converts a store of an earlier format.
+pub const FORMAT_NAME: &[u8] = b"ZOE format 3";
 
 /// The key space of a frame. Its tag is the first byte of the checksum
 /// input, so a frame verifies only in the key space that wrote it.
@@ -293,16 +290,33 @@ fn checksum(space: KeySpace, key: &[u8], header: &[u8], slots: &[u8], payload: &
     hasher.digest()
 }
 
-/// Return the key of a record: the oid, then the tid, both big-endian.
+/// Return the key of the record of `oid` at `tid`, in `records` and in
+/// `blobs`: the tid, then the oid, both big-endian.
 pub fn record_key(oid: Oid, tid: Tid) -> [u8; 16] {
+    let mut key = [0; 16];
+    key[..8].copy_from_slice(&tid.0.to_be_bytes());
+    key[8..].copy_from_slice(&oid.0.to_be_bytes());
+    key
+}
+
+/// Split a record key into its oid and tid.
+pub fn split_record_key(key: &[u8; 16]) -> (Oid, Tid) {
+    let tid = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let oid = u64::from_be_bytes(key[8..].try_into().unwrap());
+    (Oid(oid), Tid(tid))
+}
+
+/// Return the key of the object index for the record of `oid` at `tid`:
+/// the oid, then the tid, both big-endian.
+pub fn object_key(oid: Oid, tid: Tid) -> [u8; 16] {
     let mut key = [0; 16];
     key[..8].copy_from_slice(&oid.0.to_be_bytes());
     key[8..].copy_from_slice(&tid.0.to_be_bytes());
     key
 }
 
-/// Split a record key into its oid and tid.
-pub fn split_record_key(key: &[u8; 16]) -> (Oid, Tid) {
+/// Split a key of the object index into its oid and tid.
+pub fn split_object_key(key: &[u8; 16]) -> (Oid, Tid) {
     let oid = u64::from_be_bytes(key[..8].try_into().unwrap());
     let tid = u64::from_be_bytes(key[8..].try_into().unwrap());
     (Oid(oid), Tid(tid))
@@ -311,22 +325,6 @@ pub fn split_record_key(key: &[u8; 16]) -> (Oid, Tid) {
 /// Return the key of a transaction row: the tid, big-endian.
 pub fn txn_key(tid: Tid) -> [u8; 8] {
     tid.0.to_be_bytes()
-}
-
-/// Return the key of the transaction index for the record of `oid` at
-/// `tid`: the tid, then the oid, both big-endian.
-pub fn txn_oid_key(tid: Tid, oid: Oid) -> [u8; 16] {
-    let mut key = [0; 16];
-    key[..8].copy_from_slice(&tid.0.to_be_bytes());
-    key[8..].copy_from_slice(&oid.0.to_be_bytes());
-    key
-}
-
-/// Split a key of the transaction index into its tid and oid.
-pub fn split_txn_oid_key(key: &[u8; 16]) -> (Tid, Oid) {
-    let tid = u64::from_be_bytes(key[..8].try_into().unwrap());
-    let oid = u64::from_be_bytes(key[8..].try_into().unwrap());
-    (Tid(tid), Oid(oid))
 }
 
 /// Encode a number for a row of `meta`.
@@ -675,25 +673,32 @@ mod tests {
     }
 
     #[test]
-    fn keys_sort_by_oid_then_tid() {
-        let a = record_key(Oid(1), Tid(u64::MAX));
-        let b = record_key(Oid(2), Tid(0));
-        assert!(a < b);
-        assert_eq!(split_record_key(&b), (Oid(2), Tid(0)));
-    }
-
-    #[test]
-    fn index_keys_sort_by_tid_then_oid() {
-        let key = txn_oid_key(Tid(0x0102), Oid(0x0304));
+    fn record_keys_sort_by_tid_then_oid() {
+        let key = record_key(Oid(0x0304), Tid(0x0102));
         assert_eq!(
             key,
             [0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 3, 4],
             "the tid, then the oid, big-endian"
         );
-        assert_eq!(split_txn_oid_key(&key), (Tid(0x0102), Oid(0x0304)));
-        let a = txn_oid_key(Tid(1), Oid(u64::MAX));
-        let b = txn_oid_key(Tid(2), Oid(0));
-        let c = txn_oid_key(Tid(2), Oid(1));
+        assert_eq!(split_record_key(&key), (Oid(0x0304), Tid(0x0102)));
+        let a = record_key(Oid(u64::MAX), Tid(1));
+        let b = record_key(Oid(0), Tid(2));
+        let c = record_key(Oid(1), Tid(2));
+        assert!(a < b && b < c);
+    }
+
+    #[test]
+    fn object_keys_sort_by_oid_then_tid() {
+        let key = object_key(Oid(0x0304), Tid(0x0102));
+        assert_eq!(
+            key,
+            [0, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0, 0, 0, 0, 1, 2],
+            "the oid, then the tid, big-endian"
+        );
+        assert_eq!(split_object_key(&key), (Oid(0x0304), Tid(0x0102)));
+        let a = object_key(Oid(1), Tid(u64::MAX));
+        let b = object_key(Oid(2), Tid(0));
+        let c = object_key(Oid(2), Tid(1));
         assert!(a < b && b < c);
     }
 

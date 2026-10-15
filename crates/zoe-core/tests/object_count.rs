@@ -8,20 +8,9 @@
 //! records, so every snapshot and every crash image holds the count of
 //! its records.
 //!
-//! The format becomes `ZOE format 2`. The first writer open of a store of
-//! `ZOE format 1`, which has no count, counts the oids of `records` once
-//! and writes the count and the new format name in one backend write. A
-//! read-only open of such a store writes nothing and has no count.
-//!
-//! The test makes a store of format 1 with the test hook
-//! `zoe_core::testing::{remove_meta, write_meta}`, which this card adds.
 //! It checks the count against the oids of `Store::record_keys` after
-//! each step, and on every crash image of commits, of a pack and of the
-//! upgrade.
+//! each step, and on every crash image of commits and of a pack.
 
-use std::path::PathBuf;
-
-use zoe_core::testing;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid};
 
@@ -31,15 +20,8 @@ const PICKLE: &[u8] =
 
 const ROOT: Oid = Oid(0);
 
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-object-count-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// Return the number of oids that have a record in `store`, deletions
-/// included, from the keys of `records`.
+/// included, from the keys of the object index.
 fn oids_with_records(store: &Store) -> u64 {
     let mut count = 0;
     let mut from = Oid(0);
@@ -97,13 +79,6 @@ fn root_and_orphans(store: &Store, n: usize) -> Vec<Oid> {
     writes.extend(oids.iter().map(|&oid| (oid, Some(PICKLE))));
     commit(store, &writes);
     oids
-}
-
-/// Make `store` a store of format 1: no `object_count`, and the format
-/// name of before this card. A close writes no count, so the change stays.
-fn downgrade(store: &Store) {
-    testing::remove_meta(store, "object_count").unwrap();
-    testing::write_meta(store, "format", b"ZOE format 1").unwrap();
 }
 
 #[test]
@@ -164,36 +139,6 @@ fn the_count_survives_a_reopen() {
 }
 
 #[test]
-fn the_first_writer_open_of_a_store_of_format_1_counts_once() {
-    let dir = fresh_dir("upgrade");
-    let store = Store::open(&dir).unwrap();
-    let oids = root_and_orphans(&store, 4);
-    commit(&store, &[(oids[1], None)]);
-    downgrade(&store);
-    drop(store);
-
-    // A read-only open writes nothing and has no count.
-    let database = dir.join("zoe.redb");
-    let before = std::fs::read(&database).unwrap();
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), None);
-    drop(reader);
-    assert_eq!(std::fs::read(&database).unwrap(), before);
-
-    // The first writer open counts and writes the count.
-    let store = Store::open(&dir).unwrap();
-    assert_eq!(store.object_count(), Some(5));
-    assert_exact(&store, "after the upgrade");
-    drop(store);
-
-    // Then a read-only open reads it.
-    let reader = Store::open_read_only(&dir).unwrap();
-    assert_eq!(reader.object_count(), Some(5));
-    drop(reader);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn every_crash_image_of_commits_holds_the_count_of_its_records() {
     let vfs = MemVfs::new();
     let store = Store::open_vfs(vfs.clone()).unwrap();
@@ -236,27 +181,5 @@ fn every_crash_image_of_a_pack_holds_the_count_of_its_records() {
         let reopened =
             Store::open_vfs(image.vfs()).unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
         assert_exact(&reopened, &format!("{image:?}"));
-    }
-}
-
-#[test]
-fn every_crash_image_of_the_upgrade_opens_with_an_exact_count() {
-    let vfs = MemVfs::new();
-    let store = Store::open_vfs(vfs.clone()).unwrap();
-    let oids = root_and_orphans(&store, 6);
-    commit(&store, &[(oids[2], None)]);
-    downgrade(&store);
-    drop(store);
-    let vfs = vfs.durable_copy();
-    let store = Store::open_vfs(vfs.clone()).unwrap();
-    assert_eq!(store.object_count(), Some(7));
-    drop(store);
-
-    for image in vfs.crash_images() {
-        // A crash before the write of the upgrade leaves format 1, and
-        // this open counts again.
-        let reopened =
-            Store::open_vfs(image.vfs()).unwrap_or_else(|e| panic!("{image:?} does not open: {e}"));
-        assert_eq!(reopened.object_count(), Some(7), "{image:?}");
     }
 }

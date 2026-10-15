@@ -1,13 +1,15 @@
-//! Acceptance test of the transaction index: a `(tid, oid)` key space that
-//! gives the oids of each transaction.
+//! Acceptance test of the records of a transaction: `records` is keyed by
+//! `(tid, oid)`, so it gives the oids of each transaction, and the object
+//! index, keyed by `(oid, tid)`, gives the records of each oid.
 //!
-//! Every commit and every restore writes one index key per record, in the
-//! backend write transaction of its records. The transaction iterator
-//! reads the oids of a transaction from the index. So a read of one
-//! transaction, or of a short tid range, costs the size of the result, and
-//! not a scan of every record key of the store. A record without its index
-//! key, or an index key without its record, is `CorruptTxn`. A crash at
-//! any point leaves the records and the index consistent.
+//! Every commit and every restore writes one key of the object index per
+//! record, in the backend write transaction of its records. The
+//! transaction iterator reads the records of a transaction from a scan of
+//! `records` over its tid. So a read of one transaction, or of a short tid
+//! range, costs the size of the result, and not a scan of every record of
+//! the store. For the iterator, a record without its key of the object
+//! index, or a key without its record, is `CorruptTxn`. A crash at any
+//! point leaves the records and the index consistent.
 //!
 //! The cost is the number of bytes that the database reads from its file
 //! in the simulated filesystem, as `MemVfs::bytes_read` counts them. Each
@@ -16,8 +18,8 @@
 //!
 //! The test uses three hidden test hooks of `Store`: `open_vfs_uncached`
 //! opens a store with no page cache, `remove_index_key_for_test` removes
-//! one index key and keeps its record, and `remove_record_for_test`
-//! removes one record and keeps its index key.
+//! one key of the object index and keeps its record, and
+//! `remove_record_for_test` removes one record and keeps its key.
 
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, RecordInfo, Store, Tid, TxnInfo, ZoeError};
@@ -334,9 +336,18 @@ fn a_record_without_its_index_key_is_corrupt() {
     let store = Store::open_vfs(vfs.clone()).unwrap();
     let (tids, oids) = three_transactions(&store);
 
-    // The test hook removes the index key and keeps the record.
+    // The test hook removes the key of the object index and keeps the
+    // record. The loads go through the object index, so they do not see
+    // the record, and the point read does.
     store.remove_index_key_for_test(tids[1], oids[1]).unwrap();
-    assert_eq!(store.load(oids[1]).unwrap(), (pickle(oids[1], 0), tids[1]));
+    assert!(matches!(
+        store.load(oids[1]),
+        Err(ZoeError::NotFound { .. })
+    ));
+    assert_eq!(
+        store.load_serial(oids[1], tids[1]).unwrap(),
+        pickle(oids[1], 0)
+    );
     assert_only_middle_is_corrupt(store, vfs, tids);
 }
 
@@ -346,12 +357,14 @@ fn an_index_key_without_its_record_is_corrupt() {
     let store = Store::open_vfs(vfs.clone()).unwrap();
     let (tids, oids) = three_transactions(&store);
 
-    // The test hook removes the record and keeps its index key.
+    // The test hook removes the record and keeps its key of the object
+    // index. A load follows the key and finds no record.
     store.remove_record_for_test(oids[1], tids[1]).unwrap();
-    assert!(matches!(
-        store.load(oids[1]),
-        Err(ZoeError::NotFound { .. })
-    ));
+    let error = store.load(oids[1]);
+    assert!(
+        matches!(error, Err(ZoeError::CorruptRecord { oid, tid }) if oid == oids[1] && tid == tids[1]),
+        "{error:?}"
+    );
     assert_only_middle_is_corrupt(store, vfs, tids);
 }
 

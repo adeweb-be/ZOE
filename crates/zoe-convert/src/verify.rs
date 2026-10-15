@@ -12,9 +12,9 @@
 //! A store error is a finding, never a failure of the call.
 //!
 //! The walk counts the oids that have at least one record, deletions
-//! included. A store of format 2 keeps this count in `object_count`, and
-//! a count that differs is a finding. A store of format 1 has no count
-//! yet, which is no finding.
+//! included. The store keeps this count in `object_count`, and a count
+//! that differs is a finding. A backend that keeps no count gives none,
+//! which is no finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,8 +94,8 @@ pub struct Verification {
     pub objects: u64,
     /// The blob records.
     pub blobs: u64,
-    /// The `object_count` that the store keeps. A store of format 1 has
-    /// none until its first writer open: that is no finding.
+    /// The `object_count` that the store keeps. A backend that keeps no
+    /// count gives none: that is no finding.
     pub object_count: Option<u64>,
     /// The object count when it differs from the oids of the records. The
     /// check runs only when the walk read every record key.
@@ -665,8 +665,10 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         commit(&store, &[(0, Some(mapping(&[]))), (1, Some(mapping(&[])))]);
         let tid = commit(&store, &[(2, Some(mapping(&[])))]);
-        // The only record of oid 2 goes, and the count stays.
+        // The only record of oid 2 goes with its key of the object index,
+        // and the count stays.
         store.remove_record_for_test(Oid(2), tid).unwrap();
+        store.remove_index_key_for_test(tid, Oid(2)).unwrap();
         let report = verify(&store, None);
         assert_eq!(
             report.count,
@@ -676,34 +678,5 @@ mod tests {
             })
         );
         assert_eq!(report.problems(), 1, "{report:?}");
-    }
-
-    #[test]
-    fn a_store_of_format_1_has_no_count_and_no_finding() {
-        let dir = std::env::temp_dir().join(format!("zoe-verify-format-1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        {
-            let store = Store::open(&dir).unwrap();
-            commit(&store, &[(0, Some(mapping(&[])))]);
-        }
-        // Make the store a store of format 1: no count, the older name.
-        {
-            let meta: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
-            let db = redb::Database::open(dir.join("zoe.redb")).unwrap();
-            let txn = db.begin_write().unwrap();
-            {
-                let mut table = txn.open_table(meta).unwrap();
-                table.remove("object_count").unwrap();
-                table.insert("format", &b"ZOE format 1"[..]).unwrap();
-            }
-            txn.commit().unwrap();
-        }
-        let store = Store::open_read_only(&dir).unwrap();
-        let report = verify(&store, None);
-        drop(store);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(report.object_count, None);
-        assert_eq!(report.count, None);
-        assert_eq!(report.problems(), 0, "{report:?}");
     }
 }
