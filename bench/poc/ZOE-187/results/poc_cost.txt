@@ -1,0 +1,4 @@
+cargo test --release --locked -p zoe-client --lib poc_ -- --ignored --nocapture --test-threads 1
+poc_cost   1024 B ns/entry: lookup 32  copy+hash 271  copy+hash+memcpy(buffer) 124  copy+hash+Vec 112  atomic words only 41  xxh3 one-shot 37  xxh3 4 KiB stream 41  memcpy 11  alloc+memcpy 15
+poc_cost  16384 B ns/entry: lookup 15  copy+hash 894  copy+hash+memcpy(buffer) 1114  copy+hash+Vec 1206  atomic words only 402  xxh3 one-shot 593  xxh3 4 KiB stream 715  memcpy 190  alloc+memcpy 183
+poc_cost 102400 B ns/entry: lookup 16  copy+hash 6927  copy+hash+memcpy(buffer) 8564  copy+hash+Vec 8770  atomic words only 2612  xxh3 one-shot 3960  xxh3 4 KiB stream 4565  memcpy 2511  alloc+memcpy 2559

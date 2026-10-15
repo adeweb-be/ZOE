@@ -1,0 +1,8 @@
+terms-1-1024     zeo         loadBefore   2.76  zeo_cache   2.67  mvcc_load   2.86  getState   3.97  copy   0.25  (us per object, median of workers)
+terms-1-1024     zoe-native  loadBefore   0.86  native   0.52  mvcc_load   0.93  getState   3.61  copy   0.23  (us per object, median of workers)
+terms-1-102400   zeo         loadBefore  13.35  zeo_cache  12.10  mvcc_load  12.08  getState   9.35  copy   3.52  (us per object, median of workers)
+terms-1-102400   zoe-native  loadBefore  10.90  native  10.14  mvcc_load   9.50  getState   8.60  copy   3.17  (us per object, median of workers)
+terms-16-1024    zeo         loadBefore   5.32  zeo_cache   5.50  mvcc_load   6.89  getState   9.18  copy   0.44  (us per object, median of workers)
+terms-16-1024    zoe-native  loadBefore   1.96  native   1.08  mvcc_load   2.03  getState   9.06  copy   0.43  (us per object, median of workers)
+terms-16-102400  zeo         loadBefore  41.13  zeo_cache  45.76  mvcc_load  37.13  getState  16.14  copy   7.57  (us per object, median of workers)
+terms-16-102400  zoe-native  loadBefore  29.00  native  28.99  mvcc_load  32.20  getState  18.57  copy   8.12  (us per object, median of workers)

@@ -1,0 +1,6 @@
+== TRACE/p16-nobar
+  zeo         P-core loops   59.9 us/obj (n=1203)  E-core loops  148.4 (n=621)  mixed   99.0 (n=96)  slowest worker  130.5  cpu/wall 0.97  overlap 0.00  MHz P      - E      -
+  zoe-native  P-core loops   58.2 us/obj (n=1164)  E-core loops  125.0 (n=670)  mixed   77.4 (n=86)  slowest worker  111.0  cpu/wall 0.96  overlap 0.00  MHz P      - E      -
+== TRACE/p16-bar
+  zeo         P-core loops   79.6 us/obj (n=1206)  E-core loops  178.4 (n=650)  mixed  133.1 (n=64)  slowest worker  146.4  cpu/wall 0.98  overlap 0.00  MHz P      - E      -
+  zoe-native  P-core loops   74.8 us/obj (n=1152)  E-core loops  155.7 (n=700)  mixed  113.8 (n=68)  slowest worker  138.6  cpu/wall 0.97  overlap 0.00  MHz P      - E      -

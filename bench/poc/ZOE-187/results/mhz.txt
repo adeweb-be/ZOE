@@ -1,0 +1,9 @@
+c=1
+  zoe-native  P-core loops   26.2 us/obj (n=400)  E-core loops      - (n=0)  mixed      - (n=0)  slowest worker   26.7  cpu/wall 0.83  overlap 0.00  MHz P 3992.0 E      -
+  zoe-native  P-core loops   16.4 us/obj (n=400)  E-core loops      - (n=0)  mixed      - (n=0)  slowest worker   16.9  cpu/wall 0.73  overlap 0.00  MHz P 4375.5 E      -
+c=4
+  zoe-native  P-core loops   37.0 us/obj (n=1590)  E-core loops   65.1 (n=4)  mixed   50.4 (n=6)  slowest worker   40.5  cpu/wall 0.88  overlap 0.00  MHz P 4300.0 E 2801.0
+  zoe-native  P-core loops   28.6 us/obj (n=1591)  E-core loops   63.6 (n=5)  mixed   45.9 (n=4)  slowest worker   32.0  cpu/wall 0.85  overlap 0.00  MHz P 4200.0 E 2801.0
+c=16
+  zoe-native  P-core loops   62.0 us/obj (n=1154)  E-core loops  145.6 (n=710)  mixed   81.1 (n=56)  slowest worker  114.6  cpu/wall 0.96  overlap 0.00  MHz P 4150.5 E 2799.0
+  zoe-native  P-core loops   47.4 us/obj (n=1241)  E-core loops  150.8 (n=614)  mixed   65.5 (n=65)  slowest worker   99.3  cpu/wall 0.96  overlap 0.00  MHz P 4099.0 E 2800.0
