@@ -40,3 +40,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0034](0034-the-client-cache-file.md) | The client cache file (accepted) |
 | [0035](0035-the-extension-links-zoe-client-and-tokio.md) | The extension links zoe-client and tokio for the native client; it supersedes the rule of ADR 0001 and ADR 0028 that the extension never links tokio |
 | [0036](0036-concurrent-transactions-in-a-client.md) | Several transactions at once in one client process (accepted) |
+| [0037](0037-records-keyed-by-tid.md) | Records keyed by `(tid, oid)`, an object index, ZOE format 3; it supersedes the transaction index of ADR 0026 and the upgrade open of ADR 0033 |
