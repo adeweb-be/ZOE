@@ -357,7 +357,11 @@ pub trait WriteTxn {
             let data = match payload {
                 Payload::Pickle(data) => data,
                 Payload::Encoded(codec, stored) => crate::format::decode_payload(codec, &stored)
-                    .map_err(|_| ZoeError::Backend("an encoded payload does not decode".into()))?
+                    .map_err(|_| {
+                        let text =
+                            format!("the encoded payload of oid {:#x} does not decode", oid.0);
+                        ZoeError::Backend(text.into())
+                    })?
                     .into_owned()
                     .into(),
             };

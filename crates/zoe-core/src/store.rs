@@ -111,6 +111,14 @@ pub struct Options {
     /// memory. The other pickles of the transaction go to a spill file
     /// under `staging/` in the store directory. This is `staging-memory`
     /// in the configuration.
+    ///
+    /// The limit counts the staged pickles only. A payload that a skin
+    /// attaches with `Txn::set_encoded` comes in addition. `zoe serve`
+    /// also holds a copy of each pickle in memory until its compression
+    /// job runs. So the memory of one transaction of `zoe serve` can reach
+    /// about three times this limit: the pickles, their copies in the
+    /// queue, and the encoded payloads, which zstd keeps only when they are
+    /// smaller than their pickles.
     pub staging_memory: usize,
     /// The longest pickle that `store` and `store_blob` take, in bytes. A
     /// longer pickle fails with `TooLarge`. `None`, the default, sets no

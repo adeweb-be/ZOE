@@ -16,8 +16,17 @@
 //! staged record. Then the finish writes these payloads and encodes no
 //! pickle again. A job that fails fails the vote.
 //!
-//! The transaction holds the receiver of each job. An abort, a failed
-//! vote and a lost connection drop the receivers. A job whose receiver is
+//! A job sits in a slot that a thread of the pool and the vote can both
+//! take, under the lock of the slot. The vote takes each job of its
+//! transaction that no thread took yet, and encodes it itself. It waits
+//! only for a job that a thread encodes. So a vote never waits for a
+//! thread that does not start: when the blocking pool of tokio is full,
+//! or when the runtime stops and drops a thread before it runs. The queue
+//! only moves the work off the path of the transaction when a thread is
+//! free.
+//!
+//! The transaction holds the receiver and the slot of each job. An abort,
+//! a failed vote and a lost connection drop them. A job whose receiver is
 //! gone does not encode when a thread takes it. A job that encodes already
 //! ends, and nothing reads its result.
 
@@ -53,13 +62,18 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
-    /// The jobs that wait for a thread, in the order of their queue.
-    queue: VecDeque<Work>,
+    /// The jobs that wait for a thread, in the order of their queue. A
+    /// slot that the vote emptied stays here until a thread takes it.
+    queue: VecDeque<Slot>,
     /// The threads of the pool that run.
     threads: usize,
     /// The threads that encode a job. The others take the next job.
     encoding: usize,
 }
+
+/// The job of one pickle, until a thread of the pool or the vote takes
+/// it.
+type Slot = Arc<Mutex<Option<Work>>>;
 
 /// A job in the queue.
 struct Work {
@@ -73,7 +87,10 @@ struct Work {
 /// The job of one staged pickle. The drop of the job cancels it.
 pub(crate) struct Job {
     oid: Oid,
+    slot: Slot,
     encoded: oneshot::Receiver<Encoded>,
+    #[cfg(test)]
+    hook: Option<Hook>,
 }
 
 /// A job that gave no result: its thread panicked, or the runtime dropped
@@ -126,15 +143,16 @@ impl Compressor {
         compression: Compression,
     ) -> Job {
         let (sender, encoded) = oneshot::channel();
+        let slot = Arc::new(Mutex::new(Some(Work {
+            #[cfg(test)]
+            oid,
+            data,
+            compression,
+            sender,
+        })));
         let start = {
             let mut state = self.0.lock();
-            state.queue.push_back(Work {
-                #[cfg(test)]
-                oid,
-                data,
-                compression,
-                sender,
-            });
+            state.queue.push_back(Arc::clone(&slot));
             let free = state.threads - state.encoding;
             let start = state.queue.len() > free && state.threads < self.0.threads;
             if start {
@@ -145,7 +163,13 @@ impl Compressor {
         if start {
             self.0.start(runtime);
         }
-        Job { oid, encoded }
+        Job {
+            oid,
+            slot,
+            encoded,
+            #[cfg(test)]
+            hook: self.0.hook.clone(),
+        }
     }
 }
 
@@ -161,16 +185,35 @@ impl Shared {
         let running = Running {
             pool: Arc::clone(self),
             runtime: Arc::clone(runtime),
+            ran: false,
         };
         runtime.spawn_blocking(Box::new(move || running.run()));
     }
 }
 
-/// A thread of the pool. After a panic, its drop starts another thread
-/// when jobs wait, so no job waits for ever.
+/// Take the job out of `slot`. Return `None` when a thread of the pool or
+/// the vote took it already.
+fn take(slot: &Slot) -> Option<Work> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// Encode `work`. Return `None` when the test hook fails the job.
+fn encode(work: &Work, #[cfg(test)] hook: Option<&Hook>) -> Option<Encoded> {
+    #[cfg(test)]
+    if hook.is_some_and(|hook| !hook(work.oid)) {
+        return None;
+    }
+    Some(Encoded::encode(&work.data, work.compression))
+}
+
+/// A thread of the pool. A drop of a thread that never ran, as at the
+/// stop of the runtime, gives back its count. After a panic, its drop
+/// starts another thread when jobs wait.
 struct Running {
     pool: Arc<Shared>,
     runtime: Arc<dyn Runtime>,
+    /// The thread started to run the jobs.
+    ran: bool,
 }
 
 impl Running {
@@ -178,14 +221,15 @@ impl Running {
     /// pool under the same lock as the check of the empty queue. So a job
     /// that `queue` adds after that check sees one thread less, and starts
     /// a thread.
-    fn run(&self) {
+    fn run(mut self) {
+        self.ran = true;
         loop {
-            let work = {
+            let slot = {
                 let mut state = self.pool.lock();
                 match state.queue.pop_front() {
-                    Some(work) => {
+                    Some(slot) => {
                         state.encoding += 1;
-                        work
+                        slot
                     }
                     None => {
                         state.threads -= 1;
@@ -198,12 +242,16 @@ impl Running {
                     }
                 }
             };
-            let skip = work.sender.is_closed();
-            #[cfg(test)]
-            let skip = skip || self.pool.hook.as_ref().is_some_and(|hook| !hook(work.oid));
-            if !skip {
-                let encoded = Encoded::encode(&work.data, work.compression);
-                let _ = work.sender.send(encoded);
+            // The vote took the job, or the transaction ended.
+            if let Some(work) = take(&slot).filter(|work| !work.sender.is_closed()) {
+                let encoded = encode(
+                    &work,
+                    #[cfg(test)]
+                    self.pool.hook.as_ref(),
+                );
+                if let Some(encoded) = encoded {
+                    let _ = work.sender.send(encoded);
+                }
             }
             self.pool.lock().encoding -= 1;
         }
@@ -211,9 +259,15 @@ impl Running {
 }
 
 impl Drop for Running {
-    /// A thread that panics while it encodes leaves the pool here. When
-    /// jobs wait, another thread takes its place.
+    /// A thread that never ran leaves the pool here. The jobs that wait
+    /// stay in their slots, and their votes encode them, or a later job
+    /// starts a thread. A thread that panics while it encodes leaves the
+    /// pool here too. When jobs wait, another thread takes its place.
     fn drop(&mut self) {
+        if !self.ran {
+            self.pool.lock().threads -= 1;
+            return;
+        }
         if !std::thread::panicking() {
             return;
         }
@@ -229,9 +283,20 @@ impl Drop for Running {
 }
 
 impl Job {
-    /// Wait until the job ends, and return the oid and its payload.
+    /// Return the oid and its payload. When no thread of the pool took the
+    /// job yet, take it and encode it on this thread. Else wait until the
+    /// thread ends the job.
     pub(crate) fn wait(self) -> Result<(Oid, Encoded), Failed> {
         let oid = self.oid;
+        if let Some(work) = take(&self.slot) {
+            return encode(
+                &work,
+                #[cfg(test)]
+                self.hook.as_ref(),
+            )
+            .map(|encoded| (oid, encoded))
+            .ok_or(Failed(oid));
+        }
         block_on(self.encoded)
             .map(|encoded| (oid, encoded))
             .map_err(|_| Failed(oid))
@@ -297,6 +362,15 @@ mod tests {
         let jobs: Vec<Job> = (0..8)
             .map(|oid| pool.queue(&runtime, Oid(oid), data(10), Compression::default()))
             .collect();
+        // The threads of the pool run every job before a wait, which would
+        // take a job that waits.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while jobs.iter().any(|job| job.slot.lock().unwrap().is_some())
+            || running.load(Ordering::SeqCst) > 0
+        {
+            assert!(Instant::now() < deadline, "the pool runs the jobs");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for job in jobs {
             job.wait().unwrap();
         }
@@ -360,13 +434,94 @@ mod tests {
         let first = pool.queue(&runtime, Oid(1), data(10), Compression::default());
         first.wait().unwrap();
         leaves.recv_timeout(Duration::from_secs(30)).unwrap();
-        // The thread has left but still runs. A new job starts a thread.
+        // The thread has left but still runs. A new job starts a thread,
+        // which takes it: the wait finds the slot empty.
         let second = pool.queue(&runtime, Oid(2), data(10), Compression::default());
-        let (done, ended) = std::sync::mpsc::channel();
-        std::thread::spawn(move || done.send(second.wait().map(|(oid, _)| oid)).unwrap());
-        let result = ended.recv_timeout(Duration::from_secs(30));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut taken = false;
+        while !taken && Instant::now() < deadline {
+            taken = second.slot.lock().unwrap().is_none();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         go.send(()).unwrap();
-        assert_eq!(result.expect("the job runs").unwrap(), Oid(2));
+        assert!(taken, "a thread of the pool takes the job");
+        assert_eq!(second.wait().unwrap().0, Oid(2));
+    }
+
+    #[test]
+    fn a_job_ends_when_the_blocking_pool_of_tokio_is_full() {
+        // The runtime has one blocking thread. That thread queues a job and
+        // waits for it, as a vote does, so the thread of the pool cannot
+        // start.
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = Compressor::new(NonZeroUsize::new(2).unwrap());
+        let (done, ended) = std::sync::mpsc::channel();
+        tokio.spawn_blocking(move || {
+            let runtime: Arc<dyn Runtime> = Arc::new(Tokio);
+            let job = pool.queue(&runtime, Oid(1), data(100), Compression::default());
+            done.send(job.wait().map(|(oid, _)| oid)).unwrap();
+        });
+        let result = ended.recv_timeout(Duration::from_secs(30));
+        assert_eq!(result.expect("the job ends").unwrap(), Oid(1));
+    }
+
+    /// A runtime that drops each blocking thread before it runs, as tokio
+    /// does at its stop.
+    struct Stopped;
+
+    impl Runtime for Stopped {
+        fn spawn(&self, _: crate::runtime::BoxFuture<()>) {}
+
+        fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+            drop(work);
+        }
+
+        fn sleep(&self, _: Duration) -> crate::runtime::BoxFuture<()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    #[test]
+    fn a_thread_dropped_before_it_runs_leaves_no_waiter_and_no_count() {
+        let stopped: Arc<dyn Runtime> = Arc::new(Stopped);
+        let pool = Compressor::new(NonZeroUsize::MIN);
+        let first = pool.queue(&stopped, Oid(1), data(100), Compression::default());
+        let second = pool.queue(&stopped, Oid(2), data(100), Compression::default());
+        // The thread that the first job started never ran, and gave back
+        // its count.
+        assert_eq!(pool.0.lock().threads, 0);
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let oids = [first.wait(), second.wait()].map(|result| result.map(|(oid, _)| oid));
+            done.send(oids).unwrap();
+        });
+        let oids = ended
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the waits end");
+        assert_eq!(oids.map(Result::unwrap), [Oid(1), Oid(2)]);
+        // A later job on a runtime that runs its threads gets a thread.
+        let tokio = runtime();
+        let _entered = tokio.enter();
+        let runtime: Arc<dyn Runtime> = Arc::new(Tokio);
+        let third = pool.queue(&runtime, Oid(3), data(100), Compression::default());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while third.slot.lock().unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "a thread of the pool takes the job"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(third.wait().unwrap().0, Oid(3));
     }
 
     #[test]
