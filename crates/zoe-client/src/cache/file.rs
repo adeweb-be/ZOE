@@ -1,4 +1,4 @@
-//! The cache file: stage 2 of ADR 0034 (proposed). One process maps the
+//! The cache file: stage 2 of ADR 0034. One process maps the
 //! file, in the layout of the anonymous mapping.
 //!
 //! The open takes an exclusive `flock` of the file without a wait, so a
