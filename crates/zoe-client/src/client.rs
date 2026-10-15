@@ -690,6 +690,29 @@ impl Client {
         }))
     }
 
+    /// Return true when the server holds a commit at exactly `tid`. The
+    /// client starts a transaction iterator from `tid` to `tid`, reads its
+    /// first transaction and releases the iterator. A stock ZEO 6 server
+    /// and `zoe serve` both answer these calls.
+    pub async fn holds_transaction(&self, tid: Tid) -> Result<bool, Error> {
+        let id = self
+            .inner
+            .call("iterator_start", vec![bin8(tid.0), bin8(tid.0)])
+            .await?;
+        let next = self.inner.call("iterator_next", vec![id.clone()]).await;
+        self.inner
+            .notify("iterator_gc", vec![Value::Array(vec![id])])
+            .await?;
+        let next = next?;
+        if next.is_nil() {
+            return Ok(false);
+        }
+        let Some(first) = next.as_array().and_then(|items| items.first()) else {
+            return Err(bad("iterator_next", &next));
+        };
+        Ok(self::tid(first, "iterator_next")? == tid)
+    }
+
     /// Return the next value of the sequence `name` of the store. It needs
     /// the extension `sequences`: without it, it fails with
     /// `Error::Unsupported` and sends nothing.

@@ -980,50 +980,70 @@ async fn blobs_download_through_any_connection_of_the_pool() {
     );
 }
 
-#[tokio::test]
-async fn a_stale_turn_and_a_quick_verification_at_the_last_tid_give_no_invalidation() {
-    let server = start("reconnect-stale-turn");
-    let proxy = proxy(server.addr()).await;
-    // The listener reads through the proxy. The connections that commit
-    // reach the server directly.
-    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+/// Open a pool with a cache of 1 MB on `server`, with `listener`. The
+/// connections that commit reach the server directly, and so does each
+/// listener after a loss.
+fn open_listener_proxied(server: &Server, listener: Client) -> Pool {
     let addr = server.addr();
     let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
     let (_gate, opened) = watch::channel(true);
     let reconnect = Reconnect::new(gated(addr, Options::default(), opened), POLL);
     let cache = Cache::new(1 << 20).unwrap();
-    let pool = Pool::with_reconnect(
+    Pool::with_reconnect(
         Arc::new(Tokio),
         Some((listener, connect)),
         2,
         Some(cache),
         reconnect,
-    );
-    let (changed, kept, first) = cached_pair(&pool).await;
+    )
+}
 
-    // The finish has its reply, but the listener does not see its tid.
-    proxy.pause.send_replace(true);
+/// Commit `data` for `oid` through `pool` while the listener sees no tid.
+/// Lose the listener, confirm the stale mark, and run the stale turn.
+/// Return the tid of the commit.
+async fn commit_then_lose(pool: &Pool, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
     let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
-    txn.store(changed, first, &record(b"c")).await.unwrap();
+    txn.store(oid, serial, data).await.unwrap();
     txn.vote().await.unwrap();
     let finished = txn.finish().await.unwrap();
     let tid = finished.tid();
     let turn = tokio::spawn(finished.turn());
-
-    // The loss gives the stale mark, then the turn, which moves the last
-    // tid past `applied` of the cache.
     pool.listener().unwrap().disconnect();
-    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    assert_eq!(next_event(pool).await, Event::Delivery(Delivery::Stale));
     pool.delivered();
     let turn = turn.await.unwrap().unwrap();
     assert!(turn.stale());
     drop(turn);
     assert_eq!(pool.last_transaction(), tid);
+    tid
+}
+
+#[tokio::test]
+async fn a_quick_verification_at_the_last_tid_gives_its_oids_and_keeps_the_last_tid() {
+    let server = start("reconnect-stale-turn");
+    let proxy = proxy(server.addr()).await;
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let pool = open_listener_proxied(&server, listener);
+    let (changed, kept, first) = cached_pair(&pool).await;
+
+    // The finish has its reply, but the listener does not see its tid. The
+    // stale turn moves the last tid past `applied` of the cache.
+    proxy.pause.send_replace(true);
+    let tid = commit_then_lose(&pool, changed, first, &record(b"c")).await;
     let cache = pool.cache().unwrap();
     assert_eq!(cache.applied(), first);
 
-    // getInvalidations(applied) gives the tid of the pool: the consumer
-    // gets no invalidation, and only the cache moves.
+    // getInvalidations(applied) gives the tid of the pool. The consumer
+    // gets its oids, and the last tid stays.
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid,
+            oids: vec![changed],
+        }))
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
     assert_eq!(
         next_event(&pool).await,
         Event::Connected(Verification::Quick)
@@ -1034,6 +1054,66 @@ async fn a_stale_turn_and_a_quick_verification_at_the_last_tid_give_no_invalidat
     assert_eq!(cache.load(changed), None);
     assert_eq!(cache.load(kept), Some((record(b"b"), first)));
     assert_eq!(pool.load(changed).await.unwrap(), (record(b"c"), tid));
+}
+
+#[tokio::test]
+async fn a_commit_of_another_client_lost_with_the_listener_reaches_the_consumer_after_a_stale_turn()
+{
+    let server = start("reconnect-lost-foreign");
+    let proxy = proxy(server.addr()).await;
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let pool = open_listener_proxied(&server, listener);
+    let (foreign, own, first) = cached_pair(&pool).await;
+
+    // From here on, the listener sees no tid. Another client commits, then
+    // the pool commits. The listener is lost before it sees either tid.
+    proxy.pause.send_replace(true);
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let lost = commit_other(&other, foreign, first, &record(b"x")).await;
+    let tid = commit_then_lose(&pool, own, first, &record(b"c")).await;
+    assert!(lost < tid);
+
+    // The stale turn moved the last tid to the tid of the pool. The consumer
+    // never got the commit of the other client, and the server has no
+    // commit after the tid of the pool.
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.applied(), first);
+    assert_eq!(cache.load(foreign), Some((record(b"a"), first)));
+
+    // getInvalidations(applied) gives both oids at the tid of the pool. The
+    // consumer gets them, so the DB drops the object of the other client.
+    let Event::Delivery(Delivery::Invalidate(invalidation)) = next_event(&pool).await else {
+        panic!("the consumer got no invalidation for the lost commit");
+    };
+    assert_eq!(invalidation.tid, tid);
+    let mut oids = invalidation.oids;
+    oids.sort();
+    let mut expected = vec![foreign, own];
+    expected.sort();
+    assert_eq!(oids, expected);
+    assert_eq!(pool.last_transaction(), tid);
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(foreign), None);
+    assert_eq!(pool.load(foreign).await.unwrap(), (record(b"x"), lost));
+
+    // The next commit of the other client comes on the new listener.
+    let later = commit_other(&other, foreign, lost, &record(b"y")).await;
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid: later,
+            oids: vec![foreign],
+        }))
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), later);
 }
 
 #[tokio::test]

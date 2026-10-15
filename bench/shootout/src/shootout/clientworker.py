@@ -37,7 +37,14 @@ WAIT_TIMEOUT = 120
 # For each client: its module, its class, the other modules that its open
 # and its calls import, and the arguments that select it.
 CLIENT_CLASSES = {
-    ZEO_CLIENT: ("ZEO.ClientStorage", "ClientStorage", (), {}),
+    # ZEO imports msgpack in its handshake, and asyncio encodes the host
+    # with the idna codec when it connects. A warm round would count both.
+    ZEO_CLIENT: (
+        "ZEO.ClientStorage",
+        "ClientStorage",
+        ("msgpack", "encodings.idna"),
+        {},
+    ),
     NATIVE_CLIENT: ("zoe.zeo", "ClientStorage", ("zoe._zoe",), {"native": True}),
 }
 # The modules that the calls of both clients import.
@@ -65,6 +72,19 @@ def client_class(spec: dict):
     for other in CALL_MODULES + others:
         importlib.import_module(other)
     return functools.partial(getattr(importlib.import_module(module), name), **kw)
+
+
+def check_no_imports(before: set[str]) -> None:
+    """Fail when a module was imported after `before` was taken.
+
+    A warm round calls this at the end of its clock: an import inside the
+    clock would count in the time of one client only.
+    """
+    imported = sorted(set(sys.modules) - before)
+    if imported:
+        raise RuntimeError(
+            "the clock of a warm round covers imports: " + ", ".join(imported)
+        )
 
 
 def open_client(spec: dict, worker: int, opener):
@@ -167,6 +187,7 @@ def run_threads(spec: dict) -> dict:
     opener = client_class(spec)
     warm = spec["workload"] == "warm"
     storage = None if warm else open_client(spec, 0, opener)
+    modules = set(sys.modules)
     start, cpu_start = time.monotonic(), cpu()
     if warm:
         # The open and its verification count in a warm round.
@@ -181,6 +202,8 @@ def run_threads(spec: dict) -> dict:
     for thread in threads:
         thread.join()
     end, cpu_end = time.monotonic(), cpu()
+    if warm:
+        check_no_imports(modules)
     storage.close()
     if any(t is None for t in times):
         raise RuntimeError("a worker thread failed")
@@ -197,12 +220,15 @@ def _process(spec: dict, worker: int, barrier, queue) -> None:
         opener = client_class(spec)
         warm = spec["workload"] == "warm"
         storage = None if warm else open_client(spec, worker, opener)
+        modules = set(sys.modules)
         barrier.wait()
         start, cpu_start = time.monotonic(), cpu()
         if warm:
             storage = open_client(spec, worker, opener)
         times = work(spec, storage, worker, prepared)
         end, cpu_end = time.monotonic(), cpu()
+        if warm:
+            check_no_imports(modules)
         storage.close()
         queue.put((worker, start, end, cpu_end - cpu_start, times, None))
     except BaseException as error:
