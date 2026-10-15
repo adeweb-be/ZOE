@@ -45,6 +45,10 @@ struct Shared {
     state: Mutex<State>,
     #[cfg(test)]
     hook: Option<Hook>,
+    /// What a test does in a thread after it left the pool, before it
+    /// ends.
+    #[cfg(test)]
+    leaving: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -85,6 +89,8 @@ impl Compressor {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            leaving: None,
         }))
     }
 
@@ -95,6 +101,16 @@ impl Compressor {
         Arc::get_mut(&mut self.0)
             .expect("a pool without clones")
             .hook = Some(hook);
+        self
+    }
+
+    /// Run `leaving` in each thread after it left the pool, before it
+    /// ends. Call it before the pool has a clone.
+    #[cfg(test)]
+    pub(crate) fn with_leaving(mut self, leaving: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("a pool without clones")
+            .leaving = Some(leaving);
         self
     }
 
@@ -150,15 +166,18 @@ impl Shared {
     }
 }
 
-/// A thread of the pool. Its drop counts its end. After a panic, the drop
-/// starts another thread when jobs wait, so no job waits for ever.
+/// A thread of the pool. After a panic, its drop starts another thread
+/// when jobs wait, so no job waits for ever.
 struct Running {
     pool: Arc<Shared>,
     runtime: Arc<dyn Runtime>,
 }
 
 impl Running {
-    /// Run the jobs of the queue until it is empty.
+    /// Run the jobs of the queue until it is empty. The thread leaves the
+    /// pool under the same lock as the check of the empty queue. So a job
+    /// that `queue` adds after that check sees one thread less, and starts
+    /// a thread.
     fn run(&self) {
         loop {
             let work = {
@@ -168,7 +187,15 @@ impl Running {
                         state.encoding += 1;
                         work
                     }
-                    None => return,
+                    None => {
+                        state.threads -= 1;
+                        drop(state);
+                        #[cfg(test)]
+                        if let Some(leaving) = &self.pool.leaving {
+                            leaving();
+                        }
+                        return;
+                    }
                 }
             };
             let skip = work.sender.is_closed();
@@ -184,17 +211,20 @@ impl Running {
 }
 
 impl Drop for Running {
+    /// A thread that panics while it encodes leaves the pool here. When
+    /// jobs wait, another thread takes its place.
     fn drop(&mut self) {
-        let mut state = self.pool.lock();
-        if std::thread::panicking() {
-            state.encoding -= 1;
-            if !state.queue.is_empty() {
-                drop(state);
-                self.pool.start(&self.runtime);
-                return;
-            }
+        if !std::thread::panicking() {
+            return;
         }
-        state.threads -= 1;
+        let mut state = self.pool.lock();
+        state.encoding -= 1;
+        if state.queue.is_empty() {
+            state.threads -= 1;
+        } else {
+            drop(state);
+            self.pool.start(&self.runtime);
+        }
     }
 }
 
@@ -308,6 +338,35 @@ mod tests {
         let third = pool.queue(&runtime, Oid(3), data(10), Compression::default());
         third.wait().unwrap();
         assert_eq!(*started.lock().unwrap(), vec![Oid(1), Oid(3)]);
+    }
+
+    #[test]
+    fn a_job_queued_while_a_thread_leaves_still_runs() {
+        let tokio = runtime();
+        let _entered = tokio.enter();
+        let runtime: Arc<dyn Runtime> = Arc::new(Tokio);
+        // The first thread that leaves the pool stops there until the test
+        // lets it go.
+        let (left, leaves) = std::sync::mpsc::channel::<()>();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(Some(wait));
+        let leaving: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(wait) = wait.lock().unwrap().take() {
+                left.send(()).unwrap();
+                let _ = wait.recv();
+            }
+        });
+        let pool = Compressor::new(NonZeroUsize::MIN).with_leaving(leaving);
+        let first = pool.queue(&runtime, Oid(1), data(10), Compression::default());
+        first.wait().unwrap();
+        leaves.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The thread has left but still runs. A new job starts a thread.
+        let second = pool.queue(&runtime, Oid(2), data(10), Compression::default());
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(second.wait().map(|(oid, _)| oid)).unwrap());
+        let result = ended.recv_timeout(Duration::from_secs(30));
+        go.send(()).unwrap();
+        assert_eq!(result.expect("the job runs").unwrap(), Oid(2));
     }
 
     #[test]
