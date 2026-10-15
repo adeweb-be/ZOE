@@ -24,8 +24,9 @@
 //! the other clients. The hub holds its mutex while it puts frames in the
 //! queues, never while a frame goes out to the network.
 //!
-//! A `loadBefore` reply shows only the commits that the hub published, and
-//! it takes its place in the order of its connection under the mutex of
+//! A `loadBefore` reply shows only the commits that the hub published. The
+//! call makes its reply first. Then the reply takes its place in the order
+//! of its connection and goes into the session queue under the mutex of
 //! the hub, when the hub published no commit since the read. So the reply
 //! comes after the invalidation of each commit that it shows, and before
 //! the invalidation of each later commit.
@@ -50,7 +51,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zoe_core::Tid;
 
-use super::outbox::{Frame, Outbox, Place, Pushed, Room};
+use super::outbox::{Frame, Outbox, Pushed, Room};
 
 /// The id of a connection in the hub.
 pub(crate) type ClientId = u64;
@@ -114,7 +115,7 @@ pub(crate) struct Invalidations {
     state: Mutex<State>,
 }
 
-/// The state of the hub. Under its mutex, only a `loadBefore` place takes
+/// The state of the hub. Under its mutex, only a `loadBefore` reply takes
 /// another lock: the lock of the outbox of its connection, which no holder
 /// keeps while it waits for the hub.
 struct State {
@@ -180,31 +181,43 @@ impl Invalidations {
         self.lock().clients.remove(&id);
     }
 
-    /// Take the next place with `room` when the hub published no commit
-    /// after `seen`. Otherwise, give the room back.
+    /// Put `frame` at the next place with `room` when the hub published no
+    /// commit after `seen`, or leave the place empty when `frame` is
+    /// `None`. Return false when the connection is closed. When the hub
+    /// published a commit after `seen`, give the room back.
     ///
-    /// A reader reads the last published tid, then the store, then takes
-    /// its place here. With a place, its reply goes out before the
-    /// invalidation of each later commit. Without one, a commit came in
-    /// between, and the reader reads again.
-    pub(crate) fn place_since(&self, seen: Tid, room: Room) -> Result<Place, Room> {
+    /// A reader reads the last published tid, then the store, then makes
+    /// its reply and puts it here. When it goes in, it goes out before the
+    /// invalidation of each later commit. When it does not, a commit came
+    /// in between, and the reader reads again.
+    pub(crate) fn put_since(
+        &self,
+        seen: Tid,
+        room: Room,
+        frame: Option<Vec<u8>>,
+    ) -> Result<bool, Room> {
         let state = self.lock();
         if state.published == seen {
-            Ok(room.place())
+            Ok(room.put(frame))
         } else {
             Err(room)
         }
     }
 
-    /// Run `read` with the last published tid, then take the next place
-    /// with `room`, both under the mutex of the hub. So the hub publishes
-    /// no commit between the read and the place. The hub waits for the
-    /// read, so a reader calls this only after `place_since` failed a few
-    /// times.
-    pub(crate) fn read_placed<T>(&self, room: Room, read: impl FnOnce(Tid) -> T) -> (T, Place) {
+    /// Run `read` with the last published tid, then put the frame that it
+    /// gives at the next place with `room`, both under the mutex of the
+    /// hub. So the hub publishes no commit between the read and the place.
+    /// Return what `read` gives, and false when the connection is closed.
+    /// The hub waits for the read, so a reader calls this only after
+    /// `put_since` failed a few times.
+    pub(crate) fn read_put<T>(
+        &self,
+        room: Room,
+        read: impl FnOnce(Tid) -> (T, Option<Vec<u8>>),
+    ) -> (T, bool) {
         let state = self.lock();
-        let value = read(state.published);
-        (value, room.place())
+        let (value, frame) = read(state.published);
+        (value, room.put(frame))
     }
 
     /// Return the publication of `commit`. Dropping the publication
@@ -507,38 +520,39 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_takes_its_place_only_when_no_commit_came_after_its_read() {
+    fn a_reader_puts_its_reply_only_when_no_commit_came_after_its_read() {
         let hub = Invalidations::new(Tid(0));
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
         let seen = hub.published();
-        let place = hub
-            .place_since(seen, reader.outbox.blocking_room())
-            .unwrap();
-        // A commit after the place goes out after the reply.
+        let load = Some(b"load".to_vec());
+        let put = hub.put_since(seen, reader.outbox.blocking_room(), load.clone());
+        assert!(put.unwrap());
+        // A commit after the reply goes out after it.
         hub.publish(writer.commit(0, 1));
-        assert!(reader.take().is_empty());
-        assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));
         assert_eq!(reader.take(), text(&["load", "inv 1"]));
-        // A commit between the read and the place: the reader reads again.
+        // A commit between the read and the reply: the reader reads again.
         hub.publish(writer.commit(1, 2));
         let room = hub
-            .place_since(Tid(1), reader.outbox.blocking_room())
+            .put_since(Tid(1), reader.outbox.blocking_room(), load)
             .unwrap_err();
-        let place = hub.place_since(Tid(2), room).unwrap();
-        assert!(place.fill(None));
+        assert_eq!(reader.take(), text(&["inv 2"]));
+        assert!(hub.put_since(Tid(2), room, None).unwrap());
+        assert!(reader.take().is_empty());
         assert_eq!(writer.take().len(), 4);
     }
 
     #[test]
-    fn a_read_under_the_mutex_takes_its_place_before_a_later_commit() {
+    fn a_read_under_the_mutex_puts_its_reply_before_a_later_commit() {
         let hub = Invalidations::new(Tid(4));
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
-        let (seen, place) = hub.read_placed(reader.outbox.blocking_room(), |published| published);
+        let (seen, put) = hub.read_put(reader.outbox.blocking_room(), |published| {
+            (published, Some(b"load".to_vec()))
+        });
         assert_eq!(seen, Tid(4));
+        assert!(put);
         hub.publish(writer.commit(4, 5));
-        assert!(reader.outbox.send_at(place, Some(b"load".to_vec())));
         assert_eq!(reader.take(), text(&["load", "inv 5"]));
         assert_eq!(writer.take(), text(&["info 5", "reply 5"]));
     }

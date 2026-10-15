@@ -60,6 +60,10 @@ impl Runtime for SimRuntime {
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
         self.sleep_for(duration)
     }
+
+    fn now(&self) -> Duration {
+        self.shared.now()
+    }
 }
 
 impl zoe_client::Runtime for SimRuntime {

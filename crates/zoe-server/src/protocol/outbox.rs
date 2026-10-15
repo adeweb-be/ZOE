@@ -20,11 +20,9 @@
 //! of the session takes its place and goes into the session queue under one
 //! lock, so that queue holds its frames in the order of their places.
 //!
-//! A frame can take its place before it exists: `loadBefore` takes its
-//! place before an invalidation of a commit that its read did not see. The
-//! place goes into the session queue at once, and the call fills it later.
-//! The writer waits for that frame. A place that gets no frame holds no
-//! frame, and the writer skips it.
+//! A frame takes its place when it goes into its queue, so the frame of
+//! each place exists. A call without a reply puts an empty place, and the
+//! writer skips it.
 //!
 //! A frame of the session counts from the time it goes into the queue
 //! until the writer has written it. A call starts only while at most
@@ -59,7 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc::{self, OwnedPermit, error::TrySendError};
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, watch};
 
 use super::QUEUE;
 use crate::runtime::block_on;
@@ -218,9 +216,6 @@ enum Slot {
     Ready(Option<Outgoing>),
     /// The frames of one message of the hub, in their order.
     Message(Vec<Frame>),
-    /// A frame that the call gives later. A closed channel is an empty
-    /// place.
-    Pending(oneshot::Receiver<Outgoing>),
 }
 
 /// A place in the order of its connection and what it holds.
@@ -282,7 +277,6 @@ impl Outbox {
             next: 0,
             from_session: None,
             from_hub: None,
-            pending: None,
             rest: VecDeque::new(),
             session_open: true,
             hub_open: true,
@@ -329,20 +323,6 @@ impl Outbox {
     /// is not a thread of the async runtime.
     pub(crate) fn blocking_room(&self) -> Room {
         block_on(self.room())
-    }
-
-    /// Take room and put a placeholder in the session queue at the next
-    /// place. Wait while the session queue is full.
-    #[cfg(test)]
-    pub(crate) fn place(&self) -> Place {
-        self.blocking_room().place()
-    }
-
-    /// Put a frame at `place`, or leave the place empty. Return false when
-    /// the connection is closed.
-    #[cfg(test)]
-    pub(crate) fn send_at(&self, place: Place, frame: Option<Vec<u8>>) -> bool {
-        place.fill(frame)
     }
 
     /// Put a frame of the session at the next place. Wait while more than
@@ -448,38 +428,6 @@ impl Room {
             None => false,
         }
     }
-
-    /// Take the next place in the order of the connection. The frame comes
-    /// later, with `Place::fill`. The writer waits for it.
-    pub(crate) fn place(self) -> Place {
-        let Some(permit) = self.permit else {
-            return Place(None);
-        };
-        let (frame, slot) = oneshot::channel();
-        if self.outbox.put_slot(permit, Slot::Pending(slot)) {
-            Place(Some((frame, Arc::clone(&self.outbox.flow))))
-        } else {
-            Place(None)
-        }
-    }
-}
-
-/// A place in the order of a connection, for a frame that a call gives
-/// later. Dropping it leaves the place empty.
-#[derive(Debug)]
-#[must_use]
-pub(crate) struct Place(Option<(oneshot::Sender<Outgoing>, Arc<Flow>)>);
-
-impl Place {
-    /// Put `frame` at the place, or leave the place empty. Return false
-    /// when the connection is closed.
-    pub(crate) fn fill(self, frame: Option<Vec<u8>>) -> bool {
-        match (self.0, frame) {
-            (Some((place, flow)), Some(frame)) => place.send(flow.charged(frame)).is_ok(),
-            (Some((place, _)), None) => !place.is_closed(),
-            (None, _) => false,
-        }
-    }
 }
 
 /// The receiving side of the queues of a connection. The writer task takes
@@ -492,9 +440,6 @@ pub(crate) struct Inbox {
     /// The first frame of each queue, read ahead.
     from_session: Option<Placed>,
     from_hub: Option<Placed>,
-    /// The frame of the last place that went out, when its call did not
-    /// give it yet.
-    pending: Option<oneshot::Receiver<Outgoing>>,
     /// The frames of the last place that went out, after its first frame.
     rest: VecDeque<Frame>,
     /// The queue still has a sender.
@@ -506,8 +451,6 @@ pub(crate) struct Inbox {
 enum Step {
     /// This frame is next.
     Frame(Outgoing),
-    /// The next frame comes from its call: wait for it.
-    Pending,
     /// The next frame is not read yet: read ahead in these queues.
     Read { session: bool, hub: bool },
     /// Both queues are closed and empty.
@@ -517,20 +460,12 @@ enum Step {
 impl Inbox {
     /// Return the next frame in the order of the connection. Return `None`
     /// when both queues are closed and empty. The call is cancel safe: a
-    /// frame that it read ahead, or waits for, stays in the inbox.
+    /// frame that it read ahead stays in the inbox.
     pub(crate) async fn recv(&mut self) -> Option<Outgoing> {
         loop {
             match self.step() {
                 Step::Frame(frame) => return Some(frame),
                 Step::End => return None,
-                Step::Pending => {
-                    let pending = self.pending.as_mut().expect("a pending frame");
-                    let frame = pending.await;
-                    self.pending = None;
-                    if let Ok(frame) = frame {
-                        return Some(frame);
-                    }
-                }
                 Step::Read { session, hub } => tokio::select! {
                     biased;
                     placed = self.session.recv(), if session => match placed {
@@ -555,20 +490,6 @@ impl Inbox {
             let (session, hub) = match self.step() {
                 Step::Frame(frame) => return Some(frame),
                 Step::End => return None,
-                Step::Pending => {
-                    let pending = self.pending.as_mut().expect("a pending frame");
-                    match pending.try_recv() {
-                        Ok(frame) => {
-                            self.pending = None;
-                            return Some(frame);
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => return None,
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            self.pending = None;
-                            continue;
-                        }
-                    }
-                }
                 Step::Read { session, hub } => (session, hub),
             };
             let mut read = false;
@@ -593,13 +514,10 @@ impl Inbox {
     }
 
     /// Give the frame of the next place when it is read ahead, or tell
-    /// what to read or to wait for.
+    /// what to read.
     fn step(&mut self) -> Step {
         if let Some(frame) = self.rest.pop_front() {
             return Step::Frame(Outgoing::hub(frame));
-        }
-        if self.pending.is_some() {
-            return Step::Pending;
         }
         loop {
             let at_next = |slot: &Option<Placed>| slot.as_ref().map(|placed| placed.place);
@@ -622,10 +540,6 @@ impl Inbox {
                             Some(frame) => return Step::Frame(Outgoing::hub(frame)),
                             None => continue,
                         }
-                    }
-                    Slot::Pending(frame) => {
-                        self.pending = Some(frame);
-                        return Step::Pending;
                     }
                 }
             }
@@ -689,12 +603,9 @@ mod tests {
     #[test]
     fn the_writer_sends_the_frames_of_both_queues_in_the_order_of_their_places() {
         let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
-        let early = outbox.place();
+        assert!(outbox.send(b"load".to_vec()));
         assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
         assert_eq!(outbox.push(frame("inv 2")), Pushed::Queued);
-        // The frame of the first place is not there yet: nothing goes out.
-        assert!(take(&mut inbox).is_empty());
-        assert!(outbox.send_at(early, Some(b"load".to_vec())));
         assert!(outbox.send(b"reply".to_vec()));
         assert_eq!(outbox.push(frame("inv 3")), Pushed::Queued);
         assert_eq!(
@@ -706,25 +617,27 @@ mod tests {
     #[test]
     fn an_empty_place_holds_no_frame() {
         let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
-        let empty = outbox.place();
+        assert!(outbox.blocking_room().put(None));
         assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
-        assert!(take(&mut inbox).is_empty());
-        assert!(outbox.send_at(empty, None));
         assert_eq!(take(&mut inbox), ["inv 1"]);
+        drop(outbox);
+        assert!(inbox.try_recv().is_none());
+        assert!(matches!(inbox.step(), Step::End));
     }
 
     #[test]
-    fn a_place_whose_call_is_gone_does_not_stop_the_others() {
-        let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
-        let lost = outbox.place();
-        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
-        // The first place waits for its call.
-        assert!(take(&mut inbox).is_empty());
-        // The call drops its place, so the place gets no frame.
-        drop(lost);
-        assert_eq!(take(&mut inbox), ["inv"]);
+    fn a_place_whose_frame_did_not_go_in_does_not_stop_the_others() {
+        let (outbox, mut inbox, _closing) = Outbox::new(10, 1);
+        assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
+        // The hub queue is full: the push takes a place and closes the
+        // connection, and its frame does not go in.
+        assert_eq!(outbox.push(frame("inv 2")), Pushed::Overflow);
+        assert!(outbox.send(b"reply".to_vec()));
+        // The writer waits for the frame of that place while the hub queue
+        // is open.
+        assert_eq!(take(&mut inbox), ["inv 1"]);
         drop(outbox);
-        assert!(inbox.try_recv().is_none());
+        assert_eq!(take(&mut inbox), ["reply"]);
         assert!(matches!(inbox.step(), Step::End));
     }
 
@@ -752,7 +665,7 @@ mod tests {
         let room = outbox.blocking_room();
         assert!(room.is_closed());
         assert!(!room.put(Some(b"reply".to_vec())));
-        assert!(!outbox.blocking_room().place().fill(None));
+        assert!(!outbox.blocking_room().put(None));
     }
 
     #[test]
@@ -845,8 +758,7 @@ mod tests {
         let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
         assert!(outbox.send(vec![1; 100]));
         assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
-        let place = outbox.place();
-        assert!(place.fill(Some(vec![2; 50])));
+        assert!(outbox.blocking_room().put(Some(vec![2; 50])));
         // A frame of the hub does not count.
         assert_eq!(count(&outbox).0, 150);
         let first = inbox.try_recv().unwrap();
@@ -986,26 +898,33 @@ mod tests {
     }
 
     #[test]
-    fn recv_waits_for_the_next_place_and_keeps_what_it_read_ahead() {
+    fn recv_waits_for_the_next_frame_and_keeps_what_it_read_ahead() {
         let (outbox, mut inbox, _closing) = Outbox::new(10, 10);
-        let early = outbox.place();
-        assert_eq!(outbox.push(frame("inv")), Pushed::Queued);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         runtime.block_on(async {
-            // The call reads the frame of the hub ahead, then waits for the
-            // first place. The ready branch cancels it.
+            // No frame waits. The ready branch cancels the call.
             tokio::select! {
                 biased;
-                frame = inbox.recv() => panic!("a frame went out of order: {frame:?}"),
+                frame = inbox.recv() => panic!("a frame came from nowhere: {frame:?}"),
                 () = std::future::ready(()) => {}
             }
             let session = outbox.clone();
-            let send = move || session.send_at(early, Some(b"load".to_vec()));
-            assert!(tokio::task::spawn_blocking(send).await.unwrap());
+            let send = move || session.send(b"load".to_vec());
+            let sent = tokio::task::spawn_blocking(send);
             assert_eq!(inbox.recv().await.unwrap().as_slice(), b"load");
-            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"inv");
+            assert!(sent.await.unwrap());
+        });
+        assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
+        assert!(outbox.send(b"reply".to_vec()));
+        assert_eq!(outbox.push(frame("inv 2")), Pushed::Queued);
+        runtime.block_on(async {
+            // The call reads the first frame of each queue ahead, and keeps
+            // the one that it does not give.
+            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"inv 1");
+            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"reply");
+            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"inv 2");
             drop(outbox);
             assert!(inbox.recv().await.is_none());
         });

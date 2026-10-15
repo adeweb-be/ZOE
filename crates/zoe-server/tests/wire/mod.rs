@@ -71,6 +71,8 @@ pub fn s(path: &Path) -> &str {
 
 /// A `zoe serve` process. Dropping it kills the process.
 pub struct Server {
+    /// The `zoe` binary that runs.
+    binary: String,
     child: Option<Child>,
     stdout: Option<BufReader<ChildStdout>>,
     args: Vec<String>,
@@ -91,6 +93,11 @@ impl Server {
     /// `ZOE_*` variable reaches it. Without `--listen` in `args`, the server
     /// listens on a free port of 127.0.0.1.
     pub fn start(args: &[&str], env: &[(&str, &str)]) -> Server {
+        Server::start_binary(ZOE, args, env)
+    }
+
+    /// Start `zoe serve` of the `zoe` binary `binary`, as `start` does.
+    pub fn start_binary(binary: &str, args: &[&str], env: &[(&str, &str)]) -> Server {
         let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         if !args
             .iter()
@@ -103,6 +110,7 @@ impl Server {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let mut server = Server {
+            binary: binary.to_string(),
             child: None,
             stdout: None,
             args,
@@ -146,7 +154,7 @@ impl Server {
     }
 
     fn spawn(&mut self) {
-        let mut command = Command::new(ZOE);
+        let mut command = Command::new(&self.binary);
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("ZOE_") {
                 command.env_remove(name);

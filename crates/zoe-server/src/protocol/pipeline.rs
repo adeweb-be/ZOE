@@ -42,7 +42,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
@@ -90,6 +92,24 @@ impl Pool {
         }));
         output.await.ok()
     }
+
+    /// Start `work` on a blocking thread of `runtime` at once, when a
+    /// thread of the pool is free. Otherwise give `work` back. The caller
+    /// does not wait for the thread.
+    pub(crate) fn try_start<W: FnOnce() + Send + 'static>(
+        &self,
+        runtime: &dyn Runtime,
+        work: W,
+    ) -> Result<(), W> {
+        let Ok(permit) = Arc::clone(&self.0).try_acquire_owned() else {
+            return Err(work);
+        };
+        runtime.spawn_blocking(Box::new(move || {
+            let _permit = permit;
+            work();
+        }));
+        Ok(())
+    }
 }
 
 /// The signal that a call ended the connection: the client is gone, a
@@ -119,6 +139,24 @@ impl Ended {
         let mut ended = self.0.subscribe();
         // The sender lives as long as `self`, so the wait cannot fail.
         let _ = ended.wait_for(|ended| *ended).await;
+    }
+}
+
+/// End the connection when the runtime drops a call before it runs.
+struct EndUnlessRun(Option<Ended>);
+
+impl EndUnlessRun {
+    /// The call runs.
+    fn run(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for EndUnlessRun {
+    fn drop(&mut self) {
+        if let Some(ended) = self.0.take() {
+            ended.end();
+        }
     }
 }
 
@@ -166,12 +204,49 @@ impl Drop for Mark {
     }
 }
 
+/// The time of the end of the last call of a connection.
+struct Ends {
+    /// The clock of the connection.
+    runtime: Arc<dyn Runtime>,
+    /// The time of the end of the last call, in nanoseconds on the clock
+    /// of `runtime`.
+    last: AtomicU64,
+}
+
+impl Ends {
+    /// Mark the end of a call now.
+    fn mark(&self) {
+        let now = u64::try_from(self.runtime.now().as_nanos()).unwrap_or(u64::MAX);
+        self.last.fetch_max(now, Ordering::SeqCst);
+    }
+
+    /// Return the time of the end of the last call.
+    fn last(&self) -> Duration {
+        Duration::from_nanos(self.last.load(Ordering::SeqCst))
+    }
+}
+
+/// The slot of one call among the calls of its connection that run or
+/// wait. Its drop marks the end of the call, then gives the slot back.
+struct Slot {
+    _permit: OwnedSemaphorePermit,
+    ends: Arc<Ends>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // The permit drops after this, so a reader that finds every slot
+        // free also finds the end of the call.
+        self.ends.mark();
+    }
+}
+
 /// What a call takes before it starts: a slot among the calls of its
 /// connection that run or wait, a turn in the window when it runs on the
 /// read pool, and room for its reply in the session queue. The call gives
 /// back its slot and its turn when it ends.
 pub(crate) struct Ticket {
-    slot: OwnedSemaphorePermit,
+    slot: Slot,
     turn: Option<Turn>,
     room: Room,
 }
@@ -360,6 +435,8 @@ pub(crate) struct Calls {
     lane: Arc<Lane>,
     /// The slots of the calls that run or wait.
     slots: Arc<Semaphore>,
+    /// The end of the last call.
+    ends: Arc<Ends>,
     /// The tasks and the threads of the calls that did not end.
     running: Running,
     ended: Ended,
@@ -384,12 +461,16 @@ impl Calls {
             storages: Some(storages),
             session: None,
             outbox,
-            runtime,
+            runtime: Arc::clone(&runtime),
             peer: peer.into(),
             stopping,
             read_only: false,
             lane: Arc::new(Lane::new()),
             slots: Arc::new(Semaphore::new(QUEUE)),
+            ends: Arc::new(Ends {
+                runtime,
+                last: AtomicU64::new(0),
+            }),
             running: Running::new(),
             ended: Ended::new(),
         }
@@ -421,12 +502,16 @@ impl Calls {
     pub(crate) fn ticket(&self, call: &Call) -> impl Future<Output = Ticket> + Send + 'static {
         let reads = self.session.is_some() && session::on_read_pool(&call.method);
         let slots = Arc::clone(&self.slots);
+        let ends = Arc::clone(&self.ends);
         let outbox = self.outbox.clone();
         async move {
-            let slot = slots
-                .acquire_owned()
-                .await
-                .expect("the slots of a connection never close");
+            let slot = Slot {
+                _permit: slots
+                    .acquire_owned()
+                    .await
+                    .expect("the slots of a connection never close"),
+                ends,
+            };
             let turn = if reads {
                 outbox.turn().await
             } else {
@@ -444,6 +529,7 @@ impl Calls {
     /// slot until it ends. The future holds no borrow of `self`. Call it
     /// only while the reader takes no ticket: the future takes each slot,
     /// then gives them back at once.
+    #[cfg(test)]
     pub(crate) fn quiet(&self) -> impl Future<Output = ()> + Send + 'static {
         self.quiet_without(0)
     }
@@ -455,6 +541,50 @@ impl Calls {
     /// waits. The future holds no borrow of `self`.
     pub(crate) fn quiet_beside_ticket(&self) -> impl Future<Output = ()> + Send + 'static {
         self.quiet_without(1)
+    }
+
+    /// Wait until the connection is idle for `timeout`: no call runs, and
+    /// `timeout` passed since the start of the wait and since the end of
+    /// the last call. Wait forever when `timeout` is `None`. The future
+    /// holds no borrow of `self`. Call it only while the reader takes no
+    /// ticket.
+    ///
+    /// The end of a call does not wake the future. The future reads the
+    /// end of the last call when its timer ends, and then waits again
+    /// until `timeout` after that end. It waits for the end of a call
+    /// only when a call still runs at the end of its timer.
+    pub(crate) fn idle(
+        &self,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let slots = Arc::clone(&self.slots);
+        let ends = Arc::clone(&self.ends);
+        async move {
+            let Some(timeout) = timeout else {
+                return std::future::pending().await;
+            };
+            let runtime = Arc::clone(&ends.runtime);
+            let mut from = runtime.now();
+            loop {
+                let left = from.saturating_add(timeout).saturating_sub(runtime.now());
+                if !left.is_zero() {
+                    runtime.sleep(left).await;
+                }
+                if slots.available_permits() < QUEUE {
+                    // A call runs. Wait for its end, and for the end of
+                    // each other call.
+                    let _all = slots
+                        .acquire_many(QUEUE as u32)
+                        .await
+                        .expect("the slots of a connection never close");
+                }
+                let last = ends.last();
+                if last <= from {
+                    return;
+                }
+                from = last;
+            }
+        }
     }
 
     /// Take each slot but `kept`, then give them back.
@@ -508,18 +638,24 @@ impl Calls {
                 run_call(&session, &call, ticket, &ended, &peer);
             }));
         } else {
-            let pool = self.pool.clone();
-            let runtime = Arc::clone(&self.runtime);
-            self.runtime.spawn(Box::pin(async move {
+            let unrun = EndUnlessRun(Some(ended.clone()));
+            let work = move || {
+                unrun.run();
                 let _mark = mark;
-                let work = {
-                    let ended = ended.clone();
-                    move || run_call(&session, &call, ticket, &ended, &peer)
-                };
-                if pool.run(&*runtime, work).await.is_none() {
-                    ended.end();
-                }
-            }));
+                run_call(&session, &call, ticket, &ended, &peer);
+            };
+            // A free thread of the read pool runs the call at once.
+            // Otherwise a task waits for a free thread, so the reader does
+            // not wait for the pool.
+            if let Err(work) = self.pool.try_start(&*self.runtime, work) {
+                let pool = self.pool.clone();
+                let runtime = Arc::clone(&self.runtime);
+                self.runtime.spawn(Box::pin(async move {
+                    // A panic of the call ends the connection in
+                    // `run_call`, and a drop before it runs in `unrun`.
+                    let _ = pool.run(&*runtime, work).await;
+                }));
+            }
         }
     }
 
