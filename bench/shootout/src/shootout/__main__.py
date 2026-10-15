@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jsonschema
 
-from shootout import gate, run
+from shootout import client, gate, run
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
@@ -86,7 +86,59 @@ def main(argv: list[str] | None = None) -> int:
     )
     gate_cmd.add_argument("root", type=Path, help="the root of a results tree")
 
+    client_cmd = commands.add_parser(
+        "client",
+        help="the client benchmark: ZEO.ClientStorage against the native client",
+    )
+    client_cmds = client_cmd.add_subparsers(dest="client_command", required=True)
+    client_run = client_cmds.add_parser(
+        "run", help="run both clients against each server and write one result"
+    )
+    client_run.add_argument(
+        "--objects",
+        type=_positive,
+        default=client.OBJECTS,
+        help="the objects that each worker loads in a cold or warm round; each "
+        "worker commits max(1, objects // 100) times (default: %(default)s)",
+    )
+    client_run.add_argument(
+        "--server",
+        nargs="+",
+        choices=client.SERVERS,
+        default=list(client.SERVERS),
+        help="the servers to run against (default: both)",
+    )
+    client_run.add_argument(
+        "--rounds",
+        type=_positive,
+        default=client.ROUNDS,
+        help="the rounds of each row, at least 3 (default: %(default)s)",
+    )
+    client_run.add_argument(
+        "--machine",
+        help="the machine name in the result "
+        "(default: $ZOE_BENCH_MACHINE, else the CPU model)",
+    )
+    client_run.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("target/bench/work"),
+        help="where the servers and the caches write their files "
+        "(default: %(default)s)",
+    )
+    client_run.add_argument(
+        "--output",
+        type=Path,
+        help="the result file (default: target/bench/client/<started>.json)",
+    )
+    client_report = client_cmds.add_parser(
+        "report", help="print the rows of a result and the verdict"
+    )
+    client_report.add_argument("result", type=Path)
+
     args = parser.parse_args(argv)
+    if args.command == "client":
+        return _client(args, parser)
     if args.command == "index":
         print(write_index(args.root))
         return 0
@@ -125,6 +177,40 @@ def main(argv: list[str] | None = None) -> int:
         print(path, flush=True)
     write_index(args.output)
     return 0
+
+
+def _client(args, parser) -> int:
+    """Run the client benchmark, or report on a result of it."""
+    if args.client_command == "report":
+        result = json.loads(args.result.read_text())
+        return client.report(result, sys.stdout)
+    if args.rounds < client.ROUNDS:
+        parser.error(f"--rounds must be at least {client.ROUNDS}")
+    result = client.run(
+        objects=args.objects,
+        servers=tuple(args.server),
+        workdir=args.workdir,
+        machine=args.machine,
+        rounds=args.rounds,
+    )
+    jsonschema.validate(result, json.loads(client.SCHEMA.read_text()))
+    output = args.output
+    if output is None:
+        stamp = result["run"]["started"].replace("-", "").replace(":", "")
+        output = Path("target/bench/client") / f"{stamp}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    # The verdict of a run is the work of the report, not of the run.
+    client.report(result, sys.stdout)
+    print(output, flush=True)
+    return 0
+
+
+def _positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"the value must be positive: {text}")
+    return value
 
 
 def _ratio(text: str) -> float:

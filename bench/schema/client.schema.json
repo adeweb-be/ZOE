@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/client.schema.json",
+  "title": "ZOE client benchmark result",
+  "description": "One run of the client benchmark: ZEO.ClientStorage and the native client, zoe.zeo.ClientStorage, through the storage API and without ZODB, against the same servers, on one machine, with one Python build. Results are numbers about a synthetic corpus, never data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine", "python", "gil_enabled_by", "software", "run", "rows"],
+  "$defs": {
+    "workers": {
+      "description": "One item per Python process of the row that imported ZODB: the process of each round in the threads mode, the process of each worker in the processes mode.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gil_enabled", "gil_enabled_by"],
+        "properties": {
+          "gil_enabled": { "description": "sys._is_gil_enabled() when the process ended; true on a build with the GIL.", "type": "boolean" },
+          "gil_enabled_by": {
+            "description": "The modules that turned the GIL back on in the process, from the warnings of CPython. Empty on a build with the GIL.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "description": "The version of this schema. A change that a reader of the previous version cannot read increments it.",
+      "const": 1
+    },
+    "machine": {
+      "description": "The machine that ran the benchmark, as in the results of the harness. It holds no host name, user name or path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "cpu", "logical_cpus", "memory_bytes", "os", "kernel", "arch", "disk"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "cpu": { "type": "string", "minLength": 1 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "kernel": { "type": "string", "minLength": 1 },
+        "arch": { "type": "string", "minLength": 1 },
+        "disk": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["model", "rotational"],
+          "properties": {
+            "model": { "type": ["string", "null"] },
+            "rotational": { "type": ["boolean", "null"] }
+          }
+        }
+      }
+    },
+    "python": {
+      "description": "The Python build that ran both clients.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "version", "free_threaded", "compiler"],
+      "properties": {
+        "implementation": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+        "free_threaded": { "description": "True for a build without the GIL, such as 3.14t.", "type": "boolean" },
+        "compiler": { "type": "string" }
+      }
+    },
+    "gil_enabled_by": {
+      "description": "The modules that turned the GIL back on in a process of the run, over all rows. Empty on a build with the GIL.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "software": {
+      "description": "The version of each distribution and server in the run, keyed by name: ZEO and zoedb are the versions of both clients.",
+      "type": "object",
+      "required": ["ZEO", "zoedb"],
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started", "commit", "objects"],
+      "properties": {
+        "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
+        "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "objects": { "description": "The objects that each worker loads in a cold or warm row. Each worker commits max(1, objects // 100) times in a commit row.", "type": "integer", "minimum": 1 }
+      }
+    },
+    "rows": {
+      "description": "One entry per client, server, shape, workload and record size.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client", "server", "mode", "concurrency", "workload", "record_size",
+          "calls_per_second", "p50_seconds", "p99_seconds",
+          "client_cpu_per_object_seconds", "rounds", "spread"
+        ],
+        "properties": {
+          "client": { "enum": ["ZEO.ClientStorage", "zoe.zeo.ClientStorage"] },
+          "server": { "description": "zoe-serve: zoe serve. zeo: a ZEO 6 server on a FileStorage.", "enum": ["zoe-serve", "zeo"] },
+          "mode": { "description": "threads: the workers are threads of one process on one client. processes: each worker is a process with its own client.", "enum": ["threads", "processes"] },
+          "concurrency": { "description": "The number of workers.", "type": "integer", "minimum": 1 },
+          "workload": { "description": "cold: loads with no cache. warm: the same loads after a reopen on the cache file of the cold run of the same client; the open and its verification count. commit: commits of 100 new records.", "enum": ["cold", "warm", "commit"] },
+          "record_size": { "description": "The size of each record, in bytes.", "type": "integer", "minimum": 1 },
+          "calls_per_second": { "description": "The calls of all workers of a round, divided by the time of the round; the median of the rounds. A call is one loadBefore, or one commit of 100 records.", "type": "number", "exclusiveMinimum": 0 },
+          "p50_seconds": { "description": "The median time of a call, over the calls of all rounds.", "type": "number", "minimum": 0 },
+          "p99_seconds": { "description": "The 99th percentile of the same times.", "type": "number", "minimum": 0 },
+          "client_cpu_per_object_seconds": { "description": "The CPU time of the client processes of a round, user and system, divided by the objects loaded or stored; the median of the rounds.", "type": "number", "minimum": 0 },
+          "rounds": { "description": "The number of rounds. The rounds of both clients interleave.", "type": "integer", "minimum": 3 },
+          "spread": { "description": "The highest minus the lowest calls_per_second of the rounds, divided by their median.", "type": "number", "minimum": 0 },
+          "workers": { "$ref": "#/$defs/workers" }
+        }
+      }
+    }
+  }
+}
