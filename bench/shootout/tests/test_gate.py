@@ -39,9 +39,9 @@ def report(root, ratio=1.0):
     return code, out.getvalue().splitlines()
 
 
-def test_read_hot_is_the_only_scenario_left_out():
-    assert set(gate.LEFT_OUT) == {"read_hot"}
-    assert "ZEO.ClientStorage" in gate.LEFT_OUT["read_hot"]
+def test_read_hot_in_every_size_is_the_only_cell_left_out():
+    assert set(gate.LEFT_OUT) == {("read_hot", None)}
+    assert "ZEO.ClientStorage" in gate.LEFT_OUT["read_hot", None]
 
 
 def test_the_summary_counts_the_cells_left_out(tmp_path):
