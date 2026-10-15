@@ -53,6 +53,16 @@
 //! pack. It adds each selected record to the report and removes nothing.
 //! It writes nothing. With no commit between them, the report of the dry
 //! run equals the report of the pack.
+//!
+//! A store with `Options::pack_gc` false packs without garbage collection,
+//! as the `pack-gc` of FileStorage does. Such a pack has no mark and reads
+//! no reference. It keeps every record after T. Of each object, it keeps
+//! the newest record at or before T, whether a reader can reach the object
+//! or not. When that record is a deletion, the object goes: the pack
+//! removes each record of the object at or before T. It removes every
+//! other record at or before T. The batches, the watermark, the intent
+//! files of the blob files and the stop between batches stay the same. A
+//! dry run of such a store reports what such a pack removes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -167,6 +177,10 @@ impl Store {
     /// Pack the store at `at`: remove the records that no reader at or
     /// after `at` needs, and the objects that such a reader cannot reach.
     /// Return what the pack removed.
+    ///
+    /// A store with `Options::pack_gc` false keeps the objects that no
+    /// reader can reach. It removes only the old revisions, and the
+    /// objects whose newest record at or before `at` is a deletion.
     ///
     /// This is `pack_in_batches` with batches of 1,000 records and
     /// nothing between them.
@@ -318,6 +332,9 @@ struct Pack<'s> {
     store: &'s Store,
     /// The pack tid T.
     tid: Tid,
+    /// True when the pack collects garbage. When false, the pack marks
+    /// nothing and reads no reference.
+    gc: bool,
     /// The oids that a reader at or after T can reach.
     reachable: HashSet<Oid>,
     /// The oids that a finish wrote during the pack. Each has a record
@@ -338,6 +355,7 @@ impl<'s> Pack<'s> {
         Pack {
             store,
             tid,
+            gc: store.pack_gc,
             reachable: HashSet::new(),
             written: HashSet::new(),
             cursor: Some((Oid(0), Tid::ZERO)),
@@ -347,8 +365,12 @@ impl<'s> Pack<'s> {
     }
 
     /// Mark the root and each object that a record after T, up to `last`,
-    /// refers to, and what they reach.
+    /// refers to, and what they reach. A pack without garbage collection
+    /// marks nothing.
     fn mark_roots(&mut self, last: Tid) -> Result<()> {
+        if !self.gc {
+            return Ok(());
+        }
         let backend = &self.store.backend;
         let mut todo = vec![ROOT];
         let mut from = Some(Oid(0));
@@ -386,12 +408,15 @@ impl<'s> Pack<'s> {
     }
 
     /// Mark what the records of the finishes since the last call refer to.
+    /// A pack without garbage collection only keeps their oids.
     fn mark_written(&mut self) -> Result<()> {
         let mut todo = Vec::new();
         for (tid, oids) in self.store.packing.take() {
             for oid in oids {
                 self.written.insert(oid);
-                if let Some(data) = self.store.backend.load_serial(oid, tid)? {
+                if self.gc
+                    && let Some(data) = self.store.backend.load_serial(oid, tid)?
+                {
                     self.references(oid, tid, &data, &mut todo)?;
                 }
             }
@@ -430,6 +455,10 @@ impl<'s> Pack<'s> {
     /// but the newest goes. Of another oid, every record at or before T
     /// goes.
     ///
+    /// Without garbage collection, the newest record at or before T of
+    /// each oid stays, except a deletion. Every other record at or before
+    /// T goes.
+    ///
     /// The cursor names the next key to select, so the scan does not
     /// depend on the removal of the records that it selected before. A
     /// pack and a dry run select the same records.
@@ -449,7 +478,10 @@ impl<'s> Pack<'s> {
                     .filter(|&tid| tid <= self.tid)
                     .collect();
                 let no_later = keys.iter().all(|&(_, tid)| tid <= self.tid);
-                let kept = self.reachable.contains(&oid);
+                let kept = match older.last() {
+                    Some(&newest) if !self.gc => !self.is_deletion(oid, newest)?,
+                    _ => self.reachable.contains(&oid),
+                };
                 let selected = &older[..older.len() - usize::from(kept && !older.is_empty())];
                 // Of the oid at the cursor, the records before the cursor
                 // are selected already.
@@ -469,6 +501,18 @@ impl<'s> Pack<'s> {
             }
         }
         Ok(removals)
+    }
+
+    /// Tell if the record of `oid` at `tid` is a deletion. Only this pack
+    /// removes records at or before T, so a record that the key scan gave
+    /// is there.
+    fn is_deletion(&self, oid: Oid, tid: Tid) -> Result<bool> {
+        let data = self
+            .store
+            .backend
+            .load_serial(oid, tid)?
+            .ok_or(ZoeError::NotFound { oid })?;
+        Ok(data.is_empty())
     }
 
     /// Return the records of `planned` that the pack removes. A finish
@@ -642,7 +686,9 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::clock::SystemClock;
     use crate::format::blob::{blob_name, oid_dir};
+    use crate::store::Options;
     use crate::vfs::MemVfs;
 
     /// Return a record of class `m.C` whose state is a dict that holds a
@@ -1588,5 +1634,274 @@ mod tests {
         assert_eq!(store.pack_dry_run(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.pack(Tid::MAX).unwrap(), PackReport::default());
         assert_eq!(store.backend.pack_watermark().unwrap(), Tid::ZERO);
+    }
+
+    /// Open the store in `vfs` with `Options::pack_gc` false.
+    fn without_gc(vfs: MemVfs) -> Store {
+        let options = Options {
+            pack_gc: false,
+            ..Options::default()
+        };
+        Store::open_full(vfs, SystemClock, options).unwrap()
+    }
+
+    /// Commit `writes` with the current serial of each oid. `None` deletes
+    /// the oid.
+    fn commit_or_delete(store: &Store, writes: &[(Oid, Option<Vec<u8>>)]) -> Tid {
+        let mut txn = store.tpc_begin(b"user", b"", b"").unwrap();
+        for (oid, data) in writes {
+            let serial = store.load(*oid).map_or(Tid::ZERO, |(_, serial)| serial);
+            match data {
+                Some(data) => txn.store(*oid, serial, data).unwrap(),
+                None => txn.delete(*oid, serial).unwrap(),
+            }
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap()
+    }
+
+    /// The key of each record of `store`.
+    fn keys(store: &Store) -> BTreeSet<(Oid, Tid)> {
+        store
+            .backend
+            .record_keys(Oid(0), usize::MAX)
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_pack_without_gc_keeps_the_newest_record_of_an_unreachable_object() {
+        let vfs = MemVfs::new();
+        let store = without_gc(vfs.clone());
+        let g = Oid(1);
+        let t1 = commit(&store, &[(ROOT, record(&[g])), (g, record(&[]))]);
+        let t2 = commit(&store, &[(g, record(&[]))]);
+        let t3 = commit(&store, &[(ROOT, record(&[]))]);
+
+        let dry = store.pack_dry_run(t3).unwrap();
+        let report = store.pack(t3).unwrap();
+
+        // No reader reaches g. Its newest record stays, and its older
+        // record goes with the old root.
+        assert_eq!(dry, report);
+        assert_eq!((report.records, report.objects), (2, 0), "{report:?}");
+        assert_eq!(keys(&store), BTreeSet::from([(ROOT, t3), (g, t2)]));
+        assert!(is_removed(&store, g, t1));
+        assert_eq!(store.load(g).unwrap(), (record(&[]), t2));
+        assert_eq!(transactions(&store), [(t2, vec![g]), (t3, vec![ROOT])]);
+        assert_indexed(&store, "without gc");
+
+        // The store does not record the option. A default open collects
+        // garbage, and a pack at the same tid removes g.
+        drop(store);
+        let store = Store::open_vfs(vfs).unwrap();
+        let report = store.pack(t3).unwrap();
+        assert_eq!((report.records, report.objects), (1, 1), "{report:?}");
+        assert_eq!(keys(&store), BTreeSet::from([(ROOT, t3)]));
+        assert_indexed(&store, "with gc after a pack without gc");
+    }
+
+    #[test]
+    fn a_pack_without_gc_removes_an_object_whose_newest_record_is_a_deletion() {
+        let store = without_gc(MemVfs::new());
+        let (d, k) = (Oid(1), Oid(2));
+        let t1 = commit(
+            &store,
+            &[(ROOT, record(&[d, k])), (d, record(&[])), (k, record(&[]))],
+        );
+        commit(&store, &[(d, record(&[]))]);
+        let t3 = commit_or_delete(&store, &[(d, None)]);
+        let t4 = commit(&store, &[(k, record(&[]))]);
+        let t5 = commit_or_delete(&store, &[(k, None)]);
+
+        let report = store.pack(t4).unwrap();
+
+        // The root reaches d, but its newest record at or before t4 is a
+        // deletion: each of its records goes. The deletion of k comes
+        // after t4, so k keeps its newest record at or before t4.
+        assert_eq!((report.records, report.objects), (4, 1), "{report:?}");
+        assert_eq!(keys(&store), BTreeSet::from([(ROOT, t1), (k, t4), (k, t5)]));
+        for tid in [t1, t3, Tid(t3.0 + 1), Tid::MAX] {
+            let read = store.load_before(d, tid);
+            assert!(matches!(read, Err(ZoeError::NotFound { .. })), "{read:?}");
+        }
+        assert_eq!(store.load_before(k, t5).unwrap().unwrap().serial, t4);
+        assert_eq!(
+            transactions(&store),
+            [(t1, vec![ROOT]), (t4, vec![k]), (t5, vec![k])]
+        );
+        assert_indexed(&store, "without gc");
+    }
+
+    #[test]
+    fn a_pack_without_gc_reads_no_reference() {
+        let store = without_gc(MemVfs::new());
+        let t1 = commit(&store, &[(ROOT, b"not a pickle".to_vec())]);
+        let t2 = commit(&store, &[(ROOT, b"not a pickle either".to_vec())]);
+
+        // A pack with garbage collection would fail with `Format` here.
+        let dry = store.pack_dry_run(t2).unwrap();
+        let mut written = None;
+        let report = store
+            .pack_in_batches(t2, 1, || {
+                if written.is_none() {
+                    written = Some(commit(&store, &[(ROOT, b"no pickle".to_vec())]));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(dry, report);
+        assert_eq!(report.records, 1, "{report:?}");
+        assert!(is_removed(&store, ROOT, t1));
+        assert_eq!(store.load_serial(ROOT, t2).unwrap(), b"not a pickle either");
+        assert!(written.is_some());
+    }
+
+    /// A generator of pseudo-random numbers for the tests: xorshift64*. The
+    /// seed is not 0.
+    struct Random(u64);
+
+    impl Random {
+        /// Return a number below `n`.
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            let n = n as u64;
+            usize::try_from(self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_pack_without_gc_keeps_the_newest_record_of_each_object_at_or_before_t() {
+        const OBJECTS: u64 = 12;
+        for seed in 1..=16_u64 {
+            let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let store = without_gc(MemVfs::new());
+            let oids: Vec<Oid> = (0..OBJECTS).map(Oid).collect();
+            // Each record that the store holds, and true for a deletion.
+            let mut records: BTreeMap<(Oid, Tid), bool> = BTreeMap::new();
+            let mut deleted: BTreeSet<Oid> = BTreeSet::new();
+            let first: Vec<_> = oids.iter().map(|&oid| (oid, record(&oids))).collect();
+            let mut tids = vec![commit(&store, &first)];
+            records.extend(oids.iter().map(|&oid| ((oid, tids[0]), false)));
+            for _ in 0..30 {
+                let mut writes = BTreeMap::new();
+                for _ in 0..=random.below(3) {
+                    let oid = oids[random.below(oids.len())];
+                    if deleted.contains(&oid) {
+                        continue;
+                    }
+                    // The root is never deleted.
+                    let refs: Vec<Oid> = (0..random.below(3))
+                        .map(|_| oids[random.below(oids.len())])
+                        .collect();
+                    let delete = oid != ROOT && random.below(4) == 0;
+                    writes.insert(oid, (!delete).then(|| record(&refs)));
+                }
+                if writes.is_empty() {
+                    continue;
+                }
+                let writes: Vec<_> = writes.into_iter().collect();
+                let tid = commit_or_delete(&store, &writes);
+                for (oid, data) in &writes {
+                    records.insert((*oid, tid), data.is_none());
+                    if data.is_none() {
+                        deleted.insert(*oid);
+                    }
+                }
+                tids.push(tid);
+            }
+            let t = tids[random.below(tids.len())];
+            let batch = 1 + random.below(4);
+
+            // Commits during the pack write records after T, of objects
+            // that are not deleted.
+            let dry = store.pack_dry_run(t).unwrap();
+            let report = store
+                .pack_in_batches(t, batch, || {
+                    let oid = oids[random.below(oids.len())];
+                    if !deleted.contains(&oid) {
+                        let tid = commit(&store, &[(oid, record(&[]))]);
+                        records.insert((oid, tid), false);
+                    }
+                })
+                .unwrap();
+
+            let what = format!("seed {seed}, batch {batch}");
+            let mut expected = BTreeSet::new();
+            let mut gone = 0;
+            for &oid in &oids {
+                let of_oid: Vec<(Tid, bool)> = records
+                    .range((oid, Tid::ZERO)..=(oid, Tid::MAX))
+                    .map(|(&(_, tid), &deletion)| (tid, deletion))
+                    .collect();
+                expected.extend(of_oid.iter().filter(|r| r.0 > t).map(|r| (oid, r.0)));
+                match of_oid.iter().rfind(|r| r.0 <= t) {
+                    Some(&(newest, false)) => {
+                        expected.insert((oid, newest));
+                        // A reader at T reads the newest record at or
+                        // before T.
+                        let read = store.load_before(oid, Tid(t.0 + 1)).unwrap().unwrap();
+                        assert_eq!(read.serial, newest, "{what}: {oid:?}");
+                    }
+                    Some(&(_, true)) => gone += 1,
+                    None => {}
+                }
+            }
+            assert_eq!(keys(&store), expected, "{what}");
+            assert_eq!(report, dry, "{what}");
+            let removed = (records.len() - expected.len()) as u64;
+            assert_eq!((report.records, report.objects), (removed, gone), "{what}");
+            assert_indexed(&store, &what);
+        }
+    }
+
+    #[test]
+    fn every_crash_image_of_a_pack_without_gc_keeps_the_newest_record_of_each_object() {
+        let built = MemVfs::new();
+        let (g, d) = (Oid(1), Oid(2));
+        let (t2, t3, t4) = {
+            let store = without_gc(built.clone());
+            commit(
+                &store,
+                &[(ROOT, record(&[g, d])), (g, record(&[])), (d, record(&[]))],
+            );
+            let t2 = commit(&store, &[(g, record(&[])), (d, record(&[]))]);
+            let t3 = commit_or_delete(&store, &[(d, None)]);
+            let t4 = commit(&store, &[(ROOT, record(&[]))]);
+            (t2, t3, t4)
+        };
+
+        // The crash images cover the pack, one record per batch.
+        let vfs = built.durable_copy();
+        {
+            let store = without_gc(vfs.clone());
+            let report = store.pack_in_batches(t4, 1, || {}).unwrap();
+            // The root and g at t1, and the three records of d.
+            assert_eq!((report.records, report.objects), (5, 1), "{report:?}");
+            vfs.mark("packed");
+        }
+
+        let images = vfs.crash_images();
+        assert!(images.len() > 1, "the simulation produced crash images");
+        for image in &images {
+            let what = format!("{image:?}");
+            let store = Store::open_vfs(image.vfs())
+                .unwrap_or_else(|e| panic!("{what} does not open without repair: {e}"));
+            assert_indexed(&store, &what);
+            let left = keys(&store);
+            // The newest record of the root and of g stay in each image.
+            assert!(left.contains(&(ROOT, t4)), "{what}: {left:?}");
+            assert!(left.contains(&(g, t2)), "{what}: {left:?}");
+            // The deletion of d goes after the older records of d.
+            if left.iter().any(|&(oid, _)| oid == d) {
+                assert!(left.contains(&(d, t3)), "{what}: {left:?}");
+            }
+            if image.is_after("packed") {
+                assert_eq!(left, BTreeSet::from([(ROOT, t4), (g, t2)]), "{what}");
+            }
+        }
     }
 }

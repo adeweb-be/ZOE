@@ -27,13 +27,19 @@
 //! resolved pickles and calls `tpc_vote` of this class. `tpc_abort` and
 //! `close` can release the locks while the resolution runs, because the
 //! resolution holds no mutex of the transaction.
+//!
+//! The store and the table live in a `Shared` part, which the watcher of
+//! the signals also holds (see `signals`). The store closes once: in
+//! `close`, in the drop or in the watcher, whichever takes it first.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::thread;
 use std::time::Duration;
@@ -46,9 +52,48 @@ use zoe_core::{BlobFile, Oid, Options, Store, Tid, Txn, ZoeError};
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
 use crate::sequence::Sequence;
+use crate::signals;
 
 /// A transaction of the core that shares its store.
-type SharedTxn = Txn<Arc<Store>>;
+type SharedTxn = Txn<StoreRef>;
+
+/// A share of a store. The database closes when the last share drops.
+#[derive(Clone)]
+pub(crate) struct StoreRef(Arc<Owned>);
+
+/// A store and the flag that tells when its database is closed.
+struct Owned {
+    store: Store,
+    /// The fields drop in the order of their declaration. So this flag is
+    /// set after the store drops. A read through a weak handle of the core,
+    /// such as an iterator, can still hold the database then.
+    _closed: SetOnDrop,
+}
+
+/// A flag that its drop sets.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Deref for StoreRef {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.0.store
+    }
+}
+
+impl StoreRef {
+    /// Drop the store if this is its last share: the database closes.
+    /// Give the share back when another share exists.
+    pub(crate) fn try_close(self) -> Result<(), Self> {
+        Arc::try_unwrap(self.0).map(drop).map_err(Self)
+    }
+}
 
 /// One open transaction.
 struct Entry {
@@ -110,31 +155,123 @@ impl Entry {
 /// The open transactions of a storage.
 #[derive(Default)]
 struct Table {
-    /// True after `close`. The table then refuses a new transaction.
+    /// True after `close` or the close at a signal. The table then refuses
+    /// a new transaction.
     closed: bool,
     /// The open transactions, keyed by the address of the ZODB
     /// transaction object.
     entries: HashMap<usize, Arc<Entry>>,
+    /// The entries that the close at a signal took out of `entries`. They
+    /// hold Python references, so they stay here until `close` or the drop
+    /// of the storage removes them.
+    closing: Vec<Arc<Entry>>,
+}
+
+impl Table {
+    /// Remove every entry and return them.
+    fn drain(&mut self) -> Vec<Arc<Entry>> {
+        let mut entries: Vec<Arc<Entry>> = self.entries.drain().map(|(_, entry)| entry).collect();
+        entries.append(&mut self.closing);
+        entries
+    }
+}
+
+/// The parts of a storage that the watcher of the signals shares with it.
+///
+/// The watcher runs no Python code, so it drops no Python reference. The
+/// entries of the table hold Python references: the watcher takes the
+/// transaction of the core out of an entry and leaves the entry in the
+/// table. `close` and the drop of the storage remove the entries.
+pub(crate) struct Shared {
+    /// The store. It is `None` after `close`, the drop or the close at a
+    /// signal.
+    store: RwLock<Option<StoreRef>>,
+    table: Mutex<Table>,
+    /// True when the last share of the store dropped. A read through a
+    /// weak handle of the core can still hold the database then.
+    database_closed: Arc<AtomicBool>,
+}
+
+impl Shared {
+    fn new(store: Store) -> Self {
+        let database_closed = Arc::new(AtomicBool::new(false));
+        let store = StoreRef(Arc::new(Owned {
+            store,
+            _closed: SetOnDrop(Arc::clone(&database_closed)),
+        }));
+        Self {
+            store: RwLock::new(Some(store)),
+            table: Mutex::new(Table::default()),
+            database_closed,
+        }
+    }
+
+    fn table(&self) -> MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take the store out of the storage. Return `None` when it is already
+    /// out.
+    fn take_store(&self) -> Option<StoreRef> {
+        self.store
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Mark the storage closed and take its store, as `close` does. Return
+    /// `None` when `close` or the drop took the store first.
+    ///
+    /// The open transactions leave `entries`, so a later call with one of
+    /// them raises the error that it raises after `close`.
+    pub(crate) fn mark_closed(&self) -> Option<StoreRef> {
+        {
+            let mut table = self.table();
+            table.closed = true;
+            let entries: Vec<Arc<Entry>> = table.entries.drain().map(|(_, entry)| entry).collect();
+            table.closing.extend(entries);
+        }
+        self.take_store()
+    }
+
+    /// Abort each transaction that the close at a signal took out of
+    /// `entries` and that no call uses now. Leave the entries in the table.
+    pub(crate) fn abort_idle(&self) {
+        // The transactions drop after the guard of the table, because an
+        // abort can take time.
+        let idle: Vec<SharedTxn> = self
+            .table()
+            .closing
+            .iter()
+            .filter_map(|entry| entry.try_take().ok().flatten())
+            .collect();
+        drop(idle);
+    }
+
+    /// Tell if the last share of the store dropped.
+    pub(crate) fn database_closed(&self) -> bool {
+        self.database_closed.load(Ordering::Acquire)
+    }
 }
 
 /// The in-process storage. It implements ZODB's `IStorage`.
 #[pyclass(subclass, frozen, module = "zoe._zoe", name = "Storage")]
 pub(crate) struct Storage {
-    /// The store. It is `None` after `close`.
-    store: RwLock<Option<Arc<Store>>>,
+    /// The store and the table of the open transactions.
+    shared: Arc<Shared>,
     /// The absolute path of the store directory.
     path: String,
     read_only: bool,
-    table: Mutex<Table>,
     published: Published,
 }
 
 impl Storage {
     /// Return the store, or fail when the storage is closed.
-    fn opened(&self, py: Python<'_>) -> PyResult<Arc<Store>> {
+    fn opened(&self, py: Python<'_>) -> PyResult<StoreRef> {
         // The guard drops at the end of this statement. Building the
         // exception runs Python code, so it must come after.
         let store = self
+            .shared
             .store
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -148,6 +285,7 @@ impl Storage {
         // The guard drops at the end of this statement. Building the
         // exception runs Python code, so it must come after.
         let open = self
+            .shared
             .store
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -160,7 +298,7 @@ impl Storage {
     }
 
     fn table(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+        self.shared.table()
     }
 
     /// Return the entry of `transaction`. Fail when the storage did not
@@ -196,15 +334,22 @@ impl Storage {
     /// Open the store in the directory `path`, and create it if necessary.
     /// `lock_timeout` is the longest wait of a vote for its locks, in
     /// seconds. `blob_dir` is the directory of the blob files, `None` for
-    /// `<path>/blobs`. The core takes it as `Options::blob_dir`.
+    /// `<path>/blobs`. The core takes it as `Options::blob_dir`. With
+    /// `pack_gc` false, a pack keeps the objects that no reader can reach:
+    /// the core takes it as `Options::pack_gc`.
+    ///
+    /// The open installs the handlers of SIGTERM and SIGHUP that close the
+    /// stores of the process, each only when its action is the default
+    /// (see `signals`).
     #[new]
-    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None))]
+    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         read_only: bool,
         lock_timeout: Option<f64>,
         blob_dir: Option<PathBuf>,
+        pack_gc: bool,
     ) -> PyResult<Self> {
         let mut options = Options::default();
         if let Some(seconds) = lock_timeout {
@@ -213,6 +358,7 @@ impl Storage {
             })?;
         }
         options.blob_dir = blob_dir;
+        options.pack_gc = pack_gc;
         let (store, last, path) = py
             .detach(|| {
                 // A read-only storage creates no directory. It does not use
@@ -241,11 +387,18 @@ impl Storage {
                 Ok::<_, ZoeError>((store, last, path))
             })
             .map_err(|error| core(py, error))?;
+        let shared = Arc::new(Shared::new(store));
+        signals::register(&shared);
+        if let Err(error) = signals::install(py) {
+            // The table is empty, so `shared` holds no Python reference.
+            // The store closes without the GIL.
+            py.detach(move || drop(shared));
+            return Err(error);
+        }
         Ok(Self {
-            store: RwLock::new(Some(Arc::new(store))),
+            shared,
             path: path.to_string_lossy().into_owned(),
             read_only,
-            table: Mutex::new(Table::default()),
             published: Published::new(last),
         })
     }
@@ -269,10 +422,16 @@ impl Storage {
         Ok(py.detach(|| directory_size(Path::new(&self.path)))?)
     }
 
-    /// Return 0. IStorage asks only for an approximate length, and the
-    /// store keeps no object count.
-    fn __len__(&self) -> usize {
-        0
+    /// Return the object count of the store: the oids that have a record,
+    /// a deletion included, as the `len()` of FileStorage. A closed
+    /// storage gives 0, so that the truth value of a storage never raises.
+    fn __len__(&self, py: Python<'_>) -> usize {
+        let Ok(store) = self.opened(py) else {
+            return 0;
+        };
+        // The reference drops without the GIL, as in every other call.
+        let count = py.detach(move || store.object_count());
+        usize::try_from(count.unwrap_or(0)).unwrap_or(usize::MAX)
     }
 
     #[pyo3(name = "isReadOnly")]
@@ -443,6 +602,10 @@ impl Storage {
     /// Pack the store at `tid`: remove the records that no reader at or
     /// after `tid` needs, with their blob files. `zoe.storage.Storage.pack`
     /// gives the tid of the pack time.
+    ///
+    /// A storage opened with `pack_gc` false keeps the objects that no
+    /// reader can reach, except an object whose newest record at or before
+    /// `tid` is a deletion.
     ///
     /// The whole pack runs without the GIL. Other threads read and commit
     /// while it runs. A read-only storage refuses the pack.
@@ -920,13 +1083,9 @@ impl Storage {
         let entries: Vec<Arc<Entry>> = {
             let mut table = self.table();
             table.closed = true;
-            table.entries.drain().map(|(_, entry)| entry).collect()
+            table.drain()
         };
-        let store = self
-            .store
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let store = self.shared.take_store();
         let entries = py.detach(move || {
             abort_all(&entries);
             drop(store);
@@ -943,21 +1102,15 @@ impl Drop for Storage {
     /// was not closed. This also holds during the shutdown of the
     /// interpreter, on the thread that finalizes it.
     fn drop(&mut self) {
-        let store = self
-            .store
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let txns: Vec<SharedTxn> = self
-            .table
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .values()
-            .filter_map(|entry| entry.take())
-            .collect();
+        let store = self.shared.take_store();
+        let entries: Vec<Arc<Entry>> = self.shared.table().drain();
+        let txns: Vec<SharedTxn> = entries.iter().filter_map(|entry| entry.take()).collect();
         let close = move || drop((txns, store));
         Python::try_attach(|py| py.detach(close));
+        // The entries hold Python references. They drop here, so that the
+        // watcher of the signals, which can hold the last share of
+        // `shared`, never drops one.
+        drop(entries);
     }
 }
 
