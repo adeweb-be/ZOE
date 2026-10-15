@@ -18,15 +18,27 @@
 //! the layout is smaller. The open never changes a file that does not start
 //! with the magic of ZOE (or with a zero word, which an open that died
 //! before its first write leaves): such a file is not a cache file of ZOE,
-//! and the open fails. Each open gives the file its disk space. The open
-//! then marks the file not clean, with the boot id of the kernel, and
-//! writes the header page to the disk before any other write.
+//! and the open fails. An open gives the file its disk space when its
+//! blocks do not cover its length.
+//!
+//! The mark. Before the first write to the mapping, the cache marks the
+//! file not clean, with the boot id of the kernel, and writes the header
+//! page to the disk (`msync`, `MS_SYNC`). The open marks a new or dropped
+//! file at once. A kept file stays clean on the disk until its first write
+//! (a store, an end, a move of `applied` or of `head`), so an open that
+//! keeps the file and writes nothing pays no sync, and a crash then leaves
+//! the clean file of the last close. The copy of a hit, which runs on the
+//! thread of the caller, waits until a write marked the file. A mark that
+//! fails disables the cache: it serves and writes nothing more, and the
+//! file keeps the state of its last clean close.
 //!
 //! A file with entries serves only after `Cache::verify`: the pool verifies
 //! it against the server first.
 //!
-//! The close writes the whole mapping to the disk, then marks the file
-//! clean with the checksum of the state, then writes the header page again.
+//! The close of a marked file writes the whole mapping to the disk, then
+//! marks the file clean with the checksum of the state, then writes the
+//! header page again. The close of a file that no write marked writes
+//! nothing: the file on the disk is still clean.
 //! Then it frees the lock: the mapping holds the open file until the unmap,
 //! so only an explicit unlock frees the lock at the close. A closed cache
 //! never writes its mapping again; it reads it only for `applied` and
@@ -34,7 +46,7 @@
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
@@ -160,18 +172,19 @@ impl Cache {
             }
         }
         // A copy can make a kept file sparse: a write through the mapping to
-        // a hole of a full disk raises SIGBUS.
-        mapping::allocate(&file, target)?;
+        // a hole of a full disk raises SIGBUS. A file whose blocks cover its
+        // length needs no call.
+        if file.metadata()?.blocks().saturating_mul(512) < target {
+            mapping::allocate(&file, target)?;
+        }
         let cache = Cache::with(layout.words, &layout, Some(file))?;
         if !keep {
             cache.init(&fixed);
         }
-        let boot = boot_id().unwrap_or_default();
-        cache.word(H_BOOT).store(boot[0], Ordering::Relaxed);
-        cache.word(H_BOOT + 1).store(boot[1], Ordering::Relaxed);
-        cache.word(H_CLEAN).store(0, Ordering::Relaxed);
-        cache.word(H_STATE_SUM).store(0, Ordering::Relaxed);
-        cache.map.sync(HEADER_WORDS)?;
+        if !keep {
+            cache.mark_file()?;
+            cache.marked.store(true, Ordering::Relaxed);
+        }
         let empty = cache.applied().0 == 0;
         cache.verified.store(empty, Ordering::Release);
         Ok(cache)
@@ -182,6 +195,10 @@ impl Cache {
     /// file. An error leaves the file not clean: the next open after a
     /// restart of the kernel drops it.
     pub(super) fn write_clean(&self) {
+        // A file that no write marked is still clean on the disk.
+        if !self.marked.load(Ordering::Relaxed) {
+            return;
+        }
         if self.map.sync(self.map.words().len()).is_err() {
             return;
         }
@@ -193,6 +210,20 @@ impl Cache {
         self.word(H_STATE_SUM)
             .store(state_sum(&header), Ordering::Relaxed);
         let _ = self.map.sync(HEADER_WORDS);
+    }
+}
+
+impl Cache {
+    /// Write the mark of a file that a writer changes: the boot id of the
+    /// kernel, the clean flag 0 and a state checksum of 0, then write the
+    /// header page to the disk. An anonymous mapping needs no mark.
+    pub(super) fn mark_file(&self) -> io::Result<()> {
+        let boot = boot_id().unwrap_or_default();
+        self.word(H_BOOT).store(boot[0], Ordering::Relaxed);
+        self.word(H_BOOT + 1).store(boot[1], Ordering::Relaxed);
+        self.word(H_CLEAN).store(0, Ordering::Relaxed);
+        self.word(H_STATE_SUM).store(0, Ordering::Relaxed);
+        self.map.sync(HEADER_WORDS)
     }
 }
 
