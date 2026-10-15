@@ -40,6 +40,7 @@
 //! more.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
@@ -191,6 +192,19 @@ impl Shared {
         self.listener.clone()
     }
 
+    /// Return a connection of the pool for a download, in turn: a
+    /// connection that commits and is not lost. When there is none, return
+    /// the listener.
+    fn download_connection(&self) -> Arc<Client> {
+        let conns = self.conns.read().unwrap_or_else(PoisonError::into_inner);
+        let start = self.next_load.fetch_add(1, Ordering::Relaxed);
+        (0..conns.len())
+            .map(|step| &conns[(start + step) % conns.len()])
+            .find(|conn| conn.is_connected())
+            .unwrap_or(&self.listener)
+            .clone()
+    }
+
     /// Forget the connection `client`, which closed or which the pool
     /// closes.
     fn forget(&self, client: &Arc<Client>) {
@@ -336,6 +350,27 @@ impl Pool {
     /// through any connection.
     pub async fn load_serial(&self, oid: Oid, serial: Tid) -> Result<Vec<u8>, Error> {
         self.shared.any_connection().load_serial(oid, serial).await
+    }
+
+    /// Download the blob of `oid` that the transaction `serial` wrote into
+    /// `sink`, as `Client::send_blob` does, through a connection other than
+    /// the listener when one is open. So the delivery of the invalidations
+    /// never waits for the writes of a download. The pieces of the download
+    /// come on the connection that carries its `sendBlob`. Return the
+    /// number of bytes.
+    ///
+    /// The caller polls the future until it ends, or drops it: while the
+    /// download waits for the caller, its connection waits too.
+    pub async fn send_blob<W: Write>(
+        &self,
+        oid: Oid,
+        serial: Tid,
+        sink: &mut W,
+    ) -> Result<u64, Error> {
+        self.shared
+            .download_connection()
+            .send_blob(oid, serial, sink)
+            .await
     }
 
     /// Return at most `size` entries of the history of `oid`.
@@ -601,6 +636,36 @@ impl PoolTransaction {
         blob: &[u8],
     ) -> Result<(), Error> {
         self.txn().store_blob(oid, serial, data, blob).await?;
+        self.keep(oid, data);
+        Ok(())
+    }
+
+    /// Store `data` for `oid` with the blob that `blob` reads, as
+    /// `Transaction::store_blob_from` does.
+    pub async fn store_blob_from<R: Read>(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        blob: &mut R,
+    ) -> Result<(), Error> {
+        self.txn().store_blob_from(oid, serial, data, blob).await?;
+        self.keep(oid, data);
+        Ok(())
+    }
+
+    /// Store `data` for `oid` with the blob file `filename` of a shared
+    /// blob directory, as `Transaction::store_blob_shared` does.
+    pub async fn store_blob_shared(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        filename: &str,
+    ) -> Result<(), Error> {
+        self.txn()
+            .store_blob_shared(oid, serial, data, filename)
+            .await?;
         self.keep(oid, data);
         Ok(())
     }
