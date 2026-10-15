@@ -101,6 +101,26 @@ fn inside_index(key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()>
     Err(ZoeError::CorruptTxn { tid })
 }
 
+/// Tell if `oid` has at least one record in `records`. `prev` is the
+/// serial of a record of `oid` that can exist, or `Tid::ZERO`. A point read
+/// of that record answers first, and the scan runs only when it finds
+/// none.
+fn has_records_from(
+    records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+    oid: Oid,
+    prev: Tid,
+) -> Result<bool> {
+    if prev != Tid::ZERO
+        && records
+            .get(&format::record_key(oid, prev))
+            .map_err(backend)?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    has_records(records, oid)
+}
+
 /// Tell if `oid` has at least one record in `records`.
 fn has_records(
     records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
@@ -489,6 +509,7 @@ impl Backend for RedbBackend {
             max_oid: None,
             pack_watermark: None,
             touched: BTreeMap::new(),
+            fresh: None,
         }))
     }
 
@@ -903,6 +924,9 @@ struct RedbWrite<'a> {
     pack_watermark: Option<Tid>,
     /// Each oid that the write puts or removes a record of.
     touched: BTreeMap<Oid, Touched>,
+    /// The next oid that `meta` held when the write began, read at the
+    /// first put. No record has this oid or a greater one.
+    fresh: Option<Oid>,
 }
 
 /// What a write did to the records of one oid.
@@ -923,15 +947,48 @@ impl RedbWrite<'_> {
         oid: Oid,
         removed: bool,
     ) -> Result<()> {
+        Self::touch_put(touched, records, oid, Tid::ZERO, None, removed)
+    }
+
+    /// Note that the write touches `oid`, as `touch` does. `prev` is the
+    /// serial of the previous record of the put, or `Tid::ZERO`. An oid at
+    /// or after `fresh`, the next oid of `meta`, has no record, so the
+    /// note reads nothing for it.
+    fn touch_put(
+        touched: &mut BTreeMap<Oid, Touched>,
+        records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+        oid: Oid,
+        prev: Tid,
+        fresh: Option<Oid>,
+        removed: bool,
+    ) -> Result<()> {
         let entry = match touched.entry(oid) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Touched {
-                before: has_records(records, oid)?,
-                removed: false,
-            }),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let before = match fresh {
+                    Some(fresh) if oid >= fresh => false,
+                    _ => has_records_from(records, oid, prev)?,
+                };
+                entry.insert(Touched {
+                    before,
+                    removed: false,
+                })
+            }
         };
         entry.removed |= removed;
         Ok(())
+    }
+
+    /// Return the next oid that `meta` held when the write began. It
+    /// reads the row once. A row that does not decode gives `None`, and
+    /// then each note reads the records.
+    fn fresh(&mut self) -> Result<Option<Oid>> {
+        if self.fresh.is_none() {
+            let meta = self.txn.open_table(META).map_err(backend)?;
+            let value = meta.get(META_NEXT_OID).map_err(backend)?;
+            self.fresh = value.and_then(|v| format::decode_u64(v.value())).map(Oid);
+        }
+        Ok(self.fresh)
     }
 
     /// Return the object count after this write: the stored count, plus
@@ -967,12 +1024,13 @@ impl WriteTxn for RedbWrite<'_> {
         tid: Tid,
         new: &mut dyn Iterator<Item = Result<NewRecord<'_>>>,
     ) -> Result<()> {
+        let fresh = self.fresh()?;
         // The two tables stay open for all the records of the call.
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
         for record in new {
             let (oid, prev, data) = record?;
-            Self::touch(&mut self.touched, &records, oid, false)?;
+            Self::touch_put(&mut self.touched, &records, oid, prev, fresh, false)?;
             let key = format::record_key(oid, tid);
             let frame = format::encode_frame_with(
                 KeySpace::Records,
@@ -1300,6 +1358,56 @@ mod tests {
         }
         let oids = backend.txn_oids(Tid(10), Tid(11)).unwrap();
         assert_eq!(oids[&Tid(10)], vec![Oid(1), Oid(2)]);
+    }
+
+    #[test]
+    fn a_put_counts_its_oid_once_whatever_its_previous_serial() {
+        let backend = empty();
+        commit_record(&backend, Oid(1), Tid(5), b"a");
+        commit_record(&backend, Oid(1), Tid(6), b"b");
+        commit_record(&backend, Oid(4), Tid(7), b"c");
+        assert_eq!(backend.object_count(), Some(2));
+        assert_eq!(backend.next_oid().unwrap(), Oid(5));
+        let puts = [
+            // The record of the previous serial exists.
+            (Oid(1), Tid(6)),
+            // No record has the previous serial, but the oid has records.
+            (Oid(4), Tid(3)),
+            // Oids before the next oid, without a record.
+            (Oid(2), Tid(9)),
+            (Oid(3), Tid::ZERO),
+            // Oids at and after the next oid.
+            (Oid(5), Tid::ZERO),
+            (Oid(9), Tid(2)),
+        ];
+        let mut write = backend.begin_write().unwrap();
+        let mut records = puts
+            .iter()
+            .map(|&(oid, prev)| Ok((oid, prev, Cow::Borrowed(&b"x"[..]))));
+        write.put_records(Tid(10), &mut records).unwrap();
+        // A second put of a new oid in the same write counts it once.
+        write.put_record(Oid(5), Tid(11), Tid(10), b"y").unwrap();
+        write.commit().unwrap();
+        assert_eq!(backend.object_count(), Some(6));
+        assert_eq!(backend.next_oid().unwrap(), Oid(10));
+    }
+
+    #[test]
+    fn a_next_oid_that_does_not_decode_keeps_the_count_exact() {
+        let backend = empty();
+        commit_record(&backend, Oid(1), Tid(5), b"a");
+        let txn = backend.database().begin_write().unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert(META_NEXT_OID, &b"bad"[..])
+            .unwrap();
+        txn.commit().unwrap();
+
+        let mut write = backend.begin_write().unwrap();
+        write.put_record(Oid(1), Tid(6), Tid::ZERO, b"b").unwrap();
+        write.put_record(Oid(2), Tid(6), Tid::ZERO, b"c").unwrap();
+        write.commit().unwrap();
+        assert_eq!(backend.object_count(), Some(2));
     }
 
     #[test]
