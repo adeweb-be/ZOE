@@ -1162,11 +1162,17 @@ fn partial_name(filename: &Path) -> PathBuf {
 /// Write the bytes of `fetch` into a new file at `partial`, and return
 /// their number. The file must hold that many bytes after the write. Then
 /// make it read-only. A file at `partial` that a stopped download left is
-/// written again from its start.
+/// removed first.
 fn download(
     partial: &Path,
     fetch: impl FnOnce(&mut BufWriter<File>) -> Result<u64, Error>,
 ) -> Result<u64, Error> {
+    // A crash can leave a read-only partial file, which `File::create` does
+    // not open.
+    match fs::remove_file(partial) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     let mut sink = BufWriter::new(File::create(partial)?);
     let size = fetch(&mut sink)?;
     sink.flush()?;

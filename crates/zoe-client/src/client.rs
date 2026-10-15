@@ -629,6 +629,10 @@ impl Client {
     /// nothing more after it. The connection runs one download of a blob
     /// at a time: a second download of the same blob waits for the reply
     /// of the first, also when the future of the first drops before.
+    ///
+    /// The caller polls the future until it ends, or drops it. While the
+    /// channel of the download is full, the reader of the connection waits,
+    /// and the other replies and invalidations of the connection wait too.
     pub async fn send_blob<W: Write>(
         &self,
         oid: Oid,
@@ -836,8 +840,10 @@ impl Transaction {
     /// Store `data` for `oid` with the blob that `blob` reads to its end, as
     /// `store_blob` does. It reads one chunk at a time, so the blob is
     /// never in memory as a whole. A read that fails gives `Error::Io`, and
-    /// `storeBlobEnd` does not go out: the caller then aborts the
-    /// transaction.
+    /// `storeBlobEnd` does not go out. The transaction then counts as
+    /// failed, as after a failed vote: a later `store`, `vote` or `finish`
+    /// fails with `Error::Invalid` and sends nothing, and the abort or the
+    /// drop sends `tpc_abort`.
     pub async fn store_blob_from<R: Read>(
         &mut self,
         oid: Oid,
@@ -851,7 +857,15 @@ impl Transaction {
         self.inner.notify("storeBlobStart", vec![]).await?;
         let mut chunk = vec![0; BLOB_CHUNK];
         loop {
-            let n = fill(blob, &mut chunk)?;
+            let n = match fill(blob, &mut chunk) {
+                Ok(n) => n,
+                Err(error) => {
+                    // The server holds an upload without its end. Only the
+                    // abort may follow.
+                    self.ended = true;
+                    return Err(error.into());
+                }
+            };
             if n > 0 {
                 self.inner
                     .notify("storeBlobChunk", vec![chunk[..n].into()])
@@ -956,7 +970,7 @@ impl Transaction {
     fn check(&self) -> Result<(), Error> {
         if self.ended {
             return Err(Error::Invalid(
-                "a call for a transaction that the server ended".into(),
+                "a call for a transaction that failed or that the server ended".into(),
             ));
         }
         Ok(())
@@ -1165,11 +1179,16 @@ impl Inner {
             Message::Reply { id, result } => {
                 let (pending, download) = {
                     let mut calls = lock(&self.calls);
-                    let download = calls
-                        .downloads
-                        .iter()
-                        .find(|(_, download)| download.id == id)
-                        .map(|(key, _)| *key);
+                    // Most replies come with no download that runs.
+                    let download = if calls.downloads.is_empty() {
+                        None
+                    } else {
+                        calls
+                            .downloads
+                            .iter()
+                            .find(|(_, download)| download.id == id)
+                            .map(|(key, _)| *key)
+                    };
                     let download = download.and_then(|key| calls.downloads.remove(&key));
                     (calls.pending.remove(&id), download)
                 };
@@ -1462,7 +1481,6 @@ fn oid(value: &Value, method: &str) -> Result<Oid, Error> {
     p64(value).map(Oid).ok_or_else(|| bad(method, value))
 }
 
-/// The protocol error of a reply of `method` that has the wrong shape.
 /// Read the args of a call of a download: `[oid, serial]`, and the chunk
 /// for `receiveBlobChunk`. Return the oid and the serial, and the piece.
 fn piece(method: &str, args: Value) -> Result<((u64, u64), Piece), Error> {
@@ -1499,6 +1517,7 @@ fn fill(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
+/// The protocol error of a reply of `method` that has the wrong shape.
 fn bad(method: &str, value: &Value) -> Error {
     Error::Protocol(format!("{method} gave {value}"))
 }
