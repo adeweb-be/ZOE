@@ -3,15 +3,21 @@
     python terms.py results/aws/run.jsonl
 
 It reads the runs as summarize.py does and names, for each row, the term
-that keeps the ratio of the POC client under 3x, by these rules:
+that keeps the ratio of the POC client under 3x, by these rules, in order:
 
 - read_hot: the POC client has no cache, so each hit goes to the server.
-  A hit through ZEO.cache at concurrency 1 is almost all ZODB (py-spy), so
-  its time bounds any cache: the client CPUs (one core under the GIL)
-  divided by that time. When the bound is under 3x ZEO, no card can.
-- the ZODB floor: when the in-process storage reaches less than 3x ZEO,
-  no client and no server can.
+  At 1 KB, a hit through ZEO.cache at concurrency 1 is almost all ZODB
+  (py-spy), so its time bounds any cache for each worker: the workers that
+  run in parallel (one under the GIL of 3.13 in the threads mode, the
+  client vCPUs in the threads mode of 3.14t, every worker in the processes
+  mode) divided by that time. When the bound is under 3x ZEO, no card can.
+  At 100 KB no profile exists, so the row is a client cache row.
+- add in the processes mode: the reduced run measures the start of the
+  workers, not the commits, so the bound is not known from this run.
 - else, by the kind of the scenario and the size of the objects.
+
+The floor of a cell bounds no row: above concurrency 1 it adds the
+DemoStorage, the commit lock and the switching of the GIL to ZODB.
 """
 
 import statistics
@@ -33,17 +39,21 @@ def fmt(ratio):
 def term(k, z, q, f, proto, hit):
     py, sc, mode, c, size = k
     if sc == "read_hot":
-        cores = 1 if (py == "3.13" and mode == "threads") else min(c, CLIENT_CPUS)
-        bound = cores / hit[(py, size)] / z
+        card = "ZOE-156, ZOE-162" if mode == "processes" else "ZOE-156"
+        if size > 1024:
+            return "client cache (no profile at 100 KB)", card
+        if py == "3.13" and mode == "threads":
+            workers = 1
+        elif mode == "threads":
+            workers = min(c, CLIENT_CPUS)
+        else:
+            workers = c
+        bound = workers / hit[(py, size)] / z
         if bound < GATE:
-            return f"ZODB per hit ({bound:.1f}x)", "no card can: ZODB alone takes the time of a hit"
-        if mode == "processes":
-            return "client cache", "ZOE-156, ZOE-162"
-        return "client cache", "ZOE-156"
-    floor_ratio = f / z if f else None
-    floor_binds = floor_ratio is not None and floor_ratio < GATE and not (py == "3.14t" and mode == "threads")
-    if floor_binds:
-        return f"ZODB floor ({floor_ratio:.1f}x)", "no card can: ZODB and zodbshootout alone reach less than 3x ZEO"
+            return f"ZODB per hit ({bound:.1f}x)", "no card can: ZODB alone takes the time of a hit (profile at 1 KB)"
+        return "client cache", card
+    if sc == "add" and mode == "processes":
+        return "start-up of the workers (reduced run)", "not known from this run: ZOE-154 runs the full set"
     finish = statistics.median(r.get("finish_ms") or 0 for r in proto)
     if sc in ("add", "update", "read_warm"):
         if size > 1024:
@@ -51,7 +61,6 @@ def term(k, z, q, f, proto, hit):
         if mode == "threads" and c == 1:
             return f"commit latency (finish {finish:.1f} ms)", "new card: a cheaper redb finish"
         return f"commit (finish {finish:.1f} ms)", "new card: compression off the commit path, a cheaper redb finish"
-    # read_cold
     if size > 1024:
         return "100 KB load", "new card: the read path of the server"
     return "load round trip", "new card: the read path of the server; ZOE-153 for the client"
