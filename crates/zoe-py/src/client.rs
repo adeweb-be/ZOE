@@ -77,6 +77,7 @@ use zoe_client::{
 use zoe_core::{Oid, Tid};
 
 use crate::errors::{self, p64, u64_of};
+use crate::hit_memo::HitMemo;
 
 /// The number of worker threads of the runtime of the native clients.
 const WORKERS: usize = 2;
@@ -179,6 +180,8 @@ pub(crate) struct NativeClient {
     read_only: bool,
     /// What the client connects to. `new_addr` changes its addresses.
     servers: Arc<Servers>,
+    /// POC: the `bytes` of recent hits of the cache, if any.
+    memo: Option<HitMemo>,
 }
 
 #[pymethods]
@@ -381,6 +384,7 @@ impl NativeClient {
             open: Mutex::new(Vec::new()),
             traceparent,
             servers,
+            memo: HitMemo::from_env(),
         })
     }
 
@@ -690,7 +694,9 @@ impl NativeClient {
         self.check_process()?;
         if let Some(cache) = &self.cache
             && let Some((data, start, end)) =
-                cache.load_before_with(oid, tid, |len, fill| bytes(py, len, fill))
+                cache.load_before_at_with(oid, tid, |pos, len, fill| {
+                    self.hit_bytes(py, oid, pos, len, fill)
+                })
         {
             return Ok(Some((
                 data,
@@ -730,7 +736,9 @@ impl NativeClient {
         let oid = Oid(u64_of(oid)?);
         self.check_process()?;
         if let Some(cache) = &self.cache
-            && let Some((data, start)) = cache.load_with(oid, |len, fill| bytes(py, len, fill))
+            && let Some((data, start)) = cache.load_at_with(oid, |pos, len, fill| {
+                self.hit_bytes(py, oid, pos, len, fill)
+            })
         {
             return Ok(Some((data, p64(py, start.0))));
         }
@@ -754,7 +762,34 @@ impl NativeClient {
         if let Some(cache) = &self.cache {
             py.detach(|| cache.clear());
         }
+        if let Some(memo) = &self.memo {
+            memo.clear(py);
+        }
         Ok(())
+    }
+
+    /// POC: the counters of the cache and of the memo of hits, as a dict.
+    fn _poc_cache_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        if let Some(cache) = &self.cache {
+            let counts = cache.counts();
+            out.set_item("stored", counts.stored)?;
+            out.set_item("refused", counts.refused)?;
+            out.set_item("copied", counts.copied)?;
+            out.set_item("unindexed", counts.unindexed)?;
+            out.set_item("head", cache.head())?;
+            out.set_item("applied", cache.applied().0)?;
+        }
+        if let Some(memo) = &self.memo {
+            let [n, held, hits, puts, dropped, refused] = memo.stats();
+            out.set_item("memo_copies", n)?;
+            out.set_item("memo_bytes", held)?;
+            out.set_item("memo_hits", hits)?;
+            out.set_item("memo_puts", puts)?;
+            out.set_item("memo_dropped", dropped)?;
+            out.set_item("memo_refused", refused)?;
+        }
+        Ok(out)
     }
 
     /// Return the entries of the cache as a list of `(oid, start, end)`,
@@ -983,6 +1018,9 @@ impl NativeClient {
             }
             slot.take()
         };
+        if let Some(memo) = &self.memo {
+            memo.clear(py);
+        }
         let Some(pool) = pool else {
             return Ok(());
         };
@@ -996,6 +1034,27 @@ impl NativeClient {
 }
 
 impl NativeClient {
+    /// Return the `bytes` of a hit of the entry of `oid` at `pos`: the
+    /// copy of the memo, else a new checked copy, which the memo keeps.
+    fn hit_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        oid: Oid,
+        pos: u64,
+        len: usize,
+        fill: &mut Copier<'_>,
+    ) -> Option<Bound<'py, PyBytes>> {
+        let Some(memo) = self.memo.as_ref().filter(|memo| memo.keeps(len)) else {
+            return bytes(py, len, fill);
+        };
+        if let Some(data) = memo.get(py, oid.0, pos) {
+            return Some(data);
+        }
+        let data = bytes(py, len, fill)?;
+        memo.put(oid.0, pos, &data);
+        Some(data)
+    }
+
     /// Return the pool, or raise when it is closed or when the process is
     /// a child of the process that opened it.
     fn pool(&self, py: Python<'_>) -> PyResult<Arc<Pool>> {

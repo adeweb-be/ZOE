@@ -313,6 +313,12 @@ impl Cache {
         Tid(self.word(H_APPLIED).load(Ordering::Acquire))
     }
 
+    /// POC: return the logical write position of the ring.
+    #[doc(hidden)]
+    pub fn head(&self) -> u64 {
+        self.word(H_HEAD).load(Ordering::Acquire)
+    }
+
     /// Return the counts of the writers.
     pub fn counts(&self) -> CacheCounts {
         *self.lock()
@@ -493,6 +499,20 @@ impl Cache {
         before: Tid,
         out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
+        self.load_before_at_with(oid, before, |_, len, copy| out(len, copy))
+    }
+
+    /// Do as `load_before_with`, and also give `out` the logical position
+    /// of the entry first. Positions never repeat in a cache. The data of
+    /// an entry never changes while a lookup finds it intact. So a copy of
+    /// the data that a hit at a position checked stays the data of a later
+    /// hit at that position.
+    pub fn load_before_at_with<R>(
+        &self,
+        oid: Oid,
+        before: Tid,
+        out: impl FnOnce(u64, usize, &mut Copier<'_>) -> Option<R>,
+    ) -> Option<(R, Tid, Option<Tid>)> {
         if !self.verified() {
             return None;
         }
@@ -518,6 +538,16 @@ impl Cache {
         oid: Oid,
         out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid)> {
+        self.load_at_with(oid, |_, len, copy| out(len, copy))
+    }
+
+    /// Do as `load_with`, and also give `out` the logical position of the
+    /// entry first, as `load_before_at_with` does.
+    pub fn load_at_with<R>(
+        &self,
+        oid: Oid,
+        out: impl FnOnce(u64, usize, &mut Copier<'_>) -> Option<R>,
+    ) -> Option<(R, Tid)> {
         if !self.verified() {
             return None;
         }
@@ -541,10 +571,10 @@ impl Cache {
     fn read<R>(
         &self,
         entry: &Head,
-        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
+        out: impl FnOnce(u64, usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
         let mut copy = |sink: &mut dyn FnMut(&[u8])| self.copy(entry, sink);
-        let result = out(entry.len as usize, &mut copy)?;
+        let result = out(entry.pos, entry.len as usize, &mut copy)?;
         if entry.end == 0 {
             self.refresh(entry);
         }
@@ -1044,3 +1074,6 @@ fn to_vec(len: usize, copy: &mut Copier<'_>) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod poc_cost;

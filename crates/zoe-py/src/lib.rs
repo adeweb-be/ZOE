@@ -18,6 +18,7 @@
 mod cli;
 mod client;
 mod errors;
+mod hit_memo;
 mod publish;
 mod sequence;
 mod signals;
