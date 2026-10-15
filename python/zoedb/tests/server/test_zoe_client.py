@@ -4,7 +4,8 @@ The acceptance test covers the sequences over the protocol, a stock client,
 a stock server and the section that opens the client. These tests cover the
 rest: the keys of the section, its `<ssl>` section, the read-only fallback
 with the declaration, a name that is not a str, the switch to the native
-client, the arguments of TLS and of the addresses of the native client, and
+client and its fall back to the client of ZEO on a pickle server, the
+arguments of TLS and of the addresses of the native client, and
 the traceparent that the native client reads.
 """
 
@@ -324,6 +325,142 @@ def test_a_server_of_another_protocol_is_a_failed_connection(caplog):
         stop.set()
         thread.join()
         listener.close()
+
+
+# The words of the warning when a client without `native` takes the client
+# of ZEO inside.
+FELL_BACK = "the client of ZEO runs inside"
+
+# The name of the thread of the asyncio client of ZEO ends with this.
+ZEO_THREAD = "zeo client networking thread"
+
+
+def fell_back(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "zoe.zeo" and FELL_BACK in r.getMessage()
+    ]
+
+
+def commit_and_load(storage):
+    from ZODB.Connection import TransactionMetaData
+
+    oid = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, bytes(8), b"data", "", txn)
+    storage.tpc_vote(txn)
+    tid = storage.tpc_finish(txn)
+    assert storage.load(oid) == (b"data", tid)
+
+
+@pytest.fixture
+def pickle_server(tmp_path):
+    """A stock ZEO server in this process, which speaks only the pickle
+    protocol Z5."""
+    import ZEO
+
+    address, stop = ZEO.server(path=str(tmp_path / "Data.fs"))
+    yield address
+    stop()
+
+
+def test_a_default_client_on_a_pickle_server_takes_the_client_of_zeo(
+    pickle_server, caplog
+):
+    import logging
+    import threading
+
+    import zoe.zeo
+
+    with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+        storage = zoe.zeo.ClientStorage(
+            pickle_server, storage="1", wait_timeout=TIMEOUT
+        )
+    try:
+        assert type(storage) is zoe.zeo.ClientStorage
+        assert not isinstance(storage, zoe.zeo._NativeClientStorage)
+        assert storage.protocol_version == b"Z5"
+        threads = [t.name for t in threading.enumerate()]
+        assert any(name.endswith(ZEO_THREAD) for name in threads), threads
+        commit_and_load(storage)
+        [message] = fell_back(caplog)
+        assert "b'Z5'" in message
+    finally:
+        storage.close()
+
+
+def test_the_zoeclient_section_without_native_takes_the_client_of_zeo(
+    pickle_server, caplog
+):
+    import logging
+
+    import zoe.zeo
+
+    host, port = pickle_server
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    text = (
+        f"%import zoe\n<zoeclient>\nserver {host}:{port}\n"
+        f"wait-timeout {TIMEOUT}\n</zoeclient>\n"
+    )
+    config, _ = ZConfig.loadConfigFile(schema, io.StringIO(text))
+    with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+        storage = config.storage.open()
+    try:
+        assert type(storage) is zoe.zeo.ClientStorage
+        commit_and_load(storage)
+        assert len(fell_back(caplog)) == 1
+    finally:
+        storage.close()
+
+
+def test_native_true_on_a_pickle_server_fails_and_names_msgpack(pickle_server, caplog):
+    import logging
+
+    from ZEO.Exceptions import ClientDisconnected
+
+    import zoe.zeo
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ClientDisconnected) as raised:
+            zoe.zeo.ClientStorage(
+                pickle_server, storage="1", native=True, wait_timeout=1
+            )
+    text = str(raised.value)
+    assert text.startswith("timed out waiting for connection")
+    assert "Z5" in text and "msgpack true" in text
+    assert fell_back(caplog) == []
+
+
+def test_a_default_client_without_wait_stays_native(pickle_server):
+    import zoe.zeo
+
+    # Without wait, the open does not connect: it cannot see the protocol.
+    storage = zoe.zeo.ClientStorage(
+        pickle_server, storage="1", wait=False, wait_timeout=1
+    )
+    try:
+        assert isinstance(storage, zoe.zeo._NativeClientStorage)
+    finally:
+        storage.close()
+
+
+def test_a_default_client_on_zoe_serve_stays_native_and_logs_no_fall_back(
+    tmp_path, caplog
+):
+    import logging
+
+    import zoe.zeo
+
+    with ZoeServer(str(tmp_path / "store")) as server:
+        with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+            storage = client(server)
+        try:
+            assert isinstance(storage, zoe.zeo._NativeClientStorage)
+            assert fell_back(caplog) == []
+        finally:
+            storage.close()
 
 
 def test_a_call_after_the_close_raises_client_disconnected(tmp_path):

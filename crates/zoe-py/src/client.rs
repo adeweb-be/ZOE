@@ -242,11 +242,18 @@ impl NativeClient {
     ///
     /// With `client_label`, each connection sends it in `set_client_label`
     /// after `get_info`, and the server puts it in its log lines.
+    ///
+    /// `fall_back_on` lists protocols, as bytes. When the open with `wait`
+    /// finds a server of one of these protocols, it stops at once and
+    /// raises `OtherProtocol` with the protocol: it does not log and does
+    /// not wait. The caller can then open another client. A reconnect
+    /// never does this.
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None, dropping=None
+        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None, dropping=None,
+        fall_back_on=Vec::new()
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -266,6 +273,7 @@ impl NativeClient {
         client_label: Option<String>,
         cache_path: Option<PathBuf>,
         dropping: Option<Py<PyAny>>,
+        fall_back_on: Vec<Vec<u8>>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -327,7 +335,9 @@ impl NativeClient {
                 wait: timeout,
             });
             let first = match wait {
-                true => Some(runtime.block_on(servers.open(&servers.options, true))?),
+                true => {
+                    Some(runtime.block_on(servers.open(&servers.options, true, &fall_back_on))?)
+                }
                 false => None,
             };
             let reopen = servers.clone();
@@ -351,6 +361,9 @@ impl NativeClient {
                 return Err(PyValueError::new_err(text));
             }
             Err(Opening::Runtime(error)) => return Err(error.into()),
+            Err(Opening::Client(Error::OtherProtocol(theirs))) => {
+                return Err(OtherProtocol::new_err(PyBytes::new(py, &theirs).unbind()));
+            }
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
         Ok(Self {
@@ -1413,11 +1426,13 @@ struct Servers {
 impl Servers {
     /// Open a listener as `options` asks, and return it with the `Connect`
     /// of its server. With `retry`, try again after failed connections
-    /// until the wait passes. Else make one round.
+    /// until the wait passes. Else make one round. A server of a protocol
+    /// of `fall_back_on` ends the open at once.
     async fn open(
         &self,
         options: &Options,
         retry: bool,
+        fall_back_on: &[Vec<u8>],
     ) -> Result<(zoe_client::Client, Connect), Opening> {
         let targets = lock(&self.targets).clone();
         let (listener, endpoint) = open(
@@ -1427,6 +1442,7 @@ impl Servers {
             options,
             self.wait,
             retry,
+            fall_back_on,
         )
         .await?;
         // The other connections register as the listener did, on its
@@ -1458,7 +1474,7 @@ impl Servers {
             },
             false => self.options.clone(),
         };
-        self.open(&options, false)
+        self.open(&options, false, &[])
             .await
             .map_err(Opening::into_error)
     }
@@ -1631,7 +1647,8 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
 /// Open a client to the first server of `targets` that opens, on the
 /// runtime of the caller, and return it with its endpoint. Each round
 /// resolves the hosts again. With `retry`, try again after failed
-/// connections until `wait` passes.
+/// connections until `wait` passes. A server of a protocol of
+/// `fall_back_on` ends the open at once with `Error::OtherProtocol`.
 async fn open(
     targets: &[Target],
     secure: Option<&Secure>,
@@ -1639,6 +1656,7 @@ async fn open(
     options: &Options,
     wait: Duration,
     retry: bool,
+    fall_back_on: &[Vec<u8>],
 ) -> Result<(zoe_client::Client, Endpoint), Opening> {
     let deadline = Instant::now() + wait;
     loop {
@@ -1660,6 +1678,9 @@ async fn open(
             zoe_client::Client::open_first(runtime, &round.endpoints, storage, options, left).await
         };
         match opened {
+            Err(Error::OtherProtocol(theirs)) if fall_back_on.contains(&theirs) => {
+                return Err(Opening::Client(Error::OtherProtocol(theirs)));
+            }
             Err(Error::OtherProtocol(theirs)) => {
                 // ZEO logs a server of another protocol as a failed
                 // registration, and tries again after its
@@ -1673,7 +1694,7 @@ async fn open(
                     tokio::time::sleep(left).await;
                     return Err(Opening::Client(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        TIMED_OUT,
+                        timed_out(&theirs),
                     ))));
                 }
                 tokio::time::sleep(REFUSED_POLL).await;
@@ -1737,6 +1758,31 @@ fn dropping_of(dropping: Py<PyAny>) -> Dropping {
 /// The text of `ClientDisconnected` when the open saw only servers of
 /// another protocol until the wait passed: the text of ZEO.
 const TIMED_OUT: &str = "timed out waiting for connection";
+
+/// The pickle protocol of a stock ZEO 6 server without `msgpack true`.
+const PICKLE: &[u8] = b"Z5";
+
+/// Return the text of `ClientDisconnected` when the last server of the
+/// open spoke `theirs`: the text of ZEO. For `Z5`, the text also tells
+/// how to reach that server.
+fn timed_out(theirs: &[u8]) -> String {
+    if theirs == PICKLE {
+        format!(
+            "{TIMED_OUT}: the server speaks the pickle protocol Z5, and the \
+             native client speaks only M5: set msgpack true on the server, \
+             or give native=False"
+        )
+    } else {
+        TIMED_OUT.to_owned()
+    }
+}
+
+pyo3::create_exception!(
+    _zoe,
+    OtherProtocol,
+    PyException,
+    "The server speaks a protocol of `fall_back_on`: its argument."
+);
 
 /// Log a server of another protocol as ZEO logs a failed registration:
 /// at error level, under `ZEO.asyncio.client`, with the protocol of the

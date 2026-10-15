@@ -51,8 +51,11 @@ rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
 `record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
 `deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
 `new_addr` and `client_label`. It speaks only the msgpack protocol `M5`: a
-stock ZEO server needs `msgpack true`. `_NOT_BUILT` names the arguments
-whose feature it does not have yet. It is empty.
+stock ZEO server needs `msgpack true`. When the caller gives no `native`
+and the open with `wait` finds a stock ZEO server that speaks only the
+pickle protocol `Z5`, the instance takes the asyncio client of ZEO inside
+and logs a warning. `_NOT_BUILT` names the arguments whose feature it does
+not have yet. It is empty.
 """
 
 import concurrent.futures
@@ -326,9 +329,15 @@ class ClientStorage(ZEOClientStorage):
     runs inside. With `native=False`, the asyncio client of ZEO runs
     inside. A subclass runs the asyncio client of ZEO by default, and
     `native=True` on it raises `TypeError`.
+
+    Without `native`, a server that speaks only the pickle protocol `Z5`
+    at the open with `wait` gives the asyncio client of ZEO inside: the
+    instance becomes a `ClientStorage` with `native=False`. With
+    `native=True`, such a server is a failed connection.
     """
 
     def __new__(cls, *args, native=None, **kw):
+        fall_back = native is None and cls is ClientStorage
         if native is None:
             native = issubclass(cls, _NativeClientStorage) or cls is ClientStorage
         if native and cls is ClientStorage:
@@ -338,7 +347,11 @@ class ClientStorage(ZEOClientStorage):
                 f"{cls.__name__} runs the client of ZEO: native=True needs"
                 " zoe.zeo.ClientStorage itself"
             )
-        return super().__new__(cls)
+        instance = super().__new__(cls)
+        if fall_back:
+            # `_NativeClientStorage.__init__` reads and removes the mark.
+            instance._fall_back = True
+        return instance
 
     def __init__(
         self,
@@ -394,6 +407,11 @@ _NOT_BUILT = {}
 # The extensions that the native client declares: those of the client of
 # ZEO.
 _NATIVE_EXTENSIONS = EXTENSIONS
+
+# The protocols of a server for which a `ClientStorage` without `native`
+# takes the asyncio client of ZEO inside: the pickle protocol of a stock
+# ZEO server without `msgpack true`. The client of ZEO speaks it.
+_ZEO_PROTOCOLS = (b"Z5",)
 
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
@@ -701,6 +719,12 @@ class _NativeClientStorage(ClientStorage):
     the resolution raises, drops the cache entry of its oid and leaves the
     transaction to `tpc_abort`.
 
+    When `zoe.zeo.ClientStorage` made the instance without `native`, and
+    the open with `wait` finds a server that speaks only a protocol of
+    `_ZEO_PROTOCOLS`, the instance becomes a `zoe.zeo.ClientStorage` with
+    the asyncio client of ZEO inside, opened with the same arguments. It
+    logs a warning that names the protocol.
+
     The other calls of the server go through `_call` and `_async`, on the
     listener, as on the one connection of `ZEO.ClientStorage`, and raise
     what `ZEO.ClientStorage` raises for the same reply. So the iterators,
@@ -758,7 +782,8 @@ class _NativeClientStorage(ClientStorage):
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
-        given = locals()
+        given = dict(locals())
+        fall_back = self.__dict__.pop("_fall_back", False) and wait
         # Refuse a feature that is not built before any other step.
         for key, off in _NOT_BUILT.items():
             if given[key] != off:
@@ -830,23 +855,28 @@ class _NativeClientStorage(ClientStorage):
         # can read the cache from then on.
         self._native_ready = threading.Event()
         started = time.monotonic()
-        self._native = _zoe.Client(
-            [_native_address(one) for one in addr],
-            storage,
-            read_only=self._read_only,
-            read_only_fallback=self._read_only_fallback,
-            extensions=list(_NATIVE_EXTENSIONS),
-            wait_timeout=float(wait_timeout or 30),
-            pool_bound=_POOL_BOUND,
-            cache_size=cache_size,
-            tls=tls,
-            traceparent=_traceparent,
-            wait=bool(wait),
-            disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
-            client_label=client_label,
-            cache_path=cache_path,
-            dropping=_dropping_of(self),
-        )
+        try:
+            self._native = _zoe.Client(
+                [_native_address(one) for one in addr],
+                storage,
+                read_only=self._read_only,
+                read_only_fallback=self._read_only_fallback,
+                extensions=list(_NATIVE_EXTENSIONS),
+                wait_timeout=float(wait_timeout or 30),
+                pool_bound=_POOL_BOUND,
+                cache_size=cache_size,
+                tls=tls,
+                traceparent=_traceparent,
+                wait=bool(wait),
+                disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
+                client_label=client_label,
+                cache_path=cache_path,
+                dropping=_dropping_of(self),
+                fall_back_on=list(_ZEO_PROTOCOLS if fall_back else ()),
+            )
+        except _zoe.OtherProtocol as error:
+            self._open_zeo_client(given, error.args[0])
+            return
         self._cache = _NativeCache(self._native, cache_size, cache_path)
         self._native_ready.set()
         try:
@@ -874,6 +904,28 @@ class _NativeClientStorage(ClientStorage):
         except BaseException:
             self._native.close()
             raise
+
+    def _open_zeo_client(self, given, protocol):
+        """Become a `ClientStorage` with the asyncio client of ZEO inside,
+        opened with the arguments `given` of this open. The server speaks
+        `protocol`, which the client of ZEO speaks and the native client
+        does not."""
+        logger.warning(
+            "%s the server speaks the protocol %r, not M5: the client of ZEO "
+            "runs inside; set msgpack true on the server for the native client",
+            self.__name__,
+            protocol,
+        )
+        args = {
+            key: value
+            for key, value in given.items()
+            if key not in ("self", "native", "_ssl_section", "__class__")
+        }
+        self.__dict__.clear()
+        self.__class__ = ClientStorage
+        ClientStorage.__init__(
+            self, native=False, _ssl_section=given["_ssl_section"], **args
+        )
 
     @property
     def _is_read_only(self):

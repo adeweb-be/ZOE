@@ -159,7 +159,8 @@ class ZoeClient(BaseConfig):
 
     def _open_client(self, native):
         """Open the client, with the native client inside when `native`
-        is true."""
+        is true. `native` is None when the section has no key `native`:
+        the default of `zoe.zeo.ClientStorage` applies."""
         from zoe.zeo import ClientStorage
 
         config = self.config

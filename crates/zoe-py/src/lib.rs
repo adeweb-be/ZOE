@@ -39,6 +39,10 @@ mod _zoe {
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        m.add("__version__", env!("CARGO_PKG_VERSION"))
+        m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+        m.add(
+            "OtherProtocol",
+            m.py().get_type::<crate::client::OtherProtocol>(),
+        )
     }
 }
