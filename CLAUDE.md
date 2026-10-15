@@ -18,7 +18,7 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | --- | --- |
 | `just check` | `cargo fmt` check, the `Cargo.lock` of the fuzz targets, clippy with warnings as errors, ruff lint and format check |
 | `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t, then `just deploy check` |
-| `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan` |
+| `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan`; `just tsan zoe-server FILTER` runs the library tests of `zoe-server` whose name holds FILTER instead |
 | `just fuzz` | builds the fuzz targets of `zoe serve` (`crates/zoe-server/fuzz`) with libFuzzer and AddressSanitizer into `target/fuzz`, then runs them for 60 seconds in all; `just fuzz 3600` runs them for an hour, `just fuzz 600 frame` runs only `frame` |
 | `just conformance` | ZODB's storage suites and test modules in-process against `zoe.Storage`, on every interpreter |
 | `just plone` | builds the Plone instance of a scenario under `plone/` into `target/plone` and starts it; `just plone zoe check` creates a Plone site on the zoe scenario by script and reads it over HTTP |
