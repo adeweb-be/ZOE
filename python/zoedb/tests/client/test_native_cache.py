@@ -1,8 +1,8 @@
 """Acceptance test of the cache of the native client.
 
 Loads of the native client hit a cache in the client process, with the
-semantics of `ZEO.cache.ClientCache`. The argument `cache_size` bounds it.
-`just test` runs this module.
+semantics of `ZEO.cache.ClientCache`. The argument `cache_size` bounds it,
+and leaves `zoe.zeo._NOT_BUILT`. `just test` runs this module.
 
 The test counts the loads that reach the server. `zoe serve --admin-listen`
 gives `zoe_loads_total`, the number of `loadBefore` calls of a storage, on
@@ -20,8 +20,16 @@ gives `zoe_loads_total`, the number of `loadBefore` calls of a storage, on
   server. zodbshootout calls it.
 - With `cache_size` of 100 KB, after loads of 1,000 records of 1 KB, the
   cache holds at most 100 KB: a second pass in the reverse order gets at
-  most 100 hits.
-- A record larger than the cache is never cached, and loads right.
+  most 100 hits, and at least 50.
+- A record larger than half of the cache is never cached, and loads
+  right. A record of a quarter of the cache is cached.
+- A `ConflictError` of a vote drops the entry of its object, so the next
+  load reaches the server.
+- Threads load a few objects at the snapshot of `lastTransaction()` while
+  another client commits new revisions of them. Each load gives the
+  revision that the last commit before the snapshot wrote. A current
+  reply that arrived before a commit, and that the client stores after it
+  delivered that commit, would give an older revision.
 - On a free-threaded build, 16 threads load the same 100 objects together
   while another client commits new revisions of them. Each load gives the
   data of the snapshot of its thread.
@@ -57,6 +65,10 @@ RECORDS = 1000
 READERS = 16
 OBJECTS = 100
 GENERATIONS = 50
+# The readers, the objects and the commits of the snapshot test.
+SNAPSHOT_READERS = 8
+HOT_OBJECTS = 4
+HOT_COMMITS = 200
 
 
 class AdminServer:
@@ -305,18 +317,21 @@ def test_the_cache_holds_at_most_its_size(server):
         assert loaded == [data(i) for i in backwards]
         hits = RECORDS - misses
         assert hits <= CACHE_SIZE // KB, f"{hits} records of 1 KB hit the cache"
+        # The heads of the entries take a part of the ring, not half of it.
+        assert hits >= CACHE_SIZE // KB // 2, f"only {hits} records hit the cache"
     finally:
         storage.close()
 
 
-def test_a_record_larger_than_the_cache_is_never_cached(server):
-    large = bytes(range(256)) * (2 * CACHE_SIZE // 256)
+def test_a_record_larger_than_half_of_the_cache_is_never_cached(server):
+    large = bytes(range(256)) * ((CACHE_SIZE // 2 + KB) // 256)
+    quarter = bytes(range(256)) * (CACHE_SIZE // 4 // 256)
     storage = native(server.address, cache_size=CACHE_SIZE)
     try:
         writer = native(server.address)
         try:
-            oid = writer.new_oid()
-            tid = commit(writer, [(oid, ZERO, large)])
+            oid, small = writer.new_oid(), writer.new_oid()
+            tid = commit(writer, [(oid, ZERO, large), (small, ZERO, quarter)])
         finally:
             writer.close()
         seen(storage, tid)
@@ -324,7 +339,10 @@ def test_a_record_larger_than_the_cache_is_never_cached(server):
             result, misses = counted(server, lambda: load(storage, oid))
             assert result == (large, tid)
             assert misses == 1
-        # A commit of the client does not cache it either.
+        # A record of a quarter of the cache goes in.
+        assert counted(server, lambda: load(storage, small)) == ((quarter, tid), 1)
+        assert counted(server, lambda: load(storage, small)) == ((quarter, tid), 0)
+        # A commit of the client does not cache a large record either.
         own = storage.new_oid()
         own_tid = commit(storage, [(own, ZERO, large)])
         result, misses = counted(server, lambda: load(storage, own))
@@ -332,6 +350,88 @@ def test_a_record_larger_than_the_cache_is_never_cached(server):
         assert misses == 1
     finally:
         storage.close()
+
+
+def test_cache_size_is_built(server):
+    import zoe.zeo
+
+    assert "cache_size" not in zoe.zeo._NOT_BUILT
+    storage = native(server.address, cache_size=CACHE_SIZE)
+    try:
+        assert callable(storage._cache.clear)
+    finally:
+        storage.close()
+
+
+def test_a_conflict_drops_the_entry_of_its_object(server, clients):
+    from ZODB.POSException import ConflictError
+
+    storage, writer = clients
+    oid = writer.new_oid()
+    first = commit(writer, [(oid, ZERO, b"first")])
+    second = commit(writer, [(oid, first, b"second")])
+    seen(storage, second)
+    assert counted(server, lambda: load(storage, oid)) == ((b"second", second), 1)
+    assert counted(server, lambda: load(storage, oid)) == ((b"second", second), 0)
+    # The data is not a pickle, so no resolution can save the conflict.
+    with pytest.raises(ConflictError):
+        commit(storage, [(oid, first, b"stale")])
+    assert counted(server, lambda: load(storage, oid)) == ((b"second", second), 1)
+
+
+def test_a_load_at_a_snapshot_gives_the_revision_of_the_snapshot(server, clients):
+    storage, writer = clients
+    oids = [writer.new_oid() for _ in range(HOT_OBJECTS)]
+    # The tid of each commit of the writer, in order. Each commit writes
+    # every object, so the revision of a snapshot S is the one of the last
+    # tid up to S.
+    tids = []
+
+    def write(generation):
+        serial = tids[-1] if tids else ZERO
+        stores = [
+            (oid, serial, b"%d:%d" % (generation, i)) for i, oid in enumerate(oids)
+        ]
+        tids.append(commit(writer, stores))
+
+    write(0)
+    seen(storage, tids[0])
+    done = threading.Event()
+    errors = []
+    loads_ = []
+
+    def read():
+        try:
+            while not done.is_set():
+                last = storage.lastTransaction()
+                before = p64(u64(last) + 1)
+                for index, oid in enumerate(oids):
+                    record, start, _ = load_before(storage, oid, before)
+                    loads_.append((last, index, record, start))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=read, daemon=True) for _ in range(SNAPSHOT_READERS)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for generation in range(1, HOT_COMMITS + 1):
+            write(generation)
+    finally:
+        done.set()
+        for thread in threads:
+            thread.join(TIMEOUT)
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert not errors, errors
+    assert loads_
+    for last, index, record, start in loads_:
+        generation = max(g for g, tid in enumerate(tids) if tid <= last)
+        expected = (b"%d:%d" % (generation, index), tids[generation])
+        assert (record, start) == expected, (
+            f"object {index} at {last.hex()}: {record!r} of {start.hex()}"
+        )
 
 
 @pytest.mark.skipif(not FREE_THREADED, reason="the check needs a free-threaded build")
@@ -343,12 +443,15 @@ def test_threads_load_the_data_of_their_snapshot(server, clients):
         return b"%d:%d" % (generation, index)
 
     serials = [ZERO]
+    # The tid of each generation, in order.
+    tids = []
 
     def write(generation):
         stores = [
             (oid, serials[0], data(generation, index)) for index, oid in enumerate(oids)
         ]
         serials[0] = commit(writer, stores)
+        tids.append(serials[0])
 
     write(0)
     seen(storage, serials[0])
@@ -367,6 +470,7 @@ def test_threads_load_the_data_of_their_snapshot(server, clients):
             assert record == data(generation, index), (index, record)
             assert start < before, index
             assert end is None or end >= before, index
+        return generation
 
     def read():
         try:
@@ -374,8 +478,8 @@ def test_threads_load_the_data_of_their_snapshot(server, clients):
             while True:
                 last = done.is_set()
                 before = p64(u64(storage.lastTransaction()) + 1)
-                check([load_before(storage, oid, before) for oid in oids], before)
-                rounds.append(before)
+                results = [load_before(storage, oid, before) for oid in oids]
+                rounds.append((before, check(results, before)))
                 if last:
                     break
         except BaseException as error:
@@ -399,3 +503,8 @@ def test_threads_load_the_data_of_their_snapshot(server, clients):
     assert not [thread for thread in threads if thread.is_alive()]
     assert not errors, errors
     assert len(rounds) >= READERS
+    # The generation of each snapshot is the last one that committed
+    # before it.
+    for before, generation in rounds:
+        expected = max(g for g, tid in enumerate(tids) if tid < before)
+        assert generation == expected, (before.hex(), generation, expected)
