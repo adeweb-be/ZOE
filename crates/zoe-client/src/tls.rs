@@ -3,15 +3,19 @@
 //!
 //! The client speaks TLS with rustls and its ring provider, as `zoe serve`
 //! does. It checks the certificate chain of the server against the CA
-//! certificates of `authenticate`. With `check_hostname`, it also checks
-//! that the certificate is valid for the name of the server: the webpki
-//! verifier of rustls does both. Without it, the chain check of rustls
-//! runs alone, and no name check runs. It sends its own certificate to the
-//! server.
+//! certificates of `authenticate`: a PEM file, or a directory of PEM files.
+//! Without `authenticate`, it uses the CA certificates of the system, as
+//! the default context of Python's `ssl` does. With `check_hostname`, it
+//! also checks that the certificate is valid for the name of the server:
+//! the webpki verifier of rustls does both. Without it, the chain check of
+//! rustls runs alone, and no name check runs. It sends its own certificate
+//! to the server.
 //!
 //! The certificate of the server must chain to a CA certificate of
 //! `authenticate`. A self-signed server certificate in `authenticate` does
-//! not match it by its bytes, as OpenSSL does.
+//! not match it by its bytes, as OpenSSL does. In a directory, the client
+//! reads each file, while OpenSSL reads only the files whose names are
+//! the hashes of `openssl rehash`.
 
 use std::fmt;
 use std::io;
@@ -35,21 +39,33 @@ use crate::runtime::Stream;
 pub struct TlsOptions {
     certificate: PathBuf,
     key: Option<PathBuf>,
-    authenticate: PathBuf,
+    authenticate: Option<PathBuf>,
     check_hostname: bool,
 }
 
 impl TlsOptions {
     /// Send the certificate chain in `certificate`, and check the server
-    /// against the CA certificates in `authenticate`. The private key is in
-    /// `certificate` too, unless [`TlsOptions::key`] names its file. The
-    /// client checks the name of the server, unless
+    /// against the CA certificates in `authenticate`. `authenticate` is a
+    /// PEM file, or a directory: the client then reads each file in it.
+    /// The private key is in `certificate` too, unless [`TlsOptions::key`]
+    /// names its file. The client checks the name of the server, unless
     /// [`TlsOptions::check_hostname`] turns the check off.
     pub fn new(certificate: impl AsRef<Path>, authenticate: impl AsRef<Path>) -> Self {
         Self {
+            authenticate: Some(authenticate.as_ref().to_path_buf()),
+            ..Self::system(certificate)
+        }
+    }
+
+    /// Send the certificate chain in `certificate`, and check the server
+    /// against the CA certificates of the system. These are the files of
+    /// `SSL_CERT_FILE` and `SSL_CERT_DIR` when one of the two is set, else
+    /// the default files of OpenSSL.
+    pub fn system(certificate: impl AsRef<Path>) -> Self {
+        Self {
             certificate: certificate.as_ref().to_path_buf(),
             key: None,
-            authenticate: authenticate.as_ref().to_path_buf(),
+            authenticate: None,
             check_hostname: true,
         }
     }
@@ -87,20 +103,16 @@ impl fmt::Debug for Tls {
 impl Tls {
     /// Read the files of `options`. Fail with a message that names the
     /// file that does not read, holds no PEM item or does not fit. The
-    /// message of an error of the ring provider names the provider.
+    /// message of an error of the ring provider names the provider. A
+    /// directory or a system store without a CA certificate fails the load
+    /// too.
     pub fn load(options: &TlsOptions) -> Result<Self, String> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let certs = certificates(&options.certificate)?;
         let key_file = options.key.as_deref().unwrap_or(&options.certificate);
         let key = PrivateKeyDer::from_pem_file(key_file)
             .map_err(|error| format!("{}: {error}", key_file.display()))?;
-        let authenticate = &options.authenticate;
-        let mut roots = RootCertStore::empty();
-        for cert in certificates(authenticate)? {
-            roots
-                .add(cert)
-                .map_err(|error| format!("{}: {error}", authenticate.display()))?;
-        }
+        let (roots, source) = roots(options.authenticate.as_deref())?;
         let roots = Arc::new(roots);
         let algorithms = provider.signature_verification_algorithms;
         let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -109,7 +121,7 @@ impl Tls {
         let builder = if options.check_hostname {
             let webpki = WebPkiServerVerifier::builder_with_provider(roots, provider)
                 .build()
-                .map_err(|error| format!("{}: {error}", authenticate.display()))?;
+                .map_err(|error| format!("{source}: {error}"))?;
             builder.with_webpki_verifier(webpki)
         } else {
             let verifier = ChainOnly { roots, algorithms };
@@ -135,6 +147,47 @@ impl Tls {
         let stream = self.connector.connect(name, stream).await?;
         Ok(Box::new(stream))
     }
+}
+
+/// The name of the system store in an error message.
+const SYSTEM: &str = "the system CA certificates";
+
+/// Return the CA certificates of `authenticate`, and the name of their
+/// source for an error message.
+///
+/// - A file: each certificate in it must fit.
+/// - A directory: the certificates of each file in it. A certificate that
+///   does not fit is skipped, as is a file that does not read.
+/// - `None`: the CA certificates of the system, with the same rules as a
+///   directory.
+///
+/// A directory or a system store without a certificate that fits fails.
+fn roots(authenticate: Option<&Path>) -> Result<(RootCertStore, String), String> {
+    let mut roots = RootCertStore::empty();
+    let (found, source) = match authenticate {
+        Some(path) if !path.is_dir() => {
+            for cert in certificates(path)? {
+                roots
+                    .add(cert)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            }
+            return Ok((roots, path.display().to_string()));
+        }
+        Some(dir) => (
+            rustls_native_certs::load_certs_from_paths(None, Some(dir)),
+            dir.display().to_string(),
+        ),
+        None => (rustls_native_certs::load_native_certs(), SYSTEM.to_owned()),
+    };
+    roots.add_parsable_certificates(found.certs);
+    if roots.is_empty() {
+        let reason = match found.errors.first() {
+            Some(error) => format!(" ({error})"),
+            None => String::new(),
+        };
+        return Err(format!("{source}: no CA certificate{reason}"));
+    }
+    Ok((roots, source))
 }
 
 /// Read the certificates in the PEM file `path`. One at least is
@@ -229,11 +282,22 @@ mod tests {
         let options = TlsOptions::new("c.pem", "ca.pem");
         assert_eq!(options.certificate, PathBuf::from("c.pem"));
         assert_eq!(options.key, None);
-        assert_eq!(options.authenticate, PathBuf::from("ca.pem"));
+        assert_eq!(options.authenticate, Some(PathBuf::from("ca.pem")));
         assert!(options.check_hostname);
         let options = options.key("k.pem").check_hostname(false);
         assert_eq!(options.key, Some(PathBuf::from("k.pem")));
         assert!(!options.check_hostname);
+        let options = TlsOptions::system("c.pem");
+        assert_eq!(options.authenticate, None);
+        assert!(options.check_hostname);
+    }
+
+    #[test]
+    fn a_directory_without_a_certificate_fails_the_load_and_the_message_names_it() {
+        let dir = fresh_dir("no-ca");
+        std::fs::write(dir.join("readme.txt"), "no PEM here\n").unwrap();
+        let error = roots(Some(&dir)).err().unwrap();
+        assert_eq!(error, format!("{}: no CA certificate", dir.display()));
     }
 
     #[test]
