@@ -114,6 +114,10 @@ pub struct Options {
     /// The extensions that the client declares in a third argument of
     /// `register`. With none, `register` has two arguments.
     pub extensions: Vec<String>,
+    /// The label of the connection, as the `client_label` of
+    /// `ZEO.ClientStorage`. `Client::open` sends it in `set_client_label`
+    /// after `get_info`, and the server puts it in its log lines.
+    pub client_label: Option<String>,
 }
 
 /// One version of an object, as `loadBefore` gives it.
@@ -202,7 +206,14 @@ struct Inner {
     /// Wakes the downloads that wait for the end of another download of
     /// their blob.
     downloads_done: Notify,
+    /// The map of the `info` calls of the server, merged, with the stamp of
+    /// the last one. `None` until the first one.
+    pushed: Mutex<Option<(u64, Value)>>,
 }
+
+/// The stamp of the last `info` call of a server, over all the clients of
+/// the process. A higher stamp is a later call.
+static INFO_STAMP: AtomicU64 = AtomicU64::new(0);
 
 /// The calls that wait for their replies.
 struct Calls {
@@ -324,6 +335,11 @@ impl Client {
         client.read_only = read_only;
         client.registered(reply).await?;
         let info = client.inner.call("get_info", vec![]).await?;
+        // ZEO sends the label without a reply, after `get_info`.
+        if let Some(label) = &options.client_label {
+            let args = vec![label.as_str().into()];
+            client.inner.notify("set_client_label", args).await?;
+        }
         client.extensions = accepted(&info, &options.extensions);
         client.info = info;
         let traces = client.extensions.iter().any(|name| name == TRACE_CONTEXT);
@@ -465,6 +481,7 @@ impl Client {
             next_txn: AtomicU64::new(1),
             traces: AtomicBool::new(false),
             downloads_done: Notify::new(),
+            pushed: Mutex::new(None),
         });
         let (alive, tasks) = mpsc::channel(1);
         let (reader, writer) = tokio::io::split(stream);
@@ -491,6 +508,15 @@ impl Client {
     /// `connect` did not call `get_info`, and gets nil.
     pub fn info(&self) -> &Value {
         &self.info
+    }
+
+    /// Return the map of the `info` calls that the server sent on this
+    /// connection, merged in their order, with the stamp of the last one.
+    /// A higher stamp is a later call, also on another client of the
+    /// process. Return `None` before the first one. A server sends `info`
+    /// with the new sizes of the store after a commit and after a pack.
+    pub fn pushed_info(&self) -> Option<(u64, Value)> {
+        lock(&self.inner.pushed).clone()
     }
 
     /// Return the extensions that the server accepted at `Client::open`.
@@ -554,10 +580,7 @@ impl Client {
     pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
         match self.load_before(oid, protocol::MAX_TID).await? {
             Some(record) => Ok((record.data, record.tid)),
-            None => Err(Error::Server {
-                class: "ZODB.POSException.POSKeyError".into(),
-                message: format!("{oid:?}"),
-            }),
+            None => Err(protocol::pos_key_error(oid)),
         }
     }
 
@@ -683,6 +706,27 @@ impl Client {
         }
         let reply = self.inner.call("sequence_next", vec![name.into()]).await?;
         reply.as_u64().ok_or_else(|| bad("sequence_next", &reply))
+    }
+
+    /// Call `method` of the server with `args`, and return its reply, as
+    /// `_call` of `ZEO.ClientStorage` does. An error reply fails with the
+    /// error of the server.
+    pub async fn call(&self, method: &str, args: Vec<Value>) -> Result<Value, Error> {
+        self.inner.call(method, args).await
+    }
+
+    /// Send `method` with `args` as a call without a reply, as `_async` of
+    /// `ZEO.ClientStorage` does.
+    pub async fn notify(&self, method: &str, args: Vec<Value>) -> Result<(), Error> {
+        self.inner.notify(method, args).await
+    }
+
+    /// Call `ping`, and wait for its reply. The server answers the calls of
+    /// a connection in order, so each invalidation that the server sent
+    /// before the reply is in the channel of the invalidations when this
+    /// returns.
+    pub async fn ping(&self) -> Result<(), Error> {
+        self.inner.call("ping", vec![]).await.map(drop)
     }
 
     /// Return at most `size` entries of the history of `oid`, newest first.
@@ -870,6 +914,52 @@ impl Transaction {
                 "checkCurrentSerialInTransaction",
                 vec![bin8(oid.0), bin8(serial.0), self.id.into()],
             )
+            .await
+    }
+
+    /// Delete `oid` in the transaction, as `deleteObject` of
+    /// `ZEO.ClientStorage` does. `serial` is the serial that the client
+    /// read: the vote checks it as for a store. After a failed vote, it
+    /// fails with `Error::Invalid` and sends nothing.
+    pub async fn delete_object(&mut self, oid: Oid, serial: Tid) -> Result<(), Error> {
+        self.check()?;
+        self.inner
+            .notify(
+                "deleteObject",
+                vec![bin8(oid.0), bin8(serial.0), self.id.into()],
+            )
+            .await
+    }
+
+    /// Copy a record of another storage into a transaction that began with
+    /// a tid, as `restore` of `ZEO.ClientStorage` does: `restorea`. `None`
+    /// as `data` copies a deletion. After a failed vote, it fails with
+    /// `Error::Invalid` and sends nothing.
+    pub async fn restore(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: Option<&[u8]>,
+        prev_txn: Option<Tid>,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let data = data.map_or(Value::Nil, Value::from);
+        let prev_txn = prev_txn.map_or(Value::Nil, |tid| bin8(tid.0));
+        self.inner
+            .notify(
+                "restorea",
+                vec![bin8(oid.0), bin8(serial.0), data, prev_txn, self.id.into()],
+            )
+            .await
+    }
+
+    /// Undo the transaction `trans_id` in this transaction, as `undo` of
+    /// `ZEO.ClientStorage` does: `undoa`, without a reply. After a failed
+    /// vote, it fails with `Error::Invalid` and sends nothing.
+    pub async fn undo(&mut self, trans_id: &[u8]) -> Result<(), Error> {
+        self.check()?;
+        self.inner
+            .notify("undoa", vec![trans_id.into(), self.id.into()])
             .await
     }
 
@@ -1291,6 +1381,20 @@ impl Inner {
                     let _ = sender.send(invalidation);
                 }
             }
+            Message::Call { method, args } if method == "info" => {
+                // An `info` in a bad shape changes nothing, as the client of
+                // ZEO logs it and goes on.
+                if let Some([Value::Map(entries)]) = args.as_array().map(Vec::as_slice) {
+                    let stamp = INFO_STAMP.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut pushed = lock(&self.pushed);
+                    let mut merged = match pushed.take() {
+                        Some((_, Value::Map(old))) => old,
+                        _ => Vec::new(),
+                    };
+                    merge(&mut merged, entries);
+                    *pushed = Some((stamp, Value::Map(merged)));
+                }
+            }
             Message::Call { method, args }
                 if matches!(
                     method.as_str(),
@@ -1517,6 +1621,17 @@ fn accepted(info: &Value, declared: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Put each entry of `entries` into the map `into`: a key that `into` has
+/// takes the new value, and a new key goes at the end.
+pub(crate) fn merge(into: &mut Vec<(Value, Value)>, entries: &[(Value, Value)]) {
+    for (key, value) in entries {
+        match into.iter_mut().find(|(k, _)| k == key) {
+            Some((_, old)) => *old = value.clone(),
+            None => into.push((key.clone(), value.clone())),
+        }
+    }
+}
+
 /// Read the args `[tid, [oid, ...]]` of `invalidateTransaction`.
 fn invalidation(args: &Value) -> Option<Invalidation> {
     let [tid, oids] = <&[Value; 2]>::try_from(args.as_array()?.as_slice()).ok()?;
@@ -1715,6 +1830,7 @@ mod tests {
         let server = Error::Server {
             class: "builtins.ValueError".into(),
             message: "unknown storage: 2".into(),
+            value: Value::Array(vec!["unknown storage: 2".into()]),
         };
         assert!(!is_of_the_connection(&server));
         assert!(!is_of_the_connection(&Error::Protocol("M4".into())));
@@ -1727,6 +1843,7 @@ mod tests {
         let server = || Error::Server {
             class: "builtins.ValueError".into(),
             message: String::new(),
+            value: Value::Array(vec![]),
         };
         // A TLS error is not lost behind a later refused connection.
         assert!(!keeps(&refused(), &handshake()));
@@ -1753,6 +1870,21 @@ mod tests {
         let stock = Value::Map(vec![("length".into(), 0.into())]);
         assert!(accepted(&stock, &declared).is_empty());
         assert!(accepted(&Value::Nil, &declared).is_empty());
+    }
+
+    #[test]
+    fn a_merge_replaces_a_key_and_adds_a_new_one_at_the_end() {
+        let mut into = vec![("length".into(), 1.into()), ("size".into(), 2.into())];
+        merge(
+            &mut into,
+            &[("size".into(), 5.into()), ("name".into(), "x".into())],
+        );
+        let merged: Vec<(Value, Value)> = vec![
+            ("length".into(), 1.into()),
+            ("size".into(), 5.into()),
+            ("name".into(), "x".into()),
+        ];
+        assert_eq!(into, merged);
     }
 
     #[test]

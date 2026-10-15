@@ -216,7 +216,21 @@ fn server_error(args: Value) -> Error {
         }
         value => value.to_string(),
     };
-    Error::Server { class, message }
+    Error::Server {
+        class,
+        message,
+        value,
+    }
+}
+
+/// Return the `POSKeyError` of `oid`, as the server gives it for an oid
+/// without a record: one bytes argument, the oid.
+pub(crate) fn pos_key_error(oid: Oid) -> Error {
+    Error::Server {
+        class: "ZODB.POSException.POSKeyError".into(),
+        message: format!("{oid:?}"),
+        value: Value::Array(vec![bin8(oid.0)]),
+    }
 }
 
 /// Return `Error::Conflict` from a map with the keys `oid` and `serials`,
@@ -361,8 +375,12 @@ mod tests {
         match decode(&bytes).unwrap() {
             Message::Reply {
                 id: 4,
-                result: Err(Error::Server { class, .. }),
-            } => assert_eq!(class, "ZODB.POSException.POSKeyError"),
+                result: Err(Error::Server { class, value, .. }),
+            } => {
+                assert_eq!(class, "ZODB.POSException.POSKeyError");
+                // The oid stays bytes in the value.
+                assert_eq!(value, Value::Array(vec![bin8(1)]));
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -443,7 +461,7 @@ mod tests {
         };
         match decode(&reply(Value::Array(vec!["bad args".into()]))).unwrap() {
             Message::Reply {
-                result: Err(Error::Server { class, message }),
+                result: Err(Error::Server { class, message, .. }),
                 ..
             } => {
                 assert_eq!(class, "builtins.TypeError");
