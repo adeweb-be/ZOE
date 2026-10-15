@@ -31,7 +31,7 @@ use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::negotiation;
-use super::outbox::{Outbox, Place, Room};
+use super::outbox::{Outbox, Room};
 use super::status::Stats;
 use super::{NamedStorage, Stopping, Storages};
 
@@ -297,11 +297,12 @@ impl From<Result<Value, Fault>> for Outcome {
 }
 
 /// The way of the reply of one call to its client: the room that the call
-/// took in the session queue before it ran, or the place that it took in
-/// the order of the connection.
+/// took in the session queue before it ran. A call can also put its reply
+/// in the queue itself, while it runs.
 pub(crate) struct Reply {
     room: Option<Room>,
-    place: Option<Place>,
+    /// The call put its reply itself. False when the connection was closed.
+    sent: Option<bool>,
 }
 
 impl Reply {
@@ -309,7 +310,7 @@ impl Reply {
     pub(crate) fn new(room: Room) -> Self {
         Self {
             room: Some(room),
-            place: None,
+            sent: None,
         }
     }
 
@@ -324,7 +325,6 @@ impl Reply {
             Outcome::Published => None,
             Outcome::Gone => return false,
             Outcome::Done(_) if call.oneway => None,
-            Outcome::Done(value) => Some(message::reply(call.id.clone(), value)),
             // The text that a client sends goes only into fields, never
             // into the message. The text format quotes and escapes a field
             // of text, so a line feed in it cannot add a log line.
@@ -338,17 +338,19 @@ impl Reply {
                 );
                 return false;
             }
-            Outcome::Failed(fault) => {
-                Some(message::error(call.id.clone(), fault.class, fault.args))
-            }
             Outcome::Close(why) => {
                 tracing::warn!(reason = why.as_str(), "closing the connection");
                 return false;
             }
+            // The call put its reply itself.
+            Outcome::Done(_) | Outcome::Failed(_) if self.sent.is_some() => None,
+            Outcome::Done(value) => Some(message::reply(call.id.clone(), value)),
+            Outcome::Failed(fault) => {
+                Some(message::error(call.id.clone(), fault.class, fault.args))
+            }
         };
-        // A place that the call took gets the reply, or stays empty.
-        match (self.place, frame) {
-            (Some(place), frame) => place.fill(frame),
+        match (self.sent, frame) {
+            (Some(sent), _) => sent,
             (None, Some(frame)) => match self.room {
                 Some(room) => room.put(Some(frame)),
                 // A download used the room of its call for its first frame.
@@ -678,7 +680,7 @@ impl Session {
             }),
             "getTid" => self.get_tid(args),
             "new_oids" => self.new_oids(args),
-            "loadBefore" => self.load_before(args, reply),
+            "loadBefore" => self.load_before(call, reply),
             "loadSerial" => self.load_serial(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
@@ -756,21 +758,23 @@ impl Session {
     /// The reply shows the commits that the hub published, and no other:
     /// the read takes the record before the last published tid plus 1 at
     /// most, and it gives a next serial only when the hub published it. The
-    /// reply then takes its place in the order of the connection, if the
-    /// hub published no commit during the read. So the reply comes after
-    /// the invalidation of each commit that it shows, and before the
-    /// invalidation of each later commit. A stock client keeps a record
-    /// without a next serial as the current one, and needs this order.
+    /// call makes the frame of its reply, then puts it in the session queue
+    /// under the mutex of the hub, if the hub published no commit during
+    /// the read. So the reply comes after the invalidation of each commit
+    /// that it shows, and before the invalidation of each later commit. A
+    /// stock client keeps a record without a next serial as the current
+    /// one, and needs this order. The writer gets the whole frame at once.
     ///
     /// A publication during the read makes the call read again. After
     /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
-    fn load_before(&self, args: &[Value], reply: &mut Reply) -> Result<Value, Fault> {
-        let [oid, tid] = arity::<2>(args, "loadBefore")?;
+    fn load_before(&self, call: &Call, reply: &mut Reply) -> Result<Value, Fault> {
+        let [oid, tid] = arity::<2>(&call.args, "loadBefore")?;
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
         let store = &self.store;
-        let read = |published: Tid| -> Result<Value, Fault> {
+        let read = |published: Tid| -> (Result<Value, Fault>, Option<Vec<u8>>) {
             let before = tid.min(Tid(published.0.saturating_add(1)));
-            Ok(match store.load_before(oid, before)? {
+            let value = store.load_before(oid, before).map_err(Fault::from);
+            let value = value.map(|record| match record {
                 Some(record) => Value::Array(vec![
                     Value::Binary(record.data),
                     p64(record.serial.0),
@@ -780,7 +784,18 @@ impl Session {
                         .map_or(Value::Nil, |next| p64(next.0)),
                 ]),
                 None => Value::Nil,
-            })
+            });
+            // A call without a reply puts an empty place.
+            let frame = match &value {
+                _ if call.oneway => None,
+                Ok(value) => Some(message::reply_of(&call.id, value)),
+                Err(fault) => Some(message::error(
+                    call.id.clone(),
+                    fault.class,
+                    fault.args.clone(),
+                )),
+            };
+            (value, frame)
         };
         let invalidations = &self.storage.invalidations;
         let mut room = reply
@@ -789,19 +804,19 @@ impl Session {
             .unwrap_or_else(|| self.outbox.blocking_room());
         for _ in 0..LOAD_TRIES {
             let seen = invalidations.published();
-            // An error takes its place too, so it goes out in the room of
-            // the call and never waits for the client.
-            let value = read(seen);
-            match invalidations.place_since(seen, room) {
-                Ok(place) => {
-                    reply.place = Some(place);
+            // An error goes into the queue too, so it goes out in the room
+            // of the call and never waits for the client.
+            let (value, frame) = read(seen);
+            match invalidations.put_since(seen, room, frame) {
+                Ok(sent) => {
+                    reply.sent = Some(sent);
                     return value;
                 }
                 Err(back) => room = back,
             }
         }
-        let (value, place) = invalidations.read_placed(room, read);
-        reply.place = Some(place);
+        let (value, sent) = invalidations.read_put(room, read);
+        reply.sent = Some(sent);
         value
     }
 
@@ -1837,8 +1852,8 @@ mod tests {
     struct Client {
         session: Arc<Session>,
         txn: Transaction,
-        /// The place that the last call took for its reply.
-        place: Option<Place>,
+        /// The last call put its reply in the queue itself.
+        sent: Option<bool>,
     }
 
     impl Client {
@@ -1857,18 +1872,18 @@ mod tests {
             Self {
                 txn: Transaction::new(Arc::clone(&session)),
                 session,
-                place: None,
+                sent: None,
             }
         }
 
-        /// Run one call. Keep the place that it took for its reply.
+        /// Run one call. Keep whether it put its reply itself.
         fn call(&mut self, call: &Call) -> Outcome {
             if self.session.is_registered() && in_transaction(&call.method) {
                 return self.txn.call(call);
             }
             let mut reply = Reply::new(self.session.outbox.blocking_room());
             let outcome = self.session.call(call, &mut reply);
-            self.place = reply.place.take();
+            self.sent = reply.sent.take();
             outcome
         }
     }
@@ -3292,24 +3307,12 @@ mod tests {
 
         let current = done(call(&mut reader, "loadBefore", vec![p64(1), p64(u64::MAX)]));
         assert_eq!(current.as_array().unwrap()[2], Value::Nil);
-        // A commit is published before the reply goes into the queue.
+        assert_eq!(reader.sent, Some(true));
+        // A commit after the read goes out after the reply.
         let second = commit(&mut writer, 2, 1, first, b"new").unwrap();
-        let place = reader.place.take().expect("loadBefore takes a place");
-        let reply = message::reply(Value::from(1), current);
-        assert!(reader.outbox.send_at(place, Some(reply)));
         let messages = messages(&mut frames);
         assert_eq!(messages[0].0, ".reply");
         assert_eq!(messages[1], invalidation(second, &[1]));
-    }
-
-    /// Put the reply `value` of the last call of `s` at the place that the
-    /// call took.
-    fn answer(s: &mut Client, value: Value) {
-        let place = s.place.take().expect("the call took a place");
-        assert!(
-            s.outbox
-                .send_at(place, Some(message::reply(Value::from(1), value)))
-        );
     }
 
     #[test]
@@ -3334,12 +3337,10 @@ mod tests {
         let load = vec![p64(1), p64(u64::MAX)];
         let current = done(call(&mut reader, "loadBefore", load.clone()));
         assert_eq!(current, old(Value::Nil));
-        answer(&mut reader, current);
         // A load before the hidden commit does not name it.
         let before = vec![p64(1), p64(hidden.tid.0)];
         let previous = done(call(&mut reader, "loadBefore", before.clone()));
         assert_eq!(previous, old(Value::Nil));
-        answer(&mut reader, previous);
 
         // The hub publishes the commit: its invalidation comes after the
         // replies, and later loads show it.
@@ -3361,10 +3362,8 @@ mod tests {
             Value::Nil,
         ]);
         assert_eq!(current, new);
-        answer(&mut reader, current);
         let previous = done(call(&mut reader, "loadBefore", before));
         assert_eq!(previous, old(p64(hidden.tid.0)));
-        answer(&mut reader, previous);
         let methods: Vec<String> = messages(&mut frames).into_iter().map(|(m, _)| m).collect();
         assert_eq!(
             methods,
@@ -4864,9 +4863,10 @@ mod tests {
             let tid = done(call(&mut reader, "getTid", vec![p64(oid)]));
             assert_eq!(tid, p64(hidden.tid.0));
         }
-        // The call takes no place before its read, so its reply goes out
-        // after the invalidation of the commit that it shows.
-        assert!(reader.place.is_none());
+        // The call does not put its reply under the mutex of the hub, so
+        // its reply goes out after the invalidation of the commit that it
+        // shows.
+        assert!(reader.sent.is_none());
     }
 
     #[test]

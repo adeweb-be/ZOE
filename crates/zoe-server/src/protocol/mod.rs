@@ -559,7 +559,7 @@ pub(crate) async fn serve_stream(
         // starts again for each frame, after its call took its room. It
         // does not count while a call of the connection runs, and starts
         // again when the last call ends.
-        let quiet = calls.quiet();
+        let idle_calls = calls.idle(idle_timeout);
         let read = tokio::select! {
             biased;
             () = ended.wait() => {
@@ -572,10 +572,7 @@ pub(crate) async fn serve_stream(
                 break;
             }
             read = frame::read(&mut reader, max_frame_size) => read,
-            () = async {
-                quiet.await;
-                idle(&*runtime, idle_timeout).await;
-            } => {
+            () = idle_calls => {
                 tracing::info!(client = peer.as_str(), "no frame within the idle timeout: closing the connection");
                 // No call runs now. The writer stops at once, also when it
                 // waits for a client that reads nothing. Then the
@@ -952,6 +949,86 @@ mod tests {
             }
         });
         (runtime, addr)
+    }
+
+    /// The loads that the test of the handoffs counts.
+    const COUNTED_LOADS: usize = 500;
+
+    /// A load of 1 KB passes from the reader of the connection to one
+    /// blocking thread of the read pool, then to the writer: three
+    /// handoffs. The test counts each task and each blocking thread that
+    /// starts, and each wake of a task of the connection, from the first
+    /// counted load to the reply of the last one. It prints the mean.
+    #[test]
+    fn a_load_of_1_kb_takes_three_handoffs() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-handoffs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let record = vec![7u8; 1024];
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(zoe_core::Oid(1), Tid(0), &record).unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
+        let storages = Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counting = crate::runtime::Counting::default();
+        let served = counting.clone();
+        runtime.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let (reader, writer) = stream.into_split();
+            let connection = Connection {
+                peer: "test".to_owned(),
+                runtime: Arc::new(served.clone()),
+                max_frame_size: crate::serve::DEFAULT_MAX_FRAME_SIZE.get(),
+                idle_timeout: Some(crate::serve::DEFAULT_IDLE_TIMEOUT),
+                read_only: false,
+                socket: None,
+            };
+            let serving = serve_stream(reader, writer, connection, storages, never_stops());
+            served.spawn(Box::pin(serving));
+        });
+
+        let mut client = registered(addr);
+        client.set_nodelay(true).unwrap();
+        let loaded = Value::Array(vec![Value::Binary(record), session::p64(tid.0), Value::Nil]);
+        let mut load = |id: i64| {
+            let args = vec![session::p64(1), session::p64(u64::MAX)];
+            send(&mut client, id, "loadBefore", args);
+            let reply = read_frame(&mut client);
+            let reply = rmpv::decode::read_value(&mut reply.as_slice()).unwrap();
+            let expected = vec![
+                Value::from(id),
+                Value::from(0),
+                Value::from(".reply"),
+                loaded.clone(),
+            ];
+            assert_eq!(reply, Value::Array(expected));
+        };
+        // The first loads warm the caches of the store.
+        for id in 2..12 {
+            load(id);
+        }
+        let before = counting.handoffs();
+        for n in 0..COUNTED_LOADS {
+            load(1000 + i64::try_from(n).unwrap());
+        }
+        let handoffs = counting.handoffs() - before;
+        #[allow(clippy::cast_precision_loss)]
+        let mean = handoffs as f64 / COUNTED_LOADS as f64;
+        println!("handoffs per load of 1 KB: {mean:.2}");
+        assert!(mean <= 3.0, "{mean:.2} handoffs per load");
+        drop(runtime);
     }
 
     /// Send a call. The id 0 is a call without a reply.
