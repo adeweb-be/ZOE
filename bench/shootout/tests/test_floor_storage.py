@@ -22,7 +22,9 @@ import threading
 
 import jsonschema
 import pytest
+import transaction
 import ZODB.config
+from persistent.mapping import PersistentMapping
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import ConflictError
 from ZODB.utils import maxtid, z64
@@ -153,6 +155,41 @@ def test_zap_all_removes_every_record(storage):
     assert len(storage) >= 1
     storage.zap_all()
     assert len(storage) == 0
+
+
+def test_a_snapshot_that_holds_a_commit_has_its_invalidations(tmp_path):
+    with zconfig(STORAGES["floor"], tmp_path, None) as text:
+        db = ZODB.config.databaseFromString(text)
+    try:
+        with db.transaction() as connection:
+            connection.root()["x"] = PersistentMapping(v=0)
+            connection.root()["y"] = PersistentMapping(v=0)
+        first, second = (
+            transaction.TransactionManager(),
+            transaction.TransactionManager(),
+        )
+        writer, reader = db.open(first), db.open(second)
+        # The reader has x in its cache.
+        assert reader.root()["x"]["v"] == 0
+        second.commit()
+        writer.root()["x"]["v"] = 1
+        writer.root()["y"]["v"] = 1
+        # The reader begins while the commit of the writer runs its callback.
+        adapter = db._mvcc_storage
+        invalidate = adapter._invalidate_finish
+
+        def begin_then_invalidate(*args):
+            second.begin()
+            invalidate(*args)
+
+        adapter._invalidate_finish = begin_then_invalidate
+        first.commit()
+        adapter._invalidate_finish = invalidate
+        root = reader.root()
+        # One snapshot: both old, or both new.
+        assert (root["x"]["v"], root["y"]["v"]) in ((0, 0), (1, 1))
+    finally:
+        db.close()
 
 
 def test_a_loaded_record_is_the_stored_bytes_object(storage):

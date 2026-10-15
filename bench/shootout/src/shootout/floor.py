@@ -42,7 +42,8 @@ from ZODB.utils import load_current, newTid, p64, u64, z64
 # The file ends with the offset of its index, in 8 bytes.
 TRAILER = 8
 
-# The thread that runs the populate of zodbshootout.
+# The state of each thread: populating is true while the thread runs the
+# populate of zodbshootout.
 _local = threading.local()
 
 
@@ -200,7 +201,8 @@ class FloorStorage:
     def getSize(self):
         return sum(
             len(data) if data.__class__ is bytes else data.length
-            for _, data, _ in self._store.records.values()
+            # A copy, so that a commit can add a record during the sum.
+            for _, data, _ in tuple(self._store.records.values())
         )
 
     def history(self, oid, size=1):
@@ -278,18 +280,22 @@ class FloorStorage:
     def tpc_finish(self, transaction, func=lambda tid: None):
         pending = self._pending(transaction)
         store = self._store
-        with store.lock:
-            tid = newTid(store.ltid)
-            records = store.records
-            for oid, (_, data) in pending.stores.items():
-                record = records.get(oid)
-                records[oid] = (tid, data, None if record is None else record[:2])
-            # The records come before the tid, so a snapshot after the tid
-            # finds them.
-            store.ltid = tid
-            func(tid)
-        self._release(pending)
-        transaction.set_data(self, None)
+        try:
+            with store.lock:
+                tid = newTid(store.ltid)
+                records = store.records
+                for oid, (_, data) in pending.stores.items():
+                    record = records.get(oid)
+                    previous = None if record is None else record[:2]
+                    records[oid] = (tid, data, previous)
+                # The records come first, then the invalidations, then the
+                # tid. So a connection whose snapshot holds the tid finds the
+                # records, and its invalidations come before its snapshot.
+                func(tid)
+                store.ltid = tid
+        finally:
+            self._release(pending)
+            transaction.set_data(self, None)
         return tid
 
     def tpc_abort(self, transaction):

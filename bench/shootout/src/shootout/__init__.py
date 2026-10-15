@@ -43,12 +43,12 @@ RECORD_OVERHEAD = 8 * KB
 # files and the logs.
 STORE_OVERHEAD = 64 * 1024 * KB
 
-# The zodbshootout benchmarks, the scenario names in the results, and the
-# text that zodbshootout puts in the benchmark name.
 # The start of a record of the log of zodbshootout: its date, its time
 # and its level.
 RECORD = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ (\w+)")
 
+# The zodbshootout benchmarks, the scenario names in the results, and the
+# text that zodbshootout puts in the benchmark name.
 SCENARIOS = {
     "add": ("add", "add {n} objects"),
     "update": ("update", "update {n} objects"),
