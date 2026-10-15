@@ -66,6 +66,13 @@ pub enum Error {
     #[error("the server breaks the protocol: {0}")]
     Protocol(String),
 
+    /// The server speaks another protocol than `M5`, as a ZEO 4 server
+    /// (`Z4`) or a ZEO 5 server without msgpack (`Z5`). The client sent
+    /// nothing. As for `ZEO.ClientStorage`, the open counts it as a failed
+    /// connection.
+    #[error("the server speaks the protocol {}", String::from_utf8_lossy(.0))]
+    OtherProtocol(Vec<u8>),
+
     /// An argument that the client cannot send.
     #[error("the client cannot send this: {0}")]
     Invalid(String),

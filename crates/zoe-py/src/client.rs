@@ -70,8 +70,9 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Delivery, Endpoint, Error, Event, FileCheck, Open, Options, Pool,
-    PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
+    Address, Cache, Connect, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open, Options,
+    Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification,
+    traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -201,8 +202,12 @@ impl NativeClient {
     /// raises `zc.lockfile.LockError`, as the cache of ZEO does. A name of
     /// the storage longer than 256 bytes raises `ValueError`, and an error
     /// of the file raises `OSError`. A file with entries serves only after
-    /// its verification against the server; with `wait`, the open waits
-    /// for it, at most `wait_timeout` seconds.
+    /// its verification against the server: `ready` waits for it.
+    ///
+    /// With `dropping`, a verification that drops every entry of the cache
+    /// calls `dropping(reason)` before the drop, on a thread of its own,
+    /// and waits for it: `reason` is empty when the server does not keep
+    /// the commits after the cache, else the error of `getInvalidations`.
     ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
@@ -241,7 +246,7 @@ impl NativeClient {
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None
+        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None, dropping=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -260,6 +265,7 @@ impl NativeClient {
         disconnect_poll: f64,
         client_label: Option<String>,
         cache_path: Option<PathBuf>,
+        dropping: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -305,8 +311,6 @@ impl NativeClient {
             client_label,
         };
         let upgrade = read_only_fallback && !read_only;
-        // The connect and the verification of a cache file share one wait.
-        let deadline = Instant::now() + timeout;
         let opened = py.detach(move || -> Result<_, Opening> {
             let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
@@ -333,17 +337,12 @@ impl NativeClient {
             });
             let reconnect = Reconnect {
                 upgrade,
+                dropping: dropping.map(dropping_of),
                 ..Reconnect::new(open, poll)
             };
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
-            // A cache file with entries serves after its verification. The
-            // open waits for it for what is left of `wait_timeout`.
-            if wait {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let _ = runtime.block_on(tokio::time::timeout(left, pool.ready()));
-            }
             Ok((runtime, pool, servers))
         });
         let (runtime, pool, servers) = match opened {
@@ -552,6 +551,19 @@ impl NativeClient {
             && lock(&self.pool)
                 .as_ref()
                 .is_some_and(|pool| pool.is_connected())
+    }
+
+    /// Wait at most `timeout` seconds until the cache serves: a cache file
+    /// with entries serves after its verification against the server.
+    /// Return true when it serves, or when the client has no cache.
+    fn ready(&self, py: Python<'_>, timeout: f64) -> PyResult<bool> {
+        let timeout = Duration::try_from_secs_f64(timeout.max(0.0))
+            .map_err(|_| PyValueError::new_err("timeout is not a duration"))?;
+        let pool = self.pool(py)?;
+        let runtime = self.runtime;
+        // The timer of the timeout needs the runtime: make it inside.
+        let waited = async move { tokio::time::timeout(timeout, pool.ready()).await };
+        Ok(py.detach(move || runtime.block_on(waited).is_ok()))
     }
 
     /// Return the most connections that commit at once.
@@ -1633,6 +1645,24 @@ async fn open(
             zoe_client::Client::open_first(runtime, &round.endpoints, storage, options, left).await
         };
         match opened {
+            Err(Error::OtherProtocol(theirs)) => {
+                // ZEO logs a server of another protocol as a failed
+                // registration, and tries again after its
+                // `register_failed_poll`, until the wait passes.
+                log_other_protocol(&theirs);
+                if !retry {
+                    return Err(Opening::Client(Error::OtherProtocol(theirs)));
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left <= REFUSED_POLL {
+                    tokio::time::sleep(left).await;
+                    return Err(Opening::Client(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        TIMED_OUT,
+                    ))));
+                }
+                tokio::time::sleep(REFUSED_POLL).await;
+            }
             Err(Error::Io(_) | Error::Disconnected)
                 if retry && Instant::now() + RETRY < deadline =>
             {
@@ -1664,6 +1694,50 @@ async fn open(
             }
         }
     }
+}
+
+/// Return the `Dropping` function of the pool for the Python callable
+/// `dropping`: a thread of its own calls `dropping(reason)`, so the code of
+/// the callable never runs on a thread of the runtime, and the pool waits
+/// for the end of the call. An error of the callable is lost.
+fn dropping_of(dropping: Py<PyAny>) -> Dropping {
+    let dropping = Arc::new(dropping);
+    Arc::new(move |reason: String| {
+        let dropping = dropping.clone();
+        let (done, called) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            Python::try_attach(|py| {
+                if let Err(error) = dropping.call1(py, (reason,)) {
+                    error.print(py);
+                }
+            });
+            let _ = done.send(());
+        });
+        Box::pin(async move {
+            let _ = called.await;
+        })
+    })
+}
+
+/// The text of `ClientDisconnected` when the open saw only servers of
+/// another protocol until the wait passed: the text of ZEO.
+const TIMED_OUT: &str = "timed out waiting for connection";
+
+/// Log a server of another protocol as ZEO logs a failed registration:
+/// at error level, under `ZEO.asyncio.client`, with the protocol of the
+/// server as bytes. Without a Python interpreter, log nothing.
+fn log_other_protocol(theirs: &[u8]) {
+    let _ = Python::try_attach(|py| -> PyResult<()> {
+        let logger = py
+            .import("logging")?
+            .call_method1("getLogger", ("ZEO.asyncio.client",))?;
+        let protocol = PyBytes::new(py, theirs);
+        logger.call_method1(
+            "error",
+            ("Registration or cache validation failed, %s", protocol),
+        )?;
+        Ok(())
+    });
 }
 
 /// Return the name of the partial file of a download: `<filename>.dl`, as

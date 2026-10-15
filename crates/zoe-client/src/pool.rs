@@ -76,6 +76,13 @@ pub type Connect = Arc<dyn Fn() -> BoxFuture<Result<Client, Error>> + Send + Syn
 /// of its server. With `true`, it opens only a writable listener.
 pub type Open = Arc<dyn Fn(bool) -> BoxFuture<Result<(Client, Connect), Error>> + Send + Sync>;
 
+/// A function that the verification of a pool calls before it drops every
+/// entry of the cache, with the reason: empty when the server does not
+/// keep the commits after the cache, else the error of `getInvalidations`.
+/// The pool drops the entries when its future ends. So the caller sees the
+/// entries before the drop, as the `StaleCache` event of ZEO does.
+pub type Dropping = Arc<dyn Fn(String) -> BoxFuture<()> + Send + Sync>;
+
 /// The time between two attempts after the pool refused a server, as the
 /// `register_failed_poll` of `ZEO.ClientStorage`.
 pub const REFUSED_POLL: Duration = Duration::from_secs(9);
@@ -91,6 +98,8 @@ pub struct Reconnect {
     pub refused_poll: Duration,
     /// On a read-only server, try a writable server every `poll`.
     pub upgrade: bool,
+    /// Called before a verification drops every entry of the cache.
+    pub dropping: Option<Dropping>,
 }
 
 impl Reconnect {
@@ -101,6 +110,7 @@ impl Reconnect {
             poll,
             refused_poll: REFUSED_POLL.max(poll),
             upgrade: false,
+            dropping: None,
         }
     }
 }
@@ -1887,6 +1897,9 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
         }
         None => {
             if let Some(cache) = &shared.cache {
+                if !before_drop(shared, String::new()).await {
+                    return Verified::Closed;
+                }
                 cache.verify(server_tid, None);
             }
             Verified::Taken(Verification::Dropped, Some(server_tid.0))
@@ -1923,10 +1936,16 @@ async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid
                 FileCheck::Quick
             }
             Some(Ok(None)) => {
+                if !before_drop(shared, String::new()).await {
+                    return false;
+                }
                 cache.verify(server_tid, None);
                 FileCheck::Dropped
             }
             Some(Err(error)) => {
+                if !before_drop(shared, error.to_string()).await {
+                    return false;
+                }
                 cache.verify(server_tid, None);
                 FileCheck::Failed(error.to_string())
             }
@@ -1934,6 +1953,19 @@ async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid
     };
     shared.lock().file_check = Some(check);
     true
+}
+
+/// Call the `dropping` function of the reconnect, if any, with `reason`,
+/// and wait for it. Return false at the close.
+async fn before_drop(shared: &Shared, reason: String) -> bool {
+    let Some(dropping) = shared
+        .reconnect
+        .as_ref()
+        .and_then(|reconnect| reconnect.dropping.clone())
+    else {
+        return true;
+    };
+    shared.unless_closed(dropping(reason)).await.is_some()
 }
 
 /// Take the server of the new listener `client`: the pool is connected.

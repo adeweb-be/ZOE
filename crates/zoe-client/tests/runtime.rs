@@ -271,8 +271,8 @@ async fn another_protocol_is_refused() {
         peer
     });
     match Client::connect_with(runtime, addr(), "1").await {
-        Err(Error::Protocol(_)) => {}
-        other => panic!("not a protocol error: {other:?}"),
+        Err(Error::OtherProtocol(theirs)) => assert_eq!(theirs, b"Z5"),
+        other => panic!("not another protocol: {other:?}"),
     }
     let _peer = server.await.unwrap();
 }

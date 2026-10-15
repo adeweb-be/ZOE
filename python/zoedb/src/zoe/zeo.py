@@ -614,6 +614,20 @@ class _NativeServer:
         return self._storage.is_read_only()
 
 
+def _dropping_of(storage):
+    """Return the function that the native client calls before it drops
+    every entry of the cache of `storage`. It holds `storage` by a weak
+    reference, so the native client makes no cycle with it."""
+    ref = weakref.ref(storage)
+
+    def dropping(reason):
+        storage = ref()
+        if storage is not None:
+            storage._cache_dropping(reason)
+
+    return dropping
+
+
 class _NativeClientStorage(ClientStorage):
     """`zoe.zeo.ClientStorage` with the native client inside.
 
@@ -812,6 +826,10 @@ class _NativeClientStorage(ClientStorage):
 
         from zoe import _zoe
 
+        # Set once `_native` and `_cache` exist: the handlers of `StaleCache`
+        # can read the cache from then on.
+        self._native_ready = threading.Event()
+        started = time.monotonic()
         self._native = _zoe.Client(
             [_native_address(one) for one in addr],
             storage,
@@ -827,9 +845,16 @@ class _NativeClientStorage(ClientStorage):
             disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
             client_label=client_label,
             cache_path=cache_path,
+            dropping=_dropping_of(self),
         )
         self._cache = _NativeCache(self._native, cache_size, cache_path)
+        self._native_ready.set()
         try:
+            if wait:
+                # The connect and the verification of a cache file share one
+                # wait.
+                elapsed = time.monotonic() - started
+                self._native.ready(max(self._server.timeout - elapsed, 0))
             # Without `wait`, the event of the first connection takes the
             # server, so the client takes it once for each connection.
             if wait and self._native.is_connected():
@@ -1246,9 +1271,24 @@ class _NativeClientStorage(ClientStorage):
             verification = check
         self._take_server(self._verify_result(verification))
 
-    def _stale_cache(self, text=""):
-        """The client dropped its cache: notify `StaleCache` and log it as
-        ZEO does. Any object of the DB can be stale."""
+    # True when `_cache_dropping` notified the drop that the next call of
+    # `_stale_cache` reports.
+    _stale_notified = False
+
+    def _cache_dropping(self, reason):
+        """The native client drops every entry of its cache when this call
+        returns. Notify `StaleCache` and log it now, as ZEO does before its
+        drop, so a handler of the event sees the entries.
+
+        It runs on a thread of its own. At the open, it waits until the
+        storage has its cache.
+        """
+        self._native_ready.wait(self._server.timeout)
+        self._notify_stale(f"getInvalidations failed: {reason}" if reason else "")
+        self._stale_notified = True
+
+    def _notify_stale(self, text):
+        """Notify `StaleCache` and log the dropped cache as ZEO does."""
         try:
             ZODB.event.notify(ZEO.interfaces.StaleCache(self))
         except Exception:
@@ -1257,6 +1297,15 @@ class _NativeClientStorage(ClientStorage):
             _zeo_logger.critical("%s dropping stale cache: %s", self.__name__, text)
         else:
             _zeo_logger.critical("%s dropping stale cache", self.__name__)
+
+    def _stale_cache(self, text=""):
+        """The client dropped its cache: any object of the DB can be stale.
+        Notify `StaleCache` and log it, unless `_cache_dropping` did it
+        before the drop."""
+        if self._stale_notified:
+            self._stale_notified = False
+        else:
+            self._notify_stale(text)
         if self._db is not None:
             self._db.invalidateCache()
 

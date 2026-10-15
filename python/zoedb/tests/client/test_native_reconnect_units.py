@@ -149,3 +149,26 @@ def test_the_cache_gives_its_entries_as_the_cache_of_zeo():
     assert (cache.maxsize, cache.path) == (1000, "c-1.zoec")
     assert len(cache) == 2
     assert list(cache.contents()) == [(b"\0" * 8, b"\1" * 8)]
+
+
+def test_the_stale_cache_event_comes_before_the_drop_and_once(caplog, monkeypatch):
+    native = Native()
+    s = storage(native)
+    s._native_ready = threading.Event()
+    s._native_ready.set()
+    seen = []
+
+    def notify(event):
+        # The handler sees the entries: the drop comes after the call.
+        seen.append((type(event), len(event.storage._cache)))
+
+    monkeypatch.setattr(ZODB.event, "notify", notify)
+    native.cache_entries = lambda: [(b"\0" * 8, b"\1" * 8, None)]
+    s._cache_dropping("")
+    native.cache_entries = lambda: []
+    s._connected("dropped")
+    assert seen == [(StaleCache, 1)]
+    critical = [r.getMessage() for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert critical == ["test dropping stale cache"]
+    assert s._db.cache_invalidations == 1
+    assert s._server.client.verify_result == "cache too old, clearing"

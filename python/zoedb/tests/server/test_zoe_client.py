@@ -280,6 +280,52 @@ def test_a_native_open_without_a_server_raises_client_disconnected(tmp_path):
         zoe.testing.native_client(addresses, wait_timeout=1)
 
 
+def test_a_server_of_another_protocol_is_a_failed_connection(caplog):
+    import logging
+    import struct
+    import threading
+    import time
+
+    from ZEO.Exceptions import ClientDisconnected
+
+    import zoe.testing
+
+    # A server that answers each connection as a ZEO 4 server does: it
+    # sends its protocol, Z4, in one frame.
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.1)
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                peer, _ = listener.accept()
+            except TimeoutError:
+                continue
+            with peer:
+                peer.sendall(struct.pack(">I", 2) + b"Z4")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        start = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger="ZEO.asyncio.client"):
+            with pytest.raises(ClientDisconnected) as raised:
+                zoe.testing.native_client(listener.getsockname(), wait_timeout=1)
+        # As for ZEO, the open waits until wait_timeout, and logs the failed
+        # registration once: the next attempt comes after 9 seconds.
+        assert time.monotonic() - start >= 1
+        assert str(raised.value) == "timed out waiting for connection"
+        logged = [
+            r.getMessage() for r in caplog.records if r.name == "ZEO.asyncio.client"
+        ]
+        assert logged == ["Registration or cache validation failed, b'Z4'"]
+    finally:
+        stop.set()
+        thread.join()
+        listener.close()
+
+
 def test_a_call_after_the_close_raises_client_disconnected(tmp_path):
     from ZEO.Exceptions import ClientDisconnected
 

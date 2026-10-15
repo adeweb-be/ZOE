@@ -436,12 +436,7 @@ impl Client {
         let mut stream = endpoint.connect(runtime.as_ref()).await?;
         match protocol::read_frame(&mut stream).await? {
             Some(theirs) if theirs == protocol::PROTOCOL => {}
-            Some(theirs) => {
-                return Err(Error::Protocol(format!(
-                    "the server speaks the protocol {}",
-                    String::from_utf8_lossy(&theirs)
-                )));
-            }
+            Some(theirs) => return Err(Error::OtherProtocol(theirs)),
             None => return Err(Error::Disconnected),
         }
         protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
@@ -1590,12 +1585,13 @@ fn is_of_the_connection(error: &Error) -> bool {
 }
 
 /// Return how specific `error` is. An error of the server or of the
-/// protocol tells the most. A failed TLS handshake or a bad stream
-/// (`InvalidData`) comes next. A refused, lost or closed connection tells
-/// the least.
+/// protocol tells the most. A failed TLS handshake, a bad stream
+/// (`InvalidData`) or a server of another protocol comes next. A refused,
+/// lost or closed connection tells the least.
 fn specificity(error: &Error) -> u8 {
     match error {
         Error::Io(error) if error.kind() == io::ErrorKind::InvalidData => 1,
+        Error::OtherProtocol(_) => 1,
         error if is_of_the_connection(error) => 0,
         _ => 2,
     }
