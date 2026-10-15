@@ -1,9 +1,10 @@
 """Acceptance test of the phase 3 gate in the harness.
 
 N4 sets the gate of phase 3: `zoe serve` through the native client at
-least 3× ZEO 6 through `ZEO.ClientStorage`, in every zodbshootout scenario.
-The native client has a cache of its own, so `read_hot` counts. The harness
-gets two storages:
+least 3× ZEO 6 through `ZEO.ClientStorage`, in every zodbshootout cell but
+`read_hot` at 1 KB, where ZODB itself takes most of the time of a hit. The
+native client has a cache of its own, so `read_hot` at 100 KB counts. The
+harness gets two storages:
 
 - `zoe-native`: `zoe serve`, started as for `zoe-server`, opened through
   `<zoeclient>` with the native inside (the key `native true`);
@@ -11,9 +12,9 @@ gets two storages:
   PostgreSQL as `relstorage`, and otherwise the same section.
 
 `python -m shootout gate --storage zoe-native --baseline zeo DIR` checks a
-ratio of 3 when no `--ratio` is given, and counts every scenario. With
-`--storage zoe-server`, the gate keeps the parity rules: a ratio of 1 by
-default, and `read_hot` left out.
+ratio of 3 when no `--ratio` is given, and counts every cell but `read_hot`
+at 1 KB. With `--storage zoe-server`, the gate keeps the parity rules: a
+ratio of 1 by default, and `read_hot` left out in every size.
 
 Each scenario entry of a result has a list `workers`: one item per worker
 process that ran the cell, at least one per cell. Each item records
@@ -29,9 +30,9 @@ loops) than the objects that the loops read. A cache that `_cache.clear()`
 does not empty would turn `read_cold` into a cache read.
 
 The gate tests write synthetic full results that are valid for the schema,
-in the cells threads 16 and processes 16 at 1 KB. The test of the GIL
-record runs a tiny profile of `zeo` in place of the quick set. No test
-needs the native client itself.
+in the cells threads 16 and processes 16 at 1 KB and at 100 KB. The test of
+the GIL record runs a tiny profile of `zeo` in place of the quick set. No
+test needs the native client itself.
 
 `just bench test` runs it.
 """
@@ -56,7 +57,12 @@ SCHEMA_PATH = BENCH / "schema" / "results.schema.json"
 README = BENCH / "README.md"
 TIMEOUT = 30
 SCENARIOS = ("add", "update", "read_cold", "read_warm", "read_hot")
-CELLS = (("threads", 16), ("processes", 16))
+CELLS = (
+    ("threads", 16, KB),
+    ("processes", 16, KB),
+    ("threads", 16, 100 * KB),
+    ("processes", 16, 100 * KB),
+)
 ZEO = dict.fromkeys(SCENARIOS, 1000.0)
 THREE_TIMES = dict.fromkeys(SCENARIOS, 3000.0)
 # The key of `<zoeclient>` that selects the native inside.
@@ -88,7 +94,7 @@ def result_of(storage, ops):
             "name": name,
             "mode": mode,
             "concurrency": concurrency,
-            "object_size": KB,
+            "object_size": size,
             "objects_per_transaction": 100,
             "samples": 20,
             "ops_per_second": ops[name],
@@ -98,7 +104,7 @@ def result_of(storage, ops):
         }
         for name in SCENARIOS
         if name in ops
-        for mode, concurrency in CELLS
+        for mode, concurrency, size in CELLS
     ]
     return {
         "schema_version": 1,
@@ -160,16 +166,18 @@ def output(result):
     return result.stdout + result.stderr
 
 
-def rows(result, scenario=None):
-    """Return the lines of the report that give a cell of scenario.
+def rows(result, scenario=None, size=None):
+    """Return the lines of the report that give a cell of scenario at size.
 
-    Without scenario, return the lines of every cell.
+    Without scenario, return the lines of every scenario. Without size,
+    return the lines of every size.
     """
     return [
         line
         for line in result.stdout.splitlines()
         if line.split()[:1] in ([[scenario]] if scenario else [[s] for s in SCENARIOS])
         and line.split()[1:2] in (["threads"], ["processes"])
+        and size in (None, int(line.split()[3]))
     ]
 
 
@@ -244,12 +252,15 @@ def test_the_default_ratio_is_three_for_zoe_native_and_parity_for_zoe_server(
     result = gate(failing, "zoe-native")
     assert result.returncode == 1, output(result)
     assert "2.99" in result.stdout
-    # Every scenario counts, read_hot included.
-    assert failed(result) == rows(result), result.stdout
+    # Every cell counts but read_hot at 1 KB.
+    small_hot = rows(result, "read_hot", KB)
+    assert failed(result) == [r for r in rows(result) if r not in small_hot]
     assert len(rows(result)) == len(SCENARIOS) * len(CELLS), result.stdout
+    for row in small_hot:
+        assert "left out" in row, row
 
 
-def test_read_hot_counts_for_zoe_native_and_stays_left_out_for_zoe_server(
+def test_read_hot_counts_at_100_kb_for_zoe_native_and_stays_left_out_for_zoe_server(
     tmp_path, schema
 ):
     write_result(tmp_path, "zeo", ZEO, schema)
@@ -259,10 +270,14 @@ def test_read_hot_counts_for_zoe_native_and_stays_left_out_for_zoe_server(
     native = gate(tmp_path, "zoe-native")
     assert native.returncode == 1, output(native)
     assert "2.90" in native.stdout
-    hot = rows(native, "read_hot")
-    assert len(hot) == len(CELLS), native.stdout
+    hot = rows(native, "read_hot", 100 * KB)
+    assert len(hot) == 2, native.stdout
     assert failed(native) == hot, native.stdout
-    assert not any("left out" in row for row in hot), native.stdout
+    small_hot = rows(native, "read_hot", KB)
+    assert len(small_hot) == 2, native.stdout
+    for row in small_hot:
+        assert "left out" in row, row
+    assert "left out: read_hot at 1 KB, because " in native.stdout
 
     server = gate(tmp_path, "zoe-server")
     assert server.returncode == 0, output(server)
@@ -281,8 +296,12 @@ def test_a_missing_read_hot_cell_fails_zoe_native_only(tmp_path, schema):
 
     native = gate(tmp_path, "zoe-native")
     assert native.returncode == 1, output(native)
-    for row in rows(native, "read_hot"):
+    hot = rows(native, "read_hot", 100 * KB)
+    assert len(hot) == 2, native.stdout
+    for row in hot:
         assert "missing" in row, row
+    for row in rows(native, "read_hot", KB):
+        assert "left out" in row, row
 
     server = gate(tmp_path, "zoe-server")
     assert server.returncode == 0, output(server)

@@ -4,12 +4,17 @@ The acceptance test covers the sequences over the protocol, a stock client,
 a stock server and the section that opens the client. These tests cover the
 rest: the keys of the section, its `<ssl>` section, the read-only fallback
 with the declaration, a name that is not a str, the switch to the native
-client, the arguments of TLS and of the addresses of the native client, and
-the traceparent that the native client reads.
+client and its fall back to the client of ZEO on a pickle server, the
+arguments of TLS and of the addresses of the native client, and the
+traceparent that the native client reads. They also cover the CA
+certificates of the native client: a directory as `authenticate`, and those
+of the system without `authenticate`.
 """
 
 import io
+import shutil
 import socket
+import subprocess
 import types
 
 import pytest
@@ -244,19 +249,128 @@ def test_the_native_tls_takes_the_files_of_the_ssl_section(tmp_path, monkeypatch
     assert tls[4] == "b"
 
 
-def test_the_native_tls_refuses_what_it_does_not_read(tmp_path):
+def test_the_native_tls_refuses_an_encrypted_key():
     from ZODB.POSException import Unsupported
 
     import zoe.zeo
 
-    refused = {
-        "password-function": ssl_section(password_function="m.f"),
-        "authenticate": ssl_section(authenticate=None),
-        "directory": ssl_section(authenticate=str(tmp_path)),
-    }
-    for match, section in refused.items():
-        with pytest.raises(Unsupported, match=match):
-            zoe.zeo._native_tls(section, None)
+    with pytest.raises(Unsupported, match="password-function"):
+        zoe.zeo._native_tls(ssl_section(password_function="m.f"), None)
+
+
+def test_the_native_tls_takes_a_directory_or_the_system_store(tmp_path):
+    import zoe.zeo
+
+    tls = zoe.zeo._native_tls(ssl_section(authenticate=str(tmp_path)), None)
+    assert tls[2] == str(tmp_path)
+    # As for ZEO, no authenticate and DYNAMIC take the system store.
+    for authenticate in [None, "", "DYNAMIC"]:
+        tls = zoe.zeo._native_tls(ssl_section(authenticate=authenticate), None)
+        assert tls[2] is None, authenticate
+
+
+def openssl(*args, cwd):
+    subprocess.run(["openssl", *args], cwd=cwd, check=True, capture_output=True)
+
+
+NEW_KEY = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
+
+
+def sign(directory, name, ca, extensions):
+    """Make the certificate `name`, signed by the CA `ca`."""
+    openssl(
+        "req", *NEW_KEY, "-subj", f"/CN={name}",
+        "-keyout", f"{name}.key", "-out", f"{name}.csr",
+        cwd=directory,
+    )  # fmt: skip
+    (directory / f"{name}.ext").write_text(extensions)
+    openssl(
+        "x509", "-req", "-in", f"{name}.csr", "-CA", f"{ca}.pem",
+        "-CAkey", f"{ca}.key", "-CAcreateserial", "-days", "2",
+        "-extfile", f"{name}.ext", "-out", f"{name}.pem",
+        cwd=directory,
+    )  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def certs(tmp_path_factory):
+    """`server-ca` signs the server, `client-ca` signs the client, and
+    `other-ca` signs nothing."""
+    directory = tmp_path_factory.mktemp("certs")
+    for ca in ["server-ca", "client-ca", "other-ca"]:
+        openssl(
+            "req", "-x509", *NEW_KEY, "-days", "2", "-subj", f"/CN={ca}",
+            "-keyout", f"{ca}.key", "-out", f"{ca}.pem",
+            "-addext", "keyUsage = critical, keyCertSign, cRLSign",
+            cwd=directory,
+        )  # fmt: skip
+    sign(directory, "server", "server-ca", "subjectAltName = DNS:localhost\n")
+    sign(directory, "client", "client-ca", "extendedKeyUsage = clientAuth\n")
+    return directory
+
+
+@pytest.fixture
+def tls_server(tmp_path, certs):
+    """A server with TLS that requires a certificate of `client-ca`."""
+    args = [
+        "--tls-cert", str(certs / "server.pem"),
+        "--tls-key", str(certs / "server.key"),
+        "--tls-client-ca", str(certs / "client-ca.pem"),
+    ]  # fmt: skip
+    with ZoeServer(str(tmp_path / "store"), args=args) as server:
+        yield server
+
+
+def open_tls(server, certs, authenticate, wait_timeout=TIMEOUT):
+    """Open a native client of `server` with the CA certificates of
+    `authenticate`, and check its connection. Close it."""
+    import zoe.testing
+
+    section = ssl_section(
+        certificate=str(certs / "client.pem"),
+        key=str(certs / "client.key"),
+        authenticate=authenticate,
+        server_hostname="localhost",
+    )
+    storage = zoe.testing.native_client(
+        server.address,
+        storage="1",
+        wait_timeout=wait_timeout,
+        _ssl_section=section,
+    )
+    try:
+        assert len(storage.new_oid()) == 8
+    finally:
+        storage.close()
+
+
+def test_a_directory_of_ca_files_as_authenticate_checks_the_server(
+    tmp_path, certs, tls_server
+):
+    from ZEO.Exceptions import ClientDisconnected
+
+    good, other = tmp_path / "good", tmp_path / "other"
+    for directory, cas in [(good, ["other-ca", "server-ca"]), (other, ["other-ca"])]:
+        directory.mkdir()
+        for ca in cas:
+            shutil.copy(certs / f"{ca}.pem", directory)
+    open_tls(tls_server, certs, str(good))
+    with pytest.raises(ClientDisconnected):
+        open_tls(tls_server, certs, str(other), wait_timeout=2)
+
+
+def test_without_authenticate_the_client_checks_the_server_with_the_system_store(
+    certs, tls_server, monkeypatch
+):
+    from ZEO.Exceptions import ClientDisconnected
+
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certs / "server-ca.pem"))
+    open_tls(tls_server, certs, None)
+    # A CA that the system store does not hold fails the open.
+    monkeypatch.setenv("SSL_CERT_FILE", str(certs / "other-ca.pem"))
+    with pytest.raises(ClientDisconnected):
+        open_tls(tls_server, certs, None, wait_timeout=2)
 
 
 def test_an_empty_host_is_the_loopback_for_the_native_client():
@@ -324,6 +438,142 @@ def test_a_server_of_another_protocol_is_a_failed_connection(caplog):
         stop.set()
         thread.join()
         listener.close()
+
+
+# The words of the warning when a client without `native` takes the client
+# of ZEO inside.
+FELL_BACK = "the client of ZEO runs inside"
+
+# The name of the thread of the asyncio client of ZEO ends with this.
+ZEO_THREAD = "zeo client networking thread"
+
+
+def fell_back(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "zoe.zeo" and FELL_BACK in r.getMessage()
+    ]
+
+
+def commit_and_load(storage):
+    from ZODB.Connection import TransactionMetaData
+
+    oid = storage.new_oid()
+    txn = TransactionMetaData()
+    storage.tpc_begin(txn)
+    storage.store(oid, bytes(8), b"data", "", txn)
+    storage.tpc_vote(txn)
+    tid = storage.tpc_finish(txn)
+    assert storage.load(oid) == (b"data", tid)
+
+
+@pytest.fixture
+def pickle_server(tmp_path):
+    """A stock ZEO server in this process, which speaks only the pickle
+    protocol Z5."""
+    import ZEO
+
+    address, stop = ZEO.server(path=str(tmp_path / "Data.fs"))
+    yield address
+    stop()
+
+
+def test_a_default_client_on_a_pickle_server_takes_the_client_of_zeo(
+    pickle_server, caplog
+):
+    import logging
+    import threading
+
+    import zoe.zeo
+
+    with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+        storage = zoe.zeo.ClientStorage(
+            pickle_server, storage="1", wait_timeout=TIMEOUT
+        )
+    try:
+        assert type(storage) is zoe.zeo.ClientStorage
+        assert not isinstance(storage, zoe.zeo._NativeClientStorage)
+        assert storage.protocol_version == b"Z5"
+        threads = [t.name for t in threading.enumerate()]
+        assert any(name.endswith(ZEO_THREAD) for name in threads), threads
+        commit_and_load(storage)
+        [message] = fell_back(caplog)
+        assert "b'Z5'" in message
+    finally:
+        storage.close()
+
+
+def test_the_zoeclient_section_without_native_takes_the_client_of_zeo(
+    pickle_server, caplog
+):
+    import logging
+
+    import zoe.zeo
+
+    host, port = pickle_server
+    schema = ZConfig.loadSchemaFile(io.StringIO(SCHEMA))
+    text = (
+        f"%import zoe\n<zoeclient>\nserver {host}:{port}\n"
+        f"wait-timeout {TIMEOUT}\n</zoeclient>\n"
+    )
+    config, _ = ZConfig.loadConfigFile(schema, io.StringIO(text))
+    with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+        storage = config.storage.open()
+    try:
+        assert type(storage) is zoe.zeo.ClientStorage
+        commit_and_load(storage)
+        assert len(fell_back(caplog)) == 1
+    finally:
+        storage.close()
+
+
+def test_native_true_on_a_pickle_server_fails_and_names_msgpack(pickle_server, caplog):
+    import logging
+
+    from ZEO.Exceptions import ClientDisconnected
+
+    import zoe.zeo
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ClientDisconnected) as raised:
+            zoe.zeo.ClientStorage(
+                pickle_server, storage="1", native=True, wait_timeout=1
+            )
+    text = str(raised.value)
+    assert text.startswith("timed out waiting for connection")
+    assert "Z5" in text and "msgpack true" in text
+    assert fell_back(caplog) == []
+
+
+def test_a_default_client_without_wait_stays_native(pickle_server):
+    import zoe.zeo
+
+    # Without wait, the open does not connect: it cannot see the protocol.
+    storage = zoe.zeo.ClientStorage(
+        pickle_server, storage="1", wait=False, wait_timeout=1
+    )
+    try:
+        assert isinstance(storage, zoe.zeo._NativeClientStorage)
+    finally:
+        storage.close()
+
+
+def test_a_default_client_on_zoe_serve_stays_native_and_logs_no_fall_back(
+    tmp_path, caplog
+):
+    import logging
+
+    import zoe.zeo
+
+    with ZoeServer(str(tmp_path / "store")) as server:
+        with caplog.at_level(logging.WARNING, logger="zoe.zeo"):
+            storage = client(server)
+        try:
+            assert isinstance(storage, zoe.zeo._NativeClientStorage)
+            assert fell_back(caplog) == []
+        finally:
+            storage.close()
 
 
 def test_a_call_after_the_close_raises_client_disconnected(tmp_path):

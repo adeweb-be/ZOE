@@ -430,6 +430,38 @@ async fn a_pool_drops_a_file_ahead_of_its_server() {
     pool.disconnect();
 }
 
+#[tokio::test]
+async fn a_pool_drops_a_file_whose_last_transaction_the_server_does_not_hold() {
+    let name = "pool-other";
+    let server = start(name);
+    let path = dir(&format!("{name}-var")).join("c-1.zoec");
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oids = other.new_oids(2).await.unwrap();
+    let first = commit(&other, oids[0], Tid(0), b"zero").await;
+    load_all(open_pool(&server, &path).await, &oids[..1]).await;
+    let last = commit(&other, oids[1], Tid(0), b"one").await;
+    assert!(other.holds_transaction(first).await.unwrap());
+    assert!(!other.holds_transaction(Tid(first.0 + 1)).await.unwrap());
+
+    // The file saw a transaction that the server does not hold, below the
+    // last tid of the server: the server has another history, as a server
+    // restored from an older copy and then committed to.
+    poke(&path, 7, first.0 + 1);
+    poke(&path, H_CLEAN, 0);
+    let pool = open_pool(&server, &path).await;
+    assert_eq!(
+        pool.take_file_check(),
+        Some(FileCheck::Other {
+            applied: Tid(first.0 + 1),
+        })
+    );
+    let cache = pool.cache().unwrap().clone();
+    assert_eq!(cache.applied(), last);
+    assert_eq!(cache.load(oids[0]), None);
+    assert_eq!(pool.load(oids[0]).await.unwrap().0, b"zero");
+    pool.disconnect();
+}
+
 /// Return an `Open` to `server` that fails while `gate` is false.
 fn gated(server: std::net::SocketAddr, gate: Arc<AtomicBool>) -> Open {
     Arc::new(move |_| {

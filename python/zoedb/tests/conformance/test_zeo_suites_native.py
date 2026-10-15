@@ -62,7 +62,116 @@ OUT_MODULES = {
 # name is the class that defines the test and its method, or the name of a
 # doctest. The name of a doctest file has "_" in place of its last ".". The
 # planner fills it from a run inside the native layer.
-OUT = {}
+TLS_FILES = (
+    "it gives an ssl context, or the self-signed server.pem of ZEO's tests; "
+    "the native client takes TLS only from the files of the <ssl> section, "
+    "and its certificates must chain to a CA (follow-up #338); "
+    "test_native_transports.py covers TLS"
+)
+POOL = (
+    "it assumes one connection for each client; the native client has a "
+    "listener and a pool of connections that commit (ADR 0036); "
+    "test_native_concurrent.py covers the pool"
+)
+ZOEC = (
+    "it reads the .zec file of ZEO or uses ZEO.cache; the native client "
+    "keeps its cache in a .zoec file of ZOE (ADR 0034); "
+    "test_native_persistent_cache.py and "
+    "test_native_persistent_cache_units.py cover it"
+)
+VERIFIED_CACHE = (
+    "it loads from a cache file while no server is connected; the native "
+    "client serves a cache file only after its verification against a "
+    "server (ADR 0034); test_native_persistent_cache.py covers the file"
+)
+ASYNCIO = "it reads the asyncio inside of ZEO's client, which the native client has not"
+OUT = {
+    # 1. TLS from files only.
+    "FileStorageSSLTests": TLS_FILES,
+    "SSLConnectionTests": TLS_FILES,
+    "quick_close_doesnt_kill_server": TLS_FILES,
+    "SSLConfigTest.test_ssl_basic": TLS_FILES,
+    "SSLConfigTest.test_ssl_hostname_check": TLS_FILES,
+    # 2. The pool of connections.
+    "CommitLockVoteTests.checkCommitLockVoteAbort": (
+        POOL + "; it calls vote on the listener, which runs no transaction"
+    ),
+    "CommitLockVoteTests.checkCommitLockVoteClose": (
+        POOL + "; it calls vote on the listener, which runs no transaction"
+    ),
+    "CommitLockVoteTests.checkCommitLockVoteFinish": (
+        POOL + "; it calls vote on the listener, which runs no transaction"
+    ),
+    "test_ruok": POOL + "; it expects 'connections': 1",
+    "test_server_status": POOL + "; it expects 'connections': 1",
+    "TimeoutTests.checkTimeoutAfterVote": (
+        POOL + "; a stock ZEO server closes only the connection of the "
+        "transaction at its timeout, and the listener stays connected; "
+        "the rest of the test passes on the native client"
+    ),
+    # 3. The .zoec file.
+    "InvqTests.checkQuickVerificationWith2Clients": ZOEC,
+    "client-config_test": ZOEC,
+    "ZEOConfigTest.test_client_variations": ZOEC,
+    "invalidate_client_cache_entry_on_server_commit_error": ZOEC,
+    # 4. A cache file serves only after its verification.
+    "ConnectionTests.checkBasicPersistence": VERIFIED_CACHE,
+    "ConnectionTests.checkDisconnectedCacheWorks": VERIFIED_CACHE,
+    "ConnectionTests.checkDisconnectedCacheFails": VERIFIED_CACHE,
+    # 6. The asyncio inside of ZEO's client.
+    "ConnectionTests.checkBadMessage1": (
+        ASYNCIO + ": it writes through _server.client.protocol on "
+        "_server.loop; frames.rs of zoe-server covers a bad frame, and "
+        "test_native_reconnect.py the new connection"
+    ),
+    "ConnectionTests.checkBadMessage2": (
+        ASYNCIO + ": it writes through _server.client.protocol on "
+        "_server.loop; frames.rs of zoe-server covers a bad frame, and "
+        "test_native_reconnect.py the new connection"
+    ),
+    "ZRPCConnectionTests.checkCatastrophicClientLoopFailure": (
+        ASYNCIO + ": it stops _server.loop and joins _server.thread; "
+        "runtime.rs of zoe-client covers the tasks of a connection"
+    ),
+    "ZRPCConnectionTests.checkConnectionInvalidationOnReconnect": (
+        ASYNCIO + ": it calls connection_lost of _server.client.protocol; "
+        "test_native_reconnect.py covers the invalidations at a reconnect"
+    ),
+    "tpc_finish_error": (
+        ASYNCIO + ": it changes the TransactionBuffer of _check_trans; "
+        "test_native_cache.py covers the cache at a commit"
+    ),
+    "Test_convenience_functions.test_ZEO_client_convenience": (
+        ASYNCIO + ": it gives a mock of ZEO's client thread as "
+        "_client_factory; test_native_harness.py opens the native client "
+        "through ZEO.client"
+    ),
+    # The order of the imports of the gate.
+    "test_runzeo_msgpack_support": (
+        "ZEO.tests.testZEO defines it at its import, for the value of "
+        "ZEO_MSGPACK then; the run against zoe serve imports the module "
+        "first, without ZEO_MSGPACK, so the run against a stock server gets "
+        "the Z5 version and a server that speaks M5; the OUT of "
+        "test_zeo_suites.py holds it for zoe serve too"
+    ),
+    "client_asyncore_thread_has_name": (
+        ASYNCIO + ": it expects the networking thread of ZEO; "
+        "test_the_native_inside_is_the_default checks that it does not "
+        "start, and test_native_skeleton.py the threads of the native client"
+    ),
+}
+
+# The tests that the run against a stock ZEO server does not run, and why.
+# The run against zoe serve runs them.
+OUT_ZEO = {
+    "MultiprocessingTests.test_work_with_multiprocessing": (
+        "on 3.14 the start method of multiprocessing is forkserver; the run "
+        "against zoe serve starts the fork server in this test, while "
+        "tempfile.tempdir is a test directory that the test removes, so the "
+        "second run finds no socket of the fork server; the run against "
+        "zoe serve runs the test"
+    ),
+}
 
 # The classes of ZEO's tests that the cards of phase 3 name. The tests of
 # FullGenericTests run in its subclasses.
@@ -141,8 +250,9 @@ def run(module_name, layers, out):
     return result, ran
 
 
-def run_all(layers, out):
-    """Run every collected module. Fail with the list of the problems."""
+def run_all(layers, out, floor):
+    """Run every collected module. Fail with the list of the problems, or
+    when fewer than `floor` tests ran."""
     problems, total = [], 0
     for module_name in modules():
         result, ran = run(module_name, layers, out)
@@ -154,7 +264,7 @@ def run_all(layers, out):
             f"{test.id()}: unexpected success" for test in result.unexpectedSuccesses
         ]
     assert not problems, "\n\n".join(problems)
-    assert total > 450, f"only {total} tests ran"
+    assert total >= floor, f"only {total} tests ran"
 
 
 def test_the_named_tests_and_the_out_modules_are_in_the_suites():
@@ -215,11 +325,11 @@ def test_the_native_inside_is_the_default(tmp_path):
 
 def test_the_suites_of_zeo_pass_with_the_native_client_against_zoe_serve():
     layers = (zoe.testing.ZEO_LAYER, zoe.testing.NATIVE_LAYER)
-    run_all(layers, {**phase_2().OUT, **OUT})
+    run_all(layers, {**phase_2().OUT, **OUT}, 334)
 
 
 def test_the_suites_of_zeo_pass_with_the_native_client_against_zeo(monkeypatch):
     # runzeo speaks M5 when ZEO_MSGPACK is set and its configuration does
     # not set msgpack.
     monkeypatch.setenv("ZEO_MSGPACK", "1")
-    run_all((zoe.testing.NATIVE_LAYER,), OUT)
+    run_all((zoe.testing.NATIVE_LAYER,), {**OUT, **OUT_ZEO}, 423)

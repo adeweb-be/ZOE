@@ -142,8 +142,8 @@ pub enum Verification {
     Kept,
     /// `getInvalidations` gave the commits after the base: `applied` of the
     /// cache, or the last tid of the pool without a cache. The consumer got
-    /// them first, as one `Delivery::Invalidate`, unless it already had
-    /// their tid.
+    /// them first, as one `Delivery::Invalidate`, also when the pool
+    /// already delivered their tid.
     Quick,
     /// The server does not keep the commits after the last tid of the
     /// pool. The cache dropped every entry, and any object can be stale.
@@ -165,6 +165,13 @@ pub enum FileCheck {
     /// `getInvalidations` failed with this text: the cache dropped every
     /// entry.
     Failed(String),
+    /// The server holds no commit at `applied` of the file, so its history
+    /// is not the one that the file saw, for example a server restored from
+    /// an older copy: the cache dropped every entry.
+    Other {
+        /// `applied` of the file.
+        applied: Tid,
+    },
     /// `applied` of the file is above the last tid of the server: the
     /// cache dropped every entry.
     Ahead {
@@ -1836,9 +1843,10 @@ async fn reconnect(shared: &Shared) -> Option<Invalidations> {
 /// below the base, or below the last tid of the pool, refuses the server.
 /// A last tid above the base asks `getInvalidations(base)`: the cache drops
 /// the current entry of each oid that it gives, and the consumer gets them
-/// as one invalidation at the tid of the reply, when that tid is above the
-/// last tid of the pool. When the server answers `None`, the cache drops
-/// every entry. A pool that never had a listener takes the server as it is.
+/// as one invalidation at the tid of the reply. Its confirmation never
+/// moves the last tid of the pool back. When the server answers `None`, the
+/// cache drops every entry. A pool that never had a listener takes the
+/// server as it is.
 async fn verify(shared: &Shared, client: &Client) -> Verified {
     let server_tid = client.last_transaction();
     let (last, fresh) = {
@@ -1887,12 +1895,16 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
             if let Some(cache) = &shared.cache {
                 cache.verify(invalidation.tid, Some(&invalidation.oids));
             }
-            if invalidation.tid.0 > last {
-                let tid = invalidation.tid.0;
-                let event = Event::Delivery(Delivery::Invalidate(invalidation));
-                if !announce(shared, event, Some(tid)).await {
-                    return Verified::Closed;
-                }
+            // The consumer always gets the oids of the reply, as ZEO calls
+            // `invalidateTransaction` after `getInvalidations`. The tid can
+            // be the last tid of the pool: a turn after the loss moved the
+            // last tid past the base, and the commits of other clients
+            // between the base and that tid never reached the consumer.
+            // Then the confirmation keeps the last tid.
+            let tid = invalidation.tid.0;
+            let event = Event::Delivery(Delivery::Invalidate(invalidation));
+            if !announce(shared, event, Some(tid)).await {
+                return Verified::Closed;
             }
             Verified::Taken(Verification::Quick, None)
         }
@@ -1913,9 +1925,10 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// the consumer starts at the last tid of the pool.
 ///
 /// The base is `applied` of the cache. A server tid equal to the base keeps
-/// the cache. A higher one asks `getInvalidations(base)`: a reply drops the
-/// current entry of each of its oids, and `None` or an error drops every
-/// entry. A server tid below the base drops every entry too, and `applied`
+/// the cache. With a higher one, the server must hold a commit at the base,
+/// else its history is another one and the cache drops every entry. Then
+/// `getInvalidations(base)`: a reply drops the current entry of each of its
+/// oids, and `None` or an error drops every entry. A server tid below the base drops every entry too, and `applied`
 /// becomes the server tid. Then the cache serves. Return false at the
 /// close.
 async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
@@ -1930,6 +1943,27 @@ async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid
             server: server_tid,
         }
     } else {
+        let held = if base == Tid(0) {
+            Ok(true)
+        } else {
+            match shared.unless_closed(client.holds_transaction(base)).await {
+                None => return false,
+                Some(held) => held,
+            }
+        };
+        match held {
+            Ok(true) => {}
+            Ok(false) => {
+                cache.verify(server_tid, None);
+                shared.lock().file_check = Some(FileCheck::Other { applied: base });
+                return true;
+            }
+            Err(error) => {
+                cache.verify(server_tid, None);
+                shared.lock().file_check = Some(FileCheck::Failed(error.to_string()));
+                return true;
+            }
+        }
         match shared.unless_closed(client.get_invalidations(base)).await {
             None => return false,
             Some(Ok(Some(invalidation))) => {

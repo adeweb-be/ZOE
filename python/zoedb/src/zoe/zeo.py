@@ -34,7 +34,9 @@ its methods. The native client is still an instance of
 `ZEO.ClientStorage.ClientStorage`, and no thread of ZEO starts. It connects
 as ZEO does: to a `(host, port)` address, to the path of a unix domain
 socket, or to the first server of a list that opens, with TLS from the
-`<ssl>` section of `<zoeclient>`. It takes no `ssl` context: TLS runs in
+`<ssl>` section of `<zoeclient>`. It checks the server against the CA
+certificates of `authenticate`, a file or a directory, else against those
+of the system, as ZEO does. It takes no `ssl` context: TLS runs in
 Rust, and a context does not give back the files of its certificate and
 key. It runs several transactions at once, each on its own connection of a
 pool, with one more connection that orders the invalidations (ADR 0036). It
@@ -51,8 +53,11 @@ rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
 `record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
 `deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
 `new_addr` and `client_label`. It speaks only the msgpack protocol `M5`: a
-stock ZEO server needs `msgpack true`. `_NOT_BUILT` names the arguments
-whose feature it does not have yet. It is empty.
+stock ZEO server needs `msgpack true`. When the caller gives no `native`
+and the open with `wait` finds a stock ZEO server that speaks only the
+pickle protocol `Z5`, the instance takes the asyncio client of ZEO inside
+and logs a warning. `_NOT_BUILT` names the arguments whose feature it does
+not have yet. It is empty.
 """
 
 import concurrent.futures
@@ -326,9 +331,15 @@ class ClientStorage(ZEOClientStorage):
     runs inside. With `native=False`, the asyncio client of ZEO runs
     inside. A subclass runs the asyncio client of ZEO by default, and
     `native=True` on it raises `TypeError`.
+
+    Without `native`, a server that speaks only the pickle protocol `Z5`
+    at the open with `wait` gives the asyncio client of ZEO inside: the
+    instance becomes a `ClientStorage` with `native=False`. With
+    `native=True`, such a server is a failed connection.
     """
 
     def __new__(cls, *args, native=None, **kw):
+        fall_back = native is None and cls is ClientStorage
         if native is None:
             native = issubclass(cls, _NativeClientStorage) or cls is ClientStorage
         if native and cls is ClientStorage:
@@ -338,7 +349,11 @@ class ClientStorage(ZEOClientStorage):
                 f"{cls.__name__} runs the client of ZEO: native=True needs"
                 " zoe.zeo.ClientStorage itself"
             )
-        return super().__new__(cls)
+        instance = super().__new__(cls)
+        if fall_back:
+            # `_NativeClientStorage.__init__` reads and removes the mark.
+            instance._fall_back = True
+        return instance
 
     def __init__(
         self,
@@ -395,6 +410,11 @@ _NOT_BUILT = {}
 # ZEO.
 _NATIVE_EXTENSIONS = EXTENSIONS
 
+# The protocols of a server for which a `ClientStorage` without `native`
+# takes the asyncio client of ZEO inside: the pickle protocol of a stock
+# ZEO server without `msgpack true`. The client of ZEO speaks it.
+_ZEO_PROTOCOLS = (b"Z5",)
+
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
 
@@ -429,32 +449,28 @@ def _as_bytes(value):
 def _native_tls(section, server_hostname):
     """Return the TLS of the native client from an `<ssl>` section.
 
-    The tuple holds the certificate, the key or None, the CA file of
-    `authenticate`, `check-hostname`, and the server name: `server_hostname`,
-    else the `server-hostname` of the section, else None. Raise `Unsupported`
-    for what the native client does not read: an encrypted key, no
-    `authenticate`, or a directory as `authenticate`.
+    The tuple holds the certificate, the key or None, the CA file or
+    directory of `authenticate` or None, `check-hostname`, and the server
+    name: `server_hostname`, else the `server-hostname` of the section,
+    else None. As in `ZEO.zconfig.ssl_config`, no `authenticate` and
+    `DYNAMIC` that is not a directory give None: the client then checks
+    the server against the CA certificates of the system. Raise
+    `Unsupported` for an encrypted key, which the native client does not
+    read.
     """
     if section.password_function:
         raise Unsupported(
             "the native client reads only a key that is not encrypted: "
             "leave password-function out of <ssl>"
         )
-    if not section.authenticate:
-        raise Unsupported(
-            "the native client checks the server against the CA "
-            "certificates of a file: give authenticate in <ssl>"
-        )
-    if os.path.isdir(section.authenticate):
-        raise Unsupported(
-            "the native client takes a file of CA certificates as "
-            f"authenticate, not the directory {section.authenticate}"
-        )
+    auth = section.authenticate
+    if auth == "DYNAMIC" and not os.path.isdir(auth):
+        auth = None
     key = os.path.abspath(section.key) if section.key else None
     return (
         os.path.abspath(section.certificate),
         key,
-        os.path.abspath(section.authenticate),
+        os.path.abspath(auth) if auth else None,
         bool(section.check_hostname),
         server_hostname or section.server_hostname or None,
     )
@@ -701,6 +717,12 @@ class _NativeClientStorage(ClientStorage):
     the resolution raises, drops the cache entry of its oid and leaves the
     transaction to `tpc_abort`.
 
+    When `zoe.zeo.ClientStorage` made the instance without `native`, and
+    the open with `wait` finds a server that speaks only a protocol of
+    `_ZEO_PROTOCOLS`, the instance becomes a `zoe.zeo.ClientStorage` with
+    the asyncio client of ZEO inside, opened with the same arguments. It
+    logs a warning that names the protocol.
+
     The other calls of the server go through `_call` and `_async`, on the
     listener, as on the one connection of `ZEO.ClientStorage`, and raise
     what `ZEO.ClientStorage` raises for the same reply. So the iterators,
@@ -758,7 +780,8 @@ class _NativeClientStorage(ClientStorage):
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
-        given = locals()
+        given = dict(locals())
+        fall_back = self.__dict__.pop("_fall_back", False) and wait
         # Refuse a feature that is not built before any other step.
         for key, off in _NOT_BUILT.items():
             if given[key] != off:
@@ -830,23 +853,28 @@ class _NativeClientStorage(ClientStorage):
         # can read the cache from then on.
         self._native_ready = threading.Event()
         started = time.monotonic()
-        self._native = _zoe.Client(
-            [_native_address(one) for one in addr],
-            storage,
-            read_only=self._read_only,
-            read_only_fallback=self._read_only_fallback,
-            extensions=list(_NATIVE_EXTENSIONS),
-            wait_timeout=float(wait_timeout or 30),
-            pool_bound=_POOL_BOUND,
-            cache_size=cache_size,
-            tls=tls,
-            traceparent=_traceparent,
-            wait=bool(wait),
-            disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
-            client_label=client_label,
-            cache_path=cache_path,
-            dropping=_dropping_of(self),
-        )
+        try:
+            self._native = _zoe.Client(
+                [_native_address(one) for one in addr],
+                storage,
+                read_only=self._read_only,
+                read_only_fallback=self._read_only_fallback,
+                extensions=list(_NATIVE_EXTENSIONS),
+                wait_timeout=float(wait_timeout or 30),
+                pool_bound=_POOL_BOUND,
+                cache_size=cache_size,
+                tls=tls,
+                traceparent=_traceparent,
+                wait=bool(wait),
+                disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
+                client_label=client_label,
+                cache_path=cache_path,
+                dropping=_dropping_of(self),
+                fall_back_on=list(_ZEO_PROTOCOLS if fall_back else ()),
+            )
+        except _zoe.OtherProtocol as error:
+            self._open_zeo_client(given, error.args[0])
+            return
         self._cache = _NativeCache(self._native, cache_size, cache_path)
         self._native_ready.set()
         try:
@@ -874,6 +902,28 @@ class _NativeClientStorage(ClientStorage):
         except BaseException:
             self._native.close()
             raise
+
+    def _open_zeo_client(self, given, protocol):
+        """Become a `ClientStorage` with the asyncio client of ZEO inside,
+        opened with the arguments `given` of this open. The server speaks
+        `protocol`, which the client of ZEO speaks and the native client
+        does not."""
+        logger.warning(
+            "%s the server speaks the protocol %r, not M5: the client of ZEO "
+            "runs inside; set msgpack true on the server for the native client",
+            self.__name__,
+            protocol,
+        )
+        args = {
+            key: value
+            for key, value in given.items()
+            if key not in ("self", "native", "_ssl_section", "__class__")
+        }
+        self.__dict__.clear()
+        self.__class__ = ClientStorage
+        ClientStorage.__init__(
+            self, native=False, _ssl_section=given["_ssl_section"], **args
+        )
 
     @property
     def _is_read_only(self):
@@ -1356,14 +1406,16 @@ class _NativeClientStorage(ClientStorage):
         A server that does not keep the commits after the file, or a failed
         `getInvalidations`, drops the file as ZEO drops a stale cache. A
         file ahead of the server is dropped too, where ZEO refuses the
-        server: the DB has no state yet. A verification that ends after the
-        wait of the open is logged at the next connection.
+        server: the DB has no state yet. So is a file whose last
+        transaction the server does not hold: the server has another
+        history. A verification that ends after the wait of the open is
+        logged at the next connection.
         """
         check = self._native.take_cache_check()
         if check is None:
             return None
         kind, text = check
-        if kind == "ahead":
+        if kind in ("ahead", "other"):
             _zeo_logger.critical(
                 "%s Client cache is out of sync with the server. The native "
                 "client drops its cache file. Verify that this is expected: %s",
