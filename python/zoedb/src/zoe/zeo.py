@@ -32,6 +32,8 @@ client of ZEO. It is still an instance of `ZEO.ClientStorage.ClientStorage`,
 and no thread of ZEO starts. It connects as ZEO does: to a `(host, port)`
 address, to the path of a unix domain socket, or to the first server of a
 list that opens, with TLS from the `<ssl>` section of `<zoeclient>`. It
+checks the server against the CA certificates of `authenticate`, a file
+or a directory, else against those of the system, as ZEO does. It
 takes no `ssl` context: TLS runs in Rust, and a context does not give back
 the files of its certificate and key. It runs several transactions at once,
 each on its own connection of a pool, with one more connection that orders
@@ -421,32 +423,28 @@ def _as_bytes(value):
 def _native_tls(section, server_hostname):
     """Return the TLS of the native client from an `<ssl>` section.
 
-    The tuple holds the certificate, the key or None, the CA file of
-    `authenticate`, `check-hostname`, and the server name: `server_hostname`,
-    else the `server-hostname` of the section, else None. Raise `Unsupported`
-    for what the native client does not read: an encrypted key, no
-    `authenticate`, or a directory as `authenticate`.
+    The tuple holds the certificate, the key or None, the CA file or
+    directory of `authenticate` or None, `check-hostname`, and the server
+    name: `server_hostname`, else the `server-hostname` of the section,
+    else None. As in `ZEO.zconfig.ssl_config`, no `authenticate` and
+    `DYNAMIC` that is not a directory give None: the client then checks
+    the server against the CA certificates of the system. Raise
+    `Unsupported` for an encrypted key, which the native client does not
+    read.
     """
     if section.password_function:
         raise Unsupported(
             "the native client reads only a key that is not encrypted: "
             "leave password-function out of <ssl>"
         )
-    if not section.authenticate:
-        raise Unsupported(
-            "the native client checks the server against the CA "
-            "certificates of a file: give authenticate in <ssl>"
-        )
-    if os.path.isdir(section.authenticate):
-        raise Unsupported(
-            "the native client takes a file of CA certificates as "
-            f"authenticate, not the directory {section.authenticate}"
-        )
+    auth = section.authenticate
+    if auth == "DYNAMIC" and not os.path.isdir(auth):
+        auth = None
     key = os.path.abspath(section.key) if section.key else None
     return (
         os.path.abspath(section.certificate),
         key,
-        os.path.abspath(section.authenticate),
+        os.path.abspath(auth) if auth else None,
         bool(section.check_hostname),
         server_hostname or section.server_hostname or None,
     )

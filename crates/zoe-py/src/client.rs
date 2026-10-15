@@ -202,7 +202,9 @@ impl NativeClient {
     ///
     /// `tls` is `None`, or the tuple `(certificate, key, authenticate,
     /// check_hostname, server_hostname)` of the files and checks of TLS.
-    /// `key` is `None` when `certificate` holds the key. The server name is
+    /// `key` is `None` when `certificate` holds the key. `authenticate` is a
+    /// file or a directory of CA certificates, or `None` for the CA
+    /// certificates of the system. The server name is
     /// `server_hostname`, else the host of the address. With TLS, the
     /// client never connects without TLS.
     ///
@@ -1370,9 +1372,15 @@ impl Servers {
 }
 
 /// The files and the checks of TLS that `zoe.zeo` gives: the certificate,
-/// the key or `None`, the CA file of `authenticate`, `check_hostname` and
-/// `server_hostname` or `None`.
-type TlsArgs = (PathBuf, Option<PathBuf>, PathBuf, bool, Option<String>);
+/// the key or `None`, the CA file or directory of `authenticate` or `None`,
+/// `check_hostname` and `server_hostname` or `None`.
+type TlsArgs = (
+    PathBuf,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    bool,
+    Option<String>,
+);
 
 /// The TLS of the endpoints: the loaded files and the name settings.
 struct Secure {
@@ -1385,7 +1393,10 @@ impl Secure {
     /// Read the files of `args`. An error names the file.
     fn load(args: &TlsArgs) -> Result<Self, Opening> {
         let (certificate, key, authenticate, check_hostname, server_hostname) = args;
-        let mut options = TlsOptions::new(certificate, authenticate);
+        let mut options = match authenticate {
+            Some(authenticate) => TlsOptions::new(certificate, authenticate),
+            None => TlsOptions::system(certificate),
+        };
         if let Some(key) = key {
             options = options.key(key);
         }
@@ -1847,7 +1858,7 @@ mod tests {
         let tls = (
             missing.join("client.pem"),
             None,
-            missing.join("ca.pem"),
+            Some(missing.join("ca.pem")),
             true,
             None,
         );
