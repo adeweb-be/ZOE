@@ -36,3 +36,6 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0030](0030-dump-files.md) | Dump files: a format of ZOE's own, one file per tid range |
 | [0031](0031-the-in-process-storage-closes-its-stores-on-a-signal.md) | The in-process storage closes its stores on SIGTERM and SIGHUP |
 | [0032](0032-a-tool-that-reads-a-store-repairs-it.md) | A tool that reads a store repairs it when a writer left it open; it supersedes the opens of ADR 0028 |
+| [0033](0033-object-count.md) | The store counts its objects: `object_count` in `meta`, ZOE format 2 |
+| [0034](0034-the-client-cache-file.md) | The client cache file (proposed) |
+| [0036](0036-concurrent-transactions-in-a-client.md) | Several transactions at once in one client process (proposed) |

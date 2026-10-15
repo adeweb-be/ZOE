@@ -327,8 +327,8 @@ async fn idle(runtime: &dyn Runtime, timeout: Option<Duration>) {
 /// frame while no call of the connection runs. A call runs from its ticket
 /// until it puts its reply, and a download until it ends. The time counts
 /// again from the later of the last frame and the end of the last call.
-/// The time while the reader waits for room for a call does not count,
-/// because the client cannot send then. The time counts from the last
+/// The time also counts while the reader waits for room for a call, so a
+/// client that reads nothing is closed too. The time counts from the last
 /// whole frame, so a frame that takes longer than the timeout to arrive is
 /// cut. This close is an end of the connection, as a close of the
 /// hub is: the writer stops at once, and each call ends at the first reply
@@ -592,11 +592,25 @@ pub(crate) async fn serve_stream(
         // The reader waits while `QUEUE` calls run or wait, while more
         // than `outbox::WAITING` bytes of replies wait, while the window
         // of the read pool is full, and while the session queue is full.
+        // The idle time counts during this wait while no call runs. So a
+        // client that reads nothing loses its connection and its locks.
+        let quiet = calls.quiet_beside_ticket();
         let ticket = tokio::select! {
             biased;
             ticket = calls.ticket(&call) => ticket,
             () = ended.wait() => break,
             () = closing.wait() => break,
+            () = async {
+                quiet.await;
+                idle(&*runtime, idle_timeout).await;
+            } => {
+                tracing::info!(client = peer.as_str(), "no frame within the idle timeout while the reader waits for room: closing the connection");
+                // No call runs now. The writer stops at once, also when it
+                // waits for a client that reads nothing. Then the
+                // transaction aborts.
+                outbox.close();
+                break;
+            }
         };
         if ticket.is_closed() {
             break;

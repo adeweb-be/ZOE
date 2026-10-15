@@ -10,6 +10,11 @@
 //!
 //! A reference is dangling when it names an oid without a current record.
 //! A store error is a finding, never a failure of the call.
+//!
+//! The walk counts the oids that have at least one record, deletions
+//! included. A store of format 2 keeps this count in `object_count`, and
+//! a count that differs is a finding. A store of format 1 has no count
+//! yet, which is no finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,6 +72,15 @@ pub struct PickleProblem {
     pub error: String,
 }
 
+/// An object count that differs from the oids of the records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountProblem {
+    /// The `object_count` that the store keeps.
+    pub stored: u64,
+    /// The oids that have at least one record, a deletion included.
+    pub counted: u64,
+}
+
 /// The findings and the counts of `verify`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
@@ -80,6 +94,12 @@ pub struct Verification {
     pub objects: u64,
     /// The blob records.
     pub blobs: u64,
+    /// The `object_count` that the store keeps. A store of format 1 has
+    /// none until its first writer open: that is no finding.
+    pub object_count: Option<u64>,
+    /// The object count when it differs from the oids of the records. The
+    /// check runs only when the walk read every record key.
+    pub count: Option<CountProblem>,
     /// The frames that do not read.
     pub checksums: Vec<FrameProblem>,
     /// The blob files that do not match their blob records.
@@ -106,6 +126,7 @@ impl Verification {
             + self.references.len()
             + self.pickles.len()
             + self.unknown_classes.len()
+            + usize::from(self.count.is_some())
     }
 }
 
@@ -121,6 +142,12 @@ pub fn verify(store: &Store, known: Option<&BTreeSet<String>>) -> Verification {
     sequences(store, &mut report);
     let mut walk = Walk::default();
     records(store, &mut report, &mut walk);
+    report.object_count = store.object_count();
+    if let (Some(stored), Some(counted)) = (report.object_count, walk.oids)
+        && stored != counted
+    {
+        report.count = Some(CountProblem { stored, counted });
+    }
     dangling(store, &mut report, walk);
     if let Some(known) = known {
         report.unknown_classes = report
@@ -194,6 +221,9 @@ struct Walk {
     ahead: Vec<(Oid, Oid, Tid)>,
     /// The references that the walk found without a current record.
     missing: Vec<Dangling>,
+    /// The oids that have at least one record, a deletion included. It is
+    /// `None` when the walk stopped before the last record key.
+    oids: Option<u64>,
 }
 
 impl Walk {
@@ -206,6 +236,7 @@ impl Walk {
 /// each blob file, and read the current record of each oid.
 fn records(store: &Store, report: &mut Verification, walk: &mut Walk) {
     let mut from = Oid(0);
+    let mut oids = 0;
     loop {
         let keys = match store.record_keys(from, KEY_CHUNK) {
             Ok(keys) => keys,
@@ -217,14 +248,19 @@ fn records(store: &Store, report: &mut Verification, walk: &mut Walk) {
             }
         };
         let Some(&(last, _)) = keys.last() else {
+            walk.oids = Some(oids);
             return;
         };
         for versions in keys.chunk_by(|a, b| a.0 == b.0) {
+            oids += 1;
             oid_versions(store, versions, report, walk);
         }
         match last.0.checked_add(1) {
             Some(next) => from = Oid(next),
-            None => return,
+            None => {
+                walk.oids = Some(oids);
+                return;
+            }
         }
     }
 }
@@ -610,5 +646,64 @@ mod tests {
                 .contains("sequence row after \"intids\" does not decode"),
             "{problem:?}"
         );
+    }
+
+    #[test]
+    fn the_object_count_matches_the_oids_of_the_records() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(0, Some(mapping(&[]))), (1, Some(mapping(&[])))]);
+        commit(&store, &[(1, None)]);
+        let report = verify(&store, None);
+        // The deletion is a record, so its oid counts.
+        assert_eq!(report.object_count, Some(2));
+        assert_eq!(report.count, None);
+        assert_eq!(report.problems(), 0, "{report:?}");
+    }
+
+    #[test]
+    fn an_object_count_that_differs_is_a_finding() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(0, Some(mapping(&[]))), (1, Some(mapping(&[])))]);
+        let tid = commit(&store, &[(2, Some(mapping(&[])))]);
+        // The only record of oid 2 goes, and the count stays.
+        store.remove_record_for_test(Oid(2), tid).unwrap();
+        let report = verify(&store, None);
+        assert_eq!(
+            report.count,
+            Some(CountProblem {
+                stored: 3,
+                counted: 2
+            })
+        );
+        assert_eq!(report.problems(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn a_store_of_format_1_has_no_count_and_no_finding() {
+        let dir = std::env::temp_dir().join(format!("zoe-verify-format-1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let store = Store::open(&dir).unwrap();
+            commit(&store, &[(0, Some(mapping(&[])))]);
+        }
+        // Make the store a store of format 1: no count, the older name.
+        {
+            let meta: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
+            let db = redb::Database::open(dir.join("zoe.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(meta).unwrap();
+                table.remove("object_count").unwrap();
+                table.insert("format", &b"ZOE format 1"[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open_read_only(&dir).unwrap();
+        let report = verify(&store, None);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.object_count, None);
+        assert_eq!(report.count, None);
+        assert_eq!(report.problems(), 0, "{report:?}");
     }
 }
