@@ -26,11 +26,12 @@
 mod client;
 mod disk;
 mod net;
+mod pool;
 mod rng;
 mod server;
 mod world;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
@@ -43,6 +44,7 @@ use zoe_core::{Clock, Oid, Options, Store, Tid};
 use crate::protocol::{NamedStorage, Pool, Queues, STORAGE_NAME, Storages};
 use client::SimClient;
 use disk::{Cache, DATABASE, SimClock, SimVfs};
+use pool::SimPoolClient;
 use rng::Rng;
 use world::{
     Baton, NetFault, Owner, PlannedCrash, Resume, Shared, Task, TaskWaker, Timer, Wait, Why, phase,
@@ -94,6 +96,10 @@ pub struct Faults {
     /// writes to the database file, some of them torn. When false, a crash
     /// is a kill of the process, and the disk keeps every write.
     pub power_loss: bool,
+    /// The number of times that the network breaks the listener of a pool
+    /// (`Simulation::pool`) in a run. Each time, a finish of that pool has
+    /// the reply of the server and did not take its turn yet.
+    pub listener_losses: usize,
 }
 
 impl Default for Faults {
@@ -106,6 +112,7 @@ impl Default for Faults {
             stall_client_for: None,
             ack_before_durable: false,
             power_loss: true,
+            listener_losses: 0,
         }
     }
 }
@@ -139,6 +146,27 @@ pub struct Report {
     pub verify: Vec<String>,
     /// The simulated time of the run.
     pub elapsed: Duration,
+    /// Each break of the rule of the pools (`Simulation::pool`), as text: a
+    /// tid delivered twice or after a higher tid, a skipped tid of the
+    /// store, a commit of a pool delivered as an invalidation, a finish
+    /// that returns without its callback or before the tids below it, a
+    /// last transaction above the last delivered tid, a finish with its
+    /// reply that fails or runs its callback before the stale mark after a
+    /// lost listener, and a pool that stops delivering.
+    pub order_faults: Vec<String>,
+    /// The tids of other clients that the pools delivered.
+    pub foreign_deliveries: usize,
+    /// The commits of the pools that they delivered through the callback
+    /// of their finish.
+    pub own_deliveries: usize,
+    /// The tids that a listener held while a finish that counted as in
+    /// flight when the tid came waited for its reply.
+    pub held: usize,
+    /// The finishes whose reply came while their pool held a lower tid.
+    pub waited_finishes: usize,
+    /// The finishes that had their reply when their pool lost its
+    /// listener, and returned their tid after the stale mark.
+    pub lost_listener_finishes: usize,
 }
 
 /// A run of the server and its clients.
@@ -150,6 +178,9 @@ pub struct Simulation {
     crashes: usize,
     blobs: bool,
     faults: Faults,
+    /// The size of the pool of each client, or `None` for clients of one
+    /// connection.
+    pool: Option<usize>,
 }
 
 impl Simulation {
@@ -163,6 +194,7 @@ impl Simulation {
             crashes: 0,
             blobs: false,
             faults: Faults::default(),
+            pool: None,
         }
     }
 
@@ -194,6 +226,16 @@ impl Simulation {
     #[must_use]
     pub fn blobs(mut self, blobs: bool) -> Self {
         self.blobs = blobs;
+        self
+    }
+
+    /// Run each client on a `zoe_client::Pool`: a listener and at most `n`
+    /// connections that commit, at least 1, with `n` transactions at once.
+    /// Each pool records what it delivers, and the report checks it
+    /// (`Report::order_faults`).
+    #[must_use]
+    pub fn pool(mut self, n: usize) -> Self {
+        self.pool = Some(n.max(1));
         self
     }
 
@@ -258,7 +300,11 @@ impl Driver {
             }
         }
         let shared = Shared::new(plan.seed, plan.faults.clone(), fault_plan, crash_plan, send);
-        shared.lock().clients = plan.clients;
+        {
+            let mut state = shared.lock();
+            state.clients = plan.clients;
+            state.listener_losses = plan.faults.listener_losses;
+        }
         Self {
             images: rng.fork(),
             plan,
@@ -281,19 +327,30 @@ impl Driver {
             let transactions =
                 self.plan.commits / clients + usize::from(id < self.plan.commits % clients);
             let mut state = self.shared.lock();
-            let client = SimClient {
-                shared: Arc::clone(&self.shared),
-                id,
-                transactions,
-                rng: state.rng.fork(),
-                stall: self.plan.faults.stall_client_for.filter(|_| id == 0),
-                blobs: self.plan.blobs,
+            let task: Task = match self.plan.pool {
+                Some(size) => Box::pin(
+                    SimPoolClient {
+                        shared: Arc::clone(&self.shared),
+                        id,
+                        transactions,
+                        rng: state.rng.fork(),
+                        size,
+                    }
+                    .run(),
+                ),
+                None => Box::pin(
+                    SimClient {
+                        shared: Arc::clone(&self.shared),
+                        id,
+                        transactions,
+                        rng: state.rng.fork(),
+                        stall: self.plan.faults.stall_client_for.filter(|_| id == 0),
+                        blobs: self.plan.blobs,
+                    }
+                    .run(),
+                ),
             };
-            state.spawn(
-                &self.shared.ready,
-                Owner::Client(id),
-                Box::pin(client.run()),
-            );
+            state.spawn(&self.shared.ready, Owner::Client(id), task);
         }
         self.adopt();
         let mut steps = 0u64;
@@ -308,8 +365,14 @@ impl Driver {
         // The end of the run is a crash too. Then the store opens from what
         // is durable, and every acknowledged commit must be there.
         self.stop("stops at the end of the run");
-        let (lost, verify) = self.verify();
-        let mut report = self.shared.lock().report();
+        let (lost, verify, tids) = self.verify();
+        let mut state = self.shared.lock();
+        let logs = std::mem::take(&mut state.pools.logs);
+        let mut report = state.report();
+        drop(state);
+        let (order_faults, own) = pool::check_logs(&logs, &tids);
+        report.order_faults = order_faults;
+        report.own_deliveries = own;
         report.lost = lost;
         report.verify = verify;
         report.crashes = self.crashes;
@@ -327,13 +390,11 @@ impl Driver {
         let mut state = self.shared.lock();
         match opened {
             Ok(store) => {
-                let storage = NamedStorage::new(
-                    STORAGE_NAME,
-                    Path::new(STORE_PATH),
-                    Arc::new(store),
-                    Queues::DEFAULT,
-                )
-                .started_at(start);
+                let store = Arc::new(store);
+                state.server.store = Some(Arc::clone(&store));
+                let storage =
+                    NamedStorage::new(STORAGE_NAME, Path::new(STORE_PATH), store, Queues::DEFAULT)
+                        .started_at(start);
                 let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client)
                     .with_pool(Pool::new(SIM_POOL));
                 state.server.storages = Some(Arc::new(storages));
@@ -605,6 +666,7 @@ impl Driver {
             let generation = state.server.generation;
             state.server.up = false;
             state.server.storages = None;
+            state.server.store = None;
             state.server.generation += 1;
             let conns: Vec<u64> = state
                 .conns
@@ -650,8 +712,8 @@ impl Driver {
 
     /// Open the disk after the last stop. Return the number of the
     /// acknowledged commits that it does not hold whole, records and blobs,
-    /// and the findings on the store.
-    fn verify(&mut self) -> (usize, Vec<String>) {
+    /// the findings on the store, and the tids of the store.
+    fn verify(&mut self) -> (usize, Vec<String>, BTreeSet<u64>) {
         let acked = self.shared.lock().acked.clone();
         let clock = SimClock(Arc::clone(&self.shared));
         let vfs = SimVfs::new(self.disk.clone());
@@ -660,7 +722,7 @@ impl Driver {
             Err(error) => {
                 let finding = format!("the store does not open: {error}");
                 self.shared.lock().trace(&finding);
-                return (acked.len(), vec![finding]);
+                return (acked.len(), vec![finding], BTreeSet::new());
             }
         };
         let lost = acked
@@ -679,13 +741,29 @@ impl Driver {
                 !(records && blobs)
             })
             .count();
-        let findings = findings(&store, &self.disk);
+        let mut findings = findings(&store, &self.disk);
+        let mut tids = BTreeSet::new();
+        match store.iterator(None, None) {
+            Ok(transactions) => {
+                for transaction in transactions {
+                    match transaction {
+                        Ok(transaction) => {
+                            tids.insert(transaction.tid.0);
+                        }
+                        Err(error) => {
+                            findings.push(format!("a transaction does not read: {error}"))
+                        }
+                    }
+                }
+            }
+            Err(error) => findings.push(format!("the transactions do not read: {error}")),
+        }
         let mut state = self.shared.lock();
         state.trace(format!("verify: {} acknowledged, {lost} lost", acked.len()));
         for finding in &findings {
             state.trace(format!("verify: {finding}"));
         }
-        (lost, findings)
+        (lost, findings, tids)
     }
 
     /// Move the clock to the next timer or lock deadline.
