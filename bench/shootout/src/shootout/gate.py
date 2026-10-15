@@ -6,11 +6,18 @@ storage. It then divides the `ops_per_second` of the storage by the one of
 the baseline in each scenario and cell of the baseline. The gate passes
 when every ratio that counts is at least the ratio of the gate. A cell of
 the baseline without a counterpart in the storage fails the gate, and so
-does a tree without a result of the baseline.
+does a tree without a result of the baseline. With a Python build, only
+the groups of that build count. The report prints the other groups beside
+them.
 
-The gate leaves out the scenarios of `LEFT_OUT`, because no read of these
-scenarios reaches the server. The report prints their cells with the
-verdict `left out`. These cells count neither as below nor as missing.
+`default_ratio` gives the default ratio of a storage, and `left_out` the
+cells that the gate leaves out for it, by scenario and object size. Both
+read constants of this module, not options. For most storages the gate
+leaves out `read_hot` in every size, because no read of it reaches the
+server through `ZEO.ClientStorage`. For `zoe-native` it leaves out only
+`read_hot` at 1 KB, because ZODB itself takes most of the time of a hit
+there. The report prints these cells with the verdict `left out`. They
+count neither as below nor as missing.
 """
 
 import datetime
@@ -18,32 +25,87 @@ import json
 from pathlib import Path
 from typing import TextIO
 
+from shootout import KB
 from shootout.environment import python_tag
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
-# The scenarios that the gate leaves out, each with its reason.
-LEFT_OUT = {
-    "read_hot": "it empties the object cache of the connection, then reads "
-    "the objects from the cache of ZEO.ClientStorage, so no read reaches "
-    "the server",
+# The cells that the gate leaves out, as (scenario, object size) with a
+# reason. A size of None means every size.
+LeftOut = dict[tuple[str, int | None], str]
+
+# The cells that the gate leaves out for a storage that LEFT_OUT_OF does
+# not name.
+LEFT_OUT: LeftOut = {
+    ("read_hot", None): "it empties the object cache of the connection, then "
+    "reads the objects from the cache of ZEO.ClientStorage, so no read "
+    "reaches the server",
 }
 
+# The cells that the gate leaves out for each other storage. The native
+# client of zoe-native has a cache of its own, so its read_hot at 100 KB
+# counts.
+LEFT_OUT_OF: dict[str, LeftOut] = {
+    "zoe-native": {
+        ("read_hot", KB): "ZODB itself takes most of the time of a hit there",
+    },
+}
 
-def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -> int:
-    """Write the gate report to out. Return 0 when the gate passes, else 1."""
+# The default ratio of each storage: 3 for the phase 3 gate. Any other
+# storage gets parity, the phase 2 gate.
+RATIOS = {"zoe-native": 3.0}
+PARITY = 1.0
+
+
+def default_ratio(storage: str) -> float:
+    """Return the default ratio of the gate of a storage."""
+    return RATIOS.get(storage, PARITY)
+
+
+def left_out(storage: str) -> LeftOut:
+    """Return the cells that the gate leaves out for a storage."""
+    return LEFT_OUT_OF.get(storage, LEFT_OUT)
+
+
+def _is_left_out(cell: tuple[str, str, int, int], skipped: LeftOut) -> bool:
+    name, _, _, size = cell
+    return (name, None) in skipped or (name, size) in skipped
+
+
+def _label(name: str, size: int | None) -> str:
+    """Name the cells of a scenario that the gate leaves out."""
+    return name if size is None else f"{name} at {size // KB} KB"
+
+
+def report(
+    root: Path,
+    storage: str,
+    baseline: str,
+    ratio: float,
+    out: TextIO,
+    python: str | None = None,
+) -> int:
+    """Write the gate report to out. Return 0 when the gate passes, else 1.
+
+    With python, such as cp314t, only the groups of that Python build count.
+    """
     last = _last_results(root)
     groups = sorted({group for group, name in last if name == baseline})
-    if not groups:
-        print(f"gate: no result of {baseline} under {root}", file=out)
+    counted = [group for group in groups if python in (None, group[1])]
+    if not counted:
+        where = f" on {python}" if python else ""
+        print(f"gate: no result of {baseline}{where} under {root}", file=out)
         return 1
+    skipped = left_out(storage)
 
-    below = missing = left_out = total = 0
-    for group in groups:
-        machine, python, kind = group
+    below = missing = left = total = 0
+    for group in counted + [g for g in groups if g not in counted]:
+        machine, build, kind = group
+        counts = group in counted
         base = last[group, baseline]
         other = last.get((group, storage))
-        print(f"== {machine} {python} {kind}", file=out)
+        beside = "" if counts else f" (beside {python}, does not count)"
+        print(f"== {machine} {build} {kind}{beside}", file=out)
         print(f"{baseline}: {_name(base)}", file=out)
         print(f"{storage}: {_name(other) if other else 'no result'}", file=out)
         print(
@@ -52,20 +114,24 @@ def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -
         )
         cells = _cells(other) if other else {}
         for cell, base_ops in sorted(_cells(base).items()):
-            total += 1
             ops = cells.get(cell)
             value = None if ops is None else ops / base_ops
-            if cell[0] in LEFT_OUT:
-                left_out += 1
+            if _is_left_out(cell, skipped):
                 verdict = "left out"
             elif value is None:
-                missing += 1
                 verdict = "missing"
             elif value < ratio:
-                below += 1
                 verdict = "FAIL"
             else:
                 verdict = "pass"
+            if counts:
+                total += 1
+                left += verdict == "left out"
+                missing += verdict == "missing"
+                below += verdict == "FAIL"
+            else:
+                # A row beside the gate gives its verdict in lower case.
+                verdict = verdict.lower()
             row = ROW.format(
                 *cell,
                 "-" if ops is None else f"{ops:.0f}",
@@ -75,13 +141,16 @@ def report(root: Path, storage: str, baseline: str, ratio: float, out: TextIO) -
             )
             print(row, file=out)
 
-    for name, reason in LEFT_OUT.items():
-        print(f"left out: {name}, because {reason}", file=out)
+    labels = [_label(*key) for key in skipped]
+    for label, reason in zip(labels, skipped.values(), strict=True):
+        print(f"left out: {label}, because {reason}", file=out)
     passed = below == 0 and missing == 0
+    cells = f"each cell but {', '.join(labels)}" if skipped else "each cell"
+    where = f" on {python}" if python else ""
     print(
-        f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}, "
-        f"at least {ratio:g}x in each cell but {', '.join(LEFT_OUT)}; "
-        f"{total} cells, {below} below, {missing} missing, {left_out} left out",
+        f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}"
+        f"{where}, at least {ratio:g}x in {cells}; "
+        f"{total} cells, {below} below, {missing} missing, {left} left out",
         file=out,
     )
     return 0 if passed else 1

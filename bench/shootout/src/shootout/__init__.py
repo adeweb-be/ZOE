@@ -2,7 +2,9 @@
 
 `run` measures one storage and returns one result document. The document
 validates against `bench/schema/results.schema.json`. `disk_needed` gives
-the free disk space that one value of a cell needs.
+the free disk space that one value of a cell needs. `check_cold_loads`
+checks that the server of `zoe-native` loaded each object that a
+`read_cold` value read.
 """
 
 import datetime
@@ -17,8 +19,18 @@ from pathlib import Path
 
 import pyperf
 
-from shootout import environment
-from shootout.storages import STORAGES, empty_database, server_versions, zconfig
+from shootout import environment, gil
+from shootout.storages import (
+    COUNTS_COLD_LOADS,
+    RELSTORAGE,
+    STORAGES,
+    admin_address,
+    empty_database,
+    reset_database,
+    server_loads,
+    server_versions,
+    zconfig,
+)
 
 SCHEMA_VERSION = 1
 OBJECTS_PER_TRANSACTION = 100
@@ -84,10 +96,10 @@ def disk_needed(storage: str, cell: Cell) -> int:
     A value holds the populate of zodbshootout and two calls of one
     scenario: the warmup and the value. The calls of update, or of add on a
     store that zodbshootout cannot zap, write the most. The data of
-    relstorage goes to PostgreSQL, so only the logs and the pyperf output
-    of a value go to the work directory.
+    relstorage and relstorage-hf goes to PostgreSQL, so only the logs and
+    the pyperf output of a value go to the work directory.
     """
-    if storage == "relstorage":
+    if storage in RELSTORAGE:
         return STORE_OVERHEAD
     c = cell.concurrency
     n = OBJECTS_PER_TRANSACTION
@@ -105,6 +117,24 @@ def _inner_loops(concurrency: int) -> int:
     return 100 if concurrency <= 10 else 30
 
 
+def check_cold_loads(storage: str, objects_read: int, server_loads: int) -> None:
+    """Fail a read_cold value of zoe-native that read from the client cache.
+
+    zodbshootout empties the cache of the client with `_cache.clear()`
+    before each read. So the server loads each object that the value
+    reads, at least once. Fewer loads mean that a cache of the client
+    served some reads, and the value measures that cache, not cold reads.
+    The function does nothing for the other storages.
+    """
+    if storage not in COUNTS_COLD_LOADS or server_loads >= objects_read:
+        return
+    raise RuntimeError(
+        f"read_cold of {storage}: the server counted {server_loads} loads for "
+        f"{objects_read} objects read, so a cache of the client served cold "
+        "reads: _cache.clear() does not empty it"
+    )
+
+
 def run(
     storage: str,
     quick: bool = False,
@@ -117,7 +147,8 @@ def run(
     Each value of a scenario runs in its own zodbshootout run, on a fresh
     store in a new directory under workdir. When the value succeeds, the
     function removes that directory. Before each cell, the function checks
-    that the disk of workdir has the free space of one value.
+    that the disk of workdir has the free space of one value. Each scenario
+    entry records the GIL of each worker process of its values.
     """
     store = STORAGES[storage]
     profile = QUICK if quick else FULL
@@ -126,11 +157,14 @@ def run(
     workdir.mkdir(parents=True, exist_ok=True)
     started = datetime.datetime.now(datetime.UTC)
     software = environment.SOFTWARE
-    if storage == "relstorage":
+    if storage in RELSTORAGE:
         software += environment.RELSTORAGE_SOFTWARE
-    elif storage == "zoe":
+    elif storage in ("zoe", "zoe-native"):
         software += environment.ZOE_SOFTWARE
 
+    # relstorage and relstorage-hf share the database, and each needs the
+    # schema of its own history mode.
+    reset_database(store, dsn)
     root = Path(tempfile.mkdtemp(prefix=f"{storage}-", dir=workdir))
     scenarios = []
     for index, cell in enumerate(cells):
@@ -169,23 +203,37 @@ def _run_cell(
     scenarios = []
     for bench, (scenario, _) in SCENARIOS.items():
         values = []
+        workers = []
         for number in range(profile.processes * profile.values):
             valuedir = root / f"{name}-{bench}-{number}"
             valuedir.mkdir()
             empty_database(store, dsn)
             # _run_value raises when the value fails. Then the directory and
             # its logs stay.
-            values += _run_value(store, cell, bench, valuedir, dsn)
+            times, records = _run_value(store, cell, bench, valuedir, dsn)
+            values += times
+            workers += records
             shutil.rmtree(valuedir)
             empty_database(store, dsn)
-        scenarios.append(_scenario(scenario, cell, values))
+        scenarios.append(_scenario(scenario, cell, values, workers))
     return scenarios
 
 
-def _run_value(store, cell: Cell, bench: str, workdir: Path, dsn) -> list[float]:
-    """Run one value of a scenario in workdir and return its time."""
+def _run_value(
+    store, cell: Cell, bench: str, workdir: Path, dsn
+) -> tuple[list[float], list[dict]]:
+    """Run one value of a scenario in workdir.
+
+    Return its time and the GIL record of each worker process.
+    """
     output = workdir / "pyperf.json"
     log = workdir / "zodbshootout.log"
+    records = workdir / "gil"
+    records.mkdir()
+    # The loads of the server before and after the run, for the check of
+    # read_cold.
+    loads = []
+    count_loads = bench == "cold" and store.name in COUNTS_COLD_LOADS
     with zconfig(store, workdir, dsn) as text:
         config = workdir / "zodb.conf"
         config.write_text(text)
@@ -224,20 +272,35 @@ def _run_value(store, cell: Cell, bench: str, workdir: Path, dsn) -> list[float]
         if cell.mode == "threads":
             # One DB that all threads share, as in one Zope process.
             args += ["--threads", "shared"]
+        # pyperf starts its workers with a reduced environment. The variables
+        # of the GIL record reach them, and change nothing else.
+        inherit = list(gil.INHERIT)
         if "LD_LIBRARY_PATH" in os.environ:
-            # pyperf starts its workers with a reduced environment.
-            args += ["--inherit-environ", "LD_LIBRARY_PATH"]
+            inherit.append("LD_LIBRARY_PATH")
+        args += ["--inherit-environ", ",".join(inherit)]
         args += [str(config), bench]
+        if count_loads:
+            loads.append(server_loads(admin_address(workdir)))
         with log.open("wb") as out:
-            done = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT)
+            done = subprocess.run(
+                args, stdout=out, stderr=subprocess.STDOUT, env=gil.environ(records)
+            )
+        if count_loads:
+            loads.append(server_loads(admin_address(workdir)))
+    name = SCENARIOS[bench][0]
     if done.returncode != 0 or not output.exists():
-        name = SCENARIOS[bench][0]
         raise RuntimeError(f"zodbshootout failed for {name} in {cell}:\n{_tail(log)}")
-    return _values(pyperf.BenchmarkSuite.load(str(output)), bench, cell, log)
+    benchmark = _benchmark(pyperf.BenchmarkSuite.load(str(output)), bench, cell, log)
+    if count_loads:
+        check_cold_loads(store.name, _objects(benchmark, cell), loads[1] - loads[0])
+    workers = gil.read(records)
+    if not workers:
+        raise RuntimeError(f"no worker of {name} in {cell} wrote its GIL record")
+    return list(benchmark.get_values()), workers
 
 
-def _values(suite, bench: str, cell: Cell, log: Path) -> list[float]:
-    """Return the values of one scenario from the pyperf output of a run."""
+def _benchmark(suite, bench: str, cell: Cell, log: Path) -> pyperf.Benchmark:
+    """Return the benchmark of one scenario from the pyperf output of a run."""
     name, description = SCENARIOS[bench]
     text = description.format(n=OBJECTS_PER_TRANSACTION)
     found = [b for b in suite.get_benchmarks() if b.get_name().endswith(f": {text}")]
@@ -245,10 +308,24 @@ def _values(suite, bench: str, cell: Cell, log: Path) -> list[float]:
         raise RuntimeError(
             f"zodbshootout gave no result for {name} in {cell}:\n{_tail(log)}"
         )
-    return list(found[0].get_values())
+    return found[0]
 
 
-def _scenario(name: str, cell: Cell, values: list[float]) -> dict:
+def _objects(benchmark: pyperf.Benchmark, cell: Cell) -> int:
+    """Return the objects that the workers read or wrote in a run.
+
+    Each call of a scenario, warmup or value, runs loops × inner loops
+    transactions in each worker.
+    """
+    transactions = sum(
+        (sum(loops for loops, _ in run.warmups) + len(run.values) * run.get_loops())
+        * run.get_inner_loops()
+        for run in benchmark.get_runs()
+    )
+    return cell.concurrency * OBJECTS_PER_TRANSACTION * transactions
+
+
+def _scenario(name: str, cell: Cell, values: list[float], workers: list[dict]) -> dict:
     """Turn the values of one scenario of a cell into a scenario entry."""
     # A sample is the time for the slowest worker to do one transaction.
     mean = statistics.fmean(values)
@@ -263,6 +340,7 @@ def _scenario(name: str, cell: Cell, values: list[float]) -> dict:
         "mean_seconds": mean,
         "p50_seconds": _percentile(values, 50),
         "p99_seconds": _percentile(values, 99),
+        "workers": workers,
     }
 
 
