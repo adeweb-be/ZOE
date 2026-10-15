@@ -47,12 +47,86 @@ fn a_current_entry_serves_the_snapshots_up_to_applied() {
         cache.load_before(Oid(1), Tid(6)),
         Some(record(b"five", 5, None))
     );
-    // The cache does not know the snapshots after `applied`.
-    assert_eq!(cache.load_before(Oid(1), Tid(12)), None);
+    // A later snapshot gets the newest revision that the cache knows, as
+    // from the cache of ZEO.
+    assert_eq!(
+        cache.load_before(Oid(1), Tid(12)),
+        Some(record(b"five", 5, None))
+    );
     // The revision did not exist before its start.
     assert_eq!(cache.load_before(Oid(1), Tid(5)), None);
     // `load` serves the current entry, as `ZEO.ClientStorage.load` does.
     assert_eq!(cache.load(Oid(1)), Some((b"five".to_vec(), Tid(5))));
+}
+
+/// The `maxtid` of ZODB, which `ZODB.utils.load_current` gives to
+/// `loadBefore`.
+const MAXTID: Tid = Tid(0x7fff_ffff_ffff_ffff);
+
+#[test]
+fn a_current_entry_serves_load_before_at_maxtid() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    // The cache has no server: a hit is the whole answer.
+    for before in [Tid(12), Tid(1000), MAXTID, Tid::MAX] {
+        assert_eq!(
+            cache.load_before(Oid(1), before),
+            Some(record(b"five", 5, None)),
+            "{before:?}"
+        );
+    }
+    // After a commit of the process, the new current entry serves it.
+    cache.commit(Tid(12), &[(Oid(1), Some(b"twelve".as_slice()))]);
+    assert_eq!(
+        cache.load_before(Oid(1), MAXTID),
+        Some(record(b"twelve", 12, None))
+    );
+}
+
+#[test]
+fn an_entry_that_is_not_current_never_serves_load_before_at_maxtid() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    assert!(cache.store(Oid(2), Tid(6), None, b"six", Tid(10)));
+    assert!(cache.store(Oid(3), Tid(3), Some(Tid(7)), b"three", Tid(10)));
+    // A commit of another client ends the entry of oid 1.
+    cache.apply(Tid(12), &[Oid(1)]);
+    assert_eq!(cache.load_before(Oid(1), MAXTID), None);
+    assert_eq!(cache.load_before(Oid(1), Tid(13)), None);
+    // A conflict drops the entry of oid 2.
+    cache.drop_current(Oid(2));
+    assert_eq!(cache.load_before(Oid(2), MAXTID), None);
+    // An entry with an end serves only the snapshots before its end.
+    assert_eq!(cache.load_before(Oid(3), MAXTID), None);
+    // A current reply that the commit 12 made stale never goes in.
+    assert!(!cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    assert_eq!(cache.load_before(Oid(1), MAXTID), None);
+}
+
+#[test]
+fn after_a_skipped_commit_a_current_entry_serves_only_up_to_applied() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    assert!(cache.store(Oid(2), Tid(6), None, b"six", Tid(10)));
+    // The pool delivers its commit 15 without the commits in (10, 15) of
+    // the other clients: the cache cannot tell if they changed oid 1.
+    cache.skip(Tid(15), &[Oid(2)]);
+    assert_eq!(cache.applied(), Tid(10));
+    assert_eq!(cache.load_before(Oid(1), MAXTID), None);
+    assert_eq!(cache.load_before(Oid(1), Tid(16)), None);
+    assert_eq!(cache.load_before(Oid(1), Tid(12)), None);
+    assert_eq!(cache.load_before(Oid(2), MAXTID), None);
+    // The snapshots up to `applied` stay true.
+    assert_eq!(
+        cache.load_before(Oid(1), Tid(11)),
+        Some(record(b"five", 5, None))
+    );
+    // A verification at 15 or later moves `applied` past the skipped tid.
+    cache.verify(Tid(15), Some(&[]));
+    assert_eq!(
+        cache.load_before(Oid(1), MAXTID),
+        Some(record(b"five", 5, None))
+    );
 }
 
 #[test]
@@ -521,6 +595,23 @@ fn readers_never_get_a_stale_or_torn_hit() {
                         if let Some(end) = found.end {
                             assert!(end.0 >= before);
                         }
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // A current entry at `maxtid` is never older than the
+                    // revision at `applied` before the lookup. A commit
+                    // stores its entry before it moves `applied`, so the
+                    // entry can be one tid after `applied` after the lookup.
+                    let low = cache.applied().0;
+                    let found = cache.load_before(Oid(oid), MAXTID);
+                    let high = cache.applied().0;
+                    if let Some(found) = found {
+                        assert!(found.end.is_none(), "oid {oid}");
+                        assert!(found.tid.0 >= revision(oid, low + 1), "oid {oid} at {low}");
+                        assert!(
+                            found.tid.0 <= revision(oid, high + 2),
+                            "oid {oid} at {high}"
+                        );
+                        assert_eq!(found.data, data(found.tid.0));
                         hits.fetch_add(1, Ordering::Relaxed);
                     }
                 }

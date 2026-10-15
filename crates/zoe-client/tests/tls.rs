@@ -81,6 +81,9 @@ fn signed(dir: &Path, name: &str, ca: &str, extensions: &str) {
 /// - `server-ca` signs `server`, valid for `localhost` and `127.0.0.1`.
 /// - `client-ca` signs `client`.
 /// - `other-ca` signs nothing that the test uses.
+/// - `pinned-san` is self-signed, a CA, valid for `localhost`.
+/// - `pinned-cn` is self-signed, a CA, without a SAN: its CN is
+///   `zodb.example`.
 fn certs() -> &'static Path {
     static CERTS: OnceLock<PathBuf> = OnceLock::new();
     CERTS.get_or_init(|| {
@@ -102,6 +105,21 @@ fn certs() -> &'static Path {
             "client-ca",
             "basicConstraints = critical, CA:FALSE\n\
              extendedKeyUsage = clientAuth\n",
+        );
+        openssl(
+            &dir,
+            &format!(
+                "req -x509 {NEW_KEY} -days 2 -subj /CN=pinned-san -keyout pinned-san.key \
+                 -out pinned-san.pem {CA} -addext subjectAltName=DNS:localhost"
+            ),
+        );
+        // No SAN: the name is only in the CN.
+        openssl(
+            &dir,
+            &format!(
+                "req -x509 {NEW_KEY} -days 2 -subj /CN=zodb.example -keyout pinned-cn.key \
+                 -out pinned-cn.pem {CA}"
+            ),
         );
         dir
     })
@@ -179,6 +197,111 @@ async fn a_tls_client_never_speaks_to_a_server_without_tls() {
     let server = Server::start(ServeOptions::new(fresh_dir("plain").join("store"))).unwrap();
     let opened = open(&server, "server-ca", false, "localhost").await;
     assert!(opened.is_err(), "{opened:?}");
+}
+
+#[tokio::test]
+async fn a_client_without_a_certificate_opens_when_the_server_asks_for_none() {
+    let certs = certs();
+    let tls =
+        zoe_server::serve::TlsOptions::new(certs.join("server.pem"), certs.join("server.key"));
+    let store = fresh_dir("anonymous").join("store");
+    let server = Server::start(ServeOptions::new(store).tls(tls)).unwrap();
+    let authenticate = certs.join("server-ca.pem");
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let client = open_with(server.addr(), options, "localhost")
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    client.close().await;
+    // A wrong name still fails the open.
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let refused = open_with(server.addr(), options, "example.org").await;
+    assert!(matches!(refused, Err(Error::Io(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_client_without_a_certificate_fails_the_open_when_the_server_asks_for_one() {
+    let server = serve("anonymous-refused");
+    let authenticate = certs().join("server-ca.pem");
+    let options = TlsOptions::without_certificate(Some(&authenticate));
+    let refused = open_with(server.addr(), options, "localhost").await;
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+/// Start a server with TLS that sends the self-signed certificate `name`
+/// and asks for no client certificate.
+fn serve_self_signed(name: &str) -> Server {
+    let certs = certs();
+    let tls = zoe_server::serve::TlsOptions::new(
+        certs.join(format!("{name}.pem")),
+        certs.join(format!("{name}.key")),
+    );
+    let store = fresh_dir(&format!("pinned-{name}")).join("store");
+    Server::start(ServeOptions::new(store).tls(tls)).unwrap()
+}
+
+/// Open a client of `server` without a certificate, with the file
+/// `authenticate`, the name check `check` and the server name `name`.
+async fn open_pinned(
+    server: &Server,
+    authenticate: &str,
+    check: bool,
+    name: &str,
+) -> Result<Client, Error> {
+    let file = certs().join(format!("{authenticate}.pem"));
+    let options = TlsOptions::without_certificate(Some(&file)).check_hostname(check);
+    open_with(server.addr(), options, name).await
+}
+
+#[tokio::test]
+async fn a_self_signed_server_certificate_given_as_authenticate_opens() {
+    // `pinned-san` is a self-signed CA certificate, valid for `localhost`.
+    let server = serve_self_signed("pinned-san");
+    for check in [true, false] {
+        let client = open_pinned(&server, "pinned-san", check, "localhost")
+            .await
+            .unwrap();
+        client.close().await;
+    }
+    // The name check stays: a wrong name fails with it, and opens without.
+    let refused = open_pinned(&server, "pinned-san", true, "example.org").await;
+    assert!(matches!(refused, Err(Error::Io(_))), "{refused:?}");
+    let client = open_pinned(&server, "pinned-san", false, "example.org")
+        .await
+        .unwrap();
+    client.close().await;
+    // Another self-signed certificate never matches.
+    for check in [true, false] {
+        let refused = open_pinned(&server, "pinned-cn", check, "localhost").await;
+        assert!(matches!(refused, Err(Error::Io(_))), "{check}: {refused:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_certificate_without_a_san_matches_the_name_of_its_cn() {
+    // `pinned-cn` has its name only in its CN, as the server.pem of ZEO's
+    // tests. OpenSSL then checks the CN, as Python's ssl does by default.
+    let server = serve_self_signed("pinned-cn");
+    let client = open_pinned(&server, "pinned-cn", true, "zodb.example")
+        .await
+        .unwrap();
+    client.close().await;
+    for name in ["example.org", "other.zodb.example", "localhost"] {
+        let refused = open_pinned(&server, "pinned-cn", true, name).await;
+        assert!(matches!(refused, Err(Error::Io(_))), "{name}: {refused:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_certificate_signed_by_a_pinned_certificate_still_needs_its_chain() {
+    // The server sends a certificate that `server-ca` signed. With
+    // `server-ca` pinned, the chain check of webpki runs as before: the
+    // name check of `example.org` fails, and `other-ca` fails.
+    let server = serve("chain-of-pinned");
+    let refused = open(&server, "server-ca", true, "example.org").await;
+    assert!(matches!(refused, Err(Error::Io(_))), "{refused:?}");
+    let refused = open(&server, "other-ca", false, "localhost").await;
+    assert!(matches!(refused, Err(Error::Io(_))), "{refused:?}");
 }
 
 /// Return a new directory `name` with a copy of the CA certificate of each

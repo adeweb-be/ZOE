@@ -216,7 +216,9 @@ impl NativeClient {
     ///
     /// `tls` is `None`, or the tuple `(certificate, key, authenticate,
     /// check_hostname, server_hostname)` of the files and checks of TLS.
-    /// `key` is `None` when `certificate` holds the key. `authenticate` is a
+    /// `certificate` is `None` for a client without a certificate: the
+    /// client then ignores `key`. `key` is `None` when `certificate` holds
+    /// the key. `authenticate` is a
     /// file or a directory of CA certificates, or `None` for the CA
     /// certificates of the system. The server name is
     /// `server_hostname`, else the host of the address. With TLS, the
@@ -480,15 +482,52 @@ impl NativeClient {
         to_python(py, &reply, 0)
     }
 
-    /// Send `method` with `args` on the listener as a call without a reply,
-    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
-    fn call_async(&self, py: Python<'_>, method: String, args: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Call `method` as `call` does, on the listener of `generation`, and
+    /// return `(reply, generation)`: the generation of the listener that
+    /// answered. `None` takes the listener of now. The generation changes
+    /// at each loss of the listener. When the listener of `generation` is
+    /// gone, the call sends nothing and raises the `KeyError` of an id
+    /// that the server does not know, with the first arg.
+    #[pyo3(signature = (method, args, generation=None))]
+    fn call_on<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        args: &Bound<'py, PyAny>,
+        generation: Option<u64>,
+    ) -> PyResult<(Bound<'py, PyAny>, u64)> {
         let args = args_of(args)?;
         let pool = self.pool(py)?;
         let trace = self.traceparent(py, &pool)?;
         let runtime = self.runtime;
-        py.detach(move || runtime.block_on(traced(trace, pool.notify(&method, args))))
-            .map_err(|e| client_error(py, e))
+        let (reply, generation) = py
+            .detach(move || {
+                runtime.block_on(traced(trace, pool.call_on(generation, &method, args)))
+            })
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        Ok((to_python(py, &reply, 0)?, generation))
+    }
+
+    /// Send `method` with `args` on the listener as a call without a reply,
+    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
+    /// With `generation`, send it only on the listener of that generation
+    /// (see `call_on`), else send nothing.
+    #[pyo3(signature = (method, args, generation=None))]
+    fn call_async(
+        &self,
+        py: Python<'_>,
+        method: String,
+        args: &Bound<'_, PyAny>,
+        generation: Option<u64>,
+    ) -> PyResult<()> {
+        let args = args_of(args)?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        py.detach(move || {
+            runtime.block_on(traced(trace, pool.notify_on(generation, &method, args)))
+        })
+        .map_err(|e| client_error(py, e))
     }
 
     /// Load each of `oids` before `tid` that the cache does not hold, all
@@ -1499,11 +1538,11 @@ impl Servers {
     }
 }
 
-/// The files and the checks of TLS that `zoe.zeo` gives: the certificate,
-/// the key or `None`, the CA file or directory of `authenticate` or `None`,
-/// `check_hostname` and `server_hostname` or `None`.
+/// The files and the checks of TLS that `zoe.zeo` gives: the certificate
+/// or `None`, the key or `None`, the CA file or directory of `authenticate`
+/// or `None`, `check_hostname` and `server_hostname` or `None`.
 type TlsArgs = (
-    PathBuf,
+    Option<PathBuf>,
     Option<PathBuf>,
     Option<PathBuf>,
     bool,
@@ -1521,9 +1560,10 @@ impl Secure {
     /// Read the files of `args`. An error names the file.
     fn load(args: &TlsArgs) -> Result<Self, Opening> {
         let (certificate, key, authenticate, check_hostname, server_hostname) = args;
-        let mut options = match authenticate {
-            Some(authenticate) => TlsOptions::new(certificate, authenticate),
-            None => TlsOptions::system(certificate),
+        let mut options = match (certificate, authenticate) {
+            (Some(certificate), Some(authenticate)) => TlsOptions::new(certificate, authenticate),
+            (Some(certificate), None) => TlsOptions::system(certificate),
+            (None, authenticate) => TlsOptions::without_certificate(authenticate.as_deref()),
         };
         if let Some(key) = key {
             options = options.key(key);
@@ -2097,7 +2137,7 @@ mod tests {
     fn a_tls_file_that_does_not_read_fails_the_open_and_names_it() {
         let missing = std::env::temp_dir().join(format!("zoe-py-missing-{}", std::process::id()));
         let tls = (
-            missing.join("client.pem"),
+            Some(missing.join("client.pem")),
             None,
             Some(missing.join("ca.pem")),
             true,

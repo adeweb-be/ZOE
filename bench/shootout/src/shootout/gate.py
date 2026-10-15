@@ -1,7 +1,7 @@
 """The gate report: one storage against a baseline, cell by cell.
 
 `report` reads the result documents of a results tree. For each machine,
-Python build and set (quick or full), it keeps the last result of each
+Python build and set (quick, gate or full), it keeps the last result of each
 storage. It then divides the `ops_per_second` of the storage by the one of
 the baseline in each scenario and cell of the baseline. The gate passes
 when every ratio that counts is at least the ratio of the gate. A cell of
@@ -27,6 +27,7 @@ from typing import TextIO
 
 from shootout import KB
 from shootout.environment import python_tag
+from shootout.layout import run_set
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
@@ -163,13 +164,13 @@ def _last_results(root: Path) -> dict[tuple[tuple[str, str, str], str], dict]:
     one with the latest start.
     """
     last = {}
-    for kind in ("results", "quick"):
+    for kind in ("results", "quick", "gate"):
         for path in sorted((root / kind).glob("*/*/*/*.json")):
             result = json.loads(path.read_text())
             group = (
                 result["machine"]["name"],
                 python_tag(result["python"]),
-                "quick" if result["run"]["quick"] else "full",
+                run_set(result["run"]),
             )
             key = (group, result["storage"])
             if key not in last or _started(result) > _started(last[key]):
