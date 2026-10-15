@@ -24,6 +24,10 @@
 //! commit at its turn, and `Transaction.done` ends the turn after the
 //! callback of `tpc_finish`.
 //!
+//! `Transaction.vote` resolves the conflicts that the vote lists with the
+//! callable that `zoe.zeo` gives, ZODB's `tryToResolveConflict`. The
+//! callable runs on the thread of the transaction, with no lock held.
+//!
 //! A tokio runtime of the process runs the connections. It starts at the
 //! first open of a client, never at the import. Each call waits for the
 //! server inside `py.detach`: it releases the GIL, and on a free-threaded
@@ -76,6 +80,10 @@ const POOL_BOUND: usize = 64;
 
 /// The deepest nesting of a value that the client converts.
 const DEPTH: usize = 32;
+
+/// The most rounds of conflict resolution in one vote, as the vote of
+/// `ZEO.ClientStorage` has.
+const ROUNDS: usize = 9;
 
 /// The `before` of a load of the current record: ZODB's `maxtid`.
 const MAX_TID: Tid = Tid(i64::MAX as u64);
@@ -827,26 +835,89 @@ impl NativeTransaction {
         .map_err(|e| client_error(py, e))
     }
 
-    /// Vote, and return the oids that the server resolved. A failed vote
-    /// ends the transaction: the server aborted it.
-    fn vote<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    /// Vote, resolve the conflicts that the vote lists, and return the oids
+    /// that the server or the client resolved, as `tpc_vote` of
+    /// `ZEO.ClientStorage` does. For each listed conflict, it calls
+    /// `resolve(oid, committed, read, data)` on this thread, with no lock
+    /// held, stores the result over `committed` and votes again, for at
+    /// most `ROUNDS` rounds. A vote that fails ends the transaction: the
+    /// server aborted it. An error of `resolve` or of the store of its
+    /// result, or a conflict still listed after the last round, drops the
+    /// cache entry of the oid, raises, and leaves the transaction open for
+    /// its abort.
+    fn vote<'py>(
+        &self,
+        py: Python<'py>,
+        resolve: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         check_process(self.pid)?;
-        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
-        let resolved = py
-            .detach(|| {
-                let mut slot = lock(&self.txn);
-                let txn = slot.as_mut().ok_or_else(not_open)?;
-                let voted = runtime.block_on(traced(trace, txn.vote_resolved()));
-                if voted.is_err() {
-                    let ended = slot.take();
-                    let _inside = runtime.enter();
-                    drop(ended);
+        let mut resolved: Vec<Oid> = Vec::new();
+        for round in 0..=ROUNDS {
+            let trace = traceparent(py, self.traceparent.as_ref())?;
+            let voted = py
+                .detach(|| {
+                    let mut slot = lock(&self.txn);
+                    let txn = slot.as_mut().ok_or_else(not_open)?;
+                    let voted = runtime.block_on(traced(trace, txn.vote_listed()));
+                    if voted.is_err() {
+                        let ended = slot.take();
+                        let _inside = runtime.enter();
+                        drop(ended);
+                    }
+                    voted
+                })
+                .map_err(|e| client_error(py, e))?;
+            for oid in voted.resolved {
+                if !resolved.contains(&oid) {
+                    resolved.push(oid);
                 }
-                voted
-            })
-            .map_err(|e| client_error(py, e))?;
-        Ok(resolved.into_iter().map(|oid| p64(py, oid.0)).collect())
+            }
+            if voted.conflicts.is_empty() {
+                return Ok(resolved.into_iter().map(|oid| p64(py, oid.0)).collect());
+            }
+            for listed in voted.conflicts {
+                let data = if round < ROUNDS {
+                    let args = (
+                        p64(py, listed.oid.0),
+                        p64(py, listed.committed.0),
+                        p64(py, listed.read.0),
+                        PyBytes::new(py, &listed.data),
+                    );
+                    resolve
+                        .call1(args)
+                        .and_then(|data| Ok(data.cast_into::<PyBytes>()?))
+                } else {
+                    let serials = Some((listed.committed, listed.read));
+                    let class = errors::conflict_class(py);
+                    let data = Some(listed.data.as_slice());
+                    Err(errors::conflict(py, class, listed.oid, serials, data))
+                };
+                let data = match data {
+                    Ok(data) => data,
+                    Err(error) => {
+                        self.unresolved(py, listed.oid);
+                        return Err(error);
+                    }
+                };
+                let trace = traceparent(py, self.traceparent.as_ref())?;
+                let bytes = data.as_bytes();
+                let stored = py.detach(|| {
+                    let mut slot = lock(&self.txn);
+                    let txn = slot.as_mut().ok_or_else(not_open)?;
+                    let store = txn.store_resolved(listed.oid, listed.committed, bytes);
+                    runtime.block_on(traced(trace, store))
+                });
+                if let Err(error) = stored {
+                    self.unresolved(py, listed.oid);
+                    return Err(client_error(py, error));
+                }
+                if !resolved.contains(&listed.oid) {
+                    resolved.push(listed.oid);
+                }
+            }
+        }
+        unreachable!("the last round returns or raises")
     }
 
     /// Finish the transaction after its vote, and return its tid. It
@@ -892,6 +963,19 @@ impl NativeTransaction {
             }
         })
         .map_err(|e| client_error(py, e))
+    }
+}
+
+impl NativeTransaction {
+    /// Drop the current cache entry of `oid`, whose listed conflict the
+    /// client did not resolve. After the end of the transaction, do
+    /// nothing.
+    fn unresolved(&self, py: Python<'_>, oid: Oid) {
+        py.detach(|| {
+            if let Some(txn) = lock(&self.txn).as_ref() {
+                txn.unresolved(oid);
+            }
+        });
     }
 }
 

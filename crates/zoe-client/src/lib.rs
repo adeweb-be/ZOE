@@ -22,8 +22,8 @@ mod tls;
 
 pub use cache::{Cache, CacheCounts, Copier};
 pub use client::{
-    BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
-    Transaction, traced,
+    BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Listed, Options,
+    Record, Transaction, Voted, traced,
 };
 pub use endpoint::{Address, Endpoint};
 pub use error::Error;

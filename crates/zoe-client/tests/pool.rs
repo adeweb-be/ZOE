@@ -15,7 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zoe_client::{
-    Cache, Client, Connect, Delivery, Error, Invalidation, Pool, PoolTransaction, Tokio, Turn,
+    Cache, Client, Connect, Delivery, Error, Invalidation, Listed, Pool, PoolTransaction, Tokio,
+    Turn, Voted,
 };
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
@@ -323,6 +324,70 @@ async fn a_conflict_of_a_vote_drops_the_current_entry() {
     let stale = commit(&pool, oid, Tid(0), &record(b"b")).await;
     assert!(matches!(stale, Err(Error::Conflict { .. })), "{stale:?}");
     assert_eq!(cache.load(oid), None);
+}
+
+/// Commit `oid` twice through `pool`, then begin a transaction that stores
+/// `data` over the first serial. Return the transaction and both tids.
+async fn stale(pool: &Pool, oid: Oid, data: &[u8]) -> (PoolTransaction, Tid, Tid) {
+    let first = commit(pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    let second = commit(pool, oid, first, &record(b"b")).await.unwrap().tid();
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oid, first, data).await.unwrap();
+    (txn, first, second)
+}
+
+#[tokio::test]
+async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolution() {
+    let server = start("cache-resolved");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let (mut txn, first, second) = stale(&pool, oid, &record(b"c")).await;
+    assert_eq!(cache.load(oid), Some((record(b"b"), second)));
+
+    // The vote lists the conflict, and the cache stays as it is.
+    let voted = txn.vote_listed().await.unwrap();
+    let listed = Listed {
+        oid,
+        committed: second,
+        read: first,
+        data: record(b"c"),
+    };
+    assert_eq!(voted.conflicts, vec![listed]);
+    assert!(voted.resolved.is_empty());
+    assert_eq!(cache.load(oid), Some((record(b"b"), second)));
+
+    // The resolution commits, and its turn replaces the entry of the oid
+    // with the resolved pickle.
+    txn.store_resolved(oid, second, &record(b"d"))
+        .await
+        .unwrap();
+    assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
+    let turn = txn.finish().await.unwrap().turn().await.unwrap();
+    let tid = turn.tid();
+    assert_eq!(cache.load(oid), Some((record(b"d"), tid)));
+    let ended = cache.load_before(oid, tid).unwrap();
+    assert_eq!((ended.tid, ended.end), (second, Some(tid)));
+    drop(turn);
+    assert_eq!(pool.load(oid).await.unwrap(), (record(b"d"), tid));
+}
+
+#[tokio::test]
+async fn an_unresolved_conflict_drops_the_current_entry_and_waits_for_the_abort() {
+    let server = start("cache-unresolved");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let (mut txn, _, second) = stale(&pool, oid, &record(b"c")).await;
+    assert_eq!(txn.vote_listed().await.unwrap().conflicts.len(), 1);
+    txn.unresolved(oid);
+    assert_eq!(cache.load(oid), None);
+    // The abort releases the locks of the listed conflict.
+    txn.abort().await.unwrap();
+    commit(&pool, oid, second, &record(b"e")).await.unwrap();
 }
 
 #[tokio::test]
