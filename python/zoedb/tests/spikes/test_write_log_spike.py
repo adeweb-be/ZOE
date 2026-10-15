@@ -125,7 +125,8 @@ def test_the_commit_table_has_every_row():
                         and row[columns["object size"]] == size
                         and row[columns["concurrency"]] == concurrency
                     ]
-                    assert matching, f"no row {layout} {scenario} {size} c={concurrency}"
+                    cell = f"{layout} {scenario} {size} c={concurrency}"
+                    assert matching, f"no row {cell}"
                     row = matching[0]
                     for name in ("bytes per commit", "finish p50", "finish p99"):
                         assert number(row[columns[name]]) > 0, (row, name)
