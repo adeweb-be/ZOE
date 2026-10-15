@@ -73,6 +73,79 @@ fn dry_run_on_the_command_line_wins_over_its_twin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A record of class `m.C` whose state is a dict that holds a reference
+/// to each oid of `refs`.
+fn record(refs: &[zoe_core::Oid]) -> Vec<u8> {
+    let mut p = b"\x80\x03cm\nC\nq\x00.\x80\x03}(".to_vec();
+    for (i, oid) in refs.iter().enumerate() {
+        p.push(b'K');
+        p.push(u8::try_from(i).unwrap());
+        p.extend_from_slice(b"C\x08");
+        p.extend_from_slice(&oid.0.to_be_bytes());
+        p.extend_from_slice(b"h\x00\x86Q");
+    }
+    p.extend_from_slice(b"u.");
+    p
+}
+
+/// Make a store in `dir` whose root holds an object, then drops it. Return
+/// the oid of the object.
+fn unlinked_store(dir: &Path) -> zoe_core::Oid {
+    use zoe_core::{Oid, Tid};
+
+    let (root, object) = (Oid(0), Oid(1));
+    let store = common::open(dir);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(root, Tid::ZERO, &record(&[object])).unwrap();
+    txn.store(object, Tid::ZERO, &record(&[])).unwrap();
+    txn.vote().unwrap();
+    let first = txn.finish().unwrap();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(root, first, &record(&[])).unwrap();
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    object
+}
+
+#[test]
+fn pack_gc_on_the_command_line_wins_over_its_twin() {
+    let dir = fresh_dir("pack-gc");
+    let store = dir.join("zoe");
+    let object = unlinked_store(&store);
+    let path = store.to_str().unwrap();
+    let pack = |flags: &[&str], twin: &str| {
+        let mut args = vec!["pack", "--path", path, "--days", "0"];
+        args.extend_from_slice(flags);
+        let output = run(&args, &[("ZOE_PACK_GC", twin)]);
+        assert_exit(&output, 0, &format!("{flags:?} with ZOE_PACK_GC={twin}"));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let kept = || common::open(&store).load(object).is_ok();
+
+    // A dry run reports the pack of its option, and removes nothing.
+    let report = pack(&["--dry-run"], "false");
+    assert!(
+        report.contains("records  1 ") && report.contains("objects  0"),
+        "{report}"
+    );
+    let report = pack(&["--dry-run", "--pack-gc"], "false");
+    assert!(
+        report.contains("records  2 ") && report.contains("objects  1"),
+        "{report}"
+    );
+    assert!(kept());
+
+    // Without garbage collection, the pack keeps the object.
+    pack(&[], "false");
+    assert!(kept());
+    pack(&["--pack-gc=false"], "true");
+    assert!(kept());
+    // With it, the pack removes the object.
+    pack(&["--pack-gc=true"], "false");
+    assert!(!kept());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_source_that_is_not_a_data_fs_creates_no_store() {
     let dir = fresh_dir("not-data-fs");

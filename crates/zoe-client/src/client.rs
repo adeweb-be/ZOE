@@ -8,12 +8,19 @@
 //! seconds. When one of the tasks stops, the connection closes: each call
 //! that waits for its reply fails with `Error::Disconnected`, and so does
 //! each later call.
+//!
+//! On a connection that got the extension `trace_context`, each call that
+//! runs inside `traced` carries its W3C traceparent.
 
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
+use std::io;
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 
 use rmpv::Value;
@@ -22,6 +29,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use zoe_core::{Oid, Tid};
 
 use crate::Error;
+use crate::endpoint::{Address, Endpoint};
 use crate::protocol::{self, Message, bin8, get, p64};
 use crate::runtime::{Runtime, Stream, Tokio};
 
@@ -43,6 +51,23 @@ const OIDS_PER_CALL: usize = 100;
 /// `ZEO.ClientStorage` sends it.
 pub const BLOB_CHUNK: usize = 59_000;
 
+tokio::task_local! {
+    /// The W3C traceparent of the calls of the current `traced` future.
+    static TRACEPARENT: Option<String>;
+}
+
+/// Run `future` with the W3C traceparent `traceparent`. On a connection
+/// that got the extension `trace_context`, each call that `future` sends
+/// carries it, in a fifth element of its message. A call outside `traced`,
+/// or with `None`, has four elements. The heartbeat and the abort of a
+/// dropped `Transaction` carry no traceparent.
+pub fn traced<F: Future>(
+    traceparent: Option<String>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    TRACEPARENT.scope(traceparent, future)
+}
+
 /// A client of one storage of a ZEO 6 server.
 ///
 /// Its methods take `&self`, so many calls of one client can wait for
@@ -54,6 +79,32 @@ pub struct Client {
     /// Each task of the connection holds a sender. `close` waits until
     /// every sender is gone.
     tasks: mpsc::Receiver<()>,
+    /// The reply of `get_info` at `Client::open`, or nil.
+    info: Value,
+    /// The extensions that the server accepted at `Client::open`.
+    extensions: Vec<String>,
+    /// `true` when the client registered read-only.
+    read_only: bool,
+    /// The address of the server.
+    address: Address,
+}
+
+/// One attempt of `Client::open_first` to open a client.
+type Attempt<'a> = Pin<Box<dyn Future<Output = Result<Client, Error>> + Send + 'a>>;
+
+/// What `Client::open` declares to the server in `register`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Register read-only. The server then refuses each write of the
+    /// connection with `ReadOnlyError`.
+    pub read_only: bool,
+    /// When `read_only` is false and the server refuses the register with
+    /// `ReadOnlyError`, register again read-only on the same connection,
+    /// as the `read_only_fallback` of `ZEO.ClientStorage`.
+    pub read_only_fallback: bool,
+    /// The extensions that the client declares in a third argument of
+    /// `register`. With none, `register` has two arguments.
+    pub extensions: Vec<String>,
 }
 
 /// One version of an object, as `loadBefore` gives it.
@@ -96,6 +147,17 @@ pub struct Invalidation {
 pub struct Invalidations(broadcast::Receiver<Invalidation>);
 
 impl Invalidations {
+    /// Return the next invalidation that waits, or `None` when none waits.
+    /// It does not wait. It fails as `recv` does.
+    pub fn try_recv(&mut self) -> Result<Option<Invalidation>, Error> {
+        match self.0.try_recv() {
+            Ok(invalidation) => Ok(Some(invalidation)),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => Err(Error::Disconnected),
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => Err(Error::Lagged(missed)),
+        }
+    }
+
     /// Wait for the next invalidation. It fails with `Error::Lagged` when
     /// the receiver missed invalidations, and with `Error::Disconnected`
     /// after the last invalidation of a closed connection.
@@ -125,6 +187,9 @@ struct Inner {
     commit: Arc<tokio::sync::Mutex<()>>,
     /// The id of the next transaction.
     next_txn: AtomicU64,
+    /// `true` when the server accepted `trace_context`. Only then does a
+    /// call carry a traceparent.
+    traces: AtomicBool,
 }
 
 /// The calls that wait for their replies.
@@ -152,7 +217,165 @@ impl Client {
         addr: SocketAddr,
         storage: &str,
     ) -> Result<Client, Error> {
-        let mut stream = runtime.connect(addr).await?;
+        let client = Client::handshake(runtime, &Endpoint::new(addr)).await?;
+        let reply = client
+            .inner
+            .call("register", vec![storage.into(), false.into()])
+            .await?;
+        client.registered(reply).await?;
+        Ok(client)
+    }
+
+    /// Connect to the ZEO 6 server at `addr` through `runtime`, register
+    /// with the storage `storage` as `options` says, and call `get_info`.
+    ///
+    /// The client declares `options.extensions` in a third argument of
+    /// `register`. A stock server takes two arguments only: it refuses the
+    /// third with `TypeError` and keeps the connection open and
+    /// unregistered. The client then registers again with two arguments.
+    /// The extensions that the server accepted are the names of the key
+    /// `extensions` of `get_info` that the client declared.
+    pub async fn open(
+        runtime: Arc<dyn Runtime>,
+        addr: SocketAddr,
+        storage: &str,
+        options: &Options,
+    ) -> Result<Client, Error> {
+        Client::open_endpoint(runtime, &Endpoint::new(addr), storage, options).await
+    }
+
+    /// Connect to the ZEO 6 server of `endpoint` through `runtime`, and
+    /// open the client as `Client::open` does.
+    ///
+    /// With `options.read_only_fallback`, a server that refuses a writable
+    /// register with `ReadOnlyError` gets a second `register`, read-only,
+    /// on the same connection. `Client::read_only` then tells it.
+    pub async fn open_endpoint(
+        runtime: Arc<dyn Runtime>,
+        endpoint: &Endpoint,
+        storage: &str,
+        options: &Options,
+    ) -> Result<Client, Error> {
+        let mut client = Client::handshake(runtime, endpoint).await?;
+        let mut declare = !options.extensions.is_empty();
+        let mut read_only = options.read_only;
+        let reply = loop {
+            let mut args = vec![storage.into(), read_only.into()];
+            if declare {
+                let names = options.extensions.iter();
+                args.push(Value::Array(
+                    names.map(|name| name.as_str().into()).collect(),
+                ));
+            }
+            match client.inner.call("register", args).await {
+                Err(Error::Server { class, .. }) if declare && is_type_error(&class) => {
+                    declare = false;
+                }
+                Err(Error::Server { class, .. })
+                    if !read_only && options.read_only_fallback && is_read_only_error(&class) =>
+                {
+                    read_only = true;
+                }
+                reply => break reply?,
+            }
+        };
+        client.read_only = read_only;
+        client.registered(reply).await?;
+        let info = client.inner.call("get_info", vec![]).await?;
+        client.extensions = accepted(&info, &options.extensions);
+        client.info = info;
+        let traces = client.extensions.iter().any(|name| name == TRACE_CONTEXT);
+        client.inner.traces.store(traces, Ordering::SeqCst);
+        Ok(client)
+    }
+
+    /// Open a client to one server of `endpoints`, as `ZEO.ClientStorage`
+    /// does with a list of addresses.
+    ///
+    /// The client connects to all of them at once and keeps the first that
+    /// opens as `options` asks. With `options.read_only_fallback`, a server
+    /// that registers only read-only comes after a writable one: the client
+    /// keeps the first read-only server only when no other server can open
+    /// writable, or when `wait` passes. The client closes each other
+    /// connection, so it holds one connection at the end.
+    ///
+    /// When no server opens, the open fails with the most specific error:
+    /// the first error that is not of the connection, else the last error
+    /// of a TLS handshake or of a bad stream (`InvalidData`), else the last
+    /// error of a connection. When `wait` passes first, it fails with that
+    /// error too, or with `Error::Io` of the kind `TimedOut` when no attempt
+    /// failed yet. The
+    /// attempts run in the task of the caller and through `runtime`, in the
+    /// order of `endpoints`.
+    pub async fn open_first(
+        runtime: Arc<dyn Runtime>,
+        endpoints: &[Endpoint],
+        storage: &str,
+        options: &Options,
+        wait: Duration,
+    ) -> Result<Client, Error> {
+        if endpoints.is_empty() {
+            return Err(Error::Invalid("no address to connect to".into()));
+        }
+        let mut attempts: Vec<Option<Attempt<'_>>> = endpoints
+            .iter()
+            .map(|endpoint| {
+                let attempt = Client::open_endpoint(runtime.clone(), endpoint, storage, options);
+                Some(Box::pin(attempt) as Attempt<'_>)
+            })
+            .collect();
+        let mut timeout = runtime.sleep(wait);
+        let mut fallback: Option<Client> = None;
+        let mut failure: Option<Error> = None;
+        loop {
+            // The attempts come first, in their order, then the timeout.
+            let next = poll_fn(|cx| {
+                for slot in &mut attempts {
+                    if let Some(attempt) = slot
+                        && let Poll::Ready(result) = attempt.as_mut().poll(cx)
+                    {
+                        *slot = None;
+                        return Poll::Ready(Some(result));
+                    }
+                }
+                if attempts.iter().all(Option::is_none) {
+                    return Poll::Ready(None);
+                }
+                timeout.as_mut().poll(cx).map(|()| None)
+            })
+            .await;
+            match next {
+                Some(Ok(client)) if client.read_only && !options.read_only => {
+                    // A read-only fallback waits for a writable server.
+                    if fallback.is_none() {
+                        fallback = Some(client);
+                    }
+                }
+                // The drop of the other attempts and of a fallback closes
+                // their connections.
+                Some(Ok(client)) => return Ok(client),
+                Some(Err(error)) => {
+                    if failure.as_ref().is_none_or(|kept| keeps(&error, kept)) {
+                        failure = Some(error);
+                    }
+                }
+                None => break,
+            }
+        }
+        match (fallback, failure) {
+            (Some(client), _) => Ok(client),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err(Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no server opened within {wait:?}"),
+            ))),
+        }
+    }
+
+    /// Open the stream to `endpoint`, agree on the protocol and start the
+    /// tasks of the connection.
+    async fn handshake(runtime: Arc<dyn Runtime>, endpoint: &Endpoint) -> Result<Client, Error> {
+        let mut stream = endpoint.connect(runtime.as_ref()).await?;
         match protocol::read_frame(&mut stream).await? {
             Some(theirs) if theirs == protocol::PROTOCOL => {}
             Some(theirs) => {
@@ -164,23 +387,23 @@ impl Client {
             None => return Err(Error::Disconnected),
         }
         protocol::write_frame(&mut stream, protocol::PROTOCOL).await?;
+        Ok(Client::start(runtime, stream, endpoint.address().clone()))
+    }
 
-        let client = Client::start(runtime, stream);
-        let last = match client
-            .inner
-            .call("register", vec![storage.into(), false.into()])
-            .await?
-        {
-            Value::Nil => client.inner.call("lastTransaction", vec![]).await?,
+    /// Take the last tid from the reply of `register`. A nil reply asks
+    /// the server for it with `lastTransaction`.
+    async fn registered(&self, reply: Value) -> Result<(), Error> {
+        let last = match reply {
+            Value::Nil => self.inner.call("lastTransaction", vec![]).await?,
             last => last,
         };
         let last = tid(&last, "register")?;
-        client.inner.last_tid.fetch_max(last.0, Ordering::SeqCst);
-        Ok(client)
+        self.inner.last_tid.fetch_max(last.0, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Start the tasks of the connection on `stream`.
-    fn start(runtime: Arc<dyn Runtime>, stream: Box<dyn Stream>) -> Client {
+    fn start(runtime: Arc<dyn Runtime>, stream: Box<dyn Stream>, address: Address) -> Client {
         let (outgoing, frames) = mpsc::channel(OUTGOING);
         let (closing, _) = watch::channel(false);
         let (invalidations, _) = broadcast::channel(INVALIDATIONS);
@@ -197,6 +420,7 @@ impl Client {
             invalidations: Mutex::new(Some(invalidations)),
             commit: Arc::new(tokio::sync::Mutex::new(())),
             next_txn: AtomicU64::new(1),
+            traces: AtomicBool::new(false),
         });
         let (alive, tasks) = mpsc::channel(1);
         let (reader, writer) = tokio::io::split(stream);
@@ -208,7 +432,43 @@ impl Client {
             alive.clone(),
         )));
         runtime.spawn(Box::pin(beat(inner.clone(), alive)));
-        Client { inner, tasks }
+        Client {
+            inner,
+            tasks,
+            info: Value::Nil,
+            extensions: Vec::new(),
+            read_only: false,
+            address,
+        }
+    }
+
+    /// Return the reply of `get_info` at `Client::open`: a map of the
+    /// server, such as `length`, `size` and `supportsUndo`. A client of
+    /// `connect` did not call `get_info`, and gets nil.
+    pub fn info(&self) -> &Value {
+        &self.info
+    }
+
+    /// Return the extensions that the server accepted at `Client::open`.
+    pub fn extensions(&self) -> &[String] {
+        &self.extensions
+    }
+
+    /// Return the address of the server.
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    /// Tell if the client registered read-only: as `Options::read_only`
+    /// asked, or after a read-only fallback.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Tell if the connection is open: no call failed yet with
+    /// `Error::Disconnected` because the connection closed.
+    pub fn is_connected(&self) -> bool {
+        !lock(&self.inner.calls).closed
     }
 
     /// Return the last tid that the client knows: the tid of `register`,
@@ -281,6 +541,33 @@ impl Client {
         }))
     }
 
+    /// Load the record of `oid` that the transaction `serial` wrote. An
+    /// oid without such a record fails with the `POSKeyError` of the
+    /// server.
+    pub async fn load_serial(&self, oid: Oid, serial: Tid) -> Result<Vec<u8>, Error> {
+        let reply = self
+            .inner
+            .call("loadSerial", vec![bin8(oid.0), bin8(serial.0)])
+            .await?;
+        match reply.as_slice() {
+            Some(data) => Ok(data.to_vec()),
+            None => Err(bad("loadSerial", &reply)),
+        }
+    }
+
+    /// Return the next value of the sequence `name` of the store. It needs
+    /// the extension `sequences`: without it, it fails with
+    /// `Error::Unsupported` and sends nothing.
+    pub async fn sequence_next(&self, name: &str) -> Result<u64, Error> {
+        if !self.extensions.iter().any(|accepted| accepted == SEQUENCES) {
+            return Err(Error::Unsupported(format!(
+                "the server did not accept the extension {SEQUENCES}"
+            )));
+        }
+        let reply = self.inner.call("sequence_next", vec![name.into()]).await?;
+        reply.as_u64().ok_or_else(|| bad("sequence_next", &reply))
+    }
+
     /// Return at most `size` entries of the history of `oid`, newest first.
     pub async fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>, Error> {
         let reply = self
@@ -316,6 +603,22 @@ impl Client {
         description: &[u8],
         extension: &[u8],
     ) -> Result<Transaction, Error> {
+        self.begin_with(user, description, extension, None, " ")
+            .await
+    }
+
+    /// Begin a transaction as `begin` does, with the tid and the status of
+    /// `tpc_begin`. With a tid, the transaction commits under that tid, as
+    /// ZODB's copy functions ask. `status` is `" "`, or `"p"` for a
+    /// transaction that a pack changed.
+    pub async fn begin_with(
+        &self,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+        tid: Option<Tid>,
+        status: &str,
+    ) -> Result<Transaction, Error> {
         let extension = extension_map(extension)?;
         let guard = self.inner.commit.clone().lock_owned().await;
         let id = self.inner.next_txn.fetch_add(1, Ordering::SeqCst);
@@ -327,8 +630,8 @@ impl Client {
                     user.into(),
                     description.into(),
                     extension,
-                    Value::Nil,
-                    " ".into(),
+                    tid.map_or(Value::Nil, |tid| bin8(tid.0)),
+                    status.into(),
                 ],
             )
             .await?;
@@ -355,6 +658,13 @@ impl Client {
             Some(sender) => Invalidations(sender.subscribe()),
             None => Invalidations(broadcast::channel(1).1),
         }
+    }
+
+    /// Close the connection, and do not wait for its tasks. Each call that
+    /// waits fails with `Error::Disconnected`, and so does each later
+    /// call.
+    pub fn disconnect(&self) {
+        self.inner.closing.send_replace(true);
     }
 
     /// Close the connection, and wait until its tasks stop.
@@ -409,6 +719,20 @@ impl Transaction {
             .await
     }
 
+    /// Ask the server to check at the vote that `serial` is still the
+    /// current serial of `oid`. A stale serial fails the vote with
+    /// `Error::ReadConflict`. After a failed vote, it fails with
+    /// `Error::Invalid` and sends nothing.
+    pub async fn check_current_serial(&mut self, oid: Oid, serial: Tid) -> Result<(), Error> {
+        self.check()?;
+        self.inner
+            .notify(
+                "checkCurrentSerialInTransaction",
+                vec![bin8(oid.0), bin8(serial.0), self.id.into()],
+            )
+            .await
+    }
+
     /// Store `data` for `oid` with the blob `blob`, as `ZEO.ClientStorage`
     /// does without a shared blob directory: `storea`, then
     /// `storeBlobStart`, one `storeBlobChunk` per chunk of `BLOB_CHUNK`
@@ -441,13 +765,20 @@ impl Transaction {
     /// `Error::Invalid`. A stock server can list the oids that it resolved:
     /// the vote passes, and the client ignores these oids.
     pub async fn vote(&mut self) -> Result<(), Error> {
+        self.vote_resolved().await.map(drop)
+    }
+
+    /// Vote as `vote` does, and return the oids that the server resolved.
+    /// The server stored another pickle than the client for each of them,
+    /// so the client must load them again.
+    pub async fn vote_resolved(&mut self) -> Result<Vec<Oid>, Error> {
         self.check()?;
         let result = match self.inner.call("vote", vec![self.id.into()]).await {
             // A stock server lists the oids that it resolved, and a server
             // with conflict resolution in the client lists the conflicts.
             Ok(Value::Array(items)) => match items.iter().find(|item| item.is_map()) {
                 Some(item) => Err(protocol::conflict(item).unwrap_or_else(|| bad("vote", item))),
-                None => Ok(()),
+                None => items.iter().map(|item| oid(item, "vote")).collect(),
             },
             Ok(other) => Err(bad("vote", &other)),
             Err(e) => Err(e),
@@ -535,7 +866,7 @@ impl Inner {
         };
         // The guard forgets the call when its future is dropped.
         let _forget = Forget { inner: self, id };
-        let frame = protocol::call(id, method, args)?;
+        let frame = protocol::call(id, method, args, self.traceparent().as_deref())?;
         self.outgoing
             .send(frame)
             .await
@@ -548,11 +879,20 @@ impl Inner {
         if lock(&self.calls).closed {
             return Err(Error::Disconnected);
         }
-        let frame = protocol::notify(method, args)?;
+        let frame = protocol::notify(method, args, self.traceparent().as_deref())?;
         self.outgoing
             .send(frame)
             .await
             .map_err(|_| Error::Disconnected)
+    }
+
+    /// Return the traceparent of the current `traced` future when the
+    /// server accepted `trace_context`, else `None`.
+    fn traceparent(&self) -> Option<String> {
+        if !self.traces.load(Ordering::SeqCst) {
+            return None;
+        }
+        TRACEPARENT.try_with(Clone::clone).ok().flatten()
     }
 
     /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
@@ -570,7 +910,7 @@ impl Inner {
             calls.next_id += 1;
             id
         };
-        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()]) else {
+        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()], None) else {
             return;
         };
         if let Err(mpsc::error::TrySendError::Full(frame)) = self.outgoing.try_send(frame) {
@@ -712,6 +1052,62 @@ async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
     }
 }
 
+/// The extension of the sequences.
+const SEQUENCES: &str = "sequences";
+
+/// The extension that lets a call carry the trace context of the client.
+const TRACE_CONTEXT: &str = "trace_context";
+
+/// Tell if `class` is the class of a `TypeError`, as `builtins.TypeError`.
+fn is_type_error(class: &str) -> bool {
+    class.rsplit('.').next() == Some("TypeError")
+}
+
+/// Tell if the exception class `class` is a `ReadOnlyError`, of any
+/// module.
+fn is_read_only_error(class: &str) -> bool {
+    class.rsplit('.').next() == Some("ReadOnlyError")
+}
+
+/// Tell if `error` is an error of the connection, which a later attempt
+/// can avoid: the stream failed or closed.
+fn is_of_the_connection(error: &Error) -> bool {
+    matches!(error, Error::Io(_) | Error::Disconnected)
+}
+
+/// Return how specific `error` is. An error of the server or of the
+/// protocol tells the most. A failed TLS handshake or a bad stream
+/// (`InvalidData`) comes next. A refused, lost or closed connection tells
+/// the least.
+fn specificity(error: &Error) -> u8 {
+    match error {
+        Error::Io(error) if error.kind() == io::ErrorKind::InvalidData => 1,
+        error if is_of_the_connection(error) => 0,
+        _ => 2,
+    }
+}
+
+/// Tell if `Client::open_first` keeps the new error `error` in place of
+/// `kept`: a more specific error, or a later error of the connection.
+fn keeps(error: &Error, kept: &Error) -> bool {
+    let (new, old) = (specificity(error), specificity(kept));
+    new > old || (new == old && new < 2)
+}
+
+/// Return the names of the key `extensions` of the map `info` that the
+/// client declared in `declared`, in the order of the server.
+fn accepted(info: &Value, declared: &[String]) -> Vec<String> {
+    let Some(Value::Array(names)) = get(info, "extensions") else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| declared.iter().any(|declared| declared.as_str() == *name))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Read the args `[tid, [oid, ...]]` of `invalidateTransaction`.
 fn invalidation(args: &Value) -> Option<Invalidation> {
     let [tid, oids] = <&[Value; 2]>::try_from(args.as_array()?.as_slice()).ok()?;
@@ -777,6 +1173,70 @@ mod tests {
         ] {
             assert!(matches!(extension_map(&bad), Err(Error::Invalid(_))));
         }
+    }
+
+    #[test]
+    fn a_type_error_of_any_module_is_a_type_error() {
+        assert!(is_type_error("builtins.TypeError"));
+        assert!(is_type_error("exceptions.TypeError"));
+        assert!(!is_type_error("builtins.ValueError"));
+        assert!(!is_type_error("ZODB.POSException.NotTypeError"));
+    }
+
+    #[test]
+    fn a_read_only_error_of_any_module_is_a_read_only_error() {
+        assert!(is_read_only_error("ZODB.POSException.ReadOnlyError"));
+        assert!(is_read_only_error("ReadOnlyError"));
+        assert!(!is_read_only_error("ZODB.POSException.ConflictError"));
+        assert!(!is_read_only_error("ZODB.POSException.NotReadOnlyError"));
+    }
+
+    #[test]
+    fn only_a_failed_or_closed_stream_is_an_error_of_the_connection() {
+        let refused = Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(is_of_the_connection(&refused));
+        assert!(is_of_the_connection(&Error::Disconnected));
+        let server = Error::Server {
+            class: "builtins.ValueError".into(),
+            message: "unknown storage: 2".into(),
+        };
+        assert!(!is_of_the_connection(&server));
+        assert!(!is_of_the_connection(&Error::Protocol("M4".into())));
+    }
+
+    #[test]
+    fn the_open_keeps_the_most_specific_error() {
+        let refused = || Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let handshake = || Error::Io(io::Error::new(io::ErrorKind::InvalidData, "UnknownIssuer"));
+        let server = || Error::Server {
+            class: "builtins.ValueError".into(),
+            message: String::new(),
+        };
+        // A TLS error is not lost behind a later refused connection.
+        assert!(!keeps(&refused(), &handshake()));
+        assert!(keeps(&handshake(), &refused()));
+        // An error of the server stays over every error of a connection.
+        assert!(!keeps(&handshake(), &server()));
+        assert!(keeps(&server(), &handshake()));
+        // The first error of a server stays, and a later error of a
+        // connection of the same rank replaces an earlier one.
+        assert!(!keeps(&server(), &server()));
+        assert!(keeps(&refused(), &Error::Disconnected));
+        assert!(keeps(&handshake(), &handshake()));
+    }
+
+    #[test]
+    fn the_accepted_extensions_are_the_declared_names_of_get_info() {
+        let declared = vec!["sequences".to_owned(), "other".to_owned()];
+        let info = Value::Map(vec![(
+            "extensions".into(),
+            Value::Array(vec!["sequences".into(), "unknown".into()]),
+        )]);
+        assert_eq!(accepted(&info, &declared), vec!["sequences".to_owned()]);
+        // A stock server gives no key `extensions`.
+        let stock = Value::Map(vec![("length".into(), 0.into())]);
+        assert!(accepted(&stock, &declared).is_empty());
+        assert!(accepted(&Value::Nil, &declared).is_empty());
     }
 
     #[test]
