@@ -2,6 +2,7 @@
 
 use std::io;
 
+use rmpv::Value;
 use zoe_core::{Oid, Tid};
 
 /// An error of a call of the client.
@@ -10,13 +11,17 @@ use zoe_core::{Oid, Tid};
 pub enum Error {
     /// The server answered with an error. `class` is the class name of the
     /// exception, as `ZODB.POSException.POSKeyError`. `message` shows the
-    /// value of the exception.
+    /// value of the exception. `value` is that value as the server sent
+    /// it: the array of the args, or the map of the attributes.
     #[error("{class}: {message}")]
     Server {
         /// The module and the name of the exception class.
         class: String,
         /// The args or the attributes of the exception, as text.
         message: String,
+        /// The args or the attributes of the exception, as the server
+        /// sent them. So a bytes argument, such as an oid, stays bytes.
+        value: Value,
     },
 
     /// A store of the transaction has a stale serial: a

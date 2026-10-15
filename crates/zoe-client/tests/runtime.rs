@@ -1173,3 +1173,40 @@ async fn a_failed_read_of_a_blob_ends_the_transaction() {
     );
     client.close().await;
 }
+
+#[tokio::test]
+async fn open_sends_the_client_label_after_get_info() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(4).await;
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "get_info");
+        peer.reply(id, Value::Map(vec![("length".into(), 1.into())]))
+            .await;
+        // The label goes without a reply, as ZEO sends it.
+        let (id, flags, method, args) = peer.recv().await;
+        assert_eq!(method, "set_client_label");
+        assert_eq!((id, flags), (Value::from(0), Value::from(true)));
+        assert_eq!(args, Value::Array(vec!["worker".into()]));
+        // An `info` call before the reply of a call is in the info of the
+        // client when the call returns.
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "ping");
+        let sizes = Value::Map(vec![("length".into(), 3.into()), ("size".into(), 9.into())]);
+        peer.notify("info", vec![sizes]).await;
+        peer.reply(id, Value::Nil).await;
+        peer
+    });
+    let options = Options {
+        client_label: Some("worker".to_owned()),
+        ..Options::default()
+    };
+    let client = Client::open(runtime, addr(), "1", &options).await.unwrap();
+    assert_eq!(client.pushed_info(), None);
+    client.ping().await.unwrap();
+    let (_, pushed) = client.pushed_info().unwrap();
+    let sizes = Value::Map(vec![("length".into(), 3.into()), ("size".into(), 9.into())]);
+    assert_eq!(pushed, sizes);
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
