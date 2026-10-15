@@ -2,7 +2,7 @@
 //! bytes of the frame. The read of a frame has a limit, the option
 //! `--max-frame-size` of `zoe serve`.
 
-use std::io;
+use std::io::{self, IoSlice};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -13,6 +13,7 @@ const RESERVE: usize = 1 << 20;
 
 /// Return the frame of `payload`: its length, then its bytes. A payload
 /// longer than `u32::MAX` bytes fails with `InvalidInput`.
+#[cfg(test)]
 pub(crate) fn encode(payload: &[u8]) -> io::Result<Vec<u8>> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too long"))?;
@@ -60,7 +61,35 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
 
 /// Write the frame of `payload` to `writer`.
 pub(crate) async fn write<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
-    writer.write_all(&encode(payload)?).await
+    write_parts(writer, &[payload]).await
+}
+
+/// Write the frame of the payload `parts` to `writer`: its length, then
+/// each part in its order. The bytes of the parts go to the writer as they
+/// are, with no copy, in one vectored write when the writer takes them all.
+/// A payload longer than `u32::MAX` bytes fails with `InvalidInput`.
+pub(crate) async fn write_parts<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    parts: &[&[u8]],
+) -> io::Result<()> {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    let len = u32::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too long"))?;
+    let len = len.to_be_bytes();
+    let mut slices: Vec<IoSlice<'_>> = std::iter::once(&len[..])
+        .chain(parts.iter().copied())
+        .filter(|part| !part.is_empty())
+        .map(IoSlice::new)
+        .collect();
+    let mut slices = &mut slices[..];
+    while !slices.is_empty() {
+        let written = writer.write_vectored(slices).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut slices, written);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -99,6 +128,48 @@ mod tests {
             );
             assert_eq!(read(&mut reader, MAX).await.unwrap(), None);
         });
+    }
+
+    /// A writer that takes at most 3 bytes for each call, from the first
+    /// buffer that is not empty.
+    struct Slow(Vec<u8>);
+
+    impl AsyncWrite for Slow {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let n = bytes.len().min(3);
+            self.0.extend_from_slice(&bytes[..n]);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_frame_go_out_whole_and_in_order() {
+        let parts: [&[u8]; 4] = [b"head", b"", b"the data", b"t"];
+        let mut slow = Slow(Vec::new());
+        block_on(write_parts(&mut slow, &parts)).unwrap();
+        assert_eq!(slow.0, encode(b"headthe datat").unwrap());
+        // A writer that takes all the parts at once gets the same bytes.
+        let mut whole = Vec::new();
+        block_on(write_parts(&mut whole, &parts)).unwrap();
+        assert_eq!(whole, slow.0);
     }
 
     #[test]

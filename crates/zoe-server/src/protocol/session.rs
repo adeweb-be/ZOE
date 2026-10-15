@@ -36,7 +36,7 @@ use super::invalidation::{ClientId, Commit, Others};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::negotiation;
-use super::outbox::{Outbox, Room};
+use super::outbox::{Outbox, Parts, Room};
 use super::status::Stats;
 use super::{NamedStorage, Stopping, Storages};
 use crate::runtime::Runtime;
@@ -50,6 +50,12 @@ const MAX_NEW_OIDS: u64 = 100;
 /// The reads of a `loadBefore` that can each meet a publication before
 /// the call reads under the mutex of the hub.
 const LOAD_TRIES: usize = 3;
+
+/// The address and the length of each record that `Store::load_before`
+/// gave to a `loadBefore` of the tests. A test finds there the buffer of
+/// the store, and then looks for it at the socket.
+#[cfg(test)]
+pub(crate) static LOADED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// The class of a conflict error of ZODB.
 const CONFLICT_ERROR: &str = "ZODB.POSException.ConflictError";
@@ -284,6 +290,10 @@ pub(crate) enum Outcome {
     /// A `tpc_finish` that committed. Its reply went out with the
     /// invalidations of the commit.
     Published,
+    /// A load that found a record. The call put its reply in the session
+    /// queue itself, with the buffer of the record in it, so the outcome
+    /// holds no copy of the record.
+    Sent,
     /// The client is gone. The connection ends.
     Gone,
     /// The exception of the call.
@@ -309,6 +319,9 @@ pub(crate) struct Reply {
     room: Option<Room>,
     /// The call put its reply itself. False when the connection was closed.
     sent: Option<bool>,
+    /// The bytes of the reply that the call put itself, for the tests.
+    #[cfg(test)]
+    frame: Option<Vec<u8>>,
 }
 
 impl Reply {
@@ -317,7 +330,17 @@ impl Reply {
         Self {
             room: Some(room),
             sent: None,
+            #[cfg(test)]
+            frame: None,
         }
+    }
+
+    /// Keep a copy of the bytes of the frame `parts` that the call puts
+    /// itself, and give `parts` back.
+    #[cfg(test)]
+    fn keep(&mut self, parts: Option<Parts>) -> Option<Parts> {
+        self.frame = parts.as_ref().map(|parts| parts.concat());
+        parts
     }
 
     /// Put the reply of `call`, whose outcome is `outcome`, in the queue of
@@ -328,7 +351,7 @@ impl Reply {
     /// closes the connection, as ZEO does.
     pub(crate) fn send(self, call: &Call, outcome: Outcome, outbox: &Outbox) -> bool {
         let frame = match outcome {
-            Outcome::Published => None,
+            Outcome::Published | Outcome::Sent => None,
             Outcome::Gone => return false,
             Outcome::Done(_) if call.oneway => None,
             // The text that a client sends goes only into fields, never
@@ -693,7 +716,7 @@ impl Session {
             }),
             "getTid" => self.get_tid(args),
             "new_oids" => self.new_oids(args),
-            "loadBefore" => self.load_before(call, reply),
+            "loadBefore" => return self.load_before(call, reply),
             "loadSerial" => self.load_serial(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
@@ -780,35 +803,48 @@ impl Session {
     ///
     /// A publication during the read makes the call read again. After
     /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
-    fn load_before(&self, call: &Call, reply: &mut Reply) -> Result<Value, Fault> {
-        let [oid, tid] = arity::<2>(&call.args, "loadBefore")?;
-        let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
+    fn load_before(&self, call: &Call, reply: &mut Reply) -> Outcome {
+        let parsed = arity::<2>(&call.args, "loadBefore")
+            .and_then(|[oid, tid]| Ok((Oid(u64_of(oid)?), Tid(u64_of(tid)?))));
+        let (oid, tid) = match parsed {
+            Ok(parsed) => parsed,
+            Err(fault) => return Outcome::Failed(fault),
+        };
         let store = &self.store;
-        let read = |published: Tid| -> (Result<Value, Fault>, Option<Vec<u8>>) {
+        let read = |published: Tid| -> (Outcome, Option<Parts>) {
             let before = tid.min(Tid(published.0.saturating_add(1)));
-            let value = store.load_before(oid, before).map_err(Fault::from);
-            let value = value.map(|record| match record {
-                Some(record) => Value::Array(vec![
-                    Value::Binary(record.data),
-                    p64(record.serial.0),
-                    record
+            let outcome = match store.load_before(oid, before) {
+                Ok(Some(record)) => {
+                    #[cfg(test)]
+                    LOADED
+                        .lock()
+                        .unwrap()
+                        .push((record.data.as_ptr() as usize, record.data.len()));
+                    // The buffer of the record goes into the frame as it
+                    // is, with no copy. A call without a reply puts an
+                    // empty place.
+                    let next = record
                         .next
                         .filter(|next| *next <= published)
-                        .map_or(Value::Nil, |next| p64(next.0)),
-                ]),
-                None => Value::Nil,
-            });
-            // A call without a reply puts an empty place.
-            let frame = match &value {
+                        .map_or(Value::Nil, |next| p64(next.0));
+                    let parts = (!call.oneway).then(|| {
+                        message::load_reply(&call.id, record.data, &p64(record.serial.0), &next)
+                    });
+                    return (Outcome::Sent, parts);
+                }
+                Ok(None) => Outcome::Done(Value::Nil),
+                Err(error) => Outcome::Failed(Fault::from(error)),
+            };
+            let frame = match &outcome {
                 _ if call.oneway => None,
-                Ok(value) => Some(message::reply_of(&call.id, value)),
-                Err(fault) => Some(message::error(
+                Outcome::Failed(fault) => Some(message::error(
                     call.id.clone(),
                     fault.class,
                     fault.args.clone(),
                 )),
+                _ => Some(message::reply_of(&call.id, &Value::Nil)),
             };
-            (value, frame)
+            (outcome, frame.map(|frame| vec![frame]))
         };
         let invalidations = &self.storage.invalidations;
         let mut room = reply
@@ -819,18 +855,33 @@ impl Session {
             let seen = invalidations.published();
             // An error goes into the queue too, so it goes out in the room
             // of the call and never waits for the client.
-            let (value, frame) = read(seen);
+            let (outcome, frame) = read(seen);
+            #[cfg(test)]
+            let frame = reply.keep(frame);
             match invalidations.put_since(seen, room, frame) {
                 Ok(sent) => {
                     reply.sent = Some(sent);
-                    return value;
+                    return outcome;
                 }
                 Err(back) => room = back,
             }
         }
-        let (value, sent) = invalidations.read_put(room, read);
+        #[cfg(test)]
+        let mut kept = None;
+        let (outcome, sent) = invalidations.read_put(room, |published| {
+            let (outcome, frame) = read(published);
+            #[cfg(test)]
+            {
+                kept = frame.as_ref().map(|parts| parts.concat());
+            }
+            (outcome, frame)
+        });
+        #[cfg(test)]
+        {
+            reply.frame = kept;
+        }
         reply.sent = Some(sent);
-        value
+        outcome
     }
 
     /// Send the blob of `oid` at `serial` to the client: `receiveBlobStart`,
@@ -1978,7 +2029,19 @@ mod tests {
             let mut reply = Reply::new(self.session.outbox.blocking_room());
             let outcome = self.session.call(call, &mut reply);
             self.sent = reply.sent.take();
-            outcome
+            match outcome {
+                // The result of a load that put its reply is in the frame.
+                Outcome::Sent => {
+                    let frame = reply.frame.expect("the call put a frame");
+                    let message = rmpv::decode::read_value(&mut frame.as_slice()).unwrap();
+                    let Value::Array(mut parts) = message else {
+                        panic!("a reply is not an array: {message:?}");
+                    };
+                    assert_eq!(parts[1], Value::from(0), "{parts:?}");
+                    Outcome::Done(parts.pop().unwrap())
+                }
+                outcome => outcome,
+            }
         }
     }
 
@@ -2545,7 +2608,7 @@ mod tests {
             Outcome::Done(value) => Some(message::reply(call.id, value)),
             Outcome::Failed(fault) => Some(message::error(call.id, fault.class, fault.args)),
             Outcome::Close(why) => panic!("the session closed: {why}"),
-            Outcome::Published => panic!("the reply went to the outbox"),
+            Outcome::Published | Outcome::Sent => panic!("the reply went to the outbox"),
             Outcome::Gone => panic!("the client is gone"),
         }
     }
@@ -2775,7 +2838,7 @@ mod tests {
             .unwrap();
         runtime.block_on(sent.recv()).unwrap();
         let vote = runtime.block_on(sent.recv()).unwrap();
-        let reply = rmpv::decode::read_value(&mut vote.as_slice()).unwrap();
+        let reply = rmpv::decode::read_value(&mut vote.to_vec().as_slice()).unwrap();
         assert_eq!(reply.as_array().unwrap()[0], Value::from(2));
         let conflicts = &reply.as_array().unwrap()[3];
         assert_eq!(conflicts.as_array().map(Vec::len), Some(1));
@@ -3353,7 +3416,7 @@ mod tests {
     fn messages(frames: &mut Inbox) -> Vec<(String, Value)> {
         let mut taken = Vec::new();
         while let Some(frame) = frames.try_recv() {
-            let message = rmpv::decode::read_value(&mut frame.as_slice()).unwrap();
+            let message = rmpv::decode::read_value(&mut frame.to_vec().as_slice()).unwrap();
             let Value::Array(parts) = message else {
                 panic!("a message is not an array: {message:?}");
             };

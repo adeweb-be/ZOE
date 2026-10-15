@@ -541,11 +541,14 @@ pub(crate) async fn serve_stream(
                         None => break,
                     },
                 };
+                // The parts go to the socket from their own buffers.
+                let parts = frame.parts();
                 let written = tokio::select! {
                     biased;
                     () = closing.wait() => break,
-                    written = frame::write(&mut writer, frame.as_slice()) => written,
+                    written = frame::write_parts(&mut writer, &parts) => written,
                 };
+                drop(parts);
                 if written.is_err() {
                     break;
                 }
@@ -1041,6 +1044,159 @@ mod tests {
         let mean = handoffs as f64 / COUNTED_LOADS as f64;
         println!("handoffs per load of 1 KB: {mean:.2}");
         assert!(mean <= 3.0, "{mean:.2} handoffs per load");
+        drop(runtime);
+    }
+
+    /// A writer that records the address and the length of each buffer
+    /// that the server gives to it, then writes to `inner`.
+    struct Recording<W> {
+        inner: W,
+        seen: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl<W> Recording<W> {
+        fn note(&self, bytes: &[u8]) {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push((bytes.as_ptr() as usize, bytes.len()));
+        }
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for Recording<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.note(bytes);
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            parts: &[io::IoSlice<'_>],
+        ) -> std::task::Poll<io::Result<usize>> {
+            for part in parts {
+                self.note(part);
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, parts)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The size of the records of the test of the copies. No other test
+    /// loads a record of this size.
+    const UNCOPIED: usize = 100_003;
+
+    /// The bytes of a record of 100 KB go from the buffer that the store
+    /// gives to the write to the socket, with no copy in the server. The
+    /// test records the address of each buffer that `Store::load_before`
+    /// gives to a load, and the address of each buffer that the writer of
+    /// the connection gives to the socket. Each loaded buffer must reach
+    /// the socket whole.
+    #[test]
+    fn the_bytes_of_a_record_of_100_kb_reach_the_socket_without_a_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-uncopied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        // Bytes that do not compress, so the store keeps them as they are.
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let record: Vec<u8> = (0..UNCOPIED)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        for oid in 1..=4 {
+            txn.store(zoe_core::Oid(oid), Tid(0), &record).unwrap();
+        }
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        let storage = Arc::new(NamedStorage::new("1", &dir, store, Queues::DEFAULT));
+        let storages = Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&written);
+        runtime.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let writer = Recording {
+                inner: writer,
+                seen,
+            };
+            let connection = Connection {
+                peer: "test".to_owned(),
+                runtime: Arc::new(Tokio),
+                max_frame_size: crate::serve::DEFAULT_MAX_FRAME_SIZE.get(),
+                idle_timeout: None,
+                read_only: false,
+                socket: None,
+            };
+            serve_stream(reader, writer, connection, storages, never_stops()).await;
+        });
+
+        let mut client = registered(addr);
+        let loaded = Value::Array(vec![
+            Value::Binary(record.clone()),
+            session::p64(tid.0),
+            Value::Nil,
+        ]);
+        for id in 2..22 {
+            let oid = 1 + u64::try_from(id % 4).unwrap();
+            let args = vec![session::p64(oid), session::p64(u64::MAX)];
+            send(&mut client, id, "loadBefore", args);
+            let reply = read_frame(&mut client);
+            let reply = rmpv::decode::read_value(&mut reply.as_slice()).unwrap();
+            let expected = vec![
+                Value::from(id),
+                Value::from(0),
+                Value::from(".reply"),
+                loaded.clone(),
+            ];
+            assert_eq!(reply, Value::Array(expected));
+        }
+        let loads: Vec<(usize, usize)> = session::LOADED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, len)| *len == UNCOPIED)
+            .copied()
+            .collect();
+        assert_eq!(loads.len(), 20);
+        let written = written.lock().unwrap();
+        let uncopied = loads.iter().filter(|load| written.contains(load)).count();
+        println!("records of 100 KB that reached the socket without a copy: {uncopied} of 20");
+        assert_eq!(uncopied, 20);
+        drop(written);
         drop(runtime);
     }
 

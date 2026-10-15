@@ -149,6 +149,39 @@ pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
     bytes
 }
 
+/// Encode the reply to the call `id` of a load that found a record:
+/// `[data, serial, next]`. Return it in three parts: the bytes before
+/// `data`, `data` itself in its own buffer, and the bytes after it. The
+/// parts one after the other are the bytes of `reply_of` with the same
+/// values, so a stock client gets the same frame. `data` is not copied.
+pub(crate) fn load_reply(id: &Value, data: Vec<u8>, serial: &Value, next: &Value) -> Vec<Vec<u8>> {
+    let mut head = Vec::with_capacity(32 + size_hint(id));
+    // An array of 4 values, then the id, the flags 0 and the method.
+    head.push(0x94);
+    write(&mut head, id);
+    head.push(0x00);
+    head.push(0xa6);
+    head.extend_from_slice(b".reply");
+    // The result: an array of 3 values, the first of them bin data.
+    head.push(0x93);
+    let len = data.len();
+    if let Ok(len) = u8::try_from(len) {
+        head.extend_from_slice(&[0xc4, len]);
+    } else if let Ok(len) = u16::try_from(len) {
+        head.push(0xc5);
+        head.extend_from_slice(&len.to_be_bytes());
+    } else {
+        // A record is shorter than 4 GiB: the core refuses a longer one.
+        let len = u32::try_from(len).expect("a record of less than 4 GiB");
+        head.push(0xc6);
+        head.extend_from_slice(&len.to_be_bytes());
+    }
+    let mut tail = Vec::with_capacity(size_hint(serial) + size_hint(next));
+    write(&mut tail, serial);
+    write(&mut tail, next);
+    vec![head, data, tail]
+}
+
 /// The size of `value` in msgpack, or a little more. A buffer of this
 /// capacity holds the value without a copy.
 fn size_hint(value: &Value) -> usize {
@@ -308,6 +341,26 @@ mod tests {
                 assert_eq!(reply_of(&id, &result), expected);
                 assert_eq!(reply(id.clone(), result.clone()), expected);
                 assert!(size_hint(&result) + 16 + size_hint(&id) >= expected.len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_load_reply_in_parts_is_the_reply_of_the_same_values() {
+        let serial = Value::Binary(vec![3; 8]);
+        for len in [0, 1, 255, 256, 65_535, 65_536, 100_003] {
+            let data: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+            for next in [Value::Nil, Value::Binary(vec![4; 8])] {
+                for id in [Value::from(7), Value::from(70_000), Value::from("id")] {
+                    let parts = load_reply(&id, data.clone(), &serial, &next);
+                    assert_eq!(parts[1], data);
+                    let result = Value::Array(vec![
+                        Value::Binary(data.clone()),
+                        serial.clone(),
+                        next.clone(),
+                    ]);
+                    assert_eq!(parts.concat(), reply_of(&id, &result));
+                }
             }
         }
     }
