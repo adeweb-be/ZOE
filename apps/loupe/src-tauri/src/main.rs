@@ -104,6 +104,9 @@ struct FolderInfo {
     path: String,
     /// The tid of the last transaction, in ZODB form.
     last_tid: String,
+    /// True when the open repaired the store: a writer left it open, and
+    /// Loupe wrote its database file once.
+    repaired: bool,
 }
 
 /// The progress of a background job, as a `job-progress` event gives it.
@@ -174,7 +177,8 @@ async fn close(open: Open) -> Result<(), Failure> {
 
 /// Open the store folder `path` for reads only. Close the folder that is
 /// open first, so that its lock goes. The "as of" switch holds nothing
-/// after the open.
+/// after the open. The open repairs a store that a writer left open, and
+/// `FolderInfo::repaired` tells the window.
 #[tauri::command]
 async fn open_folder(loupe: State<'_, Loupe>, path: String) -> Result<FolderInfo, Failure> {
     let previous = loupe.open().take();
@@ -185,6 +189,7 @@ async fn open_folder(loupe: State<'_, Loupe>, path: String) -> Result<FolderInfo
     let info = FolderInfo {
         path,
         last_tid: zoe_loupe::tid_repr(folder.last_tid()),
+        repaired: folder.store().repaired(),
     };
     *loupe.open() = Some(Open {
         folder: Arc::new(folder),

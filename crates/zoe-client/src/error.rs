@@ -31,6 +31,23 @@ pub enum Error {
         serials: Option<(Tid, Tid)>,
     },
 
+    /// An object that the transaction read is no longer current: a
+    /// `ZODB.POSException.ReadConflictError` of the vote, after
+    /// `Transaction::check_current_serial`. `serials` is `(committed,
+    /// read)`, or `None` when the server did not give them.
+    #[error("a read conflict on the oid {oid:?}, serials {serials:?}")]
+    ReadConflict {
+        /// The oid of the conflict.
+        oid: Oid,
+        /// The committed serial and the serial that the transaction read.
+        serials: Option<(Tid, Tid)>,
+    },
+
+    /// The call needs an extension that the server did not accept on this
+    /// connection. The client sent nothing.
+    #[error("the server does not serve this: {0}")]
+    Unsupported(String),
+
     /// The connection to the server is lost or closed. Every call that
     /// waits for a reply fails with it, and so does every later call.
     #[error("the connection to the server is lost")]

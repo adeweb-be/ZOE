@@ -53,6 +53,63 @@
         directory. The default is false.
       </description>
     </key>
+    <key name="pack-gc" datatype="string">
+      <description>
+        If false, a pack removes old revisions only, as the pack-gc of
+        filestorage does: it keeps the newest revision of each object at or
+        before the pack time, also when no reader can reach the object. An
+        object whose newest revision is a deletion goes. The store does not
+        record it. The default is true: a pack collects garbage.
+      </description>
+    </key>
+  </sectiontype>
+
+  <sectiontype name="ssl">
+    <description>
+      The TLS of a zoeclient section, with the keys of the ssl section of
+      ZEO's clientstorage. The native client reads the files itself. ZEO's
+      client gets the context that ZEO makes from them. A configuration
+      that imports zoe and ZEO together has two section types named ssl,
+      and ZConfig refuses it. In such a configuration, use a zoeclient
+      section with native false and this ssl section in place of ZEO's
+      clientstorage: it opens ZEO's client with the same TLS.
+    </description>
+    <key name="certificate" datatype="existing-dirpath" required="yes">
+      <description>
+        The PEM file of the certificate of the client. It holds the private
+        key too when the key is not set.
+      </description>
+    </key>
+    <key name="key" datatype="existing-dirpath">
+      <description>
+        The PEM file of the private key of the certificate.
+      </description>
+    </key>
+    <key name="password-function">
+      <description>
+        The dotted name of a function that returns the password of the key.
+        Only ZEO's client reads an encrypted key: the native client refuses
+        this key.
+      </description>
+    </key>
+    <key name="authenticate" datatype="existing-dirpath">
+      <description>
+        The PEM file of the CA certificates that the certificate of the
+        server must chain to. The native client needs it, as a file.
+      </description>
+    </key>
+    <key name="check-hostname" datatype="boolean" default="true">
+      <description>
+        If true, the certificate of the server must be valid for the name
+        of the server. The default is true.
+      </description>
+    </key>
+    <key name="server-hostname">
+      <description>
+        The name of the server for TLS. The default is the host of the
+        address.
+      </description>
+    </key>
   </sectiontype>
 
   <sectiontype name="zoeclient" extends="zeoclient" datatype=".ZoeClient"
@@ -60,14 +117,26 @@
     <description>
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
-      the same values, and wait-timeout. It declares the ZOE extensions to
-      the server, and works as a zeoclient against a stock ZEO server.
+      the same values, wait-timeout and native, and an ssl section. It
+      declares the ZOE extensions to the server, and works as a zeoclient
+      against a stock ZEO server.
     </description>
+    <section type="ssl" name="*" attribute="ssl"/>
     <key name="wait-timeout" datatype="integer" default="30">
       <description>
         The longest wait for a connection to the server, in seconds, at the
         open and after a disconnection. A longer wait raises
         ClientDisconnected. The default is 30.
+      </description>
+    </key>
+    <key name="native" datatype="boolean" default="false">
+      <description>
+        If true, the client runs on the native client, built on the Rust
+        crate zoe-client, and not on the asyncio client of ZEO. It has one
+        connection and no cache, no blob and no reconnect yet: a key of
+        these features with a value other than its default fails the open.
+        Against a stock ZEO server, it needs msgpack true on the server.
+        The default is false.
       </description>
     </key>
   </sectiontype>
@@ -94,6 +163,12 @@
     <key name="read-only" datatype="boolean" default="false">
       <description>
         If true, the server serves this store for reads only.
+      </description>
+    </key>
+    <key name="pack-gc" datatype="boolean" default="true">
+      <description>
+        If false, a pack of this store keeps the objects that no reader can
+        reach, and removes old revisions only.
       </description>
     </key>
   </sectiontype>
@@ -128,8 +203,9 @@
     </key>
     <key name="listen" datatype="string">
       <description>
-        The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
-        port. The default is 127.0.0.1:8100.
+        The address of the ZEO port, as HOST:PORT, or the path of a unix
+        domain socket: a value with a / is a path, such as ./zeo.sock. A
+        port of 0 takes a free port. The default is 127.0.0.1:8100.
       </description>
     </key>
     <key name="admin-listen" datatype="string">
@@ -141,6 +217,13 @@
     <key name="invalidation-queue-size" datatype="string">
       <description>
         The most transactions that getInvalidations covers.
+      </description>
+    </key>
+    <key name="invalidation-age" datatype="string">
+      <description>
+        Past invalidation-queue-size, getInvalidations also covers a tid
+        younger than this, in whole seconds, such as 3600 or 1h, as the
+        key invalidation-age of ZEO. 0, the default, turns it off.
       </description>
     </key>
     <key name="client-queue-size" datatype="string">
@@ -204,6 +287,12 @@
       <description>
         If true, the server serves every store for reads only. The default
         is false.
+      </description>
+    </key>
+    <key name="pack-gc" datatype="string">
+      <description>
+        If false, a pack of each store keeps the objects that no reader can
+        reach, and removes old revisions only. The default is true.
       </description>
     </key>
     <key name="shared-blob-dir" datatype="string">

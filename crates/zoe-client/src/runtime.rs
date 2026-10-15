@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -26,6 +27,17 @@ pub trait Runtime: Send + Sync + 'static {
     /// Open a stream to `addr`.
     fn connect(&self, addr: SocketAddr) -> BoxFuture<io::Result<Box<dyn Stream>>>;
 
+    /// Open a stream to the unix domain socket at `path`. A runtime without
+    /// unix sockets fails with `io::ErrorKind::Unsupported`.
+    fn connect_unix(&self, path: PathBuf) -> BoxFuture<io::Result<Box<dyn Stream>>> {
+        Box::pin(async move {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this runtime has no unix socket: {}", path.display()),
+            ))
+        })
+    }
+
     /// Run `task` until it ends. The client does not wait for the task.
     fn spawn(&self, task: BoxFuture<()>);
 
@@ -33,8 +45,8 @@ pub trait Runtime: Send + Sync + 'static {
     fn sleep(&self, duration: Duration) -> BoxFuture<()>;
 }
 
-/// The runtime of production: TCP and the tasks and timers of the current
-/// tokio runtime.
+/// The runtime of production: TCP, unix domain sockets, and the tasks and
+/// timers of the current tokio runtime.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tokio;
 
@@ -44,6 +56,13 @@ impl Runtime for Tokio {
             let stream = tokio::net::TcpStream::connect(addr).await?;
             // A call is a small frame. Send it at once.
             stream.set_nodelay(true)?;
+            Ok(Box::new(stream) as Box<dyn Stream>)
+        })
+    }
+
+    fn connect_unix(&self, path: PathBuf) -> BoxFuture<io::Result<Box<dyn Stream>>> {
+        Box::pin(async move {
+            let stream = tokio::net::UnixStream::connect(path).await?;
             Ok(Box::new(stream) as Box<dyn Stream>)
         })
     }
