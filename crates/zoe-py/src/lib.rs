@@ -31,7 +31,7 @@ mod _zoe {
     #[pymodule_export]
     use crate::cli::main;
     #[pymodule_export]
-    use crate::client::NativeClient;
+    use crate::client::{NativeClient, NativeTransaction};
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]

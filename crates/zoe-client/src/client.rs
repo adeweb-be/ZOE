@@ -196,7 +196,16 @@ struct Inner {
 struct Calls {
     closed: bool,
     next_id: i64,
-    pending: HashMap<i64, oneshot::Sender<Result<Value, Error>>>,
+    pending: HashMap<i64, Pending>,
+}
+
+/// A call that waits for its reply.
+struct Pending {
+    /// The reply and the position of the connection when the reply came.
+    sender: oneshot::Sender<(Result<Value, Error>, Tid)>,
+    /// `true` for `tpc_finish`. The reader raises the last tid to the tid
+    /// of its reply before it gives the reply.
+    finish: bool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -471,6 +480,11 @@ impl Client {
         !lock(&self.inner.calls).closed
     }
 
+    /// Wait until the connection closes.
+    pub async fn closed(&self) {
+        closed(&mut self.inner.closing.subscribe()).await;
+    }
+
     /// Return the last tid that the client knows: the tid of `register`,
     /// of the last invalidation, or of the last commit of this client.
     pub fn last_transaction(&self) -> Tid {
@@ -515,12 +529,24 @@ impl Client {
     /// Load the record of `oid` that was current just before `tid`, or
     /// `None` when no record of `oid` is older than `tid`.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<Option<Record>, Error> {
-        let reply = self
+        self.load_before_at(oid, tid)
+            .await
+            .map(|(record, _)| record)
+    }
+
+    /// Load as `load_before` does, and return the position of the
+    /// connection with the record: the last tid that the connection had
+    /// read from its own stream when the reply came. The stream holds the
+    /// tid of `register`, the invalidations and the replies of the finishes
+    /// of the connection. The reader takes the position, not the caller.
+    pub async fn load_before_at(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
+        let (reply, position) = self
             .inner
-            .call("loadBefore", vec![bin8(oid.0), bin8(tid.0)])
-            .await?;
+            .call_at("loadBefore", vec![bin8(oid.0), bin8(tid.0)], false)
+            .await;
+        let reply = reply?;
         if reply.is_nil() {
-            return Ok(None);
+            return Ok((None, position));
         }
         let Some([data, start, end]) = reply
             .as_array()
@@ -531,14 +557,15 @@ impl Client {
         let Some(data) = data.as_slice() else {
             return Err(bad("loadBefore", &reply));
         };
-        Ok(Some(Record {
+        let record = Record {
             data: data.to_vec(),
             tid: self::tid(start, "loadBefore")?,
             end: match end {
                 Value::Nil => None,
                 end => Some(self::tid(end, "loadBefore")?),
             },
-        }))
+        };
+        Ok((Some(record), position))
     }
 
     /// Load the record of `oid` that the transaction `serial` wrote. An
@@ -806,8 +833,11 @@ impl Transaction {
     /// that the outcome is unknown: the commit can be durable.
     pub async fn finish(mut self) -> Result<Tid, Error> {
         self.check()?;
-        let reply = self.inner.call("tpc_finish", vec![self.id.into()]).await?;
-        let tid = tid(&reply, "tpc_finish")?;
+        let (reply, _) = self
+            .inner
+            .call_at("tpc_finish", vec![self.id.into()], true)
+            .await;
+        let tid = tid(&reply?, "tpc_finish")?;
         self.open = false;
         self.inner.last_tid.fetch_max(tid.0, Ordering::SeqCst);
         Ok(tid)
@@ -853,25 +883,46 @@ impl std::fmt::Debug for Transaction {
 impl Inner {
     /// Call `method` and wait for its reply.
     async fn call(&self, method: &str, args: Vec<Value>) -> Result<Value, Error> {
+        self.call_at(method, args, false).await.0
+    }
+
+    /// Call `method` and wait for its reply. Return the reply and the
+    /// position of the connection when the reader got it. `finish` marks a
+    /// `tpc_finish`, whose tid the reader adds to the position.
+    async fn call_at(
+        &self,
+        method: &str,
+        args: Vec<Value>,
+        finish: bool,
+    ) -> (Result<Value, Error>, Tid) {
         let (sender, reply) = oneshot::channel();
         let id = {
             let mut calls = lock(&self.calls);
             if calls.closed {
-                return Err(Error::Disconnected);
+                return (Err(Error::Disconnected), self.position());
             }
             let id = calls.next_id;
             calls.next_id += 1;
-            calls.pending.insert(id, sender);
+            calls.pending.insert(id, Pending { sender, finish });
             id
         };
         // The guard forgets the call when its future is dropped.
         let _forget = Forget { inner: self, id };
-        let frame = protocol::call(id, method, args, self.traceparent().as_deref())?;
-        self.outgoing
-            .send(frame)
+        let frame = match protocol::call(id, method, args, self.traceparent().as_deref()) {
+            Ok(frame) => frame,
+            Err(error) => return (Err(error), self.position()),
+        };
+        if self.outgoing.send(frame).await.is_err() {
+            return (Err(Error::Disconnected), self.position());
+        }
+        reply
             .await
-            .map_err(|_| Error::Disconnected)?;
-        reply.await.unwrap_or(Err(Error::Disconnected))
+            .unwrap_or_else(|_| (Err(Error::Disconnected), self.position()))
+    }
+
+    /// Return the last tid that the connection read from its stream.
+    fn position(&self) -> Tid {
+        Tid(self.last_tid.load(Ordering::SeqCst))
     }
 
     /// Send `method` as a call without a reply.
@@ -928,9 +979,15 @@ impl Inner {
     fn dispatch(&self, message: Message) -> Result<(), Error> {
         match message {
             Message::Reply { id, result } => {
-                let sender = lock(&self.calls).pending.remove(&id);
-                if let Some(sender) = sender {
-                    let _ = sender.send(result);
+                let pending = lock(&self.calls).pending.remove(&id);
+                if let Some(pending) = pending {
+                    if pending.finish
+                        && let Ok(reply) = &result
+                        && let Some(committed) = p64(reply)
+                    {
+                        self.last_tid.fetch_max(committed, Ordering::SeqCst);
+                    }
+                    let _ = pending.sender.send((result, self.position()));
                 }
             }
             Message::Call { method, args } if method == "invalidateTransaction" => {
@@ -957,8 +1014,9 @@ impl Inner {
             calls.closed = true;
             mem::take(&mut calls.pending)
         };
-        for sender in pending.into_values() {
-            let _ = sender.send(Err(Error::Disconnected));
+        let position = self.position();
+        for pending in pending.into_values() {
+            let _ = pending.sender.send((Err(Error::Disconnected), position));
         }
         lock(&self.invalidations).take();
     }

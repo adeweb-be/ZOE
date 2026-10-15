@@ -2,10 +2,17 @@
 //! `zoe-client`.
 //!
 //! `zoe.zeo` wraps it in a ZODB storage when `native` is true. One client
-//! holds one connection to one storage of a server, and one transaction at
-//! a time. It connects over TCP or a unix domain socket, with TLS or
-//! without, to the first of its addresses that opens. It has no cache, no
-//! blob and no reconnect.
+//! holds a pool of connections to one storage of a server (ADR 0036): the
+//! listener, and one connection for each transaction that runs. It
+//! connects over TCP or a unix domain socket, with TLS or without, to the
+//! first of its addresses that opens. It has no cache, no blob and no
+//! reconnect.
+//!
+//! The pool delivers the tids of the listener in one order. A thread of
+//! `zoe.zeo` takes each commit of another client with `next_delivery` and
+//! confirms it with `delivered`. `Transaction.finish` returns the tid of a
+//! commit at its turn, and `Transaction.done` ends the turn after the
+//! callback of `tpc_finish`.
 //!
 //! A tokio runtime of the process runs the connections. It starts at the
 //! first open of a client, never at the import. Each call waits for the
@@ -25,7 +32,8 @@
 use std::mem;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use pyo3::PyTraverseError;
@@ -36,7 +44,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Endpoint, Error, Invalidations, Options, Tls, TlsOptions, Tokio, Transaction, traced,
+    Address, Connect, Delivery, Endpoint, Error, Options, Pool, PoolTransaction, Tls, TlsOptions,
+    Tokio, Turn, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -47,6 +56,10 @@ const WORKERS: usize = 2;
 
 /// The time between two attempts to open a client, until `wait_timeout`.
 const RETRY: Duration = Duration::from_millis(100);
+
+/// The most connections of a client that commit at once, when the open
+/// gives no `pool_bound`. `zoe.zeo._POOL_BOUND` has the same value.
+const POOL_BOUND: usize = 64;
 
 /// The deepest nesting of a value that the client converts.
 const DEPTH: usize = 32;
@@ -100,24 +113,20 @@ fn runtime() -> std::io::Result<&'static Runtime> {
 }
 
 /// A client of one storage of a ZEO 6 server, with the ZOE extensions
-/// that the server accepts.
+/// that the server accepts: a pool of connections with one listener.
 #[pyclass(frozen, module = "zoe._zoe", name = "Client")]
 pub(crate) struct NativeClient {
     /// The process that opened the client.
     pid: u32,
     runtime: &'static Runtime,
-    /// The client, until `close`.
-    client: Mutex<Option<Arc<zoe_client::Client>>>,
-    /// The open transaction, from `begin` to its end.
-    transaction: Mutex<Option<Transaction>>,
-    /// The receiver whose invalidations `drain` gives. The drop in a child
-    /// of `os.fork()` takes it out.
-    invalidations: Mutex<Option<Invalidations>>,
-    /// A second receiver. It only wakes the thread that delivers the
-    /// invalidations: `wait_invalidation` reads it.
-    wake: Mutex<Option<Invalidations>>,
-    /// The last tid that the client knew after the open.
+    /// The pool, until `close`.
+    pool: Mutex<Option<Arc<Pool>>>,
+    /// The transactions that `begin` gave, while they live.
+    open: Mutex<Vec<Weak<Slot>>>,
+    /// The last tid of the listener after the open.
     opened_at: Tid,
+    /// The last tid that the pool delivered before `close`.
+    closed_at: AtomicU64,
     /// The callable that returns the traceparent of the current span, when
     /// the server accepted `trace_context`. Else `None`.
     traceparent: Option<Py<PyAny>>,
@@ -131,7 +140,11 @@ pub(crate) struct NativeClient {
 impl NativeClient {
     /// Connect to the first server of `addresses` that opens, and register
     /// with the storage `storage`, read-only when `read_only` is true.
-    /// Declare `extensions` in `register`, and call `get_info`.
+    /// Declare `extensions` in `register`, and call `get_info`. That
+    /// connection is the listener of the pool. The pool opens at most
+    /// `pool_bound` more connections to the same server, each for one
+    /// transaction at a time, when a transaction finds none free. A
+    /// `pool_bound` of 0 raises `ValueError`.
     ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
@@ -158,8 +171,8 @@ impl NativeClient {
     /// `ValueError`.
     #[new]
     #[pyo3(signature = (
-        addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout, tls=None,
-        traceparent=None
+        addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
+        pool_bound=POOL_BOUND, tls=None, traceparent=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -170,11 +183,15 @@ impl NativeClient {
         read_only_fallback: bool,
         extensions: Vec<String>,
         wait_timeout: f64,
+        pool_bound: usize,
         tls: Option<TlsArgs>,
         traceparent: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let wait = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
+        if pool_bound == 0 {
+            return Err(PyValueError::new_err("pool_bound is at least 1"));
+        }
         let targets = addresses
             .iter()
             .map(Target::extract)
@@ -188,15 +205,33 @@ impl NativeClient {
             let secure = tls.as_ref().map(Secure::load).transpose()?;
             let runtime = runtime().map_err(Opening::Runtime)?;
             let open = open(&targets, secure.as_ref(), &storage, &options, wait);
-            let client = runtime.block_on(open)?;
-            // Subscribe first, then read the last tid: the client raises
-            // its last tid before it sends an invalidation.
-            let invalidations = client.invalidations();
-            let wake = client.invalidations();
-            let opened_at = client.last_transaction();
-            Ok((runtime, client, invalidations, wake, opened_at))
+            let (listener, endpoint) = runtime.block_on(open)?;
+            // The other connections register as the listener did, on its
+            // server, without a fallback.
+            let options = Options {
+                read_only: listener.read_only(),
+                read_only_fallback: false,
+                ..options
+            };
+            let connect: Connect = Arc::new(move || {
+                let (endpoint, storage, options) =
+                    (endpoint.clone(), storage.clone(), options.clone());
+                Box::pin(async move {
+                    zoe_client::Client::open_endpoint(
+                        Arc::new(Tokio),
+                        &endpoint,
+                        &storage,
+                        &options,
+                    )
+                    .await
+                })
+            });
+            // The pool starts its dispatcher on the runtime.
+            let _inside = runtime.enter();
+            let pool = Pool::new(Arc::new(Tokio), listener, connect, pool_bound);
+            Ok((runtime, pool))
         });
-        let (runtime, client, invalidations, wake, opened_at) = match opened {
+        let (runtime, pool) = match opened {
             Ok(opened) => opened,
             Err(Opening::Address(text) | Opening::Tls(text)) => {
                 return Err(PyValueError::new_err(text));
@@ -204,17 +239,20 @@ impl NativeClient {
             Err(Opening::Runtime(error)) => return Err(error.into()),
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
-        let traces = client.extensions().iter().any(|name| name == TRACE_CONTEXT);
+        let listener = pool.listener();
+        let traces = listener
+            .extensions()
+            .iter()
+            .any(|name| name == TRACE_CONTEXT);
         Ok(Self {
             pid: std::process::id(),
             runtime,
-            read_only: client.read_only(),
-            address: client.address().clone(),
-            client: Mutex::new(Some(Arc::new(client))),
-            transaction: Mutex::new(None),
-            invalidations: Mutex::new(Some(invalidations)),
-            wake: Mutex::new(Some(wake)),
-            opened_at,
+            read_only: listener.read_only(),
+            address: listener.address().clone(),
+            opened_at: pool.last_transaction(),
+            closed_at: AtomicU64::new(pool.last_transaction().0),
+            pool: Mutex::new(Some(Arc::new(pool))),
+            open: Mutex::new(Vec::new()),
             traceparent: traceparent.filter(|_| traces),
         })
     }
@@ -246,37 +284,64 @@ impl NativeClient {
     }
 
     /// Return the last tid that the client knew after the open: the tid
-    /// of `register`.
+    /// of `register` of the listener.
     fn opened_at<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         p64(py, self.opened_at.0)
     }
 
     /// Return the reply of `get_info` at the open, as a dict.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client(py)?;
-        to_python(py, client.info(), 0)
+        let pool = self.pool(py)?;
+        to_python(py, pool.listener().info(), 0)
     }
 
     /// Return the extensions that the server accepted at the open.
     fn extensions(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        Ok(self.client(py)?.extensions().to_vec())
+        Ok(self.pool(py)?.listener().extensions().to_vec())
     }
 
-    /// Tell if the connection is open.
+    /// Tell if the client is connected: not closed, and its listener is not
+    /// lost.
     fn is_connected(&self) -> bool {
         self.pid == std::process::id()
-            && lock(&self.client)
+            && lock(&self.pool)
                 .as_ref()
-                .is_some_and(|client| client.is_connected())
+                .is_some_and(|pool| pool.is_connected())
+    }
+
+    /// Return the most connections that commit at once.
+    fn pool_bound(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.pool(py)?.bound())
+    }
+
+    /// Return the last tid that the pool delivered. With `wait`, wait first
+    /// for the delivery that runs now, if one runs: the thread that runs it
+    /// must not wait. After `close`, return the last tid before the close.
+    fn last_transaction<'py>(&self, py: Python<'py>, wait: bool) -> PyResult<Bound<'py, PyBytes>> {
+        self.check_process()?;
+        let pool = {
+            let slot = lock(&self.pool);
+            match slot.as_ref() {
+                Some(pool) => pool.clone(),
+                None => return Ok(p64(py, self.closed_at.load(AtomicOrdering::SeqCst))),
+            }
+        };
+        let tid = if wait {
+            let runtime = self.runtime;
+            py.detach(move || runtime.block_on(pool.settled_transaction()))
+        } else {
+            pool.last_transaction()
+        };
+        Ok(p64(py, tid.0))
     }
 
     /// Return `n` new oids.
     fn new_oids<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        let client = self.client(py)?;
+        let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let oids = py
-            .detach(move || runtime.block_on(traced(trace, client.new_oids(n))))
+            .detach(move || runtime.block_on(traced(trace, pool.new_oids(n))))
             .map_err(|e| client_error(py, e))?;
         Ok(oids.into_iter().map(|oid| p64(py, oid.0)).collect())
     }
@@ -298,11 +363,11 @@ impl NativeClient {
         )>,
     > {
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
-        let client = self.client(py)?;
+        let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
-        let record = py
-            .detach(move || runtime.block_on(traced(trace, client.load_before(oid, tid))))
+        let (record, _position) = py
+            .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
             .map_err(|e| client_error(py, e))?;
         Ok(record.map(|record| {
             (
@@ -321,11 +386,11 @@ impl NativeClient {
         serial: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        let client = self.client(py)?;
+        let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let data = py
-            .detach(move || runtime.block_on(traced(trace, client.load_serial(oid, serial))))
+            .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
             .map_err(|e| client_error(py, e))?;
         Ok(PyBytes::new(py, &data))
     }
@@ -333,17 +398,18 @@ impl NativeClient {
     /// Return the next value of the sequence `name` of the store. Raise
     /// `Unsupported` when the server did not accept `sequences`.
     fn sequence_next(&self, py: Python<'_>, name: String) -> PyResult<u64> {
-        let client = self.client(py)?;
+        let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
-        py.detach(move || runtime.block_on(traced(trace, client.sequence_next(&name))))
+        py.detach(move || runtime.block_on(traced(trace, pool.sequence_next(&name))))
             .map_err(|e| client_error(py, e))
     }
 
-    /// Begin a transaction. `extension` is the dict of the transaction
-    /// extension. With `tid`, the transaction commits under that tid, with
-    /// the status `status`. The caller holds the commit lock: a second
-    /// transaction raises `StorageTransactionError`.
+    /// Begin a transaction on a free connection of the pool, and return
+    /// it. `extension` is the dict of the transaction extension. With
+    /// `tid`, the transaction commits under that tid, with the status
+    /// `status`. When every connection is busy and the pool is at its
+    /// bound, wait for a free one.
     #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned()))]
     fn begin(
         &self,
@@ -353,30 +419,198 @@ impl NativeClient {
         extension: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
         status: String,
-    ) -> PyResult<()> {
+    ) -> PyResult<NativeTransaction> {
         let tid = tid.map(u64_of).transpose()?.map(Tid);
         let mut encoded = Vec::new();
         rmpv::encode::write_value(&mut encoded, &to_value(extension, 0)?)
             .map_err(|e| PyValueError::new_err(format!("the extension does not encode: {e}")))?;
-        let client = self.client(py)?;
+        let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let (user, description) = (user.to_vec(), description.to_vec());
+        let txn = py
+            .detach(|| {
+                let begin = pool.begin_with(&user, &description, &encoded, tid, &status);
+                runtime.block_on(traced(trace, begin))
+            })
+            .map_err(|e| client_error(py, e))?;
+        let slot = Arc::new(Mutex::new(Some(txn)));
+        {
+            let mut open = lock(&self.open);
+            open.retain(|slot| slot.strong_count() > 0);
+            open.push(Arc::downgrade(&slot));
+        }
+        Ok(NativeTransaction {
+            pid: self.pid,
+            runtime,
+            txn: slot,
+            turn: Mutex::new(None),
+            traceparent: self.traceparent.as_ref().map(|t| t.clone_ref(py)),
+        })
+    }
+
+    /// Abort each transaction of `begin` that is still open, and wait for
+    /// the replies of the server. Without one, do nothing.
+    fn abort(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_process()?;
+        let trace = self.traceparent(py)?;
+        let runtime = self.runtime;
+        let open: Vec<Arc<Slot>> = lock(&self.open)
+            .drain(..)
+            .filter_map(|slot| slot.upgrade())
+            .collect();
         py.detach(|| {
-            let mut slot = lock(&self.transaction);
-            if slot.is_some() {
-                return Err(Error::Invalid("a transaction is open".into()));
+            let mut result = Ok(());
+            for slot in open {
+                let txn = lock(&slot).take();
+                if let Some(txn) = txn
+                    && let Err(error) = runtime.block_on(traced(trace.clone(), txn.abort()))
+                {
+                    result = Err(error);
+                }
             }
-            let begin = client.begin_with(&user, &description, &encoded, tid, &status);
-            let txn = runtime.block_on(traced(trace, begin))?;
-            *slot = Some(txn);
-            Ok(())
+            result
         })
         .map_err(|e| client_error(py, e))
     }
 
-    /// Store `data` for `oid` in the open transaction. `serial` is the
-    /// serial that the transaction read.
+    /// Wait for the next delivery of the pool, and return it: `("invalidate",
+    /// tid, oids)` for a commit of another client, `("stale",)` when the
+    /// client lost its listener, or `None` after the close. The caller
+    /// gives it to the DB, then calls `delivered`. The pool delivers
+    /// nothing more until then.
+    fn next_delivery<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        self.check_process()?;
+        let Some(pool) = lock(&self.pool).clone() else {
+            return Ok(None);
+        };
+        let runtime = self.runtime;
+        let delivery = py.detach(move || runtime.block_on(pool.next_delivery()));
+        let Some(delivery) = delivery else {
+            return Ok(None);
+        };
+        let tuple = match delivery {
+            Delivery::Invalidate(invalidation) => {
+                let oids: Vec<_> = invalidation.oids.iter().map(|oid| p64(py, oid.0)).collect();
+                let items = [
+                    PyString::new(py, "invalidate").into_any(),
+                    p64(py, invalidation.tid.0).into_any(),
+                    PyList::new(py, oids)?.into_any(),
+                ];
+                PyTuple::new(py, items)?
+            }
+            Delivery::Stale => PyTuple::new(py, [PyString::new(py, "stale")])?,
+        };
+        Ok(Some(tuple))
+    }
+
+    /// Confirm the delivery that `next_delivery` gave: the DB got it.
+    fn delivered(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_process()?;
+        let pool = lock(&self.pool).clone();
+        if let Some(pool) = pool {
+            py.detach(move || pool.delivered());
+        }
+        Ok(())
+    }
+
+    /// Close the connections. A call that waits, and each later call,
+    /// raises `ClientDisconnected`. `next_delivery` gives `None`. A second
+    /// close does nothing.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_process()?;
+        let runtime = self.runtime;
+        let pool = {
+            let mut slot = lock(&self.pool);
+            if let Some(pool) = slot.as_ref() {
+                let last = pool.last_transaction().0;
+                self.closed_at.store(last, AtomicOrdering::SeqCst);
+            }
+            slot.take()
+        };
+        let Some(pool) = pool else {
+            return Ok(());
+        };
+        py.detach(move || {
+            pool.disconnect();
+            let _inside = runtime.enter();
+            drop(pool);
+        });
+        Ok(())
+    }
+}
+
+impl NativeClient {
+    /// Return the pool, or raise when it is closed or when the process is
+    /// a child of the process that opened it.
+    fn pool(&self, py: Python<'_>) -> PyResult<Arc<Pool>> {
+        self.check_process()?;
+        let pool = lock(&self.pool).clone();
+        pool.ok_or_else(|| errors::client_disconnected(py, "the client is closed".into()))
+    }
+
+    /// Return the W3C traceparent of the current span of the calling
+    /// thread, or `None`. Without the callable, it calls no Python code.
+    fn traceparent(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        traceparent(py, self.traceparent.as_ref())
+    }
+
+    /// Raise `RuntimeError` in a child of `os.fork()`: the threads of the
+    /// client are in the parent only.
+    fn check_process(&self) -> PyResult<()> {
+        check_process(self.pid)
+    }
+}
+
+impl Drop for NativeClient {
+    fn drop(&mut self) {
+        let pool = self
+            .pool
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if self.pid != std::process::id() {
+            // The threads and the locks of the parent are not here. Free
+            // nothing of the connections.
+            mem::forget(pool);
+            return;
+        }
+        // The drop of a connection can start a task of the runtime.
+        let _inside = self.runtime.enter();
+        drop(pool);
+    }
+}
+
+/// The open transaction of a `Transaction`.
+type Slot = Mutex<Option<PoolTransaction>>;
+
+/// One transaction of a `Client`, on its own connection of the pool, from
+/// `begin` to `finish` and `done`, or to `abort`.
+#[pyclass(frozen, module = "zoe._zoe", name = "Transaction")]
+pub(crate) struct NativeTransaction {
+    /// The process that opened the client.
+    pid: u32,
+    runtime: &'static Runtime,
+    /// The transaction, until its finish, its abort or a failed vote. The
+    /// client keeps a weak reference to it for `Client.abort`.
+    txn: Arc<Slot>,
+    /// The turn of the commit, from the return of `finish` to `done`.
+    turn: Mutex<Option<Turn>>,
+    /// The callable of the traceparent of the client, or `None`.
+    traceparent: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl NativeTransaction {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(traceparent) = &self.traceparent {
+            visit.call(traceparent)?;
+        }
+        Ok(())
+    }
+
+    /// Store `data` for `oid`. `serial` is the serial that the transaction
+    /// read.
     fn store(
         &self,
         py: Python<'_>,
@@ -385,11 +619,11 @@ impl NativeClient {
         data: &[u8],
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        self.check_process()?;
-        let trace = self.traceparent(py)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
-            let mut slot = lock(&self.transaction);
+            let mut slot = lock(&self.txn);
             let txn = slot.as_mut().ok_or_else(not_open)?;
             runtime.block_on(traced(trace, txn.store(oid, serial, data)))
         })
@@ -405,11 +639,11 @@ impl NativeClient {
         serial: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
-        self.check_process()?;
-        let trace = self.traceparent(py)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
-            let mut slot = lock(&self.transaction);
+            let mut slot = lock(&self.txn);
             let txn = slot.as_mut().ok_or_else(not_open)?;
             runtime.block_on(traced(trace, txn.check_current_serial(oid, serial)))
         })
@@ -419,12 +653,12 @@ impl NativeClient {
     /// Vote, and return the oids that the server resolved. A failed vote
     /// ends the transaction: the server aborted it.
     fn vote<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        self.check_process()?;
-        let trace = self.traceparent(py)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         let resolved = py
             .detach(|| {
-                let mut slot = lock(&self.transaction);
+                let mut slot = lock(&self.txn);
                 let txn = slot.as_mut().ok_or_else(not_open)?;
                 let voted = runtime.block_on(traced(trace, txn.vote_resolved()));
                 if voted.is_err() {
@@ -438,28 +672,43 @@ impl NativeClient {
         Ok(resolved.into_iter().map(|oid| p64(py, oid.0)).collect())
     }
 
-    /// Finish the open transaction after its vote, and return its tid.
+    /// Finish the transaction after its vote, and return its tid. It
+    /// returns when the pool delivered every tid below the tid. The caller
+    /// then runs the callback of `tpc_finish` and calls `done`: the pool
+    /// delivers no later tid until then.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.check_process()?;
-        let trace = self.traceparent(py)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         let tid = py
             .detach(|| {
-                let txn = lock(&self.transaction).take().ok_or_else(not_open)?;
-                runtime.block_on(traced(trace, txn.finish()))
+                let txn = lock(&self.txn).take().ok_or_else(not_open)?;
+                let finish = async move { txn.finish().await?.turn().await };
+                let turn = runtime.block_on(traced(trace, finish))?;
+                let tid = turn.tid();
+                *lock(&self.turn) = Some(turn);
+                Ok(tid)
             })
             .map_err(|e| client_error(py, e))?;
         Ok(p64(py, tid.0))
     }
 
-    /// Abort the open transaction, and wait for the reply of the server.
-    /// Without an open transaction, do nothing.
+    /// End the turn of the commit: the callback of `tpc_finish` ran. The
+    /// pool then delivers the tid and goes on. Without a turn, do nothing.
+    fn done(&self, py: Python<'_>) -> PyResult<()> {
+        check_process(self.pid)?;
+        py.detach(|| drop(lock(&self.turn).take()));
+        Ok(())
+    }
+
+    /// Abort the transaction, and wait for the reply of the server. After
+    /// its end, do nothing.
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
-        self.check_process()?;
-        let trace = self.traceparent(py)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
-            let txn = lock(&self.transaction).take();
+            let txn = lock(&self.txn).take();
             match txn {
                 Some(txn) => runtime.block_on(traced(trace, txn.abort())),
                 None => Ok(()),
@@ -467,147 +716,44 @@ impl NativeClient {
         })
         .map_err(|e| client_error(py, e))
     }
-
-    /// Return the invalidations that wait, in tid order, without a wait:
-    /// a tuple of a flag and a list of `(tid, oids)`. The flag is true when
-    /// the client missed invalidations: the caller must then treat its
-    /// cache as stale. After the close of the connection, the list holds
-    /// the invalidations that came before it.
-    #[allow(clippy::type_complexity)]
-    fn drain<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<(bool, Vec<(Bound<'py, PyBytes>, Vec<Bound<'py, PyBytes>>)>)> {
-        self.check_process()?;
-        let (lagged, items) = py.detach(|| {
-            let mut receiver = lock(&self.invalidations);
-            let mut lagged = false;
-            let mut items = Vec::new();
-            let Some(receiver) = receiver.as_mut() else {
-                return (lagged, items);
-            };
-            loop {
-                match receiver.try_recv() {
-                    Ok(Some(invalidation)) => items.push(invalidation),
-                    Err(Error::Lagged(_)) => lagged = true,
-                    Ok(None) | Err(_) => break,
-                }
-            }
-            (lagged, items)
-        });
-        let items: Vec<_> = items
-            .into_iter()
-            .map(|invalidation| {
-                let oids = invalidation.oids.iter().map(|oid| p64(py, oid.0));
-                (p64(py, invalidation.tid.0), oids.collect::<Vec<_>>())
-            })
-            .collect();
-        Ok((lagged, items))
-    }
-
-    /// Wait until the server sends an invalidation, and return true. Return
-    /// false when the connection closes. It takes no invalidation: `drain`
-    /// gives them.
-    fn wait_invalidation(&self, py: Python<'_>) -> PyResult<bool> {
-        self.check_process()?;
-        let runtime = self.runtime;
-        Ok(py.detach(|| {
-            let mut wake = lock(&self.wake);
-            let Some(wake) = wake.as_mut() else {
-                return false;
-            };
-            match runtime.block_on(wake.recv()) {
-                Ok(_) | Err(Error::Lagged(_)) => true,
-                Err(_) => false,
-            }
-        }))
-    }
-
-    /// Close the connection. A call that waits, and each later call, raises
-    /// `ClientDisconnected`. A second close does nothing.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        self.check_process()?;
-        let runtime = self.runtime;
-        let client = lock(&self.client).take();
-        let Some(client) = client else {
-            return Ok(());
-        };
-        py.detach(move || {
-            client.disconnect();
-            let txn = lock(&self.transaction).take();
-            {
-                let _inside = runtime.enter();
-                drop(txn);
-            }
-            // The tasks stop at once. Wait for them when no call holds
-            // the client.
-            if let Ok(client) = Arc::try_unwrap(client) {
-                runtime.block_on(client.close());
-            }
-        });
-        Ok(())
-    }
 }
 
-impl NativeClient {
-    /// Return the client, or raise when it is closed or when the process
-    /// is a child of the process that opened it.
-    fn client(&self, py: Python<'_>) -> PyResult<Arc<zoe_client::Client>> {
-        self.check_process()?;
-        let client = lock(&self.client).clone();
-        client.ok_or_else(|| errors::client_disconnected(py, "the client is closed".into()))
-    }
-
-    /// Return the W3C traceparent of the current span of the calling
-    /// thread, or `None`. Without the callable, it calls no Python code.
-    fn traceparent(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        match &self.traceparent {
-            Some(traceparent) => Ok(traceparent.bind(py).call0()?.extract()?),
-            None => Ok(None),
-        }
-    }
-
-    /// Raise `RuntimeError` in a child of `os.fork()`: the threads of the
-    /// client are in the parent only.
-    fn check_process(&self) -> PyResult<()> {
-        if self.pid != std::process::id() {
-            return Err(PyRuntimeError::new_err(
-                "the client was opened in another process, before a fork",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for NativeClient {
+impl Drop for NativeTransaction {
     fn drop(&mut self) {
-        let client = self
-            .client
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let txn = self
-            .transaction
+        let txn = lock(&self.txn).take();
+        let turn = self
+            .turn
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if self.pid != std::process::id() {
-            // The threads and the locks of the parent are not here. Free
-            // nothing of the connection.
-            let receivers = [&mut self.invalidations, &mut self.wake].map(|receiver| {
-                receiver
-                    .get_mut()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-            });
-            mem::forget((client, txn, receivers));
+            mem::forget((txn, turn));
             return;
         }
         // The drop of a transaction can start a task of the runtime.
         let _inside = self.runtime.enter();
         drop(txn);
-        drop(client);
+        drop(turn);
     }
+}
+
+/// Return the W3C traceparent of `traceparent()`, or `None` without the
+/// callable. Without the callable, it calls no Python code.
+fn traceparent(py: Python<'_>, traceparent: Option<&Py<PyAny>>) -> PyResult<Option<String>> {
+    match traceparent {
+        Some(traceparent) => Ok(traceparent.bind(py).call0()?.extract()?),
+        None => Ok(None),
+    }
+}
+
+/// Raise `RuntimeError` in a child of `os.fork()` of the process `pid`.
+fn check_process(pid: u32) -> PyResult<()> {
+    if pid != std::process::id() {
+        return Err(PyRuntimeError::new_err(
+            "the client was opened in another process, before a fork",
+        ));
+    }
+    Ok(())
 }
 
 /// An error of the open of a client.
@@ -767,15 +913,16 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
 }
 
 /// Open a client to the first server of `targets` that opens, on the
-/// runtime of the caller. Each round resolves the hosts again. Try again
-/// after failed connections until `wait` passes.
+/// runtime of the caller, and return it with its endpoint. Each round
+/// resolves the hosts again. Try again after failed connections until
+/// `wait` passes.
 async fn open(
     targets: &[Target],
     secure: Option<&Secure>,
     storage: &str,
     options: &Options,
     wait: Duration,
-) -> Result<zoe_client::Client, Opening> {
+) -> Result<(zoe_client::Client, Endpoint), Opening> {
     let deadline = Instant::now() + wait;
     loop {
         let round = endpoints(targets, secure, resolve)?;
@@ -807,7 +954,16 @@ async fn open(
                     text,
                 ))));
             }
-            opened => return Ok(opened?),
+            opened => {
+                let client = opened?;
+                let endpoint = round
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.address() == client.address())
+                    .cloned()
+                    .ok_or_else(|| Error::Protocol("the server has no endpoint".into()))?;
+                return Ok((client, endpoint));
+            }
         }
     }
 }
