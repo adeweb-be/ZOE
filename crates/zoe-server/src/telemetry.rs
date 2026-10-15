@@ -290,21 +290,35 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         // The subscriber of the log lines alone, as without
-        // `ZOE_OTLP_ENDPOINT`. The tests share the callsites, so the test
-        // needs a subscriber of its own: with none, a callsite that
-        // another test enabled gives a span that is not disabled.
+        // `ZOE_OTLP_ENDPOINT`.
         let logs = tracing_subscriber::fmt::layer()
             .with_writer(std::io::sink)
             .with_filter(Select(is_logged));
         let subscriber = tracing_subscriber::registry().with(logs);
-        tracing::subscriber::with_default(subscriber, || {
-            // The interest of a callsite is global. Another test can cache
-            // it while only its own subscriber lives. A new cache counts
-            // this subscriber too.
-            tracing::callsite::rebuild_interest_cache();
-            assert!(request("loadBefore", "1", None).is_disabled());
-            assert!(!tracing::info_span!("connection").is_disabled());
+        // `zoe serve` has one subscriber. tracing asks it once for the
+        // interest of each callsite, and disables each span of a callsite
+        // that has the interest "never". The test asks the subscriber in
+        // the same way. It does not read `is_disabled` of a span: tracing
+        // keeps one interest for each callsite, for all the subscribers of
+        // the process together, and the tests run their own subscribers in
+        // parallel. So the span of a request is not always disabled here.
+        //
+        // A disabled span has no metadata. Under a subscriber that takes
+        // each span, the spans are enabled and give the metadata of their
+        // callsites. A callsite that registers on another thread at the
+        // same time can store an interest without this subscriber, so the
+        // test rebuilds the interests until both spans are enabled.
+        let metadata = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            (0..10_000).find_map(|_| {
+                tracing::callsite::rebuild_interest_cache();
+                let load = request("loadBefore", "1", None).metadata()?;
+                let connection = tracing::info_span!("connection").metadata()?;
+                Some((load, connection))
+            })
         });
+        let (load, connection) = metadata.expect("the spans stay disabled");
+        assert!(subscriber.register_callsite(load).is_never());
+        assert!(subscriber.register_callsite(connection).is_always());
     }
 
     /// A processor that keeps each span that ends.
