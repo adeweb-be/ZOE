@@ -19,6 +19,9 @@ dev = [
     "zodburi>=3",
     # The ZEO client speaks the msgpack protocol M5 of zoe serve.
     "msgpack",
+    # The tests of trace_context make spans with the SDK of OpenTelemetry.
+    # With its API installed, zoe.zeo declares trace_context.
+    "opentelemetry-sdk",
 ]
 
 [tool.uv]

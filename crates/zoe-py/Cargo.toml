@@ -14,8 +14,18 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3.workspace = true
+# The values of `get_info` and of the transaction extension of the native
+# client.
+rmpv.workspace = true
+# The close of the stores at SIGTERM and SIGHUP.
+signal-hook.workspace = true
+# The runtime of the native client. Its threads start when the first client
+# opens. ADR 0035 records the decision.
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+# The native client of `zoe.zeo.ClientStorage`.
+zoe-client.workspace = true
 zoe-core.workspace = true
-# The `zoe` command, without `serve`: the extension never links tokio.
+# The `zoe` command, without `serve`: the extension never links rmcp.
 zoe-server.workspace = true
 
 [lints]

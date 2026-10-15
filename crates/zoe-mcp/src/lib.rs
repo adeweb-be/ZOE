@@ -23,6 +23,7 @@ mod ops;
 mod prompts;
 mod txn;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rmcp::service::ServerInitializeError;
@@ -63,8 +64,11 @@ fn open_failure(path: &Path, error: &zoe_loupe::Error) -> String {
 /// client closes stdin, also before the `initialize` request.
 ///
 /// `blob_dir` is the blob directory of the store. The store does not
-/// record it. With `None`, it is `blobs` in the folder. The open creates
-/// nothing.
+/// record it. With `None`, it is `blobs` in the folder. On a store that
+/// was closed cleanly, the open creates nothing and changes no byte. It
+/// repairs a store that a writer left open (ADR 0032): then it writes only
+/// the database file, and the call writes one line to stderr that holds
+/// `repaired the store`. A repair that fails is an `Open` error.
 ///
 /// The server holds the lock of the store while it runs. So a running
 /// instance and the server never share a store. The server writes only
@@ -74,6 +78,15 @@ pub fn serve_stdio(path: &Path, blob_dir: Option<&Path>) -> Result<(), Error> {
         path: path.to_owned(),
         source,
     })?;
+    if folder.store().repaired() {
+        // stdout carries only MCP messages, so the line goes to stderr. A
+        // failed write of the line does not stop the session.
+        let _ = writeln!(
+            std::io::stderr(),
+            "zoe mcp: {}: the store was not closed cleanly: repaired the store",
+            path.display()
+        );
+    }
     // One thread runs the session. The tools run on the blocking pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
