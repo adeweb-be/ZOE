@@ -5,9 +5,8 @@ test of `test_native_api.py` does not: the exceptions of `_call`, the
 calls that the listener refuses, the sizes of `len()` and `getSize()`,
 `record_iternext`, `history`, `pack`, `restore`, `server_status`, the
 interfaces that the client declares, the serial of a store, a call without
-`wait`, the iterators at the loss of the listener and at the close, and
-an iterator id of a lost listener, and `load_current`, which the cache
-answers.
+`wait`, the iterators at the loss of the listener and at the close, an
+iterator id of a lost listener, and `load_current`, which the cache answers.
 """
 
 import socket
