@@ -224,8 +224,10 @@ def test_inserts_of_two_clients_into_one_bucket_both_commit(dbs, connections):
 def test_two_increments_of_a_counter_both_count(dbs, connections):
     from ZODB.tests.ConflictResolution import PCounter
 
+    counter = PCounter()
+    counter.inc()
     with dbs[0].transaction() as conn:
-        conn.root()["counter"] = PCounter()
+        conn.root()["counter"] = counter
     (conn_a, tm_a), (conn_b, tm_b) = connections
     wait_for(lambda: "counter" in snapshot(conn_b, tm_b))
 
@@ -237,8 +239,8 @@ def test_two_increments_of_a_counter_both_count(dbs, connections):
 
     # The vote of b returns the oid that it resolved, so the DB loads the
     # resolved state again.
-    assert counter_b._value == 2
-    wait_for(lambda: snapshot(conn_a, tm_a)["counter"]._value == 2)
+    assert counter_b._value == 3
+    wait_for(lambda: snapshot(conn_a, tm_a)["counter"]._value == 3)
 
 
 def test_an_unresolvable_conflict_raises_and_drops_the_cache_entry(server, dbs):
