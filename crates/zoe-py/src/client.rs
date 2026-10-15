@@ -27,6 +27,11 @@
 //! `Transaction.finish` returns the tid of a commit at its turn, and
 //! `Transaction.done` ends the turn after the callback of `tpc_finish`.
 //!
+//! `call` and `call_async` send the other calls of `zoe.zeo`, its `_call`
+//! and `_async`, on the listener, and raise for an error reply what
+//! `ZEO.ClientStorage` raises. `prefetch` starts loads that fill the cache
+//! and does not wait for them. `sync` pings the listener.
+//!
 //! `Transaction.vote` resolves the conflicts that the vote lists with the
 //! callable that `zoe.zeo` gives, ZODB's `tryToResolveConflict`. The
 //! callable runs on the thread of the transaction, with no lock held.
@@ -171,6 +176,8 @@ pub(crate) struct NativeClient {
     traceparent: Option<Py<PyAny>>,
     /// `true` when the open asked for a read-only client.
     read_only: bool,
+    /// What the client connects to. `new_addr` changes its addresses.
+    servers: Arc<Servers>,
 }
 
 #[pymethods]
@@ -220,11 +227,14 @@ impl NativeClient {
     /// against the new server first. With `read_only_fallback`, a client on
     /// a read-only server tries a writable server every `disconnect_poll`
     /// seconds, and takes it.
+    ///
+    /// With `client_label`, each connection sends it in `set_client_label`
+    /// after `get_info`, and the server puts it in its log lines.
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL
+        disconnect_poll=DISCONNECT_POLL, client_label=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -241,6 +251,7 @@ impl NativeClient {
         traceparent: Option<Py<PyAny>>,
         wait: bool,
         disconnect_poll: f64,
+        client_label: Option<String>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -271,6 +282,7 @@ impl NativeClient {
             read_only,
             read_only_fallback,
             extensions,
+            client_label,
         };
         let upgrade = read_only_fallback && !read_only;
         let opened = py.detach(move || -> Result<_, Opening> {
@@ -282,7 +294,7 @@ impl NativeClient {
                 Ok(SocketAddr::from(([127, 0, 0, 1], port)))
             })?;
             let servers = Arc::new(Servers {
-                targets,
+                targets: Mutex::new(targets),
                 secure,
                 storage,
                 options,
@@ -292,8 +304,9 @@ impl NativeClient {
                 true => Some(runtime.block_on(servers.open(&servers.options, true))?),
                 false => None,
             };
+            let reopen = servers.clone();
             let open: Open = Arc::new(move |writable| {
-                let servers = servers.clone();
+                let servers = reopen.clone();
                 Box::pin(async move { servers.reopen(writable).await })
             });
             let reconnect = Reconnect {
@@ -303,9 +316,9 @@ impl NativeClient {
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
-            Ok((runtime, pool))
+            Ok((runtime, pool, servers))
         });
-        let (runtime, pool) = match opened {
+        let (runtime, pool, servers) = match opened {
             Ok(opened) => opened,
             Err(Opening::Address(text) | Opening::Tls(text)) => {
                 return Err(PyValueError::new_err(text));
@@ -323,6 +336,7 @@ impl NativeClient {
             pool: Mutex::new(Some(Arc::new(pool))),
             open: Mutex::new(Vec::new()),
             traceparent,
+            servers,
         })
     }
 
@@ -367,14 +381,108 @@ impl NativeClient {
         p64(py, self.opened_at.0)
     }
 
-    /// Return the reply of `get_info` of the listener, as a dict. Without
-    /// a listener, return an empty dict.
+    /// Return the reply of `get_info` of the listener, as a dict, with
+    /// the last `info` call of the server over it, as `_info` of
+    /// `ZEO.ClientStorage` holds them. Without a listener, return an empty
+    /// dict.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.check_process()?;
-        match self.listener() {
-            Some(listener) => to_python(py, listener.info(), 0),
+        let info = lock(&self.pool).as_ref().and_then(|pool| pool.info());
+        match info {
+            Some(info) => to_python(py, &info, 0),
             None => Ok(PyDict::new(py).into_any()),
         }
+    }
+
+    /// Take `addresses` in place of the addresses of the open, as
+    /// `new_addr` of `ZEO.ClientStorage` does. The client keeps its server.
+    /// Each later attempt to connect, after the loss of the server, tries
+    /// the new addresses. An address takes the form of the open. A setting
+    /// of TLS that does not fit an address raises `ValueError`, and the
+    /// addresses stay.
+    fn new_addr(&self, addresses: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
+        self.check_process()?;
+        let targets = addresses
+            .iter()
+            .map(Target::extract)
+            .collect::<PyResult<Vec<_>>>()?;
+        endpoints(&targets, self.servers.secure.as_deref(), |_, port| {
+            Ok(SocketAddr::from(([127, 0, 0, 1], port)))
+        })
+        .map_err(|error| match error {
+            Opening::Address(text) | Opening::Tls(text) => PyValueError::new_err(text),
+            error => PyValueError::new_err(error.into_error().to_string()),
+        })?;
+        *lock(&self.servers.targets) = targets;
+        Ok(())
+    }
+
+    /// Call `method` of the server with `args` on the listener, and return
+    /// its reply, as `_call` of `ZEO.ClientStorage` does. An array of the
+    /// reply becomes a tuple, and a map a dict. An error reply raises the
+    /// exception that `ZEO.ClientStorage` raises for it. A call of a
+    /// transaction raises `StorageTransactionError` and sends nothing.
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        args: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args = args_of(args)?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let reply = py
+            .detach(move || runtime.block_on(traced(trace, pool.call(&method, args))))
+            .map_err(|e| zeo_error(py, e))?;
+        to_python(py, &reply, 0)
+    }
+
+    /// Send `method` with `args` on the listener as a call without a reply,
+    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
+    fn call_async(&self, py: Python<'_>, method: String, args: &Bound<'_, PyAny>) -> PyResult<()> {
+        let args = args_of(args)?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        py.detach(move || runtime.block_on(traced(trace, pool.notify(&method, args))))
+            .map_err(|e| client_error(py, e))
+    }
+
+    /// Load each of `oids` before `tid` that the cache does not hold, all
+    /// at once, and return the number of loads. It does not wait for the
+    /// replies: they fill the cache. Without a cache, it loads nothing.
+    /// Without a server, it raises `ClientDisconnected`.
+    fn prefetch(
+        &self,
+        py: Python<'_>,
+        oids: Vec<Bound<'_, PyAny>>,
+        tid: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let tid = Tid(u64_of(tid)?);
+        let oids = oids
+            .iter()
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<PyResult<Vec<_>>>()?;
+        let pool = self.pool(py)?;
+        let runtime = self.runtime;
+        py.detach(move || {
+            // The tasks of the loads start on the runtime.
+            let _inside = runtime.enter();
+            pool.prefetch(&oids, tid)
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Call `ping` on the listener and wait for its reply. With `wait`,
+    /// wait then until the client delivered each tid that the listener read
+    /// before the reply. The thread that runs a delivery must not wait.
+    fn sync(&self, py: Python<'_>, wait: bool) -> PyResult<()> {
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        py.detach(move || runtime.block_on(traced(trace, pool.sync(wait))))
+            .map_err(|e| client_error(py, e))
     }
 
     /// Return the extensions that the server of the listener accepted.
@@ -513,7 +621,8 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Return the pickle of `oid` that the transaction `serial` wrote.
+    /// Return the pickle of `oid` that the transaction `serial` wrote. An
+    /// error of the server raises as for `call`.
     fn load_serial<'py>(
         &self,
         py: Python<'py>,
@@ -526,7 +635,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let data = py
             .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
-            .map_err(|e| client_error(py, e))?;
+            .map_err(|e| zeo_error(py, e))?;
         Ok(PyBytes::new(py, &data))
     }
 
@@ -881,6 +990,64 @@ impl NativeTransaction {
         .map_err(|e| client_error(py, e))
     }
 
+    /// Delete `oid`. `serial` is the serial that the transaction read: the
+    /// vote checks it as for a store.
+    fn delete_object(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            runtime.block_on(traced(trace, txn.delete_object(oid, serial)))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Copy a record of another storage into this transaction, which began
+    /// with a tid. `None` as `data` copies a deletion. `prev_txn` is a tid
+    /// or `None`.
+    fn restore(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: Option<&[u8]>,
+        prev_txn: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        let prev_txn = prev_txn.map(u64_of).transpose()?.map(Tid);
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            runtime.block_on(traced(trace, txn.restore(oid, serial, data, prev_txn)))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Undo the transaction `trans_id` in this transaction: `undoa`, sent to
+    /// the server, which answers as it does for `ZEO.ClientStorage`.
+    fn undo(&self, py: Python<'_>, trans_id: &[u8]) -> PyResult<()> {
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            runtime.block_on(traced(trace, txn.undo(trans_id)))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
     /// Ask the server to check at the vote that `serial` is still the
     /// current serial of `oid`.
     fn check_current_serial(
@@ -1140,9 +1307,10 @@ impl Opening {
 }
 
 /// What a client connects to: its addresses, its TLS, its storage, the
-/// options of its `register` and the longest wait of one open.
+/// options of its `register` and the longest wait of one open. Each open
+/// reads the addresses when it starts.
 struct Servers {
-    targets: Vec<Target>,
+    targets: Mutex<Vec<Target>>,
     secure: Option<Arc<Secure>>,
     storage: String,
     options: Options,
@@ -1158,8 +1326,9 @@ impl Servers {
         options: &Options,
         retry: bool,
     ) -> Result<(zoe_client::Client, Connect), Opening> {
+        let targets = lock(&self.targets).clone();
         let (listener, endpoint) = open(
-            &self.targets,
+            &targets,
             self.secure.as_deref(),
             &self.storage,
             options,
@@ -1505,10 +1674,50 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
             errors::client_disconnected(py, "the connection to the server is lost".into())
         }
         Error::Io(error) => errors::client_disconnected(py, error.to_string()),
-        Error::Server { class, message } => server_error(py, &class, message),
+        Error::Server { class, message, .. } => server_error(py, &class, message),
         Error::Unsupported(text) => errors::unsupported_failure(py, text),
         Error::Invalid(text) => errors::transaction_failure(py, text),
         error => errors::storage_failure(py, error.to_string()),
+    }
+}
+
+/// Return the exception of Python for an error of the client, as
+/// `ZEO.ClientStorage` raises it for the reply of a call: an error of the
+/// server with a class of the `exc_factories` of `ZEO.asyncio.client`
+/// raises what its factory makes of the value, and another class raises
+/// `ZEO.Exceptions.ServerException(class, value)`. Each other error raises
+/// as `client_error` gives it.
+fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
+    let Error::Server {
+        class,
+        value,
+        message,
+    } = error
+    else {
+        return client_error(py, error);
+    };
+    let made = (|| -> PyResult<PyErr> {
+        let value = to_python(py, &value, 0)?;
+        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
+        let exception = match factories.get_item(&class) {
+            Ok(factory) => factory.call1((&class, value))?,
+            Err(_) => py
+                .import("ZEO.Exceptions")?
+                .getattr("ServerException")?
+                .call1((&class, value))?,
+        };
+        Ok(PyErr::from_value(exception))
+    })();
+    made.unwrap_or_else(|_| server_error(py, &class, message))
+}
+
+/// Return the msgpack values of the args of a call: a list or a tuple.
+fn args_of(args: &Bound<'_, PyAny>) -> PyResult<Vec<Value>> {
+    match to_value(args, 0)? {
+        Value::Array(items) => Ok(items),
+        _ => Err(PyTypeError::new_err(
+            "the args of a call are a list or a tuple",
+        )),
     }
 }
 
