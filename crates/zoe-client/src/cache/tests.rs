@@ -237,6 +237,32 @@ fn an_entry_larger_than_half_of_the_ring_is_never_cached() {
 }
 
 #[test]
+fn the_last_oid_is_never_cached() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(!cache.store(Oid(u64::MAX), Tid(5), None, b"five", Tid(10)));
+    cache.commit(Tid(12), &[(Oid(u64::MAX), Some(b"twelve".as_slice()))]);
+    assert_eq!(cache.load(Oid(u64::MAX)), None);
+    assert_eq!(cache.counts().stored, 0);
+}
+
+#[test]
+fn an_entry_that_no_slot_takes_is_not_stored() {
+    // 128 KB of ring has 1,024 slots, and holds 1,500 entries of 8 bytes.
+    let cache = cache_at(128 * KB, 10);
+    let mut refused = 0;
+    for i in 0..1500 {
+        if !cache.store(Oid(i), Tid(5), None, &i.to_le_bytes(), Tid(10)) {
+            refused += 1;
+            assert_eq!(cache.load(Oid(i)), None);
+        }
+    }
+    let counts = cache.counts();
+    assert!(refused >= 1500 - 1024, "{refused} refused");
+    assert_eq!(counts.unindexed, refused);
+    assert_eq!(counts.stored, 1500 - refused);
+}
+
+#[test]
 fn the_data_of_any_length_comes_back() {
     let cache = cache_at(64 * KB, 100);
     for len in 0..40u64 {

@@ -326,6 +326,34 @@ async fn a_conflict_of_a_vote_drops_the_current_entry() {
 }
 
 #[tokio::test]
+async fn the_cache_applies_the_tid_of_a_dropped_finish_before_its_delivery() {
+    let server = start("cache-dropped");
+    let pool = open_cached(&server, 1).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let first = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    assert_eq!(cache.load(oid), Some((record(b"a"), first)));
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oid, first, &record(b"b")).await.unwrap();
+    txn.vote().await.unwrap();
+    let finished = txn.finish().await.unwrap();
+    let tid = finished.tid();
+    drop(finished);
+    // The tid reaches the consumer as a tid of another client. The cache
+    // applied it first: the entry of the oid ends at the tid, and the data
+    // of the dropped finish is not in the cache.
+    assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(oid), None);
+    let ended = cache.load_before(oid, tid).unwrap();
+    assert_eq!((ended.tid, ended.end), (first, Some(tid)));
+    pool.delivered();
+}
+
+#[tokio::test]
 async fn a_lost_listener_empties_the_cache() {
     let server = start("cache-lost");
     let pool = open_cached(&server, 2).await;

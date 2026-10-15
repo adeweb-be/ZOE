@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use pyo3::PyTraverseError;
-use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyException, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
@@ -171,7 +171,8 @@ impl NativeClient {
     ///
     /// A `cache_size` above 0 gives the pool a client cache whose ring
     /// holds that many bytes. A `cache_size` from 1 to 7 raises
-    /// `ValueError`.
+    /// `ValueError`. A mapping that the kernel does not give raises
+    /// `MemoryError`.
     ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
@@ -220,10 +221,15 @@ impl NativeClient {
         }
         let cache = match cache_size {
             0 => None,
-            size => Some(
-                Cache::new(size)
-                    .map_err(|e| PyValueError::new_err(format!("cache_size {size}: {e}")))?,
-            ),
+            size => Some(Cache::new(size).map_err(|e| {
+                let text = format!("cache_size {size}: {e}");
+                // A size that the cache refuses is a bad value. Any other
+                // error is a mapping that the kernel did not give.
+                match e.kind() {
+                    std::io::ErrorKind::InvalidInput => PyValueError::new_err(text),
+                    _ => PyMemoryError::new_err(text),
+                }
+            })?),
         };
         let targets = addresses
             .iter()

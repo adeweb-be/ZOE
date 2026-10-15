@@ -429,8 +429,9 @@ impl Cache {
         if !self.copy(&entry, &mut data) {
             return;
         }
-        if let Some(pos) = self.append(entry.oid, entry.start, 0, entry.prev, &data) {
-            self.link(&mut counts, entry.oid, pos);
+        if let Some(pos) = self.append(entry.oid, entry.start, 0, entry.prev, &data)
+            && self.link(&mut counts, entry.oid, pos)
+        {
             counts.stored += 1;
             counts.copied += 1;
         }
@@ -441,7 +442,7 @@ impl Cache {
     /// position of the connection that carried the reply, taken when the
     /// reply arrived. A current reply goes in only when `applied` is not
     /// above `seen`. A record with an end always goes in. Return whether
-    /// the cache took it.
+    /// the cache took it: a lookup can then find it.
     pub fn store(&self, oid: Oid, start: Tid, end: Option<Tid>, data: &[u8], seen: Tid) -> bool {
         if !self.fits(data.len()) {
             return false;
@@ -472,7 +473,8 @@ impl Cache {
         end: u64,
         data: &[u8],
     ) -> bool {
-        if start == 0 || (end != 0 && end <= start) || !self.fits(data.len()) {
+        // The key of the oid `u64::MAX` would be 0, the key of an empty slot.
+        if oid == u64::MAX || start == 0 || (end != 0 && end <= start) || !self.fits(data.len()) {
             return false;
         }
         let mut prev = None;
@@ -497,7 +499,9 @@ impl Cache {
         let Some(pos) = self.append(oid, start, end, prev.unwrap_or(0), data) else {
             return false;
         };
-        self.link(counts, oid, pos);
+        if !self.link(counts, oid, pos) {
+            return false;
+        }
         counts.stored += 1;
         true
     }
@@ -633,9 +637,10 @@ impl Cache {
     }
 
     /// Point the index at `pos` for `oid`. Take the slot of `oid`, else the
-    /// first slot that is empty or whose entry the ring overwrote. The
-    /// caller holds the writer lock.
-    fn link(&self, counts: &mut CacheCounts, oid: u64, pos: u64) {
+    /// first slot that is empty or whose entry the ring overwrote. Return
+    /// false when no slot takes it: no lookup finds the entry. The caller
+    /// holds the writer lock.
+    fn link(&self, counts: &mut CacheCounts, oid: u64, pos: u64) -> bool {
         let key = oid.wrapping_add(1);
         let mut slot = self.hash(oid);
         let mut take = None;
@@ -664,8 +669,12 @@ impl Cache {
             Some(slot) => {
                 self.slot_pos(slot).store(pos, Ordering::Release);
                 self.slot_key(slot).store(key, Ordering::Release);
+                true
             }
-            None => counts.unindexed += 1,
+            None => {
+                counts.unindexed += 1;
+                false
+            }
         }
     }
 }
