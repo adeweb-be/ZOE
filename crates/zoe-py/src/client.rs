@@ -32,6 +32,7 @@
 use std::mem;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -124,6 +125,8 @@ pub(crate) struct NativeClient {
     open: Mutex<Vec<Weak<Slot>>>,
     /// The last tid of the listener after the open.
     opened_at: Tid,
+    /// The last tid that the pool delivered before `close`.
+    closed_at: AtomicU64,
     /// The callable that returns the traceparent of the current span, when
     /// the server accepted `trace_context`. Else `None`.
     traceparent: Option<Py<PyAny>>,
@@ -245,6 +248,7 @@ impl NativeClient {
             read_only: listener.read_only(),
             address: listener.address().clone(),
             opened_at: pool.last_transaction(),
+            closed_at: AtomicU64::new(pool.last_transaction().0),
             pool: Mutex::new(Some(Arc::new(pool))),
             open: Mutex::new(Vec::new()),
             traceparent: traceparent.filter(|_| traces),
@@ -310,9 +314,16 @@ impl NativeClient {
 
     /// Return the last tid that the pool delivered. With `wait`, wait first
     /// for the delivery that runs now, if one runs: the thread that runs it
-    /// must not wait.
+    /// must not wait. After `close`, return the last tid before the close.
     fn last_transaction<'py>(&self, py: Python<'py>, wait: bool) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool(py)?;
+        self.check_process()?;
+        let pool = {
+            let slot = lock(&self.pool);
+            match slot.as_ref() {
+                Some(pool) => pool.clone(),
+                None => return Ok(p64(py, self.closed_at.load(AtomicOrdering::SeqCst))),
+            }
+        };
         let tid = if wait {
             let runtime = self.runtime;
             py.detach(move || runtime.block_on(pool.settled_transaction()))
@@ -507,7 +518,14 @@ impl NativeClient {
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.check_process()?;
         let runtime = self.runtime;
-        let pool = lock(&self.pool).take();
+        let pool = {
+            let mut slot = lock(&self.pool);
+            if let Some(pool) = slot.as_ref() {
+                let last = pool.last_transaction().0;
+                self.closed_at.store(last, AtomicOrdering::SeqCst);
+            }
+            slot.take()
+        };
         let Some(pool) = pool else {
             return Ok(());
         };

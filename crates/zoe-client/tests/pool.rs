@@ -3,12 +3,20 @@
 //!
 //! The tests run `zoe serve` in the test process with
 //! `zoe_server::serve::Server`. A second client commits as another client
-//! of the storage.
+//! of the storage. A TCP proxy between the pool and the server holds the
+//! reply of a finish, so a finish waits for its reply as long as a test
+//! needs.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zoe_client::{Client, Connect, Delivery, Error, Pool, Tokio, Turn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use zoe_client::{
+    Client, Connect, Delivery, Error, Invalidation, Pool, PoolTransaction, Tokio, Turn,
+};
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
 
@@ -248,4 +256,179 @@ async fn a_load_gives_the_position_of_its_connection() {
     let own = commit_other(&client, oid, tid, &record(b"b")).await;
     let (_, position) = client.load_before_at(oid, Tid(u64::MAX)).await.unwrap();
     assert_eq!(position, own);
+}
+
+/// A TCP proxy to the server. While `pause` holds `true`, the proxy keeps
+/// the bytes from the server and does not send them on.
+struct Proxy {
+    addr: SocketAddr,
+    pause: watch::Sender<bool>,
+}
+
+/// Start a proxy to `server`.
+async fn proxy(server: SocketAddr) -> Proxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (pause, paused) = watch::channel(false);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let upstream = TcpStream::connect(server).await.unwrap();
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = upstream.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+                let _ = server_write.shutdown().await;
+            });
+            let mut paused = paused.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 64 * 1024];
+                loop {
+                    let n = match server_read.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    if paused.wait_for(|paused| !*paused).await.is_err() {
+                        return;
+                    }
+                    if client_write.write_all(&buffer[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Proxy { addr, pause }
+}
+
+/// Open a pool of one connection that commits through `proxy`. The
+/// listener connects to the server directly.
+async fn open_proxied(server: &Server, proxy: &Proxy) -> Pool {
+    let listener = Client::connect(server.addr(), "1").await.unwrap();
+    let addr = proxy.addr;
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    Pool::new(Arc::new(Tokio), listener, connect, 1)
+}
+
+/// Begin a transaction on `pool` that stores `oid`, and vote.
+async fn voted(pool: &Pool, oid: Oid) -> PoolTransaction {
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oid, Tid(0), &record(b"a")).await.unwrap();
+    txn.vote().await.unwrap();
+    txn
+}
+
+/// Wait until `check` is true.
+async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !check() {
+        assert!(tokio::time::Instant::now() < deadline, "no {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_pool_frees_its_state_after_a_commit_and_its_drop() {
+    let server = start("free");
+    let addr = server.addr();
+    let listener = Client::connect(addr, "1").await.unwrap();
+    // The pool holds `connect`, so the marker lives as long as the pool.
+    let marker = Arc::new(());
+    let freed = Arc::downgrade(&marker);
+    let connect: Connect = Arc::new(move || {
+        let _held = &marker;
+        Box::pin(Client::connect(addr, "1"))
+    });
+    let pool = Pool::new(Arc::new(Tokio), listener, connect, 2);
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    drop(commit(&pool, oid, Tid(0), &record(b"a")).await.unwrap());
+    drop(pool);
+    wait_until(|| freed.strong_count() == 0, "free of the pool").await;
+}
+
+#[tokio::test]
+async fn a_tid_waits_while_a_finish_sent_before_it_waits_for_its_reply() {
+    let server = start("hold");
+    let proxy = proxy(server.addr()).await;
+    let pool = open_proxied(&server, &proxy).await;
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oids = pool.new_oids(2).await.unwrap();
+    let txn = voted(&pool, oids[0]).await;
+    proxy.pause.send_replace(true);
+    let finish = tokio::spawn(txn.finish());
+    // The server commits and the listener gets the tid. The reply of the
+    // finish waits in the proxy, so the pool cannot tell whose tid it is.
+    wait_until(|| pool.counters().held == 1, "hold of the tid").await;
+    let foreign = commit_other(&other, oids[1], Tid(0), &record(b"b")).await;
+    assert!(
+        tokio::time::timeout(BLOCKED, pool.next_delivery())
+            .await
+            .is_err(),
+        "a tid reached the consumer during the hold"
+    );
+    proxy.pause.send_replace(false);
+    let finished = tokio::time::timeout(TIMEOUT, finish)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let own = finished.tid();
+    assert!(own < foreign);
+    drop(finished.turn().await.unwrap());
+    assert_eq!(pool.last_transaction(), own);
+    // The commit of the other client comes after the commit of the pool.
+    assert_eq!(
+        next(&pool).await,
+        Delivery::Invalidate(Invalidation {
+            tid: foreign,
+            oids: vec![oids[1]],
+        })
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), foreign);
+}
+
+#[tokio::test]
+async fn a_finish_dropped_after_its_frame_went_out_leaves_the_hold() {
+    let server = start("dropped-finish");
+    let proxy = proxy(server.addr()).await;
+    let pool = open_proxied(&server, &proxy).await;
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let txn = voted(&pool, oid).await;
+    proxy.pause.send_replace(true);
+    let finish = tokio::spawn(txn.finish());
+    wait_until(|| pool.counters().held == 1, "hold of the tid").await;
+    // The drop of the future ends the hold. The tid reaches the consumer
+    // as a tid of another client.
+    finish.abort();
+    assert!(finish.await.unwrap_err().is_cancelled());
+    let Delivery::Invalidate(invalidation) = next(&pool).await else {
+        panic!("the tid of the dropped finish is not an invalidation");
+    };
+    assert_eq!(invalidation.oids, vec![oid]);
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), invalidation.tid);
+    proxy.pause.send_replace(false);
+}
+
+#[tokio::test]
+async fn a_finish_in_flight_when_the_listener_is_lost_fails() {
+    let server = start("doomed");
+    let proxy = proxy(server.addr()).await;
+    let pool = open_proxied(&server, &proxy).await;
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let txn = voted(&pool, oid).await;
+    proxy.pause.send_replace(true);
+    let finish = tokio::spawn(txn.finish());
+    wait_until(|| pool.counters().held == 1, "hold of the tid").await;
+    pool.listener().disconnect();
+    assert_eq!(next(&pool).await, Delivery::Stale);
+    pool.delivered();
+    // The reply comes after the loss: the outcome of the finish counts as
+    // unknown.
+    proxy.pause.send_replace(false);
+    let finished = tokio::time::timeout(TIMEOUT, finish)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(finished, Err(Error::Disconnected)));
 }

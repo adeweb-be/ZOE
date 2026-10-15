@@ -651,6 +651,12 @@ class _NativeClientStorage(ClientStorage):
                 delivery = native.next_delivery()
             except Exception:
                 logger.exception("%s the invalidations stopped", self.__name__)
+                # Without this thread, the pool delivers no more tids. Close
+                # the client, so a waiting call fails and does not hang.
+                try:
+                    native.close()
+                except Exception:
+                    logger.exception("%s the close failed", self.__name__)
                 return
             if delivery is None:
                 return

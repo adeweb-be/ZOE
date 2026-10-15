@@ -233,6 +233,10 @@ impl Simulation {
     /// connections that commit, at least 1, with `n` transactions at once.
     /// Each pool records what it delivers, and the report checks it
     /// (`Report::order_faults`).
+    ///
+    /// Do not combine it with `crashes`: a crash can remove a tid that a
+    /// pool delivered, so the check against the store gives false faults.
+    /// `run` panics on that combination.
     #[must_use]
     pub fn pool(mut self, n: usize) -> Self {
         self.pool = Some(n.max(1));
@@ -246,8 +250,13 @@ impl Simulation {
         self
     }
 
-    /// Run the simulation to its end.
+    /// Run the simulation to its end. Panic when the run has pools and
+    /// crashes (see `pool`).
     pub fn run(self) -> Report {
+        assert!(
+            self.pool.is_none() || self.crashes == 0,
+            "a run with pools has no crash"
+        );
         Driver::new(self).run()
     }
 }
