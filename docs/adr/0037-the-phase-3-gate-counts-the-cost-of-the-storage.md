@@ -1,13 +1,13 @@
 # 0037. The phase 3 gate counts the cost of the storage against a floor
 
-Status: proposed. The human chose the rule, the statistics and the end of ZOE-190 (#389, #390) after the finding of ZOE-187 (#385). The merge of this ADR accepts it. The harness builds it in ZOE-192 (the floor storage) and ZOE-193 (the rule and the report).
+Status: accepted. The human chose the rule, the statistics and the end of ZOE-190 (#389, #390) after the finding of ZOE-187 (#385), and accepted this ADR with the noise threshold of 10 % and the comparison on one Python build. The harness builds it in ZOE-192 (the floor storage) and ZOE-193 (the rule and the report).
 
 ## Context
 
-N4 sets the phase 3 gate: `zoe serve` through the native client at least 3× ZEO 6 through `ZEO.ClientStorage`, in every zodbshootout cell of the gate set but `read_hot` at 1 KB. The gate run on AWS after #382 passes 4 of 27 cells. Three facts make the 3× of the whole time a poor gate:
+N4 sets the phase 3 gate: `zoe serve` through the native client at least 3× ZEO 6 through `ZEO.ClientStorage`, in every zodbshootout cell of the gate set but `read_hot` at 1 KB. The gate run on the cloud machine of the gate after #382 passes 4 of 27 cells. Three facts make the 3× of the whole time a poor gate:
 
 - **Part of the time of a cell is not the storage.** The time of a cell holds ZODB, persistent, zodbpickle and the loop of zodbshootout as well as the client, the wire and the server. In `read_hot` at 100 KB, ZODB alone takes 17 µs per object at threads 1 against a target of 10.5 µs (ZEO 31.5 µs ÷ 3), and 82 to 92 µs at processes 16 against 42 µs (finding of ZOE-187). There, no storage reaches 3×. The phase 3 budget spike left `read_hot` at 1 KB out for the same reason, and ZOE-190 proposed to leave out more cells, one group at a time.
-- **The floor that the spike measured is not a bound.** Its DemoStorage over a FileStorage took 44 µs per object in `read_hot` at threads 1 and 100 KB, and the native client takes 34 µs.
+- **The floor that the spike measured is not a bound.** Its DemoStorage over a FileStorage took 44 µs per object in `read_hot` at threads 1 and 100 KB on the machine of the budget spike, and the native client takes 34 µs in the gate run of #382.
 - **Three values decide nothing in the noisy cells.** A value of a processes cell spreads up to ±50 % on the laptop of ZOE-187. The 0.88× of #382 at processes 16 became 1.03 to 1.34× in five paired rounds. A fixed order of the variants gave a false regression of 0.83×. zodbshootout reports a time even when the benchmark function raises.
 
 ## Decision
