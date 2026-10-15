@@ -241,6 +241,28 @@ pub fn decode_frame<'a>(
     key: &[u8],
     bytes: &'a [u8],
 ) -> Result<Frame<'a>, FrameError> {
+    let (frame, payload) = check_frame(space, key, bytes)?;
+    Ok(Frame {
+        data: codec::decode(frame.codec, payload)?,
+        ..frame
+    })
+}
+
+/// Verify the frame of the row `key` of `space` as `decode_frame` does,
+/// and leave its payload as it is stored. A reader that needs only the
+/// key of a row verifies its frame with this call, which decodes
+/// nothing.
+pub fn verify_frame(space: KeySpace, key: &[u8], bytes: &[u8]) -> Result<(), FrameError> {
+    check_frame(space, key, bytes).map(drop)
+}
+
+/// Check the header and the checksum of a frame. Return the frame with
+/// the stored payload in `data`, and the stored payload.
+fn check_frame<'a>(
+    space: KeySpace,
+    key: &[u8],
+    bytes: &'a [u8],
+) -> Result<(Frame<'a>, &'a [u8]), FrameError> {
     let header = bytes.get(..HEADER_LEN).ok_or(FrameError::Truncated)?;
     // This check comes before the checksum. A newer version and a damaged
     // version byte look the same here, so both are a corrupt frame.
@@ -270,15 +292,16 @@ pub fn decode_frame<'a>(
         offset: 2,
         value: header[2],
     })?;
-    Ok(Frame {
+    let frame = Frame {
         flags: header[1],
         codec,
         branch: u32::from_le_bytes(header[4..8].try_into().unwrap()),
         prev: Tid(u64::from_le_bytes(header[8..16].try_into().unwrap())),
         slots,
         stored_len: payload.len(),
-        data: codec::decode(codec, payload)?,
-    })
+        data: Cow::Borrowed(payload),
+    };
+    Ok((frame, payload))
 }
 
 /// Return the checksum of a frame: the xxh3-64 hash of the tag of
