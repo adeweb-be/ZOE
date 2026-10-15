@@ -36,7 +36,9 @@
 //!
 //! Keys are big-endian, so that the byte order of the keys is the numeric
 //! order of oids and tids. The numbers in the rows of `meta` are 8-byte
-//! big-endian values, as ZODB writes oids and tids.
+//! big-endian values, as ZODB writes oids and tids. The row `object_count`
+//! of `meta` holds the number of distinct oids that have at least one
+//! record, a deletion included.
 //!
 //! The transaction index gives the oids of each transaction. It has one
 //! key for each record: the 16 bytes of `txn_oid_key`, the tid then the
@@ -64,8 +66,14 @@ pub use codec::{Codec, Compression};
 pub(crate) use codec::EMPTY_ZSTD_PAYLOADS;
 
 /// The name and version of the format, in the `format` row of `meta`.
-/// An open refuses a store with another name.
-pub const FORMAT_NAME: &[u8] = b"ZOE format 1";
+/// A store of this format has the row `object_count` in `meta`. An open
+/// refuses a store with a name other than this one and `FORMAT_1_NAME`.
+pub const FORMAT_NAME: &[u8] = b"ZOE format 2";
+
+/// The name of the format without the row `object_count`. A writer open
+/// counts the objects of such a store once, then writes the count and
+/// `FORMAT_NAME`. A read-only open reads such a store and has no count.
+pub const FORMAT_1_NAME: &[u8] = b"ZOE format 1";
 
 /// The key space of a frame. Its tag is the first byte of the checksum
 /// input, so a frame verifies only in the key space that wrote it.

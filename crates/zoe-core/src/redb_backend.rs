@@ -10,6 +10,10 @@
 //! these tables has none until its first blob commit or its first
 //! reservation creates it. Until then it reads as a store without blob
 //! records or without sequences.
+//!
+//! The row `object_count` of `meta` counts the oids that have a record.
+//! Each write that puts or removes records updates it, and the first
+//! writer open of a store of format 1 writes it.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -40,6 +44,7 @@ const META_FORMAT: &str = "format";
 const META_LAST_TID: &str = "last_tid";
 const META_NEXT_OID: &str = "next_oid";
 const META_PACK_WATERMARK: &str = "pack_watermark";
+const META_OBJECT_COUNT: &str = "object_count";
 
 /// Wrap a redb error.
 fn backend(error: impl Into<redb::Error>) -> ZoeError {
@@ -96,6 +101,53 @@ fn inside_index(key: &[u8; 16], range: impl RangeBounds<[u8; 16]>) -> Result<()>
     Err(ZoeError::CorruptTxn { tid })
 }
 
+/// Tell if `oid` has at least one record in `records`.
+fn has_records(
+    records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+    oid: Oid,
+) -> Result<bool> {
+    let start = format::record_key(oid, Tid::ZERO);
+    let end = format::record_key(oid, Tid::MAX);
+    let mut scan = records.range::<&[u8; 16]>(&start..=&end).map_err(backend)?;
+    match scan.next() {
+        None => Ok(false),
+        Some(entry) => {
+            let (key, _) = entry.map_err(backend)?;
+            inside(oid, key.value(), start..=end)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Return the number of distinct oids of the keys of `records`. The scan
+/// reads every key. Each key must come after the key before it, else the
+/// count fails with `CorruptRecord`.
+fn count_objects(records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>) -> Result<u64> {
+    let mut count = 0;
+    let mut previous: Option<[u8; 16]> = None;
+    for entry in records.iter().map_err(backend)? {
+        let (key, _) = entry.map_err(backend)?;
+        let key = *key.value();
+        let (oid, tid) = format::split_record_key(&key);
+        match previous {
+            Some(before) if key <= before => return Err(ZoeError::CorruptRecord { oid, tid }),
+            Some(before) if format::split_record_key(&before).0 == oid => {}
+            _ => count += 1,
+        }
+        previous = Some(key);
+    }
+    Ok(count)
+}
+
+/// Decode the row `object_count` of `meta`. A store of the current format
+/// without the row, or with a row that is not 8 bytes, is a `Format`
+/// error.
+fn decode_object_count(value: Option<&[u8]>) -> Result<u64> {
+    value
+        .and_then(format::decode_u64)
+        .ok_or_else(|| ZoeError::Format("the object count is missing or is not 8 bytes".to_owned()))
+}
+
 /// The redb database of a store.
 enum Db {
     /// The database is open for reads and writes.
@@ -117,6 +169,13 @@ impl Db {
 pub(crate) struct RedbBackend {
     db: Db,
     last_tid: AtomicU64,
+    /// The object count of the last write that changed records. Only
+    /// writes under the commit sequencer change records, so they store
+    /// it in their order.
+    object_count: AtomicU64,
+    /// False only for a read-only open of a store of format 1, which has
+    /// no count.
+    counted: bool,
     /// How new records are written.
     compression: Compression,
 }
@@ -137,6 +196,8 @@ impl RedbBackend {
             meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
                 .map_err(backend)?;
             meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .map_err(backend)?;
+            meta.insert(META_OBJECT_COUNT, &format::encode_u64(0)[..])
                 .map_err(backend)?;
         }
         txn.commit().map_err(backend)
@@ -162,19 +223,27 @@ impl RedbBackend {
     /// the last transaction row. So a damaged `last_tid` cannot give a tid
     /// a second time. The row counts only when its frame passes the
     /// checksum under its key. So a damaged key cannot raise the last tid.
+    ///
+    /// A store of the current format must have `object_count`. A store of
+    /// format 1 has none: a writer open upgrades it (`upgrade`), and a
+    /// read-only open reads it without a count.
     fn open_db(db: Db) -> Result<Self> {
-        let last_tid = {
+        let (last_tid, object_count) = {
             let txn = db.begin_read().map_err(backend)?;
             let meta = txn.open_table(META).map_err(backend)?;
             let read = |key: &str| -> Result<Option<Vec<u8>>> {
                 Ok(meta.get(key).map_err(backend)?.map(|v| v.value().to_vec()))
             };
             let format_name = read(META_FORMAT)?.unwrap_or_default();
-            if format_name != format::FORMAT_NAME {
+            let object_count = if format_name == format::FORMAT_NAME {
+                Some(decode_object_count(read(META_OBJECT_COUNT)?.as_deref())?)
+            } else if format_name == format::FORMAT_1_NAME {
+                None
+            } else {
                 return Err(ZoeError::Format(
                     String::from_utf8_lossy(&format_name).into_owned(),
                 ));
-            }
+            };
             match txn.open_table(TXN_OIDS) {
                 Ok(_) => {}
                 Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -194,13 +263,46 @@ impl RedbBackend {
                     Ok(_) | Err(format::FrameError::Unsupported { .. })
                 )
             });
-            stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())))
+            let last_tid =
+                stored.max(last_row.map_or(0, |(key, _)| u64::from_be_bytes(*key.value())));
+            (last_tid, object_count)
+        };
+        let object_count = match (object_count, &db) {
+            (Some(count), _) => Some(count),
+            (None, Db::ReadWrite(db)) => Some(Self::upgrade(db)?),
+            (None, Db::ReadOnly(_)) => None,
         };
         Ok(Self {
             db,
             last_tid: AtomicU64::new(last_tid),
+            object_count: AtomicU64::new(object_count.unwrap_or(0)),
+            counted: object_count.is_some(),
             compression: Compression::default(),
         })
+    }
+
+    /// Upgrade a store of format 1 to the current format: count the
+    /// distinct oids of `records`, then write `object_count` and the
+    /// format name in one write transaction, with a sync. Return the
+    /// count.
+    ///
+    /// The count reads every key of `records`, so this open does not hold
+    /// N7. A crash before the commit leaves format 1, and the next writer
+    /// open counts again.
+    fn upgrade(db: &Database) -> Result<u64> {
+        let txn = db.begin_write().map_err(backend)?;
+        let count = {
+            let records = txn.open_table(RECORDS).map_err(backend)?;
+            let count = count_objects(&records)?;
+            let mut meta = txn.open_table(META).map_err(backend)?;
+            meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
+                .map_err(backend)?;
+            meta.insert(META_FORMAT, format::FORMAT_NAME)
+                .map_err(backend)?;
+            count
+        };
+        txn.commit().map_err(backend)?;
+        Ok(count)
     }
 
     /// Write new records with `compression`. The backend reads records of
@@ -381,10 +483,12 @@ impl Backend for RedbBackend {
         Ok(Box::new(RedbWrite {
             txn: db.begin_write().map_err(backend)?,
             last_tid: &self.last_tid,
+            object_count: &self.object_count,
             compression: self.compression,
             written_tid: None,
             max_oid: None,
             pack_watermark: None,
+            touched: BTreeMap::new(),
         }))
     }
 
@@ -579,6 +683,11 @@ impl Backend for RedbBackend {
         }
     }
 
+    fn object_count(&self) -> Option<u64> {
+        self.counted
+            .then(|| self.object_count.load(Ordering::Acquire))
+    }
+
     fn record_keys(&self, from: Oid, limit: usize) -> Result<Vec<(Oid, Tid)>> {
         let txn = self.db.begin_read().map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;
@@ -699,6 +808,28 @@ impl Backend for RedbBackend {
         txn.commit().map_err(backend)
     }
 
+    #[cfg(feature = "testing")]
+    fn write_meta_stored(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        {
+            let mut meta = txn.open_table(META).map_err(backend)?;
+            match value {
+                Some(value) => {
+                    meta.insert(key, value).map_err(backend)?;
+                }
+                None => {
+                    if meta.remove(key).map_err(backend)?.is_none() {
+                        return Err(ZoeError::Backend(format!("no meta row {key:?}").into()));
+                    }
+                }
+            }
+        }
+        txn.commit().map_err(backend)
+    }
+
     fn remove_index_key_for_test(&self, tid: Tid, oid: Oid) -> Result<()> {
         self.remove_for_test(TXN_OIDS, &format::txn_oid_key(tid, oid), oid)
     }
@@ -765,10 +896,64 @@ impl Backend for RedbBackend {
 struct RedbWrite<'a> {
     txn: redb::WriteTransaction,
     last_tid: &'a AtomicU64,
+    object_count: &'a AtomicU64,
     compression: Compression,
     written_tid: Option<Tid>,
     max_oid: Option<Oid>,
     pack_watermark: Option<Tid>,
+    /// Each oid that the write puts or removes a record of.
+    touched: BTreeMap<Oid, Touched>,
+}
+
+/// What a write did to the records of one oid.
+#[derive(Clone, Copy)]
+struct Touched {
+    /// The oid had a record before the write touched it.
+    before: bool,
+    /// The write removed a record of the oid.
+    removed: bool,
+}
+
+impl RedbWrite<'_> {
+    /// Note that the write touches `oid`, before it changes a record of
+    /// the oid. The first note of an oid reads if the oid has a record.
+    fn touch(
+        touched: &mut BTreeMap<Oid, Touched>,
+        records: &impl ReadableTable<&'static [u8; 16], &'static [u8]>,
+        oid: Oid,
+        removed: bool,
+    ) -> Result<()> {
+        let entry = match touched.entry(oid) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Touched {
+                before: has_records(records, oid)?,
+                removed: false,
+            }),
+        };
+        entry.removed |= removed;
+        Ok(())
+    }
+
+    /// Return the object count after this write: the stored count, plus
+    /// each touched oid that has a record now and had none before, less
+    /// each touched oid that had a record before and has none now.
+    fn count_after(&self, stored: u64) -> Result<u64> {
+        let records = self.txn.open_table(RECORDS).map_err(backend)?;
+        let mut count = stored;
+        for (&oid, touched) in &self.touched {
+            // A write that only put records of the oid leaves a record.
+            let after = !touched.removed || has_records(&records, oid)?;
+            // Only a damaged count can be lower than the oids that it
+            // counts. `zoe verify` finds such a count, so the write does
+            // not fail for it.
+            match (touched.before, after) {
+                (false, true) => count = count.saturating_add(1),
+                (true, false) => count = count.saturating_sub(1),
+                _ => {}
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl WriteTxn for RedbWrite<'_> {
@@ -787,6 +972,7 @@ impl WriteTxn for RedbWrite<'_> {
         let mut index = self.txn.open_table(TXN_OIDS).map_err(backend)?;
         for record in new {
             let (oid, prev, data) = record?;
+            Self::touch(&mut self.touched, &records, oid, false)?;
             let key = format::record_key(oid, tid);
             let frame = format::encode_frame_with(
                 KeySpace::Records,
@@ -840,6 +1026,7 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn remove_record(&mut self, oid: Oid, tid: Tid) -> Result<()> {
         let mut records = self.txn.open_table(RECORDS).map_err(backend)?;
+        Self::touch(&mut self.touched, &records, oid, true)?;
         records
             .remove(&format::record_key(oid, tid))
             .map_err(backend)?;
@@ -922,8 +1109,24 @@ impl WriteTxn for RedbWrite<'_> {
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
+        // A write that changes no record writes no count: a sequence
+        // reservation and the barrier of `sync`.
+        let object_count = if self.touched.is_empty() {
+            None
+        } else {
+            let stored = {
+                let meta = self.txn.open_table(META).map_err(backend)?;
+                let value = meta.get(META_OBJECT_COUNT).map_err(backend)?;
+                decode_object_count(value.as_ref().map(|v| v.value()))?
+            };
+            Some(self.count_after(stored)?)
+        };
         {
             let mut meta = self.txn.open_table(META).map_err(backend)?;
+            if let Some(count) = object_count {
+                meta.insert(META_OBJECT_COUNT, &format::encode_u64(count)[..])
+                    .map_err(backend)?;
+            }
             if let Some(tid) = self.pack_watermark {
                 meta.insert(META_PACK_WATERMARK, &format::encode_u64(tid.0)[..])
                     .map_err(backend)?;
@@ -944,6 +1147,9 @@ impl WriteTxn for RedbWrite<'_> {
             }
         }
         self.txn.commit().map_err(backend)?;
+        if let Some(count) = object_count {
+            self.object_count.store(count, Ordering::Release);
+        }
         if let Some(tid) = self.written_tid {
             self.last_tid.store(tid.0, Ordering::Release);
         }
@@ -1399,6 +1605,8 @@ mod tests {
             meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
                 .unwrap();
             meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .unwrap();
+            meta.insert(META_OBJECT_COUNT, &format::encode_u64(0)[..])
                 .unwrap();
         }
         txn.commit().unwrap();
@@ -2063,6 +2271,8 @@ mod tests {
                 .unwrap();
             meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
                 .unwrap();
+            meta.insert(META_OBJECT_COUNT, &format::encode_u64(0)[..])
+                .unwrap();
         }
         txn.commit().unwrap();
 
@@ -2205,6 +2415,8 @@ mod tests {
             meta.insert(META_LAST_TID, &format::encode_u64(0)[..])
                 .unwrap();
             meta.insert(META_NEXT_OID, &format::encode_u64(1)[..])
+                .unwrap();
+            meta.insert(META_OBJECT_COUNT, &format::encode_u64(0)[..])
                 .unwrap();
         }
         txn.commit().unwrap();
