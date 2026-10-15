@@ -842,8 +842,7 @@ async fn a_download_writes_the_chunks_of_its_blob_and_ends_at_the_reply() {
                 peer.notify("receiveBlobChunk", args).await;
             }
         }
-        peer.notify("receiveBlobStop", vec![bin8(1), bin8(5)])
-            .await;
+        peer.notify("receiveBlobStop", vec![bin8(1), bin8(5)]).await;
         peer.reply(id, Value::Nil).await;
         peer
     });
@@ -899,7 +898,10 @@ async fn a_download_fails_without_its_stop_or_with_an_error_reply() {
         "{result:?}"
     );
     let mut sink = Vec::new();
-    assert_eq!(client.send_blob(Oid(1), Tid(5), &mut sink).await.unwrap(), 2);
+    assert_eq!(
+        client.send_blob(Oid(1), Tid(5), &mut sink).await.unwrap(),
+        2
+    );
     assert_eq!(sink, b"ok");
     let _peer = server.await.unwrap();
     client.close().await;
@@ -959,8 +961,7 @@ async fn a_second_download_of_a_blob_waits_for_the_reply_of_the_first() {
         assert!(early.is_err(), "a second sendBlob of the blob went out");
         let args = vec![bin8(1), bin8(5), b"rest".to_vec().into()];
         peer.notify("receiveBlobChunk", args).await;
-        peer.notify("receiveBlobStop", vec![bin8(1), bin8(5)])
-            .await;
+        peer.notify("receiveBlobStop", vec![bin8(1), bin8(5)]).await;
         peer.reply(first, Value::Nil).await;
         let (second, _, method, _) = peer.recv().await;
         assert_eq!(method, "sendBlob");
@@ -981,7 +982,10 @@ async fn a_second_download_of_a_blob_waits_for_the_reply_of_the_first() {
     }
     let mut sink = Vec::new();
     let second = client.send_blob(Oid(1), Tid(5), &mut sink);
-    let size = tokio::time::timeout(TIMEOUT, second).await.unwrap().unwrap();
+    let size = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((size, sink.as_slice()), (3, &b"new"[..]));
     let _peer = server.await.unwrap();
     client.close().await;

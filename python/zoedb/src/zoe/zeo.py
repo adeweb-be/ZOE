@@ -640,9 +640,7 @@ class _NativeClientStorage(ClientStorage):
             # The layout of ZEO's blob cache, so either client reads it.
             if "zeocache" not in ZODB.blob.LAYOUTS:
                 ZODB.blob.LAYOUTS["zeocache"] = BlobCacheLayout()
-            self.fshelper = ZODB.blob.FilesystemHelper(
-                blob_dir, layout_name="zeocache"
-            )
+            self.fshelper = ZODB.blob.FilesystemHelper(blob_dir, layout_name="zeocache")
             self.fshelper.create()
         # The lock covers the count of the bytes that came into the cache.
         self._blob_lock = threading.Lock()

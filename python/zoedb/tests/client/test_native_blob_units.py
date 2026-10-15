@@ -158,9 +158,7 @@ def test_an_abort_removes_the_blob_file_that_the_transaction_took(server, tmp_pa
         storage.close()
 
 
-def test_the_blob_cache_of_the_native_client_serves_the_client_of_zeo(
-    server, tmp_path
-):
+def test_the_blob_cache_of_the_native_client_serves_the_client_of_zeo(server, tmp_path):
     import ZEO.ClientStorage
 
     cache = tmp_path / "cache"
