@@ -288,6 +288,20 @@ pub trait Backend: Send + Sync {
 /// version and the pickle.
 pub type NewRecord<'a> = (Oid, Tid, Cow<'a, [u8]>);
 
+/// The payload of a version that a commit writes.
+#[derive(Clone, Debug)]
+pub enum Payload<'a> {
+    /// The pickle. The backend encodes it with its own compression.
+    Pickle(Cow<'a, [u8]>),
+    /// The pickle that the core encoded already: the codec and the payload
+    /// of the frame. The backend writes it as it is.
+    Encoded(Codec, Cow<'a, [u8]>),
+}
+
+/// A version that a commit writes: the oid, the serial of the previous
+/// version and the payload.
+pub type NewPayload<'a> = (Oid, Tid, Payload<'a>);
+
 /// One backend write transaction. It holds the records, their keys in
 /// the transaction index, the blob records, the transaction rows and the
 /// meta update of the commits of one commit batch, or the sequence row of
@@ -309,6 +323,32 @@ pub trait WriteTxn {
     ) -> Result<()> {
         for record in records {
             let (oid, prev, data) = record?;
+            self.put_record(oid, tid, prev, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Stage each version that `tid` writes, as `put_records` does, from
+    /// its payload. An encoded payload goes into the frame as it is, so the
+    /// frame is the frame that the backend makes from the pickle with the
+    /// same compression. An error of `records` stops the call with that
+    /// error.
+    ///
+    /// The default decodes an encoded payload and calls `put_record`.
+    fn put_payloads(
+        &mut self,
+        tid: Tid,
+        records: &mut dyn Iterator<Item = Result<NewPayload<'_>>>,
+    ) -> Result<()> {
+        for record in records {
+            let (oid, prev, payload) = record?;
+            let data = match payload {
+                Payload::Pickle(data) => data,
+                Payload::Encoded(codec, stored) => crate::format::decode_payload(codec, &stored)
+                    .map_err(|_| ZoeError::Backend("an encoded payload does not decode".into()))?
+                    .into_owned()
+                    .into(),
+            };
             self.put_record(oid, tid, prev, &data)?;
         }
         Ok(())

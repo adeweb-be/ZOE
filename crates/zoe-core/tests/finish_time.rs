@@ -21,6 +21,15 @@
 //! `ZOE_FINISH_TXNS` sets the number of transactions of each scenario,
 //! 500 by default. `ZOE_FINISH_DIR` sets the directory of the store, the
 //! temporary directory of cargo by default.
+//!
+//! The test `finish_time_with_attached_payloads` runs `add` and `update`
+//! with zstd for records of 1 KB and of 100 KB, each time with the
+//! payloads encoded inline in the finish and attached before the vote
+//! (`Txn::set_encoded`), as `zoe serve` attaches them. The encodes of the
+//! attached payloads run before the vote and are not in the finish. It
+//! also prints the time of one encode with a new zstd context and with
+//! the context of the thread. `ZOE_FINISH_TXNS_LARGE` sets the number of
+//! transactions with records of 100 KB, 50 by default.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -31,13 +40,16 @@ use std::time::{Duration, Instant};
 
 use redb::StorageBackend;
 use zoe_core::vfs::{DirLock, OsVfs, Vfs, WriteFile};
-use zoe_core::{Compression, Oid, Options, Store, SystemClock, Tid};
+use zoe_core::{Compression, Encoded, Oid, Options, Store, SystemClock, Tid};
 
 /// The records of a transaction.
 const RECORDS: usize = 100;
 
-/// The size of a record.
+/// The size of a record of the first test.
 const SIZE: usize = 1024;
+
+/// The size of a large record.
+const LARGE: usize = 100 * 1024;
 
 /// The transactions that run before each scenario and are not measured.
 const WARMUP: usize = 20;
@@ -279,19 +291,24 @@ impl tracing::Subscriber for FsyncSpans {
 /// zodbshootout. The first half is text that zstd compresses well, the
 /// second half is pseudo-random bytes that it does not.
 fn record(oid: Oid, version: u64) -> Vec<u8> {
-    let mut data = Vec::with_capacity(SIZE);
+    record_of(oid, version, SIZE)
+}
+
+/// The record of `oid` in its `version`, of `size` bytes, as `record`.
+fn record_of(oid: Oid, version: u64, size: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(size);
     data.extend_from_slice(b"\x80\x03czodbshootout.speedtest\nPObject\nq\x00.\x80\x03}q\x01(");
-    while data.len() < SIZE / 2 {
+    while data.len() < size / 2 {
         data.extend_from_slice(b"X\x04\x00\x00\x00attrq\x02K\x01X\x04\x00\x00\x00dataq\x03");
     }
     let mut state = oid.0 ^ (version << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    while data.len() < SIZE {
+    while data.len() < size {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         data.extend_from_slice(&state.to_le_bytes());
     }
-    data.truncate(SIZE);
+    data.truncate(size);
     data
 }
 
@@ -339,6 +356,15 @@ impl Samples {
     }
 }
 
+/// How a scenario writes its records.
+#[derive(Clone, Copy)]
+struct Shape {
+    /// The size of a record.
+    size: usize,
+    /// True when the payloads are encoded before the vote and attached.
+    attach: bool,
+}
+
 /// Commit one transaction that writes `oids` in `version`. Return the
 /// time of `finish` and the oids with their new serial. `io` counts only
 /// the syncs and the writes of `finish`.
@@ -347,10 +373,16 @@ fn commit(
     io: &Io,
     oids: &[(Oid, Tid)],
     version: u64,
+    shape: Shape,
 ) -> (Duration, Vec<(Oid, Tid)>) {
     let mut txn = store.tpc_begin(b"user", b"finish time", b"").unwrap();
     for &(oid, serial) in oids {
-        txn.store(oid, serial, &record(oid, version)).unwrap();
+        let data = record_of(oid, version, shape.size);
+        txn.store(oid, serial, &data).unwrap();
+        if shape.attach {
+            let encoded = Encoded::encode(&data, store.compression());
+            assert!(txn.set_encoded(oid, encoded).unwrap());
+        }
     }
     txn.vote().unwrap();
     io.take();
@@ -364,6 +396,22 @@ fn commit(
 /// `compression`, and return their numbers. `add` writes new oids, and
 /// `update` writes again the oids of the warmup, in turn.
 fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Samples {
+    let shape = Shape {
+        size: SIZE,
+        attach: false,
+    };
+    run_shape(dir, compression, scenario, txns, shape)
+}
+
+/// Run `txns` transactions of `scenario` as `run` does, with records of
+/// `shape`.
+fn run_shape(
+    dir: &Path,
+    compression: Compression,
+    scenario: &str,
+    txns: usize,
+    shape: Shape,
+) -> Samples {
     let _ = std::fs::remove_dir_all(dir);
     let io = Arc::new(Io::default());
     let vfs = TimedVfs {
@@ -389,16 +437,16 @@ fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Sam
     tracing::dispatcher::with_default(&dispatch, || {
         let mut written = Vec::new();
         for _ in 0..WARMUP {
-            let (_, oids) = commit(&store, &io, &new_oids(&store), 0);
+            let (_, oids) = commit(&store, &io, &new_oids(&store), 0, shape);
             written.push(oids);
         }
         spans.take();
         for i in 0..txns {
             let finish = if scenario == "add" {
-                commit(&store, &io, &new_oids(&store), 0).0
+                commit(&store, &io, &new_oids(&store), 0, shape).0
             } else {
                 let slot = i % written.len();
-                let (finish, oids) = commit(&store, &io, &written[slot], i as u64 + 1);
+                let (finish, oids) = commit(&store, &io, &written[slot], i as u64 + 1, shape);
                 written[slot] = oids;
                 finish
             };
@@ -438,6 +486,58 @@ fn finish_time_at_concurrency_1_with_1_kb_records() {
         for scenario in ["add", "update"] {
             let samples = run(&dir, compression, scenario, txns);
             samples.print(&format!("{scenario}, compression {name}"));
+        }
+    }
+}
+
+/// Return the mean time of `encode` over `records`, in µs.
+fn encode_time(records: &[Vec<u8>], encode: impl Fn(&[u8]) -> usize) -> f64 {
+    let start = Instant::now();
+    let mut stored = 0;
+    for data in records {
+        stored += encode(data);
+    }
+    std::hint::black_box(stored);
+    start.elapsed().as_secs_f64() * 1e6 / records.len() as f64
+}
+
+#[test]
+#[ignore = "a measurement: run it in release on a real disk"]
+fn finish_time_with_attached_payloads() {
+    let number = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let dir = std::env::var_os("ZOE_FINISH_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
+        .join("finish-time-attached");
+    for (size, txns) in [
+        (SIZE, number("ZOE_FINISH_TXNS", 500)),
+        (LARGE, number("ZOE_FINISH_TXNS_LARGE", 50)),
+    ] {
+        let records: Vec<Vec<u8>> = (0..RECORDS as u64)
+            .map(|oid| record_of(Oid(oid), 0, size))
+            .collect();
+        let fresh = encode_time(&records, |data| {
+            let mut compressor = zstd::bulk::Compressor::new(3).unwrap();
+            compressor.include_contentsize(true).unwrap();
+            compressor.compress(data).unwrap().len()
+        });
+        let reused = encode_time(&records, |data| {
+            Encoded::encode(data, Compression::default()).stored_len()
+        });
+        println!(
+            "encode of one record of {size} bytes: new context {fresh:.1} µs, context of the thread {reused:.1} µs"
+        );
+        for attach in [false, true] {
+            for scenario in ["add", "update"] {
+                let shape = Shape { size, attach };
+                let samples = run_shape(&dir, Compression::default(), scenario, txns, shape);
+                let mode = if attach { "attached" } else { "inline" };
+                samples.print(&format!("{scenario}, {size} bytes, zstd, payloads {mode}"));
+            }
         }
     }
 }

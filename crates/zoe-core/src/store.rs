@@ -209,6 +209,8 @@ pub struct Store {
     pub(crate) locks: LockManager,
     pub(crate) lock_timeout: Duration,
     pub(crate) guardrails: Guardrails,
+    /// The compression of the records that the store writes.
+    compression: Compression,
     /// The tid of the last commit. Its lock is the commit sequencer. It is
     /// `None` after a failed finish, because the outcome of that commit is
     /// unknown.
@@ -497,6 +499,7 @@ impl Store {
             locks: LockManager::default(),
             lock_timeout: options.lock_timeout,
             guardrails: Guardrails::new(&options),
+            compression: options.compression,
             sequencer: Mutex::new(Some(last_tid)),
             group: GroupCommit::default(),
             next_oid: AtomicU64::new(next_oid.0),
@@ -625,6 +628,13 @@ impl Store {
         self.backend
             .record_info(oid, tid)?
             .ok_or(ZoeError::NotFound { oid })
+    }
+
+    /// Return the compression of the records that the store writes: the
+    /// `compression` option of its open. `Encoded::encode` with it gives
+    /// the payload that the finish writes.
+    pub fn compression(&self) -> Compression {
+        self.compression
     }
 
     /// Return the tid of the last committed transaction.

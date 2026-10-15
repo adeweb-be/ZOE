@@ -16,8 +16,13 @@
 //! and not more than `ZSTD_MAX_EXPANSION` times the stored length. The reader then
 //! decodes into a buffer of that length. A payload that decodes to another
 //! length is an error.
+//!
+//! Each thread keeps one zstd compression context and uses it again for
+//! each record. A context gives the same bytes as a new context with the
+//! same parameters, so the stored frames do not depend on the thread.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use zstd::bulk::{Compressor, Decompressor};
 use zstd::zstd_safe;
@@ -115,11 +120,43 @@ fn zstd_smaller(data: &[u8], level: i32) -> Option<Vec<u8>> {
     // smaller, because it needs some free space in the buffer. Then the
     // data is stored as it is. That costs a few bytes and is correct.
     let mut packed = Vec::with_capacity(data.len().checked_sub(1)?);
+    #[cfg(feature = "testing")]
+    COMPRESSIONS.with(|count| count.set(count.get() + 1));
+    COMPRESSOR.with_borrow_mut(|slot| {
+        if slot.as_ref().is_none_or(|(at, _)| *at != level) {
+            *slot = Some((level, compressor(level)?));
+        }
+        let (_, compressor) = slot.as_mut()?;
+        compressor.compress_to_buffer(data, &mut packed).ok()
+    })?;
+    (packed.len() < data.len()).then_some(packed)
+}
+
+thread_local! {
+    /// The zstd compression context of this thread, with its level.
+    static COMPRESSOR: RefCell<Option<(i32, Compressor<'static>)>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(feature = "testing")]
+thread_local! {
+    /// The number of zstd compressions of this thread.
+    static COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Return the number of zstd compressions that this thread made. Only a
+/// test build has this count.
+#[cfg(feature = "testing")]
+pub(crate) fn compressions() -> u64 {
+    COMPRESSIONS.with(std::cell::Cell::get)
+}
+
+/// Return a new zstd compression context at `level`.
+fn compressor(level: i32) -> Option<Compressor<'static>> {
     let mut compressor = Compressor::new(level).ok()?;
     // The reader needs the data length in the zstd frame header.
     compressor.include_contentsize(true).ok()?;
-    compressor.compress_to_buffer(data, &mut packed).ok()?;
-    (packed.len() < data.len()).then_some(packed)
+    Some(compressor)
 }
 
 /// Decode the payload `stored` of the codec `codec`. Return the data.
@@ -288,6 +325,35 @@ mod tests {
             let (codec, payload) = encode(&data, compression);
             assert_eq!(codec, Codec::None);
             assert_eq!(&payload[..], &data[..]);
+        }
+    }
+
+    #[test]
+    fn the_context_of_a_thread_gives_the_bytes_of_a_new_context() {
+        let mut inputs = vec![
+            b"a".to_vec(),
+            repetitive(20),
+            repetitive(5_000),
+            noise(5_000),
+            repetitive(300_000),
+            repetitive(1_000),
+        ];
+        // A record that zstd does not make smaller fails in the context,
+        // and the next record uses the context again.
+        inputs.insert(3, noise(100_000));
+        for level in [-5, 1, 3, 19, 3] {
+            for data in &inputs {
+                let (codec, payload) = encode(data, Compression::Zstd { level });
+                let mut fresh = compressor(level).unwrap();
+                let mut expected = Vec::with_capacity(data.len() - 1);
+                match fresh.compress_to_buffer(data, &mut expected) {
+                    Ok(_) if expected.len() < data.len() => {
+                        assert_eq!(codec, Codec::Zstd);
+                        assert_eq!(&payload[..], &expected[..], "level {level}");
+                    }
+                    _ => assert_eq!(codec, Codec::None, "level {level}"),
+                }
+            }
         }
     }
 

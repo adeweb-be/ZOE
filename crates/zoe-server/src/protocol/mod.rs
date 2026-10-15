@@ -20,6 +20,7 @@
 
 mod blob;
 mod clock;
+mod compress;
 mod extension;
 pub(crate) mod frame;
 mod invalidation;
@@ -56,6 +57,7 @@ use crate::runtime::{BoxFuture, Runtime, Tokio};
 use invalidation::Invalidations;
 use metrics::{Exported, Metrics};
 use outbox::{Closing, Outbox};
+use compress::Compressor;
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
 use status::Stats;
@@ -249,18 +251,29 @@ pub(crate) struct Storages {
     client_queue: usize,
     /// The read pool of all the connections.
     pool: Pool,
+    /// The compression pool of all the connections.
+    compressor: Compressor,
 }
 
 impl Storages {
     /// Serve `storages`, whose names must differ. At most `client_queue`
-    /// invalidations wait for one client. The read pool has as many
-    /// threads as the machine has cores.
+    /// invalidations wait for one client. The read pool and the
+    /// compression pool each have as many threads as the machine has
+    /// cores.
     pub(crate) fn new(storages: Vec<Arc<NamedStorage>>, client_queue: usize) -> Self {
         Self {
             storages,
             client_queue,
             pool: Pool::new(Pool::cores()),
+            compressor: Compressor::new(Pool::cores()),
         }
+    }
+
+    /// Encode the staged pickles on `compressor`.
+    #[cfg(test)]
+    pub(crate) fn with_compressor(mut self, compressor: Compressor) -> Self {
+        self.compressor = compressor;
+        self
     }
 
     /// Run the calls that read on `pool`.

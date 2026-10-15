@@ -273,8 +273,9 @@ fn write(
     for (member, finished) in members.iter_mut() {
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
-        // A spilled pickle is read back here, one at a time.
-        write.put_records(tid, &mut member.staged.records())?;
+        // An attached payload goes into its frame as it is. A spilled
+        // pickle without one is read back here, one at a time.
+        write.put_payloads(tid, &mut member.staged.payloads())?;
         for (oid, _) in member.staged.iter() {
             if let Some(blob) = member.blobs.get(&oid) {
                 write.put_blob(oid, tid, blob.record())?;
