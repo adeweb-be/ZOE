@@ -675,7 +675,9 @@ class _NativeClientStorage(ClientStorage):
         )
         self._cache = _NativeCache(self._native)
         try:
-            if self._native.is_connected():
+            # Without `wait`, the event of the first connection takes the
+            # server, so the client takes it once for each connection.
+            if wait and self._native.is_connected():
                 self._take_server()
                 logger.info(
                     "%s native client connected to storage %r at %s",

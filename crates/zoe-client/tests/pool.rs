@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -927,4 +928,151 @@ async fn blobs_download_through_any_connection_of_the_pool() {
         matches!(&missing, Err(Error::Server { class, .. }) if class.ends_with("POSKeyError")),
         "{missing:?}"
     );
+}
+
+#[tokio::test]
+async fn a_stale_turn_and_a_quick_verification_at_the_last_tid_give_no_invalidation() {
+    let server = start("reconnect-stale-turn");
+    let proxy = proxy(server.addr()).await;
+    // The listener reads through the proxy. The connections that commit
+    // reach the server directly.
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let addr = server.addr();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    let (_gate, opened) = watch::channel(true);
+    let reconnect = Reconnect::new(gated(addr, Options::default(), opened), POLL);
+    let cache = Cache::new(1 << 20).unwrap();
+    let pool = Pool::with_reconnect(
+        Arc::new(Tokio),
+        Some((listener, connect)),
+        2,
+        Some(cache),
+        reconnect,
+    );
+    let (changed, kept, first) = cached_pair(&pool).await;
+
+    // The finish has its reply, but the listener does not see its tid.
+    proxy.pause.send_replace(true);
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(changed, first, &record(b"c")).await.unwrap();
+    txn.vote().await.unwrap();
+    let finished = txn.finish().await.unwrap();
+    let tid = finished.tid();
+    let turn = tokio::spawn(finished.turn());
+
+    // The loss gives the stale mark, then the turn, which moves the last
+    // tid past `applied` of the cache.
+    pool.listener().unwrap().disconnect();
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    let turn = turn.await.unwrap().unwrap();
+    assert!(turn.stale());
+    drop(turn);
+    assert_eq!(pool.last_transaction(), tid);
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.applied(), first);
+
+    // getInvalidations(applied) gives the tid of the pool: the consumer
+    // gets no invalidation, and only the cache moves.
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(changed), None);
+    assert_eq!(cache.load(kept), Some((record(b"b"), first)));
+    assert_eq!(pool.load(changed).await.unwrap(), (record(b"c"), tid));
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_listener_changed_during_the_open_tries_again() {
+    let dir = fresh_dir("reconnect-upgrade-race");
+    drop(Server::start(ServeOptions::new(dir.join("read-only"))).unwrap());
+    let read_only =
+        Server::start(ServeOptions::new(dir.join("read-only")).read_only(true)).unwrap();
+    let writable = start("reconnect-upgrade-race-writable");
+    let (ro, rw) = (read_only.addr(), writable.addr());
+    // The first writable open waits until the test releases it.
+    let (release, released) = watch::channel(false);
+    let upgrades = Arc::new(AtomicUsize::new(0));
+    let count = upgrades.clone();
+    let open: Open = Arc::new(move |only_writable| {
+        let first = only_writable && count.fetch_add(1, Ordering::SeqCst) == 0;
+        let mut released = released.clone();
+        Box::pin(async move {
+            if first {
+                let _ = released.wait_for(|released| *released).await;
+            }
+            let (addr, options) = match only_writable {
+                true => (rw, Options::default()),
+                false => {
+                    let fallback = Options {
+                        read_only_fallback: true,
+                        ..Options::default()
+                    };
+                    (ro, fallback)
+                }
+            };
+            let client = Client::open(Arc::new(Tokio), addr, "1", &options).await?;
+            let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+            Ok((client, connect))
+        })
+    });
+    let reconnect = Reconnect {
+        upgrade: true,
+        ..Reconnect::new(open, POLL)
+    };
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, None, reconnect);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    wait_until(|| upgrades.load(Ordering::SeqCst) >= 1, "upgrade").await;
+
+    // The read-only listener is lost while the upgrade opens, and the pool
+    // connects again to the read-only server.
+    pool.listener().unwrap().disconnect();
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    assert!(pool.listener().unwrap().read_only());
+
+    // The late writable listener does not count. The next attempt takes
+    // the writable server.
+    release.send_replace(true);
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    let listener = pool.listener().unwrap();
+    assert!(!listener.read_only());
+    assert_eq!(listener.address(), &zoe_client::Address::Tcp(rw));
+    assert!(upgrades.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn a_closed_pool_opens_no_listener() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let count = opens.clone();
+    let open: Open = Arc::new(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(Error::Disconnected) })
+    });
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, None, Reconnect::new(open, POLL));
+    wait_until(|| opens.load(Ordering::SeqCst) >= 3, "attempt").await;
+    pool.disconnect();
+    let after = opens.load(Ordering::SeqCst);
+    tokio::time::sleep(POLL * 10).await;
+    assert_eq!(opens.load(Ordering::SeqCst), after);
+    assert_eq!(pool.next_event().await, None);
 }
