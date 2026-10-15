@@ -52,7 +52,6 @@
 //! these waits.
 
 use std::collections::VecDeque;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -70,10 +69,24 @@ pub(crate) const WAITING: usize = 1 << 20;
 /// share them.
 pub(crate) type Frame = Arc<Vec<u8>>;
 
+/// The bytes of one frame of the session, in parts. The frame is the
+/// parts one after the other. The writer sends each part from its own
+/// buffer, so a call can put the buffer of a record in a part with no
+/// copy.
+pub(crate) type Parts = Vec<Vec<u8>>;
+
+/// The bytes of a frame that goes out.
+enum Body {
+    /// A frame of the hub.
+    Hub(Frame),
+    /// A frame of the session.
+    Session(Parts),
+}
+
 /// A frame that goes out. A frame of the session holds its bytes in the
 /// count of its connection until it drops.
 pub(crate) struct Outgoing {
-    frame: Frame,
+    body: Body,
     charge: Option<Charge>,
 }
 
@@ -81,9 +94,23 @@ impl Outgoing {
     /// A frame of the hub. It does not count.
     fn hub(frame: Frame) -> Self {
         Self {
-            frame,
+            body: Body::Hub(frame),
             charge: None,
         }
+    }
+
+    /// Return the parts of the frame, in their order.
+    pub(crate) fn parts(&self) -> Vec<&[u8]> {
+        match &self.body {
+            Body::Hub(frame) => vec![frame.as_slice()],
+            Body::Session(parts) => parts.iter().map(Vec::as_slice).collect(),
+        }
+    }
+
+    /// Return the bytes of the frame in one buffer.
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
+        self.parts().concat()
     }
 
     /// Tell that the writer wrote the frame. Its bytes no longer count.
@@ -96,17 +123,9 @@ impl Outgoing {
     }
 }
 
-impl Deref for Outgoing {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        &self.frame
-    }
-}
-
 impl std::fmt::Debug for Outgoing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.frame.fmt(f)
+        self.parts().fmt(f)
     }
 }
 
@@ -152,11 +171,12 @@ impl Flow {
         }
     }
 
-    /// Return `frame` as a frame of the session, counted.
-    fn charged(self: &Arc<Self>, frame: Vec<u8>) -> Outgoing {
+    /// Return the frame of `parts` as a frame of the session, counted.
+    fn charged(self: &Arc<Self>, parts: Parts) -> Outgoing {
+        let bytes = parts.iter().map(Vec::len).sum();
         Outgoing {
-            charge: Some(self.charge(frame.len())),
-            frame: Arc::new(frame),
+            charge: Some(self.charge(bytes)),
+            body: Body::Session(parts),
         }
     }
 
@@ -420,9 +440,15 @@ impl Room {
     /// Put `frame` at the next place, or leave the place empty. Return
     /// false when the connection is closed.
     pub(crate) fn put(self, frame: Option<Vec<u8>>) -> bool {
+        self.put_parts(frame.map(|frame| vec![frame]))
+    }
+
+    /// Put the frame of `parts` at the next place, or leave the place
+    /// empty. Return false when the connection is closed.
+    pub(crate) fn put_parts(self, parts: Option<Parts>) -> bool {
         match self.permit {
             Some(permit) => {
-                let frame = frame.map(|frame| self.outbox.flow.charged(frame));
+                let frame = parts.map(|parts| self.outbox.flow.charged(parts));
                 self.outbox.put_slot(permit, Slot::Ready(frame))
             }
             None => false,
@@ -913,7 +939,7 @@ mod tests {
             let session = outbox.clone();
             let send = move || session.send(b"load".to_vec());
             let sent = tokio::task::spawn_blocking(send);
-            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"load");
+            assert_eq!(inbox.recv().await.unwrap().to_vec(), b"load");
             assert!(sent.await.unwrap());
         });
         assert_eq!(outbox.push(frame("inv 1")), Pushed::Queued);
@@ -922,9 +948,9 @@ mod tests {
         runtime.block_on(async {
             // The call reads the first frame of each queue ahead, and keeps
             // the one that it does not give.
-            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"inv 1");
-            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"reply");
-            assert_eq!(inbox.recv().await.unwrap().as_slice(), b"inv 2");
+            assert_eq!(inbox.recv().await.unwrap().to_vec(), b"inv 1");
+            assert_eq!(inbox.recv().await.unwrap().to_vec(), b"reply");
+            assert_eq!(inbox.recv().await.unwrap().to_vec(), b"inv 2");
             drop(outbox);
             assert!(inbox.recv().await.is_none());
         });
