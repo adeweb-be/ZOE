@@ -34,7 +34,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3Default, xxh3_64};
 use zoe_core::{Oid, Tid};
 
 use crate::client::Record;
@@ -85,6 +85,9 @@ const HEAD_BYTES: u64 = 72;
 /// The codec of an entry whose data is raw.
 const CODEC_RAW: u64 = 0;
 
+/// The words of the data that a hit copies at a time: 4 KiB.
+const BLOCK_WORDS: usize = 512;
+
 /// The fewest index slots.
 const MIN_SLOTS: u64 = 1024;
 /// The bytes of the ring for each index slot.
@@ -107,6 +110,11 @@ pub struct CacheCounts {
     /// The entries that no index slot took. No lookup finds them.
     pub unindexed: u64,
 }
+
+/// The copy of the data of a hit. `copy(sink)` gives the data to `sink`
+/// in blocks, in order, then checks it. It returns false when the data is
+/// not good: the caller then drops what `sink` got.
+pub type Copier<'a> = dyn FnMut(&mut dyn FnMut(&[u8])) -> bool + 'a;
 
 /// The head of an entry, as a reader copied and checked it.
 #[derive(Clone, Copy, Debug)]
@@ -389,18 +397,29 @@ impl Cache {
         })
     }
 
-    /// Copy the data of `entry` into `buf`, then check its checksum and
-    /// that the ring did not reach it during the copy.
-    fn copy(&self, entry: &Head, buf: &mut [u8]) -> bool {
-        if buf.len() as u64 != entry.len {
-            return false;
-        }
+    /// Give the data of `entry` to `sink` in blocks of `BLOCK_WORDS` words,
+    /// in one pass: load the words of a block into a local buffer, hash the
+    /// block, then give it to `sink`. Then check the checksum of the data and
+    /// that the ring did not reach the entry during the copy.
+    fn copy(&self, entry: &Head, sink: &mut dyn FnMut(&[u8])) -> bool {
+        let len = entry.len as usize;
         let at = self.at(entry.pos) + HEAD_WORDS;
-        for (i, chunk) in buf.chunks_mut(8).enumerate() {
-            let word = self.word(at + i).load(Ordering::Relaxed).to_le_bytes();
-            chunk.copy_from_slice(&word[..chunk.len()]);
+        let Some(words) = self.map.words().get(at..at + len.div_ceil(8)) else {
+            return false;
+        };
+        let mut hasher = Xxh3Default::new();
+        let mut block = [0u8; BLOCK_WORDS * 8];
+        let mut left = len;
+        for chunk in words.chunks(BLOCK_WORDS) {
+            for (bytes, word) in block.as_chunks_mut::<8>().0.iter_mut().zip(chunk) {
+                *bytes = word.load(Ordering::Relaxed).to_le_bytes();
+            }
+            let data = &block[..left.min(chunk.len() * 8)];
+            hasher.update(data);
+            sink(data);
+            left -= data.len();
         }
-        xxh3_64(buf) == entry.data_sum && self.intact(entry.pos)
+        hasher.digest() == entry.data_sum && self.intact(entry.pos)
     }
 
     fn hash(&self, oid: u64) -> u64 {
@@ -449,8 +468,9 @@ impl Cache {
     }
 
     /// Find the entry of `oid` that holds the revision of the snapshots
-    /// before `before`. `out(len, fill)` makes a buffer of `len` bytes and
-    /// calls `fill` on it, which copies the data and checks it. Return the
+    /// before `before`. `out(len, copy)` gets the `len` bytes of the data
+    /// from `copy` (see `Copier`), and returns `None` when `copy` fails.
+    /// Return the
     /// result of `out`, the start tid of the entry and its end tid, or
     /// `None` for a current entry. A current entry serves only `before`
     /// up to `applied + 1`.
@@ -458,7 +478,7 @@ impl Cache {
         &self,
         oid: Oid,
         before: Tid,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
         if !self.verified() {
             return None;
@@ -482,7 +502,7 @@ impl Cache {
     pub fn load_with<R>(
         &self,
         oid: Oid,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid)> {
         if !self.verified() {
             return None;
@@ -507,10 +527,10 @@ impl Cache {
     fn read<R>(
         &self,
         entry: &Head,
-        out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
+        out: impl FnOnce(usize, &mut Copier<'_>) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
-        let mut fill = |buf: &mut [u8]| self.copy(entry, buf);
-        let result = out(entry.len as usize, &mut fill)?;
+        let mut copy = |sink: &mut dyn FnMut(&[u8])| self.copy(entry, sink);
+        let result = out(entry.len as usize, &mut copy)?;
         if entry.end == 0 {
             self.refresh(entry);
         }
@@ -547,10 +567,10 @@ impl Cache {
         if !self.marked.load(Ordering::Relaxed) {
             return;
         }
-        let mut data = vec![0; entry.len as usize];
-        if !self.copy(&entry, &mut data) {
+        let mut copy = |sink: &mut dyn FnMut(&[u8])| self.copy(&entry, sink);
+        let Some(data) = to_vec(entry.len as usize, &mut copy) else {
             return;
-        }
+        };
         if let Some(pos) = self.append(entry.oid, entry.start, 0, entry.prev, &data)
             && self.link(&mut counts, entry.oid, pos)
         {
@@ -609,8 +629,7 @@ impl Cache {
             if entry.start == start {
                 // Keep an intact entry of the revision. Drop one whose data
                 // fails its checksum, and store the revision again.
-                let mut stored = vec![0; entry.len as usize];
-                if self.copy(&entry, &mut stored) {
+                if self.copy(&entry, &mut |_| {}) {
                     return false;
                 }
                 self.set_end(&entry, entry.start);
@@ -946,9 +965,9 @@ impl std::fmt::Debug for Cache {
 }
 
 /// The `out` of a lookup that returns the data as a `Vec`.
-fn to_vec(len: usize, fill: &mut dyn FnMut(&mut [u8]) -> bool) -> Option<Vec<u8>> {
-    let mut data = vec![0; len];
-    fill(&mut data).then_some(data)
+fn to_vec(len: usize, copy: &mut Copier<'_>) -> Option<Vec<u8>> {
+    let mut data = Vec::with_capacity(len);
+    copy(&mut |block| data.extend_from_slice(block)).then_some(data)
 }
 
 #[cfg(test)]

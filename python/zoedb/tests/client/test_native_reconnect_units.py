@@ -5,9 +5,12 @@ storage of the native client directly, with a native client of the test.
 """
 
 import logging
+import socket
 
 import ZODB.event
+import zope.interface
 from ZEO.interfaces import StaleCache
+from ZODB.interfaces import IBlobStorage
 
 import zoe.zeo
 
@@ -93,3 +96,59 @@ def test_a_refused_server_logs_a_critical_message(caplog):
     (record,) = [r for r in caplog.records if r.levelno == logging.CRITICAL]
     assert "the server is behind" in record.getMessage()
     assert s._db.cache_invalidations == 0
+
+
+class Lookups:
+    """A `socket.gethostbyaddr` that counts its calls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, host):
+        self.calls.append(host)
+        return ("db.example", [], [host])
+
+
+def test_the_canonical_name_of_the_server_comes_at_its_first_read(monkeypatch):
+    lookups = Lookups()
+    monkeypatch.setattr(socket, "gethostbyaddr", lookups)
+    s = storage(Native())
+    s._storage = "1"
+    s._take_server()
+    assert lookups.calls == []
+    # `sortKey` reads the canonical name, as for ZEO.
+    assert s.sortKey() == "1:('db.example', 8100)"
+    assert s._server_addr == "('db.example', 8100)"
+    assert lookups.calls == ["127.0.0.1"]
+    # A new connection asks again at the next read.
+    s._take_server()
+    assert s._server_addr == "('db.example', 8100)"
+    assert lookups.calls == ["127.0.0.1", "127.0.0.1"]
+
+
+def test_a_unix_socket_needs_no_lookup(monkeypatch):
+    lookups = Lookups()
+    monkeypatch.setattr(socket, "gethostbyaddr", lookups)
+    native = Native()
+    native.address = lambda: "/run/zoe.sock"
+    s = storage(native)
+    s._take_server()
+    assert s._server_addr == "/run/zoe.sock"
+    assert lookups.calls == []
+
+
+def test_the_interfaces_of_the_server_are_declared_once(monkeypatch):
+    calls = []
+    also = zope.interface.alsoProvides
+    monkeypatch.setattr(
+        zope.interface,
+        "alsoProvides",
+        lambda *args: (calls.append(args[1:]), also(*args)),
+    )
+    native = Native()
+    native.info = lambda: {"interfaces": (("ZODB.interfaces", "IBlobStorage"),)}
+    s = storage(native)
+    s._take_server()
+    s._take_server()
+    assert IBlobStorage.providedBy(s)
+    assert calls == [(IBlobStorage,)]
