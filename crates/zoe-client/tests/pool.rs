@@ -507,6 +507,59 @@ async fn lose(pool: &Pool) {
 }
 
 #[tokio::test]
+async fn an_iterator_id_of_a_lost_listener_never_reaches_the_new_listener() {
+    let server = start("iterator-generation");
+    let (gate, opened) = watch::channel(false);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (_, _, first) = cached_pair(&pool).await;
+    let nil = rmpv::Value::Nil;
+    let start = vec![nil.clone(), nil];
+    let (old, before) = pool
+        .call_on(None, "iterator_start", start.clone())
+        .await
+        .unwrap();
+    lose(&pool).await;
+    gate.send_replace(true);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    let (new, after) = pool.call_on(None, "iterator_start", start).await.unwrap();
+    assert_ne!(before, after);
+    // The server numbers the iterators of each connection from 0: the new
+    // iterator has the id of the old one.
+    assert_eq!(old, new);
+
+    // The id of the old listener names no iterator of the new one.
+    let refused = pool
+        .call_on(Some(before), "iterator_next", vec![old.clone()])
+        .await;
+    match refused {
+        Err(Error::Server { class, value, .. }) => {
+            assert_eq!(class, "builtins.KeyError");
+            assert_eq!(value, rmpv::Value::Array(vec![old.clone()]));
+        }
+        other => panic!("{other:?}"),
+    }
+    // iterator_gc of the old id sends nothing to the new listener.
+    pool.notify_on(
+        Some(before),
+        "iterator_gc",
+        vec![rmpv::Value::Array(vec![old])],
+    )
+    .await
+    .unwrap();
+    // So the new iterator is whole: it gives the commit of the pair first.
+    let (next, served) = pool
+        .call_on(Some(after), "iterator_next", vec![new])
+        .await
+        .unwrap();
+    assert_eq!(served, after);
+    assert_eq!(next.as_array().unwrap()[0], bin8(first.0));
+}
+
+#[tokio::test]
 async fn a_pool_connects_again_and_verifies_its_cache_through_get_invalidations() {
     let server = start("reconnect-quick");
     let (gate, opened) = watch::channel(false);
@@ -1054,6 +1107,79 @@ async fn a_quick_verification_at_the_last_tid_gives_its_oids_and_keeps_the_last_
     assert_eq!(cache.load(changed), None);
     assert_eq!(cache.load(kept), Some((record(b"b"), first)));
     assert_eq!(pool.load(changed).await.unwrap(), (record(b"c"), tid));
+}
+
+/// The `maxtid` of ZODB, which `ZODB.utils.load_current` gives to
+/// `loadBefore`.
+const MAXTID: Tid = Tid(0x7fff_ffff_ffff_ffff);
+
+#[tokio::test]
+async fn a_current_entry_serves_load_before_at_maxtid_without_the_server() {
+    let server = start("maxtid-without-server");
+    let (_gate, opened) = watch::channel(false);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (changed, kept, first) = cached_pair(&pool).await;
+    let cache = pool.cache().unwrap();
+    let found = cache.load_before(kept, MAXTID).unwrap();
+    assert_eq!(
+        (found.data, found.tid, found.end),
+        (record(b"b"), first, None)
+    );
+    // Without a server, the pool loads nothing: the cache alone answers.
+    lose(&pool).await;
+    assert!(matches!(
+        pool.load_before(kept, MAXTID).await,
+        Err(Error::Disconnected)
+    ));
+    assert_eq!(pool.last_transaction(), cache.applied());
+    assert_eq!(cache.load_before(kept, MAXTID).unwrap().data, record(b"b"));
+    assert_eq!(
+        cache.load_before(changed, MAXTID).unwrap().data,
+        record(b"a")
+    );
+}
+
+#[tokio::test]
+async fn after_a_stale_turn_a_current_entry_serves_maxtid_only_after_the_verification() {
+    let server = start("maxtid-stale-turn");
+    let proxy = proxy(server.addr()).await;
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let pool = open_listener_proxied(&server, listener);
+    let (changed, kept, first) = cached_pair(&pool).await;
+
+    // The stale turn moves the last tid past `applied` of the cache. The
+    // commits of other clients before it never reached the cache, so the
+    // entry of `kept` can be stale at the last tid: it serves only the
+    // snapshots up to `applied`.
+    proxy.pause.send_replace(true);
+    let tid = commit_then_lose(&pool, changed, first, &record(b"c")).await;
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.applied(), first);
+    assert!(pool.last_transaction() > cache.applied());
+    for before in [MAXTID, Tid(tid.0 + 1)] {
+        assert_eq!(cache.load_before(kept, before), None);
+        assert_eq!(cache.load_before(changed, before), None);
+    }
+    assert_eq!(
+        cache.load_before(kept, Tid(first.0 + 1)).unwrap().data,
+        record(b"b")
+    );
+
+    // The verification moves `applied` to the last tid: the entry serves
+    // `maxtid` again.
+    assert!(matches!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(_))
+    ));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load_before(kept, MAXTID).unwrap().data, record(b"b"));
+    assert_eq!(cache.load_before(changed, MAXTID), None);
 }
 
 #[tokio::test]

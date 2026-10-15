@@ -69,6 +69,7 @@
       "required": ["quick", "started", "commit"],
       "properties": {
         "quick": { "description": "True for the quick set of the pull-request gate, false for the full nightly set.", "type": "boolean" },
+        "set": { "description": "The set of the run: quick, gate (the head-to-head of the phase gates: 6 cells, 3 values each) or full.", "enum": ["quick", "gate", "full"] },
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
         "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" }
       }
