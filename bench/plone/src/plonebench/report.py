@@ -344,3 +344,51 @@ def build(runs: list[Path]) -> tuple[str, dict]:
             )
         lines.append("")
     return "\n".join(lines) + "\n", summary
+
+
+def timeline(runs: list[Path], bucket: float) -> str:
+    """Return, for each run, the successful operations per second and the
+    p50 and p95 of their latency in buckets of `bucket` seconds from the
+    start of the measured window, and the CPU of each process and the
+    bytes the server wrote in each bucket."""
+    from plonebench import sampler
+
+    lines = []
+    for result in load(runs):
+        if "measured" not in result:
+            continue
+        start = result["measured"]["start"]
+        end = result["measured"]["end"]
+        records = list(
+            ledger.read([str(Path(result["_dir"]) / "ledger" / "run.jsonl")])
+        )
+        samples = sampler.load(Path(result["_dir"]) / "samples.jsonl")
+        lines += [
+            f"### {result['run_id']}",
+            "",
+            "| from s | ok ops/s | p50 ms | p95 ms | failed | server CPU | "
+            "Zope CPU | server MB written |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        t = start
+        while t < end:
+            chosen = [
+                r for r in records if t <= r.start < t + bucket and r.kind != "login"
+            ]
+            ok = [r.seconds for r in chosen if r.outcome == ledger.OK]
+            lat = analysis.latency(ok)
+            res = sampler.summarize(samples, t, t + bucket).get("processes", {})
+            zope = sum(
+                v["cpu_share"] or 0 for k, v in res.items() if k.startswith("inst")
+            )
+            server = res.get("server", {})
+            written = server.get("write_bytes")
+            lines.append(
+                f"| {t - start:.0f} | {len(ok) / bucket:.1f} | {_ms(lat['p50'])} | "
+                f"{_ms(lat['p95'])} | {len(chosen) - len(ok)} | "
+                f"{_pct(server.get('cpu_share'))} | {_pct(zope)} | "
+                f"{'–' if written is None else f'{written / 2**20:.1f}'} |"
+            )
+            t += bucket
+        lines.append("")
+    return "\n".join(lines) + "\n"

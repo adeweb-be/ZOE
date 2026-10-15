@@ -136,6 +136,12 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("runs", nargs="+", type=Path)
     report.add_argument("--out", type=Path)
     report.add_argument("--json", type=Path)
+    report.add_argument(
+        "--timeline",
+        type=float,
+        default=None,
+        help="print each run in buckets of this many seconds instead",
+    )
 
     serve = commands.add_parser(
         "serve", help="start a stack on a copy of a fixture and wait"
@@ -185,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         from plonebench import report as report_module
 
+        if args.timeline:
+            print(report_module.timeline(args.runs, args.timeline))
+            return 0
         text, data = report_module.build(args.runs)
         if args.out:
             args.out.write_text(text)
