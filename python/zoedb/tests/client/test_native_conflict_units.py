@@ -92,7 +92,8 @@ def test_the_resolution_runs_on_the_thread_of_the_transaction(storage):
 
 def test_the_vote_returns_each_resolved_oid_once(storage):
     stales = stale(storage, 2)
-    _, resolved = commit(storage, [(oid, first, counter(5)) for oid, first, _ in stales])
+    stores = [(oid, first, counter(5)) for oid, first, _ in stales]
+    _, resolved = commit(storage, stores)
     assert sorted(resolved) == sorted(oid for oid, _, _ in stales)
 
 

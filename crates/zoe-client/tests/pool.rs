@@ -333,10 +333,7 @@ async fn stale(pool: &Pool, oid: Oid, data: &[u8]) -> (PoolTransaction, Tid, Tid
         .await
         .unwrap()
         .tid();
-    let second = commit(pool, oid, first, &record(b"b"))
-        .await
-        .unwrap()
-        .tid();
+    let second = commit(pool, oid, first, &record(b"b")).await.unwrap().tid();
     let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
     txn.store(oid, first, data).await.unwrap();
     (txn, first, second)
@@ -365,7 +362,9 @@ async fn a_conflict_that_the_client_resolves_never_enters_the_cache() {
 
     // The resolution commits, and its turn ends the entry of the oid
     // without a new one.
-    txn.store_resolved(oid, second, &record(b"d")).await.unwrap();
+    txn.store_resolved(oid, second, &record(b"d"))
+        .await
+        .unwrap();
     assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
     let turn = txn.finish().await.unwrap().turn().await.unwrap();
     let tid = turn.tid();
