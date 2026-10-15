@@ -3,7 +3,9 @@
 //!
 //! `zoe.zeo` wraps it in a ZODB storage when `native` is true. One client
 //! holds one connection to one storage of a server, and one transaction at
-//! a time. It has no cache, no blob and no reconnect.
+//! a time. It connects over TCP or a unix domain socket, with TLS or
+//! without, to the first of its addresses that opens. It has no cache, no
+//! blob and no reconnect.
 //!
 //! A tokio runtime of the process runs the connections. It starts at the
 //! first open of a client, never at the import. Each call waits for the
@@ -17,6 +19,7 @@
 
 use std::mem;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -25,7 +28,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
 use rmpv::Value;
 use tokio::runtime::Runtime;
-use zoe_client::{Error, Invalidations, Options, Tokio, Transaction};
+use zoe_client::{
+    Address, Endpoint, Error, Invalidations, Options, Tls, TlsOptions, Tokio, Transaction,
+};
 use zoe_core::{Oid, Tid};
 
 use crate::errors::{self, p64, u64_of};
@@ -38,6 +43,11 @@ const RETRY: Duration = Duration::from_millis(100);
 
 /// The deepest nesting of a value that the client converts.
 const DEPTH: usize = 32;
+
+/// The server name of TLS on a unix domain socket without
+/// `server_hostname`. The client then does not check the name, so any
+/// valid name does.
+const UNIX_SERVER_NAME: &str = "localhost";
 
 /// The modules whose exception classes a server error can name. Another
 /// class raises `StorageError`.
@@ -99,39 +109,67 @@ pub(crate) struct NativeClient {
     wake: Mutex<Option<Invalidations>>,
     /// The last tid that the client knew after the open.
     opened_at: Tid,
+    /// `true` when the client registered read-only.
+    read_only: bool,
+    /// The address of the server.
+    address: Address,
 }
 
 #[pymethods]
 impl NativeClient {
-    /// Connect to the server at `(host, port)` and register with the
-    /// storage `storage`, read-only when `read_only` is true. Declare
-    /// `extensions` in `register`, and call `get_info`.
+    /// Connect to the first server of `addresses` that opens, and register
+    /// with the storage `storage`, read-only when `read_only` is true.
+    /// Declare `extensions` in `register`, and call `get_info`.
+    ///
+    /// An address is a `(host, port)` tuple or the path of a unix domain
+    /// socket as a `str`. The client connects to all of them and keeps one
+    /// server: with `read_only_fallback`, a writable server before a
+    /// read-only one.
+    ///
+    /// `tls` is `None`, or the tuple `(certificate, key, authenticate,
+    /// check_hostname, server_hostname)` of the files and checks of TLS.
+    /// `key` is `None` when `certificate` holds the key. `authenticate` is a
+    /// file or a directory of CA certificates, or `None` for the CA
+    /// certificates of the system. The server name is
+    /// `server_hostname`, else the host of the address. With TLS, the
+    /// client never connects without TLS.
     ///
     /// A connection that fails, or that the server closes before the
     /// register, is tried again until `wait_timeout` seconds pass. Then
     /// the open raises `ClientDisconnected`. Another error of the open
-    /// raises at once.
+    /// raises at once. A file of `tls` that does not read raises
+    /// `ValueError`.
     #[new]
-    #[pyo3(signature = (host, port, storage, *, read_only, extensions, wait_timeout))]
+    #[pyo3(signature = (
+        addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout, tls=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
-        host: String,
-        port: u16,
+        addresses: Vec<Bound<'_, PyAny>>,
         storage: String,
         read_only: bool,
+        read_only_fallback: bool,
         extensions: Vec<String>,
         wait_timeout: f64,
+        tls: Option<TlsArgs>,
     ) -> PyResult<Self> {
         let wait = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
+        let targets = addresses
+            .iter()
+            .map(Target::extract)
+            .collect::<PyResult<Vec<_>>>()?;
         let options = Options {
             read_only,
+            read_only_fallback,
             extensions,
         };
         let opened = py.detach(move || -> Result<_, Opening> {
-            let addr = resolve(&host, port)?;
+            let secure = tls.as_ref().map(Secure::load).transpose()?;
             let runtime = runtime().map_err(Opening::Runtime)?;
-            let client = runtime.block_on(open(addr, &storage, &options, wait))?;
+            let open = open(&targets, secure.as_ref(), &storage, &options, wait);
+            let client = runtime.block_on(open)?;
             // Subscribe first, then read the last tid: the client raises
             // its last tid before it sends an invalidation.
             let invalidations = client.invalidations();
@@ -141,18 +179,39 @@ impl NativeClient {
         });
         let (runtime, client, invalidations, wake, opened_at) = match opened {
             Ok(opened) => opened,
-            Err(Opening::Address(text)) => return Err(PyValueError::new_err(text)),
+            Err(Opening::Address(text) | Opening::Tls(text)) => {
+                return Err(PyValueError::new_err(text));
+            }
             Err(Opening::Runtime(error)) => return Err(error.into()),
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
         Ok(Self {
             pid: std::process::id(),
             runtime,
+            read_only: client.read_only(),
+            address: client.address().clone(),
             client: Mutex::new(Some(Arc::new(client))),
             transaction: Mutex::new(None),
             invalidations: Mutex::new(Some(invalidations)),
             wake: Mutex::new(Some(wake)),
             opened_at,
+        })
+    }
+
+    /// Tell if the client registered read-only: as asked, or after a
+    /// read-only fallback.
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Return the address of the server: `(host, port)` with the IP address
+    /// of the server, or the path of a unix domain socket.
+    fn address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match &self.address {
+            Address::Tcp(addr) => (addr.ip().to_string(), addr.port())
+                .into_pyobject(py)?
+                .into_any(),
+            Address::Unix(path) => PyString::new(py, &path.to_string_lossy()).into_any(),
         })
     }
 
@@ -504,8 +563,11 @@ impl Drop for NativeClient {
 
 /// An error of the open of a client.
 enum Opening {
-    /// The address does not resolve.
+    /// An address or a server name is not valid.
     Address(String),
+    /// The files of TLS do not read, or the settings of TLS do not fit an
+    /// address.
+    Tls(String),
     /// The runtime does not start.
     Runtime(std::io::Error),
     /// The client does not open.
@@ -518,37 +580,185 @@ impl From<Error> for Opening {
     }
 }
 
-/// Return the first address of `host` and `port`.
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, Opening> {
-    let mut addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| Opening::Address(format!("the address {host}:{port}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| Opening::Address(format!("the address {host}:{port} has no IP address")))
+/// The files and the checks of TLS that `zoe.zeo` gives: the certificate,
+/// the key or `None`, the CA file or directory of `authenticate` or `None`,
+/// `check_hostname` and `server_hostname` or `None`.
+type TlsArgs = (
+    PathBuf,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    bool,
+    Option<String>,
+);
+
+/// The TLS of the endpoints: the loaded files and the name settings.
+struct Secure {
+    tls: Tls,
+    check_hostname: bool,
+    server_hostname: Option<String>,
 }
 
-/// Open a client on the runtime of the caller. Try again after a failed
-/// connection until `wait` passes.
+impl Secure {
+    /// Read the files of `args`. An error names the file.
+    fn load(args: &TlsArgs) -> Result<Self, Opening> {
+        let (certificate, key, authenticate, check_hostname, server_hostname) = args;
+        let mut options = match authenticate {
+            Some(authenticate) => TlsOptions::new(certificate, authenticate),
+            None => TlsOptions::system(certificate),
+        };
+        if let Some(key) = key {
+            options = options.key(key);
+        }
+        let options = options.check_hostname(*check_hostname);
+        Ok(Self {
+            tls: Tls::load(&options).map_err(Opening::Tls)?,
+            check_hostname: *check_hostname,
+            server_hostname: server_hostname.clone(),
+        })
+    }
+}
+
+/// An address that `zoe.zeo` gives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    /// A host and a port.
+    Tcp(String, u16),
+    /// The path of a unix domain socket.
+    Unix(PathBuf),
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Tcp(host, port) => write!(f, "{host}:{port}"),
+            Target::Unix(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+impl Target {
+    /// Read a `(host, port)` tuple, or the path of a unix domain socket as
+    /// a `str`. Another value raises `TypeError`.
+    fn extract(address: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(path) = address.cast::<PyString>() {
+            return Ok(Target::Unix(PathBuf::from(path.to_str()?)));
+        }
+        if let Ok(pair) = address.cast::<PyTuple>()
+            && let Ok((host, port)) = pair.extract::<(String, u16)>()
+        {
+            return Ok(Target::Tcp(host, port));
+        }
+        Err(PyTypeError::new_err(format!(
+            "an address is (host, port) or the path of a unix socket, not {address}"
+        )))
+    }
+}
+
+/// The endpoints of one round of the open, and the error of each host that
+/// did not resolve.
+struct Round {
+    endpoints: Vec<Endpoint>,
+    unresolved: Vec<String>,
+}
+
+/// Return the endpoints of `targets`, each with TLS when `secure` is given.
+/// `resolve` gives the IP address of a host and a port. A host that does
+/// not resolve is left out of the round, and its error is kept. A setting
+/// that does not fit an address fails with `Opening`.
+fn endpoints(
+    targets: &[Target],
+    secure: Option<&Secure>,
+    resolve: impl Fn(&str, u16) -> Result<SocketAddr, String>,
+) -> Result<Round, Opening> {
+    let mut round = Round {
+        endpoints: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    for target in targets {
+        let (endpoint, host) = match target {
+            Target::Tcp(host, port) => match resolve(host, *port) {
+                Ok(addr) => (Endpoint::new(addr), Some(host.as_str())),
+                Err(error) => {
+                    round.unresolved.push(error);
+                    continue;
+                }
+            },
+            Target::Unix(path) => (Endpoint::new(Address::Unix(path.clone())), None),
+        };
+        let Some(secure) = secure else {
+            round.endpoints.push(endpoint);
+            continue;
+        };
+        let name = match (secure.server_hostname.as_deref(), host) {
+            (Some(name), _) | (None, Some(name)) => name,
+            (None, None) if secure.check_hostname => {
+                return Err(Opening::Tls(format!(
+                    "TLS on the unix socket {target} checks the name of the server: \
+                     give server_hostname"
+                )));
+            }
+            (None, None) => UNIX_SERVER_NAME,
+        };
+        let endpoint = endpoint
+            .tls(secure.tls.clone(), name)
+            .map_err(|error| Opening::Address(error.to_string()))?;
+        round.endpoints.push(endpoint);
+    }
+    Ok(round)
+}
+
+/// Return the first IP address of `host` and `port`.
+fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("the address {host}:{port}: {e}"))?;
+    addrs
+        .next()
+        .ok_or_else(|| format!("the address {host}:{port} has no IP address"))
+}
+
+/// Open a client to the first server of `targets` that opens, on the
+/// runtime of the caller. Each round resolves the hosts again. Try again
+/// after failed connections until `wait` passes.
 async fn open(
-    addr: SocketAddr,
+    targets: &[Target],
+    secure: Option<&Secure>,
     storage: &str,
     options: &Options,
     wait: Duration,
-) -> Result<zoe_client::Client, Error> {
+) -> Result<zoe_client::Client, Opening> {
     let deadline = Instant::now() + wait;
     loop {
-        match zoe_client::Client::open(Arc::new(Tokio), addr, storage, options).await {
+        let round = endpoints(targets, secure, resolve)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        let opened = if round.endpoints.is_empty() {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                round.unresolved.join("; "),
+            )))
+        } else {
+            let runtime = Arc::new(Tokio);
+            zoe_client::Client::open_first(runtime, &round.endpoints, storage, options, left).await
+        };
+        match opened {
             Err(Error::Io(_) | Error::Disconnected) if Instant::now() + RETRY < deadline => {
                 tokio::time::sleep(RETRY).await;
             }
             Err(Error::Io(error)) => {
-                return Err(Error::Io(std::io::Error::new(
+                let addresses: Vec<String> = targets.iter().map(Target::to_string).collect();
+                let mut text = format!(
+                    "no connection to {} within {wait:?}: {error}",
+                    addresses.join(", ")
+                );
+                if !round.endpoints.is_empty() && !round.unresolved.is_empty() {
+                    text = format!("{text}; {}", round.unresolved.join("; "));
+                }
+                return Err(Opening::Client(Error::Io(std::io::Error::new(
                     error.kind(),
-                    format!("no connection to {addr} within {wait:?}: {error}"),
-                )));
+                    text,
+                ))));
             }
-            opened => return opened,
+            opened => return Ok(opened?),
         }
     }
 }
@@ -688,6 +898,68 @@ fn to_python<'py>(py: Python<'py>, value: &Value, depth: usize) -> PyResult<Boun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unix_socket_has_no_resolution() {
+        let targets = [
+            Target::Unix(PathBuf::from("./zeo.sock")),
+            Target::Tcp("127.0.0.1".into(), 8100),
+        ];
+        let round = endpoints(&targets, None, resolve).ok().unwrap();
+        assert!(round.unresolved.is_empty());
+        let endpoints = round.endpoints;
+        let addresses: Vec<_> = endpoints.iter().map(Endpoint::address).collect();
+        assert_eq!(
+            addresses,
+            [
+                &Address::Unix(PathBuf::from("./zeo.sock")),
+                &Address::Tcp("127.0.0.1:8100".parse().unwrap()),
+            ]
+        );
+        assert!(endpoints.iter().all(|endpoint| !endpoint.is_tls()));
+    }
+
+    #[test]
+    fn a_tls_file_that_does_not_read_fails_the_open_and_names_it() {
+        let missing = std::env::temp_dir().join(format!("zoe-py-missing-{}", std::process::id()));
+        let tls = (
+            missing.join("client.pem"),
+            None,
+            Some(missing.join("ca.pem")),
+            true,
+            None,
+        );
+        match Secure::load(&tls) {
+            Err(Opening::Tls(text)) => assert!(text.contains("client.pem"), "{text}"),
+            _ => panic!("the open did not fail on the missing file"),
+        }
+    }
+
+    #[test]
+    fn a_host_that_does_not_resolve_leaves_the_others_in_the_round() {
+        let targets = [
+            Target::Tcp("no-such-host".into(), 8100),
+            Target::Tcp("127.0.0.1".into(), 8100),
+        ];
+        let fake = |host: &str, port: u16| match host {
+            "no-such-host" => Err(format!("the address {host}:{port}: not found")),
+            _ => resolve(host, port),
+        };
+        let round = endpoints(&targets, None, fake).ok().unwrap();
+        assert_eq!(round.endpoints.len(), 1);
+        assert_eq!(
+            round.endpoints[0].address(),
+            &Address::Tcp("127.0.0.1:8100".parse().unwrap())
+        );
+        assert_eq!(round.unresolved.len(), 1);
+        assert!(round.unresolved[0].contains("no-such-host"));
+    }
+
+    #[test]
+    fn an_address_shows_as_zeo_gives_it() {
+        assert_eq!(Target::Tcp("db".into(), 8100).to_string(), "db:8100");
+        assert_eq!(Target::Unix("./zeo.sock".into()).to_string(), "./zeo.sock");
+    }
 
     #[test]
     fn an_ip_address_resolves_to_itself() {

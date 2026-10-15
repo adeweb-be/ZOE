@@ -15,9 +15,9 @@ FAKE_ZODB = "import sys, types; sys.modules['ZODB'] = types.ModuleType('ZODB')\n
 WARNING = (
     "import warnings\n"
     "warnings.warn(\n"
-    '    "The global interpreter lock (GIL) has been enabled to load module "\n'
+    "    \"The global interpreter lock (GIL) has been enabled to load module \"\n"
     "    \"'fake._ext', which has not declared that it can run safely without \"\n"
-    '    "the GIL.",\n'
+    "    \"the GIL.\",\n"
     "    RuntimeWarning,\n"
     ")\n"
 )

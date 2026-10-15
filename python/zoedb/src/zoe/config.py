@@ -6,8 +6,9 @@ as their storage. The `zoe` entry point of `zodburi.resolvers` names
 `resolve_uri`.
 
 `<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
-`<zeoclient>`, with the same values, and `wait-timeout`. It has no
-environment twins, as `<zeoclient>` has none.
+`<zeoclient>`, with the same values, `wait-timeout` and `native`, and an
+`<ssl>` section with the keys of the `<ssl>` section of ZEO's
+`<clientstorage>`. It has no environment twins, as `<zeoclient>` has none.
 
 The keys are in kebab-case. The query of the URI takes the same keys with
 the same values. Each key has an environment variable, its twin: `ZOE_` and
@@ -148,10 +149,17 @@ class ZoeClient(BaseConfig):
     """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
 
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
-    `wait-timeout` as `wait_timeout` and `native` as `native`.
+    `wait-timeout` as `wait_timeout` and `native` as `native`. It gives the
+    `<ssl>` section as it is: the native client reads its files, and ZEO's
+    client gets the context that ZEO's `<ssl>` section gives.
     """
 
     def open(self):
+        return self._open_client(self.config.native)
+
+    def _open_client(self, native):
+        """Open the client, with the native client inside when `native`
+        is true."""
         from zoe.zeo import ClientStorage
 
         config = self.config
@@ -179,6 +187,7 @@ class ZoeClient(BaseConfig):
             password=config.password,
             realm=config.realm,
             wait_timeout=config.wait_timeout,
-            native=config.native,
+            native=native,
+            _ssl_section=config.ssl,
             **options,
         )

@@ -528,8 +528,8 @@ async fn a_blob_commits_against_the_server() {
 /// The options of a client that declares `sequences`.
 fn declaring() -> Options {
     Options {
-        read_only: false,
         extensions: vec!["sequences".to_owned()],
+        ..Options::default()
     }
 }
 

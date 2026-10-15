@@ -23,16 +23,23 @@ elements. The client exports no span: the application configures
 OpenTelemetry.
 
 `%import zoe` gives the ZConfig section `<zoeclient>`, which opens this class.
+Its `<ssl>` section gives the files of TLS: the client builds its TLS from
+them, as ZEO's `<clientstorage>` does.
 
 `ClientStorage(..., native=True)` runs the client on the native client of
 `zoe._zoe`, built on the Rust crate `zoe-client`, and not on the asyncio
 client of ZEO. It is still an instance of `ZEO.ClientStorage.ClientStorage`,
-and no thread of ZEO starts. It has the thinnest slice of a client yet: one
-TCP address, one connection, one transaction at a time, no cache, no blob
-and no reconnect. It declares `sequences` only, and speaks only the msgpack
-protocol `M5`: a stock ZEO server needs `msgpack true`. `_NOT_BUILT` names
-the arguments whose feature it does not have yet. `native` is false by
-default.
+and no thread of ZEO starts. It connects as ZEO does: to a `(host, port)`
+address, to the path of a unix domain socket, or to the first server of a
+list that opens, with TLS from the `<ssl>` section of `<zoeclient>`. It
+checks the server against the CA certificates of `authenticate`, a file
+or a directory, else against those of the system, as ZEO does. It
+takes no `ssl` context: TLS runs in Rust, and a context does not give back
+the files of its certificate and key. It has one connection, one
+transaction at a time, no cache, no blob and no reconnect. It declares
+`sequences` only, and speaks only the msgpack protocol `M5`: a stock ZEO
+server needs `msgpack true`. `_NOT_BUILT` names the arguments whose feature
+it does not have yet. `native` is false by default.
 """
 
 import contextvars
@@ -298,7 +305,22 @@ class ClientStorage(ZEOClientStorage):
             )
         return super().__new__(cls)
 
-    def __init__(self, *args, native=False, _client_factory=_ClientThread, **kw):
+    def __init__(
+        self,
+        *args,
+        native=False,
+        _client_factory=_ClientThread,
+        _ssl_section=None,
+        **kw,
+    ):
+        # `_ssl_section` is the `<ssl>` section of `<zoeclient>`. ZEO's
+        # client takes the context that it gives.
+        if _ssl_section is not None:
+            from ZEO.zconfig import client_ssl
+
+            kw["ssl"], server_hostname = client_ssl(_ssl_section)
+            if kw.get("ssl_server_hostname") is None:
+                kw["ssl_server_hostname"] = server_hostname
         super().__init__(*args, _client_factory=_client_factory, **kw)
 
     def notify_connected(self, conn, info):
@@ -334,15 +356,12 @@ _MB = 1024**2
 # value fails the open with an error that names the argument.
 _NOT_BUILT = {
     "cache_size": 20 * _MB,
-    "read_only_fallback": False,
     "blob_dir": None,
     "shared_blob_dir": False,
     "blob_cache_size": None,
     "blob_cache_size_check": 10,
     "client_label": None,
     "cache": None,
-    "ssl": None,
-    "ssl_server_hostname": None,
     "client": None,
     "var": None,
     "wait": True,
@@ -364,12 +383,59 @@ def _as_bytes(value):
     return value.encode("utf-8") if isinstance(value, str) else bytes(value)
 
 
+def _native_tls(section, server_hostname):
+    """Return the TLS of the native client from an `<ssl>` section.
+
+    The tuple holds the certificate, the key or None, the CA file or
+    directory of `authenticate` or None, `check-hostname`, and the server
+    name: `server_hostname`, else the `server-hostname` of the section,
+    else None. As in `ZEO.zconfig.ssl_config`, no `authenticate` and
+    `DYNAMIC` that is not a directory give None: the client then checks
+    the server against the CA certificates of the system. Raise
+    `Unsupported` for an encrypted key, which the native client does not
+    read.
+    """
+    if section.password_function:
+        raise Unsupported(
+            "the native client reads only a key that is not encrypted: "
+            "leave password-function out of <ssl>"
+        )
+    auth = section.authenticate
+    if auth == "DYNAMIC" and not os.path.isdir(auth):
+        auth = None
+    key = os.path.abspath(section.key) if section.key else None
+    return (
+        os.path.abspath(section.certificate),
+        key,
+        os.path.abspath(auth) if auth else None,
+        bool(section.check_hostname),
+        server_hostname or section.server_hostname or None,
+    )
+
+
+def _native_address(addr):
+    """Return an address for the native client.
+
+    A `(host, port)` address with an empty host is on `127.0.0.1`, as for
+    ZEO. The path of a unix domain socket stays as it is.
+    """
+    if isinstance(addr, tuple) and len(addr) == 2:
+        host, port = addr
+        return (host or "127.0.0.1", port)
+    return addr
+
+
 class _NativeClientStorage(ClientStorage):
     """`zoe.zeo.ClientStorage` with the native client inside.
 
     It takes the arguments of `ZEO.ClientStorage`. It ignores the arguments
     that ZEO 6 ignores too. Each argument of `_NOT_BUILT` must keep the
-    value that leaves its feature off. `native` must stay true.
+    value that leaves its feature off. `native` must stay true. `ssl` must
+    stay None: the TLS comes from the `<ssl>` section of `<zoeclient>`.
+
+    With several addresses, the client connects to all of them and keeps
+    one server: with `read_only_fallback`, a writable server before a
+    read-only one.
 
     A thread of the client gives the invalidations of the other clients to
     the DB, in tid order. `lastTransaction()` gives a tid only after the DB
@@ -407,6 +473,7 @@ class _NativeClientStorage(ClientStorage):
         password=None,
         realm=None,
         native=True,
+        _ssl_section=None,
     ):
         if not native:
             raise ValueError("this class runs the native client: native is true")
@@ -417,18 +484,21 @@ class _NativeClientStorage(ClientStorage):
                 raise Unsupported(
                     f"the native client does not have {key} yet: leave {key} out"
                 )
+        if ssl is not None:
+            raise Unsupported(
+                "the native client takes no ssl context: give the files of "
+                "TLS in the <ssl> section of <zoeclient>"
+            )
+        tls = None
+        if _ssl_section is not None:
+            tls = _native_tls(_ssl_section, ssl_server_hostname)
         self.__name__ = name or str(addr)
         addr = self._normalize_addr(addr)
-        if len(addr) != 1 or not isinstance(addr[0], tuple):
-            raise Unsupported(
-                "the native client connects to one TCP address (host, port) yet"
-            )
-        host, port = addr[0]
         # ZEO's tests read `_addr` to open a second client.
         self._addr = addr
         self._storage = storage
         self._is_read_only = bool(read_only)
-        self._read_only_fallback = False
+        self._read_only_fallback = bool(read_only_fallback)
         self._server_addr = None
         self._client_label = None
         self._info = {
@@ -459,17 +529,20 @@ class _NativeClientStorage(ClientStorage):
         from zoe import _zoe
 
         self._native = _zoe.Client(
-            host,
-            port,
+            [_native_address(one) for one in addr],
             storage,
             read_only=self._is_read_only,
+            read_only_fallback=self._read_only_fallback,
             extensions=list(_NATIVE_EXTENSIONS),
             wait_timeout=float(wait_timeout or 30),
+            tls=tls,
         )
         try:
+            # A read-only fallback registers read-only.
+            self._is_read_only = self._native.read_only()
             self._last_tid = self._native.opened_at()
             self._info.update(self._native.info())
-            self.set_server_addr((host, port))
+            self.set_server_addr(self._native.address())
             self._connection_generation = 1
             logger.info(
                 "%s native client connected to storage %r at %s",
