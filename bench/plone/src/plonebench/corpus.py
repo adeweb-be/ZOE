@@ -355,6 +355,21 @@ def file_bytes(spec: SiteSpec, path: str, size: int) -> bytes:
     return rng.randbytes(size)
 
 
+def code_words(plan: Plan) -> list[str]:
+    """Return the words of the operation codes: words of the vocabulary
+    that the text of the site already holds, so a code adds no new word
+    to the lexicons of the text indexes."""
+    return plan.words[100:1100]
+
+
+def op_code(op: str, words: list[str]) -> str:
+    """Return the code of the operation `op` (hex): four words of `words`.
+    A title of the benchmark starts with a prefix and this code, so the
+    verification finds the operation of a title, and a search for the
+    four words finds the object."""
+    return " ".join(words[int(op[i : i + 6], 16) % len(words)] for i in range(0, 24, 6))
+
+
 def user_ids(spec: SiteSpec) -> dict[str, list[str]]:
     return {
         EDITOR: [f"{EDITOR}-{n:03d}" for n in range(spec.editors)],

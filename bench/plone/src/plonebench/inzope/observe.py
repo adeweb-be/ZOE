@@ -12,7 +12,7 @@ and workflow state, the length of its workflow history, its versions (and
 their titles when asked), whether an anonymous user may View it, its
 history id, and its catalog entries (count, Title, review_state,
 modified, allowedRolesAndUsers has Anonymous). For each token it reads the
-paths that a SearchableText query finds. It also lists every content
+paths that a query of the Title index finds. It also lists every content
 object that is not in the manifest, the UIDs and history ids held by more
 than one object, and the size of the catalog against the content.
 """
@@ -144,7 +144,8 @@ for path, obj in walk(site, ""):
 
 tokens = {}
 for token in request.get("tokens", []):
-    brains = catalog.unrestrictedSearchResults(SearchableText=token)
+    # The four words of a code, in the Title index: an AND of the words.
+    brains = catalog.unrestrictedSearchResults(Title=token)
     tokens[token] = sorted(b.getPath()[len(site_path) + 1 :] for b in brains)
 
 brains = catalog.unrestrictedSearchResults(path=site_path)

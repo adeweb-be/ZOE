@@ -32,7 +32,7 @@ def rec(op, kind, outcome, start, end, target="s/doc", user=0, **values):
 def observed_object(**changes):
     obj = {
         "exists": True,
-        "title": "Edit aaaaaaaa x",
+        "title": "Edit aa ab ac ad x",
         "description": "d",
         "state": "published",
         "modified": "m",
@@ -44,7 +44,7 @@ def observed_object(**changes):
         "history_id": 1,
         "catalog": [
             {
-                "Title": "Edit aaaaaaaa x",
+                "Title": "Edit aa ab ac ad x",
                 "review_state": "published",
                 "modified": "m",
                 "anonymous": True,
@@ -74,8 +74,8 @@ def observed(objects, **extra):
 
 def test_the_last_acknowledged_edit_wins():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit 11111111 x", description="d"),
-        rec("2", "edit", OK, 2, 3, title="Edit aaaaaaaa x", description="d"),
+        rec("1", "edit", OK, 0, 1, title="Edit ca cb cc cd x", description="d"),
+        rec("2", "edit", OK, 2, 3, title="Edit aa ab ac ad x", description="d"),
     ]
     obj = observed_object(versions=3)
     verdict = verification.judge(records, MANIFEST, observed({"s/doc": obj}))
@@ -84,8 +84,8 @@ def test_the_last_acknowledged_edit_wins():
 
 def test_a_lost_update_fails():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit aaaaaaaa x", description="d"),
-        rec("2", "edit", OK, 2, 3, title="Edit 22222222 x", description="d"),
+        rec("1", "edit", OK, 0, 1, title="Edit aa ab ac ad x", description="d"),
+        rec("2", "edit", OK, 2, 3, title="Edit da db dc dd x", description="d"),
     ]
     obj = observed_object(versions=3)
     verdict = verification.judge(records, MANIFEST, observed({"s/doc": obj}))
@@ -94,8 +94,8 @@ def test_a_lost_update_fails():
 
 def test_an_ambiguous_later_write_may_have_committed():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit 11111111 x", description="d"),
-        rec("2", "edit", AMBIGUOUS, 2, 3, title="Edit aaaaaaaa x", description="d"),
+        rec("1", "edit", OK, 0, 1, title="Edit ca cb cc cd x", description="d"),
+        rec("2", "edit", AMBIGUOUS, 2, 3, title="Edit aa ab ac ad x", description="d"),
     ]
     for versions in (2, 3):
         obj = observed_object(versions=versions)
@@ -106,8 +106,8 @@ def test_an_ambiguous_later_write_may_have_committed():
 
 def test_a_failed_edit_adds_no_version():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit aaaaaaaa x", description="d"),
-        rec("2", "edit", FAILED, 2, 3, title="Edit 22222222 x", description="d"),
+        rec("1", "edit", OK, 0, 1, title="Edit aa ab ac ad x", description="d"),
+        rec("2", "edit", FAILED, 2, 3, title="Edit da db dc dd x", description="d"),
     ]
     obj = observed_object(versions=3)
     verdict = verification.judge(records, MANIFEST, observed({"s/doc": obj}))
@@ -125,7 +125,7 @@ def test_concurrent_writers_accept_any_write_that_could_be_last():
             1.0,
             target=path,
             user=1,
-            title="Patch aaaaaaaa x",
+            title="Patch aa ab ac ad x",
         ),
         rec(
             "2",
@@ -135,10 +135,10 @@ def test_concurrent_writers_accept_any_write_that_could_be_last():
             1.5,
             target=path,
             user=2,
-            title="Patch bbbbbbbb x",
+            title="Patch ba bb bc bd x",
         ),
     ]
-    for title in ("Patch aaaaaaaa x", "Patch bbbbbbbb x"):
+    for title in ("Patch aa ab ac ad x", "Patch ba bb bc bd x"):
         obj = observed_object(title=title, versions=3)
         obj["catalog"][0]["Title"] = title
         verdict = verification.judge(records, MANIFEST, observed({path: obj}))
@@ -156,7 +156,7 @@ def test_a_write_acknowledged_before_another_started_cannot_be_last():
             1.0,
             target=path,
             user=1,
-            title="Patch aaaaaaaa x",
+            title="Patch aa ab ac ad x",
         ),
         rec(
             "2",
@@ -166,11 +166,11 @@ def test_a_write_acknowledged_before_another_started_cannot_be_last():
             3.0,
             target=path,
             user=2,
-            title="Patch bbbbbbbb x",
+            title="Patch ba bb bc bd x",
         ),
     ]
-    obj = observed_object(title="Patch aaaaaaaa x", versions=3)
-    obj["catalog"][0]["Title"] = "Patch aaaaaaaa x"
+    obj = observed_object(title="Patch aa ab ac ad x", versions=3)
+    obj["catalog"][0]["Title"] = "Patch aa ab ac ad x"
     verdict = verification.judge(records, MANIFEST, observed({path: obj}))
     assert verdict["checks"]["edits"]["violations"] == 1
 
@@ -184,7 +184,7 @@ def test_phantoms_and_refused_creations():
             0,
             1,
             target="s/new-1",
-            title="New 111111111111 x",
+            title="New ea eb ec ed x",
             folder="s",
         ),
         rec(
@@ -194,17 +194,17 @@ def test_phantoms_and_refused_creations():
             0,
             1,
             target="s",
-            title="New 222222222222 x",
+            title="New fa fb fc fd x",
             folder="s",
         ),
     ]
     objects = {
         "s/new-1": observed_object(
-            title="New 111111111111 x",
+            title="New ea eb ec ed x",
             versions=1,
             catalog=[
                 {
-                    "Title": "New 111111111111 x",
+                    "Title": "New ea eb ec ed x",
                     "review_state": "published",
                     "modified": "m",
                     "anonymous": True,
@@ -213,8 +213,8 @@ def test_phantoms_and_refused_creations():
         )
     }
     extra = {
-        "s/new-1": {"title": "New 111111111111 x", "type": "Document"},
-        "s/new-2": {"title": "New 222222222222 x", "type": "Document"},
+        "s/new-1": {"title": "New ea eb ec ed x", "type": "Document"},
+        "s/new-2": {"title": "New fa fb fc fd x", "type": "Document"},
         "s/stray": {"title": "Something", "type": "Document"},
     }
     verdict = verification.judge(records, MANIFEST, observed(objects, extra=extra))
@@ -232,16 +232,16 @@ def test_stale_catalog_and_permissions():
 
 def test_search_tokens():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit 11111111 x", description="d"),
-        rec("2", "edit", OK, 2, 3, title="Edit aaaaaaaa x", description="d"),
+        rec("1", "edit", OK, 0, 1, title="Edit ca cb cc cd x", description="d"),
+        rec("2", "edit", OK, 2, 3, title="Edit aa ab ac ad x", description="d"),
     ]
     obj = observed_object(versions=3)
-    good = {"aaaaaaaa": ["s/doc"], "11111111": []}
+    good = {"aa ab ac ad": ["s/doc"], "ca cb cc cd": []}
     verdict = verification.judge(
         records, MANIFEST, observed({"s/doc": obj}, tokens=good)
     )
     assert verdict["checks"]["search"]["violations"] == 0
-    stale = {"aaaaaaaa": ["s/doc"], "11111111": ["s/doc"]}
+    stale = {"aa ab ac ad": ["s/doc"], "ca cb cc cd": ["s/doc"]}
     verdict = verification.judge(
         records, MANIFEST, observed({"s/doc": obj}, tokens=stale)
     )
@@ -250,9 +250,9 @@ def test_search_tokens():
 
 def test_the_request_names_the_targets_and_tokens():
     records = [
-        rec("1", "edit", OK, 0, 1, title="Edit aaaaaaaa x", description="d"),
-        rec("2", "create", FAILED, 0, 1, target="s", title="New 222222222222 x"),
+        rec("1", "edit", OK, 0, 1, title="Edit aa ab ac ad x", description="d"),
+        rec("2", "create", FAILED, 0, 1, target="s", title="New fa fb fc fd x"),
     ]
     wanted = verification.request(records, MANIFEST)
     assert wanted["paths"] == ["s/doc"]
-    assert wanted["tokens"] == ["aaaaaaaa"]
+    assert wanted["tokens"] == ["aa ab ac ad"]

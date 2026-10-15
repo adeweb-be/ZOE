@@ -26,11 +26,11 @@ WORKFLOW_KINDS = ("workflow",)
 TITLE_PATHS = (f"{corpus.BENCH}/{corpus.HOT}/", f"{corpus.BENCH}/{corpus.SHARED}/")
 MAX_TITLE_PATHS = 64
 MAX_TOKENS = 4000
-_TOKEN = re.compile(r"^(?:Edit|New|Patch|Import) ([0-9a-f]{8,12}) ")
+_TOKEN = re.compile(r"^(?:Edit|New|Patch|Import) ([a-z]+ [a-z]+ [a-z]+ [a-z]+)(?: |$)")
 
 
 def token_of(title: str | None) -> str | None:
-    """Return the op token that a title of the benchmark holds."""
+    """Return the operation code that a title of the benchmark holds."""
     if not title:
         return None
     match = _TOKEN.match(title)

@@ -55,6 +55,10 @@ FOLDERS = [i for i in BROWSABLE if i["portal_type"] == "Folder"]
 DOCS = [i for i in BROWSABLE if i["portal_type"] in ("Document", "News Item")]
 FILES = [i for i in BROWSABLE if i["portal_type"] == "File"]
 COLLECTIONS = TARGETS.items(portal_type="Collection")
+# Titles carry an operation code made of words that the site already
+# holds. A new word in each save would make concurrent saves collide on
+# the word ids of the lexicons, which real edits do far less often.
+CODE_WORDS = corpus.code_words(corpus.plan_site(TARGETS.spec))
 
 _counter = itertools.count()
 _state = {"step": 0}
@@ -419,7 +423,7 @@ class PloneUser(HttpUser):
         form = forms.parse(page.text).form_with("form.buttons.save")
         if form is None:
             return self.judge(page, False, target=path, detail="no edit form")
-        title = f"Edit {attempt.op[:8]} " + _words(self.rng, 3)
+        title = f"Edit {corpus.op_code(attempt.op, CODE_WORDS)} " + _words(self.rng, 3)
         description = "Edited " + _words(self.rng, 8)
         attempt.intent(path, {"title": title, "description": description})
         response = attempt.request(
@@ -463,7 +467,7 @@ class PloneUser(HttpUser):
         form = forms.parse(page.text).form_with("form.buttons.save")
         if form is None:
             return self.judge(page, False, target=folder, detail="no add form")
-        title = f"New {attempt.op[:12]} " + _words(self.rng, 3)
+        title = f"New {corpus.op_code(attempt.op, CODE_WORDS)} " + _words(self.rng, 3)
         attempt.intent(folder, {"title": title, "folder": folder})
         response = attempt.request(
             "POST",
@@ -573,7 +577,7 @@ class PloneUser(HttpUser):
     # REST edits.
 
     def patch(self, attempt: Attempt, path: str, field: str) -> OpResult:
-        value = f"Patch {attempt.op[:8]} " + _words(self.rng, 4)
+        value = f"Patch {corpus.op_code(attempt.op, CODE_WORDS)} " + _words(self.rng, 4)
         attempt.intent(path, {field: value})
         response = attempt.request(
             "PATCH",
@@ -636,7 +640,9 @@ class PloneUser(HttpUser):
         gevent.sleep(5)
 
     def import_item(self, attempt: Attempt) -> OpResult:
-        title = f"Import {attempt.op[:12]} " + _words(self.rng, 3)
+        title = f"Import {corpus.op_code(attempt.op, CODE_WORDS)} " + _words(
+            self.rng, 3
+        )
         attempt.intent(
             f"{corpus.BENCH}/{corpus.IMPORT}",
             {"title": title, "folder": f"{corpus.BENCH}/{corpus.IMPORT}"},
