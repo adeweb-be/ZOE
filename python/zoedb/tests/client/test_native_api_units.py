@@ -4,11 +4,18 @@
 test of `test_native_api.py` does not: the exceptions of `_call`, the
 calls that the listener refuses, the sizes of `len()` and `getSize()`,
 `record_iternext`, `history`, `pack`, `restore`, `server_status`, the
-interfaces that the client declares and the serial of a store.
+interfaces that the client declares, the serial of a store, a call without
+`wait`, and the iterators at the loss of the listener and at the close.
 """
 
+import socket
+import threading
+import time
+
+import msgpack
 import pytest
 import ZODB.interfaces
+from ZEO.Exceptions import ClientDisconnected
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import POSKeyError, StorageTransactionError
 from ZODB.utils import p64, z64
@@ -143,13 +150,148 @@ def test_a_dropped_iterator_is_released_at_the_end_of_a_transaction(storage):
     assert iid not in storage._iterator_ids
 
 
-def test_the_loss_of_the_listener_forgets_the_iterators(storage):
+def test_the_gc_of_a_disconnect_forgets_the_iterators(storage):
     commit(storage, {storage.new_oid(): (z64, b"a")})
     iterator = storage.iterator()
     next(iterator)
     storage._iterator_gc(True)
     assert not storage._iterator_ids
-    from ZEO.Exceptions import ClientDisconnected
-
     with pytest.raises(ClientDisconnected):
         next(iterator)
+
+
+def wait_until(condition, message):
+    """Poll `condition` until it is true, for `TIMEOUT` seconds at most."""
+    deadline = time.monotonic() + TIMEOUT
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(message)
+        time.sleep(0.01)
+
+
+def test_the_loss_of_the_listener_forgets_the_iterators(tmp_path):
+    with ZoeServer(str(tmp_path / "store")) as server:
+        storage = zoe.testing.native_client(
+            server.address, storage="1", wait_timeout=TIMEOUT
+        )
+        try:
+            for _ in range(2):
+                commit(storage, {storage.new_oid(): (z64, b"a")})
+            iterator = storage.iterator()
+            next(iterator)
+            assert storage._iterator_ids
+            server.kill()
+            # The thread of the deliveries gets the stale mark of the lost
+            # listener.
+            wait_until(
+                lambda: not storage._iterator_ids, "the iterators stayed after the loss"
+            )
+            assert iterator._iid == -1
+            with pytest.raises(ClientDisconnected):
+                next(iterator)
+        finally:
+            storage.close()
+
+
+class Tap:
+    """A TCP proxy in front of a server. For each connection of a client,
+    it keeps the methods that the client sent and whether the client
+    closed its side.
+    """
+
+    def __init__(self, upstream):
+        self.upstream = upstream
+        self.methods = {}
+        self.closed = set()
+        self._lock = threading.Lock()
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self.address = self._listener.getsockname()[:2]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def close(self):
+        self._listener.close()
+
+    def _accept(self):
+        number = 0
+        while True:
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            server = socket.create_connection(self.upstream)
+            number += 1
+            with self._lock:
+                self.methods[number] = []
+            for args in ((number, client, server), (None, server, client)):
+                threading.Thread(target=self._pump, args=args, daemon=True).start()
+
+    def _pump(self, number, source, sink):
+        first = True
+        try:
+            while True:
+                head = self._receive(source, 4)
+                body = self._receive(source, int.from_bytes(head, "big"))
+                if number is not None and not first:
+                    message = msgpack.unpackb(body, raw=False, strict_map_key=False)
+                    with self._lock:
+                        self.methods[number].append(message[2])
+                first = False
+                sink.sendall(head + body)
+        except (OSError, EOFError):
+            pass
+        finally:
+            if number is not None:
+                with self._lock:
+                    self.closed.add(number)
+            for sock in (source, sink):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _receive(sock, size):
+        chunks = []
+        while size:
+            chunk = sock.recv(size)
+            if not chunk:
+                raise EOFError
+            chunks.append(chunk)
+            size -= len(chunk)
+        return b"".join(chunks)
+
+    def numbers(self, method):
+        """Return the connections that sent `method`."""
+        with self._lock:
+            return {n for n, methods in self.methods.items() if method in methods}
+
+
+def test_the_close_releases_the_iterators_with_their_connection(tmp_path):
+    with ZoeServer(str(tmp_path / "store")) as server:
+        tap = Tap(server.address)
+        try:
+            storage = zoe.testing.native_client(
+                tap.address, storage="1", wait_timeout=TIMEOUT
+            )
+            try:
+                commit(storage, {storage.new_oid(): (z64, b"a")})
+                iterator = storage.iterator()
+                next(iterator)
+                [number] = tap.numbers("iterator_start")
+                assert number not in tap.closed
+            finally:
+                storage.close()
+            # The server drops the iterators of a connection that closes.
+            wait_until(
+                lambda: number in tap.closed,
+                "the connection of the iterator stayed open after the close",
+            )
+        finally:
+            tap.close()
+
+
+def test_a_call_without_wait_gives_a_future(storage):
+    assert storage._call("ping", wait=False).result(TIMEOUT) is None
+    future = storage._call("history", p64(42), 1, wait=False)
+    with pytest.raises(POSKeyError):
+        future.result(TIMEOUT)
