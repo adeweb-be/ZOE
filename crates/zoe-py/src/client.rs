@@ -527,8 +527,8 @@ impl NativeClient {
     /// Return how the verification of the cache file ended, once: `None`
     /// before its end, after the first call, and without a file with
     /// entries. Else a tuple `(kind, text)`: `kind` is `"kept"`, `"quick"`,
-    /// `"dropped"`, `"failed"` or `"ahead"`, and `text` says more for the
-    /// last two.
+    /// `"dropped"`, `"failed"`, `"other"` or `"ahead"`, and `text` says more
+    /// for the last three.
     fn take_cache_check(&self) -> Option<(&'static str, String)> {
         let check = lock(&self.pool).as_ref()?.take_file_check()?;
         Some(match check {
@@ -536,6 +536,14 @@ impl NativeClient {
             FileCheck::Quick => ("quick", String::new()),
             FileCheck::Dropped => ("dropped", String::new()),
             FileCheck::Failed(text) => ("failed", text),
+            FileCheck::Other { applied } => (
+                "other",
+                format!(
+                    "the server holds no transaction {:016x}, the last transaction \
+                     of the cache file: its history is another one",
+                    applied.0
+                ),
+            ),
             FileCheck::Ahead { applied, server } => (
                 "ahead",
                 format!(

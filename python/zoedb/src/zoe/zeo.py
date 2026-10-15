@@ -1130,14 +1130,16 @@ class _NativeClientStorage(ClientStorage):
         A server that does not keep the commits after the file, or a failed
         `getInvalidations`, drops the file as ZEO drops a stale cache. A
         file ahead of the server is dropped too, where ZEO refuses the
-        server: the DB has no state yet. A verification that ends after the
-        wait of the open is logged at the next connection.
+        server: the DB has no state yet. So is a file whose last
+        transaction the server does not hold: the server has another
+        history. A verification that ends after the wait of the open is
+        logged at the next connection.
         """
         check = self._native.take_cache_check()
         if check is None:
             return
         kind, text = check
-        if kind == "ahead":
+        if kind in ("ahead", "other"):
             logger.critical(
                 "%s Client cache is out of sync with the server: the native "
                 "client drops its cache file. Verify that this is expected: %s",

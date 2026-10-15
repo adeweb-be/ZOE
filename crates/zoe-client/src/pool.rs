@@ -155,6 +155,13 @@ pub enum FileCheck {
     /// `getInvalidations` failed with this text: the cache dropped every
     /// entry.
     Failed(String),
+    /// The server holds no commit at `applied` of the file, so its history
+    /// is not the one that the file saw, for example a server restored from
+    /// an older copy: the cache dropped every entry.
+    Other {
+        /// `applied` of the file.
+        applied: Tid,
+    },
     /// `applied` of the file is above the last tid of the server: the
     /// cache dropped every entry.
     Ahead {
@@ -1900,9 +1907,10 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// the consumer starts at the last tid of the pool.
 ///
 /// The base is `applied` of the cache. A server tid equal to the base keeps
-/// the cache. A higher one asks `getInvalidations(base)`: a reply drops the
-/// current entry of each of its oids, and `None` or an error drops every
-/// entry. A server tid below the base drops every entry too, and `applied`
+/// the cache. With a higher one, the server must hold a commit at the base,
+/// else its history is another one and the cache drops every entry. Then
+/// `getInvalidations(base)`: a reply drops the current entry of each of its
+/// oids, and `None` or an error drops every entry. A server tid below the base drops every entry too, and `applied`
 /// becomes the server tid. Then the cache serves. Return false at the
 /// close.
 async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
@@ -1917,6 +1925,27 @@ async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid
             server: server_tid,
         }
     } else {
+        let held = if base == Tid(0) {
+            Ok(true)
+        } else {
+            match shared.unless_closed(client.holds_transaction(base)).await {
+                None => return false,
+                Some(held) => held,
+            }
+        };
+        match held {
+            Ok(true) => {}
+            Ok(false) => {
+                cache.verify(server_tid, None);
+                shared.lock().file_check = Some(FileCheck::Other { applied: base });
+                return true;
+            }
+            Err(error) => {
+                cache.verify(server_tid, None);
+                shared.lock().file_check = Some(FileCheck::Failed(error.to_string()));
+                return true;
+            }
+        }
         match shared.unless_closed(client.get_invalidations(base)).await {
             None => return false,
             Some(Ok(Some(invalidation))) => {
