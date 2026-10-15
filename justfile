@@ -497,10 +497,11 @@ plone scenario="zoe" command="start" *args:
 # storage cost of at most a third of the one of ZEO over the floor storage
 # (phase 3, ADR 0037), and `--python cp314t` counts only that build.
 # `run --gate --storage zeo zoe-native floor` runs the gate set in rounds
-# that interleave the storages, and `--cell` picks some of its cells. `run` runs each
-# value of zodbshootout on a fresh store under target/bench/work, removes
-# the store when the value ends, and fails a cell before it starts when that
-# disk has less free space than one value needs. Each result records the GIL
+# that interleave the storages, and `--cell` picks some of its cells.
+# `run` runs each value of zodbshootout on a fresh store under
+# target/bench/work, removes the store when the value ends, and fails a
+# cell before it starts when that disk has less free space than one value
+# needs. Each result records the GIL
 # of each worker process. `run` and `test` build `zoe` in release for the
 # storages zoe-server and zoe-native, unless ZOE_BINARY names a binary.
 # `just bench test FILE...` runs only the tests of those files.

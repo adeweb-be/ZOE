@@ -234,6 +234,9 @@ def run_gate(
         index = GATE.cells.index(cell)
         name = f"{index}-{cell.mode}-{cell.concurrency}-{cell.object_size}"
         runs = [s for s in stores if cell.mode == "threads" or s.multi_process]
+        if not runs:
+            # Only one process can open these storages.
+            continue
         _check_disk(runs, cell, workdir, roots.values())
         for bench, (scenario, _) in SCENARIOS.items():
             values = {store.name: [] for store in runs}

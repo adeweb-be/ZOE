@@ -21,11 +21,13 @@ verdict `left out`. They count neither as below nor as missing.
 The cost of a storage is its time minus the time of the storage `floor`
 of the same round. For each cell, the report takes the last run of the
 baseline that holds the cell, and the values of the storage and of the
-floor of the same run, paired by round. A round that lacks one of the
+floor of the same run, paired by round. Each scenario and cell of the gate
+set counts: a cell that no run holds is missing. A round that lacks one of the
 three does not count. The ratio of a round is the cost of the baseline
 divided by the cost of the storage. A cost of the storage at or below 0
 gives an infinite ratio. A cell passes when the median of its ratios is
-at least the ratio of the gate. A cell where the median cost of the
+at least the ratio of the gate; with an even number of rounds, the median
+is the lower of the two middle ratios. A cell where the median cost of the
 baseline is below 10 % of its median time gets the verdict `below the
 noise`, and counts neither as below nor as missing. A cell without a
 complete round is missing. The time is the time of the slowest worker
@@ -39,7 +41,7 @@ import statistics
 from pathlib import Path
 from typing import TextIO
 
-from shootout import KB
+from shootout import GATE, KB, SCENARIOS
 from shootout.environment import python_tag
 from shootout.layout import run_set
 
@@ -223,7 +225,7 @@ def _cost_report(
             ),
             file=out,
         )
-        for cell in sorted(_gate_cells(runs[group][baseline])):
+        for cell in _every_cell():
             row = _cost_row(runs[group], cell, storage, baseline, ratio)
             verdict = row[-1]
             if counts:
@@ -236,8 +238,7 @@ def _cost_report(
                 row[-1] = verdict.lower()
             print(COST_ROW.format(*row), file=out)
 
-    # A gate without a cell with rounds does not pass.
-    passed = below == 0 and missing == 0 and total > 0
+    passed = below == 0 and missing == 0
     print(
         f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}"
         f"{where}, a cost ratio of at least {ratio:g} over {FLOOR} in each cell "
@@ -250,10 +251,10 @@ def _cost_report(
 
 def _cost_row(runs, cell, storage: str, baseline: str, ratio: float) -> list:
     """Return the fields of the row of a cell under the cost rule."""
-    base_started, base = max(
-        ((_started(r), e) for r in runs[baseline] if (e := _entry(r, cell))),
-        key=lambda pair: pair[0],
-    )
+    held = [(_started(r), e) for r in runs[baseline] if (e := _entry(r, cell))]
+    if not held:
+        return [*cell, "-", "-", "-", "-", "-", "-", 0, "missing"]
+    base_started, base = max(held, key=lambda pair: pair[0])
     rounds = {}
     for name in (baseline, storage, FLOOR):
         entry = base if name == baseline else None
@@ -271,8 +272,10 @@ def _cost_row(runs, cell, storage: str, baseline: str, ratio: float) -> list:
         for name in (baseline, storage, FLOOR)
     }
     ratios = [_cost_ratio(r[baseline], r[storage], r[FLOOR]) for r in complete]
-    median = statistics.median(ratios)
-    if times[baseline] - times[FLOOR] < NOISE * times[baseline]:
+    # With an even number of rounds, the lower of the two middle ratios.
+    median = statistics.median_low(ratios)
+    cost = statistics.median(r[baseline] - r[FLOOR] for r in complete)
+    if cost < NOISE * times[baseline]:
         verdict = "below the noise"
     elif median < ratio:
         verdict = "FAIL"
@@ -307,13 +310,13 @@ def _entry(result: dict, cell: tuple[str, str, int, int]) -> dict | None:
     return None
 
 
-def _gate_cells(results: list[dict]) -> set[tuple[str, str, int, int]]:
-    return {
-        (s["name"], s["mode"], s["concurrency"], s["object_size"])
-        for result in results
-        for s in result["scenarios"]
-        if s.get("values")
-    }
+def _every_cell() -> list[tuple[str, str, int, int]]:
+    """Return each scenario and cell of the gate set, in the order of the report."""
+    return sorted(
+        (name, cell.mode, cell.concurrency, cell.object_size)
+        for name, _ in SCENARIOS.values()
+        for cell in GATE.cells
+    )
 
 
 def _gate_results(root: Path) -> dict[tuple[str, str, str], dict[str, list[dict]]]:

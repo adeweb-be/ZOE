@@ -33,8 +33,8 @@ loops) than the objects that the loops read. A cache that `_cache.clear()`
 does not empty would turn `read_cold` into a cache read.
 
 The gate tests write synthetic gate results that are valid for the schema,
-with 7 rounds in the cells threads 16 and processes 16 at 1 KB and at
-100 KB. The test of
+with 7 rounds in each cell of the gate set: threads 1 and 16 and
+processes 16, at 1 KB and at 100 KB. The test of
 the GIL record runs a tiny profile of `zeo` in place of the quick set. No
 test needs the native client itself.
 
@@ -61,9 +61,12 @@ SCHEMA_PATH = BENCH / "schema" / "results.schema.json"
 README = BENCH / "README.md"
 TIMEOUT = 30
 SCENARIOS = ("add", "update", "read_cold", "read_warm", "read_hot")
+# The cells of the gate set: the gate counts each of them.
 CELLS = (
+    ("threads", 1, KB),
     ("threads", 16, KB),
     ("processes", 16, KB),
+    ("threads", 1, 100 * KB),
     ("threads", 16, 100 * KB),
     ("processes", 16, 100 * KB),
 )

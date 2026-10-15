@@ -99,6 +99,26 @@ def write(root, storage, scenarios, started=STARTED, python="cp314t"):
     path.write_text(json.dumps(result))
 
 
+# Each scenario and cell of the gate set, as (name, cell).
+EVERY = [
+    (name, (cell.mode, cell.concurrency, cell.object_size))
+    for name, _ in shootout.SCENARIOS.values()
+    for cell in GATE.cells
+]
+CELLS = len(EVERY)
+
+
+def fill(root, python="cp314t"):
+    """Write an earlier gate run that passes in each cell of the gate set.
+
+    A test writes the cells that it checks in a later run, which wins.
+    """
+    earlier = "2026-01-01T00:00:00Z"
+    for storage, seconds in (("zeo", 1.0), ("floor", 0.25), ("zoe-native", 0.5)):
+        times = dict.fromkeys(EVERY, [seconds] * ROUNDS)
+        write(root, storage, times, started=earlier, python=python)
+
+
 def native_for(ratios, zeo=1.0, floor=0.25):
     """Return the times of zoe-native that give each cost ratio of ratios."""
     return [floor + (zeo - floor) / ratio for ratio in ratios]
@@ -116,9 +136,10 @@ def report(root, storage="zoe-native", python="cp314t"):
     return code, out.getvalue().splitlines()
 
 
-def row(lines, name):
-    [line] = [line for line in lines if line.startswith(f"{name} ")]
-    return line
+def row(lines, name, cell=CELL):
+    """Return the row of a scenario and cell, in the first group."""
+    key = [name, cell[0], str(cell[1]), str(cell[2])]
+    return next(line for line in lines if line.split()[:4] == key)
 
 
 def test_the_gate_set_has_seven_rounds():
@@ -128,6 +149,7 @@ def test_the_gate_set_has_seven_rounds():
 
 def test_a_cell_passes_and_fails_on_the_median_of_its_ratios(tmp_path):
     # Three rounds below 3 and four above: the median passes.
+    fill(tmp_path / "pass")
     write_three(tmp_path / "pass", native_for([2.0] * 3 + [3.5] * 4))
     code, lines = report(tmp_path / "pass")
     assert code == 0, lines
@@ -135,6 +157,7 @@ def test_a_cell_passes_and_fails_on_the_median_of_its_ratios(tmp_path):
     assert line.endswith("pass"), line
     assert "3.50" in line.split() and "2.00-3.50" in line.split(), line
     # Four rounds below 3 and three above: the median fails.
+    fill(tmp_path / "fail")
     write_three(tmp_path / "fail", native_for([2.5] * 4 + [4.0] * 3))
     code, lines = report(tmp_path / "fail")
     assert code == 1, lines
@@ -142,10 +165,11 @@ def test_a_cell_passes_and_fails_on_the_median_of_its_ratios(tmp_path):
     assert line.endswith("FAIL"), line
     assert "2.50" in line.split(), line
     assert lines[-1].startswith("gate failed: zoe-native against zeo on cp314t")
-    assert lines[-1].endswith("1 cells, 1 below, 0 missing, 0 below the noise")
+    assert lines[-1].endswith(f"{CELLS} cells, 1 below, 0 missing, 0 below the noise")
 
 
 def test_the_report_prints_the_times_the_whole_ratio_and_the_cost_ratio(tmp_path):
+    fill(tmp_path)
     write_three(tmp_path, native_for([3.0] * ROUNDS))
     code, lines = report(tmp_path)
     assert code == 0, lines
@@ -159,6 +183,7 @@ def test_the_report_prints_the_times_the_whole_ratio_and_the_cost_ratio(tmp_path
 
 
 def test_a_cost_of_zoe_native_at_or_below_zero_passes(tmp_path):
+    fill(tmp_path)
     write_three(tmp_path, [0.25] * 3 + [0.2] * 4)
     code, lines = report(tmp_path)
     assert code == 0, lines
@@ -169,7 +194,7 @@ def test_a_cost_of_zoe_native_at_or_below_zero_passes(tmp_path):
 
 def test_a_cell_below_the_noise_is_reported_and_does_not_count(tmp_path):
     # The cost of ZEO is 5 % of its time, and zoe-native is slower.
-    write_three(tmp_path, [1.2] * ROUNDS, floor=[0.95] * ROUNDS)
+    fill(tmp_path)
     write(
         tmp_path,
         "zeo",
@@ -192,7 +217,41 @@ def test_a_cell_below_the_noise_is_reported_and_does_not_count(tmp_path):
     assert code == 0, lines
     assert row(lines, "add").endswith("below the noise"), lines
     assert row(lines, "update").endswith("pass"), lines
-    assert lines[-1].endswith("2 cells, 0 below, 0 missing, 1 below the noise")
+    assert lines[-1].endswith(f"{CELLS} cells, 0 below, 0 missing, 1 below the noise")
+
+
+def test_the_noise_is_the_median_of_the_costs_of_the_rounds(tmp_path):
+    # The median cost of ZEO over the rounds is 0.2, 20 % of its median
+    # time, so the cell counts. The difference of the median times would be
+    # 0.05, 5 %.
+    fill(tmp_path)
+    zeo = [1.0] * 4 + [1.2] * 3
+    write_three(tmp_path, zeo, zeo=zeo, floor=[0.8] * 3 + [0.95] * 4)
+    code, lines = report(tmp_path)
+    assert code == 1, lines
+    assert row(lines, "add").endswith("FAIL"), lines
+
+
+def test_with_an_even_number_of_rounds_the_median_is_the_lower_ratio(tmp_path):
+    # Three rounds at 2 and three where zoe-native costs nothing.
+    fill(tmp_path)
+    write_three(tmp_path, native_for([2.0] * 3) + [0.2] * 3 + [None])
+    code, lines = report(tmp_path)
+    assert code == 1, lines
+    words = row(lines, "add").split()
+    assert words[8:11] == ["2.00", "2.00-inf", "6"], words
+
+
+def test_a_cell_of_the_gate_set_that_no_run_holds_is_missing(tmp_path):
+    # One job ran one cell only: the other cells of the gate set are missing.
+    write_three(tmp_path, native_for([3.0] * ROUNDS))
+    code, lines = report(tmp_path)
+    assert code == 1, lines
+    assert row(lines, "add").endswith("pass"), lines
+    assert row(lines, "add", ("processes", 16, 100 * KB)).endswith("missing")
+    assert lines[-1].endswith(
+        f"{CELLS} cells, 0 below, {CELLS - 1} missing, 0 below the noise"
+    )
 
 
 def test_a_round_that_lacks_a_storage_does_not_count(tmp_path):
@@ -200,6 +259,7 @@ def test_a_round_that_lacks_a_storage_does_not_count(tmp_path):
     # other rounds count. Rounds 5 and 6 of zoe-native would fail.
     native = native_for([4.0] * 5 + [1.0]) + [None]
     floor = [0.25] * 5 + [None, 0.25]
+    fill(tmp_path)
     write_three(tmp_path, native, floor=floor)
     code, lines = report(tmp_path)
     assert code == 0, lines
@@ -209,6 +269,7 @@ def test_a_round_that_lacks_a_storage_does_not_count(tmp_path):
 
 def test_a_cell_without_the_floor_or_zoe_native_is_missing(tmp_path):
     other = ("threads", 1, KB)
+    fill(tmp_path)
     write(tmp_path, "zeo", {("add", CELL): [1.0] * ROUNDS, ("add", other): [1.0] * 7})
     write(tmp_path, "floor", {("add", CELL): [0.25] * ROUNDS})
     write(
@@ -218,14 +279,15 @@ def test_a_cell_without_the_floor_or_zoe_native_is_missing(tmp_path):
     )
     code, lines = report(tmp_path)
     assert code == 1, lines
-    verdicts = [line.split()[-1] for line in lines if line.startswith("add ")]
-    assert sorted(verdicts) == ["missing", "pass"], lines
-    assert lines[-1].endswith("2 cells, 0 below, 1 missing, 0 below the noise")
+    assert row(lines, "add").endswith("pass"), lines
+    assert row(lines, "add", other).endswith("missing"), lines
+    assert lines[-1].endswith(f"{CELLS} cells, 0 below, 1 missing, 0 below the noise")
 
 
 def test_each_cell_can_come_from_its_own_run(tmp_path):
     # Two gate runs, one per cell: the rounds of a cell pair within its run.
     other = ("processes", 16, 100 * KB)
+    fill(tmp_path)
     write_three(tmp_path, native_for([3.0] * ROUNDS))
     later = "2026-01-05T00:00:00Z"
     write(tmp_path, "zeo", {("add", other): [1.0] * ROUNDS}, started=later)
@@ -235,23 +297,26 @@ def test_each_cell_can_come_from_its_own_run(tmp_path):
     )
     code, lines = report(tmp_path)
     assert code == 1, lines
-    verdicts = sorted(line.split()[-1] for line in lines if line.startswith("add "))
-    assert verdicts == ["FAIL", "pass"], lines
+    assert row(lines, "add").endswith("pass"), lines
+    assert row(lines, "add", other).endswith("FAIL"), lines
 
 
 def test_the_left_out_cells_of_zoe_native_are_gone(tmp_path):
     assert gate.left_out("zoe-native") == {}
     hot = ("read_hot", ("threads", 1, KB))
+    fill(tmp_path)
     write(tmp_path, "zeo", {hot: [1.0] * ROUNDS})
     write(tmp_path, "floor", {hot: [0.5] * ROUNDS})
     write(tmp_path, "zoe-native", {hot: [0.8] * ROUNDS})
     code, lines = report(tmp_path)
     assert code == 1, lines
-    assert row(lines, "read_hot").endswith("FAIL"), lines
+    assert row(lines, "read_hot", hot[1]).endswith("FAIL"), lines
     assert not any("left out" in line for line in lines), lines
 
 
 def test_a_build_counts_and_the_other_prints_beside_it(tmp_path):
+    fill(tmp_path)
+    fill(tmp_path, python="cp313")
     write_three(tmp_path, native_for([3.0] * ROUNDS))
     for storage, times in (
         ("zeo", [1.0] * 7),
@@ -266,7 +331,8 @@ def test_a_build_counts_and_the_other_prints_beside_it(tmp_path):
         "== reference cp314t gate",
         "== reference cp313 gate (beside cp314t, does not count)",
     ]
-    rows = [line for line in lines if line.startswith("add ")]
+    key = ["add", *map(str, CELL)]
+    rows = [line for line in lines if line.split()[:4] == key]
     assert rows[0].endswith("pass") and rows[1].endswith("fail"), rows
 
 
@@ -278,7 +344,7 @@ class FakeValues:
 
     def __call__(self, store, cell, bench, workdir, dsn):
         self.order.append((bench, cell, store.name))
-        seconds = {"zeo": 1.0, "zoe-native": 0.4, "floor": 0.1}[store.name]
+        seconds = {"zeo": 1.0, "zoe-native": 0.4, "floor": 0.1}.get(store.name, 1.0)
         return [seconds], [{"gil_enabled": False, "gil_enabled_by": []}]
 
 
@@ -307,6 +373,16 @@ def test_the_order_of_the_storages_rotates_from_round_to_round(monkeypatch, tmp_
         for scenario in result["scenarios"]:
             assert [v["round"] for v in scenario["values"]] == list(range(ROUNDS))
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_cell_that_no_storage_of_the_run_takes_is_skipped(monkeypatch, tmp_path):
+    fake = FakeValues()
+    monkeypatch.setattr(shootout, "_run_value", fake)
+    # Only one process can open a store of zoe: it takes no processes cell.
+    cells = [Cell("threads", 16, KB), Cell("processes", 16, KB)]
+    [result] = run_gate(["zoe"], workdir=tmp_path, cells=cells)
+    assert {cell.mode for _, cell, _ in fake.order} == {"threads"}
+    assert {s["mode"] for s in result["scenarios"]} == {"threads"}
 
 
 def test_a_cell_outside_the_gate_set_is_refused(tmp_path):
