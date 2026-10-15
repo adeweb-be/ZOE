@@ -70,6 +70,18 @@ def watchers():
         with open(f"/proc/self/task/{task}/comm") as comm:
             count += comm.read().strip() == "zoe-signals"
     return count
+
+
+def started_watchers():
+    # A new thread sets its own name, so the name shows a short time after
+    # the thread starts. Wait for it.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        count = watchers()
+        if count:
+            return count
+        time.sleep(0.01)
+    return watchers()
 """
 
 
@@ -187,7 +199,7 @@ def test_the_open_installs_a_handler_of_each_signal_whose_action_is_the_default(
         import zoe
         print(caught(signal.SIGTERM), caught(signal.SIGHUP), watchers())
         storage = zoe.Storage(sys.argv[1])
-        print(caught(signal.SIGTERM), caught(signal.SIGHUP), watchers())
+        print(caught(signal.SIGTERM), caught(signal.SIGHUP), started_watchers())
         # Python still sees the default action.
         print(signal.getsignal(signal.SIGTERM) is signal.SIG_DFL)
         storage.close()
@@ -206,7 +218,7 @@ def test_one_watcher_thread_serves_every_storage(tmp_path):
         """
         import zoe
         storages = [zoe.Storage(path) for path in sys.argv[1:]]
-        print(watchers())
+        print(started_watchers())
         ready()
         wait_for_the_test()
         """,
