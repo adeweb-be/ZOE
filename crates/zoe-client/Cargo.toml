@@ -9,9 +9,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The anonymous mapping of the client cache.
+libc.workspace = true
 rmpv.workspace = true
+# TLS to the server, with the TLS stack of zoe-server.
+rustls.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls.workspace = true
+xxhash-rust.workspace = true
 zoe-core.workspace = true
 
 [dev-dependencies]

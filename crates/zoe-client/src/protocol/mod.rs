@@ -3,7 +3,10 @@
 //!
 //! A frame is a 4-byte big-endian length, then the bytes of the frame. The
 //! first frame of each side is the protocol, `M5`, as raw bytes. Each later
-//! frame is a msgpack array `[id, flags, method, args]`.
+//! frame is a msgpack array `[id, flags, method, args]`. On a connection
+//! that got the extension `trace_context`, a call can have a fifth element:
+//! its trace context, a map whose key `traceparent` holds a W3C
+//! traceparent.
 
 use std::io;
 
@@ -30,6 +33,9 @@ const ERROR: i64 = 2;
 
 /// The class of the conflict error of ZODB.
 const CONFLICT: &str = "ZODB.POSException.ConflictError";
+
+/// The class of the read conflict error of ZODB.
+const READ_CONFLICT: &str = "ZODB.POSException.ReadConflictError";
 
 /// Read one frame from `reader`. Return `None` at the end of the stream
 /// before a frame starts. An end inside a frame fails with `UnexpectedEof`.
@@ -76,9 +82,23 @@ fn frame(payload: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(frame)
 }
 
-/// Return the frame of the message `[id, flags, method, args]`.
-fn message(id: i64, flags: Value, method: &str, args: Value) -> Result<Vec<u8>, Error> {
-    let message = Value::Array(vec![id.into(), flags, method.into(), args]);
+/// The key of the W3C traceparent in the trace context of a call.
+const TRACEPARENT: &str = "traceparent";
+
+/// Return the frame of the message `[id, flags, method, args]`. With a
+/// `traceparent`, the message has a fifth element: the trace context.
+fn message(
+    id: i64,
+    flags: Value,
+    method: &str,
+    args: Value,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    let mut parts = vec![id.into(), flags, method.into(), args];
+    if let Some(traceparent) = traceparent {
+        parts.push(Value::Map(vec![(TRACEPARENT.into(), traceparent.into())]));
+    }
+    let message = Value::Array(parts);
     let mut payload = Vec::new();
     rmpv::encode::write_value(&mut payload, &message)
         .map_err(|e| Error::Invalid(format!("{method}: {e}")))?;
@@ -86,20 +106,29 @@ fn message(id: i64, flags: Value, method: &str, args: Value) -> Result<Vec<u8>, 
 }
 
 /// Return the frame of a call that waits for its reply. A stock client
-/// sends `false` as its flags.
-pub(crate) fn call(id: i64, method: &str, args: Vec<Value>) -> Result<Vec<u8>, Error> {
-    message(id, false.into(), method, Value::Array(args))
+/// sends `false` as its flags. With a `traceparent`, the call carries it.
+pub(crate) fn call(
+    id: i64,
+    method: &str,
+    args: Vec<Value>,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    message(id, false.into(), method, Value::Array(args), traceparent)
 }
 
 /// Return the frame of a call without a reply: the id 0 and the flags
-/// `true`.
-pub(crate) fn notify(method: &str, args: Vec<Value>) -> Result<Vec<u8>, Error> {
-    message(0, true.into(), method, Value::Array(args))
+/// `true`. With a `traceparent`, the call carries it.
+pub(crate) fn notify(
+    method: &str,
+    args: Vec<Value>,
+    traceparent: Option<&str>,
+) -> Result<Vec<u8>, Error> {
+    message(0, true.into(), method, Value::Array(args), traceparent)
 }
 
 /// Return the frame of the heartbeat: `[-1, 0, ".reply", nil]`.
 pub(crate) fn heartbeat() -> Vec<u8> {
-    message(-1, 0.into(), ".reply", Value::Nil).expect("the heartbeat encodes")
+    message(-1, 0.into(), ".reply", Value::Nil, None).expect("the heartbeat encodes")
 }
 
 /// A message from the server.
@@ -155,7 +184,10 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Message, Error> {
 }
 
 /// Return the error of an error reply, whose args are `[class, value]`. A
-/// `ConflictError` with an oid is `Error::Conflict`.
+/// `ConflictError` with an oid is `Error::Conflict`, and a
+/// `ReadConflictError` with an oid is `Error::ReadConflict`. The message
+/// of another error is empty without an argument, the text of its one
+/// argument, or else the value.
 fn server_error(args: Value) -> Error {
     let (class, value) = match args {
         Value::Array(items) if items.len() == 2 => {
@@ -172,9 +204,32 @@ fn server_error(args: Value) -> Error {
     {
         return conflict;
     }
+    if class == READ_CONFLICT
+        && let Some(Error::Conflict { oid, serials }) = conflict(&value)
+    {
+        return Error::ReadConflict { oid, serials };
+    }
+    let message = match &value {
+        Value::Array(items) if items.is_empty() => String::new(),
+        Value::Array(items) if items.len() == 1 && items[0].as_str().is_some() => {
+            items[0].as_str().unwrap_or_default().to_owned()
+        }
+        value => value.to_string(),
+    };
     Error::Server {
         class,
-        message: value.to_string(),
+        message,
+        value,
+    }
+}
+
+/// Return the `POSKeyError` of `oid`, as the server gives it for an oid
+/// without a record: one bytes argument, the oid.
+pub(crate) fn pos_key_error(oid: Oid) -> Error {
+    Error::Server {
+        class: "ZODB.POSException.POSKeyError".into(),
+        message: format!("{oid:?}"),
+        value: Value::Array(vec![bin8(oid.0)]),
     }
 }
 
@@ -231,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_call_has_an_int_id_and_false_flags() {
-        let frame = call(7, "lastTransaction", vec![]).unwrap();
+        let frame = call(7, "lastTransaction", vec![], None).unwrap();
         let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
         assert_eq!(
             value,
@@ -246,7 +301,7 @@ mod tests {
 
     #[test]
     fn a_notification_has_the_id_0_and_true_flags() {
-        let frame = notify("storea", vec![bin8(1)]).unwrap();
+        let frame = notify("storea", vec![bin8(1)], None).unwrap();
         let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
         assert_eq!(
             value,
@@ -257,6 +312,28 @@ mod tests {
                 Value::Array(vec![Value::Binary(vec![0, 0, 0, 0, 0, 0, 0, 1])])
             ])
         );
+    }
+
+    #[test]
+    fn a_traceparent_is_a_fifth_element() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let context = Value::Map(vec![("traceparent".into(), traceparent.into())]);
+        let frame = call(7, "loadBefore", vec![bin8(1)], Some(traceparent)).unwrap();
+        let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                7.into(),
+                false.into(),
+                "loadBefore".into(),
+                Value::Array(vec![bin8(1)]),
+                context.clone(),
+            ])
+        );
+        let frame = notify("storea", vec![], Some(traceparent)).unwrap();
+        let value = rmpv::decode::read_value(&mut payload(&frame)).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 5);
+        assert_eq!(value.as_array().unwrap()[4], context);
     }
 
     #[test]
@@ -298,8 +375,12 @@ mod tests {
         match decode(&bytes).unwrap() {
             Message::Reply {
                 id: 4,
-                result: Err(Error::Server { class, .. }),
-            } => assert_eq!(class, "ZODB.POSException.POSKeyError"),
+                result: Err(Error::Server { class, value, .. }),
+            } => {
+                assert_eq!(class, "ZODB.POSException.POSKeyError");
+                // The oid stays bytes in the value.
+                assert_eq!(value, Value::Array(vec![bin8(1)]));
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -338,6 +419,68 @@ mod tests {
                 result: Err(Error::Conflict { serials: None, .. }),
                 ..
             } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_conflict_error_gives_its_oid_and_serials() {
+        let value = Value::Map(vec![
+            ("message".into(), "database read conflict error".into()),
+            ("oid".into(), bin8(5)),
+            ("class_name".into(), Value::Nil),
+            ("serials".into(), Value::Array(vec![bin8(3), bin8(2)])),
+        ]);
+        let bytes = encode(Value::Array(vec![
+            1.into(),
+            2.into(),
+            ".reply".into(),
+            Value::Array(vec![READ_CONFLICT.into(), value]),
+        ]));
+        match decode(&bytes).unwrap() {
+            Message::Reply {
+                result: Err(Error::ReadConflict { oid, serials }),
+                ..
+            } => {
+                assert_eq!(oid, Oid(5));
+                assert_eq!(serials, Some((Tid(3), Tid(2))));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_message_of_an_error_is_the_text_of_its_arguments() {
+        let reply = |args: Value| {
+            encode(Value::Array(vec![
+                1.into(),
+                2.into(),
+                ".reply".into(),
+                Value::Array(vec!["builtins.TypeError".into(), args]),
+            ]))
+        };
+        match decode(&reply(Value::Array(vec!["bad args".into()]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { class, message, .. }),
+                ..
+            } => {
+                assert_eq!(class, "builtins.TypeError");
+                assert_eq!(message, "bad args");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(&reply(Value::Array(vec![1.into(), 2.into()]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { message, .. }),
+                ..
+            } => assert_eq!(message, "[1, 2]"),
+            other => panic!("{other:?}"),
+        }
+        match decode(&reply(Value::Array(vec![]))).unwrap() {
+            Message::Reply {
+                result: Err(Error::Server { message, .. }),
+                ..
+            } => assert_eq!(message, ""),
             other => panic!("{other:?}"),
         }
     }

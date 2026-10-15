@@ -2,6 +2,7 @@
 
 use std::io;
 
+use rmpv::Value;
 use zoe_core::{Oid, Tid};
 
 /// An error of a call of the client.
@@ -10,13 +11,17 @@ use zoe_core::{Oid, Tid};
 pub enum Error {
     /// The server answered with an error. `class` is the class name of the
     /// exception, as `ZODB.POSException.POSKeyError`. `message` shows the
-    /// value of the exception.
+    /// value of the exception. `value` is that value as the server sent
+    /// it: the array of the args, or the map of the attributes.
     #[error("{class}: {message}")]
     Server {
         /// The module and the name of the exception class.
         class: String,
         /// The args or the attributes of the exception, as text.
         message: String,
+        /// The args or the attributes of the exception, as the server
+        /// sent them. So a bytes argument, such as an oid, stays bytes.
+        value: Value,
     },
 
     /// A store of the transaction has a stale serial: a
@@ -30,6 +35,23 @@ pub enum Error {
         /// The committed serial and the serial that the transaction read.
         serials: Option<(Tid, Tid)>,
     },
+
+    /// An object that the transaction read is no longer current: a
+    /// `ZODB.POSException.ReadConflictError` of the vote, after
+    /// `Transaction::check_current_serial`. `serials` is `(committed,
+    /// read)`, or `None` when the server did not give them.
+    #[error("a read conflict on the oid {oid:?}, serials {serials:?}")]
+    ReadConflict {
+        /// The oid of the conflict.
+        oid: Oid,
+        /// The committed serial and the serial that the transaction read.
+        serials: Option<(Tid, Tid)>,
+    },
+
+    /// The call needs an extension that the server did not accept on this
+    /// connection. The client sent nothing.
+    #[error("the server does not serve this: {0}")]
+    Unsupported(String),
 
     /// The connection to the server is lost or closed. Every call that
     /// waits for a reply fails with it, and so does every later call.
