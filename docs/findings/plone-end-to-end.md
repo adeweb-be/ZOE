@@ -1,0 +1,42 @@
+# Finding: where ZOE helps a Plone site, and where it does not yet (interim)
+
+The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). **Interim**: one repetition of each primary scenario on `zeo` and `zoe-native`, small fixture, one machine. The contention, background, cold-start, probe-overhead and sustained-write campaigns did not run yet. `HANDOFF.md` at the root of the repository gives the state and the next steps.
+
+- Tables: [`plone-end-to-end/interim-report.md`](plone-end-to-end/interim-report.md). Machine-readable: [`plone-end-to-end/interim-summary.json`](plone-end-to-end/interim-summary.json).
+- Commit under test: `0f03dfb` (the harness changed after it, the stores and the servers did not).
+- Label: a **synthetic realistic-site benchmark**, not a production-site benchmark. Fixture `small`: 685 objects, the same logical site in a `Data.fs` and in its `zoe convert` copy (digest equal).
+- Machine: 4 vCPU (Xeon 2.1 GHz, shared VM), 16 GiB, ext4 on a virtual disk. Server on CPU 0, two Zope instances of two threads on CPUs 1 and 2, Locust on CPU 3 (under 5 % of its CPU in every run). CPython 3.13, GIL on.
+- Closed workload, no think time: 1, 4 and 16 users, 45 s each, first 5 s of each step left out.
+- Every run passed its verification: no lost acknowledged write, no phantom, no refused write committed, versions, workflow history, permissions, catalog entries and search all as the ledger says.
+
+## Measured
+
+1. **Pages and searches: parity.** `browse`, `catalog`: ZEO and ZOE within 5 % on rate and p95 at every load (18–20 pages/s at saturation). Both Zope processes are CPU-bound (about 90–110 ms of Zope CPU per operation); the storage server uses under 1 % of a CPU. A faster storage cannot move these numbers on a warm, small site.
+2. **Write requests: the storage is a small slice.** On both stacks a save takes 400–650 ms of request time. The vote and the finish take about 10 ms of it, the whole commit phase (pickling, catalog, storage) 60–90 ms. The native client loads faster: 25–31 ms of storage reads per write request against 38–48 ms on ZEO, about 3–4 % of the request.
+3. **Edits fail under concurrency on both stacks, for the same reason.** `edit` at 16 users: 16.9 % failed saves on ZEO, 15.3 % on ZOE, after Zope's three retries; 60–67 % of saves succeed at their first attempt at 4 and 16 users. The objects that conflict are catalog structures. A map of the conflicting oids (`inzope/oidmap.py`) puts most of them in the `_wordinfo` buckets of the ZCTextIndex indexes `SearchableText` and `Description`, then `sortable_title`, `UID`, `cmf_uid`, `path`, `id`. The `modified` DateIndex holds very few.
+4. **ZOE removes the `portal_uidgenerator` conflict, and the next object takes its place.** On ZEO, every conflict of `create-spread` and `create-shared` is on `portal_uidgenerator` (135 in `create-spread`). On ZOE (`zoe.plone` sequence), none is there; about as many land on catalog buckets and read conflicts instead. The failure rate of creations barely moves (2–5 % on both).
+5. **Workflow transitions do not conflict.** `workflow`: no failure on either stack at any load, and every anonymous visibility check after a transition passed. The ZOE clients resolved about 640 bucket conflicts per step, all with success.
+6. **Resolution work is thrown away.** The clients of ZOE resolved 800–1,750 bucket conflicts per 45 s step in `edit` and `create-*`. The ZEO server resolved 2,588 in the `edit` run and failed on 160. A vote that resolves many buckets and then meets one that does not resolve fails whole, and the publisher retries the request from the start.
+7. **ZOE writes far more to disk per operation.** Bytes that the server process wrote, per successful operation: `edit` about 2.2–2.7 MB on ZOE against 0.43–0.46 MB on ZEO; `workflow` 0.86–0.94 MB against 0.04 MB; `create-*` 1.7–2.6 MB against 0.85–1.05 MB. The mean fsync batch of `zoe serve` is 1.0 in every run: no group commit at these rates. This VM has fast enough storage that it does not show in latency; a site with a slow or metered disk would see it.
+8. **The harness itself:** a hex token in each title made each concurrent save add a new word to the text index lexicons, and two such saves always conflicted on the new word id. That inflated the conflicts of the first `edit`, `create-*` and `mixed` runs (the runs in the interim report). Titles now carry four known words (`corpus.op_code`). A sanity run of `edit` with the codes at 4 users on ZOE still had 63 conflicts in 30 s, in the same `_wordinfo` buckets: the text index contention is real, the lexicon part was the artifact. These four scenarios must run again.
+
+## Not measured yet
+
+- Field-level merges, structural merges in Rust, shadow mode and early write-intent locks: phase 4, not built. No stack has them; nothing here measures them.
+- Compression off: `zoe serve` has no option for it.
+- Free-threaded Python: Plone 6.1 supports CPython up to 3.13; the instances run 3.13 with the GIL on (recorded in each result).
+- Cold filesystem pages: the container cannot drop the page cache.
+- A larger fixture (`medium`, `large`): not built; the site fits in every cache.
+
+## Ranked optimization opportunities
+
+| # | Observed bottleneck | Evidence | Affected workloads | Headroom (estimate) | Candidate change | Complexity and correctness risk | Next experiment |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | Unresolvable conflicts in ZCTextIndex `_wordinfo` buckets and other catalog BTrees | 3, 6, 8; oid map | every concurrent save and creation | up to the 15 % failed saves and 35–40 % retried saves at 16 users; retries cost most of the p95 | tier 1 native merges of buckets with value policies (a posting dict as a set union per key), or a catalog that defers text indexing; field-level merge on the content object does not help alone | high: a wrong merge loses postings; needs the differential tests of F6 and shadow mode first | rerun `edit` with codes, then classify each conflicting key (same key, split, delete) |
+| 2 | Wasted resolution before a failing vote | 6 | the same | the client CPU of the resolutions of failed votes | try the classes without `_p_resolveConflict`, and the ones most likely to fail, first, so a vote fails before it resolves | low in the client; no format change | count resolutions per failed vote with the codes |
+| 3 | Disk writes per commit and no group commit | 7 | every write | none on this VM; I/O-bound sites | look at the redb pages written per commit, and the fsync batching under real concurrency | medium: durability (N1) must hold | the sustained-write campaign with disk counters, then the same on a slow disk |
+| 4 | Zope CPU per page (rendering) | 1, 2 | every read and every write | the large one for users, but not in the storage | outside ZOE: caching, rendering | – | a larger fixture and cold caches, where the storage reads weigh more |
+| 5 | `portal_uidgenerator` | 4 | concurrent creation | done: 0 conflicts on ZOE | already built (F29) | – | none |
+| 6 | Load time of the client | 2 | every request | about 3–4 % of a write request today | the native client already wins; more matters on a larger site with cold caches | low | medium fixture, cold start |
+
+Measured statements are 1–7. The headroom figures and the candidate changes are hypotheses. With one repetition, differences of a few percent between ZEO and ZOE are within run-to-run noise.

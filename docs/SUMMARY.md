@@ -55,3 +55,4 @@
 - [Finding: persistent loses the state of an object on CPython 3.14t](findings/persistent-inline-values.md)
 - [Finding: zodbpickle turns the GIL on at `import ZODB` on CPython 3.14t](findings/zodbpickle-free-threading.md)
 - [Finding: BTrees turns the GIL on in a ZODB application on CPython 3.14t](findings/btrees-free-threading.md)
+- [Finding: where ZOE helps a Plone site, and where it does not yet (interim)](findings/plone-end-to-end.md)

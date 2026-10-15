@@ -1,0 +1,2909 @@
+{
+ "browse|zeo": {
+  "scenario": "browse",
+  "stack": "zeo",
+  "runs": [
+   "20261015T202216Z-browse-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 425,
+    "ok_per_second": {
+     "median": 10.625,
+     "min": 10.625,
+     "max": 10.625,
+     "values": [
+      10.625
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 425,
+     "mean": 0.09490203801323385,
+     "p50": 0.09452629089355469,
+     "p95": 0.12920999526977536,
+     "p99": 0.14285106658935545,
+     "max": 0.3259704113006592,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 88.58823529411765,
+    "server_cpu_ms_per_op": 0.11764705882353003,
+    "locust_cpu_share": 0.02277120579010615,
+    "server_write_kb_per_op": 0.08470588235294117,
+    "zope_busy": 0.9824959273501577,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.01344442367553711
+     },
+     "view-document": {
+      "ok_per_second": 2.325,
+      "failure_rate": 0.0,
+      "p95": 0.12856240272521968
+     },
+     "view-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.10786318778991699
+     },
+     "view-folder": {
+      "ok_per_second": 6.4,
+      "failure_rate": 0.0,
+      "p95": 0.1303207278251648
+     },
+     "view-news-item": {
+      "ok_per_second": 0.85,
+      "failure_rate": 0.0,
+      "p95": 0.10852533578872679
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 743,
+    "ok_per_second": {
+     "median": 18.575,
+     "min": 18.575,
+     "max": 18.575,
+     "values": [
+      18.575
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 743,
+     "mean": 0.21683855814054548,
+     "p50": 0.2196195125579834,
+     "p95": 0.314482569694519,
+     "p99": 0.35046967506408716,
+     "max": 0.5001039505004883,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 103.76850605652758,
+    "server_cpu_ms_per_op": 0.09421265141319016,
+    "locust_cpu_share": 0.03683538827403241,
+    "server_write_kb_per_op": 0.04845222072678331,
+    "zope_busy": 3.8972875376499134,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.031129443645477293
+     },
+     "view-document": {
+      "ok_per_second": 3.475,
+      "failure_rate": 0.0,
+      "p95": 0.3081743955612183
+     },
+     "view-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.3151210188865661
+     },
+     "view-folder": {
+      "ok_per_second": 11.0,
+      "failure_rate": 0.0,
+      "p95": 0.32037078142166137
+     },
+     "view-news-item": {
+      "ok_per_second": 2.0,
+      "failure_rate": 0.0,
+      "p95": 0.2997168183326721
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 779,
+    "ok_per_second": {
+     "median": 19.475,
+     "min": 19.475,
+     "max": 19.475,
+     "values": [
+      19.475
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 779,
+     "mean": 0.8478539926555864,
+     "p50": 0.825554370880127,
+     "p95": 1.1351979017257685,
+     "p99": 1.2066658830642703,
+     "max": 1.2649619579315186,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 98.98587933247752,
+    "server_cpu_ms_per_op": 0.051347881899871675,
+    "locust_cpu_share": 0.03889305079480167,
+    "server_write_kb_per_op": 0.03080872913992298,
+    "zope_busy": 4.096447772374711,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 1.425,
+      "failure_rate": 0.0,
+      "p95": 0.8791104316711424
+     },
+     "view-document": {
+      "ok_per_second": 3.925,
+      "failure_rate": 0.0,
+      "p95": 1.109683609008789
+     },
+     "view-file": {
+      "ok_per_second": 1.425,
+      "failure_rate": 0.0,
+      "p95": 1.0981307506561278
+     },
+     "view-folder": {
+      "ok_per_second": 11.075,
+      "failure_rate": 0.0,
+      "p95": 1.150103545188904
+     },
+     "view-news-item": {
+      "ok_per_second": 1.625,
+      "failure_rate": 0.0,
+      "p95": 1.0901889324188232
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   2
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   0
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "browse|zoe-native": {
+  "scenario": "browse",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T202540Z-browse-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 418,
+    "ok_per_second": {
+     "median": 10.45,
+     "min": 10.45,
+     "max": 10.45,
+     "values": [
+      10.45
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 418,
+     "mean": 0.09645838144293242,
+     "p50": 0.09649670124053955,
+     "p95": 0.1279728889465332,
+     "p99": 0.14166189193725584,
+     "max": 0.2619361877441406,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 90.28708133971293,
+    "server_cpu_ms_per_op": 0.11961722488038289,
+    "locust_cpu_share": 0.02225582499779289,
+    "server_write_kb_per_op": 0.05741626794258373,
+    "zope_busy": 0.9828168875500183,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.010223388671875
+     },
+     "view-document": {
+      "ok_per_second": 2.3,
+      "failure_rate": 0.0,
+      "p95": 0.12217316627502442
+     },
+     "view-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.13240432739257812
+     },
+     "view-folder": {
+      "ok_per_second": 6.25,
+      "failure_rate": 0.0,
+      "p95": 0.1293109893798828
+     },
+     "view-news-item": {
+      "ok_per_second": 0.85,
+      "failure_rate": 0.0,
+      "p95": 0.12136313915252683
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 736,
+    "ok_per_second": {
+     "median": 18.4,
+     "min": 18.4,
+     "max": 18.4,
+     "values": [
+      18.4
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 736,
+     "mean": 0.21821577393490335,
+     "p50": 0.21656513214111328,
+     "p95": 0.3123209476470947,
+     "p99": 0.3683344960212707,
+     "max": 0.48468947410583496,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 104.33423913043477,
+    "server_cpu_ms_per_op": 0.09510869565217399,
+    "locust_cpu_share": 0.03786550071883558,
+    "server_write_kb_per_op": 0.043478260869565216,
+    "zope_busy": 3.871320605300264,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 1.025,
+      "failure_rate": 0.0,
+      "p95": 0.028357267379760742
+     },
+     "view-document": {
+      "ok_per_second": 3.425,
+      "failure_rate": 0.0,
+      "p95": 0.29916090965270997
+     },
+     "view-file": {
+      "ok_per_second": 1.025,
+      "failure_rate": 0.0,
+      "p95": 0.2913033962249756
+     },
+     "view-folder": {
+      "ok_per_second": 10.925,
+      "failure_rate": 0.0,
+      "p95": 0.31891117095947263
+     },
+     "view-news-item": {
+      "ok_per_second": 2.0,
+      "failure_rate": 0.0,
+      "p95": 0.29378968477249146
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 812,
+    "ok_per_second": {
+     "median": 20.3,
+     "min": 20.3,
+     "max": 20.3,
+     "values": [
+      20.3
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 812,
+     "mean": 0.81486971713052,
+     "p50": 0.800525426864624,
+     "p95": 1.0738327264785765,
+     "p99": 1.203253479003906,
+     "max": 1.2527272701263428,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 95.20935960591133,
+    "server_cpu_ms_per_op": 0.061576354679802735,
+    "locust_cpu_share": 0.03965666564421734,
+    "server_write_kb_per_op": 0.014778325123152709,
+    "zope_busy": 4.112854016875065,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 1.55,
+      "failure_rate": 0.0,
+      "p95": 0.8394980549812316
+     },
+     "view-document": {
+      "ok_per_second": 4.075,
+      "failure_rate": 0.0,
+      "p95": 1.0721361637115479
+     },
+     "view-file": {
+      "ok_per_second": 1.475,
+      "failure_rate": 0.0,
+      "p95": 1.0103795528411865
+     },
+     "view-folder": {
+      "ok_per_second": 11.45,
+      "failure_rate": 0.0,
+      "p95": 1.1009617924690245
+     },
+     "view-news-item": {
+      "ok_per_second": 1.75,
+      "failure_rate": 0.0,
+      "p95": 1.0446400523185728
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   0
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "catalog|zeo": {
+  "scenario": "catalog",
+  "stack": "zeo",
+  "runs": [
+   "20261015T202900Z-catalog-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 357,
+    "ok_per_second": {
+     "median": 8.925,
+     "min": 8.925,
+     "max": 8.925,
+     "values": [
+      8.925
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 357,
+     "mean": 0.11320382807435107,
+     "p50": 0.1181328296661377,
+     "p95": 0.14822783470153805,
+     "p99": 0.16342396736145018,
+     "max": 0.185438871383667,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 105.74229691876751,
+    "server_cpu_ms_per_op": 0.02801120448179212,
+    "locust_cpu_share": 0.019697195364831502,
+    "server_write_kb_per_op": 0.011204481792717087,
+    "zope_busy": 0.988714624300053,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 1.65,
+      "failure_rate": 0.0,
+      "p95": 0.1583438515663147
+     },
+     "rest-search": {
+      "ok_per_second": 0.875,
+      "failure_rate": 0.0,
+      "p95": 0.029438352584838866
+     },
+     "search": {
+      "ok_per_second": 3.2,
+      "failure_rate": 0.0,
+      "p95": 0.1432667970657348
+     },
+     "search-filtered": {
+      "ok_per_second": 1.5,
+      "failure_rate": 0.0,
+      "p95": 0.14119994640350342
+     },
+     "search-page-2": {
+      "ok_per_second": 0.8,
+      "failure_rate": 0.0,
+      "p95": 0.14410153627395628
+     },
+     "search-subject": {
+      "ok_per_second": 0.9,
+      "failure_rate": 0.0,
+      "p95": 0.15397870540618896
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 702,
+    "ok_per_second": {
+     "median": 17.55,
+     "min": 17.55,
+     "max": 17.55,
+     "values": [
+      17.55
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 702,
+     "mean": 0.2302478915266162,
+     "p50": 0.2400674819946289,
+     "p95": 0.31208391189575196,
+     "p99": 0.3573662972450257,
+     "max": 0.4204237461090088,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 106.7094017094017,
+    "server_cpu_ms_per_op": 0.028490028490028515,
+    "locust_cpu_share": 0.03545351780173691,
+    "server_write_kb_per_op": 0.011396011396011397,
+    "zope_busy": 3.8774198612000874,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 2.7,
+      "failure_rate": 0.0,
+      "p95": 0.3243862986564636
+     },
+     "rest-search": {
+      "ok_per_second": 1.8,
+      "failure_rate": 0.0,
+      "p95": 0.07131041288375854
+     },
+     "search": {
+      "ok_per_second": 6.025,
+      "failure_rate": 0.0,
+      "p95": 0.3076045513153076
+     },
+     "search-filtered": {
+      "ok_per_second": 3.675,
+      "failure_rate": 0.0,
+      "p95": 0.3253467798233031
+     },
+     "search-page-2": {
+      "ok_per_second": 1.475,
+      "failure_rate": 0.0,
+      "p95": 0.28337421417236325
+     },
+     "search-subject": {
+      "ok_per_second": 1.875,
+      "failure_rate": 0.0,
+      "p95": 0.3124068260192871
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 722,
+    "ok_per_second": {
+     "median": 18.05,
+     "min": 18.05,
+     "max": 18.05,
+     "values": [
+      18.05
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 722,
+     "mean": 0.9049771885462415,
+     "p50": 0.915642499923706,
+     "p95": 1.1011486053466795,
+     "p99": 1.198298163414001,
+     "max": 1.3873772621154785,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 106.74515235457065,
+    "server_cpu_ms_per_op": 0.027700831024930775,
+    "locust_cpu_share": 0.0365869419639453,
+    "server_write_kb_per_op": 0.0110803324099723,
+    "zope_busy": 3.996466649050069,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 2.85,
+      "failure_rate": 0.0,
+      "p95": 1.1249109506607056
+     },
+     "rest-search": {
+      "ok_per_second": 2.025,
+      "failure_rate": 0.0,
+      "p95": 0.8862349987030029
+     },
+     "search": {
+      "ok_per_second": 6.225,
+      "failure_rate": 0.0,
+      "p95": 1.103878879547119
+     },
+     "search-filtered": {
+      "ok_per_second": 3.625,
+      "failure_rate": 0.0,
+      "p95": 1.1163879394531246
+     },
+     "search-page-2": {
+      "ok_per_second": 1.975,
+      "failure_rate": 0.0,
+      "p95": 1.0528021574020385
+     },
+     "search-subject": {
+      "ok_per_second": 1.35,
+      "failure_rate": 0.0,
+      "p95": 1.1296833038330076
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   2
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   0
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "catalog|zoe-native": {
+  "scenario": "catalog",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T203222Z-catalog-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 338,
+    "ok_per_second": {
+     "median": 8.45,
+     "min": 8.45,
+     "max": 8.45,
+     "values": [
+      8.45
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 338,
+     "mean": 0.11940166724504099,
+     "p50": 0.11929917335510254,
+     "p95": 0.17315584421157837,
+     "p99": 0.18758731603622436,
+     "max": 0.39476704597473145,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 111.83431952662718,
+    "server_cpu_ms_per_op": 0.029585798816568074,
+    "locust_cpu_share": 0.018934345494647408,
+    "server_write_kb_per_op": 0.0,
+    "zope_busy": 0.9874992855499954,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 1.5,
+      "failure_rate": 0.0,
+      "p95": 0.1649206757545471
+     },
+     "rest-search": {
+      "ok_per_second": 0.825,
+      "failure_rate": 0.0,
+      "p95": 0.03244881629943847
+     },
+     "search": {
+      "ok_per_second": 3.0,
+      "failure_rate": 0.0,
+      "p95": 0.17367160320281982
+     },
+     "search-filtered": {
+      "ok_per_second": 1.475,
+      "failure_rate": 0.0,
+      "p95": 0.176202917098999
+     },
+     "search-page-2": {
+      "ok_per_second": 0.775,
+      "failure_rate": 0.0,
+      "p95": 0.16984820365905762
+     },
+     "search-subject": {
+      "ok_per_second": 0.875,
+      "failure_rate": 0.0,
+      "p95": 0.15785360336303708
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 701,
+    "ok_per_second": {
+     "median": 17.525,
+     "min": 17.525,
+     "max": 17.525,
+     "values": [
+      17.525
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 701,
+     "mean": 0.22944782735957908,
+     "p50": 0.23638033866882324,
+     "p95": 0.3178584575653076,
+     "p99": 0.37596821784973145,
+     "max": 0.5123600959777832,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 109.885877318117,
+    "server_cpu_ms_per_op": 0.028530670470756088,
+    "locust_cpu_share": 0.03428257590099273,
+    "server_write_kb_per_op": 0.0,
+    "zope_busy": 3.852431013825094,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 2.625,
+      "failure_rate": 0.0,
+      "p95": 0.3452142715454101
+     },
+     "rest-search": {
+      "ok_per_second": 1.8,
+      "failure_rate": 0.0,
+      "p95": 0.05991407632827759
+     },
+     "search": {
+      "ok_per_second": 6.125,
+      "failure_rate": 0.0,
+      "p95": 0.313871955871582
+     },
+     "search-filtered": {
+      "ok_per_second": 3.7,
+      "failure_rate": 0.0,
+      "p95": 0.313012957572937
+     },
+     "search-page-2": {
+      "ok_per_second": 1.45,
+      "failure_rate": 0.0,
+      "p95": 0.32483826875686644
+     },
+     "search-subject": {
+      "ok_per_second": 1.825,
+      "failure_rate": 0.0,
+      "p95": 0.30301361083984374
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 717,
+    "ok_per_second": {
+     "median": 17.925,
+     "min": 17.925,
+     "max": 17.925,
+     "values": [
+      17.925
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 717,
+     "mean": 0.9077942141927935,
+     "p50": 0.9268016815185547,
+     "p95": 1.109675407409668,
+     "p99": 1.2327106189727786,
+     "max": 1.3129301071166992,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 107.39191073919109,
+    "server_cpu_ms_per_op": 0.0,
+    "locust_cpu_share": 0.03632973428992315,
+    "server_write_kb_per_op": 0.0,
+    "zope_busy": 3.996125789774999,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 2.875,
+      "failure_rate": 0.0,
+      "p95": 1.0978326320648193
+     },
+     "rest-search": {
+      "ok_per_second": 2.1,
+      "failure_rate": 0.0,
+      "p95": 0.9018530011177063
+     },
+     "search": {
+      "ok_per_second": 6.15,
+      "failure_rate": 0.0,
+      "p95": 1.107720136642456
+     },
+     "search-filtered": {
+      "ok_per_second": 3.625,
+      "failure_rate": 0.0,
+      "p95": 1.1065428256988523
+     },
+     "search-page-2": {
+      "ok_per_second": 1.925,
+      "failure_rate": 0.0,
+      "p95": 1.1637311935424806
+     },
+     "search-subject": {
+      "ok_per_second": 1.25,
+      "failure_rate": 0.0,
+      "p95": 1.109046745300293
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   0
+  ],
+  "server_conflicts_resolved": [
+   1
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "create-shared|zeo": {
+  "scenario": "create-shared",
+  "stack": "zeo",
+  "runs": [
+   "20261015T204925Z-create-shared-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 80,
+    "ok_per_second": {
+     "median": 2.0,
+     "min": 2.0,
+     "max": 2.0,
+     "values": [
+      2.0
+     ]
+    },
+    "writes_ok_per_second": 2.0,
+    "latency_ok": {
+     "count": 80,
+     "mean": 0.501561439037323,
+     "p50": 0.49748504161834717,
+     "p95": 0.638550341129303,
+     "p99": 0.6810903882980345,
+     "max": 0.7047348022460938,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 456.375,
+    "server_cpu_ms_per_op": 14.750000000000004,
+    "locust_cpu_share": 0.037863756010815,
+    "server_write_kb_per_op": 671.5,
+    "zope_busy": 0.9621400678500777,
+    "conflict_classes": {},
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.0,
+      "failure_rate": 0.0,
+      "p95": 0.638550341129303
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 90,
+    "ok_per_second": {
+     "median": 2.175,
+     "min": 2.175,
+     "max": 2.175,
+     "values": [
+      2.175
+     ]
+    },
+    "writes_ok_per_second": 2.175,
+    "latency_ok": {
+     "count": 87,
+     "mean": 1.5245793879717247,
+     "p50": 1.2216486930847168,
+     "p95": 3.7401986360549935,
+     "p99": 5.3812871122360235,
+     "max": 5.9274067878723145,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.03333333333333333,
+    "first_attempt_share": 0.6333333333333333,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.522222222222222,
+    "conflicts_per_1000_ops": 588.8888888888889,
+    "exhausted": 3,
+    "retried_seconds_share": 0.404736214874014,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 808.2758620689657,
+    "server_cpu_ms_per_op": 36.66666666666666,
+    "locust_cpu_share": 0.05961491961415577,
+    "server_write_kb_per_op": 914.8045977011494,
+    "zope_busy": 3.5990542655752735,
+    "conflict_classes": {
+     "Products.CMFUid.UniqueIdGeneratorTool.UniqueIdGeneratorTool": 53
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.175,
+      "failure_rate": 0.03333333333333333,
+      "p95": 3.7401986360549935
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 83,
+    "ok_per_second": {
+     "median": 2.05,
+     "min": 2.05,
+     "max": 2.05,
+     "values": [
+      2.05
+     ]
+    },
+    "writes_ok_per_second": 2.05,
+    "latency_ok": {
+     "count": 82,
+     "mean": 7.784396854842582,
+     "p50": 7.588115096092224,
+     "p95": 9.37290974855423,
+     "p99": 12.024042718410485,
+     "max": 14.59922981262207,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.012048192771084338,
+    "first_attempt_share": 0.7349397590361446,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.3855421686746987,
+    "conflicts_per_1000_ops": 409.6385542168675,
+    "exhausted": 1,
+    "retried_seconds_share": 0.24347301009955621,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 919.9999999999998,
+    "server_cpu_ms_per_op": 28.292682926829272,
+    "locust_cpu_share": 0.06422442286142821,
+    "server_write_kb_per_op": 841.8536585365854,
+    "zope_busy": 4.085858170350093,
+    "conflict_classes": {
+     "Products.CMFUid.UniqueIdGeneratorTool.UniqueIdGeneratorTool": 34
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.05,
+      "failure_rate": 0.012048192771084338,
+      "p95": 9.37290974855423
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   112
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   0
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "create-shared|zoe-native": {
+  "scenario": "create-shared",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T205253Z-create-shared-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 79,
+    "ok_per_second": {
+     "median": 1.975,
+     "min": 1.975,
+     "max": 1.975,
+     "values": [
+      1.975
+     ]
+    },
+    "writes_ok_per_second": 1.975,
+    "latency_ok": {
+     "count": 79,
+     "mean": 0.5054370179961,
+     "p50": 0.5232691764831543,
+     "p95": 0.6436267614364624,
+     "p99": 0.6671834897994995,
+     "max": 0.7132992744445801,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 457.34177215189874,
+    "server_cpu_ms_per_op": 16.32911392405063,
+    "locust_cpu_share": 0.03760331072117031,
+    "server_write_kb_per_op": 5121.822784810127,
+    "zope_busy": 0.9571339617749572,
+    "conflict_classes": {},
+    "kinds": {
+     "create": {
+      "ok_per_second": 1.975,
+      "failure_rate": 0.0,
+      "p95": 0.6436267614364624
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 96,
+    "ok_per_second": {
+     "median": 2.35,
+     "min": 2.35,
+     "max": 2.35,
+     "values": [
+      2.35
+     ]
+    },
+    "writes_ok_per_second": 2.35,
+    "latency_ok": {
+     "count": 94,
+     "mean": 1.492171028827099,
+     "p50": 1.3992671966552734,
+     "p95": 2.538266837596893,
+     "p99": 3.531044559478742,
+     "max": 5.97391939163208,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.020833333333333332,
+    "first_attempt_share": 0.6666666666666666,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.4583333333333335,
+    "conflicts_per_1000_ops": 500.0,
+    "exhausted": 2,
+    "retried_seconds_share": 0.3266922231916268,
+    "client_resolved": 763,
+    "zope_cpu_ms_per_op": 763.2978723404256,
+    "server_cpu_ms_per_op": 35.42553191489362,
+    "locust_cpu_share": 0.06241687228991474,
+    "server_write_kb_per_op": 2312.936170212766,
+    "zope_busy": 3.692745605524851,
+    "conflict_classes": {
+     "<read conflict>": 22,
+     "BTrees.IOBTree.IOBucket": 14,
+     "BTrees.OOBTree.OOBTree": 6,
+     "BTrees.IOBTree.IOBTree": 4,
+     "BTrees.OIBTree.OIBTree": 2
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.35,
+      "failure_rate": 0.020833333333333332,
+      "p95": 2.538266837596893
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 83,
+    "ok_per_second": {
+     "median": 2.075,
+     "min": 2.075,
+     "max": 2.075,
+     "values": [
+      2.075
+     ]
+    },
+    "writes_ok_per_second": 2.075,
+    "latency_ok": {
+     "count": 83,
+     "mean": 7.533951273883682,
+     "p50": 7.4676597118377686,
+     "p95": 9.241720271110534,
+     "p99": 10.626694464683515,
+     "max": 12.589545965194702,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 0.8313253012048193,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.2409638554216866,
+    "conflicts_per_1000_ops": 240.96385542168676,
+    "exhausted": 0,
+    "retried_seconds_share": 0.14094080867995548,
+    "client_resolved": 579,
+    "zope_cpu_ms_per_op": 903.3734939759036,
+    "server_cpu_ms_per_op": 29.75903614457832,
+    "locust_cpu_share": 0.07035086946725803,
+    "server_write_kb_per_op": 1909.5421686746988,
+    "zope_busy": 3.968091327224988,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 11,
+     "<read conflict>": 6,
+     "BTrees.OIBTree.OIBTree": 1,
+     "BTrees.OOBTree.OOBTree": 1,
+     "BTrees.IOBTree.IOBTree": 1
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.075,
+      "failure_rate": 0.0,
+      "p95": 9.241720271110534
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   36
+  ],
+  "server_conflicts_resolved": [
+   1
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "create-spread|zeo": {
+  "scenario": "create-spread",
+  "stack": "zeo",
+  "runs": [
+   "20261015T204231Z-create-spread-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 84,
+    "ok_per_second": {
+     "median": 2.1,
+     "min": 2.1,
+     "max": 2.1,
+     "values": [
+      2.1
+     ]
+    },
+    "writes_ok_per_second": 2.1,
+    "latency_ok": {
+     "count": 84,
+     "mean": 0.47564847128731863,
+     "p50": 0.4731999635696411,
+     "p95": 0.5764277100563049,
+     "p99": 0.5995278978347779,
+     "max": 0.6270298957824707,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 435.11904761904776,
+    "server_cpu_ms_per_op": 14.285714285714286,
+    "locust_cpu_share": 0.03505465817133324,
+    "server_write_kb_per_op": 641.1904761904761,
+    "zope_busy": 0.9607521111252026,
+    "conflict_classes": {},
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.1,
+      "failure_rate": 0.0,
+      "p95": 0.5764277100563049
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 106,
+    "ok_per_second": {
+     "median": 2.525,
+     "min": 2.525,
+     "max": 2.525,
+     "values": [
+      2.525
+     ]
+    },
+    "writes_ok_per_second": 2.525,
+    "latency_ok": {
+     "count": 101,
+     "mean": 1.2733450809327682,
+     "p50": 0.7218856811523438,
+     "p95": 4.469557285308838,
+     "p99": 5.360163927078247,
+     "max": 6.914819002151489,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.04716981132075472,
+    "first_attempt_share": 0.6415094339622641,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.5943396226415096,
+    "conflicts_per_1000_ops": 688.6792452830189,
+    "exhausted": 5,
+    "retried_seconds_share": 0.5888816979519266,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 655.049504950495,
+    "server_cpu_ms_per_op": 44.950495049504966,
+    "locust_cpu_share": 0.04810100395741641,
+    "server_write_kb_per_op": 1053.1089108910892,
+    "zope_busy": 3.763567662500054,
+    "conflict_classes": {
+     "Products.CMFUid.UniqueIdGeneratorTool.UniqueIdGeneratorTool": 73
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.525,
+      "failure_rate": 0.04716981132075472,
+      "p95": 4.469557285308838
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 134,
+    "ok_per_second": {
+     "median": 3.25,
+     "min": 3.25,
+     "max": 3.25,
+     "values": [
+      3.25
+     ]
+    },
+    "writes_ok_per_second": 3.25,
+    "latency_ok": {
+     "count": 130,
+     "mean": 4.887207044087924,
+     "p50": 4.457982063293457,
+     "p95": 6.924173402786255,
+     "p99": 9.926375124454484,
+     "max": 13.03519082069397,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.029850746268656716,
+    "first_attempt_share": 0.7686567164179104,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.4029850746268657,
+    "conflicts_per_1000_ops": 462.6865671641791,
+    "exhausted": 4,
+    "retried_seconds_share": 0.471010582839748,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 554.230769230769,
+    "server_cpu_ms_per_op": 28.461538461538467,
+    "locust_cpu_share": 0.05935927015925954,
+    "server_write_kb_per_op": 851.0153846153846,
+    "zope_busy": 4.159360339874934,
+    "conflict_classes": {
+     "Products.CMFUid.UniqueIdGeneratorTool.UniqueIdGeneratorTool": 62
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 3.25,
+      "failure_rate": 0.029850746268656716,
+      "p95": 6.924173402786255
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   162
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   0
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "create-spread|zoe-native": {
+  "scenario": "create-spread",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T204600Z-create-spread-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 81,
+    "ok_per_second": {
+     "median": 2.025,
+     "min": 2.025,
+     "max": 2.025,
+     "values": [
+      2.025
+     ]
+    },
+    "writes_ok_per_second": 2.025,
+    "latency_ok": {
+     "count": 81,
+     "mean": 0.4927406664247866,
+     "p50": 0.4854261875152588,
+     "p95": 0.6097166538238525,
+     "p99": 0.6567088127136231,
+     "max": 0.6669707298278809,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 447.4074074074075,
+    "server_cpu_ms_per_op": 16.419753086419757,
+    "locust_cpu_share": 0.036838734078683946,
+    "server_write_kb_per_op": 5218.518518518518,
+    "zope_busy": 0.9587165828749221,
+    "conflict_classes": {},
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.025,
+      "failure_rate": 0.0,
+      "p95": 0.6097166538238525
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 117,
+    "ok_per_second": {
+     "median": 2.775,
+     "min": 2.775,
+     "max": 2.775,
+     "values": [
+      2.775
+     ]
+    },
+    "writes_ok_per_second": 2.775,
+    "latency_ok": {
+     "count": 111,
+     "mean": 1.099975686889511,
+     "p50": 0.632861852645874,
+     "p95": 3.229833245277405,
+     "p99": 5.866368341445931,
+     "max": 7.8598527908325195,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.05128205128205128,
+    "first_attempt_share": 0.6581196581196581,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.52991452991453,
+    "conflicts_per_1000_ops": 632.4786324786324,
+    "exhausted": 6,
+    "retried_seconds_share": 0.5732474096451408,
+    "client_resolved": 1753,
+    "zope_cpu_ms_per_op": 579.7297297297299,
+    "server_cpu_ms_per_op": 40.54054054054054,
+    "locust_cpu_share": 0.051675755059396936,
+    "server_write_kb_per_op": 2571.5675675675675,
+    "zope_busy": 3.7367427276749483,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 34,
+     "<read conflict>": 23,
+     "BTrees.OOBTree.OOBTree": 9,
+     "BTrees.IOBTree.IOBTree": 5,
+     "BTrees.OIBTree.OIBTree": 3
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 2.775,
+      "failure_rate": 0.05128205128205128,
+      "p95": 3.229833245277405
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 133,
+    "ok_per_second": {
+     "median": 3.25,
+     "min": 3.25,
+     "max": 3.25,
+     "values": [
+      3.25
+     ]
+    },
+    "writes_ok_per_second": 3.25,
+    "latency_ok": {
+     "count": 130,
+     "mean": 4.875415345338674,
+     "p50": 4.396634578704834,
+     "p95": 7.880527019500732,
+     "p99": 8.974092888832093,
+     "max": 9.852137565612793,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.022556390977443608,
+    "first_attempt_share": 0.7744360902255639,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.345864661654135,
+    "conflicts_per_1000_ops": 390.97744360902254,
+    "exhausted": 3,
+    "retried_seconds_share": 0.3724690843787777,
+    "client_resolved": 1460,
+    "zope_cpu_ms_per_op": 537.7692307692308,
+    "server_cpu_ms_per_op": 29.15384615384615,
+    "locust_cpu_share": 0.05935203844350088,
+    "server_write_kb_per_op": 1729.5076923076922,
+    "zope_busy": 4.1133231525249805,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 31,
+     "<read conflict>": 17,
+     "BTrees.OOBTree.OOBTree": 3,
+     "BTrees.IOBTree.IOBTree": 1
+    },
+    "kinds": {
+     "create": {
+      "ok_per_second": 3.25,
+      "failure_rate": 0.022556390977443608,
+      "p95": 7.880527019500732
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   49
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "edit|zeo": {
+  "scenario": "edit",
+  "stack": "zeo",
+  "runs": [
+   "20261015T203543Z-edit-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 87,
+    "ok_per_second": {
+     "median": 2.175,
+     "min": 2.175,
+     "max": 2.175,
+     "values": [
+      2.175
+     ]
+    },
+    "writes_ok_per_second": 2.175,
+    "latency_ok": {
+     "count": 87,
+     "mean": 0.45451031882187415,
+     "p50": 0.4490997791290283,
+     "p95": 0.5587545871734619,
+     "p99": 0.5954147100448609,
+     "max": 0.640204668045044,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 420.11494252873547,
+    "server_cpu_ms_per_op": 8.390804597701148,
+    "locust_cpu_share": 0.038121165691651526,
+    "server_write_kb_per_op": 332.5977011494253,
+    "zope_busy": 0.9475065138749528,
+    "conflict_classes": {},
+    "kinds": {
+     "edit": {
+      "ok_per_second": 2.175,
+      "failure_rate": 0.0,
+      "p95": 0.5587545871734619
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 138,
+    "ok_per_second": {
+     "median": 3.325,
+     "min": 3.325,
+     "max": 3.325,
+     "values": [
+      3.325
+     ]
+    },
+    "writes_ok_per_second": 3.325,
+    "latency_ok": {
+     "count": 133,
+     "mean": 0.9781663812192759,
+     "p50": 0.7180383205413818,
+     "p95": 2.0620125293731686,
+     "p99": 3.887566766738895,
+     "max": 5.19136381149292,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.036231884057971016,
+    "first_attempt_share": 0.6521739130434783,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.449275362318841,
+    "conflicts_per_1000_ops": 521.7391304347826,
+    "exhausted": 5,
+    "retried_seconds_share": 0.46626205595280534,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 511.8045112781954,
+    "server_cpu_ms_per_op": 19.022556390977442,
+    "locust_cpu_share": 0.05885827876606866,
+    "server_write_kb_per_op": 461.38345864661653,
+    "zope_busy": 3.774615206524845,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 67,
+     "BTrees.IOBTree.IOBTree": 3,
+     "BTrees.OOBTree.OOBTree": 2
+    },
+    "kinds": {
+     "edit": {
+      "ok_per_second": 3.325,
+      "failure_rate": 0.036231884057971016,
+      "p95": 2.0620125293731686
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 166,
+    "ok_per_second": {
+     "median": 3.45,
+     "min": 3.45,
+     "max": 3.45,
+     "values": [
+      3.45
+     ]
+    },
+    "writes_ok_per_second": 3.45,
+    "latency_ok": {
+     "count": 138,
+     "mean": 4.2101176078768745,
+     "p50": 4.017334461212158,
+     "p95": 5.842509305477142,
+     "p99": 7.179981951713561,
+     "max": 8.617921113967896,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.1686746987951807,
+    "first_attempt_share": 0.6024096385542169,
+    "requests_per_op": 1.8433734939759037,
+    "server_attempts_per_op": 3.180722891566265,
+    "conflicts_per_1000_ops": 361.4457831325301,
+    "exhausted": 2,
+    "retried_seconds_share": 0.35724979089134573,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 531.9565217391305,
+    "server_cpu_ms_per_op": 18.550724637681157,
+    "locust_cpu_share": 0.06934061910146323,
+    "server_write_kb_per_op": 426.60869565217394,
+    "zope_busy": 4.0728613921500365,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 58,
+     "BTrees.OOBTree.OOBTree": 1,
+     "BTrees.IOBTree.IOBTree": 1
+    },
+    "kinds": {
+     "edit": {
+      "ok_per_second": 3.45,
+      "failure_rate": 0.1686746987951807,
+      "p95": 5.842509305477142
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   160
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   2588
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "edit|zoe-native": {
+  "scenario": "edit",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T203907Z-edit-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 87,
+    "ok_per_second": {
+     "median": 2.175,
+     "min": 2.175,
+     "max": 2.175,
+     "values": [
+      2.175
+     ]
+    },
+    "writes_ok_per_second": 2.175,
+    "latency_ok": {
+     "count": 87,
+     "mean": 0.4604707230096576,
+     "p50": 0.4553093910217285,
+     "p95": 0.5663820981979371,
+     "p99": 0.6395515441894531,
+     "max": 0.6515238285064697,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 417.5862068965517,
+    "server_cpu_ms_per_op": 9.195402298850572,
+    "locust_cpu_share": 0.03812222561038302,
+    "server_write_kb_per_op": 4299.816091954023,
+    "zope_busy": 0.9607973055750108,
+    "conflict_classes": {},
+    "kinds": {
+     "edit": {
+      "ok_per_second": 2.175,
+      "failure_rate": 0.0,
+      "p95": 0.5663820981979371
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 138,
+    "ok_per_second": {
+     "median": 3.4,
+     "min": 3.4,
+     "max": 3.4,
+     "values": [
+      3.4
+     ]
+    },
+    "writes_ok_per_second": 3.4,
+    "latency_ok": {
+     "count": 136,
+     "mean": 1.077556138529497,
+     "p50": 0.745752215385437,
+     "p95": 3.357196569442749,
+     "p99": 4.957242274284364,
+     "max": 6.4202721118927,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.014492753623188406,
+    "first_attempt_share": 0.6739130434782609,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 3.449275362318841,
+    "conflicts_per_1000_ops": 478.2608695652174,
+    "exhausted": 2,
+    "retried_seconds_share": 0.4524234444265008,
+    "client_resolved": 967,
+    "zope_cpu_ms_per_op": 496.9852941176471,
+    "server_cpu_ms_per_op": 19.77941176470588,
+    "locust_cpu_share": 0.06293956427702035,
+    "server_write_kb_per_op": 2660.8529411764707,
+    "zope_busy": 3.8208723269000417,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 56,
+     "<read conflict>": 8,
+     "BTrees.IOBTree.IOBTree": 2
+    },
+    "kinds": {
+     "edit": {
+      "ok_per_second": 3.4,
+      "failure_rate": 0.014492753623188406,
+      "p95": 3.357196569442749
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 177,
+    "ok_per_second": {
+     "median": 3.75,
+     "min": 3.75,
+     "max": 3.75,
+     "values": [
+      3.75
+     ]
+    },
+    "writes_ok_per_second": 3.75,
+    "latency_ok": {
+     "count": 150,
+     "mean": 3.988982140223185,
+     "p50": 3.7187503576278687,
+     "p95": 5.977297484874724,
+     "p99": 6.924793477058407,
+     "max": 7.52730655670166,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.15254237288135594,
+    "first_attempt_share": 0.6440677966101694,
+    "requests_per_op": 1.847457627118644,
+    "server_attempts_per_op": 3.169491525423729,
+    "conflicts_per_1000_ops": 322.03389830508473,
+    "exhausted": 0,
+    "retried_seconds_share": 0.34528557065414306,
+    "client_resolved": 802,
+    "zope_cpu_ms_per_op": 472.99999999999994,
+    "server_cpu_ms_per_op": 18.4,
+    "locust_cpu_share": 0.07112045208837921,
+    "server_write_kb_per_op": 2233.52,
+    "zope_busy": 4.0903347246001776,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 48,
+     "<read conflict>": 7,
+     "BTrees.IOBTree.IOBTree": 2
+    },
+    "kinds": {
+     "edit": {
+      "ok_per_second": 3.75,
+      "failure_rate": 0.15254237288135594,
+      "p95": 5.977297484874724
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   17
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "mixed|zeo": {
+  "scenario": "mixed",
+  "stack": "zeo",
+  "runs": [
+   "20261015T210301Z-mixed-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 437,
+    "ok_per_second": {
+     "median": 10.925,
+     "min": 10.925,
+     "max": 10.925,
+     "values": [
+      10.925
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 437,
+     "mean": 0.09237282990863721,
+     "p50": 0.09272623062133789,
+     "p95": 0.12224607467651367,
+     "p99": 0.1360089111328125,
+     "max": 0.3241291046142578,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 86.29290617848969,
+    "server_cpu_ms_per_op": 0.11441647597254066,
+    "locust_cpu_share": 0.023285436421918142,
+    "server_write_kb_per_op": 0.04576659038901602,
+    "zope_busy": 0.9836293295750238,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.010920047760009766
+     },
+     "view-document": {
+      "ok_per_second": 2.375,
+      "failure_rate": 0.0,
+      "p95": 0.12322852611541747
+     },
+     "view-file": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 0.11953997611999512
+     },
+     "view-folder": {
+      "ok_per_second": 6.6,
+      "failure_rate": 0.0,
+      "p95": 0.12147880792617798
+     },
+     "view-news-item": {
+      "ok_per_second": 0.9,
+      "failure_rate": 0.0,
+      "p95": 0.12803047895431519
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 786,
+    "ok_per_second": {
+     "median": 19.65,
+     "min": 19.65,
+     "max": 19.65,
+     "values": [
+      19.65
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 786,
+     "mean": 0.20501757123088107,
+     "p50": 0.21151304244995117,
+     "p95": 0.2812016010284424,
+     "p99": 0.3203642725944519,
+     "max": 0.43204522132873535,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 98.2442748091603,
+    "server_cpu_ms_per_op": 0.11450381679389295,
+    "locust_cpu_share": 0.039662569675648275,
+    "server_write_kb_per_op": 0.06615776081424936,
+    "zope_busy": 3.878398260750123,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 0.8,
+      "failure_rate": 0.0,
+      "p95": 0.30858665704727173
+     },
+     "download-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.03680640459060667
+     },
+     "rest-search": {
+      "ok_per_second": 0.4,
+      "failure_rate": 0.0,
+      "p95": 0.07412678003311157
+     },
+     "search": {
+      "ok_per_second": 1.3,
+      "failure_rate": 0.0,
+      "p95": 0.2769423246383667
+     },
+     "search-filtered": {
+      "ok_per_second": 1.175,
+      "failure_rate": 0.0,
+      "p95": 0.2686545610427856
+     },
+     "search-page-2": {
+      "ok_per_second": 0.55,
+      "failure_rate": 0.0,
+      "p95": 0.25281176567077634
+     },
+     "search-subject": {
+      "ok_per_second": 0.475,
+      "failure_rate": 0.0,
+      "p95": 0.2414357185363769
+     },
+     "view-document": {
+      "ok_per_second": 2.8,
+      "failure_rate": 0.0,
+      "p95": 0.2677059292793274
+     },
+     "view-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.2532265067100525
+     },
+     "view-folder": {
+      "ok_per_second": 8.55,
+      "failure_rate": 0.0,
+      "p95": 0.29119050502777094
+     },
+     "view-news-item": {
+      "ok_per_second": 1.5,
+      "failure_rate": 0.0,
+      "p95": 0.25315495729446413
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 524,
+    "ok_per_second": {
+     "median": 13.1,
+     "min": 13.1,
+     "max": 13.1,
+     "values": [
+      13.1
+     ]
+    },
+    "writes_ok_per_second": 1.45,
+    "latency_ok": {
+     "count": 524,
+     "mean": 1.2430728091538408,
+     "p50": 1.0104777812957764,
+     "p95": 3.225615799427032,
+     "p99": 4.053998832702637,
+     "max": 6.051422834396362,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 0.9847328244274809,
+    "requests_per_op": 1.1106870229007633,
+    "server_attempts_per_op": 1.2442748091603053,
+    "conflicts_per_1000_ops": 19.083969465648856,
+    "exhausted": 0,
+    "retried_seconds_share": 0.08051414778915421,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 146.92748091603053,
+    "server_cpu_ms_per_op": 2.9961832061068696,
+    "locust_cpu_share": 0.04989531941911814,
+    "server_write_kb_per_op": 51.55725190839695,
+    "zope_busy": 4.049670528450088,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 6,
+     "Products.CMFUid.UniqueIdGeneratorTool.UniqueIdGeneratorTool": 2,
+     "BTrees.IOBTree.IOBTree": 1,
+     "BTrees.OOBTree.OOBTree": 1
+    },
+    "kinds": {
+     "collection": {
+      "ok_per_second": 0.375,
+      "failure_rate": 0.0,
+      "p95": 1.194983696937561
+     },
+     "create": {
+      "ok_per_second": 0.575,
+      "failure_rate": 0.0,
+      "p95": 4.612654328346252
+     },
+     "download-file": {
+      "ok_per_second": 0.6,
+      "failure_rate": 0.0,
+      "p95": 1.088463234901428
+     },
+     "edit": {
+      "ok_per_second": 0.6,
+      "failure_rate": 0.0,
+      "p95": 4.018696522712707
+     },
+     "rest-search": {
+      "ok_per_second": 0.3,
+      "failure_rate": 0.0,
+      "p95": 1.1270381212234497
+     },
+     "search": {
+      "ok_per_second": 1.225,
+      "failure_rate": 0.0,
+      "p95": 1.358900260925293
+     },
+     "search-filtered": {
+      "ok_per_second": 0.525,
+      "failure_rate": 0.0,
+      "p95": 1.3604063987731934
+     },
+     "search-page-2": {
+      "ok_per_second": 0.325,
+      "failure_rate": 0.0,
+      "p95": 1.1302904605865478
+     },
+     "search-subject": {
+      "ok_per_second": 0.25,
+      "failure_rate": 0.0,
+      "p95": 1.3141269922256469
+     },
+     "view-document": {
+      "ok_per_second": 1.775,
+      "failure_rate": 0.0,
+      "p95": 1.312382459640503
+     },
+     "view-file": {
+      "ok_per_second": 0.575,
+      "failure_rate": 0.0,
+      "p95": 1.3105121612548827
+     },
+     "view-folder": {
+      "ok_per_second": 4.875,
+      "failure_rate": 0.0,
+      "p95": 1.282939052581787
+     },
+     "view-news-item": {
+      "ok_per_second": 0.675,
+      "failure_rate": 0.0,
+      "p95": 1.123416495323181
+     },
+     "visibility": {
+      "ok_per_second": 0.15,
+      "failure_rate": 0.0,
+      "p95": 1.780985414981842
+     },
+     "workflow": {
+      "ok_per_second": 0.275,
+      "failure_rate": 0.0,
+      "p95": 3.3061766624450684
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   16
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   161
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "mixed|zoe-native": {
+  "scenario": "mixed",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T210625Z-mixed-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 407,
+    "ok_per_second": {
+     "median": 10.175,
+     "min": 10.175,
+     "max": 10.175,
+     "values": [
+      10.175
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 407,
+     "mean": 0.09919934542231829,
+     "p50": 0.09608721733093262,
+     "p95": 0.14248390197753905,
+     "p99": 0.15583398342132568,
+     "max": 0.3034036159515381,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 92.0884520884521,
+    "server_cpu_ms_per_op": 0.0982800982800981,
+    "locust_cpu_share": 0.022257986597695765,
+    "server_write_kb_per_op": 0.03931203931203931,
+    "zope_busy": 0.9793494285001316,
+    "conflict_classes": {},
+    "kinds": {
+     "download-file": {
+      "ok_per_second": 0.5,
+      "failure_rate": 0.0,
+      "p95": 0.01374268531799317
+     },
+     "view-document": {
+      "ok_per_second": 2.2,
+      "failure_rate": 0.0,
+      "p95": 0.13591114282608033
+     },
+     "view-file": {
+      "ok_per_second": 0.5,
+      "failure_rate": 0.0,
+      "p95": 0.13254644870758056
+     },
+     "view-folder": {
+      "ok_per_second": 6.125,
+      "failure_rate": 0.0,
+      "p95": 0.14686446189880364
+     },
+     "view-news-item": {
+      "ok_per_second": 0.85,
+      "failure_rate": 0.0,
+      "p95": 0.12187914848327636
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 772,
+    "ok_per_second": {
+     "median": 19.3,
+     "min": 19.3,
+     "max": 19.3,
+     "values": [
+      19.3
+     ]
+    },
+    "writes_ok_per_second": 0.0,
+    "latency_ok": {
+     "count": 772,
+     "mean": 0.20886719041537744,
+     "p50": 0.21155381202697754,
+     "p95": 0.30158752202987665,
+     "p99": 0.36693598270416244,
+     "max": 0.4541945457458496,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.0,
+    "server_attempts_per_op": 1.0,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 99.92227979274612,
+    "server_cpu_ms_per_op": 0.11658031088082912,
+    "locust_cpu_share": 0.04068031310309008,
+    "server_write_kb_per_op": 0.04145077720207254,
+    "zope_busy": 3.8784663648251128,
+    "conflict_classes": {},
+    "kinds": {
+     "collection": {
+      "ok_per_second": 0.8,
+      "failure_rate": 0.0,
+      "p95": 0.36557717323303224
+     },
+     "download-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.029752194881439195
+     },
+     "rest-search": {
+      "ok_per_second": 0.4,
+      "failure_rate": 0.0,
+      "p95": 0.07426351308822632
+     },
+     "search": {
+      "ok_per_second": 1.25,
+      "failure_rate": 0.0,
+      "p95": 0.27024589776992797
+     },
+     "search-filtered": {
+      "ok_per_second": 1.175,
+      "failure_rate": 0.0,
+      "p95": 0.2920740127563476
+     },
+     "search-page-2": {
+      "ok_per_second": 0.55,
+      "failure_rate": 0.0,
+      "p95": 0.25548624992370605
+     },
+     "search-subject": {
+      "ok_per_second": 0.475,
+      "failure_rate": 0.0,
+      "p95": 0.25986902713775634
+     },
+     "view-document": {
+      "ok_per_second": 2.725,
+      "failure_rate": 0.0,
+      "p95": 0.2983372688293457
+     },
+     "view-file": {
+      "ok_per_second": 1.05,
+      "failure_rate": 0.0,
+      "p95": 0.2715210080146789
+     },
+     "view-folder": {
+      "ok_per_second": 8.375,
+      "failure_rate": 0.0,
+      "p95": 0.30813705921173096
+     },
+     "view-news-item": {
+      "ok_per_second": 1.45,
+      "failure_rate": 0.0,
+      "p95": 0.3197183489799499
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 571,
+    "ok_per_second": {
+     "median": 14.275,
+     "min": 14.275,
+     "max": 14.275,
+     "values": [
+      14.275
+     ]
+    },
+    "writes_ok_per_second": 1.625,
+    "latency_ok": {
+     "count": 571,
+     "mean": 1.1576044538601475,
+     "p50": 0.9312772750854492,
+     "p95": 3.1019731760025024,
+     "p99": 3.549761891365048,
+     "max": 3.9931983947753906,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 0.9807355516637478,
+    "requests_per_op": 1.1138353765323994,
+    "server_attempts_per_op": 1.2504378283712785,
+    "conflicts_per_1000_ops": 19.26444833625219,
+    "exhausted": 0,
+    "retried_seconds_share": 0.06000504028446913,
+    "client_resolved": 281,
+    "zope_cpu_ms_per_op": 135.32399299474608,
+    "server_cpu_ms_per_op": 2.9772329246935203,
+    "locust_cpu_share": 0.0519339893230078,
+    "server_write_kb_per_op": 544.7915936952714,
+    "zope_busy": 4.112243595375299,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBucket": 9,
+     "<read conflict>": 2
+    },
+    "kinds": {
+     "collection": {
+      "ok_per_second": 0.4,
+      "failure_rate": 0.0,
+      "p95": 1.0421860814094543
+     },
+     "create": {
+      "ok_per_second": 0.675,
+      "failure_rate": 0.0,
+      "p95": 3.414940667152405
+     },
+     "download-file": {
+      "ok_per_second": 0.65,
+      "failure_rate": 0.0,
+      "p95": 0.8962622284889221
+     },
+     "edit": {
+      "ok_per_second": 0.65,
+      "failure_rate": 0.0,
+      "p95": 3.9589970111846924
+     },
+     "rest-search": {
+      "ok_per_second": 0.325,
+      "failure_rate": 0.0,
+      "p95": 1.063590908050537
+     },
+     "search": {
+      "ok_per_second": 1.325,
+      "failure_rate": 0.0,
+      "p95": 1.1881653308868407
+     },
+     "search-filtered": {
+      "ok_per_second": 0.625,
+      "failure_rate": 0.0,
+      "p95": 1.0949667930603026
+     },
+     "search-page-2": {
+      "ok_per_second": 0.35,
+      "failure_rate": 0.0,
+      "p95": 1.1548286080360413
+     },
+     "search-subject": {
+      "ok_per_second": 0.275,
+      "failure_rate": 0.0,
+      "p95": 1.069339394569397
+     },
+     "view-document": {
+      "ok_per_second": 2.0,
+      "failure_rate": 0.0,
+      "p95": 1.1839529156684874
+     },
+     "view-file": {
+      "ok_per_second": 0.65,
+      "failure_rate": 0.0,
+      "p95": 1.1440452337265015
+     },
+     "view-folder": {
+      "ok_per_second": 5.275,
+      "failure_rate": 0.0,
+      "p95": 1.1751904487609863
+     },
+     "view-news-item": {
+      "ok_per_second": 0.625,
+      "failure_rate": 0.0,
+      "p95": 1.1785096645355224
+     },
+     "visibility": {
+      "ok_per_second": 0.15,
+      "failure_rate": 0.0,
+      "p95": 1.8812068104743958
+     },
+     "workflow": {
+      "ok_per_second": 0.3,
+      "failure_rate": 0.0,
+      "p95": 3.274858522415161
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   2
+  ],
+  "server_conflicts_resolved": [
+   84
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ },
+ "workflow|zeo": {
+  "scenario": "workflow",
+  "stack": "zeo",
+  "runs": [
+   "20261015T205618Z-workflow-zeo-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 152,
+    "ok_per_second": {
+     "median": 3.8,
+     "min": 3.8,
+     "max": 3.8,
+     "values": [
+      3.8
+     ]
+    },
+    "writes_ok_per_second": 2.35,
+    "latency_ok": {
+     "count": 152,
+     "mean": 0.2633895623056512,
+     "p50": 0.3284677267074585,
+     "p95": 0.4501212239265442,
+     "p99": 0.4808286142349246,
+     "max": 0.5921368598937988,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.618421052631579,
+    "server_attempts_per_op": 2.5789473684210527,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 241.71052631578948,
+    "server_cpu_ms_per_op": 1.8421052631578965,
+    "locust_cpu_share": 0.040170960018359035,
+    "server_write_kb_per_op": 36.71052631578947,
+    "zope_busy": 0.9565812348499094,
+    "conflict_classes": {},
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 1.45,
+      "failure_rate": 0.0,
+      "p95": 0.10515562295913697
+     },
+     "workflow": {
+      "ok_per_second": 2.35,
+      "failure_rate": 0.0,
+      "p95": 0.4552688717842102
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 285,
+    "ok_per_second": {
+     "median": 7.125,
+     "min": 7.125,
+     "max": 7.125,
+     "values": [
+      7.125
+     ]
+    },
+    "writes_ok_per_second": 4.775,
+    "latency_ok": {
+     "count": 285,
+     "mean": 0.5587935522982949,
+     "p50": 0.6845266819000244,
+     "p95": 0.904075288772583,
+     "p99": 0.9808395004272464,
+     "max": 1.0187582969665527,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.6701754385964913,
+    "server_attempts_per_op": 2.705263157894737,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 269.0877192982456,
+    "server_cpu_ms_per_op": 3.6491228070175437,
+    "locust_cpu_share": 0.07880941301811333,
+    "server_write_kb_per_op": 40.22456140350877,
+    "zope_busy": 3.8023843575250567,
+    "conflict_classes": {},
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 2.35,
+      "failure_rate": 0.0,
+      "p95": 0.2196366310119629
+     },
+     "workflow": {
+      "ok_per_second": 4.775,
+      "failure_rate": 0.0,
+      "p95": 0.9198888540267944
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 297,
+    "ok_per_second": {
+     "median": 7.425,
+     "min": 7.425,
+     "max": 7.425,
+     "values": [
+      7.425
+     ]
+    },
+    "writes_ok_per_second": 4.975,
+    "latency_ok": {
+     "count": 297,
+     "mean": 2.2189931042667994,
+     "p50": 2.4616806507110596,
+     "p95": 2.9882537841796872,
+     "p99": 3.23388394355774,
+     "max": 3.4171524047851562,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 0.9966329966329966,
+    "requests_per_op": 1.67003367003367,
+    "server_attempts_per_op": 2.68013468013468,
+    "conflicts_per_1000_ops": 3.367003367003367,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0032501273392436317,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 259.66329966329965,
+    "server_cpu_ms_per_op": 3.468013468013469,
+    "locust_cpu_share": 0.08188298223503925,
+    "server_write_kb_per_op": 41.804713804713806,
+    "zope_busy": 4.08048912880065,
+    "conflict_classes": {
+     "<read conflict>": 1
+    },
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 2.45,
+      "failure_rate": 0.0,
+      "p95": 2.3614269018173215
+     },
+     "workflow": {
+      "ok_per_second": 4.975,
+      "failure_rate": 0.0,
+      "p95": 3.0656970739364624
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   5
+  ],
+  "server_conflicts_resolved": [
+   0
+  ],
+  "zeoserver_resolved": [
+   1266
+  ],
+  "fsync_batch_mean": [
+   null
+  ]
+ },
+ "workflow|zoe-native": {
+  "scenario": "workflow",
+  "stack": "zoe-native",
+  "runs": [
+   "20261015T205941Z-workflow-zoe-native-r0"
+  ],
+  "steps": [
+   {
+    "step": 0,
+    "users": 1,
+    "repetitions": 1,
+    "operations": 156,
+    "ok_per_second": {
+     "median": 3.9,
+     "min": 3.9,
+     "max": 3.9,
+     "values": [
+      3.9
+     ]
+    },
+    "writes_ok_per_second": 2.45,
+    "latency_ok": {
+     "count": 156,
+     "mean": 0.2591116703473605,
+     "p50": 0.3131992816925049,
+     "p95": 0.4374697208404541,
+     "p99": 0.46670829057693475,
+     "max": 0.5096235275268555,
+     "p99_reliable": false
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.6282051282051282,
+    "server_attempts_per_op": 2.58974358974359,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 0,
+    "zope_cpu_ms_per_op": 234.551282051282,
+    "server_cpu_ms_per_op": 1.8589743589743586,
+    "locust_cpu_share": 0.04221135352668898,
+    "server_write_kb_per_op": 1079.2820512820513,
+    "zope_busy": 0.9636650824999379,
+    "conflict_classes": {},
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 1.45,
+      "failure_rate": 0.0,
+      "p95": 0.11539236307144164
+     },
+     "workflow": {
+      "ok_per_second": 2.45,
+      "failure_rate": 0.0,
+      "p95": 0.4512226223945618
+     }
+    }
+   },
+   {
+    "step": 1,
+    "users": 4,
+    "repetitions": 1,
+    "operations": 290,
+    "ok_per_second": {
+     "median": 7.25,
+     "min": 7.25,
+     "max": 7.25,
+     "values": [
+      7.25
+     ]
+    },
+    "writes_ok_per_second": 4.85,
+    "latency_ok": {
+     "count": 290,
+     "mean": 0.5528660354943111,
+     "p50": 0.6815519332885742,
+     "p95": 0.9208345651626588,
+     "p99": 1.0176914024353032,
+     "max": 1.8965578079223633,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 0.996551724137931,
+    "requests_per_op": 1.6689655172413793,
+    "server_attempts_per_op": 2.706896551724138,
+    "conflicts_per_1000_ops": 3.4482758620689653,
+    "exhausted": 0,
+    "retried_seconds_share": 0.007129179611520461,
+    "client_resolved": 635,
+    "zope_cpu_ms_per_op": 264.6896551724139,
+    "server_cpu_ms_per_op": 3.7586206896551735,
+    "locust_cpu_share": 0.08052520096548149,
+    "server_write_kb_per_op": 861.8482758620689,
+    "zope_busy": 3.821664677374952,
+    "conflict_classes": {
+     "BTrees.IOBTree.IOBTree": 1
+    },
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 2.4,
+      "failure_rate": 0.0,
+      "p95": 0.25292837619781494
+     },
+     "workflow": {
+      "ok_per_second": 4.85,
+      "failure_rate": 0.0,
+      "p95": 0.9538477778434753
+     }
+    }
+   },
+   {
+    "step": 2,
+    "users": 16,
+    "repetitions": 1,
+    "operations": 292,
+    "ok_per_second": {
+     "median": 7.3,
+     "min": 7.3,
+     "max": 7.3,
+     "values": [
+      7.3
+     ]
+    },
+    "writes_ok_per_second": 4.975,
+    "latency_ok": {
+     "count": 292,
+     "mean": 2.238570759557698,
+     "p50": 2.4841160774230957,
+     "p95": 3.0546071887016293,
+     "p99": 3.285841302871704,
+     "max": 3.3720033168792725,
+     "p99_reliable": true
+    },
+    "failure_rate": 0.0,
+    "first_attempt_share": 1.0,
+    "requests_per_op": 1.6815068493150684,
+    "server_attempts_per_op": 2.684931506849315,
+    "conflicts_per_1000_ops": 0.0,
+    "exhausted": 0,
+    "retried_seconds_share": 0.0,
+    "client_resolved": 641,
+    "zope_cpu_ms_per_op": 263.52739726027403,
+    "server_cpu_ms_per_op": 3.7328767123287667,
+    "locust_cpu_share": 0.08110390346457198,
+    "server_write_kb_per_op": 936.2465753424658,
+    "zope_busy": 4.050912345725169,
+    "conflict_classes": {},
+    "kinds": {
+     "visibility": {
+      "ok_per_second": 2.325,
+      "failure_rate": 0.0,
+      "p95": 2.3871288299560547
+     },
+     "workflow": {
+      "ok_per_second": 4.975,
+      "failure_rate": 0.0,
+      "p95": 3.134751224517822
+     }
+    }
+   }
+  ],
+  "verification": [
+   "pass"
+  ],
+  "violations": [
+   0
+  ],
+  "server_conflicts": [
+   0
+  ],
+  "server_conflicts_resolved": [
+   1395
+  ],
+  "zeoserver_resolved": [
+   null
+  ],
+  "fsync_batch_mean": [
+   1.0
+  ]
+ }
+}
