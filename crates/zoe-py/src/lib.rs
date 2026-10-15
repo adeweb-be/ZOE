@@ -10,8 +10,13 @@
 //!
 //! The open of a store installs the handlers of SIGTERM and SIGHUP that
 //! close the stores of the process (`signals`).
+//!
+//! `Client` is the native client of `zoe.zeo.ClientStorage` (`client`).
+//! Its tokio runtime starts when the first client opens, never at the
+//! import of the module.
 
 mod cli;
+mod client;
 mod errors;
 mod publish;
 mod sequence;
@@ -25,6 +30,8 @@ mod _zoe {
 
     #[pymodule_export]
     use crate::cli::main;
+    #[pymodule_export]
+    use crate::client::NativeClient;
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]

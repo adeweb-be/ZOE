@@ -12,7 +12,8 @@ mod protocol;
 pub mod runtime;
 
 pub use client::{
-    BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Record, Transaction,
+    BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
+    Transaction,
 };
 pub use error::Error;
 pub use runtime::{Runtime, Tokio};

@@ -7,9 +7,9 @@
 //! report. It ends with 0 when the client closes stdin, also before the
 //! `initialize` request.
 //!
-//! The console script of the wheel has no MCP server: its extension never
-//! links tokio or rmcp. There, the command fails with 1 and names the `zoe`
-//! binary.
+//! The console script of the wheel has no MCP server: its extension is
+//! built without the feature `serve` and never links rmcp. There, the
+//! command fails with 1 and names the `zoe` binary.
 
 use std::path::PathBuf;
 

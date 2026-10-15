@@ -38,4 +38,5 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0032](0032-a-tool-that-reads-a-store-repairs-it.md) | A tool that reads a store repairs it when a writer left it open; it supersedes the opens of ADR 0028 |
 | [0033](0033-object-count.md) | The store counts its objects: `object_count` in `meta`, ZOE format 2 |
 | [0034](0034-the-client-cache-file.md) | The client cache file (accepted) |
+| [0035](0035-the-extension-links-zoe-client-and-tokio.md) | The extension links zoe-client and tokio for the native client; it supersedes the rule of ADR 0001 and ADR 0028 that the extension never links tokio |
 | [0036](0036-concurrent-transactions-in-a-client.md) | Several transactions at once in one client process (accepted) |

@@ -23,14 +23,34 @@ elements. The client exports no span: the application configures
 OpenTelemetry.
 
 `%import zoe` gives the ZConfig section `<zoeclient>`, which opens this class.
+
+`ClientStorage(..., native=True)` runs the client on the native client of
+`zoe._zoe`, built on the Rust crate `zoe-client`, and not on the asyncio
+client of ZEO. It is still an instance of `ZEO.ClientStorage.ClientStorage`,
+and no thread of ZEO starts. It has the thinnest slice of a client yet: one
+TCP address, one connection, one transaction at a time, no cache, no blob
+and no reconnect. It declares `sequences` only, and speaks only the msgpack
+protocol `M5`: a stock ZEO server needs `msgpack true`. `_NOT_BUILT` names
+the arguments whose feature it does not have yet. `native` is false by
+default.
 """
 
 import contextvars
+import logging
+import os
+import threading
 
 from ZEO.asyncio.client import ClientIO, ClientThread, Fallback, Protocol
 from ZEO.asyncio.futures import run_coroutine_threadsafe
 from ZEO.ClientStorage import ClientStorage as ZEOClientStorage
-from ZODB.POSException import ReadOnlyError, Unsupported
+from ZEO.Exceptions import ClientDisconnected
+from ZODB.POSException import (
+    POSKeyError,
+    ReadOnlyError,
+    StorageTransactionError,
+    Unsupported,
+)
+from ZODB.utils import maxtid, z64
 
 try:
     from opentelemetry.trace.propagation.tracecontext import (
@@ -42,6 +62,8 @@ else:
     _PROPAGATOR = TraceContextTextMapPropagator()
 
 __all__ = ["EXTENSIONS", "ClientStorage", "Sequence"]
+
+logger = logging.getLogger(__name__)
 
 # The extension that lets a call carry the trace context of the client.
 _TRACE_CONTEXT = "trace_context"
@@ -260,9 +282,23 @@ class Sequence:
 
 
 class ClientStorage(ZEOClientStorage):
-    """`ZEO.ClientStorage` with the ZOE extensions that the server accepts."""
+    """`ZEO.ClientStorage` with the ZOE extensions that the server accepts.
 
-    def __init__(self, *args, _client_factory=_ClientThread, **kw):
+    With `native=True`, the instance is a `_NativeClientStorage`: the
+    native client runs inside.
+    """
+
+    def __new__(cls, *args, native=False, **kw):
+        if native and cls is ClientStorage:
+            cls = _NativeClientStorage
+        elif native and not issubclass(cls, _NativeClientStorage):
+            raise TypeError(
+                f"{cls.__name__} runs the client of ZEO: native=True needs"
+                " zoe.zeo.ClientStorage itself"
+            )
+        return super().__new__(cls)
+
+    def __init__(self, *args, native=False, _client_factory=_ClientThread, **kw):
         super().__init__(*args, _client_factory=_client_factory, **kw)
 
     def notify_connected(self, conn, info):
@@ -288,3 +324,382 @@ class ClientStorage(ZEOClientStorage):
         if "sequences" not in self._info.get("extensions", ()):
             raise Unsupported("the server does not serve the extension sequences")
         return self._call("sequence_next", name)
+
+
+# The size of the cache of ZEO when the caller gives none.
+_MB = 1024**2
+
+# The arguments of `ZEO.ClientStorage` whose feature the native client does
+# not have yet, each with the value that leaves its feature off. Any other
+# value fails the open with an error that names the argument.
+_NOT_BUILT = {
+    "cache_size": 20 * _MB,
+    "read_only_fallback": False,
+    "blob_dir": None,
+    "shared_blob_dir": False,
+    "blob_cache_size": None,
+    "blob_cache_size_check": 10,
+    "client_label": None,
+    "cache": None,
+    "ssl": None,
+    "ssl_server_hostname": None,
+    "client": None,
+    "var": None,
+    "wait": True,
+    "server_sync": False,
+}
+
+# The extensions that the native client declares.
+_NATIVE_EXTENSIONS = ("sequences",)
+
+# The number of oids that the native client asks for at a time.
+_NEW_OIDS = 100
+
+# The longest time that `close` waits for the thread of the invalidations.
+_JOIN_TIMEOUT = 30
+
+
+def _as_bytes(value):
+    """Return the bytes of a user name or a description."""
+    return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+
+
+class _NativeClientStorage(ClientStorage):
+    """`zoe.zeo.ClientStorage` with the native client inside.
+
+    It takes the arguments of `ZEO.ClientStorage`. It ignores the arguments
+    that ZEO 6 ignores too. Each argument of `_NOT_BUILT` must keep the
+    value that leaves its feature off. `native` must stay true.
+
+    A thread of the client gives the invalidations of the other clients to
+    the DB, in tid order. `lastTransaction()` gives a tid only after the DB
+    got the invalidations of that tid. `tpc_finish` calls its callback
+    before `lastTransaction()` gives the tid to another thread.
+    """
+
+    def __init__(
+        self,
+        addr,
+        storage="1",
+        cache_size=20 * _MB,
+        name="",
+        wait_timeout=None,
+        disconnect_poll=None,
+        read_only=0,
+        read_only_fallback=0,
+        blob_dir=None,
+        shared_blob_dir=False,
+        blob_cache_size=None,
+        blob_cache_size_check=10,
+        client_label=None,
+        cache=None,
+        ssl=None,
+        ssl_server_hostname=None,
+        client=None,
+        var=None,
+        min_disconnect_poll=1,
+        max_disconnect_poll=None,
+        wait=True,
+        drop_cache_rather_verify=True,
+        credentials=None,
+        server_sync=False,
+        username=None,
+        password=None,
+        realm=None,
+        native=True,
+    ):
+        if not native:
+            raise ValueError("this class runs the native client: native is true")
+        given = locals()
+        # Refuse a feature that is not built before any other step.
+        for key, off in _NOT_BUILT.items():
+            if given[key] != off:
+                raise Unsupported(
+                    f"the native client does not have {key} yet: leave {key} out"
+                )
+        self.__name__ = name or str(addr)
+        addr = self._normalize_addr(addr)
+        if len(addr) != 1 or not isinstance(addr[0], tuple):
+            raise Unsupported(
+                "the native client connects to one TCP address (host, port) yet"
+            )
+        host, port = addr[0]
+        # ZEO's tests read `_addr` to open a second client.
+        self._addr = addr
+        self._storage = storage
+        self._is_read_only = bool(read_only)
+        self._read_only_fallback = False
+        self._server_addr = None
+        self._client_label = None
+        self._info = {
+            "length": 0,
+            "size": 0,
+            "name": "ZEO Client",
+            "supportsUndo": 0,
+            "interfaces": (),
+        }
+        self._db = None
+        self._oids = []
+        self._oids_lock = threading.Lock()
+        # A child of `os.fork()` must not use the oids of its parent.
+        self._pid = os.getpid()
+        self.blob_dir = None
+        self.shared_blob_dir = False
+        self.fshelper = None
+        self.server_sync = False
+        self.protocol_version = b"M5"
+        # One transaction at a time, as ZEO's client.
+        self._commit_lock = threading.Lock()
+        self._transaction = None
+        # The delivery of the invalidations, `lastTransaction()` and the
+        # callback of `tpc_finish` take this lock.
+        self._deliver_lock = threading.RLock()
+        self._delivery = None
+
+        from zoe import _zoe
+
+        self._native = _zoe.Client(
+            host,
+            port,
+            storage,
+            read_only=self._is_read_only,
+            extensions=list(_NATIVE_EXTENSIONS),
+            wait_timeout=float(wait_timeout or 30),
+        )
+        try:
+            self._last_tid = self._native.opened_at()
+            self._info.update(self._native.info())
+            self.set_server_addr((host, port))
+            self._connection_generation = 1
+            logger.info(
+                "%s native client connected to storage %r at %s",
+                self.__name__,
+                storage,
+                self._server_addr,
+            )
+            self._delivery = threading.Thread(
+                target=self._deliver_forever,
+                name=f"{self.__name__} zoe native client invalidations",
+                daemon=True,
+            )
+            self._delivery.start()
+        except BaseException:
+            self._native.close()
+            raise
+
+    def _check_process(self):
+        """Raise `RuntimeError` in a child of `os.fork()`.
+
+        The check comes before any lock: a thread of the parent can hold a
+        lock at the fork, and the child would wait for it for ever.
+        """
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                "the client was opened in another process, before a fork"
+            )
+
+    # The calls that the native client does not have yet.
+
+    def _call(self, method, *args, **kw):
+        raise Unsupported(f"the native client does not call {method} yet")
+
+    def _async(self, method, *args):
+        raise Unsupported(f"the native client does not call {method} yet")
+
+    def _async_iter(self, it):
+        raise Unsupported("the native client does not upload blobs yet")
+
+    def new_addr(self, addr):
+        raise Unsupported("the native client does not change its address yet")
+
+    def loadBlob(self, oid, serial):
+        raise Unsupported("the native client has no blobs yet")
+
+    def storeBlob(self, oid, serial, data, blobfilename, version, txn):
+        raise Unsupported("the native client has no blobs yet")
+
+    def prefetch(self, oids, tid):
+        # The client has no cache, so a prefetch has nothing to fill.
+        pass
+
+    # The state of the connection.
+
+    def is_connected(self, test=False):
+        return self._native.is_connected()
+
+    def is_read_only(self):
+        return self._is_read_only
+
+    isReadOnly = is_read_only
+
+    def supportsUndo(self):
+        return False
+
+    def close(self):
+        self._check_process()
+        self._native.close()
+        delivery = self._delivery
+        if delivery is not None and delivery is not threading.current_thread():
+            delivery.join(_JOIN_TIMEOUT)
+
+    # The invalidations.
+
+    def _deliver_forever(self):
+        """Give each invalidation to the DB until the connection closes."""
+        native = self._native
+        try:
+            while native.wait_invalidation():
+                with self._deliver_lock:
+                    self._deliver()
+        except Exception:
+            logger.exception("%s the invalidations stopped", self.__name__)
+
+    def _deliver(self, tid=None, callback=None):
+        """Give the invalidations that wait to the DB, in tid order.
+
+        With `tid`, call `callback(tid)` for the commit of this client at
+        its place in the tid order. The caller holds `_deliver_lock`.
+        """
+        lagged, items = self._native.drain()
+        if lagged and self._db is not None:
+            # The client missed invalidations: the cache of the DB is stale.
+            self._db.invalidateCache()
+        failure = None
+        for item_tid, oids in items:
+            if tid is not None and item_tid > tid:
+                failure = self._committed(tid, callback)
+                tid = None
+            if self._db is not None:
+                self._db.invalidate(item_tid, oids)
+            self._last_tid = max(self._last_tid, item_tid)
+        if tid is not None:
+            failure = self._committed(tid, callback)
+        if failure is not None:
+            raise failure
+
+    def _committed(self, tid, callback):
+        """Call `callback(tid)` and raise the last tid to `tid`.
+
+        Return the exception of the callback, or None.
+        """
+        try:
+            callback(tid)
+        except Exception as error:
+            return error
+        finally:
+            self._last_tid = max(self._last_tid, tid)
+        return None
+
+    def lastTransaction(self):
+        self._check_process()
+        with self._deliver_lock:
+            self._deliver()
+            return self._last_tid
+
+    # The loads.
+
+    def load(self, oid, version=""):
+        result = self.loadBefore(oid, maxtid)
+        if result is None:
+            raise POSKeyError(oid)
+        return result[:2]
+
+    def loadBefore(self, oid, tid):
+        return self._native.load_before(oid, tid)
+
+    def loadSerial(self, oid, serial):
+        return self._native.load_serial(oid, serial)
+
+    def getTid(self, oid):
+        return self.load(oid)[1]
+
+    def new_oid(self):
+        self._check_process()
+        if self._is_read_only:
+            raise ReadOnlyError()
+        with self._oids_lock:
+            if not self._oids:
+                self._oids = list(reversed(self._native.new_oids(_NEW_OIDS)))
+            return self._oids.pop()
+
+    def _sequence_next(self, name):
+        return self._native.sequence_next(name)
+
+    # The two-phase commit.
+
+    def _check_trans(self, trans, meth):
+        if self._is_read_only:
+            raise ReadOnlyError()
+        if trans is None or trans is not self._transaction:
+            raise StorageTransactionError("Transaction not committing", meth, trans)
+
+    def tpc_transaction(self):
+        return self._transaction
+
+    def tpc_begin(self, txn, tid=None, status=" "):
+        self._check_process()
+        if self._is_read_only:
+            raise ReadOnlyError()
+        if txn is self._transaction:
+            raise StorageTransactionError(
+                "Duplicate tpc_begin calls for same transaction"
+            )
+        self._commit_lock.acquire()
+        try:
+            if isinstance(status, bytes):
+                status = status.decode("ascii")
+            self._native.begin(
+                _as_bytes(txn.user),
+                _as_bytes(txn.description),
+                txn.extension,
+                tid,
+                status,
+            )
+        except BaseException:
+            self._commit_lock.release()
+            raise
+        self._transaction = txn
+
+    def store(self, oid, serial, data, version, txn):
+        if version:
+            raise Unsupported("versions are not supported")
+        self._check_trans(txn, "store")
+        self._native.store(oid, serial or z64, data)
+
+    def checkCurrentSerialInTransaction(self, oid, serial, transaction):
+        self._check_trans(transaction, "checkCurrentSerialInTransaction")
+        self._native.check_current_serial(oid, serial)
+
+    def tpc_vote(self, txn):
+        self._check_trans(txn, "tpc_vote")
+        return self._native.vote() or None
+
+    def tpc_finish(self, txn, f=lambda tid: None):
+        self._check_process()
+        self._check_trans(txn, "tpc_finish")
+        try:
+            # The lock covers the round trip. So the thread of the
+            # invalidations gives no later tid to the DB before `f(tid)`.
+            # The call waits only for the server, never for that thread.
+            with self._deliver_lock:
+                tid = self._native.finish()
+                self._deliver(tid, f)
+        finally:
+            self.tpc_end(txn)
+        return tid
+
+    def tpc_abort(self, txn, timeout=None):
+        self._check_process()
+        if txn is None or txn is not self._transaction:
+            return
+        try:
+            self._native.abort()
+        except ClientDisconnected:
+            logger.debug("%s ClientDisconnected in tpc_abort() ignored", self.__name__)
+        finally:
+            self.tpc_end(txn)
+
+    def tpc_end(self, txn):
+        if txn is not None and txn is self._transaction:
+            self._transaction = None
+            self._commit_lock.release()
