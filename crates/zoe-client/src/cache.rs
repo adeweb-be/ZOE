@@ -1,4 +1,4 @@
-//! The client cache: the layout of ADR 0034 (proposed) in one anonymous
+//! The client cache: the layout of ADR 0034 in one anonymous
 //! mapping, with the semantics of `ZEO.cache.ClientCache`.
 //!
 //! The mapping holds a header, an index and a ring of entries. An entry is
