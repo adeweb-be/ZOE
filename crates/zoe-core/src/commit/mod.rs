@@ -764,40 +764,42 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
         for chunk in staged.chunks(READ_CHUNK) {
-            let current = self.load_current(chunk.iter().map(|(oid, _)| *oid))?;
-            for (&(oid, staged), record) in chunk.iter().zip(current) {
-                let current = record.as_ref().map_or(Tid::ZERO, |record| record.tid);
+            let serials = self.current_serials(chunk.iter().map(|(oid, _)| *oid))?;
+            for (&(oid, staged), serial) in chunk.iter().zip(serials) {
+                let current = serial.unwrap_or(Tid::ZERO);
                 if current == staged.serial {
                     continue;
                 }
-                match record {
-                    // A deletion has an empty pickle and is never
-                    // resolved.
-                    Some(record)
-                        if resolve
-                            && !staged.restored
-                            && staged.serial != Tid::ZERO
-                            && staged.pickle_len() != 0
-                            && !record.data.is_empty() =>
-                    {
+                let stale = Stale {
+                    oid,
+                    current,
+                    read: staged.serial,
+                    read_only: false,
+                };
+                if !resolve
+                    || staged.restored
+                    || staged.serial == Tid::ZERO
+                    || staged.pickle_len() == 0
+                {
+                    return Ok(Check::Failed(stale));
+                }
+                // Only a conflict reads its committed record. A deletion
+                // has an empty pickle and is never resolved. A record that
+                // is gone since the serials were read is a pack of it:
+                // the vote then fails as it does for a stale serial.
+                match self.store.backend.load_before(oid, Tid::MAX)? {
+                    Some(record) if record.tid == current && !record.data.is_empty() => {
                         conflicts.push((oid, record));
                     }
-                    _ => {
-                        return Ok(Check::Failed(Stale {
-                            oid,
-                            current,
-                            read: staged.serial,
-                            read_only: false,
-                        }));
-                    }
+                    _ => return Ok(Check::Failed(stale)),
                 }
             }
         }
         let read_current: Vec<_> = self.read_current.iter().collect();
         for chunk in read_current.chunks(READ_CHUNK) {
-            let current = self.load_current(chunk.iter().map(|&(&oid, _)| oid))?;
-            for (&(&oid, &read), record) in chunk.iter().zip(current) {
-                let current = record.map_or(Tid::ZERO, |record| record.tid);
+            let serials = self.current_serials(chunk.iter().map(|&(&oid, _)| oid))?;
+            for (&(&oid, &read), serial) in chunk.iter().zip(serials) {
+                let current = serial.unwrap_or(Tid::ZERO);
                 if current != read {
                     return Ok(Check::Failed(Stale {
                         oid,
@@ -811,24 +813,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(Check::Passed(conflicts))
     }
 
-    /// Return the current record of each oid of `oids`, in order, from one
-    /// backend read. A backend that gives another number of records fails
+    /// Return the current serial of each oid of `oids`, in order, from one
+    /// backend read. A backend that gives another number of serials fails
     /// with a backend error, so the vote never skips an oid.
-    fn load_current(
+    fn current_serials(
         &self,
         oids: impl ExactSizeIterator<Item = Oid>,
-    ) -> Result<Vec<Option<Record>>> {
+    ) -> Result<Vec<Option<Tid>>> {
         let expected = oids.len();
         let mut oids = oids;
-        let records = self.store.backend.load_current(&mut oids)?;
-        if records.len() != expected {
+        let serials = self.store.backend.current_serials(&mut oids)?;
+        if serials.len() != expected {
             let error = format!(
-                "the backend gave {} current records for {expected} oids",
-                records.len()
+                "the backend gave {} current serials for {expected} oids",
+                serials.len()
             );
             return Err(ZoeError::Backend(error.into()));
         }
-        Ok(records)
+        Ok(serials)
     }
 
     /// Return the serial of the current record of `oid`, or `Tid::ZERO`
@@ -949,7 +951,7 @@ fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
     }
 }
 
-/// The number of oids whose current records the vote reads in one backend
+/// The number of oids whose current serials the vote reads in one backend
 /// read.
 const READ_CHUNK: usize = 256;
 

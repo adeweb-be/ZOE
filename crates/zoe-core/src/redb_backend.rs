@@ -364,6 +364,17 @@ impl RedbBackend {
             .map_err(|e| refused(e, &format!("transaction row {tid:?}"), corrupt))
     }
 
+    /// Verify the record frame stored under `key` for `oid` without
+    /// decoding it. Return the tid of the key.
+    fn verified(oid: Oid, key: &[u8; 16], bytes: &[u8]) -> Result<Tid> {
+        let (_, tid) = format::split_record_key(key);
+        format::verify_frame(KeySpace::Records, key, bytes).map_err(|e| {
+            let row = format!("record of oid {oid:?}, tid {tid:?}");
+            refused(e, &row, ZoeError::CorruptRecord { oid, tid })
+        })?;
+        Ok(tid)
+    }
+
     /// Decode and verify the record frame stored under `key` for `oid`.
     /// Return the tid of the key and the frame.
     fn frame<'a>(oid: Oid, key: &[u8; 16], bytes: &'a [u8]) -> Result<(Tid, format::Frame<'a>)> {
@@ -415,6 +426,27 @@ impl Backend for RedbBackend {
             }
             None => Ok(None),
         }
+    }
+
+    fn current_serials(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
+        // One read transaction serves every oid. The key of the newest
+        // record gives its tid, so no value is read or decoded.
+        let txn = self.db.begin_read().map_err(backend)?;
+        let records = txn.open_table(RECORDS).map_err(backend)?;
+        oids.map(|oid| {
+            let start = format::record_key(oid, Tid::ZERO);
+            let end = format::record_key(oid, Tid::MAX);
+            let mut range = records.range::<&[u8; 16]>(&start..&end).map_err(backend)?;
+            match range.next_back() {
+                Some(entry) => {
+                    let (key, _) = entry.map_err(backend)?;
+                    inside(oid, key.value(), start..end)?;
+                    Ok(Some(format::split_record_key(key.value()).1))
+                }
+                None => Ok(None),
+            }
+        })
+        .collect()
     }
 
     fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
@@ -591,6 +623,8 @@ impl Backend for RedbBackend {
             }
             None => None,
         };
+        // The key of the next record gives its serial. Its frame is
+        // verified and not decoded: the load returns no byte of it.
         let next = match records
             .range::<&[u8; 16]>(&split..=&end)
             .map_err(backend)?
@@ -599,7 +633,7 @@ impl Backend for RedbBackend {
             Some(entry) => {
                 let (key, value) = entry.map_err(backend)?;
                 inside(oid, key.value(), split..=end)?;
-                Some(Self::frame(oid, key.value(), value.value())?.0)
+                Some(Self::verified(oid, key.value(), value.value())?)
             }
             None => None,
         };
