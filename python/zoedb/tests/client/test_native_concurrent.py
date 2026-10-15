@@ -19,13 +19,25 @@ invalidations. `just test` runs this module.
   invalidations: the invalidations of the other clients, and the callback
   of `tpc_finish` for the commits of the process. The DB gets the
   invalidations of the other client once each, in tid order, and never
-  gets a commit of the process as an invalidation.
+  gets a commit of the process as an invalidation. The same holds against
+  a stock ZEO 6 server with `msgpack true`.
+- The client opens its connections on demand. The open costs one
+  connection, the listener. A transaction opens a connection only when it
+  finds none free, so commits one after the other use one connection.
+  Transactions that hold their votes at once each hold a connection.
+- The pool has at most `zoe.zeo._POOL_BOUND` connections that commit, and
+  the listener. A transaction that finds them all busy waits for a free
+  one, and goes on when another transaction ends.
 
-The tests open the native client with `zoe.testing.native_client`. Each
-test imports ZEO and ZODB's test modules itself.
+The tests open the native client with `zoe.testing.native_client`. The
+`ruok` status of `zoe serve` gives the number of connections that
+registered. Each test imports ZEO and ZODB's test modules itself.
 """
 
+import json
 import pickle
+import socket
+import struct
 import threading
 import time
 
@@ -48,6 +60,13 @@ COMMITS = 200
 # the commits of each thread and of the other client.
 OWN_WRITERS = 4
 ROUNDS = 50
+# The transactions that hold their votes at once in the on-demand test.
+HOLDERS = 8
+# The least bound of the pool: the threads cells of zodbshootout run 64
+# threads.
+LEAST_BOUND = 64
+# The time that a test waits to see that a thread stays blocked.
+BLOCKED = 0.5
 
 
 def native(address, **kw):
@@ -113,6 +132,23 @@ def join(threads, timeout):
         thread.join(max(0.0, deadline - time.monotonic()))
     alive = [thread.name for thread in threads if thread.is_alive()]
     assert not alive, f"threads still run after {timeout} seconds: {alive}"
+
+
+def connections(address):
+    """Return the connections that registered on the storage 1 of address.
+
+    The `ruok` status of `zoe serve` gives them. The status connection does
+    not register.
+    """
+    with socket.create_connection(address, timeout=TIMEOUT) as sock:
+
+        def read_frame():
+            size = struct.unpack(">I", sock.recv(4, socket.MSG_WAITALL))[0]
+            return sock.recv(size, socket.MSG_WAITALL)
+
+        sock.sendall(struct.pack(">I", 4) + b"ruok")
+        assert read_frame() == b"M5"
+        return json.loads(read_frame().decode("ascii"))["1"]["connections"]
 
 
 @pytest.fixture
@@ -355,10 +391,16 @@ class RecordingDB:
         return data
 
 
-def test_last_transaction_never_gives_a_tid_before_the_db_got_it(server):
-    storage = native(server.address)
+def check_the_contract(address):
+    """Commit through two clients on address, and check the DB of the first.
+
+    Several threads of the first client and two threads of the second
+    commit at once. While they run, `lastTransaction()` of the first client
+    never gives a tid that its DB did not get.
+    """
+    storage = native(address)
     try:
-        other = native(server.address)
+        other = native(address)
         try:
             db = RecordingDB()
             storage.registerDB(db)
@@ -399,5 +441,114 @@ def test_last_transaction_never_gives_a_tid_before_the_db_got_it(server):
             assert len(own_tids) == OWN_WRITERS * ROUNDS
         finally:
             other.close()
+    finally:
+        storage.close()
+
+
+def test_last_transaction_never_gives_a_tid_before_the_db_got_it(server):
+    check_the_contract(server.address)
+
+
+def test_against_a_stock_zeo_server_the_pool_keeps_the_contract(tmp_path):
+    import ZEO
+
+    # A ZEO 6 server speaks the msgpack protocol only with this option.
+    address, stop = ZEO.server(
+        path=str(tmp_path / "Data.fs"), zeo_conf={"msgpack": True}
+    )
+    try:
+        check_the_contract(address)
+    finally:
+        stop()
+
+
+def hold_votes(storage, oids, releases, voted, errors):
+    """Start a thread for each oid. Each one commits the oid and holds its
+    vote until its event of releases is set.
+
+    `voted` is a list. Each thread appends its index after its vote.
+    """
+    from ZODB.Connection import TransactionMetaData
+
+    def hold(index):
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        try:
+            storage.store(oids[index], ZERO, record(index), "", txn)
+            storage.tpc_vote(txn)
+            voted.append(index)
+            assert releases[index].wait(RUN_TIMEOUT), f"holder {index}"
+            storage.tpc_finish(txn)
+        except BaseException:
+            storage.tpc_abort(txn)
+            raise
+
+    return [start(hold, errors, index) for index in range(len(oids))]
+
+
+def test_the_pool_opens_its_connections_on_demand(server):
+    storage = native(server.address)
+    try:
+        # The open costs one connection: the listener.
+        assert connections(server.address) == 1
+        oid = storage.new_oid()
+        serial = ZERO
+        for round_ in range(10):
+            serial = commit(storage, [(oid, serial, record(round_))])
+        # Commits one after the other take the same connection.
+        assert connections(server.address) == 2
+
+        oids = [storage.new_oid() for _ in range(HOLDERS)]
+        releases = [threading.Event() for _ in oids]
+        voted, errors = [], []
+        threads = hold_votes(storage, oids, releases, voted, errors)
+        try:
+            wait_for(lambda: len(voted) == HOLDERS or errors, "the votes")
+            assert not errors, errors
+            # Each transaction that holds its vote holds a connection.
+            assert connections(server.address) == HOLDERS + 1
+        finally:
+            for release in releases:
+                release.set()
+        join(threads, RUN_TIMEOUT)
+        assert not errors, errors
+        for index, oid in enumerate(oids):
+            assert storage.load(oid)[0] == record(index)
+    finally:
+        storage.close()
+
+
+def test_a_transaction_waits_for_a_free_connection_at_the_bound(server):
+    import zoe.zeo
+
+    bound = zoe.zeo._POOL_BOUND
+    assert bound >= LEAST_BOUND
+    storage = native(server.address)
+    try:
+        oids = [storage.new_oid() for _ in range(bound + 1)]
+        releases = [threading.Event() for _ in oids]
+        voted, errors = [], []
+        threads = hold_votes(storage, oids, releases, voted, errors)
+        try:
+            wait_for(lambda: len(voted) >= bound or errors, "the votes")
+            assert not errors, errors
+            # One transaction finds every connection busy, and waits.
+            time.sleep(BLOCKED)
+            assert len(voted) == bound
+            assert connections(server.address) == bound + 1
+            waiting = set(range(bound + 1)) - set(voted)
+            # The first transaction that ends frees its connection.
+            releases[voted[0]].set()
+            wait_for(lambda: len(voted) == bound + 1 or errors, "the last vote")
+            assert not errors, errors
+            assert set(voted[bound:]) == waiting
+            assert connections(server.address) <= bound + 1
+        finally:
+            for release in releases:
+                release.set()
+        join(threads, RUN_TIMEOUT)
+        assert not errors, errors
+        for index, oid in enumerate(oids):
+            assert storage.load(oid)[0] == record(index)
     finally:
         storage.close()

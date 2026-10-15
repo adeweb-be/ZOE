@@ -10,9 +10,17 @@ the native client against `zoe serve`:
   thread checks, through one client.
 - `test_race_load_vs_external_invalidate`: eight workers, each on its own
   client, check and commit.
+- `test_load_vs_external_invalidate_without_conflicts`: the checker of the
+  second test, `_check_race_load_vs_external_invalidate`, with a model of
+  this module. ZODB's model writes both of its objects in each commit. A
+  client that commits with a stale cache then gets a conflict, and the
+  conflict hides the fault. Half of the steps of this model change only a
+  third object, so they commit without a conflict, and a client that runs
+  the callback of `tpc_finish` before it delivered an earlier tid fails
+  the check.
 
 The client runs with its default settings, where several transactions of
-one process run at once.
+one process run at once. No key turns the pool on.
 
 racetest sets the rounds of each check in the method itself: 500 rounds of
 the local check, 8 workers of 100 rounds for the external check. A test
@@ -36,6 +44,8 @@ RACES = (
     "test_race_loadopen_vs_local_invalidate",
     "test_race_load_vs_external_invalidate",
 )
+# The race test of this module, on the checker of ZODB.
+MODEL_RACE = "test_load_vs_external_invalidate_without_conflicts"
 # The runs of each race test.
 REPEATS = 10
 
@@ -49,6 +59,8 @@ def native_case():
     import ZEO.ClientStorage
     from ZEO.tests import forker, testZEO
     from ZODB.tests import StorageTestBase
+
+    model = conflict_free_model()
 
     class NativeFileStorageTests(testZEO.FileStorageTests):
         def setUp(self):
@@ -73,7 +85,45 @@ def native_case():
             client.registerDB(testZEO.DummyDB())
             return client
 
+        def test_load_vs_external_invalidate_without_conflicts(self):
+            self._check_race_load_vs_external_invalidate(model)
+
     return NativeFileStorageTests
+
+
+def conflict_free_model():
+    """Return a model for the checker of ZODB whose steps can commit
+    without a conflict.
+
+    Its invariant is the one of ZODB's `T2ObjectsInc`: obj1 equals obj2.
+    Half of its steps add 1 to both. The other half add 1 to obj3 only.
+    """
+    import random
+
+    from ZODB.tests.MinPO import MinPO
+    from ZODB.tests.racetest import IModelSpec
+    from zope.interface import implementer
+
+    @implementer(IModelSpec)
+    class T2ObjectsIncOrTouch:
+        def init(self, root):
+            root["obj1"] = MinPO(0)
+            root["obj2"] = MinPO(0)
+            root["obj3"] = MinPO(0)
+
+        def next(self, root):
+            if random.randint(0, 1):
+                root["obj1"].value += 1
+                root["obj2"].value += 1
+            else:
+                root["obj3"].value += 1
+
+        def assertStateOK(self, root):
+            one, two = root["obj1"].value, root["obj2"].value
+            if one != two:
+                raise AssertionError(f"obj1 ({one}) != obj2 ({two})")
+
+    return T2ObjectsIncOrTouch()
 
 
 def test_the_race_tests_pass_with_ten_times_their_rounds():
@@ -93,7 +143,7 @@ def test_the_race_tests_pass_with_ten_times_their_rounds():
         for layer in layers:
             layer.setUp()
             started.append(layer)
-        for name in RACES:
+        for name in (*RACES, MODEL_RACE):
             for _ in range(REPEATS):
                 for layer in layers:
                     if hasattr(layer, "testSetUp"):
@@ -113,4 +163,4 @@ def test_the_race_tests_pass_with_ten_times_their_rounds():
     ]
     assert not problems, "\n\n".join(problems)
     assert not result.skipped, result.skipped
-    assert result.testsRun == len(RACES) * REPEATS
+    assert result.testsRun == (len(RACES) + 1) * REPEATS
