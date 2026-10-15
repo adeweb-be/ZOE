@@ -23,9 +23,9 @@
 //!
 //! The pool delivers the tids of the listener in one order. A thread of
 //! `zoe.zeo` takes each commit of another client, and each change of the
-//! connection, with `next_delivery`, and confirms it with `delivered`. `Transaction.finish` returns the tid of a
-//! commit at its turn, and `Transaction.done` ends the turn after the
-//! callback of `tpc_finish`.
+//! connection, with `next_delivery`, and confirms it with `delivered`.
+//! `Transaction.finish` returns the tid of a commit at its turn, and
+//! `Transaction.done` ends the turn after the callback of `tpc_finish`.
 //!
 //! `Transaction.vote` resolves the conflicts that the vote lists with the
 //! callable that `zoe.zeo` gives, ZODB's `tryToResolveConflict`. The
@@ -46,6 +46,7 @@
 //! and its drop there frees nothing. A client that the child opens gets a
 //! runtime of the child.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::mem;
@@ -335,15 +336,18 @@ impl NativeClient {
     /// Tell if the listener registered read-only: as asked, or after a
     /// read-only fallback. Without a listener, tell if the open asked for
     /// a read-only client.
-    fn read_only(&self) -> bool {
-        self.listener()
-            .map_or(self.read_only, |listener| listener.read_only())
+    fn read_only(&self) -> PyResult<bool> {
+        self.check_process()?;
+        Ok(self
+            .listener()
+            .map_or(self.read_only, |listener| listener.read_only()))
     }
 
     /// Return the address of the server: `(host, port)` with the IP address
     /// of the server, or the path of a unix domain socket. Return `None`
     /// without a listener.
     fn address<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.check_process()?;
         let Some(listener) = self.listener() else {
             return Ok(None);
         };
@@ -1315,6 +1319,28 @@ fn endpoints(
     Ok(round)
 }
 
+/// Resolve the host of each TCP address of `targets`, as `resolve` does,
+/// on the blocking threads of the runtime. A lookup of the system can wait
+/// for a long time: on a worker thread it would stop the connections of
+/// every client of the process.
+async fn resolve_hosts(targets: &[Target]) -> HashMap<(String, u16), Result<SocketAddr, String>> {
+    let mut resolved = HashMap::new();
+    for target in targets {
+        let Target::Tcp(host, port) = target else {
+            continue;
+        };
+        let key = (host.clone(), *port);
+        if resolved.contains_key(&key) {
+            continue;
+        }
+        let (name, port) = key.clone();
+        let lookup = tokio::task::spawn_blocking(move || resolve(&name, port)).await;
+        let addr = lookup.unwrap_or_else(|e| Err(format!("the address {host}:{port}: {e}")));
+        resolved.insert(key, addr);
+    }
+    resolved
+}
+
 /// Return the first IP address of `host` and `port`.
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
     let mut addrs = (host, port)
@@ -1339,7 +1365,13 @@ async fn open(
 ) -> Result<(zoe_client::Client, Endpoint), Opening> {
     let deadline = Instant::now() + wait;
     loop {
-        let round = endpoints(targets, secure, resolve)?;
+        let resolved = resolve_hosts(targets).await;
+        let round = endpoints(targets, secure, |host, port| {
+            resolved
+                .get(&(host.to_owned(), port))
+                .cloned()
+                .unwrap_or_else(|| Err(format!("the address {host}:{port} was not resolved")))
+        })?;
         let left = deadline.saturating_duration_since(Instant::now());
         let opened = if round.endpoints.is_empty() {
             Err(Error::Io(std::io::Error::new(
@@ -1627,6 +1659,22 @@ mod tests {
     fn an_address_shows_as_zeo_gives_it() {
         assert_eq!(Target::Tcp("db".into(), 8100).to_string(), "db:8100");
         assert_eq!(Target::Unix("./zeo.sock".into()).to_string(), "./zeo.sock");
+    }
+
+    #[test]
+    fn a_host_name_resolves_on_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let targets = [
+            Target::Tcp("localhost".into(), 8100),
+            Target::Unix(PathBuf::from("./zeo.sock")),
+        ];
+        let resolved = runtime.block_on(resolve_hosts(&targets));
+        assert_eq!(resolved.len(), 1);
+        let addr = resolved[&("localhost".to_owned(), 8100)].clone().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 8100);
     }
 
     #[test]
