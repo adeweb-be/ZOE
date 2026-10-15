@@ -11,12 +11,13 @@ the groups of that build count. The report prints the other groups beside
 them.
 
 `default_ratio` gives the default ratio of a storage, and `left_out` the
-scenarios that the gate leaves out for it. Both read constants of this
-module, not options. The gate leaves out the scenarios of `LEFT_OUT` for
-each storage but those of `COUNTS_EVERY_SCENARIO`, because no read of
-these scenarios reaches the server through `ZEO.ClientStorage`. The report
-prints their cells with the verdict `left out`. These cells count neither
-as below nor as missing.
+cells that the gate leaves out for it, by scenario and object size. Both
+read constants of this module, not options. For most storages the gate
+leaves out `read_hot` in every size, because no read of it reaches the
+server through `ZEO.ClientStorage`. For `zoe-native` it leaves out only
+`read_hot` at 1 KB, because ZODB itself takes most of the time of a hit
+there. The report prints these cells with the verdict `left out`. They
+count neither as below nor as missing.
 """
 
 import datetime
@@ -24,20 +25,31 @@ import json
 from pathlib import Path
 from typing import TextIO
 
+from shootout import KB
 from shootout.environment import python_tag
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
-# The scenarios that the gate leaves out, each with its reason.
-LEFT_OUT = {
-    "read_hot": "it empties the object cache of the connection, then reads "
-    "the objects from the cache of ZEO.ClientStorage, so no read reaches "
-    "the server",
+# The cells that the gate leaves out, as (scenario, object size) with a
+# reason. A size of None means every size.
+LeftOut = dict[tuple[str, int | None], str]
+
+# The cells that the gate leaves out for a storage that LEFT_OUT_OF does
+# not name.
+LEFT_OUT: LeftOut = {
+    ("read_hot", None): "it empties the object cache of the connection, then "
+    "reads the objects from the cache of ZEO.ClientStorage, so no read "
+    "reaches the server",
 }
 
-# The storages for which every scenario counts. The native client of
-# zoe-native has a cache of its own, so its read_hot is a number of ZOE.
-COUNTS_EVERY_SCENARIO = frozenset({"zoe-native"})
+# The cells that the gate leaves out for each other storage. The native
+# client of zoe-native has a cache of its own, so its read_hot at 100 KB
+# counts.
+LEFT_OUT_OF: dict[str, LeftOut] = {
+    "zoe-native": {
+        ("read_hot", KB): "ZODB itself takes most of the time of a hit there",
+    },
+}
 
 # The default ratio of each storage: 3 for the phase 3 gate. Any other
 # storage gets parity, the phase 2 gate.
@@ -50,9 +62,19 @@ def default_ratio(storage: str) -> float:
     return RATIOS.get(storage, PARITY)
 
 
-def left_out(storage: str) -> dict[str, str]:
-    """Return the scenarios that the gate leaves out for a storage."""
-    return {} if storage in COUNTS_EVERY_SCENARIO else LEFT_OUT
+def left_out(storage: str) -> LeftOut:
+    """Return the cells that the gate leaves out for a storage."""
+    return LEFT_OUT_OF.get(storage, LEFT_OUT)
+
+
+def _is_left_out(cell: tuple[str, str, int, int], skipped: LeftOut) -> bool:
+    name, _, _, size = cell
+    return (name, None) in skipped or (name, size) in skipped
+
+
+def _label(name: str, size: int | None) -> str:
+    """Name the cells of a scenario that the gate leaves out."""
+    return name if size is None else f"{name} at {size // KB} KB"
 
 
 def report(
@@ -94,7 +116,7 @@ def report(
         for cell, base_ops in sorted(_cells(base).items()):
             ops = cells.get(cell)
             value = None if ops is None else ops / base_ops
-            if cell[0] in skipped:
+            if _is_left_out(cell, skipped):
                 verdict = "left out"
             elif value is None:
                 verdict = "missing"
@@ -119,10 +141,11 @@ def report(
             )
             print(row, file=out)
 
-    for name, reason in skipped.items():
-        print(f"left out: {name}, because {reason}", file=out)
+    labels = [_label(*key) for key in skipped]
+    for label, reason in zip(labels, skipped.values(), strict=True):
+        print(f"left out: {label}, because {reason}", file=out)
     passed = below == 0 and missing == 0
-    cells = f"each cell but {', '.join(skipped)}" if skipped else "each cell"
+    cells = f"each cell but {', '.join(labels)}" if skipped else "each cell"
     where = f" on {python}" if python else ""
     print(
         f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}"
