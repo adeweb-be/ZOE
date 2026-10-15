@@ -105,7 +105,8 @@ static SPARE: Spares = Spares(Mutex::new(Vec::new()));
 /// does not free and allocate a large buffer for each load, and the
 /// allocator does not give the pages back to the kernel and fault them in
 /// again. Keep at most `SPARES` buffers, each of `SPLIT` to `SPARE_BYTES`
-/// bytes. Drop each other buffer.
+/// bytes. When `SPARES` buffers are kept, a larger buffer takes the place
+/// of the smallest one. Drop each other buffer.
 pub fn recycle(buffer: Vec<u8>) {
     SPARE.give(buffer);
 }
@@ -122,21 +123,35 @@ impl Spares {
         if !(SPLIT..=SPARE_BYTES).contains(&buffer.capacity()) {
             return;
         }
-        if let Ok(mut spare) = self.0.try_lock()
-            && spare.len() < SPARES
-        {
-            buffer.clear();
+        let Ok(mut spare) = self.0.try_lock() else {
+            return;
+        };
+        buffer.clear();
+        if spare.len() < SPARES {
             spare.push(buffer);
+        } else if let Some(smallest) = spare.iter_mut().min_by_key(|kept| kept.capacity())
+            && smallest.capacity() < buffer.capacity()
+        {
+            *smallest = buffer;
         }
     }
 
-    /// Return an empty buffer for `len` bytes: a kept buffer that holds
-    /// them, else a new buffer of at most `RESERVE` bytes.
+    /// Return an empty buffer for `len` bytes. A bin of at least `SPLIT`
+    /// bytes takes the smallest kept buffer that holds it. Each other bin,
+    /// and a bin that no kept buffer holds, gets a new buffer of at most
+    /// `RESERVE` bytes.
     fn take(&self, len: usize) -> Vec<u8> {
-        let kept = self.0.try_lock().ok().and_then(|mut spare| {
-            let at = spare.iter().position(|buffer| buffer.capacity() >= len)?;
-            Some(spare.swap_remove(at))
-        });
+        let kept = (len >= SPLIT)
+            .then(|| self.0.try_lock().ok())
+            .flatten()
+            .and_then(|mut spare| {
+                let (at, _) = spare
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, kept)| kept.capacity() >= len)
+                    .min_by_key(|(_, kept)| kept.capacity())?;
+                Some(spare.swap_remove(at))
+            });
         kept.unwrap_or_else(|| Vec::with_capacity(len.min(RESERVE)))
     }
 }
@@ -387,8 +402,17 @@ pub(crate) fn decode_payload(payload: Payload) -> Result<Message, Error> {
             // does not reserve memory.
             let mut values = Vec::with_capacity(items.min(bytes.len() + 1));
             values.push(Value::Binary(bin));
+            // `decode` reads these items inside two arrays, the message
+            // and the args, and rmpv counts two levels for each array. So
+            // both paths have one limit.
             for _ in 1..items {
-                values.push(read_value(&mut bytes)?);
+                values.push(
+                    rmpv::decode::read_value_with_max_depth(
+                        &mut bytes,
+                        rmpv::decode::MAX_DEPTH - 4,
+                    )
+                    .map_err(|e| Error::Protocol(format!("a frame that is not msgpack: {e}")))?,
+                );
             }
             Value::Array(values)
         }
@@ -870,6 +894,29 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+        // More than `PEEK` bytes after a long bin: the rest has a read of
+        // its own.
+        let trailing = Value::Binary(vec![5; 100]);
+        let payload = encode(Value::Array(vec![
+            4.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![
+                Value::Binary(data.clone()),
+                trailing.clone(),
+                Value::Nil,
+            ]),
+        ]));
+        match decodes_as_whole(&payload) {
+            Payload::Bin {
+                items, bin, rest, ..
+            } => {
+                assert_eq!(items, Some(3));
+                assert_eq!(bin, data);
+                assert_eq!(rest, [encode(trailing), encode(Value::Nil)].concat());
+            }
+            other => panic!("{other:?}"),
+        }
         // The reply of `loadSerial`: the args are the bin.
         let payload = encode(Value::Array(vec![
             5.into(),
@@ -907,12 +954,34 @@ mod tests {
         // A buffer shorter than `SPLIT` or longer than `SPARE_BYTES` drops.
         spares.give(Vec::with_capacity(SPLIT - 1));
         spares.give(Vec::with_capacity(SPARE_BYTES + 1));
-        assert_eq!(spares.0.lock().unwrap().len(), 1);
-        // At most `SPARES` buffers stay.
+        let capacities = |spares: &Spares| {
+            let mut capacities: Vec<usize> =
+                spares.0.lock().unwrap().iter().map(Vec::capacity).collect();
+            capacities.sort_unstable();
+            capacities
+        };
+        assert_eq!(capacities(&spares), [100 * 1024]);
+        // A bin shorter than `SPLIT` never takes a kept buffer.
+        assert_eq!(spares.take(8).capacity(), 8);
+        assert_eq!(spares.take(SPLIT - 1).capacity(), SPLIT - 1);
+        assert_eq!(capacities(&spares), [100 * 1024]);
+        // A bin takes the smallest kept buffer that holds it.
+        spares.give(Vec::with_capacity(SPARE_BYTES));
+        spares.give(Vec::with_capacity(SPLIT));
+        assert_eq!(spares.take(SPLIT + 1).capacity(), 100 * 1024);
+        assert_eq!(spares.take(SPLIT).capacity(), SPLIT);
+        assert_eq!(capacities(&spares), [SPARE_BYTES]);
+        // At most `SPARES` buffers stay. Then a larger buffer takes the
+        // place of the smallest one, and a buffer that is not larger drops.
         for _ in 0..2 * SPARES {
             spares.give(Vec::with_capacity(SPLIT));
         }
-        assert_eq!(spares.0.lock().unwrap().len(), SPARES);
+        assert_eq!(capacities(&spares).len(), SPARES);
+        spares.give(Vec::with_capacity(2 * SPLIT));
+        spares.give(Vec::with_capacity(SPLIT));
+        let mut expected = vec![SPLIT; SPARES - 2];
+        expected.extend([2 * SPLIT, SPARE_BYTES]);
+        assert_eq!(capacities(&spares), expected);
         // While another thread holds the lock, a buffer drops and a new
         // one comes, without a wait.
         let held = spares.0.lock().unwrap();
@@ -1070,6 +1139,39 @@ mod tests {
     }
 
     #[test]
+    fn both_decodes_have_the_same_depth_limit() {
+        // rmpv counts two levels for each array, so its limit falls near 510
+        // nested arrays here. A value that deep needs more stack than the
+        // default thread of a test in a debug build.
+        let check = || {
+            let mut ok = Vec::new();
+            for depth in 500..520 {
+                let mut payload = encode(Value::Array(vec![
+                    1.into(),
+                    false.into(),
+                    ".reply".into(),
+                    Value::Nil,
+                ]));
+                payload.pop();
+                payload.push(0x92);
+                payload.extend(encode(Value::Binary(large(SPLIT))));
+                payload.extend(std::iter::repeat_n(0x91, depth));
+                payload.push(0xc0);
+                decodes_as_whole(&payload);
+                ok.push(decode(&payload).is_ok());
+            }
+            // The depths cover both sides of the limit.
+            assert!(ok.contains(&true) && ok.contains(&false));
+        };
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(check)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn an_end_inside_a_long_frame_fails() {
         let payload = encode(Value::Array(vec![
             1.into(),
@@ -1078,13 +1180,32 @@ mod tests {
             Value::Array(vec![Value::Binary(large(SPLIT)), bin8(1), Value::Nil]),
         ]));
         let frame = frame(&payload).unwrap();
-        // Cut inside the start, inside the bin, and inside the rest.
-        for cut in [4 + PEEK / 2, 4 + PEEK + 10, frame.len() - 1] {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
+        // Cut inside the start, inside the bin, and inside the rest that
+        // comes in the same read as the bin.
+        let cuts = [4 + PEEK / 2, 4 + PEEK + 10, frame.len() - 1];
+        // A rest of more than `PEEK` bytes has a read of its own: cut
+        // inside it.
+        let long = encode(Value::Array(vec![
+            1.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![
+                Value::Binary(large(SPLIT)),
+                Value::Binary(vec![5; 100]),
+                Value::Nil,
+            ]),
+        ]));
+        let long = super::frame(&long).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (frame, cut) in cuts
+            .map(|cut| (&frame, cut))
+            .into_iter()
+            .chain([(&long, long.len() - 50), (&long, long.len() - 1)])
+        {
             let error = rt.block_on(read_payload(&mut &frame[..cut])).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "cut {cut}");
         }
     }
 
