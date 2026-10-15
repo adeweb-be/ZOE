@@ -383,6 +383,53 @@ def test_without_authenticate_the_client_checks_the_server_with_the_system_store
         open_tls(tls_server, certs, None, wait_timeout=2)
 
 
+def test_the_self_signed_certificate_of_the_server_as_authenticate(tmp_path):
+    import os
+
+    import ZEO.tests
+    from ZEO.Exceptions import ClientDisconnected
+
+    import zoe.testing
+
+    # The certificates of ZEO's tests: each side gives the self-signed
+    # certificate of the other as authenticate, as ZEO.tests.testssl does.
+    # The name of the server is only in the CN of its certificate.
+    here = os.path.dirname(ZEO.tests.__file__)
+    args = [
+        "--tls-cert", os.path.join(here, "server.pem"),
+        "--tls-key", os.path.join(here, "server_key.pem"),
+        "--tls-client-ca", os.path.join(here, "client.pem"),
+    ]  # fmt: skip
+
+    def open_native(server, **keys):
+        files = {
+            "certificate": os.path.join(here, "client.pem"),
+            "key": os.path.join(here, "client_key.pem"),
+            "authenticate": os.path.join(here, "server.pem"),
+        }
+        section = ssl_section(**{**files, **keys})
+        storage = zoe.testing.native_client(
+            server.address, storage="1", wait_timeout=2, _ssl_section=section
+        )
+        try:
+            assert len(storage.new_oid()) == 8
+        finally:
+            storage.close()
+
+    with ZoeServer(str(tmp_path / "store"), args=args) as server:
+        open_native(server, server_hostname="zodb.org")
+        open_native(server, check_hostname=False)
+        with pytest.raises(ClientDisconnected):
+            open_native(server, server_hostname="example.org")
+        # Another self-signed certificate does not match.
+        with pytest.raises(ClientDisconnected):
+            open_native(
+                server,
+                authenticate=os.path.join(here, "client.pem"),
+                check_hostname=False,
+            )
+
+
 def test_an_ssl_section_with_only_authenticate_opens_the_native_client(tmp_path, certs):
     import ZODB
     from ZODB.utils import z64
