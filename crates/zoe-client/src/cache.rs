@@ -165,6 +165,9 @@ pub struct Cache {
     marked: AtomicBool,
     /// The next mark fails: a hook of the tests.
     fail_mark: AtomicBool,
+    /// The last tid that the pool delivered without the cache: a commit of
+    /// the pool after a lost listener (`skip`). It is not in the file.
+    skipped: AtomicU64,
 }
 
 /// The layout of a cache: the bytes of the ring, the number of slots, the
@@ -279,6 +282,7 @@ impl Cache {
             verified: AtomicBool::new(true),
             marked: AtomicBool::new(anonymous),
             fail_mark: AtomicBool::new(false),
+            skipped: AtomicU64::new(0),
         })
     }
 
@@ -472,8 +476,17 @@ impl Cache {
     /// from `copy` (see `Copier`), and returns `None` when `copy` fails.
     /// Return the
     /// result of `out`, the start tid of the entry and its end tid, or
-    /// `None` for a current entry. A current entry serves only `before`
-    /// up to `applied + 1`.
+    /// `None` for a current entry.
+    ///
+    /// A current entry is the revision of the snapshots up to `applied`.
+    /// It serves any `before` above its start, as the cache of ZEO does: a
+    /// `before` above `applied + 1`, such as the `maxtid` of
+    /// `ZODB.utils.load_current`, gets the newest revision that the client
+    /// knows. The DB never takes a snapshot after `lastTransaction()`, and
+    /// the pool delivers a tid only after the cache applied it. One case
+    /// breaks this order: a commit of the pool after a lost listener
+    /// (`skip`). Until `applied` reaches the skipped tid, a current entry
+    /// serves only `before` up to `applied + 1`.
     pub fn load_before_with<R>(
         &self,
         oid: Oid,
@@ -484,11 +497,12 @@ impl Cache {
             return None;
         }
         let applied = self.applied().0;
+        let in_order = self.skipped.load(Ordering::Acquire) <= applied;
         let before = before.0;
         let entry = self.chain(oid.0).find(|entry| {
             entry.start < before
                 && if entry.end == 0 {
-                    before <= applied.saturating_add(1)
+                    in_order || before <= applied.saturating_add(1)
                 } else {
                     !entry.dropped() && entry.end >= before
                 }
@@ -700,6 +714,22 @@ impl Cache {
             }
         }
         self.set_applied(tid.0);
+    }
+
+    /// Skip the commit `tid` of this process, which the pool delivers after
+    /// a lost listener without the commits of the other clients before it:
+    /// drop the current entry of each of `oids`, and keep `applied`. Until
+    /// `applied` reaches `tid`, a current entry serves only the snapshots up
+    /// to `applied`.
+    pub fn skip(&self, tid: Tid, oids: &[Oid]) {
+        let _counts = self.lock();
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.skipped.fetch_max(tid.0, Ordering::Release);
+        for oid in oids {
+            self.drop_current_locked(oid.0);
+        }
     }
 
     /// Drop the current entry of `oid`, as `invalidate(oid, None)` of ZEO

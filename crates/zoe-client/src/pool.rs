@@ -1348,7 +1348,8 @@ impl Finished {
     /// pool: it ends the current entry of each oid that it wrote, and adds
     /// the data of each store that the server did not resolve. A turn after
     /// a lost listener only drops the current entry of each oid that it
-    /// wrote: the cache did not get the commits before it.
+    /// wrote, and the cache skips the tid (`Cache::skip`): the cache did
+    /// not get the commits before it.
     pub async fn turn(mut self) -> Result<Turn, Error> {
         let tid = self.tid;
         let stale = self
@@ -1367,9 +1368,8 @@ impl Finished {
         self.armed = false;
         if let Some(cache) = &self.shared.cache {
             if stale {
-                for (oid, _) in &self.writes {
-                    cache.drop_current(*oid);
-                }
+                let oids: Vec<Oid> = self.writes.iter().map(|(oid, _)| *oid).collect();
+                cache.skip(tid, &oids);
             } else {
                 cache.commit(tid, &last_writes(&self.writes));
             }

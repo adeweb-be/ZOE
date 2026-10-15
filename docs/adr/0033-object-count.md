@@ -41,7 +41,7 @@ The naming table says that the format name bumps only with a migration tool. The
 ## Consequences
 
 - `len(zoe.Storage)` and the `length` of `zoe serve` are exact, as FileStorage's. ZODB's doctest `IExternalGC.test` passes through ZEO's suite.
-- Each write that changes records reads one key of `records` for each oid that it touches, and a pack batch reads one more for each oid that it removes a record of. The write of the row is one more `meta` row in a write that already writes `last_tid`.
+- Each write that changes records reads at most one key of `records` for each oid that it touches (none for an oid at or above `next_oid`, which has no record yet), and a pack batch reads one more for each oid that it removes a record of. The write of the row is one more `meta` row in a write that already writes `last_tid`.
 - The first writer open of a store of format 1 reads every key of `records`, so it takes longer than N7 allows. Each later open reads the row.
 - A flipped bit in the row is outside the bit-flip gate, as for `last_tid` and `next_oid`, because `meta` has no frames. `zoe verify` finds such a count. A later write adds to and subtracts from the damaged value; it never fails for it.
 - No tool takes a store back to format 1.
