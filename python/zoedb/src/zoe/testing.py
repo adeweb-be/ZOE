@@ -845,9 +845,12 @@ class NativeLayer:
     `ZEO.ClientStorage` itself, and a test module that imported the class
     at its own import. `ZEO.client`, `ZEO.DB` and the `<zeoclient>` section
     of ZODB read the attribute of `ZEO.ClientStorage` when they run, so they
-    open the native client too. The `<zoeclient>` section opens the native
-    client whatever its key `native`. `tearDown` puts back the class of ZEO
-    and the open of `<zoeclient>`.
+    open the native client too. A class of a loaded module that a test
+    module derives from the class of ZEO, as `TestClientStorage` of
+    `ZEO.tests.ConnectionTests`, gets the class of the native client as
+    its base in place of the class of ZEO. The `<zoeclient>` section opens
+    the native client whatever its key `native`. `tearDown` puts back the
+    class of ZEO, the bases of each class and the open of `<zoeclient>`.
 
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
@@ -869,8 +872,21 @@ class NativeLayer:
         original = ZEO.ClientStorage.ClientStorage
         native = zoe.zeo._NativeClientStorage
         for module in list(sys.modules.values()):
-            if getattr(module, "__dict__", {}).get("ClientStorage") is original:
+            names = getattr(module, "__dict__", {})
+            if names.get("ClientStorage") is original:
                 self._patch(module, "ClientStorage", native)
+            for value in list(names.values()):
+                # The native class derives from the class of ZEO through
+                # zoe.zeo.ClientStorage: these classes keep their bases.
+                if (
+                    isinstance(value, type)
+                    and original in value.__bases__
+                    and not issubclass(native, value)
+                ):
+                    bases = tuple(
+                        native if base is original else base for base in value.__bases__
+                    )
+                    self._patch(value, "__bases__", bases)
         section = zoe.config.ZoeClient
         self._patch(section, "open", lambda client: client._open_client(native=True))
 

@@ -205,7 +205,7 @@ fn server_error(args: Value) -> Error {
         return conflict;
     }
     if class == READ_CONFLICT
-        && let Some(Error::Conflict { oid, serials }) = conflict(&value)
+        && let Some(Error::Conflict { oid, serials, .. }) = conflict(&value)
     {
         return Error::ReadConflict { oid, serials };
     }
@@ -235,7 +235,8 @@ pub(crate) fn pos_key_error(oid: Oid) -> Error {
 
 /// Return `Error::Conflict` from a map with the keys `oid` and `serials`,
 /// as an error reply and a vote reply give them. `serials` is
-/// `[committed, read]`, or nil.
+/// `[committed, read]`, or nil. A str `class_name` gives the class of the
+/// object.
 pub(crate) fn conflict(value: &Value) -> Option<Error> {
     let oid = get(value, "oid").and_then(p64).map(Oid)?;
     let serials = match get(value, "serials") {
@@ -245,7 +246,14 @@ pub(crate) fn conflict(value: &Value) -> Option<Error> {
         }
         Some(_) => return None,
     };
-    Some(Error::Conflict { oid, serials })
+    let class_name = get(value, "class_name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(Error::Conflict {
+        oid,
+        serials,
+        class_name,
+    })
 }
 
 /// Return the value of the str key `key` in the map `value`.
@@ -405,12 +413,32 @@ mod tests {
         };
         match decode(&reply(map(Value::Array(vec![bin8(3), bin8(2)])))).unwrap() {
             Message::Reply {
-                result: Err(Error::Conflict { oid, serials }),
+                result:
+                    Err(Error::Conflict {
+                        oid,
+                        serials,
+                        class_name,
+                    }),
                 ..
             } => {
                 assert_eq!(oid, Oid(5));
                 assert_eq!(serials, Some((Tid(3), Tid(2))));
+                assert_eq!(class_name, None);
             }
+            other => panic!("{other:?}"),
+        }
+        // A stock server names the class of the object.
+        let named = Value::Map(vec![
+            ("message".into(), "database conflict error".into()),
+            ("oid".into(), bin8(5)),
+            ("class_name".into(), "persistent.Counter".into()),
+            ("serials".into(), Value::Array(vec![bin8(3), bin8(2)])),
+        ]);
+        match decode(&reply(named)).unwrap() {
+            Message::Reply {
+                result: Err(Error::Conflict { class_name, .. }),
+                ..
+            } => assert_eq!(class_name.as_deref(), Some("persistent.Counter")),
             other => panic!("{other:?}"),
         }
         // After a lock-wait timeout, the serials are nil.

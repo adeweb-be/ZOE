@@ -720,6 +720,31 @@ impl Cache {
         }
     }
 
+    /// Return the entries that a lookup can find, as `(oid, start, end)`,
+    /// with `None` as the end of a current entry, in the order of the
+    /// index. A dropped entry is not in it. A cache that serves and writes
+    /// nothing more has no entries. The writer lock keeps the entries
+    /// still during the scan. `__len__` and `contents()` of the cache of
+    /// ZEO give the same things.
+    pub fn entries(&self) -> Vec<(Oid, Tid, Option<Tid>)> {
+        let _counts = self.lock();
+        if self.disabled.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        for slot in 0..self.slots {
+            let key = self.slot_key(slot).load(Ordering::Acquire);
+            if key == 0 {
+                continue;
+            }
+            for entry in self.chain(key - 1).filter(|entry| !entry.dropped()) {
+                let end = (entry.end != 0).then_some(Tid(entry.end));
+                entries.push((Oid(entry.oid), Tid(entry.start), end));
+            }
+        }
+        entries
+    }
+
     /// Drop every entry, and keep `applied`: move the head of the ring two
     /// rings forward.
     pub fn clear(&self) {

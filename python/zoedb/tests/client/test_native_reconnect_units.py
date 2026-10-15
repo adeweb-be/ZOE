@@ -6,9 +6,13 @@ storage of the native client directly, with a native client of the test.
 
 import logging
 import socket
+import threading
+import time
 
+import pytest
 import ZODB.event
 import zope.interface
+from ZEO.Exceptions import ClientDisconnected
 from ZEO.interfaces import StaleCache
 from ZODB.interfaces import IBlobStorage
 
@@ -33,6 +37,14 @@ class Native:
     def take_cache_check(self):
         return None
 
+    def cache_entries(self):
+        return []
+
+    connected = True
+
+    def is_connected(self):
+        return self.connected
+
 
 class DB:
     def __init__(self):
@@ -51,6 +63,9 @@ def storage(native):
     result._server_addr = None
     result._db = DB()
     result._native = native
+    result._cache = zoe.zeo._NativeCache(native, 0, None)
+    result._server = zoe.zeo._NativeServer(result, 30)
+    result._operational = threading.Event()
     return result
 
 
@@ -68,11 +83,17 @@ def test_read_only_follows_the_server_of_the_native_client():
 
 def test_a_connection_with_a_verified_cache_keeps_the_db(caplog):
     s = storage(Native())
-    with caplog.at_level(logging.INFO, logger="zoe.zeo"):
+    with caplog.at_level(logging.INFO, logger="ZEO.ClientStorage"):
         s._connected("quick")
+        s._connected("kept")
     assert s._db.cache_invalidations == 0
     assert "8100" in s._server_addr
-    assert any("Reconnected" in r.getMessage() for r in caplog.records)
+    # The client logs its connections as ZEO does, under the logger of ZEO.
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Connected to storage" in m for m in messages)
+    assert any("Reconnected to storage" in m for m in messages)
+    assert s._server.client.verify_result == "empty cache"
+    assert s._connection_generation == 2
 
 
 def test_a_dropped_cache_notifies_stale_cache_and_invalidates_the_db(
@@ -96,6 +117,64 @@ def test_a_refused_server_logs_a_critical_message(caplog):
     (record,) = [r for r in caplog.records if r.levelno == logging.CRITICAL]
     assert "the server is behind" in record.getMessage()
     assert s._db.cache_invalidations == 0
+
+
+def test_a_call_without_a_server_waits_for_one_as_zeo_does():
+    native = Native()
+    native.connected = False
+    s = storage(native)
+    s._closed = False
+    start = time.monotonic()
+    with pytest.raises(ClientDisconnected):
+        s._wait(0.2)
+    assert time.monotonic() - start >= 0.2
+    # A connection during the wait ends it.
+    threading.Timer(0.1, lambda: setattr(native, "connected", True)).start()
+    start = time.monotonic()
+    s._wait(5)
+    assert time.monotonic() - start < 1
+    # After the close, the wait raises at once.
+    native.connected = False
+    s._closed = True
+    start = time.monotonic()
+    with pytest.raises(ClientDisconnected):
+        s._wait(5)
+    assert time.monotonic() - start < 1
+
+
+def test_the_cache_gives_its_entries_as_the_cache_of_zeo():
+    native = Native()
+    native.cache_entries = lambda: [
+        (b"\0" * 8, b"\1" * 8, None),
+        (b"\0" * 8, b"\0" * 7 + b"\1", b"\1" * 8),
+    ]
+    cache = zoe.zeo._NativeCache(native, 1000, "c-1.zoec")
+    assert (cache.maxsize, cache.path) == (1000, "c-1.zoec")
+    assert len(cache) == 2
+    assert list(cache.contents()) == [(b"\0" * 8, b"\1" * 8)]
+
+
+def test_the_stale_cache_event_comes_before_the_drop_and_once(caplog, monkeypatch):
+    native = Native()
+    s = storage(native)
+    s._native_ready = threading.Event()
+    s._native_ready.set()
+    seen = []
+
+    def notify(event):
+        # The handler sees the entries: the drop comes after the call.
+        seen.append((type(event), len(event.storage._cache)))
+
+    monkeypatch.setattr(ZODB.event, "notify", notify)
+    native.cache_entries = lambda: [(b"\0" * 8, b"\1" * 8, None)]
+    s._cache_dropping("")
+    native.cache_entries = lambda: []
+    s._connected("dropped")
+    assert seen == [(StaleCache, 1)]
+    critical = [r.getMessage() for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert critical == ["test dropping stale cache"]
+    assert s._db.cache_invalidations == 1
+    assert s._server.client.verify_result == "cache too old, clearing"
 
 
 class Lookups:

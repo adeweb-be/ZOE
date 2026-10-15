@@ -117,7 +117,9 @@ async fn a_stale_serial_is_a_conflict_with_its_serials() {
     let second = commit(&a, &[(oid, first, record(b"2"))]).await.unwrap();
 
     match commit(&b, &[(oid, first, record(b"3"))]).await {
-        Err(Error::Conflict { oid: at, serials }) => {
+        Err(Error::Conflict {
+            oid: at, serials, ..
+        }) => {
             assert_eq!(at, oid);
             assert_eq!(serials, Some((second, first)));
         }

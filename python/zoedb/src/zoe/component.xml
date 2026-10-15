@@ -133,14 +133,15 @@
         ClientDisconnected. The default is 30.
       </description>
     </key>
-    <key name="native" datatype="boolean" default="false">
+    <key name="native" datatype="boolean">
       <description>
         If true, the client runs on the native client, built on the Rust
-        crate zoe-client, and not on the asyncio client of ZEO. It has one
-        connection and no cache, no blob and no reconnect yet: a key of
-        these features with a value other than its default fails the open.
-        Against a stock ZEO server, it needs msgpack true on the server.
-        The default is false.
+        crate zoe-client, and not on the asyncio client of ZEO. Against a
+        stock ZEO server, it needs msgpack true on the server. If false,
+        the asyncio client of ZEO runs inside. Without the key, the client
+        is native, but a stock ZEO server that speaks only the pickle
+        protocol Z5 at the open, with wait, gives the asyncio client of ZEO
+        inside.
       </description>
     </key>
   </sectiontype>

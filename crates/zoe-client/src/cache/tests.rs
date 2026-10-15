@@ -212,6 +212,33 @@ fn clear_drops_every_entry_and_keeps_applied() {
 }
 
 #[test]
+fn the_entries_are_those_that_a_lookup_finds() {
+    let cache = cache_at(64 * KB, 10);
+    assert_eq!(cache.entries(), vec![]);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    assert!(cache.store(Oid(1), Tid(3), Some(Tid(5)), b"three", Tid(10)));
+    assert!(cache.store(Oid(2), Tid(6), None, b"six", Tid(10)));
+    let mut entries = cache.entries();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            (Oid(1), Tid(3), Some(Tid(5))),
+            (Oid(1), Tid(5), None),
+            (Oid(2), Tid(6), None),
+        ]
+    );
+    // A dropped entry is not in them.
+    cache.drop_current(Oid(2));
+    assert!(!cache.entries().contains(&(Oid(2), Tid(6), None)));
+    cache.clear();
+    assert_eq!(cache.entries(), vec![]);
+    assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));
+    cache.close();
+    assert_eq!(cache.entries(), vec![]);
+}
+
+#[test]
 fn a_verification_drops_the_current_entries_of_the_changed_oids() {
     let cache = cache_at(64 * KB, 10);
     assert!(cache.store(Oid(1), Tid(5), None, b"one", Tid(10)));

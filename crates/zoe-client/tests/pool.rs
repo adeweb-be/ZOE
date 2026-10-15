@@ -16,8 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zoe_client::{
-    Cache, Client, Connect, Delivery, Error, Event, Invalidation, Listed, Open, Options, Pool,
-    PoolTransaction, Reconnect, Tokio, Turn, Verification, Voted,
+    Cache, Client, Connect, Delivery, Dropping, Error, Event, Invalidation, Listed, Open, Options,
+    Pool, PoolTransaction, Reconnect, Tokio, Turn, Verification, Voted,
 };
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
@@ -460,11 +460,14 @@ fn gated(server: SocketAddr, options: Options, gate: watch::Receiver<bool>) -> O
 /// Open a pool with a cache of 1 MB on `server`, that connects again to it
 /// through `open`.
 async fn open_reconnecting(server: &Server, open: Open) -> Pool {
+    open_with(server, Reconnect::new(open, POLL)).await
+}
+
+async fn open_with(server: &Server, reconnect: Reconnect) -> Pool {
     let addr = server.addr();
     let listener = Client::connect(addr, "1").await.unwrap();
     let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
     let cache = Cache::new(1 << 20).unwrap();
-    let reconnect = Reconnect::new(open, POLL);
     Pool::with_reconnect(
         Arc::new(Tokio),
         Some((listener, connect)),
@@ -612,6 +615,53 @@ async fn a_pool_drops_its_cache_when_the_server_does_not_keep_the_commits() {
     let cache = pool.cache().unwrap();
     assert_eq!(cache.load(kept), None);
     assert_eq!(cache.applied(), tid);
+}
+
+/// The cache of a pool and an oid, once the pool exists.
+type Slot = std::sync::Mutex<Option<(Arc<Cache>, Oid)>>;
+
+#[tokio::test]
+async fn the_dropping_function_sees_the_entries_before_the_drop() {
+    let dir = fresh_dir("reconnect-dropping");
+    let server =
+        Server::start(ServeOptions::new(dir.join("store")).invalidation_queue_size(1)).unwrap();
+    let (gate, opened) = watch::channel(false);
+    // The function reads the cache through a slot that the test fills
+    // once the pool exists, and sends what it saw.
+    let slot: Arc<Slot> = Arc::default();
+    let (seen, mut saw) = tokio::sync::mpsc::unbounded_channel();
+    let reader = slot.clone();
+    let dropping: Dropping = Arc::new(move |reason| {
+        let held = reader
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(cache, oid)| cache.load(*oid).is_some());
+        seen.send((reason, held)).unwrap();
+        Box::pin(async {})
+    });
+    let reconnect = Reconnect {
+        dropping: Some(dropping),
+        ..Reconnect::new(gated(server.addr(), Options::default(), opened), POLL)
+    };
+    let pool = open_with(&server, reconnect).await;
+    let (changed, kept, first) = cached_pair(&pool).await;
+    *slot.lock().unwrap() = Some((pool.cache().unwrap().clone(), kept));
+    lose(&pool).await;
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let tid = commit_other(&other, changed, first, &record(b"c")).await;
+    commit_other(&other, changed, tid, &record(b"d")).await;
+    gate.send_replace(true);
+
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Dropped)
+    );
+    pool.delivered();
+    // The function ran once, with the entries still in the cache.
+    assert_eq!(saw.try_recv().unwrap(), (String::new(), Some(true)));
+    assert!(saw.try_recv().is_err());
+    assert_eq!(pool.cache().unwrap().load(kept), None);
 }
 
 #[tokio::test]

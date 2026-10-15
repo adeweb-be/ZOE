@@ -70,8 +70,9 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Copier, Delivery, Endpoint, Error, Event, FileCheck, Open, Options,
-    Pool, PoolTransaction, Reconnect, Tls, TlsOptions, Tokio, Turn, Verification, traced,
+    Address, Cache, Connect, Copier, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open,
+    Options, Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn,
+    Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -201,8 +202,12 @@ impl NativeClient {
     /// raises `zc.lockfile.LockError`, as the cache of ZEO does. A name of
     /// the storage longer than 256 bytes raises `ValueError`, and an error
     /// of the file raises `OSError`. A file with entries serves only after
-    /// its verification against the server; with `wait`, the open waits
-    /// for it, at most `wait_timeout` seconds.
+    /// its verification against the server: `ready` waits for it.
+    ///
+    /// With `dropping`, a verification that drops every entry of the cache
+    /// calls `dropping(reason)` before the drop, on a thread of its own,
+    /// and waits for it: `reason` is empty when the server does not keep
+    /// the commits after the cache, else the error of `getInvalidations`.
     ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
@@ -239,11 +244,18 @@ impl NativeClient {
     ///
     /// With `client_label`, each connection sends it in `set_client_label`
     /// after `get_info`, and the server puts it in its log lines.
+    ///
+    /// `fall_back_on` lists protocols, as bytes. When the open with `wait`
+    /// finds a server of one of these protocols, it stops at once and
+    /// raises `OtherProtocol` with the protocol: it does not log and does
+    /// not wait. The caller can then open another client. A reconnect
+    /// never does this.
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None
+        disconnect_poll=DISCONNECT_POLL, client_label=None, cache_path=None, dropping=None,
+        fall_back_on=Vec::new()
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -262,6 +274,8 @@ impl NativeClient {
         disconnect_poll: f64,
         client_label: Option<String>,
         cache_path: Option<PathBuf>,
+        dropping: Option<Py<PyAny>>,
+        fall_back_on: Vec<Vec<u8>>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -307,8 +321,6 @@ impl NativeClient {
             client_label,
         };
         let upgrade = read_only_fallback && !read_only;
-        // The connect and the verification of a cache file share one wait.
-        let deadline = Instant::now() + timeout;
         let opened = py.detach(move || -> Result<_, Opening> {
             let secure = tls.as_ref().map(Secure::load).transpose()?.map(Arc::new);
             let runtime = runtime().map_err(Opening::Runtime)?;
@@ -325,7 +337,9 @@ impl NativeClient {
                 wait: timeout,
             });
             let first = match wait {
-                true => Some(runtime.block_on(servers.open(&servers.options, true))?),
+                true => {
+                    Some(runtime.block_on(servers.open(&servers.options, true, &fall_back_on))?)
+                }
                 false => None,
             };
             let reopen = servers.clone();
@@ -335,17 +349,12 @@ impl NativeClient {
             });
             let reconnect = Reconnect {
                 upgrade,
+                dropping: dropping.map(dropping_of),
                 ..Reconnect::new(open, poll)
             };
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
-            // A cache file with entries serves after its verification. The
-            // open waits for it for what is left of `wait_timeout`.
-            if wait {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let _ = runtime.block_on(tokio::time::timeout(left, pool.ready()));
-            }
             Ok((runtime, pool, servers))
         });
         let (runtime, pool, servers) = match opened {
@@ -354,6 +363,9 @@ impl NativeClient {
                 return Err(PyValueError::new_err(text));
             }
             Err(Opening::Runtime(error)) => return Err(error.into()),
+            Err(Opening::Client(Error::OtherProtocol(theirs))) => {
+                return Err(OtherProtocol::new_err(PyBytes::new(py, &theirs).unbind()));
+            }
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
         Ok(Self {
@@ -464,7 +476,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let reply = py
             .detach(move || runtime.block_on(traced(trace, pool.call(&method, args))))
-            .map_err(|e| zeo_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         to_python(py, &reply, 0)
     }
 
@@ -564,6 +576,21 @@ impl NativeClient {
                 .is_some_and(|pool| pool.is_connected())
     }
 
+    /// Wait at most `timeout` seconds until the cache serves: a cache file
+    /// with entries serves after its verification against the server.
+    /// The wait also ends without a cache, at the close and when the cache
+    /// is disabled (`Pool::ready`). Return false when `timeout` passed
+    /// first.
+    fn ready(&self, py: Python<'_>, timeout: f64) -> PyResult<bool> {
+        let timeout = Duration::try_from_secs_f64(timeout.max(0.0))
+            .map_err(|_| PyValueError::new_err("timeout is not a duration"))?;
+        let pool = self.pool(py)?;
+        let runtime = self.runtime;
+        // The timer of the timeout needs the runtime: make it inside.
+        let waited = async move { tokio::time::timeout(timeout, pool.ready()).await };
+        Ok(py.detach(move || runtime.block_on(waited).is_ok()))
+    }
+
     /// Return the most connections that commit at once.
     fn pool_bound(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.pool(py)?.bound())
@@ -605,7 +632,8 @@ impl NativeClient {
     /// pickle, its serial and the serial of the next record or `None`.
     /// Return `None` when `oid` has no record before `tid`. A hit of the
     /// cache sends nothing to the server. A miss stores the reply in the
-    /// cache.
+    /// cache. An error of the server raises what ZEO raises for it, as for
+    /// `call`.
     #[allow(clippy::type_complexity)]
     fn load_before<'py>(
         &self,
@@ -636,7 +664,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
-            .map_err(|e| client_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| {
             (
                 PyBytes::new(py, &record.data),
@@ -649,7 +677,8 @@ impl NativeClient {
     /// Return the current record of `oid`: its pickle and its serial, or
     /// `None` when `oid` has no record. A hit of the current entry of the
     /// cache sends nothing to the server, as `load` of `ZEO.ClientStorage`
-    /// does. A miss stores the reply in the cache.
+    /// does. A miss stores the reply in the cache. An error of the server
+    /// raises what ZEO raises for it, as for `call`.
     #[allow(clippy::type_complexity)]
     fn load<'py>(
         &self,
@@ -668,7 +697,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
-            .map_err(|e| client_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| (PyBytes::new(py, &record.data), p64(py, record.tid.0))))
     }
 
@@ -680,6 +709,22 @@ impl NativeClient {
             py.detach(|| cache.clear());
         }
         Ok(())
+    }
+
+    /// Return the entries of the cache as a list of `(oid, start, end)`,
+    /// with `None` as the end of a current entry. Without a cache, return
+    /// an empty list.
+    fn cache_entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        self.check_process()?;
+        let entries = match &self.cache {
+            Some(cache) => py.detach(|| cache.entries()),
+            None => Vec::new(),
+        };
+        let items = entries.into_iter().map(|(oid, start, end)| {
+            let end = end.map(|end| p64(py, end.0));
+            (p64(py, oid.0), p64(py, start.0), end)
+        });
+        PyList::new(py, items)
     }
 
     /// Return the pickle of `oid` that the transaction `serial` wrote. An
@@ -696,7 +741,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let data = py
             .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
-            .map_err(|e| zeo_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(PyBytes::new(py, &data))
     }
 
@@ -920,6 +965,16 @@ impl NativeClient {
     }
 
     /// Return the listener of the pool, if the client is open and has one.
+    /// Return the address of the server as ZEO names its connection in
+    /// its logs: `('host', port)`, or the path of a unix domain socket.
+    fn peer_name(&self) -> String {
+        match self.listener().map(|listener| listener.address().clone()) {
+            Some(Address::Tcp(addr)) => format!("('{}', {})", addr.ip(), addr.port()),
+            Some(Address::Unix(path)) => path.to_string_lossy().into_owned(),
+            None => String::new(),
+        }
+    }
+
     fn listener(&self) -> Option<Arc<zoe_client::Client>> {
         if self.pid != std::process::id() {
             return None;
@@ -1381,11 +1436,13 @@ struct Servers {
 impl Servers {
     /// Open a listener as `options` asks, and return it with the `Connect`
     /// of its server. With `retry`, try again after failed connections
-    /// until the wait passes. Else make one round.
+    /// until the wait passes. Else make one round. A server of a protocol
+    /// of `fall_back_on` ends the open at once.
     async fn open(
         &self,
         options: &Options,
         retry: bool,
+        fall_back_on: &[Vec<u8>],
     ) -> Result<(zoe_client::Client, Connect), Opening> {
         let targets = lock(&self.targets).clone();
         let (listener, endpoint) = open(
@@ -1395,6 +1452,7 @@ impl Servers {
             options,
             self.wait,
             retry,
+            fall_back_on,
         )
         .await?;
         // The other connections register as the listener did, on its
@@ -1426,7 +1484,7 @@ impl Servers {
             },
             false => self.options.clone(),
         };
-        self.open(&options, false)
+        self.open(&options, false, &[])
             .await
             .map_err(Opening::into_error)
     }
@@ -1608,7 +1666,8 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
 /// Open a client to the first server of `targets` that opens, on the
 /// runtime of the caller, and return it with its endpoint. Each round
 /// resolves the hosts again. With `retry`, try again after failed
-/// connections until `wait` passes.
+/// connections until `wait` passes. A server of a protocol of
+/// `fall_back_on` ends the open at once with `Error::OtherProtocol`.
 async fn open(
     targets: &[Target],
     secure: Option<&Secure>,
@@ -1616,6 +1675,7 @@ async fn open(
     options: &Options,
     wait: Duration,
     retry: bool,
+    fall_back_on: &[Vec<u8>],
 ) -> Result<(zoe_client::Client, Endpoint), Opening> {
     let deadline = Instant::now() + wait;
     loop {
@@ -1637,6 +1697,27 @@ async fn open(
             zoe_client::Client::open_first(runtime, &round.endpoints, storage, options, left).await
         };
         match opened {
+            Err(Error::OtherProtocol(theirs)) if fall_back_on.contains(&theirs) => {
+                return Err(Opening::Client(Error::OtherProtocol(theirs)));
+            }
+            Err(Error::OtherProtocol(theirs)) => {
+                // ZEO logs a server of another protocol as a failed
+                // registration, and tries again after its
+                // `register_failed_poll`, until the wait passes.
+                log_other_protocol(&theirs);
+                if !retry {
+                    return Err(Opening::Client(Error::OtherProtocol(theirs)));
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left <= REFUSED_POLL {
+                    tokio::time::sleep(left).await;
+                    return Err(Opening::Client(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        timed_out(&theirs),
+                    ))));
+                }
+                tokio::time::sleep(REFUSED_POLL).await;
+            }
             Err(Error::Io(_) | Error::Disconnected)
                 if retry && Instant::now() + RETRY < deadline =>
             {
@@ -1668,6 +1749,75 @@ async fn open(
             }
         }
     }
+}
+
+/// Return the `Dropping` function of the pool for the Python callable
+/// `dropping`: a thread of its own calls `dropping(reason)`, so the code of
+/// the callable never runs on a thread of the runtime, and the pool waits
+/// for the end of the call. An error of the callable is lost.
+fn dropping_of(dropping: Py<PyAny>) -> Dropping {
+    let dropping = Arc::new(dropping);
+    Arc::new(move |reason: String| {
+        let dropping = dropping.clone();
+        let (done, called) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            Python::try_attach(|py| {
+                if let Err(error) = dropping.call1(py, (reason,)) {
+                    error.print(py);
+                }
+            });
+            let _ = done.send(());
+        });
+        Box::pin(async move {
+            let _ = called.await;
+        })
+    })
+}
+
+/// The text of `ClientDisconnected` when the open saw only servers of
+/// another protocol until the wait passed: the text of ZEO.
+const TIMED_OUT: &str = "timed out waiting for connection";
+
+/// The pickle protocol of a stock ZEO 6 server without `msgpack true`.
+const PICKLE: &[u8] = b"Z5";
+
+/// Return the text of `ClientDisconnected` when the last server of the
+/// open spoke `theirs`: the text of ZEO. For `Z5`, the text also tells
+/// how to reach that server.
+fn timed_out(theirs: &[u8]) -> String {
+    if theirs == PICKLE {
+        format!(
+            "{TIMED_OUT}: the server speaks the pickle protocol Z5, and the \
+             native client speaks only M5: set msgpack true on the server, \
+             or give native=False"
+        )
+    } else {
+        TIMED_OUT.to_owned()
+    }
+}
+
+pyo3::create_exception!(
+    _zoe,
+    OtherProtocol,
+    PyException,
+    "The server speaks a protocol of `fall_back_on`: its argument."
+);
+
+/// Log a server of another protocol as ZEO logs a failed registration:
+/// at error level, under `ZEO.asyncio.client`, with the protocol of the
+/// server as bytes. Without a Python interpreter, log nothing.
+fn log_other_protocol(theirs: &[u8]) {
+    let _ = Python::try_attach(|py| -> PyResult<()> {
+        let logger = py
+            .import("logging")?
+            .call_method1("getLogger", ("ZEO.asyncio.client",))?;
+        let protocol = PyBytes::new(py, theirs);
+        logger.call_method1(
+            "error",
+            ("Registration or cache validation failed, %s", protocol),
+        )?;
+        Ok(())
+    });
 }
 
 /// Return the name of the partial file of a download: `<filename>.dl`, as
@@ -1725,8 +1875,18 @@ fn not_open() -> Error {
 /// Return the exception of Python for an error of the client.
 fn client_error(py: Python<'_>, error: Error) -> PyErr {
     match error {
-        Error::Conflict { oid, serials } => {
-            errors::conflict(py, errors::conflict_class(py), oid, serials, None)
+        Error::Conflict {
+            oid,
+            serials,
+            class_name,
+        } => {
+            let error = errors::conflict(py, errors::conflict_class(py), oid, serials, None);
+            // ZEO gives the class that the server names to the error, so
+            // its text names the class of the object.
+            if let Some(class_name) = class_name {
+                let _ = error.value(py).setattr("class_name", class_name);
+            }
+            error
         }
         Error::ReadConflict { oid, serials } => {
             errors::conflict(py, errors::read_conflict_class(py), oid, serials, None)
@@ -1748,7 +1908,7 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
 /// raises what its factory makes of the value, and another class raises
 /// `ZEO.Exceptions.ServerException(class, value)`. Each other error raises
 /// as `client_error` gives it.
-fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
+fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
     let Error::Server {
         class,
         value,
@@ -1759,9 +1919,20 @@ fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
     };
     let made = (|| -> PyResult<PyErr> {
         let value = to_python(py, &value, 0)?;
-        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
+        let client = py.import("ZEO.asyncio.client")?;
+        let factories = client.getattr("exc_factories")?;
         let exception = match factories.get_item(&class) {
-            Ok(factory) => factory.call1((&class, value))?,
+            Ok(factory) => {
+                let exception = factory.call1((&class, &value))?;
+                // ZEO logs an error of the server that its factories make,
+                // but a POSKeyError and a ConflictError.
+                if !exception.is_instance(&client.getattr("unlogged_exceptions")?)? {
+                    client
+                        .getattr("logger")?
+                        .call_method1("error", ("%s from server: %s:%s", name, &class, &value))?;
+                }
+                exception
+            }
             Err(_) => py
                 .import("ZEO.Exceptions")?
                 .getattr("ServerException")?

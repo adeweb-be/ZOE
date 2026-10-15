@@ -34,6 +34,10 @@ pub enum Error {
         oid: Oid,
         /// The committed serial and the serial that the transaction read.
         serials: Option<(Tid, Tid)>,
+        /// The class of the object, when the error of the server names it
+        /// in `class_name`, as a stock server does after its own
+        /// resolution failed.
+        class_name: Option<String>,
     },
 
     /// An object that the transaction read is no longer current: a
@@ -61,6 +65,13 @@ pub enum Error {
     /// The server sent a frame that the protocol does not allow.
     #[error("the server breaks the protocol: {0}")]
     Protocol(String),
+
+    /// The server speaks another protocol than `M5`, as a ZEO 4 server
+    /// (`Z4`) or a ZEO 5 server without msgpack (`Z5`). The client sent
+    /// nothing. As for `ZEO.ClientStorage`, the open counts it as a failed
+    /// connection.
+    #[error("the server speaks the protocol {}", String::from_utf8_lossy(.0))]
+    OtherProtocol(Vec<u8>),
 
     /// An argument that the client cannot send.
     #[error("the client cannot send this: {0}")]
