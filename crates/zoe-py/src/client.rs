@@ -5,8 +5,12 @@
 //! holds a pool of connections to one storage of a server (ADR 0036): the
 //! listener, and one connection for each transaction that runs. It
 //! connects over TCP or a unix domain socket, with TLS or without, to the
-//! first of its addresses that opens. It has no cache, no blob and no
-//! reconnect.
+//! first of its addresses that opens. It has no blob and no reconnect.
+//!
+//! With a `cache_size`, the pool holds a client cache in memory (ADR 0034).
+//! A hit runs on the calling thread: it takes no lock, sends nothing and
+//! does not release the GIL. A miss loads from the server and stores the
+//! reply.
 //!
 //! The pool delivers the tids of the listener in one order. A thread of
 //! `zoe.zeo` takes each commit of another client with `next_delivery` and
@@ -43,8 +47,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Connect, Delivery, Endpoint, Error, Options, Pool, PoolTransaction, Tls, TlsOptions,
-    Tokio, Turn, traced,
+    Address, Cache, Connect, Delivery, Endpoint, Error, Options, Pool, PoolTransaction, Tls,
+    TlsOptions, Tokio, Turn, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -62,6 +66,9 @@ const POOL_BOUND: usize = 64;
 
 /// The deepest nesting of a value that the client converts.
 const DEPTH: usize = 32;
+
+/// The `before` of a load of the current record: ZODB's `maxtid`.
+const MAX_TID: Tid = Tid(i64::MAX as u64);
 
 /// The extension that lets a call carry the trace context of the client.
 const TRACE_CONTEXT: &str = "trace_context";
@@ -120,6 +127,9 @@ pub(crate) struct NativeClient {
     runtime: &'static Runtime,
     /// The pool, until `close`.
     pool: Mutex<Option<Arc<Pool>>>,
+    /// The client cache of the pool, if any. The hits read it without the
+    /// mutex of the pool. The close empties it.
+    cache: Option<Arc<Cache>>,
     /// The transactions that `begin` gave, while they live.
     open: Mutex<Vec<Weak<Slot>>>,
     /// The last tid of the listener after the open.
@@ -142,6 +152,10 @@ impl NativeClient {
     /// `pool_bound` more connections to the same server, each for one
     /// transaction at a time, when a transaction finds none free. A
     /// `pool_bound` of 0 raises `ValueError`.
+    ///
+    /// A `cache_size` above 0 gives the pool a client cache whose ring
+    /// holds that many bytes. A `cache_size` from 1 to 7 raises
+    /// `ValueError`.
     ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
@@ -167,7 +181,7 @@ impl NativeClient {
     #[new]
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
-        pool_bound=POOL_BOUND, tls=None, traceparent=None
+        pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -179,6 +193,7 @@ impl NativeClient {
         extensions: Vec<String>,
         wait_timeout: f64,
         pool_bound: usize,
+        cache_size: u64,
         tls: Option<TlsArgs>,
         traceparent: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
@@ -187,6 +202,13 @@ impl NativeClient {
         if pool_bound == 0 {
             return Err(PyValueError::new_err("pool_bound is at least 1"));
         }
+        let cache = match cache_size {
+            0 => None,
+            size => Some(
+                Cache::new(size)
+                    .map_err(|e| PyValueError::new_err(format!("cache_size {size}: {e}")))?,
+            ),
+        };
         let targets = addresses
             .iter()
             .map(Target::extract)
@@ -223,7 +245,7 @@ impl NativeClient {
             });
             // The pool starts its dispatcher on the runtime.
             let _inside = runtime.enter();
-            let pool = Pool::new(Arc::new(Tokio), listener, connect, pool_bound);
+            let pool = Pool::with_cache(Arc::new(Tokio), listener, connect, pool_bound, cache);
             Ok((runtime, pool))
         });
         let (runtime, pool) = match opened {
@@ -245,6 +267,7 @@ impl NativeClient {
             read_only: listener.read_only(),
             address: listener.address().clone(),
             opened_at: pool.last_transaction(),
+            cache: pool.cache().cloned(),
             pool: Mutex::new(Some(Arc::new(pool))),
             open: Mutex::new(Vec::new()),
             traceparent: traceparent.filter(|_| traces),
@@ -335,7 +358,9 @@ impl NativeClient {
 
     /// Return the record of `oid` that was current before `tid`: its
     /// pickle, its serial and the serial of the next record or `None`.
-    /// Return `None` when `oid` has no record before `tid`.
+    /// Return `None` when `oid` has no record before `tid`. A hit of the
+    /// cache sends nothing to the server. A miss stores the reply in the
+    /// cache.
     #[allow(clippy::type_complexity)]
     fn load_before<'py>(
         &self,
@@ -350,6 +375,17 @@ impl NativeClient {
         )>,
     > {
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
+        self.check_process()?;
+        if let Some(cache) = &self.cache
+            && let Some((data, start, end)) =
+                cache.load_before_with(oid, tid, |len, fill| bytes(py, len, fill))
+        {
+            return Ok(Some((
+                data,
+                p64(py, start.0),
+                end.map(|end| p64(py, end.0)),
+            )));
+        }
         let pool = self.pool(py)?;
         let trace = self.traceparent(py)?;
         let runtime = self.runtime;
@@ -363,6 +399,42 @@ impl NativeClient {
                 record.end.map(|end| p64(py, end.0)),
             )
         }))
+    }
+
+    /// Return the current record of `oid`: its pickle and its serial, or
+    /// `None` when `oid` has no record. A hit of the current entry of the
+    /// cache sends nothing to the server, as `load` of `ZEO.ClientStorage`
+    /// does. A miss stores the reply in the cache.
+    #[allow(clippy::type_complexity)]
+    fn load<'py>(
+        &self,
+        py: Python<'py>,
+        oid: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>> {
+        let oid = Oid(u64_of(oid)?);
+        self.check_process()?;
+        if let Some(cache) = &self.cache
+            && let Some((data, start)) = cache.load_with(oid, |len, fill| bytes(py, len, fill))
+        {
+            return Ok(Some((data, p64(py, start.0))));
+        }
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py)?;
+        let runtime = self.runtime;
+        let (record, _position) = py
+            .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
+            .map_err(|e| client_error(py, e))?;
+        Ok(record.map(|record| (PyBytes::new(py, &record.data), p64(py, record.tid.0))))
+    }
+
+    /// Empty the cache, and keep the tid up to which it applied the
+    /// commits. Without a cache, do nothing.
+    fn cache_clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_process()?;
+        if let Some(cache) = &self.cache {
+            py.detach(|| cache.clear());
+        }
+        Ok(())
     }
 
     /// Return the pickle of `oid` that the transaction `serial` wrote.
@@ -715,6 +787,23 @@ impl Drop for NativeTransaction {
         drop(txn);
         drop(turn);
     }
+}
+
+/// The `out` of a lookup of the cache: a `bytes` of `len` bytes that `fill`
+/// fills and checks, or `None` when the check fails.
+fn bytes<'py>(
+    py: Python<'py>,
+    len: usize,
+    fill: &mut dyn FnMut(&mut [u8]) -> bool,
+) -> Option<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, len, |buf| {
+        if fill(buf) {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err("the entry changed during the copy"))
+        }
+    })
+    .ok()
 }
 
 /// Return the W3C traceparent of `traceparent()`, or `None` without the

@@ -2372,11 +2372,13 @@ name = "zoe-client"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "libc",
  "rmpv",
  "rustls",
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "xxhash-rust",
  "zoe-core",
  "zoe-server",
 ]

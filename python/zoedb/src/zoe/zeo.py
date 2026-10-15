@@ -35,8 +35,9 @@ list that opens, with TLS from the `<ssl>` section of `<zoeclient>`. It
 takes no `ssl` context: TLS runs in Rust, and a context does not give back
 the files of its certificate and key. It runs several transactions at once,
 each on its own connection of a pool, with one more connection that orders
-the invalidations (ADR 0036). It has no cache, no blob and no reconnect. It
-declares
+the invalidations (ADR 0036). It keeps a client cache in memory, with the
+semantics of the cache of ZEO, of `cache_size` bytes (ADR 0034). It has no
+cache file, no blob and no reconnect. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It speaks
 only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
@@ -59,7 +60,7 @@ from ZODB.POSException import (
     StorageTransactionError,
     Unsupported,
 )
-from ZODB.utils import maxtid, z64
+from ZODB.utils import z64
 
 try:
     from opentelemetry.trace import get_current_span
@@ -361,7 +362,6 @@ _MB = 1024**2
 # not have yet, each with the value that leaves its feature off. Any other
 # value fails the open with an error that names the argument.
 _NOT_BUILT = {
-    "cache_size": 20 * _MB,
     "blob_dir": None,
     "shared_blob_dir": False,
     "blob_cache_size": None,
@@ -441,6 +441,17 @@ def _native_address(addr):
     return addr
 
 
+class _NativeCache:
+    """The `_cache` of the native client: its client cache, in Rust."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def clear(self):
+        """Drop every entry of the cache. zodbshootout calls it."""
+        self._native.cache_clear()
+
+
 class _NativeClientStorage(ClientStorage):
     """`zoe.zeo.ClientStorage` with the native client inside.
 
@@ -460,6 +471,10 @@ class _NativeClientStorage(ClientStorage):
     `tpc_finish` returns, and runs its callback, at the place of its tid in
     that order. `lastTransaction()` gives a tid only after the DB got its
     invalidations or the callback of its commit ran.
+
+    The client cache holds `cache_size` bytes of records, 20 MB by default,
+    in memory. 0 turns it off. The client applies each tid to the cache
+    before the DB gets it. `_cache.clear()` empties it.
     """
 
     def __init__(
@@ -556,9 +571,11 @@ class _NativeClientStorage(ClientStorage):
             extensions=list(_NATIVE_EXTENSIONS),
             wait_timeout=float(wait_timeout or 30),
             pool_bound=_POOL_BOUND,
+            cache_size=cache_size,
             tls=tls,
             traceparent=_traceparent,
         )
+        self._cache = _NativeCache(self._native)
         try:
             # A read-only fallback registers read-only.
             self._is_read_only = self._native.read_only()
@@ -613,7 +630,7 @@ class _NativeClientStorage(ClientStorage):
         raise Unsupported("the native client has no blobs yet")
 
     def prefetch(self, oids, tid):
-        # The client has no cache, so a prefetch has nothing to fill.
+        # The client does not prefetch: each load fills the cache.
         pass
 
     # The state of the connection.
@@ -680,10 +697,11 @@ class _NativeClientStorage(ClientStorage):
     # The loads.
 
     def load(self, oid, version=""):
-        result = self.loadBefore(oid, maxtid)
+        # The current entry of the cache answers, as for ZEO.
+        result = self._native.load(oid)
         if result is None:
             raise POSKeyError(oid)
-        return result[:2]
+        return result
 
     def loadBefore(self, oid, tid):
         return self._native.load_before(oid, tid)

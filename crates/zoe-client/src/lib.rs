@@ -8,7 +8,10 @@
 //!
 //! `Pool` runs several transactions at once on a pool of connections, and
 //! delivers the tids of its listener connection in one order (ADR 0036).
+//! It can hold a `Cache`, the client cache of ADR 0034, with the semantics
+//! of the cache of ZEO.
 
+mod cache;
 mod client;
 mod endpoint;
 mod error;
@@ -17,6 +20,7 @@ mod protocol;
 pub mod runtime;
 mod tls;
 
+pub use cache::{Cache, CacheCounts};
 pub use client::{
     BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
     Transaction, traced,
