@@ -1,5 +1,7 @@
-//! The client cache: the layout of ADR 0034 (proposed) in one anonymous
-//! mapping, with the semantics of `ZEO.cache.ClientCache`.
+//! The client cache: the layout of ADR 0034 (proposed) in one mapping,
+//! with the semantics of `ZEO.cache.ClientCache`. The mapping is anonymous
+//! (`Cache::new`), or a file that one process maps (`Cache::open`, in
+//! `file.rs`). The same code reads and writes both.
 //!
 //! The mapping holds a header, an index and a ring of entries. An entry is
 //! the data of one revision of an oid, with its start tid and its end tid.
@@ -24,8 +26,10 @@
 //! moves the head, then a release fence, then writes the entry; the reader
 //! copies the entry, then an acquire fence, then loads the head.
 
+mod file;
 mod mapping;
 
+use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
@@ -41,16 +45,26 @@ const HEADER_WORDS: usize = 512;
 /// The magic of the header: `ZOECACH` and the version of the layout.
 const MAGIC: u64 = u64::from_le_bytes(*b"ZOECACH\x01");
 
-// The words of the header. The magic, the size of the ring and the number
-// of slots have a checksum. The words 4 and 5 hold the boot id of the
-// kernel, the word 6 the clean flag and the word 9 the checksum of the
-// state. An anonymous mapping leaves them at zero: only a file uses them.
+// The words of the header. The static checksum covers the magic, the size
+// of the ring, the number of slots and the name of the storage. The words 4
+// and 5 hold the boot id of the kernel, the word 6 the clean flag and the
+// word 9 the checksum of the state. An anonymous mapping leaves these four
+// words at zero: only a file uses them.
 const H_MAGIC: usize = 0;
 const H_RING: usize = 1;
 const H_SLOTS: usize = 2;
 const H_STATIC_SUM: usize = 3;
+const H_BOOT: usize = 4;
+const H_CLEAN: usize = 6;
 const H_APPLIED: usize = 7;
 const H_HEAD: usize = 8;
+const H_STATE_SUM: usize = 9;
+/// The length of the name of the storage, then its bytes in 32 words.
+const H_STORAGE: usize = 10;
+/// The most bytes of the name of the storage.
+const STORAGE_BYTES: usize = 256;
+/// The words of the header that the static checksum covers.
+const STATIC_WORDS: usize = 3 + 1 + STORAGE_BYTES / 8;
 
 // The words of the head of an entry. `end` is the only word that changes in
 // place. Its change writes the head checksum again.
@@ -118,6 +132,9 @@ impl Head {
 
 /// The client cache of one storage, in one process.
 pub struct Cache {
+    /// The cache file, which holds its lock, until the close. `None` for an
+    /// anonymous mapping.
+    file: Mutex<Option<File>>,
     map: Mapping,
     /// The bytes of the ring, a multiple of 8.
     ring: u64,
@@ -128,8 +145,79 @@ pub struct Cache {
     base: usize,
     /// The lock of the writers, with their counts.
     writer: Mutex<CacheCounts>,
-    /// The cache stores nothing more: it was closed, or its order was lost.
+    /// The cache serves and writes nothing more: it was closed, or its
+    /// order was lost.
     disabled: AtomicBool,
+    /// The cache serves. A file with entries serves only after its
+    /// verification against the server.
+    verified: AtomicBool,
+}
+
+/// The layout of a cache: the bytes of the ring, the number of slots, the
+/// first word of the ring, and the words of the mapping.
+struct Layout {
+    ring: u64,
+    slots: u64,
+    base: usize,
+    words: usize,
+}
+
+impl Layout {
+    /// Return the layout of a cache whose ring holds `size` bytes, rounded
+    /// down to a multiple of 8.
+    fn of(size: u64) -> io::Result<Layout> {
+        let ring = size / 8 * 8;
+        if ring == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the cache holds at least 8 bytes",
+            ));
+        }
+        let slots = (ring / BYTES_PER_SLOT).max(MIN_SLOTS).next_power_of_two();
+        let too_large = || io::Error::new(io::ErrorKind::InvalidInput, "the cache is too large");
+        let index_words = usize::try_from(slots * 2).map_err(|_| too_large())?;
+        let ring_words = usize::try_from(ring / 8).map_err(|_| too_large())?;
+        let words = HEADER_WORDS
+            .checked_add(index_words)
+            .and_then(|n| n.checked_add(ring_words))
+            .filter(|words| words.checked_mul(8).is_some())
+            .ok_or_else(too_large)?;
+        Ok(Layout {
+            ring,
+            slots,
+            base: HEADER_WORDS + index_words,
+            words,
+        })
+    }
+
+    /// Return the static words of the header for the storage `storage`:
+    /// the magic, the size of the ring, the number of slots, the length of
+    /// the name and its bytes. The name holds at most `STORAGE_BYTES`.
+    fn static_words(&self, storage: &[u8]) -> io::Result<[u64; STATIC_WORDS]> {
+        if storage.len() > STORAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the name of the storage is longer than {STORAGE_BYTES} bytes"),
+            ));
+        }
+        let mut words = [0u64; STATIC_WORDS];
+        words[H_MAGIC] = MAGIC;
+        words[H_RING] = self.ring;
+        words[H_SLOTS] = self.slots;
+        words[3] = storage.len() as u64;
+        for (word, chunk) in words[4..].iter_mut().zip(storage.chunks(8)) {
+            let mut bytes = [0u8; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_le_bytes(bytes);
+        }
+        Ok(words)
+    }
+}
+
+/// The checksum of a slice of words.
+fn words_sum(words: &[u64]) -> u64 {
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    xxh3_64(&bytes)
 }
 
 fn align8(n: u64) -> u64 {
@@ -150,50 +238,45 @@ impl Cache {
     /// mapping. The header and the index come on top. `size` rounds down
     /// to a multiple of 8, and must hold at least one word.
     pub fn new(size: u64) -> io::Result<Cache> {
-        let ring = size / 8 * 8;
-        if ring == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the cache holds at least 8 bytes",
-            ));
-        }
-        let slots = (ring / BYTES_PER_SLOT).max(MIN_SLOTS).next_power_of_two();
-        let too_large = || io::Error::new(io::ErrorKind::InvalidInput, "the cache is too large");
-        let index_words = usize::try_from(slots * 2).map_err(|_| too_large())?;
-        let ring_words = usize::try_from(ring / 8).map_err(|_| too_large())?;
-        let words = HEADER_WORDS
-            .checked_add(index_words)
-            .and_then(|n| n.checked_add(ring_words))
-            .ok_or_else(too_large)?;
-        let cache = Cache {
-            map: Mapping::anonymous(words)?,
-            ring,
-            slots,
-            index: HEADER_WORDS,
-            base: HEADER_WORDS + index_words,
-            writer: Mutex::new(CacheCounts::default()),
-            disabled: AtomicBool::new(false),
-        };
-        cache.init();
+        let layout = Layout::of(size)?;
+        let fixed = layout.static_words(b"")?;
+        let cache = Cache::with(layout.words, &layout, None)?;
+        cache.init(&fixed);
         Ok(cache)
     }
 
-    /// Write the header of an empty cache.
-    fn init(&self) {
-        let mut fixed = [0u8; 24];
-        for (chunk, word) in fixed
-            .as_chunks_mut::<8>()
-            .0
-            .iter_mut()
-            .zip([MAGIC, self.ring, self.slots])
-        {
-            *chunk = word.to_le_bytes();
+    /// Return a cache on a new mapping of `layout`: of `file`, else
+    /// anonymous. It serves at once.
+    fn with(words: usize, layout: &Layout, file: Option<File>) -> io::Result<Cache> {
+        let map = match &file {
+            Some(file) => Mapping::shared(file, words)?,
+            None => Mapping::anonymous(words)?,
+        };
+        Ok(Cache {
+            file: Mutex::new(file),
+            map,
+            ring: layout.ring,
+            slots: layout.slots,
+            index: HEADER_WORDS,
+            base: layout.base,
+            writer: Mutex::new(CacheCounts::default()),
+            disabled: AtomicBool::new(false),
+            verified: AtomicBool::new(true),
+        })
+    }
+
+    /// Write the header of an empty cache, with the static words `fixed`.
+    /// The other words of the mapping must be zero.
+    fn init(&self, fixed: &[u64; STATIC_WORDS]) {
+        for (i, word) in fixed.iter().enumerate() {
+            let index = match i {
+                0..3 => i,
+                _ => H_STORAGE + i - 3,
+            };
+            self.word(index).store(*word, Ordering::Relaxed);
         }
-        self.word(H_MAGIC).store(MAGIC, Ordering::Relaxed);
-        self.word(H_RING).store(self.ring, Ordering::Relaxed);
-        self.word(H_SLOTS).store(self.slots, Ordering::Relaxed);
         self.word(H_STATIC_SUM)
-            .store(xxh3_64(&fixed), Ordering::Relaxed);
+            .store(words_sum(fixed), Ordering::Relaxed);
         self.word(H_APPLIED).store(0, Ordering::Relaxed);
         // The positions start at one ring, so the position 0 is no entry.
         self.word(H_HEAD).store(self.ring, Ordering::Release);
@@ -212,6 +295,12 @@ impl Cache {
     /// Return the counts of the writers.
     pub fn counts(&self) -> CacheCounts {
         *self.lock()
+    }
+
+    /// Tell if the cache serves: it is verified and not closed. A cache
+    /// that a file gave serves only after `verify`.
+    pub fn verified(&self) -> bool {
+        self.verified.load(Ordering::Acquire) && !self.disabled.load(Ordering::Relaxed)
     }
 
     /// Tell if an entry with `len` bytes of data fits: an entry larger
@@ -349,6 +438,9 @@ impl Cache {
         before: Tid,
         out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
     ) -> Option<(R, Tid, Option<Tid>)> {
+        if !self.verified() {
+            return None;
+        }
         let applied = self.applied().0;
         let before = before.0;
         let entry = self.chain(oid.0).find(|entry| {
@@ -370,6 +462,9 @@ impl Cache {
         oid: Oid,
         out: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> bool) -> Option<R>,
     ) -> Option<(R, Tid)> {
+        if !self.verified() {
+            return None;
+        }
         let entry = self.chain(oid.0).find(|entry| entry.end == 0)?;
         self.read(&entry, out)
             .map(|(result, start, _)| (result, start))
@@ -414,7 +509,7 @@ impl Cache {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        if self.disabled.load(Ordering::Relaxed) {
+        if !self.verified() {
             return;
         }
         // Under the lock, the entry is still the newest of its oid and
@@ -442,13 +537,14 @@ impl Cache {
     /// position of the connection that carried the reply, taken when the
     /// reply arrived. A current reply goes in only when `applied` is not
     /// above `seen`. A record with an end always goes in. Return whether
-    /// the cache took it: a lookup can then find it.
+    /// the cache took it: a lookup can then find it. A cache that does not
+    /// serve stores nothing.
     pub fn store(&self, oid: Oid, start: Tid, end: Option<Tid>, data: &[u8], seen: Tid) -> bool {
         if !self.fits(data.len()) {
             return false;
         }
         let mut counts = self.lock();
-        if self.disabled.load(Ordering::Relaxed) {
+        if !self.verified() {
             return false;
         }
         if end.is_none() && self.applied().0 > seen.0 {
@@ -484,7 +580,14 @@ impl Cache {
                 continue;
             }
             if entry.start == start {
-                return false;
+                // Keep an intact entry of the revision. Drop one whose data
+                // fails its checksum, and store the revision again.
+                let mut stored = vec![0; entry.len as usize];
+                if self.copy(&entry, &mut stored) {
+                    return false;
+                }
+                self.set_end(&entry, entry.start);
+                continue;
             }
             if end == 0 && entry.end == 0 {
                 if entry.start > start {
@@ -507,9 +610,20 @@ impl Cache {
     }
 
     /// Apply the commit `tid` of another client: end the current entry of
-    /// each of `oids` at `tid`, then move `applied` to `tid`.
+    /// each of `oids` at `tid`, then move `applied` to `tid`. Before its
+    /// verification, a cache drops the current entry of each oid, and
+    /// `applied` stays.
     pub fn apply(&self, tid: Tid, oids: &[Oid]) {
         let _counts = self.lock();
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.verified.load(Ordering::Relaxed) {
+            for oid in oids {
+                self.drop_current_locked(oid.0);
+            }
+            return;
+        }
         for oid in oids {
             self.end_current(oid.0, tid.0);
         }
@@ -519,15 +633,23 @@ impl Cache {
     /// Apply the commit `tid` of this process. Each write ends the current
     /// entry of its oid at `tid`. A write with data then adds a current
     /// entry with that data. A write without data, such as an oid that the
-    /// server resolved, adds nothing. Then move `applied` to `tid`.
+    /// server resolved, adds nothing. Then move `applied` to `tid`. Before
+    /// its verification, a cache drops the current entry of each oid, and
+    /// `applied` stays.
     pub fn commit(&self, tid: Tid, writes: &[(Oid, Option<&[u8]>)]) {
         let mut counts = self.lock();
-        let disabled = self.disabled.load(Ordering::Relaxed);
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.verified.load(Ordering::Relaxed) {
+            for (oid, _) in writes {
+                self.drop_current_locked(oid.0);
+            }
+            return;
+        }
         for (oid, data) in writes {
             self.end_current(oid.0, tid.0);
-            if let Some(data) = data
-                && !disabled
-            {
+            if let Some(data) = data {
                 self.store_locked(&mut counts, oid.0, tid.0, 0, data);
             }
         }
@@ -538,7 +660,14 @@ impl Cache {
     /// does after a `ConflictError`. The entries with an end stay.
     pub fn drop_current(&self, oid: Oid) {
         let _counts = self.lock();
-        for entry in self.chain(oid.0) {
+        if !self.disabled.load(Ordering::Relaxed) {
+            self.drop_current_locked(oid.0);
+        }
+    }
+
+    /// Drop the current entries of `oid`. The caller holds the writer lock.
+    fn drop_current_locked(&self, oid: u64) {
+        for entry in self.chain(oid) {
             if entry.end == 0 {
                 self.set_end(&entry, entry.start);
             }
@@ -549,38 +678,64 @@ impl Cache {
     /// rings forward.
     pub fn clear(&self) {
         let _counts = self.lock();
-        self.clear_locked();
+        if !self.disabled.load(Ordering::Relaxed) {
+            self.clear_locked();
+        }
     }
 
     /// Verify the cache against a server whose last tid is `tid`, as
     /// `verify` of ZEO does after a connection. `changed` gives the oids
     /// that the commits after `applied` wrote: the current entry of each
-    /// goes, and the other entries stay. `None` drops every entry. Then
-    /// `applied` moves to `tid`. One hold of the writer lock does both, so
-    /// a store that runs after it refuses a current reply older than `tid`.
+    /// goes, and the other entries stay, and `applied` moves up to `tid`.
+    /// `None` drops every entry, and `applied` becomes `tid`, also when it
+    /// was above. One hold of the writer lock does both, so a store that
+    /// runs after it refuses a current reply older than `tid`. Then the
+    /// cache serves.
     pub fn verify(&self, tid: Tid, changed: Option<&[Oid]>) {
         let _counts = self.lock();
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
         match changed {
             Some(oids) => {
                 for oid in oids {
-                    for entry in self.chain(oid.0) {
-                        if entry.end == 0 {
-                            self.set_end(&entry, entry.start);
-                        }
-                    }
+                    self.drop_current_locked(oid.0);
                 }
+                self.set_applied(tid.0);
             }
-            None => self.clear_locked(),
+            None => {
+                self.clear_locked();
+                self.word(H_APPLIED).store(tid.0, Ordering::Release);
+            }
         }
-        self.set_applied(tid.0);
+        self.verified.store(true, Ordering::Release);
     }
 
-    /// Drop every entry, and store nothing more. After the close, or after
-    /// the loss of the order of the commits.
+    /// Drop every entry, and serve and write nothing more. After the loss
+    /// of the order of the commits.
     pub fn disable(&self) {
         let _counts = self.lock();
+        if !self.disabled.load(Ordering::Relaxed) {
+            self.clear_locked();
+            self.disabled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Close the cache: it serves and writes nothing more. An anonymous
+    /// mapping drops every entry. A file keeps its entries: the close
+    /// writes the mapping to the file, marks the file clean, and frees the
+    /// lock of the file. A second close does nothing.
+    pub fn close(&self) {
+        let _counts = self.lock();
+        let file = self.file.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if self.disabled.load(Ordering::Relaxed) && file.is_none() {
+            return;
+        }
+        match file {
+            None => self.clear_locked(),
+            Some(_) => self.write_clean(),
+        }
         self.disabled.store(true, Ordering::Relaxed);
-        self.clear_locked();
     }
 
     fn clear_locked(&self) {

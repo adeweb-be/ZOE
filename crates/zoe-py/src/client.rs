@@ -16,10 +16,10 @@
 //! only the name of the file. `zoe.zeo` keeps the blob cache: its layout,
 //! its locks and its pruning.
 //!
-//! With a `cache_size`, the pool holds a client cache in memory (ADR 0034).
-//! A hit runs on the calling thread: it takes no lock, sends nothing and
-//! does not release the GIL. A miss loads from the server and stores the
-//! reply.
+//! With a `cache_size`, the pool holds a client cache (ADR 0034): in
+//! memory, or in the file `cache_path`, which survives the process. A hit
+//! runs on the calling thread: it takes no lock, sends nothing and does not
+//! release the GIL. A miss loads from the server and stores the reply.
 //!
 //! The pool delivers the tids of the listener in one order. A thread of
 //! `zoe.zeo` takes each commit of another client, and each change of the
@@ -187,6 +187,15 @@ impl NativeClient {
     /// `ValueError`. A mapping that the kernel does not give raises
     /// `MemoryError`.
     ///
+    /// With `cache_path`, the cache is that file, which the open creates
+    /// when it does not exist (ADR 0034, stage 2). The open takes the lock
+    /// of the file before it connects: a file that another open holds
+    /// raises `zc.lockfile.LockError`, as the cache of ZEO does. A name of
+    /// the storage longer than 256 bytes raises `ValueError`, and an error
+    /// of the file raises `OSError`. A file with entries serves only after
+    /// its verification against the server; with `wait`, the open waits
+    /// for it, at most `wait_timeout` seconds.
+    ///
     /// An address is a `(host, port)` tuple or the path of a unix domain
     /// socket as a `str`. The client connects to all of them and keeps one
     /// server: with `read_only_fallback`, a writable server before a
@@ -221,7 +230,7 @@ impl NativeClient {
     #[pyo3(signature = (
         addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout,
         pool_bound=POOL_BOUND, cache_size=0, tls=None, traceparent=None, wait=true,
-        disconnect_poll=DISCONNECT_POLL
+        disconnect_poll=DISCONNECT_POLL, cache_path=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -238,6 +247,7 @@ impl NativeClient {
         traceparent: Option<Py<PyAny>>,
         wait: bool,
         disconnect_poll: f64,
+        cache_path: Option<PathBuf>,
     ) -> PyResult<Self> {
         let timeout = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -248,9 +258,9 @@ impl NativeClient {
         if pool_bound == 0 {
             return Err(PyValueError::new_err("pool_bound is at least 1"));
         }
-        let cache = match cache_size {
-            0 => None,
-            size => Some(Cache::new(size).map_err(|e| {
+        let cache = match (cache_size, cache_path) {
+            (0, _) => None,
+            (size, None) => Some(Cache::new(size).map_err(|e| {
                 let text = format!("cache_size {size}: {e}");
                 // A size that the cache refuses is a bad value. Any other
                 // error is a mapping that the kernel did not give.
@@ -259,6 +269,17 @@ impl NativeClient {
                     _ => PyMemoryError::new_err(text),
                 }
             })?),
+            (size, Some(path)) => {
+                let name = storage.as_bytes();
+                let opened = py.detach(|| Cache::open(&path, size, name));
+                Some(opened.map_err(|e| match e.kind() {
+                    io::ErrorKind::WouldBlock => errors::lock_failure(py, &path),
+                    io::ErrorKind::InvalidInput => {
+                        PyValueError::new_err(format!("cache_size {size}: {e}"))
+                    }
+                    _ => e.into(),
+                })?)
+            }
         };
         let targets = addresses
             .iter()
@@ -300,6 +321,10 @@ impl NativeClient {
             // The pool starts its tasks on the runtime.
             let _inside = runtime.enter();
             let pool = Pool::with_reconnect(Arc::new(Tokio), first, pool_bound, cache, reconnect);
+            // A cache file with entries serves after its verification.
+            if wait {
+                let _ = runtime.block_on(tokio::time::timeout(timeout, pool.ready()));
+            }
             Ok((runtime, pool))
         });
         let (runtime, pool) = match opened {

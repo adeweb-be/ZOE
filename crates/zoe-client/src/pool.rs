@@ -388,9 +388,10 @@ impl Pool {
         Pool::with_cache(runtime, listener, connect, bound, None)
     }
 
-    /// Start a pool as `new` does, with the client cache `cache`. The
-    /// cache must be empty: its `applied` moves to the last tid of the
-    /// listener.
+    /// Start a pool as `new` does, with the client cache `cache`. An empty
+    /// cache moves its `applied` to the last tid of the listener. A cache
+    /// that a file gave with entries serves only after the dispatcher
+    /// verified it against the listener (`Pool::ready`).
     pub fn with_cache(
         runtime: Arc<dyn Runtime>,
         listener: Client,
@@ -439,7 +440,8 @@ impl Pool {
                 state.fresh = true;
             }
         }
-        // An empty cache is true at any tid.
+        // An empty cache is true at any tid. A cache that waits for its
+        // verification keeps its `applied`.
         if let Some(cache) = &cache {
             cache.apply(Tid(state.last), &[]);
         }
@@ -473,6 +475,18 @@ impl Pool {
     /// Return the most connections that commit at once.
     pub fn bound(&self) -> usize {
         self.shared.bound
+    }
+
+    /// Wait until the cache of the pool serves: a cache that a file gave
+    /// serves after its verification. Return at once without a cache, and
+    /// at the close.
+    pub async fn ready(&self) {
+        let Some(cache) = &self.shared.cache else {
+            return;
+        };
+        self.shared
+            .until(|state| (state.closed || cache.verified()).then_some(()))
+            .await;
     }
 
     /// Return the client cache of the pool, if it has one. A hit there
@@ -729,7 +743,7 @@ impl Pool {
             (std::mem::take(&mut state.free), state.pending.take())
         };
         if let Some(cache) = &self.shared.cache {
-            cache.disable();
+            cache.close();
         }
         self.shared.bump();
         {
@@ -1234,6 +1248,21 @@ enum Route {
 /// listener is lost, give the stale mark, then connect again if the pool
 /// does. Stop at the close.
 async fn dispatch(shared: Arc<Shared>, mut stream: Option<Invalidations>) {
+    // A cache that a file gave serves only after its verification against
+    // the first listener, at the last tid that the start read.
+    if let Some(cache) = &shared.cache
+        && stream.is_some()
+        && !cache.verified()
+    {
+        let Ok(listener) = shared.listener() else {
+            return;
+        };
+        let server_tid = Tid(shared.lock().last);
+        if !verify_file(&shared, cache, &listener, server_tid).await {
+            return;
+        }
+        shared.bump();
+    }
     loop {
         if let Some(mut invalidations) = stream.take() {
             let Ok(listener) = shared.listener() else {
@@ -1570,7 +1599,11 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
     };
     if fresh {
         if let Some(cache) = &shared.cache {
-            cache.verify(server_tid, Some(&[]));
+            if cache.verified() {
+                cache.verify(server_tid, Some(&[]));
+            } else if !verify_file(shared, cache, client, server_tid).await {
+                return Verified::Closed;
+            }
         }
         return Verified::Taken(Verification::Kept, None);
     }
@@ -1616,6 +1649,39 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
                 cache.verify(server_tid, None);
             }
             Verified::Taken(Verification::Dropped, Some(server_tid.0))
+        }
+    }
+}
+
+/// Verify a cache that a file gave against `client`, whose last tid is
+/// `server_tid`, before the cache serves. The pool delivers nothing for it:
+/// the consumer starts at the last tid of the pool.
+///
+/// The base is `applied` of the cache. A server tid equal to the base keeps
+/// the cache. A higher one asks `getInvalidations(base)`: a reply drops the
+/// current entry of each of its oids, and `None` or an error drops every
+/// entry. A server tid below the base drops every entry too, and `applied`
+/// becomes the server tid. Then the cache serves. Return false at the
+/// close.
+async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
+    let base = cache.applied();
+    if base == server_tid {
+        cache.verify(server_tid, Some(&[]));
+        return true;
+    }
+    if base > server_tid {
+        cache.verify(server_tid, None);
+        return true;
+    }
+    match shared.unless_closed(client.get_invalidations(base)).await {
+        None => false,
+        Some(Ok(Some(invalidation))) => {
+            cache.verify(invalidation.tid, Some(&invalidation.oids));
+            true
+        }
+        Some(Ok(None) | Err(_)) => {
+            cache.verify(server_tid, None);
+            true
         }
     }
 }
