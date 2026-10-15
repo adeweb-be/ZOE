@@ -259,4 +259,38 @@ def test_each_client_imports_the_modules_of_its_calls(name):
         assert "zoe._zoe" in sys.modules
         assert opener.keywords == {"native": True}
     else:
+        # ZEO imports msgpack in its handshake.
+        assert "msgpack" in sys.modules
         assert opener.keywords == {}
+
+
+def test_an_import_after_the_start_of_the_clock_fails(tmp_path, monkeypatch):
+    before = set(sys.modules)
+    clientworker.check_no_imports(before)
+    (tmp_path / "fakelate.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "fakelate", raising=False)
+    __import__("fakelate")
+    try:
+        with pytest.raises(RuntimeError, match="fakelate"):
+            clientworker.check_no_imports(before)
+    finally:
+        sys.modules.pop("fakelate", None)
+
+
+def test_a_warm_round_whose_open_imports_a_module_fails(fake_client, tmp_path):
+    spec, _ = fake_client
+    (tmp_path / "fakelate.py").write_text("")
+    real = clientworker.open_client
+
+    def open_client(spec, worker, opener):
+        __import__("fakelate")
+        return real(spec, worker, opener)
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(clientworker, "open_client", open_client)
+            with pytest.raises(RuntimeError, match="fakelate"):
+                clientworker.run_threads(spec)
+    finally:
+        sys.modules.pop("fakelate", None)
