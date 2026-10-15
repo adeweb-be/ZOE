@@ -603,6 +603,22 @@ impl Client {
         description: &[u8],
         extension: &[u8],
     ) -> Result<Transaction, Error> {
+        self.begin_with(user, description, extension, None, " ")
+            .await
+    }
+
+    /// Begin a transaction as `begin` does, with the tid and the status of
+    /// `tpc_begin`. With a tid, the transaction commits under that tid, as
+    /// ZODB's copy functions ask. `status` is `" "`, or `"p"` for a
+    /// transaction that a pack changed.
+    pub async fn begin_with(
+        &self,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+        tid: Option<Tid>,
+        status: &str,
+    ) -> Result<Transaction, Error> {
         let extension = extension_map(extension)?;
         let guard = self.inner.commit.clone().lock_owned().await;
         let id = self.inner.next_txn.fetch_add(1, Ordering::SeqCst);
@@ -614,8 +630,8 @@ impl Client {
                     user.into(),
                     description.into(),
                     extension,
-                    Value::Nil,
-                    " ".into(),
+                    tid.map_or(Value::Nil, |tid| bin8(tid.0)),
+                    status.into(),
                 ],
             )
             .await?;

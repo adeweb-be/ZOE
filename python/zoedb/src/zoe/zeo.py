@@ -723,16 +723,20 @@ class _NativeClientStorage(ClientStorage):
         self._check_process()
         if self._is_read_only:
             raise ReadOnlyError()
-        if tid is not None:
-            raise Unsupported("the native client does not restore transactions yet")
         if txn is self._transaction:
             raise StorageTransactionError(
                 "Duplicate tpc_begin calls for same transaction"
             )
         self._commit_lock.acquire()
         try:
+            if isinstance(status, bytes):
+                status = status.decode("ascii")
             self._native.begin(
-                _as_bytes(txn.user), _as_bytes(txn.description), txn.extension
+                _as_bytes(txn.user),
+                _as_bytes(txn.description),
+                txn.extension,
+                tid,
+                status,
             )
         except BaseException:
             self._commit_lock.release()

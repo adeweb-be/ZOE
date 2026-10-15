@@ -339,15 +339,20 @@ impl NativeClient {
     }
 
     /// Begin a transaction. `extension` is the dict of the transaction
-    /// extension. The caller holds the commit lock: a second transaction
-    /// raises `StorageTransactionError`.
+    /// extension. With `tid`, the transaction commits under that tid, with
+    /// the status `status`. The caller holds the commit lock: a second
+    /// transaction raises `StorageTransactionError`.
+    #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned()))]
     fn begin(
         &self,
         py: Python<'_>,
         user: &[u8],
         description: &[u8],
         extension: &Bound<'_, PyAny>,
+        tid: Option<&Bound<'_, PyAny>>,
+        status: String,
     ) -> PyResult<()> {
+        let tid = tid.map(u64_of).transpose()?.map(Tid);
         let mut encoded = Vec::new();
         rmpv::encode::write_value(&mut encoded, &to_value(extension, 0)?)
             .map_err(|e| PyValueError::new_err(format!("the extension does not encode: {e}")))?;
@@ -360,7 +365,7 @@ impl NativeClient {
             if slot.is_some() {
                 return Err(Error::Invalid("a transaction is open".into()));
             }
-            let begin = client.begin(&user, &description, &encoded);
+            let begin = client.begin_with(&user, &description, &encoded, tid, &status);
             let txn = runtime.block_on(traced(trace, begin))?;
             *slot = Some(txn);
             Ok(())
