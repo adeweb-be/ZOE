@@ -129,9 +129,10 @@ pub enum Verification {
     /// The server had no commit after the last tid of the pool, or the pool
     /// never had a listener.
     Kept,
-    /// `getInvalidations` gave the commits after the last tid of the pool.
-    /// The consumer got them first, as one `Delivery::Invalidate`, unless
-    /// it already had their tid.
+    /// `getInvalidations` gave the commits after the base: `applied` of the
+    /// cache, or the last tid of the pool without a cache. The consumer got
+    /// them first, as one `Delivery::Invalidate`, unless it already had
+    /// their tid.
     Quick,
     /// The server does not keep the commits after the last tid of the
     /// pool. The cache dropped every entry, and any object can be stale.
@@ -708,7 +709,10 @@ impl Pool {
 
     /// Return the next delivery for the consumer, as `next_event` does. It
     /// confirms each other event itself. The consumer confirms each
-    /// delivery with `delivered`.
+    /// delivery with `delivered`. The consumer of a pool of
+    /// `with_reconnect` must call `next_event`: only that call gives
+    /// `Event::Connected(Verification::Dropped)`, after which any object
+    /// can be stale.
     pub async fn next_delivery(&self) -> Option<Delivery> {
         loop {
             match self.next_event().await? {
@@ -1544,7 +1548,9 @@ async fn reconnect(shared: &Shared) -> Option<Invalidations> {
             return None;
         }
         delay = settings.poll;
+        // A pending listener that the server closed since is of no use.
         let pending = shared.lock().pending.take();
+        let pending = pending.filter(|(client, _)| client.is_connected());
         let opened = match pending {
             Some(opened) => Ok(opened),
             None => shared.unless_closed((settings.open)(false)).await?,
@@ -1728,14 +1734,31 @@ async fn upgrade_forever(shared: Arc<Shared>) {
         if let Ok((client, connect)) = opened
             && !client.read_only()
         {
-            {
+            let kept = {
                 let mut state = shared.lock();
                 if state.closed {
                     return;
                 }
-                state.pending = Some((client, connect));
+                // The listener can change during the open: the pool lost it,
+                // and connected again. Then the writable listener comes too
+                // late, and the next attempt opens a new one.
+                let same = !state.lost
+                    && shared
+                        .server()
+                        .listener
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &listener));
+                if same {
+                    state.pending = Some((client, connect));
+                    None
+                } else {
+                    Some(client)
+                }
+            };
+            match kept {
+                None => listener.disconnect(),
+                Some(client) => client.disconnect(),
             }
-            listener.disconnect();
         }
     }
 }
