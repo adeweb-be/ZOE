@@ -1,0 +1,13 @@
+[package]
+name = "walproto"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+redb = "4.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = { version = "0.14", default-features = false }
+zoe-core = { path = "/home/user/ZOE/crates/zoe-core" }
+
+[profile.release]
+debug = 1

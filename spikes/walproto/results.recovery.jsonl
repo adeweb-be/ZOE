@@ -1,0 +1,2 @@
+{"log_mb":64.1,"commits":1068,"records":106800,"replayed_bytes":67169307,"replay_ms":82.1,"open_ms":82.6,"replay_ms_per_mb":1.28,"fold_ms":564.0}
+{"log_mb":256.1,"commits":4269,"records":426900,"replayed_bytes":268488541,"replay_ms":413.8,"open_ms":414.3,"replay_ms_per_mb":1.62,"fold_ms":2852.5}
