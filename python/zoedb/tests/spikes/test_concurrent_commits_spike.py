@@ -171,10 +171,10 @@ def test_the_cost_compares_one_connection_and_the_pool_with_and_without_the_rule
     )
 
 
-def test_the_adr_draft_is_proposed():
+def test_the_adr_has_a_status():
     drafts = sorted((ROOT / "docs" / "adr").glob(f"[0-9][0-9][0-9][0-9]-{ADR_NAME}"))
     assert len(drafts) == 1, drafts
     # The draft takes a number after the ADRs that exist: 0031 or later.
     assert int(drafts[0].name[:4]) >= 31, drafts[0].name
     text = drafts[0].read_text()
-    assert re.search(r"^Status: proposed", text, re.MULTILINE), "not proposed"
+    assert re.search(r"^Status: (proposed|accepted)", text, re.MULTILINE), "no status"
