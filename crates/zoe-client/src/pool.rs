@@ -375,6 +375,18 @@ impl Shared {
         self.server().listener.clone().ok_or(Error::Disconnected)
     }
 
+    /// Return the listener with its generation, or `None` when `generation`
+    /// is not the generation of now. Fail with `Error::Disconnected` while
+    /// the pool has no listener. The mutex of the state keeps the listener
+    /// and the generation together: a loss changes both under it.
+    fn listener_of(&self, generation: Option<u64>) -> Result<Option<(Arc<Client>, u64)>, Error> {
+        let state = self.lock();
+        if generation.is_some_and(|generation| generation != state.generation) {
+            return Ok(None);
+        }
+        Ok(Some((self.listener()?, state.generation)))
+    }
+
     /// Return a connection of the pool for a load, in turn: the listener
     /// or a connection that commits. Skip a connection that is lost. When
     /// all are lost, return the listener, so the load fails with
@@ -706,6 +718,51 @@ impl Pool {
     pub async fn notify(&self, method: &str, args: Vec<Value>) -> Result<(), Error> {
         check_listener_call(method)?;
         self.shared.listener()?.notify(method, args).await
+    }
+
+    /// Call `method` as `call` does, on the listener of `generation`, and
+    /// return the reply with the generation of the listener that gave it.
+    /// `None` takes the listener of now. The generation changes at each
+    /// loss of the listener of a pool that connects again. The state that
+    /// a call keeps on the server, as an iterator id, belongs to the
+    /// listener of its generation: the server of the next listener gives
+    /// the same ids to other state.
+    ///
+    /// When the listener of `generation` is gone, the call sends nothing
+    /// and fails as the server fails a call on an id that it does not know:
+    /// `Error::Server` with `builtins.KeyError` and the first arg.
+    pub async fn call_on(
+        &self,
+        generation: Option<u64>,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<(Value, u64), Error> {
+        check_listener_call(method)?;
+        let Some((listener, current)) = self.shared.listener_of(generation)? else {
+            let id = args.into_iter().next().unwrap_or(Value::Nil);
+            return Err(Error::Server {
+                class: "builtins.KeyError".into(),
+                message: id.to_string(),
+                value: Value::Array(vec![id]),
+            });
+        };
+        Ok((listener.call(method, args).await?, current))
+    }
+
+    /// Send `method` as `notify` does, on the listener of `generation`
+    /// (see `call_on`). When the listener of `generation` is gone, send
+    /// nothing: its server dropped the state of the connection.
+    pub async fn notify_on(
+        &self,
+        generation: Option<u64>,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<(), Error> {
+        check_listener_call(method)?;
+        match self.shared.listener_of(generation)? {
+            Some((listener, _)) => listener.notify(method, args).await,
+            None => Ok(()),
+        }
     }
 
     /// Return the map of the reply of `get_info` of the listener, with the

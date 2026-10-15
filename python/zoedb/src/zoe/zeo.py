@@ -480,6 +480,41 @@ def _native_tls(section, server_hostname):
     )
 
 
+# The calls on the iterators of the server. The first arg of a call, or
+# the reply of a start, is an iterator id.
+_ITERATOR_CALLS = frozenset(
+    {"iterator_start", "iterator_next", "iterator_record_start", "iterator_record_next"}
+)
+_ITERATOR_STARTS = frozenset({"iterator_start", "iterator_record_start"})
+
+
+class _Iid(int):
+    """An iterator id of the server, with the generation of the listener
+    that gave it.
+
+    The server of each listener numbers the iterators of its connection
+    from 0. So two ids are equal only with the same generation, and a call
+    with the id goes only to the listener of its generation.
+    """
+
+    def __new__(cls, iid, generation):
+        self = super().__new__(cls, iid)
+        self.generation = generation
+        return self
+
+    def __eq__(self, other):
+        return isinstance(other, _Iid) and (int(self), self.generation) == (
+            int(other),
+            other.generation,
+        )
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((int(self), self.generation))
+
+
 def _serial(serial):
     """Return the bytes of the serial of a store.
 
@@ -1132,7 +1167,23 @@ class _NativeClientStorage(ClientStorage):
             self._wait(timeout)
         if method == "sendBlob":
             return self._send_blob(*args)
+        if method in _ITERATOR_CALLS:
+            return self._iterator_call(method, args)
         return self._native.call(method, args)
+
+    def _iterator_call(self, method, args):
+        """Call `method` on the listener of the generation of its iterator
+        id, and give the id of a new iterator the generation of the listener
+        that answered. An id of a lost listener raises the `KeyError` of an
+        id that the server does not know, and sends nothing."""
+        generation = None
+        if args and isinstance(args[0], _Iid):
+            generation = args[0].generation
+            args = (int(args[0]), *args[1:])
+        reply, generation = self._native.call_on(method, args, generation)
+        if method in _ITERATOR_STARTS and isinstance(reply, int):
+            return _Iid(reply, generation)
+        return reply
 
     def _send_blob(self, oid, serial):
         """Download the blob of `oid` at `serial` into the blob cache."""
@@ -1196,8 +1247,16 @@ class _NativeClientStorage(ClientStorage):
             if not iids:
                 return
             self._iterator_ids -= iids
+        # Each id goes only to the listener of its generation. The server of
+        # a lost listener dropped its iterators.
+        generations = {}
+        for iid in iids:
+            generation = getattr(iid, "generation", None)
+            generations.setdefault(generation, []).append(int(iid))
         try:
-            self._async("iterator_gc", list(iids))
+            for generation, ids in generations.items():
+                self._check_process()
+                self._native.call_async("iterator_gc", (ids,), generation)
         except ClientDisconnected:
             # The server dropped every iterator of the connection.
             self._iterator_gc(True)
