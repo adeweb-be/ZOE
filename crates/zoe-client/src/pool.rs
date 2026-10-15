@@ -172,14 +172,23 @@ impl Shared {
     }
 
     /// Return a connection of the pool for a load, in turn: the listener
-    /// or a connection that commits.
+    /// or a connection that commits. Skip a connection that is lost. When
+    /// all are lost, return the listener, so the load fails with
+    /// `Error::Disconnected`.
     fn any_connection(&self) -> Arc<Client> {
         let conns = self.conns.read().unwrap_or_else(PoisonError::into_inner);
-        let n = self.next_load.fetch_add(1, Ordering::Relaxed) % (conns.len() + 1);
-        match n.checked_sub(1) {
-            Some(i) => conns[i].clone(),
-            None => self.listener.clone(),
+        let count = conns.len() + 1;
+        let start = self.next_load.fetch_add(1, Ordering::Relaxed);
+        for step in 0..count {
+            let conn = match ((start + step) % count).checked_sub(1) {
+                Some(i) => &conns[i],
+                None => &self.listener,
+            };
+            if conn.is_connected() {
+                return conn.clone();
+            }
         }
+        self.listener.clone()
     }
 
     /// Forget the connection `client`, which closed or which the pool
@@ -363,16 +372,22 @@ impl Pool {
         })
     }
 
-    /// Take a free connection, open one, or wait for one.
+    /// Take a free connection, open one, or wait for one. A free
+    /// connection that is lost closes and leaves the pool.
     async fn lease(&self) -> Result<Lease, Error> {
         let shared = &self.shared;
+        let mut dead = Vec::new();
         let taken = shared
             .until(|state| {
                 if state.closed || state.lost {
                     return Some(Err(Error::Disconnected));
                 }
-                if let Some(client) = state.free.pop() {
-                    return Some(Ok(Some(client)));
+                while let Some(client) = state.free.pop() {
+                    if client.is_connected() {
+                        return Some(Ok(Some(client)));
+                    }
+                    state.opened = state.opened.saturating_sub(1);
+                    dead.push(client);
                 }
                 if state.opened < shared.bound {
                     state.opened += 1;
@@ -380,22 +395,26 @@ impl Pool {
                 }
                 None
             })
-            .await?;
-        let client = match taken {
+            .await;
+        for client in &dead {
+            shared.forget(client);
+            client.disconnect();
+        }
+        let client = match taken? {
             Some(client) => client,
-            None => match (shared.connect)().await {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    let mut conns = shared.conns.write().unwrap_or_else(PoisonError::into_inner);
-                    conns.push(client.clone());
-                    client
-                }
-                Err(error) => {
-                    shared.lock().opened -= 1;
-                    shared.bump();
-                    return Err(error);
-                }
-            },
+            None => {
+                // The slot goes back to the pool when the connect fails or
+                // its future drops.
+                let mut slot = Opening {
+                    shared: shared.clone(),
+                    armed: true,
+                };
+                let client = Arc::new((shared.connect)().await?);
+                slot.armed = false;
+                let mut conns = shared.conns.write().unwrap_or_else(PoisonError::into_inner);
+                conns.push(client.clone());
+                client
+            }
         };
         Ok(Lease {
             shared: shared.clone(),
@@ -511,6 +530,26 @@ impl Drop for Lease {
     }
 }
 
+/// A slot of `opened` for a connection that opens now. The drop gives the
+/// slot back, unless the connection opened.
+struct Opening {
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.shared.lock();
+            state.opened = state.opened.saturating_sub(1);
+        }
+        self.shared.bump();
+    }
+}
+
 /// A transaction of the pool, on its own connection: `store`, then `vote`,
 /// then `finish`. A transaction that is dropped before its finish or its
 /// abort sends `tpc_abort`, as `Transaction` does, and gives its
@@ -618,9 +657,10 @@ impl PoolTransaction {
             state.in_flight.insert(seq);
             seq
         };
-        let flight = InFlight {
+        let mut flight = InFlight {
             shared: shared.clone(),
             seq,
+            armed: true,
         };
         let txn = self.txn.take().expect("an open transaction");
         let writes = std::mem::take(&mut self.writes);
@@ -638,7 +678,8 @@ impl PoolTransaction {
             }
             state.replied.insert(tid.0, Slot::default());
         }
-        std::mem::forget(flight);
+        flight.armed = false;
+        drop(flight);
         shared.bump();
         Ok(Finished {
             shared,
@@ -663,14 +704,20 @@ impl std::fmt::Debug for PoolTransaction {
     }
 }
 
-/// A finish that counts as in flight. The drop takes it out of the hold.
+/// A finish that counts as in flight. The drop takes it out of the hold,
+/// unless the finish got its reply.
 struct InFlight {
     shared: Arc<Shared>,
     seq: u64,
+    /// `true` until the finish got its reply.
+    armed: bool,
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         {
             let mut state = self.shared.lock();
             state.in_flight.remove(&self.seq);
@@ -830,11 +877,16 @@ enum Route {
 async fn dispatch(shared: Arc<Shared>, mut invalidations: Invalidations) {
     loop {
         match invalidations.recv().await {
-            Ok(invalidation) => {
-                if !deliver(&shared, invalidation).await {
+            Ok(invalidation) => match deliver(&shared, invalidation).await {
+                Step::Next => {}
+                Step::Closed => return,
+                Step::Lost => {
+                    if !shared.lock().closed {
+                        lose(&shared).await;
+                    }
                     return;
                 }
-            }
+            },
             Err(_) => {
                 if !shared.lock().closed {
                     lose(&shared).await;
@@ -845,47 +897,64 @@ async fn dispatch(shared: Arc<Shared>, mut invalidations: Invalidations) {
     }
 }
 
-/// Deliver the tid of `invalidation`. Return false after the close.
-async fn deliver(shared: &Shared, invalidation: Invalidation) -> bool {
+/// What the dispatcher does after a tid.
+enum Step {
+    /// Deliver the next tid.
+    Next,
+    /// The pool is closed.
+    Closed,
+    /// The listener was lost during the hold of the tid.
+    Lost,
+}
+
+/// Deliver the tid of `invalidation`.
+async fn deliver(shared: &Shared, invalidation: Invalidation) -> Step {
     let tid = invalidation.tid.0;
     let horizon = {
         let mut state = shared.lock();
         if state.closed {
-            return false;
+            return Step::Closed;
         }
         // A tid at or before the start of the pool was before the open.
         if tid <= state.last {
-            return true;
+            return Step::Next;
         }
         state.head = Some(tid);
         state.next_seq
     };
     shared.bump();
     let mut held = false;
-    let route = shared
-        .until(|state| {
-            if state.closed {
-                return Some(None);
-            }
-            if let Some(slot) = state.replied.get_mut(&tid) {
-                slot.turn = true;
-                state.started += 1;
-                return Some(Some(Route::Own));
-            }
-            // A finish counted after the tid came commits a later tid.
-            if state.in_flight.range(..horizon).next().is_none() {
-                state.started += 1;
-                return Some(Some(Route::Foreign));
-            }
-            if !held {
-                held = true;
-                state.counters.held += 1;
-            }
-            None
-        })
-        .await;
+    let hold = shared.until(|state| {
+        if state.closed {
+            return Some(None);
+        }
+        if let Some(slot) = state.replied.get_mut(&tid) {
+            slot.turn = true;
+            state.started += 1;
+            return Some(Some(Route::Own));
+        }
+        // A finish counted after the tid came commits a later tid.
+        if state.in_flight.range(..horizon).next().is_none() {
+            state.started += 1;
+            return Some(Some(Route::Foreign));
+        }
+        if !held {
+            held = true;
+            state.counters.held += 1;
+        }
+        None
+    });
+    // A lost listener ends the hold. Then each finish in flight fails.
+    let route = tokio::select! {
+        biased;
+        route = hold => route,
+        () = shared.listener.closed() => {
+            shared.lock().head = None;
+            return Step::Lost;
+        }
+    };
     let Some(route) = route else {
-        return false;
+        return Step::Closed;
     };
     shared.bump();
     let delivered = match route {
@@ -898,7 +967,7 @@ async fn deliver(shared: &Shared, invalidation: Invalidation) -> bool {
         },
     };
     shared.lock().head = None;
-    delivered
+    if delivered { Step::Next } else { Step::Closed }
 }
 
 /// Apply the commit of another client to the cache, then offer it to the

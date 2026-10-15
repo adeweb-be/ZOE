@@ -480,6 +480,11 @@ impl Client {
         !lock(&self.inner.calls).closed
     }
 
+    /// Wait until the connection closes.
+    pub async fn closed(&self) {
+        closed(&mut self.inner.closing.subscribe()).await;
+    }
+
     /// Return the last tid that the client knows: the tid of `register`,
     /// of the last invalidation, or of the last commit of this client.
     pub fn last_transaction(&self) -> Tid {

@@ -428,20 +428,39 @@ impl Run {
                 return Outcome::Lost { in_finish: true };
             }
         };
-        // The callback of the finish.
+        // The callback of the finish. It runs only in the turn of the tid:
+        // the pool did not deliver the tid yet.
+        let delivered = self.pool.last_transaction().0;
         {
             let mut log = lock(&self.log);
+            let client = log.client;
             if turn.stale() && log.stale.is_none() {
-                let client = log.client;
                 log.faults.push(format!(
                     "c{client}: the callback of {tid:016x} runs before the stale mark"
                 ));
             }
-            log.deliver(tid, Kind::Own);
-            log.returned.push(tid);
+            if delivered < tid {
+                log.deliver(tid, Kind::Own);
+            } else {
+                log.faults.push(format!(
+                    "c{client}: the turn of {tid:016x} comes after the pool delivered {delivered:016x}"
+                ));
+            }
         }
         let stale = turn.stale();
         drop(turn);
+        // The finish returns its tid.
+        let delivered = self.pool.last_transaction().0;
+        {
+            let mut log = lock(&self.log);
+            log.returned.push(tid);
+            if delivered < tid {
+                let client = log.client;
+                log.faults.push(format!(
+                    "c{client}: the finish of {tid:016x} returns before the pool delivered it"
+                ));
+            }
+        }
         self.check_last();
         let mut state = self.shared.lock();
         if stale {
