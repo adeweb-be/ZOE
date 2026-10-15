@@ -11,10 +11,15 @@
 //!
 //! On a connection that got the extension `trace_context`, each call that
 //! runs inside `traced` carries its W3C traceparent.
+//!
+//! `Client::send_blob` downloads a blob. The server answers `sendBlob` with
+//! `receiveBlobStart`, one `receiveBlobChunk` per chunk and
+//! `receiveBlobStop`, then the reply. The reader gives these calls to the
+//! download of their oid and serial.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
-use std::io;
+use std::io::{self, Read, Write};
 use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -25,7 +30,7 @@ use std::time::Duration;
 
 use rmpv::Value;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use zoe_core::{Oid, Tid};
 
 use crate::Error;
@@ -50,6 +55,10 @@ const OIDS_PER_CALL: usize = 100;
 /// The largest chunk of a blob that `Transaction::store_blob` sends, as
 /// `ZEO.ClientStorage` sends it.
 pub const BLOB_CHUNK: usize = 59_000;
+
+/// The number of pieces of a download that wait for the download. The
+/// reader waits while the channel is full.
+const PIECES: usize = 16;
 
 tokio::task_local! {
     /// The W3C traceparent of the calls of the current `traced` future.
@@ -190,6 +199,9 @@ struct Inner {
     /// `true` when the server accepted `trace_context`. Only then does a
     /// call carry a traceparent.
     traces: AtomicBool,
+    /// Wakes the downloads that wait for the end of another download of
+    /// their blob.
+    downloads_done: Notify,
 }
 
 /// The calls that wait for their replies.
@@ -197,6 +209,27 @@ struct Calls {
     closed: bool,
     next_id: i64,
     pending: HashMap<i64, Pending>,
+    /// The downloads of blobs that run, by oid and serial. An entry stays
+    /// until the reply of its `sendBlob`, also when its download stops
+    /// before: so the connection never runs two downloads of one blob.
+    downloads: HashMap<(u64, u64), Download>,
+}
+
+/// A download of a blob that runs on the connection.
+struct Download {
+    /// The message id of its `sendBlob`.
+    id: i64,
+    /// The channel of its pieces, or `None` when the download stopped
+    /// before the reply. The reader then drops the pieces.
+    pieces: Option<mpsc::Sender<Piece>>,
+}
+
+/// A call of the server for a download.
+#[derive(Debug)]
+enum Piece {
+    Start,
+    Chunk(Vec<u8>),
+    Stop,
 }
 
 /// A call that waits for its reply.
@@ -422,6 +455,7 @@ impl Client {
                 closed: false,
                 next_id: 1,
                 pending: HashMap::new(),
+                downloads: HashMap::new(),
             }),
             outgoing,
             closing,
@@ -430,6 +464,7 @@ impl Client {
             commit: Arc::new(tokio::sync::Mutex::new(())),
             next_txn: AtomicU64::new(1),
             traces: AtomicBool::new(false),
+            downloads_done: Notify::new(),
         });
         let (alive, tasks) = mpsc::channel(1);
         let (reader, writer) = tokio::io::split(stream);
@@ -580,6 +615,27 @@ impl Client {
             Some(data) => Ok(data.to_vec()),
             None => Err(bad("loadSerial", &reply)),
         }
+    }
+
+    /// Download the blob of `oid` that the transaction `serial` wrote into
+    /// `sink`, as `ZEO.ClientStorage.loadBlob` does: `sendBlob`, which the
+    /// server answers with `receiveBlobStart`, the chunks and
+    /// `receiveBlobStop` before its reply. Return the number of bytes.
+    ///
+    /// It succeeds only when the server sent the whole blob: the reply
+    /// passed and `receiveBlobStop` came. A blob that the server does not
+    /// have fails with the `POSKeyError` of the server. A write to `sink`
+    /// that fails gives `Error::Io` after the reply; the download writes
+    /// nothing more after it. The connection runs one download of a blob
+    /// at a time: a second download of the same blob waits for the reply
+    /// of the first, also when the future of the first drops before.
+    pub async fn send_blob<W: Write>(
+        &self,
+        oid: Oid,
+        serial: Tid,
+        sink: &mut W,
+    ) -> Result<u64, Error> {
+        self.inner.send_blob(oid, serial, sink).await
     }
 
     /// Return the next value of the sequence `name` of the store. It needs
@@ -773,16 +829,61 @@ impl Transaction {
         data: &[u8],
         blob: &[u8],
     ) -> Result<(), Error> {
+        self.store_blob_from(oid, serial, data, &mut &blob[..])
+            .await
+    }
+
+    /// Store `data` for `oid` with the blob that `blob` reads to its end, as
+    /// `store_blob` does. It reads one chunk at a time, so the blob is
+    /// never in memory as a whole. A read that fails gives `Error::Io`, and
+    /// `storeBlobEnd` does not go out: the caller then aborts the
+    /// transaction.
+    pub async fn store_blob_from<R: Read>(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        blob: &mut R,
+    ) -> Result<(), Error> {
         self.check()?;
         let args = vec![bin8(oid.0), bin8(serial.0), data.into(), self.id.into()];
         self.inner.notify("storea", args.clone()).await?;
         self.inner.notify("storeBlobStart", vec![]).await?;
-        for chunk in blob.chunks(BLOB_CHUNK) {
-            self.inner
-                .notify("storeBlobChunk", vec![chunk.into()])
-                .await?;
+        let mut chunk = vec![0; BLOB_CHUNK];
+        loop {
+            let n = fill(blob, &mut chunk)?;
+            if n > 0 {
+                self.inner
+                    .notify("storeBlobChunk", vec![chunk[..n].into()])
+                    .await?;
+            }
+            if n < BLOB_CHUNK {
+                break;
+            }
         }
         self.inner.notify("storeBlobEnd", args).await
+    }
+
+    /// Store `data` for `oid` with the blob in the file `filename` of the
+    /// directory of `oid` in a blob directory that the client shares with
+    /// the server, as `ZEO.ClientStorage` does with a shared blob
+    /// directory: `storea`, then `storeBlobShared`. The server takes the
+    /// file by rename. No call has a reply. The server reports an error of
+    /// the stage at the vote. After a failed vote, it fails with
+    /// `Error::Invalid` and sends nothing.
+    pub async fn store_blob_shared(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        filename: &str,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let (oid, serial) = (bin8(oid.0), bin8(serial.0));
+        let args = vec![oid.clone(), serial.clone(), data.into(), self.id.into()];
+        self.inner.notify("storea", args).await?;
+        let args = vec![oid, serial, data.into(), filename.into(), self.id.into()];
+        self.inner.notify("storeBlobShared", args).await
     }
 
     /// Vote. A stale serial fails with `Error::Conflict`, both when the
@@ -937,6 +1038,85 @@ impl Inner {
             .map_err(|_| Error::Disconnected)
     }
 
+    /// Download a blob into `sink`. See `Client::send_blob`.
+    async fn send_blob<W: Write>(
+        &self,
+        oid: Oid,
+        serial: Tid,
+        sink: &mut W,
+    ) -> Result<u64, Error> {
+        let key = (oid.0, serial.0);
+        // Take the blob on this connection, or wait for the download that
+        // has it.
+        let (id, mut pieces, reply) = loop {
+            let done = self.downloads_done.notified();
+            {
+                let mut calls = lock(&self.calls);
+                if calls.closed {
+                    return Err(Error::Disconnected);
+                }
+                if !calls.downloads.contains_key(&key) {
+                    let id = calls.next_id;
+                    calls.next_id += 1;
+                    let (sender, reply) = oneshot::channel();
+                    calls.pending.insert(id, Pending { sender, finish: false });
+                    let (pieces, receiver) = mpsc::channel(PIECES);
+                    let pieces = Some(pieces);
+                    calls.downloads.insert(key, Download { id, pieces });
+                    break (id, receiver, reply);
+                }
+            }
+            done.await;
+        };
+        let mut guard = Downloading {
+            inner: self,
+            key,
+            id,
+            sent: false,
+        };
+        let args = vec![bin8(oid.0), bin8(serial.0)];
+        let frame = protocol::call(id, "sendBlob", args, self.traceparent().as_deref())?;
+        if self.outgoing.send(frame).await.is_err() {
+            return Err(Error::Disconnected);
+        }
+        guard.sent = true;
+        // The reader drops the sender of the pieces at the reply, after the
+        // last piece. So the loop ends at the reply, or at the close.
+        let mut size = 0;
+        let mut order = Ok(());
+        let (mut started, mut stopped) = (false, false);
+        let mut written: io::Result<()> = Ok(());
+        while let Some(piece) = pieces.recv().await {
+            match piece {
+                Piece::Start if !started => started = true,
+                Piece::Chunk(bytes) if started && !stopped => {
+                    size += bytes.len() as u64;
+                    if written.is_ok() {
+                        written = sink.write_all(&bytes);
+                    }
+                }
+                Piece::Stop if started && !stopped => stopped = true,
+                piece => {
+                    order = Err(Error::Protocol(format!(
+                        "{piece:?} out of order in the download of {oid:?} at {serial:?}"
+                    )));
+                }
+            }
+        }
+        let (reply, _) = reply
+            .await
+            .unwrap_or_else(|_| (Err(Error::Disconnected), self.position()));
+        reply?;
+        order?;
+        if !stopped {
+            return Err(Error::Protocol(format!(
+                "sendBlob of {oid:?} at {serial:?} replied before receiveBlobStop"
+            )));
+        }
+        written?;
+        Ok(size)
+    }
+
     /// Return the traceparent of the current `traced` future when the
     /// server accepted `trace_context`, else `None`.
     fn traceparent(&self) -> Option<String> {
@@ -976,10 +1156,27 @@ impl Inner {
     /// Handle one message from the server. An invalidation in a bad shape
     /// fails with `Error::Protocol`: the reader then closes the connection,
     /// so that no receiver misses a commit without a signal.
-    fn dispatch(&self, message: Message) -> Result<(), Error> {
+    ///
+    /// A call of a download returns the channel of its download and the
+    /// piece: the reader sends it, and waits while the channel is full.
+    fn dispatch(&self, message: Message) -> Result<Option<(mpsc::Sender<Piece>, Piece)>, Error> {
         match message {
             Message::Reply { id, result } => {
-                let pending = lock(&self.calls).pending.remove(&id);
+                let (pending, download) = {
+                    let mut calls = lock(&self.calls);
+                    let download = calls
+                        .downloads
+                        .iter()
+                        .find(|(_, download)| download.id == id)
+                        .map(|(key, _)| *key);
+                    let download = download.and_then(|key| calls.downloads.remove(&key));
+                    (calls.pending.remove(&id), download)
+                };
+                // The end of a download frees its blob for the next one.
+                if download.is_some() {
+                    drop(download);
+                    self.downloads_done.notify_waiters();
+                }
                 if let Some(pending) = pending {
                     if pending.finish
                         && let Ok(reply) = &result
@@ -1000,20 +1197,41 @@ impl Inner {
                     let _ = sender.send(invalidation);
                 }
             }
+            Message::Call { method, args }
+                if matches!(
+                    method.as_str(),
+                    "receiveBlobStart" | "receiveBlobChunk" | "receiveBlobStop"
+                ) =>
+            {
+                let (key, piece) = piece(&method, args)?;
+                let calls = lock(&self.calls);
+                // The pieces of a download that stopped, or that is not of
+                // this client, go nowhere.
+                let pieces = calls
+                    .downloads
+                    .get(&key)
+                    .and_then(|download| download.pieces.clone());
+                return Ok(pieces.map(|pieces| (pieces, piece)));
+            }
             // `info` and the other calls of the server change nothing here.
             Message::Call { .. } | Message::Other => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Close the connection: stop the tasks, and fail each call that waits.
     fn shut(&self) {
         self.closing.send_replace(true);
-        let pending = {
+        let (pending, downloads) = {
             let mut calls = lock(&self.calls);
             calls.closed = true;
-            mem::take(&mut calls.pending)
+            (
+                mem::take(&mut calls.pending),
+                mem::take(&mut calls.downloads),
+            )
         };
+        drop(downloads);
+        self.downloads_done.notify_waiters();
         let position = self.position();
         for pending in pending.into_values() {
             let _ = pending.sender.send((Err(Error::Disconnected), position));
@@ -1034,6 +1252,38 @@ impl Drop for Forget<'_> {
     }
 }
 
+/// Ends the hold of a download on its blob when its future ends. A
+/// download whose `sendBlob` went out keeps the blob until the reply, and
+/// its pieces go nowhere. A download whose `sendBlob` never went out frees
+/// it at once.
+struct Downloading<'a> {
+    inner: &'a Inner,
+    key: (u64, u64),
+    id: i64,
+    sent: bool,
+}
+
+impl Drop for Downloading<'_> {
+    fn drop(&mut self) {
+        let removed = {
+            let mut calls = lock(&self.inner.calls);
+            calls.pending.remove(&self.id);
+            match calls.downloads.get_mut(&self.key) {
+                Some(download) if download.id == self.id && self.sent => {
+                    download.pieces = None;
+                    None
+                }
+                Some(download) if download.id == self.id => calls.downloads.remove(&self.key),
+                _ => None,
+            }
+        };
+        if removed.is_some() {
+            drop(removed);
+            self.inner.downloads_done.notify_waiters();
+        }
+    }
+}
+
 /// Wait until the connection closes.
 async fn closed(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closing| *closing).await;
@@ -1050,11 +1300,18 @@ async fn read(inner: Arc<Inner>, mut stream: ReadHalf<Box<dyn Stream>>, _alive: 
             frame = protocol::read_frame(&mut stream) => frame,
         };
         let Ok(Some(payload)) = frame else { break };
-        if protocol::decode(&payload)
-            .and_then(|message| inner.dispatch(message))
-            .is_err()
-        {
-            break;
+        match protocol::decode(&payload).and_then(|message| inner.dispatch(message)) {
+            Ok(None) => {}
+            Ok(Some((pieces, piece))) => {
+                // A download that stopped drops its receiver: the send then
+                // fails, and the reader goes on.
+                tokio::select! {
+                    biased;
+                    () = closed(&mut closing) => break,
+                    _ = pieces.send(piece) => {}
+                }
+            }
+            Err(_) => break,
         }
     }
     inner.shut();
@@ -1205,6 +1462,42 @@ fn oid(value: &Value, method: &str) -> Result<Oid, Error> {
 }
 
 /// The protocol error of a reply of `method` that has the wrong shape.
+/// Read the args of a call of a download: `[oid, serial]`, and the chunk
+/// for `receiveBlobChunk`. Return the oid and the serial, and the piece.
+fn piece(method: &str, args: Value) -> Result<((u64, u64), Piece), Error> {
+    let Value::Array(mut items) = args else {
+        return Err(bad(method, &args));
+    };
+    let piece = match (method, items.len()) {
+        ("receiveBlobStart", 2) => Piece::Start,
+        ("receiveBlobStop", 2) => Piece::Stop,
+        ("receiveBlobChunk", 3) => match items.pop() {
+            Some(Value::Binary(bytes)) => Piece::Chunk(bytes),
+            _ => return Err(bad(method, &Value::Array(items))),
+        },
+        _ => return Err(bad(method, &Value::Array(items))),
+    };
+    match (p64(&items[0]), p64(&items[1])) {
+        (Some(oid), Some(serial)) => Ok(((oid, serial), piece)),
+        _ => Err(bad(method, &Value::Array(items))),
+    }
+}
+
+/// Read from `reader` until `buf` is full or the reader is at its end.
+/// Return the number of bytes read.
+fn fill(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 fn bad(method: &str, value: &Value) -> Error {
     Error::Protocol(format!("{method} gave {value}"))
 }

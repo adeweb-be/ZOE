@@ -5,7 +5,13 @@
 //! holds a pool of connections to one storage of a server (ADR 0036): the
 //! listener, and one connection for each transaction that runs. It
 //! connects over TCP or a unix domain socket, with TLS or without, to the
-//! first of its addresses that opens. It has no blob and no reconnect.
+//! first of its addresses that opens. It has no reconnect.
+//!
+//! `send_blob` downloads a blob into a file of the blob cache of
+//! `zoe.zeo`, and `Transaction.store_blob` uploads a blob file. With a blob
+//! directory that the server shares, `Transaction.store_blob_shared` sends
+//! only the name of the file. `zoe.zeo` keeps the blob cache: its layout,
+//! its locks and its pruning.
 //!
 //! With a `cache_size`, the pool holds a client cache in memory (ADR 0034).
 //! A hit runs on the calling thread: it takes no lock, sends nothing and
@@ -33,9 +39,12 @@
 //! and its drop there frees nothing. A client that the child opens gets a
 //! runtime of the child.
 
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::mem;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -73,6 +82,10 @@ const MAX_TID: Tid = Tid(i64::MAX as u64);
 
 /// The extension that lets a call carry the trace context of the client.
 const TRACE_CONTEXT: &str = "trace_context";
+
+/// The mode of a blob file of the cache: read-only for its owner, as
+/// `ZEO.ClientStorage` sets it (`stat.S_IREAD`).
+const BLOB_MODE: u32 = 0o400;
 /// The server name of TLS on a unix domain socket without
 /// `server_hostname`. The client then does not check the name, so any
 /// valid name does.
@@ -465,6 +478,43 @@ impl NativeClient {
         Ok(PyBytes::new(py, &data))
     }
 
+    /// Download the blob of `oid` that the transaction `serial` wrote into
+    /// the file `filename`, and return its size. The caller holds the lock
+    /// of the blob in the cache.
+    ///
+    /// The bytes go to `<filename>.dl` first. Only a whole blob, whose file
+    /// has the size of the bytes that came, becomes `filename`, by rename,
+    /// read-only. A failed download removes `<filename>.dl`. A blob that
+    /// the server does not have raises `POSKeyError`. An error of the file
+    /// raises `OSError`.
+    fn send_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        filename: PathBuf,
+    ) -> PyResult<u64> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py)?;
+        let runtime = self.runtime;
+        py.detach(move || {
+            let partial = partial_name(&filename);
+            let downloaded = download(&partial, |sink| {
+                runtime.block_on(traced(trace, pool.send_blob(oid, serial, sink)))
+            })
+            .and_then(|size| {
+                fs::rename(&partial, &filename)?;
+                Ok(size)
+            });
+            if downloaded.is_err() {
+                let _ = fs::remove_file(&partial);
+            }
+            downloaded
+        })
+        .map_err(|e| blob_error(py, e))
+    }
+
     /// Return the next value of the sequence `name` of the store. Raise
     /// `Unsupported` when the server did not accept `sequences`.
     fn sequence_next(&self, py: Python<'_>, name: String) -> PyResult<u64> {
@@ -696,6 +746,55 @@ impl NativeTransaction {
             let mut slot = lock(&self.txn);
             let txn = slot.as_mut().ok_or_else(not_open)?;
             runtime.block_on(traced(trace, txn.store(oid, serial, data)))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Store `data` for `oid` with the blob in the file `filename`, and
+    /// upload the file in chunks. The file stays in its place. An error of
+    /// the file raises `OSError`; the caller then aborts the transaction.
+    fn store_blob(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: &[u8],
+        filename: PathBuf,
+    ) -> PyResult<()> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut file = File::open(&filename)?;
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            let store = txn.store_blob_from(oid, serial, data, &mut file);
+            runtime.block_on(traced(trace, store))
+        })
+        .map_err(|e| blob_error(py, e))
+    }
+
+    /// Store `data` for `oid` with the blob in the file `filename` of the
+    /// directory of `oid` in the blob directory that the server shares. The
+    /// server takes the file by rename.
+    fn store_blob_shared(
+        &self,
+        py: Python<'_>,
+        oid: &Bound<'_, PyAny>,
+        serial: &Bound<'_, PyAny>,
+        data: &[u8],
+        filename: &str,
+    ) -> PyResult<()> {
+        let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            let store = txn.store_blob_shared(oid, serial, data, filename);
+            runtime.block_on(traced(trace, store))
         })
         .map_err(|e| client_error(py, e))
     }
@@ -1043,6 +1142,47 @@ async fn open(
                 return Ok((client, endpoint));
             }
         }
+    }
+}
+
+/// Return the name of the partial file of a download: `<filename>.dl`, as
+/// `ZEO.ClientStorage` names it.
+fn partial_name(filename: &Path) -> PathBuf {
+    let mut partial = filename.as_os_str().to_owned();
+    partial.push(".dl");
+    PathBuf::from(partial)
+}
+
+/// Write the bytes of `fetch` into a new file at `partial`, and return
+/// their number. The file must hold that many bytes after the write. Then
+/// make it read-only. A file at `partial` that a stopped download left is
+/// written again from its start.
+fn download(
+    partial: &Path,
+    fetch: impl FnOnce(&mut BufWriter<File>) -> Result<u64, Error>,
+) -> Result<u64, Error> {
+    let mut sink = BufWriter::new(File::create(partial)?);
+    let size = fetch(&mut sink)?;
+    sink.flush()?;
+    let file = sink.into_inner().map_err(|e| e.into_error())?;
+    let written = file.metadata()?.len();
+    if written != size {
+        return Err(Error::Io(io::Error::other(format!(
+            "the download wrote {written} bytes of {size} into {}",
+            partial.display()
+        ))));
+    }
+    file.set_permissions(fs::Permissions::from_mode(BLOB_MODE))?;
+    Ok(size)
+}
+
+/// Return the exception of Python for an error of a blob call. An error of
+/// a file there (`Error::Io`) raises `OSError`. Another error raises as
+/// `client_error` gives it.
+fn blob_error(py: Python<'_>, error: Error) -> PyErr {
+    match error {
+        Error::Io(error) => error.into(),
+        error => client_error(py, error),
     }
 }
 

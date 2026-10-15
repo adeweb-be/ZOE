@@ -36,8 +36,10 @@ takes no `ssl` context: TLS runs in Rust, and a context does not give back
 the files of its certificate and key. It runs several transactions at once,
 each on its own connection of a pool, with one more connection that orders
 the invalidations (ADR 0036). It keeps a client cache in memory, with the
-semantics of the cache of ZEO, of `cache_size` bytes (ADR 0034). It has no
-cache file, no blob and no reconnect. It declares
+semantics of the cache of ZEO, of `cache_size` bytes (ADR 0034). It has
+blobs in both modes of ZEO: a blob cache in `blob_dir`, or a blob directory
+that it shares with the server (`shared_blob_dir`). It has no cache file
+and no reconnect. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It speaks
 only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
@@ -50,10 +52,14 @@ import logging
 import os
 import threading
 
+import ZODB.blob
+import zope.interface
 from ZEO.asyncio.client import ClientIO, ClientThread, Fallback, Protocol
 from ZEO.asyncio.futures import run_coroutine_threadsafe
+from ZEO.ClientStorage import BlobCacheLayout, _lock_blob
 from ZEO.ClientStorage import ClientStorage as ZEOClientStorage
 from ZEO.Exceptions import ClientDisconnected
+from ZODB.interfaces import IBlobStorage
 from ZODB.POSException import (
     POSKeyError,
     ReadOnlyError,
@@ -362,10 +368,6 @@ _MB = 1024**2
 # not have yet, each with the value that leaves its feature off. Any other
 # value fails the open with an error that names the argument.
 _NOT_BUILT = {
-    "blob_dir": None,
-    "shared_blob_dir": False,
-    "blob_cache_size": None,
-    "blob_cache_size_check": 10,
     "client_label": None,
     "cache": None,
     "client": None,
@@ -429,6 +431,15 @@ def _native_tls(section, server_hostname):
     )
 
 
+def _remove_files(blobs):
+    """Remove the file of each (oid, file) of `blobs` that exists."""
+    for _, filename in blobs:
+        try:
+            os.remove(filename)
+        except FileNotFoundError:
+            pass
+
+
 def _native_address(addr):
     """Return an address for the native client.
 
@@ -475,6 +486,18 @@ class _NativeClientStorage(ClientStorage):
     The client cache holds `cache_size` bytes of records, 20 MB by default,
     in memory. 0 turns it off. The client applies each tid to the cache
     before the DB gets it. `_cache.clear()` empties it.
+
+    The blobs work as in `ZEO.ClientStorage`, with its code for the blob
+    cache. With `blob_dir` and no `shared_blob_dir`, `blob_dir` is a blob
+    cache in the layout `zeocache`. `loadBlob` downloads a blob that the
+    cache does not hold, under the file lock of its directory, so threads
+    and processes download it once. The download writes `<blob>.dl` and
+    renames it when the whole blob came. `storeBlob` moves the file into
+    the cache and uploads it in chunks, and `tpc_finish` gives it its name
+    under the new tid. `blob_cache_size` and `blob_cache_size_check` prune
+    the cache in a thread, as ZEO does. With `shared_blob_dir`, the server
+    takes the file of `storeBlob` from the shared directory by rename, and
+    `loadBlob` reads the shared directory.
     """
 
     def __init__(
@@ -547,14 +570,17 @@ class _NativeClientStorage(ClientStorage):
         self._oids_lock = threading.Lock()
         # A child of `os.fork()` must not use the oids of its parent.
         self._pid = os.getpid()
-        self.blob_dir = None
-        self.shared_blob_dir = False
-        self.fshelper = None
+        self._setup_blobs(
+            blob_dir, shared_blob_dir, blob_cache_size, blob_cache_size_check
+        )
         self.server_sync = False
         self.protocol_version = b"M5"
         # The open transactions, each with its transaction of the native
         # client. The lock covers the check and the change of the dict.
         self._transactions = {}
+        # The blob files that each open transaction stored, as (oid, file).
+        # The lock of `_transactions` covers it too.
+        self._transaction_blobs = {}
         self._transactions_lock = threading.Lock()
         # A thread that gives a tid to the DB marks itself here. Its own
         # call of `lastTransaction()` does not wait for that tid.
@@ -580,6 +606,10 @@ class _NativeClientStorage(ClientStorage):
             # A read-only fallback registers read-only.
             self._is_read_only = self._native.read_only()
             self._info.update(self._native.info())
+            # Of the interfaces of the server, the client declares only
+            # the one that it has, as ZEO declares them.
+            if ("ZODB.interfaces", "IBlobStorage") in self._info["interfaces"]:
+                zope.interface.alsoProvides(self, IBlobStorage)
             self.set_server_addr(self._native.address())
             self._connection_generation = 1
             logger.info(
@@ -598,6 +628,39 @@ class _NativeClientStorage(ClientStorage):
             self._native.close()
             raise
 
+    def _setup_blobs(self, blob_dir, shared, cache_size, cache_size_check):
+        """Set the blob directory up as `ZEO.ClientStorage` does."""
+        self.blob_dir = blob_dir
+        self.shared_blob_dir = shared
+        if blob_dir is None:
+            self.fshelper = None
+        elif shared:
+            self.fshelper = ZODB.blob.FilesystemHelper(blob_dir)
+        else:
+            # The layout of ZEO's blob cache, so either client reads it.
+            if "zeocache" not in ZODB.blob.LAYOUTS:
+                ZODB.blob.LAYOUTS["zeocache"] = BlobCacheLayout()
+            self.fshelper = ZODB.blob.FilesystemHelper(
+                blob_dir, layout_name="zeocache"
+            )
+            self.fshelper.create()
+        # The lock covers the count of the bytes that came into the cache.
+        self._blob_lock = threading.Lock()
+        self._blob_cache_size = cache_size
+        self._blob_data_bytes_loaded = 0
+        if cache_size is not None:
+            if not 0 <= cache_size_check < 100:
+                raise ValueError("blob_cache_size_check is a percent below 100")
+            self._blob_cache_size_check = cache_size * cache_size_check // 100
+            self._check_blob_size()
+
+    def _blob_bytes_came(self, size):
+        """Count `size` bytes that came into the blob cache. Prune the cache
+        in a thread when the count passes the check size, as ZEO does."""
+        with self._blob_lock:
+            self._blob_data_bytes_loaded += size
+            self._check_blob_size(self._blob_data_bytes_loaded)
+
     def _check_process(self):
         """Raise `RuntimeError` in a child of `os.fork()`.
 
@@ -612,7 +675,18 @@ class _NativeClientStorage(ClientStorage):
     # The calls that the native client does not have yet.
 
     def _call(self, method, *args, **kw):
+        # The code of ZEO for the blob cache downloads a blob with this
+        # call, under the lock of the blob.
+        if method == "sendBlob":
+            return self._send_blob(*args)
         raise Unsupported(f"the native client does not call {method} yet")
+
+    def _send_blob(self, oid, serial):
+        """Download the blob of `oid` at `serial` into the blob cache."""
+        self._check_process()
+        filename = self.fshelper.getBlobFilename(oid, serial)
+        size = self._native.send_blob(oid, serial, filename)
+        self._blob_bytes_came(size)
 
     def _async(self, method, *args):
         raise Unsupported(f"the native client does not call {method} yet")
@@ -623,11 +697,52 @@ class _NativeClientStorage(ClientStorage):
     def new_addr(self, addr):
         raise Unsupported("the native client does not change its address yet")
 
-    def loadBlob(self, oid, serial):
-        raise Unsupported("the native client has no blobs yet")
+    # The blobs. `loadBlob`, `openCommittedBlobFile` and
+    # `temporaryDirectory` are those of `ZEO.ClientStorage`.
 
     def storeBlob(self, oid, serial, data, blobfilename, version, txn):
-        raise Unsupported("the native client has no blobs yet")
+        if version:
+            raise Unsupported("versions are not supported")
+        native = self._check_trans(txn, "storeBlob")
+        # Take the file at once, as ZEO does: into the directory of the oid,
+        # under a temporary name that ends in `.tmp-`.
+        self.fshelper.getPathForOID(oid, create=True)
+        fd, target = self.fshelper.blob_mkstemp(oid, serial)
+        os.close(fd)
+        target += "-"
+        ZODB.blob.rename_or_copy_blob(blobfilename, target)
+        os.remove(target[:-1])
+        with self._transactions_lock:
+            self._transaction_blobs.setdefault(txn, []).append((oid, target))
+        data = _as_bytes(data)
+        if self.shared_blob_dir:
+            native.store_blob_shared(oid, serial, data, os.path.basename(target))
+        else:
+            native.store_blob(oid, serial, data, target)
+
+    def _blobs_of(self, txn):
+        """Return the blob files that txn stored, and forget them."""
+        with self._transactions_lock:
+            return self._transaction_blobs.pop(txn, [])
+
+    def _cache_blobs(self, blobs, tid):
+        """Give each uploaded blob file its name in the cache under `tid`.
+
+        This is `_update_blob_cache` of ZEO: each rename runs under the
+        lock of the blob. Then count the bytes for the pruning.
+        """
+        size = 0
+        for oid, filename in blobs:
+            size += os.stat(filename).st_size
+            self.fshelper.getPathForOID(oid, create=True)
+            target = self.fshelper.getBlobFilename(oid, tid)
+            lock = _lock_blob(target)
+            try:
+                ZODB.blob.rename_or_copy_blob(filename, target)
+            finally:
+                lock.close()
+        if blobs:
+            self._blob_bytes_came(size)
 
     def prefetch(self, oids, tid):
         # The client does not prefetch: each load fills the cache.
@@ -652,6 +767,8 @@ class _NativeClientStorage(ClientStorage):
         delivery = self._delivery
         if delivery is not None and delivery is not threading.current_thread():
             delivery.join(_JOIN_TIMEOUT)
+        if self._check_blob_size_thread is not None:
+            self._check_blob_size_thread.join()
 
     # The invalidations.
 
@@ -789,6 +906,7 @@ class _NativeClientStorage(ClientStorage):
     def tpc_finish(self, txn, f=lambda tid: None):
         self._check_process()
         native = self._check_trans(txn, "tpc_finish")
+        tid = None
         try:
             # The finish returns at the turn of its tid: the DB got every
             # tid below it. The client gives no later tid to the DB until
@@ -801,7 +919,12 @@ class _NativeClientStorage(ClientStorage):
                 self._local.delivering = False
                 native.done()
         finally:
+            blobs = self._blobs_of(txn)
             self.tpc_end(txn)
+            if tid is None:
+                _remove_files(blobs)
+        if not self.shared_blob_dir:
+            self._cache_blobs(blobs, tid)
         return tid
 
     def tpc_abort(self, txn, timeout=None):
@@ -814,7 +937,12 @@ class _NativeClientStorage(ClientStorage):
         except ClientDisconnected:
             logger.debug("%s ClientDisconnected in tpc_abort() ignored", self.__name__)
         finally:
+            blobs = self._blobs_of(txn)
             self.tpc_end(txn)
+            # The server ended the transaction, so it no longer reads these
+            # files. In a shared directory, the server already moved each
+            # file that it staged.
+            _remove_files(blobs)
 
     def tpc_end(self, txn):
         if txn is not None:

@@ -517,3 +517,40 @@ async fn a_finish_in_flight_when_the_listener_is_lost_fails() {
         .unwrap();
     assert!(matches!(finished, Err(Error::Disconnected)));
 }
+
+#[tokio::test]
+async fn blobs_download_through_any_connection_of_the_pool() {
+    let server = start("blobs");
+    let pool = open(&server, 2).await;
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let blob: Vec<u8> = (0..3 * 65_536 + 7).map(|n| (n % 251) as u8).collect();
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store_blob_from(oid, Tid(0), &record(b"blob"), &mut blob.as_slice())
+        .await
+        .unwrap();
+    txn.vote().await.unwrap();
+    let tid = txn.finish().await.unwrap().turn().await.unwrap().tid();
+
+    // Each load takes the next connection: the listener and the connection
+    // of the commit both carry a download.
+    for _ in 0..4 {
+        let mut sink = Vec::new();
+        let size = pool.send_blob(oid, tid, &mut sink).await.unwrap();
+        assert_eq!(size, blob.len() as u64);
+        assert!(sink == blob, "the download gives the committed bytes");
+    }
+    // Downloads of one blob at once on the pool all get the whole blob.
+    let downloads = (0..6).map(|_| async {
+        let mut sink = Vec::new();
+        pool.send_blob(oid, tid, &mut sink).await.map(|_| sink)
+    });
+    for sink in futures::future::join_all(downloads).await {
+        assert!(sink.unwrap() == blob);
+    }
+    // A serial without a blob fails with the error of the server.
+    let missing = pool.send_blob(oid, Tid(tid.0 + 1), &mut Vec::new()).await;
+    assert!(
+        matches!(&missing, Err(Error::Server { class, .. }) if class.ends_with("POSKeyError")),
+        "{missing:?}"
+    );
+}

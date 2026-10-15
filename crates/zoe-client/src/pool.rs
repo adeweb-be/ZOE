@@ -40,6 +40,7 @@
 //! more.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
@@ -338,6 +339,22 @@ impl Pool {
         self.shared.any_connection().load_serial(oid, serial).await
     }
 
+    /// Download the blob of `oid` that the transaction `serial` wrote into
+    /// `sink`, through any connection, as `Client::send_blob` does. The
+    /// pieces of the download come on the connection that carries its
+    /// `sendBlob`. Return the number of bytes.
+    pub async fn send_blob<W: Write>(
+        &self,
+        oid: Oid,
+        serial: Tid,
+        sink: &mut W,
+    ) -> Result<u64, Error> {
+        self.shared
+            .any_connection()
+            .send_blob(oid, serial, sink)
+            .await
+    }
+
     /// Return at most `size` entries of the history of `oid`.
     pub async fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>, Error> {
         self.shared.any_connection().history(oid, size).await
@@ -601,6 +618,36 @@ impl PoolTransaction {
         blob: &[u8],
     ) -> Result<(), Error> {
         self.txn().store_blob(oid, serial, data, blob).await?;
+        self.keep(oid, data);
+        Ok(())
+    }
+
+    /// Store `data` for `oid` with the blob that `blob` reads, as
+    /// `Transaction::store_blob_from` does.
+    pub async fn store_blob_from<R: Read>(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        blob: &mut R,
+    ) -> Result<(), Error> {
+        self.txn().store_blob_from(oid, serial, data, blob).await?;
+        self.keep(oid, data);
+        Ok(())
+    }
+
+    /// Store `data` for `oid` with the blob file `filename` of a shared
+    /// blob directory, as `Transaction::store_blob_shared` does.
+    pub async fn store_blob_shared(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        filename: &str,
+    ) -> Result<(), Error> {
+        self.txn()
+            .store_blob_shared(oid, serial, data, filename)
+            .await?;
         self.keep(oid, data);
         Ok(())
     }
