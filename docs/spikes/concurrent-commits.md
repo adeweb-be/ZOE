@@ -29,7 +29,7 @@ The client process delivers the tids in one order, and moves `lastTransaction()`
 
 Where `lastTransaction()` comes from: the last tid that the client delivered, from the `register` tid of the listener on. Not `Client::last_transaction` of `zoe-client`, which the reader raises before it sends the invalidation (the first fault below), and not the maximum over the connections of the pool, as the POC takes it at the open.
 
-**Loads and the client cache.** With a pool, a load may use any connection, and a "current" `loadBefore` reply is ordered only against the stream of that connection. A client cache (ZOE-152) must store such a reply only when its `applied` is not above the position of that connection when the reply arrived: the last tid of its invalidations and of the replies of its own finishes. The process's `lastTransaction()` is not that position: a reply answered before a commit and stored after the listener delivered that commit would enter the cache stale, the race of ZEO issue 166. ADR 0033 states it with ADR 0034. The POC has no client cache, so this spike gives no evidence on it.
+**Loads and the client cache.** With a pool, a load may use any connection, and a "current" `loadBefore` reply is ordered only against the stream of that connection. A client cache (ZOE-152) must store such a reply only when its `applied` is not above the position of that connection when the reply arrived: the last tid of its invalidations and of the replies of its own finishes. The process's `lastTransaction()` is not that position: a reply answered before a commit and stored after the listener delivered that commit would enter the cache stale, the race of ZEO issue 166. ADR 0036 states it with ADR 0034. The POC has no client cache, so this spike gives no evidence on it.
 
 Three faults that the rule removes, all three in the POC of ZOE-077:
 
@@ -118,14 +118,14 @@ So (b) saves sockets, and it brings a protocol change, a second path in the clie
 
 ## Recommendation
 
-**Build (a), a pool of connections with the rule, in the native client of F28 (ZOE-155).** It keeps the contract of ZODB in every run of the race tests, it needs no change of the server or of the wire protocol, it works against a stock ZEO server, and it removes the cap of one commit at a time in the threads cells (see Cost). The ADR draft [0033](../adr/0033-concurrent-transactions-in-a-client.md) states the decision for the human.
+**Build (a), a pool of connections with the rule, in the native client of F28 (ZOE-155).** It keeps the contract of ZODB in every run of the race tests, it needs no change of the server or of the wire protocol, it works against a stock ZEO server, and it removes the cap of one commit at a time in the threads cells (see Cost). The ADR draft [0036](../adr/0036-concurrent-transactions-in-a-client.md) states the decision for the human.
 
 For ZOE-155:
 
 - Put the rule in Rust, not in Python. The reader task of the listener knows the order. It hands each tid in turn to one dispatcher, which runs `invalidate` or `f(tid)` and then moves `lastTransaction()`. With one connection, the reader puts the reply of a finish in the same stream (point 7). Then the order does not depend on which Python thread wakes first.
 - Take the hold of version 2 (point 6): wait only for the finishes sent before the tid arrived.
 - Open the connections of the pool on demand, up to a bound, so a DB that opens costs the listener and one connection.
-- Treat a lost or lagged listener as a lost connection: `invalidateCache`, and connect the listener again with a new `register` tid, `getInvalidations` and a new hold. ZOE-159 owns the reconnect. A finish that already has its reply when the listener is lost is open: failing it reaches ZODB from `tpc_finish`; running `f(T)` after `invalidateCache` and returning T keeps the contract. ADR 0033 names both.
+- Treat a lost or lagged listener as a lost connection: `invalidateCache`, and connect the listener again with a new `register` tid, `getInvalidations` and a new hold. ZOE-159 owns the reconnect. A finish that already has its reply when the listener is lost is open: failing it reaches ZODB from `tpc_finish`; running `f(T)` after `invalidateCache` and returning T keeps the contract. ADR 0036 names both.
 - Run ZODB's race tests on both interpreters in the acceptance test of the client, and add a model whose steps commit without a conflict, as the POC model does: with ZODB's model alone, `test_race_load_vs_external_invalidate` passes on a client that breaks the contract. Add ZODB's third race test, `test_race_external_invalidate_vs_disconnect`, once the client reconnects: the spike did not run it, because the POC does not reconnect.
 - The client cache of ZOE-152 takes its invalidations from the same dispatcher, in the same order, and stores a current load reply only against the position of the connection that carried it (see "Loads and the client cache").
 
