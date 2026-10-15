@@ -6,7 +6,8 @@ calls that the listener refuses, the sizes of `len()` and `getSize()`,
 `record_iternext`, `history`, `pack`, `restore`, `server_status`, the
 interfaces that the client declares, the serial of a store, a call without
 `wait`, the iterators at the loss of the listener and at the close, and
-an iterator id of a lost listener.
+an iterator id of a lost listener, and `load_current`, which the cache
+answers.
 """
 
 import socket
@@ -48,6 +49,23 @@ def commit(storage, records, tid=None):
         storage.store(oid, serial, data, "", txn)
     storage.tpc_vote(txn)
     return storage.tpc_finish(txn)
+
+
+def test_load_current_comes_from_the_cache_without_the_server(tmp_path):
+    from ZODB.utils import load_current, maxtid
+
+    with ZoeServer(str(tmp_path / "store")) as server:
+        # A load that the cache does not answer waits one second for a
+        # server, then raises ClientDisconnected.
+        storage = zoe.testing.native_client(server.address, storage="1", wait_timeout=1)
+        try:
+            oid = storage.new_oid()
+            tid = commit(storage, {oid: (z64, b"data")})
+            server.stop()
+            assert storage.loadBefore(oid, maxtid) == (b"data", tid, None)
+            assert load_current(storage, oid) == (b"data", tid)
+        finally:
+            storage.close()
 
 
 def test_the_label_and_the_server_sync_are_built():

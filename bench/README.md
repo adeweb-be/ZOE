@@ -10,6 +10,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | --- | --- |
 | `just bench` | the full set against every storage; writes to `target/bench/results` |
 | `just bench run --quick` | the quick set, the regression gate of a pull request |
+| `just bench run --gate --storage zeo zoe-native` | the gate set, the head-to-head that the phase gates count; results go under `gate/` |
 | `just bench run --storage zeo --quick` | one storage only |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench test FILE...` | the tests of those files only |
@@ -42,6 +43,7 @@ zodbshootout runs five scenarios: `add`, `update`, `read_cold`, `read_warm` (zod
 | Set | Cells | Values per scenario and cell |
 | --- | --- | --- |
 | quick | threads, concurrency 1 and 16, objects of 1 KB | 5 |
+| gate | threads, concurrency 1 and 16; processes at 16; objects of 1 KB and 100 KB | 3 |
 | full | threads at concurrency 1, 4, 16 and 64; processes at 4, 16 and 64; objects of 1 KB and 100 KB | 20 |
 
 - Each value runs in its own zodbshootout run, on a fresh store: one scenario, one pyperf worker process, one warmup, then the value (`--processes 1 --warmups 1 --values 1 --loops 1`). The warmup runs in the same process and on the same store as the value, so the costs of a first call stay out of the value. The other options are the same for every value.
@@ -94,7 +96,7 @@ just bench gate --storage zoe-native --python cp314t target/bench/results
 - It exits with 0 when the ratio of each cell that counts is at least the ratio of the gate. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline.
 - `--storage zoe-server --baseline zeo` are the defaults. `--ratio` takes any positive value in place of the default ratio of the storage.
 - `--python cp314t` counts only the results of that build. The report prints the groups of the other builds after them, marked `does not count`, with their verdicts in lower case. Without `--python`, every build counts.
-- The phase 2 gate counts only the full set of the reference machine. The phase 3 gate counts the full set of the reference machine on CPython 3.14t, each storage as its stack runs there, with the report of 3.13 printed beside it: on 3.13 the threads cells measure one client process under the GIL, and on 3.14t they measure the storage when it commits in parallel. The GIL record of each result says which workers ran with the GIL. The RelStorage row of N4 counts `relstorage` and `relstorage-hf`.
+- The phase 2 gate counts only the full set of the reference machine. The phase 3 gate counts the gate set (`--gate`), a head-to-head of `zeo` and `zoe-native` on 6 cells; the full set is the comprehensive benchmark of a later phase. It counts the results on CPython 3.14t, each storage as its stack runs there, with the report of 3.13 printed beside it: on 3.13 the threads cells measure one client process under the GIL, and on 3.14t they measure the storage when it commits in parallel. The GIL record of each result says which workers ran with the GIL. The RelStorage row of N4 counts `relstorage` and `relstorage-hf`.
 
 ## The client benchmark
 
