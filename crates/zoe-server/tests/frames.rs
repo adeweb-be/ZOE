@@ -152,6 +152,10 @@ fn peak_kib(pid: u32) -> u64 {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the memory of the server in /proc: Linux only"
+)]
 fn a_frame_of_many_small_values_closes_its_connection_and_takes_little_memory() {
     let dir = fresh_dir("many-values");
     let mut server = Server::path(&dir.join("store"));
@@ -223,6 +227,10 @@ fn costly_ping(id: u32, chains: u16) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the memory of the server in /proc: Linux only"
+)]
 fn the_calls_that_wait_for_a_session_hold_little_memory_and_keep_the_connection() {
     const PINGS: u32 = 64;
     let dir = fresh_dir("waiting-session");

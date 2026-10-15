@@ -189,6 +189,10 @@ fn mutated_messages_never_stop_the_server() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the memory of the server in /proc: Linux only"
+)]
 fn bad_handshakes_and_lying_lengths_are_refused_cheaply() {
     let dir = fresh_dir("handshake");
     let mut server = Server::start(

@@ -51,6 +51,10 @@ fn call_on(conn: &mut Conn, method: &str, id: &Value) -> Value {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the memory of the server in /proc: Linux only"
+)]
 fn open_iterators_hold_no_pickle_and_still_give_their_records() {
     let dir = fresh_dir("open-iterators");
     let server = Server::path(&dir.join("store"));

@@ -191,6 +191,10 @@ fn a_drop_zeroes_a_file_of_the_same_length_in_place() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "APFS makes no sparse copy: Linux only"
+)]
 fn a_kept_sparse_file_gets_its_disk_space_again() {
     let path = dir("sparse").join("c-1.zoec");
     fill(&path, 3);
