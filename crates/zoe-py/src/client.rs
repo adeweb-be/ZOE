@@ -12,6 +12,11 @@
 //! server inside `py.detach`: it releases the GIL, and on a free-threaded
 //! build it holds nothing.
 //!
+//! When the server accepted `trace_context`, each call reads the W3C
+//! traceparent of the current span on the calling thread, when it starts,
+//! through the callable `traceparent` of the open. The call then carries
+//! it to the server.
+//!
 //! A child of `os.fork()` has no thread of the runtime of its parent. A
 //! client of the parent raises `RuntimeError` at each call in the child,
 //! and its drop there frees nothing. A client that the child opens gets a
@@ -23,13 +28,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Endpoint, Error, Invalidations, Options, Tls, TlsOptions, Tokio, Transaction,
+    Address, Endpoint, Error, Invalidations, Options, Tls, TlsOptions, Tokio, Transaction, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -44,6 +51,8 @@ const RETRY: Duration = Duration::from_millis(100);
 /// The deepest nesting of a value that the client converts.
 const DEPTH: usize = 32;
 
+/// The extension that lets a call carry the trace context of the client.
+const TRACE_CONTEXT: &str = "trace_context";
 /// The server name of TLS on a unix domain socket without
 /// `server_hostname`. The client then does not check the name, so any
 /// valid name does.
@@ -109,6 +118,9 @@ pub(crate) struct NativeClient {
     wake: Mutex<Option<Invalidations>>,
     /// The last tid that the client knew after the open.
     opened_at: Tid,
+    /// The callable that returns the traceparent of the current span, when
+    /// the server accepted `trace_context`. Else `None`.
+    traceparent: Option<Py<PyAny>>,
     /// `true` when the client registered read-only.
     read_only: bool,
     /// The address of the server.
@@ -134,6 +146,11 @@ impl NativeClient {
     /// `server_hostname`, else the host of the address. With TLS, the
     /// client never connects without TLS.
     ///
+    /// When the server accepts `trace_context`, each call calls
+    /// `traceparent()` on the calling thread when it starts. A str result
+    /// is the W3C traceparent that the call carries. `None` gives a call
+    /// without one.
+    ///
     /// A connection that fails, or that the server closes before the
     /// register, is tried again until `wait_timeout` seconds pass. Then
     /// the open raises `ClientDisconnected`. Another error of the open
@@ -141,9 +158,10 @@ impl NativeClient {
     /// `ValueError`.
     #[new]
     #[pyo3(signature = (
-        addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout, tls=None
+        addresses, storage, *, read_only, read_only_fallback, extensions, wait_timeout, tls=None,
+        traceparent=None
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         addresses: Vec<Bound<'_, PyAny>>,
@@ -153,6 +171,7 @@ impl NativeClient {
         extensions: Vec<String>,
         wait_timeout: f64,
         tls: Option<TlsArgs>,
+        traceparent: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let wait = Duration::try_from_secs_f64(wait_timeout)
             .map_err(|_| PyValueError::new_err("wait_timeout is not a duration"))?;
@@ -185,6 +204,7 @@ impl NativeClient {
             Err(Opening::Runtime(error)) => return Err(error.into()),
             Err(Opening::Client(error)) => return Err(client_error(py, error)),
         };
+        let traces = client.extensions().iter().any(|name| name == TRACE_CONTEXT);
         Ok(Self {
             pid: std::process::id(),
             runtime,
@@ -195,7 +215,17 @@ impl NativeClient {
             invalidations: Mutex::new(Some(invalidations)),
             wake: Mutex::new(Some(wake)),
             opened_at,
+            traceparent: traceparent.filter(|_| traces),
         })
+    }
+
+    // The class is frozen, so it has no `__clear__`. The callable makes no
+    // cycle that the collector cannot break at another object.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(traceparent) = &self.traceparent {
+            visit.call(traceparent)?;
+        }
+        Ok(())
     }
 
     /// Tell if the client registered read-only: as asked, or after a
@@ -243,9 +273,10 @@ impl NativeClient {
     /// Return `n` new oids.
     fn new_oids<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let client = self.client(py)?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let oids = py
-            .detach(move || runtime.block_on(client.new_oids(n)))
+            .detach(move || runtime.block_on(traced(trace, client.new_oids(n))))
             .map_err(|e| client_error(py, e))?;
         Ok(oids.into_iter().map(|oid| p64(py, oid.0)).collect())
     }
@@ -268,9 +299,10 @@ impl NativeClient {
     > {
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
         let client = self.client(py)?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let record = py
-            .detach(move || runtime.block_on(client.load_before(oid, tid)))
+            .detach(move || runtime.block_on(traced(trace, client.load_before(oid, tid))))
             .map_err(|e| client_error(py, e))?;
         Ok(record.map(|record| {
             (
@@ -290,9 +322,10 @@ impl NativeClient {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         let client = self.client(py)?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let data = py
-            .detach(move || runtime.block_on(client.load_serial(oid, serial)))
+            .detach(move || runtime.block_on(traced(trace, client.load_serial(oid, serial))))
             .map_err(|e| client_error(py, e))?;
         Ok(PyBytes::new(py, &data))
     }
@@ -301,8 +334,9 @@ impl NativeClient {
     /// `Unsupported` when the server did not accept `sequences`.
     fn sequence_next(&self, py: Python<'_>, name: String) -> PyResult<u64> {
         let client = self.client(py)?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
-        py.detach(move || runtime.block_on(client.sequence_next(&name)))
+        py.detach(move || runtime.block_on(traced(trace, client.sequence_next(&name))))
             .map_err(|e| client_error(py, e))
     }
 
@@ -325,6 +359,7 @@ impl NativeClient {
         rmpv::encode::write_value(&mut encoded, &to_value(extension, 0)?)
             .map_err(|e| PyValueError::new_err(format!("the extension does not encode: {e}")))?;
         let client = self.client(py)?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let (user, description) = (user.to_vec(), description.to_vec());
         py.detach(|| {
@@ -332,8 +367,8 @@ impl NativeClient {
             if slot.is_some() {
                 return Err(Error::Invalid("a transaction is open".into()));
             }
-            let txn =
-                runtime.block_on(client.begin_with(&user, &description, &encoded, tid, &status))?;
+            let begin = client.begin_with(&user, &description, &encoded, tid, &status);
+            let txn = runtime.block_on(traced(trace, begin))?;
             *slot = Some(txn);
             Ok(())
         })
@@ -351,11 +386,12 @@ impl NativeClient {
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         self.check_process()?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         py.detach(|| {
             let mut slot = lock(&self.transaction);
             let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(txn.store(oid, serial, data))
+            runtime.block_on(traced(trace, txn.store(oid, serial, data)))
         })
         .map_err(|e| client_error(py, e))
     }
@@ -370,11 +406,12 @@ impl NativeClient {
     ) -> PyResult<()> {
         let (oid, serial) = (Oid(u64_of(oid)?), Tid(u64_of(serial)?));
         self.check_process()?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         py.detach(|| {
             let mut slot = lock(&self.transaction);
             let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(txn.check_current_serial(oid, serial))
+            runtime.block_on(traced(trace, txn.check_current_serial(oid, serial)))
         })
         .map_err(|e| client_error(py, e))
     }
@@ -383,12 +420,13 @@ impl NativeClient {
     /// ends the transaction: the server aborted it.
     fn vote<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         self.check_process()?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let resolved = py
             .detach(|| {
                 let mut slot = lock(&self.transaction);
                 let txn = slot.as_mut().ok_or_else(not_open)?;
-                let voted = runtime.block_on(txn.vote_resolved());
+                let voted = runtime.block_on(traced(trace, txn.vote_resolved()));
                 if voted.is_err() {
                     let ended = slot.take();
                     let _inside = runtime.enter();
@@ -403,11 +441,12 @@ impl NativeClient {
     /// Finish the open transaction after its vote, and return its tid.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         self.check_process()?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         let tid = py
             .detach(|| {
                 let txn = lock(&self.transaction).take().ok_or_else(not_open)?;
-                runtime.block_on(txn.finish())
+                runtime.block_on(traced(trace, txn.finish()))
             })
             .map_err(|e| client_error(py, e))?;
         Ok(p64(py, tid.0))
@@ -417,11 +456,12 @@ impl NativeClient {
     /// Without an open transaction, do nothing.
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
         self.check_process()?;
+        let trace = self.traceparent(py)?;
         let runtime = self.runtime;
         py.detach(|| {
             let txn = lock(&self.transaction).take();
             match txn {
-                Some(txn) => runtime.block_on(txn.abort()),
+                Some(txn) => runtime.block_on(traced(trace, txn.abort())),
                 None => Ok(()),
             }
         })
@@ -516,6 +556,15 @@ impl NativeClient {
         self.check_process()?;
         let client = lock(&self.client).clone();
         client.ok_or_else(|| errors::client_disconnected(py, "the client is closed".into()))
+    }
+
+    /// Return the W3C traceparent of the current span of the calling
+    /// thread, or `None`. Without the callable, it calls no Python code.
+    fn traceparent(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        match &self.traceparent {
+            Some(traceparent) => Ok(traceparent.bind(py).call0()?.extract()?),
+            None => Ok(None),
+        }
     }
 
     /// Raise `RuntimeError` in a child of `os.fork()`: the threads of the

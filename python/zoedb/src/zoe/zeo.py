@@ -37,9 +37,11 @@ or a directory, else against those of the system, as ZEO does. It
 takes no `ssl` context: TLS runs in Rust, and a context does not give back
 the files of its certificate and key. It has one connection, one
 transaction at a time, no cache, no blob and no reconnect. It declares
-`sequences` only, and speaks only the msgpack protocol `M5`: a stock ZEO
-server needs `msgpack true`. `_NOT_BUILT` names the arguments whose feature
-it does not have yet. `native` is false by default.
+`sequences`, and `trace_context` when the package `opentelemetry` is
+installed, and sends the traceparent as the client of ZEO does. It speaks
+only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
+`_NOT_BUILT` names the arguments whose feature it does not have yet.
+`native` is false by default.
 """
 
 import contextvars
@@ -60,6 +62,7 @@ from ZODB.POSException import (
 from ZODB.utils import maxtid, z64
 
 try:
+    from opentelemetry.trace import get_current_span
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
@@ -86,6 +89,9 @@ def _traceparent():
     Without a valid current span, or without OpenTelemetry, return None.
     """
     if _PROPAGATOR is None:
+        return None
+    # Without a valid span, build no carrier.
+    if not get_current_span().get_span_context().is_valid:
         return None
     carrier = {}
     _PROPAGATOR.inject(carrier)
@@ -368,8 +374,9 @@ _NOT_BUILT = {
     "server_sync": False,
 }
 
-# The extensions that the native client declares.
-_NATIVE_EXTENSIONS = ("sequences",)
+# The extensions that the native client declares: those of the client of
+# ZEO.
+_NATIVE_EXTENSIONS = EXTENSIONS
 
 # The number of oids that the native client asks for at a time.
 _NEW_OIDS = 100
@@ -536,6 +543,7 @@ class _NativeClientStorage(ClientStorage):
             extensions=list(_NATIVE_EXTENSIONS),
             wait_timeout=float(wait_timeout or 30),
             tls=tls,
+            traceparent=_traceparent,
         )
         try:
             # A read-only fallback registers read-only.

@@ -15,7 +15,7 @@ mod tls;
 
 pub use client::{
     BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
-    Transaction,
+    Transaction, traced,
 };
 pub use endpoint::{Address, Endpoint};
 pub use error::Error;

@@ -8,6 +8,9 @@
 //! seconds. When one of the tasks stops, the connection closes: each call
 //! that waits for its reply fails with `Error::Disconnected`, and so does
 //! each later call.
+//!
+//! On a connection that got the extension `trace_context`, each call that
+//! runs inside `traced` carries its W3C traceparent.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -15,7 +18,7 @@ use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
@@ -47,6 +50,23 @@ const OIDS_PER_CALL: usize = 100;
 /// The largest chunk of a blob that `Transaction::store_blob` sends, as
 /// `ZEO.ClientStorage` sends it.
 pub const BLOB_CHUNK: usize = 59_000;
+
+tokio::task_local! {
+    /// The W3C traceparent of the calls of the current `traced` future.
+    static TRACEPARENT: Option<String>;
+}
+
+/// Run `future` with the W3C traceparent `traceparent`. On a connection
+/// that got the extension `trace_context`, each call that `future` sends
+/// carries it, in a fifth element of its message. A call outside `traced`,
+/// or with `None`, has four elements. The heartbeat and the abort of a
+/// dropped `Transaction` carry no traceparent.
+pub fn traced<F: Future>(
+    traceparent: Option<String>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    TRACEPARENT.scope(traceparent, future)
+}
 
 /// A client of one storage of a ZEO 6 server.
 ///
@@ -167,6 +187,9 @@ struct Inner {
     commit: Arc<tokio::sync::Mutex<()>>,
     /// The id of the next transaction.
     next_txn: AtomicU64,
+    /// `true` when the server accepted `trace_context`. Only then does a
+    /// call carry a traceparent.
+    traces: AtomicBool,
 }
 
 /// The calls that wait for their replies.
@@ -261,6 +284,8 @@ impl Client {
         let info = client.inner.call("get_info", vec![]).await?;
         client.extensions = accepted(&info, &options.extensions);
         client.info = info;
+        let traces = client.extensions.iter().any(|name| name == TRACE_CONTEXT);
+        client.inner.traces.store(traces, Ordering::SeqCst);
         Ok(client)
     }
 
@@ -395,6 +420,7 @@ impl Client {
             invalidations: Mutex::new(Some(invalidations)),
             commit: Arc::new(tokio::sync::Mutex::new(())),
             next_txn: AtomicU64::new(1),
+            traces: AtomicBool::new(false),
         });
         let (alive, tasks) = mpsc::channel(1);
         let (reader, writer) = tokio::io::split(stream);
@@ -840,7 +866,7 @@ impl Inner {
         };
         // The guard forgets the call when its future is dropped.
         let _forget = Forget { inner: self, id };
-        let frame = protocol::call(id, method, args)?;
+        let frame = protocol::call(id, method, args, self.traceparent().as_deref())?;
         self.outgoing
             .send(frame)
             .await
@@ -853,11 +879,20 @@ impl Inner {
         if lock(&self.calls).closed {
             return Err(Error::Disconnected);
         }
-        let frame = protocol::notify(method, args)?;
+        let frame = protocol::notify(method, args, self.traceparent().as_deref())?;
         self.outgoing
             .send(frame)
             .await
             .map_err(|_| Error::Disconnected)
+    }
+
+    /// Return the traceparent of the current `traced` future when the
+    /// server accepted `trace_context`, else `None`.
+    fn traceparent(&self) -> Option<String> {
+        if !self.traces.load(Ordering::SeqCst) {
+            return None;
+        }
+        TRACEPARENT.try_with(Clone::clone).ok().flatten()
     }
 
     /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
@@ -875,7 +910,7 @@ impl Inner {
             calls.next_id += 1;
             id
         };
-        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()]) else {
+        let Ok(frame) = protocol::call(id, "tpc_abort", vec![txn.into()], None) else {
             return;
         };
         if let Err(mpsc::error::TrySendError::Full(frame)) = self.outgoing.try_send(frame) {
@@ -1019,6 +1054,9 @@ async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
 
 /// The extension of the sequences.
 const SEQUENCES: &str = "sequences";
+
+/// The extension that lets a call carry the trace context of the client.
+const TRACE_CONTEXT: &str = "trace_context";
 
 /// Tell if `class` is the class of a `TypeError`, as `builtins.TypeError`.
 fn is_type_error(class: &str) -> bool {

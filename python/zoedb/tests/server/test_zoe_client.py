@@ -4,9 +4,10 @@ The acceptance test covers the sequences over the protocol, a stock client,
 a stock server and the section that opens the client. These tests cover the
 rest: the keys of the section, its `<ssl>` section, the read-only fallback
 with the declaration, a name that is not a str, the switch to the native
-client, and the arguments of TLS and of the addresses of the native client.
-They also cover the CA certificates of the native client: a directory as
-`authenticate`, and those of the system without `authenticate`.
+client, the arguments of TLS and of the addresses of the native client, and
+the traceparent that the native client reads. They also cover the CA
+certificates of the native client: a directory as `authenticate`, and those
+of the system without `authenticate`.
 """
 
 import io
@@ -445,6 +446,71 @@ def test_a_child_of_fork_refuses_a_client_of_its_parent(tmp_path):
             assert len(storage.new_oid()) == 8
         finally:
             storage.close()
+
+
+def test_the_native_client_declares_the_extensions_of_the_client_of_zeo():
+    import zoe.zeo
+
+    assert zoe.zeo._NATIVE_EXTENSIONS == zoe.zeo.EXTENSIONS
+    traces = "trace_context" in zoe.zeo._NATIVE_EXTENSIONS
+    assert traces == (zoe.zeo._PROPAGATOR is not None)
+
+
+def native(server, extensions, traceparent):
+    """Open a `zoe._zoe.Client` that declares `extensions`."""
+    from zoe import _zoe
+
+    return _zoe.Client(
+        [tuple(server.address)],
+        "1",
+        read_only=False,
+        read_only_fallback=False,
+        extensions=extensions,
+        wait_timeout=float(TIMEOUT),
+        traceparent=traceparent,
+    )
+
+
+def test_the_native_client_reads_the_traceparent_only_when_it_traces(tmp_path):
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    reads = []
+
+    def read():
+        reads.append(None)
+        return traceparent
+
+    with ZoeServer(str(tmp_path / "store")) as server:
+        # The server accepted the extension: each call reads the
+        # traceparent once, when it starts.
+        traced = native(server, ["trace_context"], read)
+        try:
+            assert traced.extensions() == ["trace_context"]
+            assert len(traced.new_oids(1)) == 1
+            traced.begin(b"", b"", {})
+            traced.abort()
+            assert len(reads) == 3
+        finally:
+            traced.close()
+        # Without the declaration, no call reads the traceparent.
+        reads.clear()
+        plain = native(server, ["sequences"], read)
+        try:
+            assert len(plain.new_oids(1)) == 1
+            plain.begin(b"", b"", {})
+            plain.abort()
+            assert reads == []
+        finally:
+            plain.close()
+
+
+def test_a_traceparent_that_is_not_a_str_raises_type_error(tmp_path):
+    with ZoeServer(str(tmp_path / "store")) as server:
+        client = native(server, ["trace_context"], lambda: 1)
+        try:
+            with pytest.raises(TypeError):
+                client.new_oids(1)
+        finally:
+            client.close()
 
 
 def test_native_on_another_subclass_raises_type_error():
