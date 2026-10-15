@@ -1,6 +1,6 @@
 # 0036. Several transactions at once in one client process
 
-Status: proposed. The spike `docs/spikes/concurrent-commits.md` gives the evidence. The human decides. The native client of F28 builds the choice.
+Status: accepted. The human accepted design (a). The spike `docs/spikes/concurrent-commits.md` gives the evidence. The native client of F28 builds the choice.
 
 ## Context
 
