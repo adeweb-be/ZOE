@@ -27,6 +27,9 @@ class Native:
     def address(self):
         return ("127.0.0.1", 8100)
 
+    def take_cache_check(self):
+        return None
+
 
 class DB:
     def __init__(self):

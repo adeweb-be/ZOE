@@ -688,7 +688,10 @@ impl Cache {
     /// that the commits after `applied` wrote: the current entry of each
     /// goes, and the other entries stay, and `applied` moves up to `tid`.
     /// `None` drops every entry, and `applied` becomes `tid`, also when it
-    /// was above. One hold of the writer lock does both, so a store that
+    /// was above. A lower `tid` is only for a cache that does not serve
+    /// yet: the verification of a file ahead of its server, at the open.
+    /// Its `store` refused every reply until then. One hold of the writer
+    /// lock does both, so a store that
     /// runs after it refuses a current reply older than `tid`. Then the
     /// cache serves.
     pub fn verify(&self, tid: Tid, changed: Option<&[Oid]>) {
@@ -704,6 +707,10 @@ impl Cache {
                 self.set_applied(tid.0);
             }
             None => {
+                debug_assert!(
+                    !self.verified.load(Ordering::Relaxed) || tid >= self.applied(),
+                    "only a cache that does not serve moves applied down"
+                );
                 self.clear_locked();
                 self.word(H_APPLIED).store(tid.0, Ordering::Release);
             }

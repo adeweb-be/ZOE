@@ -13,10 +13,14 @@
 //!   the file was not closed but the kernel did not restart since: a
 //!   process that dies leaves its writes in the page cache.
 //!
-//! Else the open drops every entry: it cuts the file to zero and gives it
-//! its length again, so every word is zero. The open then marks the file
-//! not clean, with the boot id of the kernel, and writes the header page
-//! to the disk before any other write.
+//! Else the open drops every entry: it makes the file zero in place, and
+//! gives it the length of the layout. It makes the file shorter only when
+//! the layout is smaller. The open never changes a file that does not start
+//! with the magic of ZOE (or with a zero word, which an open that died
+//! before its first write leaves): such a file is not a cache file of ZOE,
+//! and the open fails. Each open gives the file its disk space. The open
+//! then marks the file not clean, with the boot id of the kernel, and
+//! writes the header page to the disk before any other write.
 //!
 //! A file with entries serves only after `Cache::verify`: the pool verifies
 //! it against the server first.
@@ -25,7 +29,8 @@
 //! clean with the checksum of the state, then writes the header page again.
 //! Then it frees the lock: the mapping holds the open file until the unmap,
 //! so only an explicit unlock frees the lock at the close. A closed cache
-//! never reads or writes its mapping again.
+//! never writes its mapping again; it reads it only for `applied` and
+//! `Debug`.
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io;
@@ -39,6 +44,9 @@ use super::{
     Cache, H_BOOT, H_CLEAN, H_HEAD, H_MAGIC, H_RING, H_SLOTS, H_STATE_SUM, H_STATIC_SUM, H_STORAGE,
     HEADER_WORDS, Layout, STATIC_WORDS, words_sum,
 };
+
+/// The first bytes of the magic of every version of the layout.
+const MAGIC_PREFIX: &[u8; 7] = b"ZOECACH";
 
 /// The file that gives the boot id of the kernel.
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
@@ -82,9 +90,11 @@ impl Cache {
     /// its length never changes while it is open.
     ///
     /// The open fails with `io::ErrorKind::WouldBlock` when another open
-    /// file holds the lock of the file, in this process or in another, and
-    /// with `io::ErrorKind::InvalidInput` for a bad size or a name of the
-    /// storage longer than 256 bytes. Any other error is the error of the
+    /// file holds the lock of the file, in this process or in another, with
+    /// `io::ErrorKind::InvalidInput` for a bad size or a name of the storage
+    /// longer than 256 bytes, and with `io::ErrorKind::InvalidData` for a
+    /// file that is not a cache file of ZOE, such as the `.zec` file of ZEO:
+    /// the open does not change it. Any other error is the error of the
     /// file.
     ///
     /// A file with entries does not serve until `Cache::verify`. A new
@@ -110,6 +120,19 @@ impl Cache {
             Err(TryLockError::Error(error)) => return Err(error),
         }
         let len = file.metadata()?.len();
+        if len > 0 {
+            let mut magic = [0u8; 8];
+            let read = file.read_exact_at(&mut magic, 0);
+            if read.is_err() || (magic != [0; 8] && !magic.starts_with(MAGIC_PREFIX)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is not a cache file of the native client: the open leaves it as it is",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         let keep = len >= HEADER_WORDS as u64 * 8 && {
             let mut page = vec![0u8; HEADER_WORDS * 8];
             file.read_exact_at(&mut page, 0)?;
@@ -121,12 +144,24 @@ impl Cache {
                 .collect();
             trustworthy(&header, &fixed, len, &layout)
         };
+        let target = layout.words as u64 * 8;
         if !keep {
-            let len = layout.words as u64 * 8;
-            file.set_len(0)?;
-            file.set_len(len)?;
-            mapping::allocate(&file, len)?;
+            // Zero in place, so a closed cache of this process that still
+            // maps the file never finds its end moved. Cut the file only
+            // when the file system cannot zero a range.
+            if let Err(error) = mapping::zero(&file, len.min(target)) {
+                if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    return Err(error);
+                }
+                file.set_len(0)?;
+            }
+            if file.metadata()?.len() != target {
+                file.set_len(target)?;
+            }
         }
+        // A copy can make a kept file sparse: a write through the mapping to
+        // a hole of a full disk raises SIGBUS.
+        mapping::allocate(&file, target)?;
         let cache = Cache::with(layout.words, &layout, Some(file))?;
         if !keep {
             cache.init(&fixed);

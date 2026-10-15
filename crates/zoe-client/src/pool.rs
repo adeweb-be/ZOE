@@ -140,6 +140,31 @@ pub enum Verification {
     Dropped,
 }
 
+/// How the verification of a cache that a file gave ended, at the open of
+/// the pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileCheck {
+    /// The server had no commit after `applied` of the file.
+    Kept,
+    /// `getInvalidations` gave the commits after `applied`: the cache
+    /// dropped the current entry of each oid.
+    Quick,
+    /// The server does not keep the commits after `applied`: the cache
+    /// dropped every entry.
+    Dropped,
+    /// `getInvalidations` failed with this text: the cache dropped every
+    /// entry.
+    Failed(String),
+    /// `applied` of the file is above the last tid of the server: the
+    /// cache dropped every entry.
+    Ahead {
+        /// `applied` of the file.
+        applied: Tid,
+        /// The last tid of the server.
+        server: Tid,
+    },
+}
+
 /// What the pool gives to its consumer: a delivery, or a change of the
 /// connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +265,9 @@ struct State {
     /// The last tid that the pool delivered.
     last: u64,
     counters: Counters,
+    /// How the verification of a cache file ended, until
+    /// `Pool::take_file_check` takes it.
+    file_check: Option<FileCheck>,
 }
 
 /// An event for the consumer.
@@ -498,6 +526,13 @@ impl Pool {
         self.shared
             .until(|state| (state.closed || cache.verified()).then_some(()))
             .await;
+    }
+
+    /// Return how the verification of a cache that a file gave ended, once.
+    /// Return `None` before its end, after the first call, and for a cache
+    /// that served at once.
+    pub fn take_file_check(&self) -> Option<FileCheck> {
+        self.shared.lock().file_check.take()
     }
 
     /// Return the client cache of the pool, if it has one. A hit there
@@ -1847,25 +1882,34 @@ async fn verify(shared: &Shared, client: &Client) -> Verified {
 /// close.
 async fn verify_file(shared: &Shared, cache: &Cache, client: &Client, server_tid: Tid) -> bool {
     let base = cache.applied();
-    if base == server_tid {
+    let check = if base == server_tid {
         cache.verify(server_tid, Some(&[]));
-        return true;
-    }
-    if base > server_tid {
+        FileCheck::Kept
+    } else if base > server_tid {
         cache.verify(server_tid, None);
-        return true;
-    }
-    match shared.unless_closed(client.get_invalidations(base)).await {
-        None => false,
-        Some(Ok(Some(invalidation))) => {
-            cache.verify(invalidation.tid, Some(&invalidation.oids));
-            true
+        FileCheck::Ahead {
+            applied: base,
+            server: server_tid,
         }
-        Some(Ok(None) | Err(_)) => {
-            cache.verify(server_tid, None);
-            true
+    } else {
+        match shared.unless_closed(client.get_invalidations(base)).await {
+            None => return false,
+            Some(Ok(Some(invalidation))) => {
+                cache.verify(invalidation.tid, Some(&invalidation.oids));
+                FileCheck::Quick
+            }
+            Some(Ok(None)) => {
+                cache.verify(server_tid, None);
+                FileCheck::Dropped
+            }
+            Some(Err(error)) => {
+                cache.verify(server_tid, None);
+                FileCheck::Failed(error.to_string())
+            }
         }
-    }
+    };
+    shared.lock().file_check = Some(check);
+    true
 }
 
 /// Take the server of the new listener `client`: the pool is connected.
