@@ -1,10 +1,13 @@
 //! The compression pool: the threads that encode the staged pickles of the
 //! transactions, off the path of the transaction.
 //!
-//! All the connections of the server share one pool. At most its number
-//! of threads, the number of cores by default, encode at once, on
-//! blocking threads of the runtime. The jobs wait in the order of their
-//! queue.
+//! All the connections of the server share one pool: one queue of jobs,
+//! and at most its number of threads, the number of cores by default,
+//! that run them in the order of the queue, on blocking threads of the
+//! runtime. A thread of the pool runs the jobs of the queue one after the
+//! other, with the zstd context of its thread, and ends when the queue is
+//! empty. A new job starts a thread only when it waits behind the jobs
+//! that the threads run. So a stream of small jobs wakes few threads.
 //!
 //! `storea` and `restorea` stage the pickle in the core, queue a job and
 //! reply at once. The job encodes the pickle with the compression of the
@@ -15,13 +18,14 @@
 //!
 //! The transaction holds the receiver of each job. An abort, a failed
 //! vote and a lost connection drop the receivers. A job whose receiver is
-//! gone leaves the queue, or does not encode when it gets a thread. A job
-//! that encodes already ends, and nothing reads its result.
+//! gone does not encode when a thread takes it. A job that encodes already
+//! ends, and nothing reads its result.
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::oneshot;
 use zoe_core::{Compression, Encoded, Oid};
 
 use crate::runtime::{Runtime, block_on};
@@ -33,11 +37,33 @@ pub(crate) type Hook = Arc<dyn Fn(Oid) -> bool + Send + Sync>;
 
 /// The compression pool of all the connections.
 #[derive(Clone)]
-pub(crate) struct Compressor {
-    /// One permit for each thread of the pool.
-    threads: Arc<Semaphore>,
+pub(crate) struct Compressor(Arc<Shared>);
+
+struct Shared {
+    /// The most threads that run jobs at once.
+    threads: usize,
+    state: Mutex<State>,
     #[cfg(test)]
     hook: Option<Hook>,
+}
+
+#[derive(Default)]
+struct State {
+    /// The jobs that wait for a thread, in the order of their queue.
+    queue: VecDeque<Work>,
+    /// The threads of the pool that run.
+    threads: usize,
+    /// The threads that encode a job. The others take the next job.
+    encoding: usize,
+}
+
+/// A job in the queue.
+struct Work {
+    #[cfg(test)]
+    oid: Oid,
+    data: Vec<u8>,
+    compression: Compression,
+    sender: oneshot::Sender<Encoded>,
 }
 
 /// The job of one staged pickle. The drop of the job cancels it.
@@ -54,24 +80,28 @@ pub(crate) struct Failed(pub(crate) Oid);
 impl Compressor {
     /// A pool of `threads` threads.
     pub(crate) fn new(threads: NonZeroUsize) -> Self {
-        Self {
-            threads: Arc::new(Semaphore::new(
-                threads.get().min(Semaphore::MAX_PERMITS),
-            )),
+        Self(Arc::new(Shared {
+            threads: threads.get(),
+            state: Mutex::new(State::default()),
             #[cfg(test)]
             hook: None,
-        }
+        }))
     }
 
-    /// Run `hook` in each job before it encodes.
+    /// Run `hook` in each job before it encodes. Call it before the pool
+    /// has a clone.
     #[cfg(test)]
     pub(crate) fn with_hook(mut self, hook: Hook) -> Self {
-        self.hook = Some(hook);
+        Arc::get_mut(&mut self.0)
+            .expect("a pool without clones")
+            .hook = Some(hook);
         self
     }
 
     /// Queue the encode of `data`, the staged pickle of `oid`, with
-    /// `compression`, on `runtime`. The call does not wait.
+    /// `compression`. Start a thread of the pool on `runtime` when the job
+    /// waits behind the jobs that the threads run, and the pool has fewer
+    /// threads than its limit. The call does not wait.
     pub(crate) fn queue(
         &self,
         runtime: &Arc<dyn Runtime>,
@@ -79,31 +109,92 @@ impl Compressor {
         data: Vec<u8>,
         compression: Compression,
     ) -> Job {
-        let (mut sender, encoded) = oneshot::channel();
-        let threads = Arc::clone(&self.threads);
-        let blocking = Arc::clone(runtime);
-        #[cfg(test)]
-        let hook = self.hook.clone();
-        runtime.spawn(Box::pin(async move {
-            let permit = tokio::select! {
-                permit = threads.acquire_owned() => permit.ok(),
-                () = sender.closed() => None,
-            };
-            let Some(permit) = permit else { return };
-            blocking.spawn_blocking(Box::new(move || {
-                // The thread keeps its permit until the encode ends.
-                let _permit = permit;
-                if sender.is_closed() {
-                    return;
-                }
+        let (sender, encoded) = oneshot::channel();
+        let start = {
+            let mut state = self.0.lock();
+            state.queue.push_back(Work {
                 #[cfg(test)]
-                if hook.is_some_and(|hook| !hook(oid)) {
-                    return;
-                }
-                let _ = sender.send(Encoded::encode(&data, compression));
-            }));
-        }));
+                oid,
+                data,
+                compression,
+                sender,
+            });
+            let free = state.threads - state.encoding;
+            let start = state.queue.len() > free && state.threads < self.0.threads;
+            if start {
+                state.threads += 1;
+            }
+            start
+        };
+        if start {
+            self.0.start(runtime);
+        }
         Job { oid, encoded }
+    }
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // The state stays valid after a panic: `Running` counts the end
+        // of its thread when it unwinds.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Start a thread of the pool, which `queue` counted already.
+    fn start(self: &Arc<Self>, runtime: &Arc<dyn Runtime>) {
+        let running = Running {
+            pool: Arc::clone(self),
+            runtime: Arc::clone(runtime),
+        };
+        runtime.spawn_blocking(Box::new(move || running.run()));
+    }
+}
+
+/// A thread of the pool. Its drop counts its end. After a panic, the drop
+/// starts another thread when jobs wait, so no job waits for ever.
+struct Running {
+    pool: Arc<Shared>,
+    runtime: Arc<dyn Runtime>,
+}
+
+impl Running {
+    /// Run the jobs of the queue until it is empty.
+    fn run(&self) {
+        loop {
+            let work = {
+                let mut state = self.pool.lock();
+                match state.queue.pop_front() {
+                    Some(work) => {
+                        state.encoding += 1;
+                        work
+                    }
+                    None => return,
+                }
+            };
+            let skip = work.sender.is_closed();
+            #[cfg(test)]
+            let skip = skip || self.pool.hook.as_ref().is_some_and(|hook| !hook(work.oid));
+            if !skip {
+                let encoded = Encoded::encode(&work.data, work.compression);
+                let _ = work.sender.send(encoded);
+            }
+            self.pool.lock().encoding -= 1;
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut state = self.pool.lock();
+        if std::thread::panicking() {
+            state.encoding -= 1;
+            if !state.queue.is_empty() {
+                drop(state);
+                self.pool.start(&self.runtime);
+                return;
+            }
+        }
+        state.threads -= 1;
     }
 }
 

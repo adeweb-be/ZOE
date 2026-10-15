@@ -27,8 +27,7 @@ use redb::{
 
 use crate::backend::{
     Backend, BlobRecord, Bytes, NewPayload, NewRecord, PackStats, Payload, Record, RecordEncoding,
-    RecordMeta, TxnIter,
-    TxnMeta, TxnRecords, TxnStatus, WriteTxn,
+    RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
@@ -1025,9 +1024,8 @@ impl WriteTxn for RedbWrite<'_> {
         tid: Tid,
         new: &mut dyn Iterator<Item = Result<NewRecord<'_>>>,
     ) -> Result<()> {
-        let mut payloads = new.map(|record| {
-            record.map(|(oid, prev, data)| (oid, prev, Payload::Pickle(data)))
-        });
+        let mut payloads =
+            new.map(|record| record.map(|(oid, prev, data)| (oid, prev, Payload::Pickle(data))));
         self.put_payloads(tid, &mut payloads)
     }
 

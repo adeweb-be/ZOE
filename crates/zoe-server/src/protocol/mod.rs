@@ -54,10 +54,10 @@ use zoe_core::Store;
 
 use crate::runtime::{BoxFuture, Runtime, Tokio};
 
+use compress::Compressor;
 use invalidation::Invalidations;
 use metrics::{Exported, Metrics};
 use outbox::{Closing, Outbox};
-use compress::Compressor;
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
 use status::Stats;

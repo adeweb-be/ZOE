@@ -287,14 +287,10 @@ impl tracing::Subscriber for FsyncSpans {
     }
 }
 
-/// The record of `oid` in its `version`: 1 KB, the size of a record of
-/// zodbshootout. The first half is text that zstd compresses well, the
-/// second half is pseudo-random bytes that it does not.
-fn record(oid: Oid, version: u64) -> Vec<u8> {
-    record_of(oid, version, SIZE)
-}
-
-/// The record of `oid` in its `version`, of `size` bytes, as `record`.
+/// The record of `oid` in its `version`, of `size` bytes: 1 KB is the
+/// size of a record of zodbshootout. The first half is text that zstd
+/// compresses well, the second half is pseudo-random bytes that it does
+/// not.
 fn record_of(oid: Oid, version: u64, size: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
     data.extend_from_slice(b"\x80\x03czodbshootout.speedtest\nPObject\nq\x00.\x80\x03}q\x01(");

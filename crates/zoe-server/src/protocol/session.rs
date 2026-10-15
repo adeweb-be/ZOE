@@ -1302,8 +1302,9 @@ impl Transaction {
     }
 
     /// Run one call of the transaction, and count it in the status of the
-    /// storage.
-    pub(crate) fn call(&mut self, call: &Call) -> Outcome {
+    /// storage. `storea` and `restorea` take the pickle out of the args of
+    /// `call` for the compression pool.
+    pub(crate) fn call(&mut self, call: &mut Call) -> Outcome {
         let was_open = self.open.is_some();
         let listed = self.open.as_ref().map_or(0, |open| open.listed);
         let started = Instant::now();
@@ -1376,8 +1377,8 @@ impl Transaction {
     }
 
     /// Run one call of the transaction.
-    fn dispatch(&mut self, call: &Call) -> Outcome {
-        let args = call.args.as_slice();
+    fn dispatch(&mut self, call: &mut Call) -> Outcome {
+        let args = call.args.as_mut_slice();
         if !self.session.is_registered() {
             return Outcome::Close(format!("{} before register", call.method));
         }
@@ -1391,7 +1392,7 @@ impl Transaction {
             "checkCurrentSerialInTransaction" => self.check_current_serial(args),
             "deleteObject" => self.delete_object(args),
             "vote" => self.vote(args),
-            "tpc_finish" => return self.tpc_finish(call),
+            "tpc_finish" => return self.tpc_finish(&*call),
             "tpc_abort" => self.tpc_abort(args),
             "storeBlobStart" => self.store_blob_start(args),
             "storeBlobChunk" => self.store_blob_chunk(args),
@@ -1473,8 +1474,8 @@ impl Transaction {
 
     /// Stage a new version of an object, and queue the encode of its
     /// pickle. The call does not wait for the encode.
-    fn storea(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, serial, data, id] = arity::<4>(args, "storea")?;
+    fn storea(&mut self, args: &mut [Value]) -> Result<Value, Fault> {
+        let [oid, serial, data, id] = arity_mut::<4>(args, "storea")?;
         let mut staged = None;
         self.current(id)?.stage(|txn| {
             let (oid, serial) = (Oid(u64_of(oid)?), store_serial(serial)?);
@@ -1482,7 +1483,7 @@ impl Transaction {
                 return Err(Fault::type_error("data is not bytes"));
             };
             txn.store(oid, serial, data)?;
-            staged = Some((oid, data.as_slice()));
+            staged = Some((oid, std::mem::take(data)));
             Ok(())
         });
         if let Some((oid, data)) = staged {
@@ -1499,7 +1500,7 @@ impl Transaction {
     /// that listed conflicts: the finish encodes these pickles. A pickle in
     /// the spill file stays out of memory, and the second vote takes its
     /// locks already.
-    fn queue(&mut self, oid: Oid, data: &[u8]) {
+    fn queue(&mut self, oid: Oid, data: Vec<u8>) {
         let (Some((compressor, runtime)), Some(open)) = (&self.compress, &mut self.open) else {
             return;
         };
@@ -1512,7 +1513,7 @@ impl Transaction {
         {
             return;
         }
-        let job = compressor.queue(runtime, oid, data.to_vec(), compression);
+        let job = compressor.queue(runtime, oid, data, compression);
         open.jobs.push(job);
     }
 
@@ -1522,18 +1523,19 @@ impl Transaction {
     /// transaction, not `serial`, and `prev_txn` is not used. In a
     /// transaction without a tid, the vote fails with
     /// `StorageTransactionError`.
-    fn restorea(&mut self, args: &[Value]) -> Result<Value, Fault> {
-        let [oid, _serial, data, _prev_txn, id] = arity::<5>(args, "restorea")?;
+    fn restorea(&mut self, args: &mut [Value]) -> Result<Value, Fault> {
+        let [oid, _serial, data, _prev_txn, id] = arity_mut::<5>(args, "restorea")?;
         let mut staged = None;
         self.current(id)?.stage(|txn| {
             let oid = Oid(u64_of(oid)?);
-            let data = match data {
-                Value::Binary(data) => Some(data.as_slice()),
-                Value::Nil => None,
+            match data {
+                Value::Binary(data) => {
+                    txn.restore(oid, Some(data))?;
+                    staged = Some((oid, std::mem::take(data)));
+                }
+                Value::Nil => txn.restore(oid, None)?,
                 _ => return Err(Fault::type_error("data is not bytes or None")),
-            };
-            txn.restore(oid, data)?;
-            staged = data.map(|data| (oid, data));
+            }
             Ok(())
         });
         if let Some((oid, data)) = staged {
@@ -1787,7 +1789,10 @@ impl Drop for Transaction {
 fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
     for job in jobs {
         let (oid, encoded) = job.wait().map_err(|Failed(oid)| {
-            Fault::storage(format!("the encode of the pickle of oid {:#x} failed", oid.0))
+            Fault::storage(format!(
+                "the encode of the pickle of oid {:#x} failed",
+                oid.0
+            ))
         })?;
         txn.set_encoded(oid, encoded)?;
     }
@@ -1840,6 +1845,15 @@ fn client_label(value: &Value) -> String {
 }
 
 /// Return the `N` arguments of `method`.
+/// Return the args of `method` as an array of `N` values to change.
+fn arity_mut<'a, const N: usize>(
+    args: &'a mut [Value],
+    method: &str,
+) -> Result<&'a mut [Value; N], Fault> {
+    args.try_into()
+        .map_err(|_| Fault::type_error(format!("{method} takes {N} arguments")))
+}
+
 fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Value; N], Fault> {
     args.try_into()
         .map_err(|_| Fault::type_error(format!("{method} takes {N} arguments")))
@@ -1959,7 +1973,7 @@ mod tests {
         /// Run one call. Keep whether it put its reply itself.
         fn call(&mut self, call: &Call) -> Outcome {
             if self.session.is_registered() && in_transaction(&call.method) {
-                return self.txn.call(call);
+                return self.txn.call(&mut call.clone());
             }
             let mut reply = Reply::new(self.session.outbox.blocking_room());
             let outcome = self.session.call(call, &mut reply);
@@ -3103,7 +3117,10 @@ mod tests {
             let mut reply = Reply::new(s.session.outbox.blocking_room());
             let fault = failed(s.session.call(&next, &mut reply));
             assert_eq!(fault.class, "builtins.ValueError");
-            assert_eq!(failed(s.txn.call(&next)).class, "builtins.ValueError");
+            assert_eq!(
+                failed(s.txn.call(&mut next.clone())).class,
+                "builtins.ValueError"
+            );
             // The connection stays open, and the store gave no value.
             assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
             assert_eq!(s.store.sequence("intids").next().unwrap(), 1);
@@ -5186,7 +5203,7 @@ mod tests {
             let mut s = Client {
                 session,
                 txn,
-                place: None,
+                sent: None,
             };
             let register = vec![Value::from("1"), Value::Boolean(false)];
             done(call(&mut s, "register", register));
@@ -5306,7 +5323,10 @@ mod tests {
             let (_, vote) = voting.join().unwrap();
             let fault = failed(vote);
             assert_eq!(fault.class, CONFLICT_ERROR);
-            assert_eq!(item(&fault, "serials"), Value::Array(vec![p64(tid), p64(0)]));
+            assert_eq!(
+                item(&fault, "serials"),
+                Value::Array(vec![p64(tid), p64(0)])
+            );
         }
 
         #[test]
@@ -5393,12 +5413,21 @@ mod tests {
             let (pooled, inline) = (storage("pooled"), storage("inline"));
             let mut a = client(&pooled, &compressor);
             let mut b = Client::new(Arc::clone(&inline), outbox());
-            done(call(&mut b, "register", vec![Value::from("1"), Value::Boolean(false)]));
+            done(call(
+                &mut b,
+                "register",
+                vec![Value::from("1"), Value::Boolean(false)],
+            ));
             let tid = 0x0300_0000_0000_0001;
             let records: Vec<(u64, Vec<u8>)> = vec![
                 (1, large(1)),
                 (2, MAPPING.to_vec()),
-                (3, (0..5_000u64).map(|i| (i * 2_654_435_761 >> 13) as u8).collect()),
+                (
+                    3,
+                    (0..5_000u64)
+                        .map(|i| ((i * 2_654_435_761) >> 13) as u8)
+                        .collect(),
+                ),
             ];
             for s in [&mut a, &mut b] {
                 begin(s, 1, Some(tid));

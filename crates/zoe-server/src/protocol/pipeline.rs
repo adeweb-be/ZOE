@@ -367,7 +367,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, comp
     let (compressor, runtime) = compress;
     let mut transaction = Transaction::new(Arc::clone(session)).compressing(compressor, runtime);
     while let Some((
-        call,
+        mut call,
         Ticket {
             slot: _slot, room, ..
         },
@@ -379,7 +379,7 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, comp
         }
         let _entered = session.span(peer).entered();
         let _request = session.request(&call).entered();
-        let outcome = transaction.call(&call);
+        let outcome = transaction.call(&mut call);
         if !Reply::new(room).send(&call, outcome, session.outbox()) {
             lane.stop();
             ended.end();
