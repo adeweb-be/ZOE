@@ -33,5 +33,6 @@ pub use pool::{
     Connect, Counters, Delivery, Dropping, Event, FileCheck, Finished, Open, Pool, PoolTransaction,
     REFUSED_POLL, Reconnect, Turn, Verification,
 };
+pub use protocol::recycle;
 pub use runtime::{Runtime, Tokio};
 pub use tls::{Tls, TlsOptions};

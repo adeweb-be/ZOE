@@ -666,8 +666,11 @@ impl NativeClient {
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
             .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| {
+            let data = PyBytes::new(py, &record.data);
+            // The buffer goes back to the client for the next long reply.
+            zoe_client::recycle(record.data);
             (
-                PyBytes::new(py, &record.data),
+                data,
                 p64(py, record.tid.0),
                 record.end.map(|end| p64(py, end.0)),
             )
@@ -698,7 +701,11 @@ impl NativeClient {
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
             .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
-        Ok(record.map(|record| (PyBytes::new(py, &record.data), p64(py, record.tid.0))))
+        Ok(record.map(|record| {
+            let data = PyBytes::new(py, &record.data);
+            zoe_client::recycle(record.data);
+            (data, p64(py, record.tid.0))
+        }))
     }
 
     /// Empty the cache, and keep the tid up to which it applied the
@@ -742,7 +749,9 @@ impl NativeClient {
         let data = py
             .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
             .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
-        Ok(PyBytes::new(py, &data))
+        let bytes = PyBytes::new(py, &data);
+        zoe_client::recycle(data);
+        Ok(bytes)
     }
 
     /// Download the blob of `oid` that the transaction `serial` wrote into

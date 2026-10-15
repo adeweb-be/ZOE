@@ -601,23 +601,7 @@ impl Client {
         if reply.is_nil() {
             return Ok((None, position));
         }
-        let Some([data, start, end]) = reply
-            .as_array()
-            .and_then(|items| <&[Value; 3]>::try_from(items.as_slice()).ok())
-        else {
-            return Err(bad("loadBefore", &reply));
-        };
-        let Some(data) = data.as_slice() else {
-            return Err(bad("loadBefore", &reply));
-        };
-        let record = Record {
-            data: data.to_vec(),
-            tid: self::tid(start, "loadBefore")?,
-            end: match end {
-                Value::Nil => None,
-                end => Some(self::tid(end, "loadBefore")?),
-            },
-        };
+        let record = record(reply)?;
         Ok((Some(record), position))
     }
 
@@ -629,9 +613,10 @@ impl Client {
             .inner
             .call("loadSerial", vec![bin8(oid.0), bin8(serial.0)])
             .await?;
-        match reply.as_slice() {
-            Some(data) => Ok(data.to_vec()),
-            None => Err(bad("loadSerial", &reply)),
+        match reply {
+            // The data moves out of the reply: no copy.
+            Value::Binary(data) => Ok(data),
+            reply => Err(bad("loadSerial", &reply)),
         }
     }
 
@@ -1514,10 +1499,10 @@ async fn read(inner: Arc<Inner>, mut stream: ReadHalf<Box<dyn Stream>>, _alive: 
         let frame = tokio::select! {
             biased;
             () = closed(&mut closing) => break,
-            frame = protocol::read_frame(&mut stream) => frame,
+            frame = protocol::read_payload(&mut stream) => frame,
         };
         let Ok(Some(payload)) = frame else { break };
-        match protocol::decode(&payload).and_then(|message| inner.dispatch(message)) {
+        match protocol::decode_payload(payload).and_then(|message| inner.dispatch(message)) {
             Ok(None) => {}
             Ok(Some((pieces, piece))) => {
                 // A download that stopped drops its receiver: the send then
@@ -1761,6 +1746,29 @@ fn fill(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
+/// Read the record of a reply of `loadBefore`: `[data, start, end]`. The
+/// data moves out of the reply: no copy.
+fn record(reply: Value) -> Result<Record, Error> {
+    let Value::Array(items) = reply else {
+        return Err(bad("loadBefore", &reply));
+    };
+    let [data, start, end]: [Value; 3] = items
+        .try_into()
+        .map_err(|items| bad("loadBefore", &Value::Array(items)))?;
+    let next = match &end {
+        Value::Nil => Some(None),
+        end => p64(end).map(Some),
+    };
+    match (data, p64(&start), next) {
+        (Value::Binary(data), Some(tid), Some(next)) => Ok(Record {
+            data,
+            tid: Tid(tid),
+            end: next.map(Tid),
+        }),
+        (data, ..) => Err(bad("loadBefore", &Value::Array(vec![data, start, end]))),
+    }
+}
+
 /// The protocol error of a reply of `method` that has the wrong shape.
 fn bad(method: &str, value: &Value) -> Error {
     Error::Protocol(format!("{method} gave {value}"))
@@ -1769,6 +1777,33 @@ fn bad(method: &str, value: &Value) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_record_of_a_reply_keeps_the_buffer_of_its_data() {
+        let data = vec![7u8; 1000];
+        let at = data.as_ptr();
+        let reply = Value::Array(vec![Value::Binary(data), bin8(5), Value::Nil]);
+        let read = record(reply).unwrap();
+        assert_eq!(read.data.as_ptr(), at);
+        assert_eq!((read.data.len(), read.tid, read.end), (1000, Tid(5), None));
+        let reply = Value::Array(vec![Value::Binary(vec![1]), bin8(5), bin8(9)]);
+        assert_eq!(record(reply).unwrap().end, Some(Tid(9)));
+        for reply in [
+            Value::Nil,
+            Value::Array(vec![Value::Binary(vec![1]), bin8(5)]),
+            Value::Array(vec![Value::Nil, bin8(5), Value::Nil]),
+            Value::Array(vec![Value::Binary(vec![1]), 5.into(), Value::Nil]),
+            Value::Array(vec![Value::Binary(vec![1]), bin8(5), 9.into()]),
+        ] {
+            let text = reply.to_string();
+            match record(reply) {
+                Err(Error::Protocol(message)) => {
+                    assert_eq!(message, format!("loadBefore gave {text}"))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn an_empty_extension_is_an_empty_map() {

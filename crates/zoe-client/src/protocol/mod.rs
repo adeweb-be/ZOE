@@ -9,6 +9,7 @@
 //! traceparent.
 
 use std::io;
+use std::sync::Mutex;
 
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,11 +38,30 @@ const CONFLICT: &str = "ZODB.POSException.ConflictError";
 /// The class of the read conflict error of ZODB.
 const READ_CONFLICT: &str = "ZODB.POSException.ReadConflictError";
 
+/// The shortest payload that `read_payload` reads in two parts: first its
+/// start, then the rest. A shorter payload is one read.
+const SPLIT: usize = 16 * 1024;
+
+/// The bytes at the start of a long payload that `read_payload` reads
+/// first. They hold the head of a reply up to the first byte of its bin.
+const PEEK: usize = 64;
+
 /// Read one frame from `reader`. Return `None` at the end of the stream
 /// before a frame starts. An end inside a frame fails with `UnexpectedEof`.
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<Option<Vec<u8>>> {
+    let Some(len) = read_len(reader).await? else {
+        return Ok(None);
+    };
+    let mut payload = Vec::new();
+    read_more(reader, &mut payload, len).await?;
+    Ok(Some(payload))
+}
+
+/// Read the length of a frame. Return `None` at the end of the stream
+/// before the length starts.
+async fn read_len<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<usize>> {
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < len.len() {
@@ -54,13 +74,230 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
         }
         got += n;
     }
-    let len = u32::from_be_bytes(len) as usize;
-    let mut payload = Vec::with_capacity(len.min(RESERVE));
-    let read = reader.take(len as u64).read_to_end(&mut payload).await?;
+    Ok(Some(u32::from_be_bytes(len) as usize))
+}
+
+/// Read `len` more bytes from `reader` at the end of `buffer`.
+async fn read_more<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    len: usize,
+) -> io::Result<()> {
+    buffer.reserve(len.min(RESERVE));
+    let read = reader.take(len as u64).read_to_end(buffer).await?;
     if read < len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(payload))
+    Ok(())
+}
+
+/// The most buffers that `recycle` keeps.
+const SPARES: usize = 16;
+
+/// The largest buffer that `recycle` keeps.
+const SPARE_BYTES: usize = 256 * 1024;
+
+/// The buffers that `recycle` keeps for the next bins.
+static SPARE: Spares = Spares(Mutex::new(Vec::new()));
+
+/// Give the buffer of a bin back after its use, for example the data of a
+/// `Record`. The next bin of a long payload then reuses it: the process
+/// does not free and allocate a large buffer for each load, and the
+/// allocator does not give the pages back to the kernel and fault them in
+/// again. Keep at most `SPARES` buffers, each of `SPLIT` to `SPARE_BYTES`
+/// bytes. When `SPARES` buffers are kept, a larger buffer takes the place
+/// of the smallest one. Drop each other buffer.
+pub fn recycle(buffer: Vec<u8>) {
+    SPARE.give(buffer);
+}
+
+/// Buffers for bins. The code never waits for the lock: while another
+/// thread holds it, a buffer drops or a new buffer comes. So a caller that
+/// holds the GIL does not wait, and a child of `fork` whose parent held the
+/// lock at the fork does not wait for ever.
+struct Spares(Mutex<Vec<Vec<u8>>>);
+
+impl Spares {
+    /// Keep `buffer` for a later bin, with the rules of `recycle`.
+    fn give(&self, mut buffer: Vec<u8>) {
+        if !(SPLIT..=SPARE_BYTES).contains(&buffer.capacity()) {
+            return;
+        }
+        let Ok(mut spare) = self.0.try_lock() else {
+            return;
+        };
+        buffer.clear();
+        if spare.len() < SPARES {
+            spare.push(buffer);
+        } else if let Some(smallest) = spare.iter_mut().min_by_key(|kept| kept.capacity())
+            && smallest.capacity() < buffer.capacity()
+        {
+            *smallest = buffer;
+        }
+    }
+
+    /// Return an empty buffer for `len` bytes. A bin of at least `SPLIT`
+    /// bytes takes the smallest kept buffer that holds it. Each other bin,
+    /// and a bin that no kept buffer holds, gets a new buffer of at most
+    /// `RESERVE` bytes.
+    fn take(&self, len: usize) -> Vec<u8> {
+        let kept = (len >= SPLIT)
+            .then(|| self.0.try_lock().ok())
+            .flatten()
+            .and_then(|mut spare| {
+                let (at, _) = spare
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, kept)| kept.capacity() >= len)
+                    .min_by_key(|(_, kept)| kept.capacity())?;
+                Some(spare.swap_remove(at))
+            });
+        kept.unwrap_or_else(|| Vec::with_capacity(len.min(RESERVE)))
+    }
+}
+
+/// The payload of a frame from the server, as `read_payload` reads it.
+#[derive(Clone, Debug)]
+pub(crate) enum Payload {
+    /// The bytes of the payload in one buffer.
+    Whole(Vec<u8>),
+    /// A reply whose args are a bin, or an array whose first item is a bin.
+    /// The bin has its own buffer, so its bytes go from the stream to that
+    /// buffer and are not copied again.
+    Bin {
+        /// The id of the reply.
+        id: i64,
+        /// The items of the args, or `None` when the args are the bin.
+        items: Option<usize>,
+        /// The bytes of the bin.
+        bin: Vec<u8>,
+        /// The bytes of the payload after the bin.
+        rest: Vec<u8>,
+    },
+}
+
+/// Read one frame from `reader`, as `read_frame` does. A payload of at
+/// least `SPLIT` bytes that starts as a reply with a bin (`lead`) gives
+/// `Payload::Bin`. Each other payload gives `Payload::Whole`.
+pub(crate) async fn read_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<Payload>> {
+    let Some(len) = read_len(reader).await? else {
+        return Ok(None);
+    };
+    let mut head = Vec::new();
+    if len < SPLIT {
+        read_more(reader, &mut head, len).await?;
+        return Ok(Some(Payload::Whole(head)));
+    }
+    read_more(reader, &mut head, PEEK).await?;
+    let Some(lead) = lead(&head).filter(|lead| lead.len <= len - lead.at) else {
+        read_more(reader, &mut head, len - PEEK).await?;
+        return Ok(Some(Payload::Whole(head)));
+    };
+    // A short rest comes in the same read as the bin, then moves to its
+    // own buffer. So the frame of a load needs no read for its rest.
+    let after = len - lead.at - lead.len;
+    let with_bin = if after <= PEEK {
+        lead.len + after
+    } else {
+        lead.len
+    };
+    let mut bin = SPARE.take(with_bin);
+    let end = PEEK.min(lead.at + with_bin);
+    bin.extend_from_slice(&head[lead.at..end]);
+    let more = with_bin - bin.len();
+    read_more(reader, &mut bin, more).await?;
+    let mut rest = if with_bin > lead.len {
+        bin.split_off(lead.len)
+    } else {
+        head.split_off(end)
+    };
+    let more = after - rest.len();
+    read_more(reader, &mut rest, more).await?;
+    Ok(Some(Payload::Bin {
+        id: lead.id,
+        items: lead.items,
+        bin,
+        rest,
+    }))
+}
+
+/// The start of a reply whose args are a bin, or an array whose first item
+/// is a bin.
+#[derive(Debug, PartialEq)]
+struct Lead {
+    id: i64,
+    /// The items of the args, or `None` when the args are the bin.
+    items: Option<usize>,
+    /// The offset of the first byte of the bin in the payload.
+    at: usize,
+    /// The bytes of the bin.
+    len: usize,
+}
+
+/// Read the start of a payload. Return its `Lead` when it is a reply that
+/// `decode` gives as `Message::Reply` without an error, and its args are a
+/// bin or an array whose first item is a bin. Return `None` for each other
+/// payload, and when `head` ends before the first byte of the bin.
+fn lead(head: &[u8]) -> Option<Lead> {
+    let mut bytes = head;
+    if array_len(&mut bytes)? != 4 {
+        return None;
+    }
+    let mut item = || read_value(&mut bytes).ok();
+    let id = item()?.as_i64().filter(|id| *id > 0)?;
+    let flags = match item()? {
+        Value::Boolean(flag) => i64::from(flag),
+        other => other.as_i64()?,
+    };
+    if flags & ERROR != 0 || item()?.as_str() != Some(".reply") {
+        return None;
+    }
+    let items = match bytes.first()? {
+        0xc4..=0xc6 => None,
+        _ => Some(array_len(&mut bytes).filter(|items| *items > 0)?),
+    };
+    let len = bin_len(&mut bytes)?;
+    Some(Lead {
+        id,
+        items,
+        at: head.len() - bytes.len(),
+        len,
+    })
+}
+
+/// Read the head of a msgpack array, and return its number of items.
+fn array_len(bytes: &mut &[u8]) -> Option<usize> {
+    let (&marker, rest) = bytes.split_first()?;
+    let (len, size) = match marker {
+        0x90..=0x9f => (usize::from(marker & 0x0f), 0),
+        0xdc => (be(rest, 2)?, 2),
+        0xdd => (be(rest, 4)?, 4),
+        _ => return None,
+    };
+    *bytes = &rest[size..];
+    Some(len)
+}
+
+/// Read the head of a msgpack bin, and return its number of bytes.
+fn bin_len(bytes: &mut &[u8]) -> Option<usize> {
+    let (&marker, rest) = bytes.split_first()?;
+    let size = match marker {
+        0xc4 => 1,
+        0xc5 => 2,
+        0xc6 => 4,
+        _ => return None,
+    };
+    let len = be(rest, size)?;
+    *bytes = &rest[size..];
+    Some(len)
+}
+
+/// Read the big-endian number in the first `size` bytes of `bytes`.
+fn be(bytes: &[u8], size: usize) -> Option<usize> {
+    let bytes = bytes.get(..size)?;
+    Some(bytes.iter().fold(0, |n, &byte| n << 8 | usize::from(byte)))
 }
 
 /// Write the frame of `payload` to `writer`.
@@ -145,11 +382,60 @@ pub(crate) enum Message {
     Other,
 }
 
+/// Decode a payload that `read_payload` read. A `Payload::Bin` keeps the
+/// buffer of its bin as the bytes of `Value::Binary`.
+pub(crate) fn decode_payload(payload: Payload) -> Result<Message, Error> {
+    let (id, items, bin, rest) = match payload {
+        Payload::Whole(bytes) => return decode(&bytes),
+        Payload::Bin {
+            id,
+            items,
+            bin,
+            rest,
+        } => (id, items, bin, rest),
+    };
+    let mut bytes = rest.as_slice();
+    let args = match items {
+        None => Value::Binary(bin),
+        Some(items) => {
+            // Each item takes at least one byte: a false number of items
+            // does not reserve memory.
+            let mut values = Vec::with_capacity(items.min(bytes.len() + 1));
+            values.push(Value::Binary(bin));
+            // `decode` reads these items inside two arrays, the message
+            // and the args, and rmpv counts two levels for each array. So
+            // both paths have one limit.
+            for _ in 1..items {
+                values.push(
+                    rmpv::decode::read_value_with_max_depth(
+                        &mut bytes,
+                        rmpv::decode::MAX_DEPTH - 4,
+                    )
+                    .map_err(|e| Error::Protocol(format!("a frame that is not msgpack: {e}")))?,
+                );
+            }
+            Value::Array(values)
+        }
+    };
+    if !bytes.is_empty() {
+        return Err(Error::Protocol("bytes after the message".into()));
+    }
+    Ok(Message::Reply {
+        id,
+        result: Ok(args),
+    })
+}
+
+/// Read one msgpack value from `bytes`.
+fn read_value(bytes: &mut &[u8]) -> Result<Value, Error> {
+    rmpv::decode::read_value(bytes)
+        .map_err(|e| Error::Protocol(format!("a frame that is not msgpack: {e}")))
+}
+
 /// Decode the payload of a frame from the server.
 pub(crate) fn decode(payload: &[u8]) -> Result<Message, Error> {
     let mut bytes = payload;
-    let value = rmpv::decode::read_value(&mut bytes)
-        .map_err(|e| Error::Protocol(format!("a frame that is not msgpack: {e}")))?;
+    let value = read_value(&mut bytes)?;
     if !bytes.is_empty() {
         return Err(Error::Protocol("bytes after the message".into()));
     }
@@ -537,6 +823,431 @@ mod tests {
         ] {
             assert!(matches!(decode(&bytes), Err(Error::Protocol(_))));
         }
+    }
+
+    /// Write the frame of `payload` through a pipe of 64 bytes, then read
+    /// it with `read_payload`.
+    fn read_through_pipe(payload: &[u8]) -> io::Result<Option<Payload>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut a, mut b) = tokio::io::duplex(64);
+            let write = async {
+                write_frame(&mut a, payload).await.unwrap();
+                drop(a);
+            };
+            let read = async {
+                let first = read_payload(&mut b).await;
+                if let Ok(Some(_)) = &first {
+                    assert!(read_payload(&mut b).await.unwrap().is_none());
+                }
+                first
+            };
+            tokio::join!(write, read).1
+        })
+    }
+
+    /// Check that `read_payload` and `decode_payload` give the message that
+    /// `decode` gives for `payload`.
+    fn decodes_as_whole(payload: &[u8]) -> Payload {
+        let read = read_through_pipe(payload).unwrap().unwrap();
+        let split = read.clone();
+        assert_eq!(
+            format!("{:?}", decode_payload(split)),
+            format!("{:?}", decode(payload))
+        );
+        read
+    }
+
+    fn large(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 + 7) as u8).collect()
+    }
+
+    #[test]
+    fn the_bin_of_a_long_reply_has_its_own_buffer() {
+        let data = large(100 * 1024 + 3);
+        for (id, end) in [(3, Value::Nil), (1 << 40, bin8(9))] {
+            let payload = encode(Value::Array(vec![
+                Value::from(id),
+                false.into(),
+                ".reply".into(),
+                Value::Array(vec![Value::Binary(data.clone()), bin8(8), end.clone()]),
+            ]));
+            match decodes_as_whole(&payload) {
+                Payload::Bin {
+                    id: read,
+                    items,
+                    bin,
+                    rest,
+                } => {
+                    assert_eq!((read, items), (id, Some(3)));
+                    assert_eq!(bin, data);
+                    assert_eq!(
+                        rest,
+                        encode(bin8(8))
+                            .into_iter()
+                            .chain(encode(end))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // More than `PEEK` bytes after a long bin: the rest has a read of
+        // its own.
+        let trailing = Value::Binary(vec![5; 100]);
+        let payload = encode(Value::Array(vec![
+            4.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![
+                Value::Binary(data.clone()),
+                trailing.clone(),
+                Value::Nil,
+            ]),
+        ]));
+        match decodes_as_whole(&payload) {
+            Payload::Bin {
+                items, bin, rest, ..
+            } => {
+                assert_eq!(items, Some(3));
+                assert_eq!(bin, data);
+                assert_eq!(rest, [encode(trailing), encode(Value::Nil)].concat());
+            }
+            other => panic!("{other:?}"),
+        }
+        // The reply of `loadSerial`: the args are the bin.
+        let payload = encode(Value::Array(vec![
+            5.into(),
+            0.into(),
+            ".reply".into(),
+            Value::Binary(data.clone()),
+        ]));
+        match decodes_as_whole(&payload) {
+            Payload::Bin {
+                items, bin, rest, ..
+            } => {
+                assert_eq!(items, None);
+                assert_eq!(bin, data);
+                assert!(rest.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bin_reuses_a_buffer_that_came_back() {
+        let spares = Spares(Mutex::new(Vec::new()));
+        let mut given = Vec::with_capacity(100 * 1024);
+        given.extend_from_slice(b"old");
+        let at = given.as_ptr();
+        spares.give(given);
+        // A bin that the buffer holds takes it, empty.
+        let taken = spares.take(100 * 1024);
+        assert_eq!((taken.as_ptr(), taken.len()), (at, 0));
+        // A longer bin gets a new buffer.
+        spares.give(taken);
+        let longer = spares.take(100 * 1024 + 1);
+        assert_ne!(longer.as_ptr(), at);
+        assert_eq!(longer.capacity(), 100 * 1024 + 1);
+        // A buffer shorter than `SPLIT` or longer than `SPARE_BYTES` drops.
+        spares.give(Vec::with_capacity(SPLIT - 1));
+        spares.give(Vec::with_capacity(SPARE_BYTES + 1));
+        let capacities = |spares: &Spares| {
+            let mut capacities: Vec<usize> =
+                spares.0.lock().unwrap().iter().map(Vec::capacity).collect();
+            capacities.sort_unstable();
+            capacities
+        };
+        assert_eq!(capacities(&spares), [100 * 1024]);
+        // A bin shorter than `SPLIT` never takes a kept buffer.
+        assert_eq!(spares.take(8).capacity(), 8);
+        assert_eq!(spares.take(SPLIT - 1).capacity(), SPLIT - 1);
+        assert_eq!(capacities(&spares), [100 * 1024]);
+        // A bin takes the smallest kept buffer that holds it.
+        spares.give(Vec::with_capacity(SPARE_BYTES));
+        spares.give(Vec::with_capacity(SPLIT));
+        assert_eq!(spares.take(SPLIT + 1).capacity(), 100 * 1024);
+        assert_eq!(spares.take(SPLIT).capacity(), SPLIT);
+        assert_eq!(capacities(&spares), [SPARE_BYTES]);
+        // At most `SPARES` buffers stay. Then a larger buffer takes the
+        // place of the smallest one, and a buffer that is not larger drops.
+        for _ in 0..2 * SPARES {
+            spares.give(Vec::with_capacity(SPLIT));
+        }
+        assert_eq!(capacities(&spares).len(), SPARES);
+        spares.give(Vec::with_capacity(2 * SPLIT));
+        spares.give(Vec::with_capacity(SPLIT));
+        let mut expected = vec![SPLIT; SPARES - 2];
+        expected.extend([2 * SPLIT, SPARE_BYTES]);
+        assert_eq!(capacities(&spares), expected);
+        // While another thread holds the lock, a buffer drops and a new
+        // one comes, without a wait.
+        let held = spares.0.lock().unwrap();
+        let new = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    spares.give(Vec::with_capacity(SPLIT));
+                    spares.take(SPLIT)
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!((held.len(), new.capacity()), (SPARES, SPLIT));
+        drop(held);
+        // A bin longer than `RESERVE` gets a buffer of `RESERVE` bytes.
+        assert_eq!(spares.take(RESERVE + 1).capacity(), RESERVE);
+    }
+
+    #[test]
+    fn the_decode_of_a_bin_keeps_its_buffer() {
+        let bin = vec![3u8; 100];
+        let at = bin.as_ptr();
+        let payload = Payload::Bin {
+            id: 2,
+            items: Some(2),
+            bin,
+            rest: encode(Value::Nil),
+        };
+        match decode_payload(payload).unwrap() {
+            Message::Reply {
+                id: 2,
+                result: Ok(Value::Array(items)),
+            } => {
+                assert!(matches!(&items[0], Value::Binary(data) if data.as_ptr() == at));
+                assert_eq!(items[1], Value::Nil);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_short_bin_in_a_long_reply_ends_inside_the_start() {
+        let payload = encode(Value::Array(vec![
+            5.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![
+                Value::Binary(b"abc".to_vec()),
+                Value::Binary(large(SPLIT)),
+            ]),
+        ]));
+        match decodes_as_whole(&payload) {
+            Payload::Bin { items, bin, .. } => {
+                assert_eq!(items, Some(2));
+                assert_eq!(bin, b"abc");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_long_payloads_are_whole() {
+        let data = Value::Binary(large(SPLIT));
+        for message in [
+            // A call of the server.
+            vec![
+                0.into(),
+                true.into(),
+                "receiveBlobChunk".into(),
+                Value::Array(vec![data.clone()]),
+            ],
+            // An error reply.
+            vec![
+                1.into(),
+                2.into(),
+                ".reply".into(),
+                Value::Array(vec!["E".into(), data.clone()]),
+            ],
+            // An id that the client never gives.
+            vec![
+                0.into(),
+                false.into(),
+                ".reply".into(),
+                Value::Array(vec![data.clone()]),
+            ],
+            // Args whose first item is not a bin.
+            vec![
+                1.into(),
+                false.into(),
+                ".reply".into(),
+                Value::Array(vec![Value::Nil, data.clone()]),
+            ],
+            // An empty array in the args.
+            vec![
+                1.into(),
+                false.into(),
+                ".reply".into(),
+                Value::Array(vec![Value::Array(vec![]), data.clone()]),
+            ],
+            // Flags that are not a bool or an int.
+            vec![
+                1.into(),
+                Value::Nil,
+                ".reply".into(),
+                Value::Array(vec![data.clone()]),
+            ],
+        ] {
+            let payload = encode(Value::Array(message));
+            assert!(matches!(decodes_as_whole(&payload), Payload::Whole(_)));
+        }
+        // A short reply is one read.
+        let payload = encode(Value::Array(vec![
+            1.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![Value::Binary(vec![1; 100])]),
+        ]));
+        assert!(matches!(decodes_as_whole(&payload), Payload::Whole(_)));
+    }
+
+    #[test]
+    fn a_bad_long_reply_is_a_protocol_error() {
+        let reply = |args: Value| {
+            encode(Value::Array(vec![
+                1.into(),
+                false.into(),
+                ".reply".into(),
+                args,
+            ]))
+        };
+        let data = large(SPLIT);
+        // An array with more items than the payload holds.
+        let mut short = reply(Value::Array(vec![Value::Binary(data.clone()), Value::Nil]));
+        short.pop();
+        let bad = [
+            // Bytes after the message.
+            [reply(Value::Binary(data.clone())), vec![0]].concat(),
+            [
+                reply(Value::Array(vec![Value::Binary(data.clone())])),
+                vec![0],
+            ]
+            .concat(),
+            short,
+        ];
+        for payload in bad {
+            let read = read_through_pipe(&payload).unwrap().unwrap();
+            assert!(matches!(decode_payload(read), Err(Error::Protocol(_))));
+        }
+        // A bin longer than the payload is a whole payload, and not msgpack.
+        let mut payload = reply(Value::Binary(data));
+        payload.truncate(payload.len() - 1);
+        let read = read_through_pipe(&payload).unwrap().unwrap();
+        assert!(matches!(read, Payload::Whole(_)));
+        assert!(matches!(decode_payload(read), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn both_decodes_have_the_same_depth_limit() {
+        // rmpv counts two levels for each array, so its limit falls near 510
+        // nested arrays here. A value that deep needs more stack than the
+        // default thread of a test in a debug build.
+        let check = || {
+            let mut ok = Vec::new();
+            for depth in 500..520 {
+                let mut payload = encode(Value::Array(vec![
+                    1.into(),
+                    false.into(),
+                    ".reply".into(),
+                    Value::Nil,
+                ]));
+                payload.pop();
+                payload.push(0x92);
+                payload.extend(encode(Value::Binary(large(SPLIT))));
+                payload.extend(std::iter::repeat_n(0x91, depth));
+                payload.push(0xc0);
+                decodes_as_whole(&payload);
+                ok.push(decode(&payload).is_ok());
+            }
+            // The depths cover both sides of the limit.
+            assert!(ok.contains(&true) && ok.contains(&false));
+        };
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(check)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn an_end_inside_a_long_frame_fails() {
+        let payload = encode(Value::Array(vec![
+            1.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![Value::Binary(large(SPLIT)), bin8(1), Value::Nil]),
+        ]));
+        let frame = frame(&payload).unwrap();
+        // Cut inside the start, inside the bin, and inside the rest that
+        // comes in the same read as the bin.
+        let cuts = [4 + PEEK / 2, 4 + PEEK + 10, frame.len() - 1];
+        // A rest of more than `PEEK` bytes has a read of its own: cut
+        // inside it.
+        let long = encode(Value::Array(vec![
+            1.into(),
+            false.into(),
+            ".reply".into(),
+            Value::Array(vec![
+                Value::Binary(large(SPLIT)),
+                Value::Binary(vec![5; 100]),
+                Value::Nil,
+            ]),
+        ]));
+        let long = super::frame(&long).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (frame, cut) in cuts
+            .map(|cut| (&frame, cut))
+            .into_iter()
+            .chain([(&long, long.len() - 50), (&long, long.len() - 1)])
+        {
+            let error = rt.block_on(read_payload(&mut &frame[..cut])).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn the_start_of_a_reply_gives_its_bin() {
+        let head = |args: &[u8]| {
+            let mut bytes = encode(Value::Array(vec![
+                7.into(),
+                false.into(),
+                ".reply".into(),
+                Value::Nil,
+            ]));
+            bytes.pop();
+            bytes.extend_from_slice(args);
+            bytes
+        };
+        // An array of 16 bits, then a bin of 32 bits.
+        let bytes = head(b"\xdc\x00\x03\xc6\x00\x01\x00\x00");
+        assert_eq!(
+            lead(&bytes),
+            Some(Lead {
+                id: 7,
+                items: Some(3),
+                at: bytes.len(),
+                len: 1 << 16,
+            })
+        );
+        // A bin of 8 bits as the args.
+        let bytes = head(b"\xc4\x05");
+        assert_eq!(
+            lead(&bytes),
+            Some(Lead {
+                id: 7,
+                items: None,
+                at: bytes.len(),
+                len: 5,
+            })
+        );
+        // A start that ends before the length of the bin.
+        assert_eq!(lead(&head(b"\x93\xc5\x01")), None);
+        assert_eq!(lead(&head(b"\x93")), None);
+        assert_eq!(lead(b"\x94\x07"), None);
     }
 
     #[test]

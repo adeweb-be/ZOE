@@ -914,6 +914,7 @@ impl Cache {
         // then sees that the ring reached it.
         self.word(H_HEAD).store(pos + total, Ordering::Relaxed);
         fence(Ordering::Release);
+        let at = self.at(pos);
         let mut words = [0u64; HEAD_WORDS];
         words[E_POS] = pos;
         words[E_OID] = oid;
@@ -922,19 +923,35 @@ impl Cache {
         words[E_PREV] = prev;
         words[E_LENGTHS] = len | (len << 32);
         words[E_CODEC] = CODEC_RAW | (total << 32);
-        words[E_DATA_SUM] = xxh3_64(data);
+        words[E_DATA_SUM] = self.write_data(at + HEAD_WORDS, data);
         words[E_HEAD_SUM] = head_sum(&words[..E_HEAD_SUM]);
-        let at = self.at(pos);
         for (i, word) in words.iter().enumerate() {
             self.word(at + i).store(*word, Ordering::Relaxed);
         }
-        for (i, chunk) in data.chunks(8).enumerate() {
-            let mut bytes = [0u8; 8];
-            bytes[..chunk.len()].copy_from_slice(chunk);
-            self.word(at + HEAD_WORDS + i)
-                .store(u64::from_le_bytes(bytes), Ordering::Relaxed);
-        }
         Some(pos)
+    }
+
+    /// Write `data` to the words from `at`, and return its xxh3. One pass
+    /// does both, `BLOCK_WORDS` words at a time: it hashes a block, then
+    /// writes it while the block is still in the CPU cache. The last word
+    /// has zeros after the data. The caller holds the writer lock, and
+    /// `append` checked that the ring holds the words.
+    fn write_data(&self, at: usize, data: &[u8]) -> u64 {
+        let words = &self.map.words()[at..at + data.len().div_ceil(8)];
+        let mut hasher = Xxh3Default::new();
+        for (block, words) in data.chunks(BLOCK_WORDS * 8).zip(words.chunks(BLOCK_WORDS)) {
+            hasher.update(block);
+            let (full, tail) = block.as_chunks::<8>();
+            for (bytes, word) in full.iter().zip(words) {
+                word.store(u64::from_le_bytes(*bytes), Ordering::Relaxed);
+            }
+            if !tail.is_empty() {
+                let mut bytes = [0u8; 8];
+                bytes[..tail.len()].copy_from_slice(tail);
+                words[full.len()].store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+            }
+        }
+        hasher.digest()
     }
 
     /// Point the index at `pos` for `oid`. Take the slot of `oid`, else the
