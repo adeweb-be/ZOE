@@ -1,8 +1,10 @@
 //! The exceptions that `zoe.Storage` raises: the exceptions of ZODB, and
-//! `zoe.WrongThread`.
+//! `zoe.WrongThread`. The native client also raises `ClientDisconnected`
+//! of ZEO, and `LockError` of `zc.lockfile` for a cache file that another
+//! open holds.
 //!
-//! The module imports ZODB only when it raises an exception. So loading
-//! the extension does not load ZODB.
+//! The module imports ZODB and ZEO only when it raises an exception. So
+//! loading the extension does not load them.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -42,6 +44,50 @@ exception!(
 exception!(read_only_error, "ZODB.POSException", "ReadOnlyError");
 exception!(unsupported, "ZODB.POSException", "Unsupported");
 exception!(wrong_thread, "zoe.storage", "WrongThread");
+exception!(
+    client_disconnected_error,
+    "ZEO.Exceptions",
+    "ClientDisconnected"
+);
+
+/// Return the class `ConflictError` of ZODB.
+pub(crate) fn conflict_class(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    conflict_error(py)
+}
+
+/// Return the class `ReadConflictError` of ZODB.
+pub(crate) fn read_conflict_class(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    read_conflict_error(py)
+}
+
+exception!(lock_error, "zc.lockfile", "LockError");
+
+/// Return a `LockError` of `zc.lockfile` for the cache file `path`, which
+/// another open holds, with the text of `zc.lockfile`.
+pub(crate) fn lock_failure(py: Python<'_>, path: &std::path::Path) -> PyErr {
+    let text = format!("Couldn't lock '{}'", path.display());
+    raise(lock_error(py), (text,), None)
+}
+
+/// Return a `ClientDisconnected` of ZEO with the text `text`.
+pub(crate) fn client_disconnected(py: Python<'_>, text: String) -> PyErr {
+    raise(client_disconnected_error(py), (text,), None)
+}
+
+/// Return a `StorageError` of ZODB with the text `text`.
+pub(crate) fn storage_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(storage_error(py), (text,), None)
+}
+
+/// Return a `StorageTransactionError` of ZODB with the text `text`.
+pub(crate) fn transaction_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(storage_transaction_error(py), (text,), None)
+}
+
+/// Return an `Unsupported` of ZODB with the text `text`.
+pub(crate) fn unsupported_failure(py: Python<'_>, text: String) -> PyErr {
+    raise(unsupported(py), (text,), None)
+}
 
 /// A core error, with the details of a vote that failed on a conflict.
 pub(crate) struct Failure {
@@ -93,6 +139,7 @@ impl Failure {
             | ZoeError::Format(_)
             | ZoeError::ReadOnly
             | ZoeError::NotClosedCleanly
+            | ZoeError::RepairFailed(_)
             | ZoeError::TooLarge { .. }
             | ZoeError::MissingBlobDir { .. }
             | ZoeError::NotBlobDir { .. } => message(storage_error(py), &self.error),
@@ -195,7 +242,7 @@ pub(crate) fn u64_of(value: &Bound<'_, PyAny>) -> PyResult<u64> {
 /// serials when the vote gave them. ZODB reads the class name of the
 /// object from `data`, the pickle that the transaction stored. If it cannot
 /// read it, the exception has no `data`.
-fn conflict(
+pub(crate) fn conflict(
     py: Python<'_>,
     class: PyResult<&Bound<'_, PyType>>,
     oid: Oid,
@@ -231,7 +278,7 @@ fn message(class: PyResult<&Bound<'_, PyType>>, error: &ZoeError) -> PyErr {
 
 /// Return an exception of the class `class`, made from `args` and
 /// `kwargs`. An error in the import or in the call comes back instead.
-fn raise<'py, A>(
+pub(crate) fn raise<'py, A>(
     class: PyResult<&Bound<'py, PyType>>,
     args: A,
     kwargs: Option<&Bound<'py, PyDict>>,

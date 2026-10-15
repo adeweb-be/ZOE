@@ -24,7 +24,15 @@ import zoe
 
 # The keys of the stanza: the keys of the example in the specification, and
 # read-only, as in <filestorage> and <zeoclient>.
-KEYS = {"path", "blob-dir", "backend", "lock-timeout", "early-locks", "read-only"}
+KEYS = {
+    "path",
+    "blob-dir",
+    "backend",
+    "lock-timeout",
+    "early-locks",
+    "read-only",
+    "pack-gc",
+}
 # The ways to give a value to a key.
 SOURCES = ["stanza", "environment", "uri"]
 # A schema that holds one storage section of any type.

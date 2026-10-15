@@ -27,6 +27,11 @@ export interface LoupeObject {
 export interface FolderInfo {
   path: string;
   lastTid: string;
+  /**
+   * True when the open repaired the store: a writer left it open, and
+   * Loupe wrote its database file once.
+   */
+  repaired: boolean;
 }
 
 /** One revision of an object: the transaction that wrote a record. */
