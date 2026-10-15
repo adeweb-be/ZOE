@@ -216,7 +216,9 @@ impl NativeClient {
     ///
     /// `tls` is `None`, or the tuple `(certificate, key, authenticate,
     /// check_hostname, server_hostname)` of the files and checks of TLS.
-    /// `key` is `None` when `certificate` holds the key. `authenticate` is a
+    /// `certificate` is `None` for a client without a certificate: the
+    /// client then ignores `key`. `key` is `None` when `certificate` holds
+    /// the key. `authenticate` is a
     /// file or a directory of CA certificates, or `None` for the CA
     /// certificates of the system. The server name is
     /// `server_hostname`, else the host of the address. With TLS, the
@@ -1499,11 +1501,11 @@ impl Servers {
     }
 }
 
-/// The files and the checks of TLS that `zoe.zeo` gives: the certificate,
-/// the key or `None`, the CA file or directory of `authenticate` or `None`,
-/// `check_hostname` and `server_hostname` or `None`.
+/// The files and the checks of TLS that `zoe.zeo` gives: the certificate
+/// or `None`, the key or `None`, the CA file or directory of `authenticate`
+/// or `None`, `check_hostname` and `server_hostname` or `None`.
 type TlsArgs = (
-    PathBuf,
+    Option<PathBuf>,
     Option<PathBuf>,
     Option<PathBuf>,
     bool,
@@ -1521,9 +1523,10 @@ impl Secure {
     /// Read the files of `args`. An error names the file.
     fn load(args: &TlsArgs) -> Result<Self, Opening> {
         let (certificate, key, authenticate, check_hostname, server_hostname) = args;
-        let mut options = match authenticate {
-            Some(authenticate) => TlsOptions::new(certificate, authenticate),
-            None => TlsOptions::system(certificate),
+        let mut options = match (certificate, authenticate) {
+            (Some(certificate), Some(authenticate)) => TlsOptions::new(certificate, authenticate),
+            (Some(certificate), None) => TlsOptions::system(certificate),
+            (None, authenticate) => TlsOptions::without_certificate(authenticate.as_deref()),
         };
         if let Some(key) = key {
             options = options.key(key);
@@ -2097,7 +2100,7 @@ mod tests {
     fn a_tls_file_that_does_not_read_fails_the_open_and_names_it() {
         let missing = std::env::temp_dir().join(format!("zoe-py-missing-{}", std::process::id()));
         let tls = (
-            missing.join("client.pem"),
+            Some(missing.join("client.pem")),
             None,
             Some(missing.join("ca.pem")),
             true,
