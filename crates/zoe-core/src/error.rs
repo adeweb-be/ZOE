@@ -136,11 +136,22 @@ pub enum ZoeError {
 
     /// The store was not closed cleanly. A read-only open cannot rebuild
     /// the free-space map of its database. Open the store once with a
-    /// writer: the writer rebuilds it.
+    /// writer: the writer rebuilds it. `Store::open_read_only` gives it.
+    /// `Store::open_read_only_repairing` repairs the store instead.
     #[error(
         "the store was not closed cleanly: open it once with a writer, which rebuilds the free-space map of its database"
     )]
     NotClosedCleanly,
+
+    /// The store was not closed cleanly, and its repair failed.
+    /// `Store::open_read_only_repairing` opens the database file for
+    /// writes to repair it. The source is the error of that open or of the
+    /// repair. An error of the system stays as it is: for example
+    /// `Read-only file system (os error 30)` on a read-only file system,
+    /// or `Permission denied (os error 13)` for a file without write
+    /// permission.
+    #[error("the store was not closed cleanly, and its repair failed: {0}")]
+    RepairFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// The store is closed. A transaction iterator or a blob file outlived
     /// its store. `Store::pack_until` also gives it when its stop ends the

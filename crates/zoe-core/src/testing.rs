@@ -1,5 +1,7 @@
 //! A test hook that reads and rewrites the stored bytes of a row, so that
-//! a test can damage a frame and check that every read detects it.
+//! a test can damage a frame and check that every read detects it. It
+//! also writes and removes a row of `meta`, so that a test can make a
+//! store of an older format.
 //!
 //! The feature `testing` builds this module. Only the dev-dependency of
 //! this crate on itself turns the feature on, so only test builds have
@@ -33,4 +35,17 @@ pub fn read_frame(store: &Store, key: Key) -> Result<Vec<u8>> {
 /// checks nothing and changes no other row.
 pub fn write_frame(store: &Store, key: Key, bytes: &[u8]) -> Result<()> {
     store.backend.write_stored(key, bytes)
+}
+
+/// Store `bytes` in the row `key` of `meta`. The hook checks nothing and
+/// changes no other row. The open store keeps the state that it read at
+/// its open, so the change counts from the next open.
+pub fn write_meta(store: &Store, key: &str, bytes: &[u8]) -> Result<()> {
+    store.backend.write_meta_stored(key, Some(bytes))
+}
+
+/// Remove the row `key` of `meta`, as `write_meta` changes it. A row that
+/// does not exist is a `Backend` error.
+pub fn remove_meta(store: &Store, key: &str) -> Result<()> {
+    store.backend.write_meta_stored(key, None)
 }

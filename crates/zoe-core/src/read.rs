@@ -580,6 +580,16 @@ impl Store {
         self.backend.pack_watermark()
     }
 
+    /// Return the number of objects of the store: the oids that have at
+    /// least one record, a deletion included, as the `len()` of
+    /// FileStorage. A pack lowers it when it removes every record of an
+    /// oid. The count includes each commit whose `finish` returned and
+    /// each pack batch that committed. A read-only open of a store of
+    /// format 1 has no count and gives `None`. The call reads no row.
+    pub fn object_count(&self) -> Option<u64> {
+        self.backend.object_count()
+    }
+
     /// Return the first oid at or after `from` whose current record is not
     /// a deletion, with that record.
     fn current_at_or_after(&self, mut from: Oid) -> Result<Option<(Oid, Record)>> {
