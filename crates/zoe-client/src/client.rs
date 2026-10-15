@@ -771,6 +771,29 @@ impl std::fmt::Debug for Client {
     }
 }
 
+/// The reply of `Transaction::vote_listed`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Voted {
+    /// The oids that the server resolved, in the order of the reply.
+    pub resolved: Vec<Oid>,
+    /// The conflicts that the client must resolve, in the order of the
+    /// reply.
+    pub conflicts: Vec<Listed>,
+}
+
+/// A conflict that a vote lists for the client to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// The oid of the conflict.
+    pub oid: Oid,
+    /// The serial that committed after the read of the transaction.
+    pub committed: Tid,
+    /// The serial that the transaction read.
+    pub read: Tid,
+    /// The pickle that the transaction stored.
+    pub data: Vec<u8>,
+}
+
 /// An open transaction of a client: `store`, then `vote`, then `finish`.
 /// A transaction that is dropped before `finish` or `abort` sends
 /// `tpc_abort` and does not wait for its reply.
@@ -888,7 +911,7 @@ impl Transaction {
 
     /// Vote. A stale serial fails with `Error::Conflict`, both when the
     /// server fails the vote and when it lists the conflict for the client
-    /// to resolve: this client resolves no conflict. A failed vote aborts
+    /// to resolve: this method resolves no conflict. A failed vote aborts
     /// the transaction, and a later `store`, `vote` or `finish` fails with
     /// `Error::Invalid`. A stock server can list the oids that it resolved:
     /// the vote passes, and the client ignores these oids.
@@ -900,33 +923,54 @@ impl Transaction {
     /// The server stored another pickle than the client for each of them,
     /// so the client must load them again.
     pub async fn vote_resolved(&mut self) -> Result<Vec<Oid>, Error> {
+        let voted = self.vote_listed().await?;
+        let Some(listed) = voted.conflicts.first() else {
+            return Ok(voted.resolved);
+        };
+        let error = Error::Conflict {
+            oid: listed.oid,
+            serials: Some((listed.committed, listed.read)),
+        };
+        self.end().await;
+        Err(error)
+    }
+
+    /// Vote, and return the oids that the server resolved and the conflicts
+    /// that it lists for the client to resolve. With listed conflicts, the
+    /// transaction stays open and the server keeps its locks. The caller
+    /// then stores the resolved pickle of each conflict over its committed
+    /// serial and votes again, or aborts. A vote that fails aborts the
+    /// transaction, as for `vote`.
+    pub async fn vote_listed(&mut self) -> Result<Voted, Error> {
         self.check()?;
         let result = match self.inner.call("vote", vec![self.id.into()]).await {
             // A stock server lists the oids that it resolved, and a server
             // with conflict resolution in the client lists the conflicts.
-            Ok(Value::Array(items)) => match items.iter().find(|item| item.is_map()) {
-                Some(item) => Err(protocol::conflict(item).unwrap_or_else(|| bad("vote", item))),
-                None => items.iter().map(|item| oid(item, "vote")).collect(),
-            },
+            Ok(Value::Array(items)) => vote_reply(&items),
             Ok(other) => Err(bad("vote", &other)),
             Err(e) => Err(e),
         };
         if result.is_err() {
-            self.ended = true;
-            // The server keeps the locks of a listed conflict until the
-            // abort. The abort of a failed vote gets nil. When this future
-            // is dropped before the abort returns, the drop of the
-            // transaction sends it.
-            if self
-                .inner
-                .call("tpc_abort", vec![self.id.into()])
-                .await
-                .is_ok()
-            {
-                self.open = false;
-            }
+            self.end().await;
         }
         result
+    }
+
+    /// End the transaction after a failed vote: send `tpc_abort` and wait
+    /// for its reply. The server keeps the locks of a listed conflict until
+    /// the abort. The abort of a failed vote gets nil. When this future is
+    /// dropped before the abort returns, the drop of the transaction sends
+    /// it.
+    async fn end(&mut self) {
+        self.ended = true;
+        if self
+            .inner
+            .call("tpc_abort", vec![self.id.into()])
+            .await
+            .is_ok()
+        {
+            self.open = false;
+        }
     }
 
     /// Finish the transaction after a vote, and return its tid. The server
@@ -1462,6 +1506,41 @@ fn oid(value: &Value, method: &str) -> Result<Oid, Error> {
     p64(value).map(Oid).ok_or_else(|| bad(method, value))
 }
 
+/// Read the items of a vote reply: an oid that the server resolved, or a
+/// map `{oid, serials: [committed, read], data}` that lists a conflict.
+fn vote_reply(items: &[Value]) -> Result<Voted, Error> {
+    let mut voted = Voted::default();
+    for item in items {
+        if item.is_map() {
+            voted
+                .conflicts
+                .push(listed(item).ok_or_else(|| bad("vote", item))?);
+        } else {
+            voted.resolved.push(oid(item, "vote")?);
+        }
+    }
+    Ok(voted)
+}
+
+/// Read a conflict that a vote lists. A map without the serials or the
+/// data does not read.
+fn listed(value: &Value) -> Option<Listed> {
+    let oid = get(value, "oid").and_then(p64).map(Oid)?;
+    let Some(Value::Array(serials)) = get(value, "serials") else {
+        return None;
+    };
+    let [committed, read] = serials.as_slice() else {
+        return None;
+    };
+    let data = get(value, "data")?.as_slice()?.to_vec();
+    Some(Listed {
+        oid,
+        committed: Tid(p64(committed)?),
+        read: Tid(p64(read)?),
+        data,
+    })
+}
+
 /// The protocol error of a reply of `method` that has the wrong shape.
 /// Read the args of a call of a download: `[oid, serial]`, and the chunk
 /// for `receiveBlobChunk`. Return the oid and the serial, and the piece.
@@ -1525,6 +1604,42 @@ mod tests {
         ] {
             assert!(matches!(extension_map(&bad), Err(Error::Invalid(_))));
         }
+    }
+
+    fn conflict_map(data: Option<Value>, serials: Value) -> Value {
+        let mut map = vec![("oid".into(), bin8(5)), ("serials".into(), serials)];
+        map.extend(data.map(|data| ("data".into(), data)));
+        Value::Map(map)
+    }
+
+    #[test]
+    fn a_vote_reply_gives_the_resolved_oids_and_the_listed_conflicts() {
+        let serials = Value::Array(vec![bin8(3), bin8(2)]);
+        let map = conflict_map(Some(Value::Binary(b"p".to_vec())), serials.clone());
+        let voted = vote_reply(&[bin8(4), map, bin8(6)]).unwrap();
+        assert_eq!(voted.resolved, vec![Oid(4), Oid(6)]);
+        let listed = Listed {
+            oid: Oid(5),
+            committed: Tid(3),
+            read: Tid(2),
+            data: b"p".to_vec(),
+        };
+        assert_eq!(voted.conflicts, vec![listed]);
+        assert_eq!(vote_reply(&[]).unwrap(), Voted::default());
+        // A map without the data, without both serials, or with data that
+        // is not bytes, does not read.
+        for map in [
+            conflict_map(None, serials.clone()),
+            conflict_map(Some(Value::Binary(vec![])), Value::Nil),
+            conflict_map(Some(Value::Binary(vec![])), Value::Array(vec![bin8(3)])),
+            conflict_map(Some(Value::from(1)), serials),
+        ] {
+            assert!(matches!(vote_reply(&[map]), Err(Error::Protocol(_))));
+        }
+        assert!(matches!(
+            vote_reply(&[Value::from("x")]),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]

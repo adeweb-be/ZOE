@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use zoe_client::runtime::{BoxFuture, Stream};
-use zoe_client::{BLOB_CHUNK, Client, Error, Options, Runtime, Tokio};
+use zoe_client::{BLOB_CHUNK, Client, Error, Listed, Options, Runtime, Tokio, Voted};
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
 
@@ -326,6 +326,57 @@ async fn a_listed_conflict_fails_the_vote_and_aborts() {
     assert!(matches!(vote, Err(Error::Invalid(_))), "{vote:?}");
     drop(txn);
     assert_eq!(client.new_oids(1).await.unwrap(), vec![Oid(1)]);
+    let _peer = server.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_listed_conflict_keeps_the_transaction_open_for_the_resolution() {
+    let (runtime, mut peer) = scripted(1);
+    let server = tokio::spawn(async move {
+        peer.handshake(0).await;
+        let (_, _, method, args) = peer.recv().await;
+        assert_eq!(method, "tpc_begin");
+        let txn = args.as_array().unwrap()[0].clone();
+        let (_, _, method, _) = peer.recv().await;
+        assert_eq!(method, "storea");
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "vote");
+        let conflict = Value::Map(vec![
+            ("oid".into(), bin8(5)),
+            ("serials".into(), Value::Array(vec![bin8(3), bin8(2)])),
+            ("data".into(), Value::Binary(b"p".to_vec())),
+        ]);
+        peer.reply(id, Value::Array(vec![bin8(4), conflict])).await;
+        // No abort: the next frame is the store of the resolution, over
+        // the committed serial.
+        let (_, _, method, args) = peer.recv().await;
+        assert_eq!(method, "storea");
+        let resolved = vec![bin8(5), bin8(3), Value::Binary(b"r".to_vec()), txn];
+        assert_eq!(args, Value::Array(resolved));
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "vote");
+        peer.reply(id, Value::Array(vec![])).await;
+        let (id, _, method, _) = peer.recv().await;
+        assert_eq!(method, "tpc_finish");
+        peer.reply(id, bin8(9)).await;
+        peer
+    });
+    let client = Client::connect_with(runtime, addr(), "1").await.unwrap();
+    let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
+    txn.store(Oid(5), Tid(2), b"p").await.unwrap();
+    let voted = txn.vote_listed().await.unwrap();
+    assert_eq!(voted.resolved, vec![Oid(4)]);
+    let listed = Listed {
+        oid: Oid(5),
+        committed: Tid(3),
+        read: Tid(2),
+        data: b"p".to_vec(),
+    };
+    assert_eq!(voted.conflicts, vec![listed]);
+    txn.store(Oid(5), Tid(3), b"r").await.unwrap();
+    assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
+    assert_eq!(txn.finish().await.unwrap(), Tid(9));
     let _peer = server.await.unwrap();
     client.close().await;
 }

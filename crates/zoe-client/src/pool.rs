@@ -49,7 +49,9 @@ use zoe_core::{Oid, Tid};
 
 use crate::Error;
 use crate::cache::Cache;
-use crate::client::{Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction};
+use crate::client::{
+    Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction, Voted,
+};
 use crate::protocol::MAX_TID;
 use crate::runtime::{BoxFuture, Runtime};
 
@@ -658,23 +660,68 @@ impl PoolTransaction {
     /// `tpc_vote` of `ZEO.ClientStorage` does.
     pub async fn vote_resolved(&mut self) -> Result<Vec<Oid>, Error> {
         let voted = self.txn().vote_resolved().await;
-        if let Some(cache) = &self.lease.shared.cache {
-            match &voted {
-                Ok(resolved) => {
-                    let resolved: HashSet<Oid> = resolved.iter().copied().collect();
-                    for (oid, data) in &mut self.writes {
-                        if resolved.contains(oid) {
-                            *data = None;
-                        }
-                    }
-                }
-                Err(Error::Conflict { oid, .. } | Error::ReadConflict { oid, .. }) => {
-                    cache.drop_current(*oid);
-                }
-                Err(_) => {}
-            }
+        match &voted {
+            Ok(resolved) => self.server_resolved(resolved),
+            Err(error) => self.failed(error),
         }
         voted
+    }
+
+    /// Vote, as `Transaction::vote_listed` does, with the cache rules of
+    /// `vote_resolved`. A listed conflict changes nothing in the cache: the
+    /// caller resolves it with `store_resolved`, or calls `unresolved`.
+    pub async fn vote_listed(&mut self) -> Result<Voted, Error> {
+        let voted = self.txn().vote_listed().await;
+        match &voted {
+            Ok(voted) => self.server_resolved(&voted.resolved),
+            Err(error) => self.failed(error),
+        }
+        voted
+    }
+
+    /// Store `data`, the resolution of a conflict that a vote listed, over
+    /// the serial `committed` that the vote gave. The cache of the pool
+    /// will not hold it, as the cache of `ZEO.ClientStorage`.
+    pub async fn store_resolved(
+        &mut self,
+        oid: Oid,
+        committed: Tid,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        self.txn().store(oid, committed, data).await?;
+        if self.lease.shared.cache.is_some() {
+            self.writes.push((oid, None));
+        }
+        Ok(())
+    }
+
+    /// Drop the current entry of `oid` from the cache: the client did not
+    /// resolve the conflict that a vote listed for it, as `tpc_vote` of
+    /// `ZEO.ClientStorage` does. The transaction stays open for its abort.
+    pub fn unresolved(&self, oid: Oid) {
+        if let Some(cache) = &self.lease.shared.cache {
+            cache.drop_current(oid);
+        }
+    }
+
+    /// Keep no pickle of the oids that the server resolved for the cache.
+    fn server_resolved(&mut self, resolved: &[Oid]) {
+        if resolved.is_empty() {
+            return;
+        }
+        let resolved: HashSet<Oid> = resolved.iter().copied().collect();
+        for (oid, data) in &mut self.writes {
+            if resolved.contains(oid) {
+                *data = None;
+            }
+        }
+    }
+
+    /// Drop the current entry of the oid of a conflict of a failed vote.
+    fn failed(&self, error: &Error) {
+        if let Error::Conflict { oid, .. } | Error::ReadConflict { oid, .. } = error {
+            self.unresolved(*oid);
+        }
     }
 
     /// Vote, as `Transaction::vote` does, with the cache rules of

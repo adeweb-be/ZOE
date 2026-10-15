@@ -38,8 +38,9 @@ each on its own connection of a pool, with one more connection that orders
 the invalidations (ADR 0036). It keeps a client cache in memory, with the
 semantics of the cache of ZEO, of `cache_size` bytes (ADR 0034). It has
 blobs in both modes of ZEO: a blob cache in `blob_dir`, or a blob directory
-that it shares with the server (`shared_blob_dir`). It has no cache file
-and no reconnect. It declares
+that it shares with the server (`shared_blob_dir`). It resolves in the
+client the conflicts that a vote lists, as `ZEO.ClientStorage` does. It has
+no cache file and no reconnect. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It speaks
 only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
@@ -498,6 +499,14 @@ class _NativeClientStorage(ClientStorage):
     the cache in a thread, as ZEO does. With `shared_blob_dir`, the server
     takes the file of `storeBlob` from the shared directory by rename, and
     `loadBlob` reads the shared directory.
+
+    `tpc_vote` resolves the conflicts that the vote lists with
+    `tryToResolveConflict`, on the thread of the transaction, stores each
+    result and votes again, for at most nine rounds, as ZEO does. It
+    returns the oids that the server or the client resolved. The client
+    cache never holds the pickle of such an oid. A conflict that does not
+    resolve raises `ConflictError`, drops the cache entry of its oid and
+    leaves the transaction to `tpc_abort`.
     """
 
     def __init__(
@@ -899,7 +908,10 @@ class _NativeClientStorage(ClientStorage):
         native.check_current_serial(oid, serial)
 
     def tpc_vote(self, txn):
-        return self._check_trans(txn, "tpc_vote").vote() or None
+        # The native client resolves each conflict that the vote lists with
+        # `tryToResolveConflict`, on this thread, as ZEO does.
+        native = self._check_trans(txn, "tpc_vote")
+        return native.vote(self.tryToResolveConflict) or None
 
     def tpc_finish(self, txn, f=lambda tid: None):
         self._check_process()
