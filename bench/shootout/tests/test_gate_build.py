@@ -6,10 +6,11 @@ import json
 from shootout import KB, gate
 
 
-def write(root, storage, python, ops, sizes=(KB,)):
+def write(root, storage, python, ops, sizes=(KB,), cells=(("threads", 16),)):
     """Write a result of storage on python, such as cp314t, with ops per name.
 
-    Each name has one cell in each object size of sizes.
+    Each name has one cell in each object size of sizes and each (mode,
+    concurrency) of cells.
     """
     builds = {"cp313": ("3.13.0", False), "cp314t": ("3.14.0", True)}
     version, free_threaded = builds[python]
@@ -25,12 +26,13 @@ def write(root, storage, python, ops, sizes=(KB,)):
         "scenarios": [
             {
                 "name": name,
-                "mode": "threads",
-                "concurrency": 16,
+                "mode": mode,
+                "concurrency": concurrency,
                 "object_size": size,
                 "ops_per_second": value,
             }
             for name, value in ops.items()
+            for mode, concurrency in cells
             for size in sizes
         ],
     }
@@ -53,7 +55,11 @@ def test_the_default_ratios_are_constants_of_the_gate():
 
 
 def test_only_zoe_native_counts_read_hot_at_100_kb():
-    assert set(gate.left_out("zoe-native")) == {("read_hot", KB)}
+    assert set(gate.left_out("zoe-native")) == {
+        ("read_hot", KB),
+        ("read_hot", 100 * KB, "threads", 1),
+        ("read_hot", 100 * KB, "processes", None),
+    }
     assert gate.left_out("zoe-server") == gate.LEFT_OUT
     assert gate.left_out("zoe") == gate.LEFT_OUT
 
@@ -67,7 +73,59 @@ def verdicts(lines, scenario):
     ]
 
 
-def test_zoe_native_leaves_out_read_hot_at_1_kb_and_counts_it_at_100_kb(tmp_path):
+def cell_verdicts(lines, scenario):
+    """Return the mode, concurrency, size and verdict of each row of scenario."""
+    return {
+        (line.split()[1], int(line.split()[2]), int(line.split()[3])): " ".join(
+            line.split()[7:]
+        )
+        for line in lines
+        if line.startswith(f"{scenario} ")
+    }
+
+
+LEFT_OUT_OF_NATIVE = [
+    "left out: read_hot at 1 KB, because ZODB itself takes most of the time of a "
+    "hit there",
+    "left out: read_hot at 100 KB with threads at concurrency 1, because "
+    + gate.HIT_AT_100_KB,
+    "left out: read_hot at 100 KB with processes, because " + gate.HIT_AT_100_KB,
+]
+SUMMARY_OF_NATIVE = (
+    "at least 3x in each cell but read_hot at 1 KB, read_hot at 100 KB with threads "
+    "at concurrency 1, read_hot at 100 KB with processes;"
+)
+
+
+def test_zoe_native_counts_read_hot_at_100_kb_only_with_threads_above_concurrency_1(
+    tmp_path,
+):
+    sizes = (KB, 100 * KB)
+    cells = (("threads", 1), ("threads", 16), ("processes", 4), ("processes", 16))
+    write(tmp_path, "zeo", "cp313", {"read_hot": 1000.0}, sizes, cells)
+    write(tmp_path, "zoe-native", "cp313", {"read_hot": 2900.0}, sizes, cells)
+    code, lines = report(tmp_path, "zoe-native")
+    assert code == 1
+    assert cell_verdicts(lines, "read_hot") == {
+        ("threads", 1, KB): "left out",
+        ("threads", 16, KB): "left out",
+        ("processes", 4, KB): "left out",
+        ("processes", 16, KB): "left out",
+        ("threads", 1, 100 * KB): "left out",
+        ("threads", 16, 100 * KB): "FAIL",
+        ("processes", 4, 100 * KB): "left out",
+        ("processes", 16, 100 * KB): "left out",
+    }
+    assert [
+        line for line in lines if line.startswith("left out: ")
+    ] == LEFT_OUT_OF_NATIVE
+    assert SUMMARY_OF_NATIVE in lines[-1]
+    assert lines[-1].endswith("8 cells, 1 below, 0 missing, 7 left out")
+
+
+def test_zoe_native_leaves_out_read_hot_at_1_kb_and_counts_it_at_100_kb_with_threads_16(
+    tmp_path,
+):
     sizes = (KB, 100 * KB)
     write(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0}, sizes)
     write(tmp_path, "zoe-native", "cp313", {"add": 3000.0, "read_hot": 2900.0}, sizes)
@@ -75,11 +133,10 @@ def test_zoe_native_leaves_out_read_hot_at_1_kb_and_counts_it_at_100_kb(tmp_path
     assert code == 1
     assert verdicts(lines, "read_hot") == [(KB, "left out"), (100 * KB, "FAIL")]
     assert verdicts(lines, "add") == [(KB, "pass"), (100 * KB, "pass")]
-    assert [line for line in lines if line.startswith("left out: ")] == [
-        "left out: read_hot at 1 KB, because ZODB itself takes most of the "
-        "time of a hit there"
-    ]
-    assert "at least 3x in each cell but read_hot at 1 KB;" in lines[-1]
+    assert [
+        line for line in lines if line.startswith("left out: ")
+    ] == LEFT_OUT_OF_NATIVE
+    assert SUMMARY_OF_NATIVE in lines[-1]
     assert lines[-1].endswith("4 cells, 1 below, 0 missing, 1 left out")
 
 

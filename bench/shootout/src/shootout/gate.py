@@ -11,13 +11,18 @@ the groups of that build count. The report prints the other groups beside
 them.
 
 `default_ratio` gives the default ratio of a storage, and `left_out` the
-cells that the gate leaves out for it, by scenario and object size. Both
-read constants of this module, not options. For most storages the gate
-leaves out `read_hot` in every size, because no read of it reaches the
-server through `ZEO.ClientStorage`. For `zoe-native` it leaves out only
-`read_hot` at 1 KB, because ZODB itself takes most of the time of a hit
-there. The report prints these cells with the verdict `left out`. They
-count neither as below nor as missing.
+cells that the gate leaves out for it, by scenario, object size, mode and
+concurrency. Both read constants of this module, not options. For most
+storages the gate leaves out `read_hot` in every cell, because no read of
+it reaches the server through `ZEO.ClientStorage`. For `zoe-native` it
+leaves out the `read_hot` cells whose reads hit the cache of the native
+client: at 1 KB, and at 100 KB with threads at concurrency 1 and with
+processes. There ZODB alone takes more than a third of the time of ZEO, so
+no client reaches 3 times ZEO. Its `read_hot` at 100 KB with threads at a
+higher concurrency counts: the threads share one cache, which does not
+hold their objects, so the reads reach the server. The report prints the
+cells that it leaves out with the verdict `left out`. They count neither
+as below nor as missing.
 """
 
 import datetime
@@ -31,9 +36,11 @@ from shootout.layout import run_set
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
 
-# The cells that the gate leaves out, as (scenario, object size) with a
-# reason. A size of None means every size.
-LeftOut = dict[tuple[str, int | None], str]
+# The cells that the gate leaves out, as (scenario, object size) or
+# (scenario, object size, mode, concurrency) with a reason. None means
+# every value, and a key without mode and concurrency means every mode
+# and every concurrency.
+LeftOut = dict[tuple, str]
 
 # The cells that the gate leaves out for a storage that LEFT_OUT_OF does
 # not name.
@@ -43,12 +50,22 @@ LEFT_OUT: LeftOut = {
     "reaches the server",
 }
 
+# The reason of the read_hot cells at 100 KB that the native client serves
+# from its cache.
+HIT_AT_100_KB = (
+    "each read hits the cache of the client, and ZODB alone takes more than "
+    "a third of the time of ZEO there"
+)
+
 # The cells that the gate leaves out for each other storage. The native
-# client of zoe-native has a cache of its own, so its read_hot at 100 KB
-# counts.
+# client of zoe-native has a cache of its own. Its read_hot at 100 KB with
+# threads at a concurrency above 1 counts: the threads share one cache,
+# and their reads reach the server.
 LEFT_OUT_OF: dict[str, LeftOut] = {
     "zoe-native": {
         ("read_hot", KB): "ZODB itself takes most of the time of a hit there",
+        ("read_hot", 100 * KB, "threads", 1): HIT_AT_100_KB,
+        ("read_hot", 100 * KB, "processes", None): HIT_AT_100_KB,
     },
 }
 
@@ -69,13 +86,31 @@ def left_out(storage: str) -> LeftOut:
 
 
 def _is_left_out(cell: tuple[str, str, int, int], skipped: LeftOut) -> bool:
-    name, _, _, size = cell
-    return (name, None) in skipped or (name, size) in skipped
+    name, mode, concurrency, size = cell
+    return any(
+        key[0] == name
+        and key[1] in (None, size)
+        and key[2] in (None, mode)
+        and key[3] in (None, concurrency)
+        for key in map(_full, skipped)
+    )
 
 
-def _label(name: str, size: int | None) -> str:
+def _full(key: tuple) -> tuple[str, int | None, str | None, int | None]:
+    """Return a key of LeftOut with its mode and concurrency."""
+    return (*key, None, None)[:4]
+
+
+def _label(
+    name: str, size: int | None, mode: str | None = None, concurrency: int | None = None
+) -> str:
     """Name the cells of a scenario that the gate leaves out."""
-    return name if size is None else f"{name} at {size // KB} KB"
+    label = name if size is None else f"{name} at {size // KB} KB"
+    if mode is not None:
+        label += f" with {mode}"
+    if concurrency is not None:
+        label += f" at concurrency {concurrency}"
+    return label
 
 
 def report(

@@ -494,7 +494,9 @@ plone scenario="zoe" command="start" *args:
 # compares zoe serve with ZEO cell by cell. The gate of zoe-server checks
 # parity by default and leaves read_hot out (phase 2). The gate of
 # `--storage zoe-native` checks 3 times ZEO by default in every cell but
-# read_hot at 1 KB, which it reports and does not count (phase 3), and
+# the read_hot cells that hit the native cache (1 KB, and 100 KB with
+# threads at concurrency 1 and with processes), which it reports and does
+# not count (phase 3), and
 # `--python cp314t` counts only that build. `run` runs each
 # value of zodbshootout on a fresh store under target/bench/work, removes
 # the store when the value ends, and fails a cell before it starts when that
