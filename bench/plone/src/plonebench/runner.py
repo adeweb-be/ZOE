@@ -86,9 +86,7 @@ def locust_command(
         }
     )
     command = [
-        "taskset",
-        "-c",
-        options.settings.locust_cpus,
+        *stack.pin(options.settings.locust_cpus),
         sys.executable,
         "-m",
         "locust",
@@ -171,7 +169,7 @@ def run(options: RunOptions) -> Path:
             "spec": json.loads((fixture_dir / "spec.json").read_text()),
             "equivalence": json.loads((fixture_dir / "equivalence.json").read_text()),
         },
-        "environment": environment.record(stack.WORK),
+        "environment": environment.record(stack.WORK, options.settings.zeo_fsync),
         "workload_model": "closed: each user waits for its response before its next "
         "operation, so a slower server lowers the offered rate",
         "exclusions": [],

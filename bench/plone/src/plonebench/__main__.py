@@ -35,6 +35,7 @@ def settings_of(args) -> stack.Settings:
         zope_cpus=tuple(args.zope_cpus.split(";")),
         locust_cpus=args.locust_cpus,
         probe=not args.no_probe,
+        zeo_fsync=args.zeo_fsync,
     )
 
 
@@ -53,6 +54,13 @@ def add_settings(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--locust-cpus", default=defaults.locust_cpus)
     parser.add_argument(
         "--no-probe", action="store_true", help="run without the WSGI probe"
+    )
+    parser.add_argument(
+        "--zeo-fsync",
+        choices=("full", "plain"),
+        default=defaults.zeo_fsync,
+        help="macOS: the ZEO server syncs with F_FULLFSYNC (full, as zoe serve "
+        "does) or with stock fsync(2) (plain)",
     )
 
 

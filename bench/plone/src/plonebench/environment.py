@@ -26,7 +26,17 @@ EGGS = (
 )
 
 
+def sysctl(name: str) -> str | None:
+    try:
+        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True)
+    except OSError:
+        return None
+    return out.stdout.strip() or None
+
+
 def cpu_model() -> str:
+    if sys.platform == "darwin":
+        return sysctl("machdep.cpu.brand_string") or "unknown"
     try:
         with open("/proc/cpuinfo") as file:
             for line in file:
@@ -38,6 +48,9 @@ def cpu_model() -> str:
 
 
 def memory_bytes() -> int | None:
+    if sys.platform == "darwin":
+        value = sysctl("hw.memsize")
+        return int(value) if value else None
     try:
         with open("/proc/meminfo") as file:
             for line in file:
@@ -46,6 +59,55 @@ def memory_bytes() -> int | None:
     except OSError:
         return None
     return None
+
+
+def core_kinds() -> dict | None:
+    """The performance and efficiency cores of an Apple CPU. The scheduler
+    of macOS chooses the kind of core for each thread."""
+    if sys.platform != "darwin":
+        return None
+    kinds = {}
+    for level in range(int(sysctl("hw.nperflevels") or 0)):
+        name = sysctl(f"hw.perflevel{level}.name") or f"level{level}"
+        count = sysctl(f"hw.perflevel{level}.physicalcpu")
+        kinds[name] = int(count) if count else None
+    return kinds or None
+
+
+def filesystem(path: Path) -> str | None:
+    if sys.platform == "darwin":
+        import psutil
+
+        path = path.resolve()
+        best = None
+        for part in psutil.disk_partitions(all=True):
+            mount = Path(part.mountpoint)
+            if path == mount or mount in path.parents:
+                if best is None or len(str(mount)) > len(best.mountpoint):
+                    best = part
+        return best.fstype if best else None
+    try:
+        out = subprocess.run(
+            ["stat", "-f", "-c", "%T", str(path)], capture_output=True, text=True
+        )
+    except OSError:
+        return None
+    return out.stdout.strip() or None
+
+
+def durability(zeo_fsync: str) -> dict:
+    """How each server makes a commit durable. On macOS, fsync(2) leaves
+    the data in the cache of the drive; only fcntl F_FULLFSYNC writes it to
+    the medium. Rust's File::sync_data uses F_FULLFSYNC there, and
+    Python's os.fsync does not, unless the harness patches it."""
+    if sys.platform == "darwin":
+        zeo = (
+            "F_FULLFSYNC: the harness makes os.fsync of the ZEO server use it"
+            if zeo_fsync == "full"
+            else "fsync(2) in FileStorage: the drive may still cache the data"
+        )
+        return {"zeo": zeo, "zoe": "F_FULLFSYNC (Rust File::sync_data)"}
+    return {"zeo": "fsync(2) in FileStorage", "zoe": "fdatasync(2)"}
 
 
 def cgroup_limits() -> dict:
@@ -60,7 +122,7 @@ def cgroup_limits() -> dict:
 def eggs() -> dict[str, str]:
     """The versions of the eggs that the buildout scenarios share."""
     versions = {}
-    for path in (stack.PLONE / "eggs").glob("*.egg"):
+    for path in stack.egg_paths("*.egg"):
         match = re.match(r"^(.+?)-([^-]+)-py", path.name)
         if match and match.group(1) in EGGS:
             versions[match.group(1)] = match.group(2)
@@ -116,7 +178,7 @@ def zope_python() -> dict:
         return {}
 
 
-def record(store_dir: Path) -> dict:
+def record(store_dir: Path, zeo_fsync: str = "full") -> dict:
     from plonebench.sampler import disk_of
 
     disk = disk_of(store_dir)
@@ -134,22 +196,22 @@ def record(store_dir: Path) -> dict:
         locust_version = locust.__version__
     except ImportError:
         locust_version = None
-    fs = None
-    try:
-        out = subprocess.run(
-            ["stat", "-f", "-c", "%T", str(store_dir)], capture_output=True, text=True
-        )
-        fs = out.stdout.strip()
-    except OSError:
-        pass
     return {
         "machine": {
+            "os": platform.system(),
             "cpu": cpu_model(),
             "logical_cpus": os.cpu_count(),
+            "core_kinds": core_kinds(),
             "memory_bytes": memory_bytes(),
             "kernel": platform.release(),
             "cgroup": cgroup_limits(),
-            "store_disk": {"device_rotational": rotational, "filesystem": fs},
+            "cpu_pinning": stack.pinning(),
+            "store_disk": {
+                "device": disk,
+                "device_rotational": rotational,
+                "filesystem": filesystem(store_dir),
+            },
+            "durability": durability(zeo_fsync),
         },
         "software": {
             "zope_python": zope_python(),

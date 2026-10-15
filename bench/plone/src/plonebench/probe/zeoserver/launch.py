@@ -7,10 +7,25 @@ which does not import the `zc` namespace packages on this interpreter. The
 interpreter of the instance puts the same eggs on sys.path the way
 buildout does. This script loads the probe of plonebench_zeoprobe.py, then
 runs ZEO.runzeo with the configuration file.
+
+On macOS, os.fsync leaves the data in the cache of the drive, and the Rust
+std of `zoe serve` uses F_FULLFSYNC. When PLONEBENCH_ZEO_FSYNC is `full`,
+this script makes os.fsync use F_FULLFSYNC too, so both servers make a
+commit durable the same way.
 """
 
 import os
 import sys
+
+if sys.platform == "darwin" and os.environ.get("PLONEBENCH_ZEO_FSYNC") == "full":
+    import fcntl
+
+    def _full_fsync(fd):
+        if hasattr(fd, "fileno"):
+            fd = fd.fileno()
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+
+    os.fsync = _full_fsync
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import plonebench_zeoprobe  # noqa: E402,F401  the probe

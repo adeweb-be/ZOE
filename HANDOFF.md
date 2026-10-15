@@ -3,10 +3,10 @@
 | | |
 | --- | --- |
 | Branch | `claude/plone-zeo-zoe-locust-benchmark-pvkgea`, pushed. No pull request yet. |
-| Base | `main` at `0f03dfb` (ZOE-186). Every run so far measured the servers and clients of that commit; only the harness changed after it. |
-| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file. |
+| Base | `main` at `c0db22b` (ZOE-192), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
+| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main` and the port of the harness to macOS (section 4.4). |
 | Card | None: the work came as a direct request. When a card exists, move this file to `docs/handoffs/<card>.md`, as `CLAUDE.md` asks, and name the card in the commits of the follow-up. |
-| Status | Harness complete and tested. One repetition of the primary scenarios done on `zeo` and `zoe-native`. Stopped on request before the follow-up campaigns. Nothing runs now. |
+| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios done on `zeo` and `zoe-native`, on Linux. On macOS: the builds, the fixture and three smoke runs of `edit` pass; no campaign yet. Nothing runs now. |
 | Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the interim results); then this file. |
 
 ---
@@ -233,9 +233,23 @@ Then run `inzope/oidmap.py` against a read-only FileStorage copy of the fixture,
 - Process control: never `pkill -f` a pattern that the command line of the calling shell contains (it killed the shell once). Campaigns were started with `setsid nohup script.sh` and stopped with `kill -TERM -- -<pgid>`.
 - `ruff check` / `ruff format --check` of `bench/plone` are clean with `uvx ruff`; `just check` does not cover `bench/` (the shootout harness is not covered either).
 
+### 4.4 The port to macOS
+
+The human made macOS a target, and the harness now runs on an Apple M3 Pro (6 performance and 6 efficiency cores, APFS). `bench/README.md`, paragraph "On macOS", is the user manual. What changed and why:
+
+- **No CPU pinning.** macOS has no CPU affinity API. `stack.pin()` returns no prefix there, and each result records `cpu_pinning: "none: macOS has no CPU affinity"` and `core_kinds`. The `--*-cpus` options stay, for Linux.
+- **Durability.** On macOS `os.fsync` returns in 0.04 ms and `F_FULLFSYNC` in 3 ms (measured on this machine): `fsync(2)` leaves the data in the cache of the drive. The Rust std of `zoe serve` uses `F_FULLFSYNC`. So `probe/zeoserver/launch.py` makes `os.fsync` of the ZEO server use `F_FULLFSYNC` before ZODB is imported (FileStorage binds `os.fsync` at import). `--zeo-fsync plain` keeps stock ZEO. Measured with `edit`, 4 users: ZEO `tpc_finish` 6.5 ms per commit with `full`, 3.3 ms with `plain`; `zoe serve` 7.3 ms. Each result records `durability`, and the report prints it in its header. The runs of one stack pool in the report, so never mix the two modes in one report.
+- **The sampler.** `sampler._Darwin` reads `proc_pid_rusage` (`rusage_info_v4`) and `proc_pidinfo` through ctypes: CPU, RSS, bytes read and written to disk, threads, context switches. The run delay is the runnable time minus the CPU time, because `ri_runnable_time` counts the time on a CPU too. Checked against psutil, and under 3× oversubscription. The machine CPU and the disk counters come from psutil (now a direct dependency). The disk is the physical store under the APFS volume of the run (`diskutil`). Absent on macOS: steal, iowait, disk flushes, and the split of voluntary and involuntary switches (one `switches` key).
+- **The rest.** `environment` reads `sysctl` and psutil instead of `/proc` and `/sys`. Store copies use `/bin/cp -c` (APFS clones): the devenv shell puts GNU `cp` first on PATH, and GNU `cp` has no `-c`. Buildout puts the eggs in `target/plone/eggs/cp313/` here, so `stack.egg_paths()` looks one level down too.
+- **Environment.** `devenv shell` works; `just plone zeo|zoeclient|zeoclient build` and `cargo build --release` passed without change. `just bench plone prepare` built the same fixture as on Linux (`small-ba01ff255313`, 685 objects, equivalent) in 49 s.
+
+Smoke runs (`edit`, 4 users × 20 s, warmup 10 s; not in any finding): `20261015T223110Z-edit-zeo-r0` (full fsync), `20261015T223220Z-edit-zoe-native-r0`, `20261015T223322Z-edit-zeo-r0` (plain fsync). All pass the verification. `zoe serve` wrote 333 MB in the 14 s window and the ZEO server 52 MB: the gap of finding 8 shows on macOS too.
+
+**Open question: the Python of the instances.** The instances run CPython 3.13 with the GIL, because the Plone build of the repository pins 3.13 (`justfile`, recipe `plone`; `plone/README.md`: "the newest version that Plone 6.1 supports"). So the benchmark cannot show what free-threaded 3.14t would give Plone. Moving the instances to 3.14 or 3.14t changes `plone/` and the `justfile` for the whole repository, and needs a Plone that supports it. The human decides.
+
 ## 5. Next steps, in order
 
-Time estimates are for this 4-vCPU VM, one repetition (the human's choice).
+The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, first rerun the primary scenarios (`browse`, `catalog`, `workflow`, and step 1 below) as the new baseline. Then rerun the step-1 command with `--zeo-fsync plain`, to show the cost of full durability on ZEO.
 
 1. **Rerun the write scenarios with the word codes** (≈ 35 min, 8 runs):
    ```sh
@@ -272,7 +286,8 @@ Time estimates are for this 4-vCPU VM, one repetition (the human's choice).
 ## 7. Limits to keep in the report
 
 - Synthetic site, small fixture: everything fits in every cache. Not a production benchmark.
-- One machine, a shared VM with 4 vCPUs; one repetition by the human's choice, so differences of a few percent are noise.
+- One machine per series: a shared Linux VM with 4 vCPUs, or an Apple M3 Pro with no CPU pinning and two kinds of core. One repetition by the human's choice, so differences of a few percent are noise.
+- On macOS, both servers sync with `F_FULLFSYNC` by default, and stock ZEO does not (section 4.4).
 - Closed workload, no think time; the offered rate falls when the server slows.
 - CPython 3.13 with the GIL, 2 instances × 2 threads; free-threaded Plone is out of reach (Plone 6.1 stops at 3.13).
 - The page cache cannot be dropped: no cold-disk claim.

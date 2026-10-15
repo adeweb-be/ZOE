@@ -16,6 +16,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -127,7 +128,8 @@ class Settings:
     # clients: no `client` key, so no persistent cache file.
     client_cache: str = "128MB"
     # The CPUs (taskset lists) of the server, of each instance, and of the
-    # load generator.
+    # load generator. macOS has no CPU affinity: there the processes are not
+    # pinned, and the result says so.
     server_cpus: str = "0"
     zope_cpus: tuple[str, ...] = ("1", "2")
     locust_cpus: str = "3"
@@ -135,9 +137,27 @@ class Settings:
     server_port: int = 18100
     admin_port: int = 18199
     probe: bool = True
+    # How the ZEO server syncs a commit on macOS: `full` makes os.fsync use
+    # F_FULLFSYNC, as `zoe serve` does; `plain` keeps stock fsync(2). Linux
+    # ignores it.
+    zeo_fsync: str = "full"
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
+
+
+def pinning() -> str:
+    """How the processes of a run are pinned to CPUs."""
+    if sys.platform == "darwin":
+        return "none: macOS has no CPU affinity"
+    return "taskset"
+
+
+def pin(cpus: str) -> list[str]:
+    """The prefix of a command that runs it on the CPUs `cpus`."""
+    if sys.platform == "darwin":
+        return []
+    return ["taskset", "-c", cpus]
 
 
 def interpreter(config: StackConfig) -> Path:
@@ -146,13 +166,25 @@ def interpreter(config: StackConfig) -> Path:
 
 def zope_serve_script() -> Path:
     found = sorted(
-        glob.glob(str(PLONE / "eggs" / "Zope-*" / "Zope2" / "Startup" / "serve.py"))
+        path
+        for path in egg_paths("Zope-*")
+        if (path / "Zope2" / "Startup" / "serve.py").exists()
     )
     if not found:
         raise FileNotFoundError(
             "no Zope egg under target/plone/eggs: run `just plone zeo build`"
         )
-    return Path(found[-1])
+    return found[-1] / "Zope2" / "Startup" / "serve.py"
+
+
+def egg_paths(pattern: str) -> list[Path]:
+    """The eggs of the buildout scenarios that match `pattern`. Buildout
+    puts them in target/plone/eggs, or in a subdirectory per Python ABI
+    such as eggs/cp313."""
+    eggs = PLONE / "eggs"
+    return [Path(p) for p in glob.glob(str(eggs / pattern))] + [
+        Path(p) for p in glob.glob(str(eggs / "*" / pattern))
+    ]
 
 
 def zoe_binary() -> Path:
@@ -409,12 +441,13 @@ class Stack:
             raise RuntimeError(f"port {self.settings.server_port} is in use")
         log = open(self.run / "log" / "server.out", "w")
         self.logs.append(log)
-        taskset = ["taskset", "-c", self.settings.server_cpus]
+        taskset = pin(self.settings.server_cpus)
         if self.config.server == "zeo":
             conf = self.run / "zeo.conf"
             conf.write_text(zeo_conf(self.settings, self.store, self.run))
             env = clean_environment(
                 PLONEBENCH_PROBE_OUT=str(self.run / "probe" / "zeoserver.jsonl"),
+                PLONEBENCH_ZEO_FSYNC=self.settings.zeo_fsync,
             )
             launch = PROBE / "zeoserver" / "launch.py"
             command = [
@@ -499,9 +532,7 @@ class Stack:
             env = clean_environment(PYTHONPATH=str(PROBE))
             process = subprocess.Popen(
                 [
-                    "taskset",
-                    "-c",
-                    cpus,
+                    *pin(cpus),
                     str(interpreter(self.config)),
                     str(serve),
                     str(ini),
@@ -593,13 +624,19 @@ def _stop(process: subprocess.Popen, timeout: float) -> int | None:
 
 def copy_store(source: Path, destination: Path) -> None:
     """Copy a store directory, with reflinks where the file system has
-    them."""
+    them. On macOS, the `cp -c` of the system clones the files on APFS; the
+    development shell puts GNU cp first on PATH."""
     if destination.exists():
         shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["cp", "-a", "--reflink=auto", str(source), str(destination)], check=True
-    )
+    if sys.platform == "darwin":
+        clone = ["/bin/cp", "-a", "-c"]
+    else:
+        clone = ["cp", "-a", "--reflink=auto"]
+    if subprocess.run([*clone, str(source), str(destination)]).returncode:
+        if destination.exists():
+            shutil.rmtree(destination)
+        subprocess.run(["cp", "-a", str(source), str(destination)], check=True)
 
 
 def write_json(path: Path, data) -> None:

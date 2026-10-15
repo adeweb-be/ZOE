@@ -18,6 +18,8 @@ dependencies = [
     # The runner reads server_status of both servers through a stock client.
     "ZEO>=6",
     "msgpack>=1",
+    # The sampler reads the machine CPU and the disk counters on macOS.
+    "psutil>=7",
 ]
 
 [dependency-groups]

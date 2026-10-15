@@ -251,6 +251,20 @@ def _merge(dicts):
     return dict(sorted(total.items(), key=lambda kv: -kv[1]))
 
 
+def durability(results: list[dict]) -> str:
+    """How each server synced a commit, over all runs. A mix of ZEO fsync
+    modes shows every mode, since the runs of one stack pool."""
+    modes: dict[str, set] = {}
+    for result in results:
+        for server, mode in (
+            result["environment"]["machine"].get("durability") or {}
+        ).items():
+            modes.setdefault(server, set()).add(mode)
+    if not modes:
+        return "not recorded"
+    return "; ".join(f"{k}: {' | '.join(sorted(v))}" for k, v in sorted(modes.items()))
+
+
 def build(runs: list[Path]) -> tuple[str, dict]:
     results = load(runs)
     summary = summarize(results)
@@ -264,7 +278,14 @@ def build(runs: list[Path]) -> tuple[str, dict]:
             f"- Machine: {env['machine']['cpu']}, "
             f"{env['machine']['logical_cpus']} logical CPUs, "
             f"{(env['machine']['memory_bytes'] or 0) / 2**30:.0f} GiB, kernel "
-            f"{env['machine']['kernel']}",
+            f"{env['machine']['kernel']}"
+            + (
+                f", cores {env['machine']['core_kinds']}"
+                if env["machine"].get("core_kinds")
+                else ""
+            ),
+            f"- CPU pinning: {env['machine'].get('cpu_pinning', 'taskset')}",
+            f"- Durability: {durability(results)}",
             f"- Zope Python: {env['software']['zope_python']}",
             f"- Eggs: {env['software']['eggs']}; zoedb {env['software']['zoedb']}; "
             f"{env['software']['zoe']}; Locust {env['software']['locust']}",
