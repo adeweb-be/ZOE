@@ -75,6 +75,7 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 - A walk that stops early does not make a reference dangle: a load of the oid confirms each dangling reference.
 - The memory of `verify` grows with the number of oids and of references, not with the size of the records or of the transaction rows. The walk keeps 8 bytes for each oid with a current record. It keeps about 24 bytes for each reference to a later oid, in the list `ahead`, until the walk ends. ZODB gives a new object its oid when it pickles the parent, so nearly every reference in a store that ZODB builds points to a later oid.
 - A blob record without its record is not checked: no read of the store lists the blob records.
+- The walk counts the oids that have at least one record, deletions included. When the store has `object_count` and the walk read every record key, a count that differs is one finding, `Verification::count`. A store of `ZOE format 1` has no count (`Verification::object_count` is `None`): the report says so in one line, and that is no finding.
 
 ## Dumps
 

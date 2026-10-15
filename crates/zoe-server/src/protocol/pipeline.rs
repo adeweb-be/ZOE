@@ -437,10 +437,24 @@ impl Calls {
     /// only while the reader takes no ticket: the future takes each slot,
     /// then gives them back at once.
     pub(crate) fn quiet(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.quiet_without(0)
+    }
+
+    /// Wait until no call of the connection runs, while the reader waits
+    /// for a ticket. That ticket holds one slot, or gets the next slot
+    /// that a call gives back, so the future takes each other slot. Poll
+    /// the ticket first: the semaphore gives the slots in the order of the
+    /// waits. The future holds no borrow of `self`.
+    pub(crate) fn quiet_beside_ticket(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.quiet_without(1)
+    }
+
+    /// Take each slot but `kept`, then give them back.
+    fn quiet_without(&self, kept: usize) -> impl Future<Output = ()> + Send + 'static {
         let slots = Arc::clone(&self.slots);
         async move {
             let _all = slots
-                .acquire_many_owned(QUEUE as u32)
+                .acquire_many_owned((QUEUE - kept) as u32)
                 .await
                 .expect("the slots of a connection never close");
         }
@@ -759,6 +773,77 @@ mod tests {
             // No call runs, whatever the window: the connection is quiet.
             drop(second);
             tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn quiet_beside_a_ticket_waits_for_the_calls_that_hold_the_other_slots() {
+        let (storages, _store) = storages("quiet-beside-slots");
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = Calls::new(
+                storages,
+                outbox,
+                Arc::new(Tokio),
+                "test".into(),
+                Stopping::new().1,
+            );
+            let limit = Duration::from_secs(30);
+            let ping = call(1, "ping", Vec::new());
+            let mut held = Vec::new();
+            for _ in 0..QUEUE {
+                held.push(
+                    tokio::time::timeout(limit, connection.ticket(&ping))
+                        .await
+                        .unwrap(),
+                );
+            }
+            // The next ticket waits for a slot, and the quiet waits after it.
+            let waiting = tokio::spawn(connection.ticket(&ping));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let quiet = tokio::spawn(connection.quiet_beside_ticket());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // The first slot that a call gives back goes to the ticket.
+            drop(held.pop());
+            let ticket = tokio::time::timeout(limit, waiting).await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!quiet.is_finished());
+            // No other call runs: the connection is quiet beside the ticket.
+            drop(held);
+            tokio::time::timeout(limit, quiet).await.unwrap().unwrap();
+            drop(ticket);
+        });
+    }
+
+    #[test]
+    fn quiet_beside_a_ticket_ends_while_the_ticket_waits_for_room() {
+        use crate::protocol::outbox::WAITING;
+
+        let (storages, _store) = storages("quiet-beside-room");
+        // The test reads no frame, so the bytes of the reply stay counted.
+        let (outbox, _inbox, _closing) = Outbox::new(100, 100);
+        runtime().block_on(async {
+            let connection = registered(storages, outbox).await;
+            let limit = Duration::from_secs(30);
+            let load = call(2, "loadBefore", Vec::new());
+            let first = tokio::time::timeout(limit, connection.ticket(&load))
+                .await
+                .unwrap();
+            // The first load puts a large reply and ends.
+            let Ticket { slot, turn, room } = first;
+            assert!(room.put(Some(vec![0; 2 * WAITING])));
+            drop((slot, turn));
+            // The second load holds a slot and waits until the reply goes.
+            let waiting = tokio::spawn(connection.ticket(&load));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished());
+            // No call runs, so the connection is quiet beside the ticket.
+            tokio::time::timeout(limit, connection.quiet_beside_ticket())
+                .await
+                .unwrap();
+            assert!(!waiting.is_finished());
+            waiting.abort();
         });
     }
 
