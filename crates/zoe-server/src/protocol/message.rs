@@ -132,12 +132,44 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, String> {
 
 /// Encode the reply to the call `id` with `result`.
 pub(crate) fn reply(id: Value, result: Value) -> Vec<u8> {
-    encode(Value::Array(vec![
-        id,
-        Value::from(0),
-        Value::from(".reply"),
-        result,
-    ]))
+    reply_of(&id, &result)
+}
+
+/// Encode the reply to the call `id` with `result`, as `reply` does, from
+/// borrowed values.
+pub(crate) fn reply_of(id: &Value, result: &Value) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 + size_hint(id) + size_hint(result));
+    // An array of 4 values, then the id, the flags 0 and the method.
+    bytes.push(0x94);
+    write(&mut bytes, id);
+    bytes.push(0x00);
+    bytes.push(0xa6);
+    bytes.extend_from_slice(b".reply");
+    write(&mut bytes, result);
+    bytes
+}
+
+/// The size of `value` in msgpack, or a little more. A buffer of this
+/// capacity holds the value without a copy.
+fn size_hint(value: &Value) -> usize {
+    match value {
+        Value::Binary(bytes) | Value::Ext(_, bytes) => 6 + bytes.len(),
+        Value::String(text) => 5 + text.as_bytes().len(),
+        Value::Array(items) => 5 + items.iter().map(size_hint).sum::<usize>(),
+        Value::Map(items) => {
+            5 + items
+                .iter()
+                .map(|(key, value)| size_hint(key) + size_hint(value))
+                .sum::<usize>()
+        }
+        _ => 9,
+    }
+}
+
+/// Write `value` to `bytes`.
+fn write(bytes: &mut Vec<u8>, value: &Value) {
+    // A write to a vector never fails.
+    rmpv::encode::write_value(bytes, value).expect("write to a vector");
 }
 
 /// Encode the error reply to the call `id`: the exception `class` with
@@ -164,8 +196,7 @@ pub(crate) fn notify(method: &str, args: Vec<Value>) -> Vec<u8> {
 
 fn encode(value: Value) -> Vec<u8> {
     let mut bytes = Vec::new();
-    // A write to a vector never fails.
-    rmpv::encode::write_value(&mut bytes, &value).expect("write to a vector");
+    write(&mut bytes, &value);
     bytes
 }
 
@@ -253,6 +284,32 @@ mod tests {
         assert!(!call.oneway);
         assert_eq!(call.method, "loadBefore");
         assert_eq!(call.args, vec![Value::Nil]);
+    }
+
+    #[test]
+    fn a_reply_is_the_array_of_the_id_the_flags_the_method_and_the_result() {
+        let load = Value::Array(vec![
+            Value::Binary(vec![7; 1000]),
+            Value::Binary(vec![0; 8]),
+            Value::Nil,
+        ]);
+        for id in [Value::from(1), Value::from(70_000), Value::from("id")] {
+            for result in [
+                load.clone(),
+                Value::Nil,
+                Value::Map(vec![(Value::from("k"), load.clone())]),
+            ] {
+                let expected = frame(Value::Array(vec![
+                    id.clone(),
+                    Value::from(0),
+                    Value::from(".reply"),
+                    result.clone(),
+                ]));
+                assert_eq!(reply_of(&id, &result), expected);
+                assert_eq!(reply(id.clone(), result.clone()), expected);
+                assert!(size_hint(&result) + 16 + size_hint(&id) >= expected.len());
+            }
+        }
     }
 
     #[test]

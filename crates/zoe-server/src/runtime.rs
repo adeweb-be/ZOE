@@ -13,9 +13,9 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zoe_core::{Clock, SystemClock, Waiter};
 
@@ -33,6 +33,10 @@ pub(crate) trait Runtime: Send + Sync + 'static {
 
     /// Return a future that ends after `duration`.
     fn sleep(&self, duration: Duration) -> BoxFuture<()>;
+
+    /// Return the time since a fixed origin, on the clock of `sleep`. It
+    /// never goes back.
+    fn now(&self) -> Duration;
 }
 
 /// The runtime of production: the tasks, the blocking pool and the timers
@@ -51,6 +55,71 @@ impl Runtime for Tokio {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
         Box::pin(tokio::time::sleep(duration))
+    }
+
+    fn now(&self) -> Duration {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
+    }
+}
+
+/// A runtime that counts the handoffs of the connection code: each task
+/// that starts, each blocking thread that starts, and each wake of a task
+/// that it started. The tasks and the threads run on `Tokio`.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Counting(Arc<Handoffs>);
+
+/// The handoffs that a `Counting` runtime saw.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Handoffs {
+    tasks: std::sync::atomic::AtomicUsize,
+    threads: std::sync::atomic::AtomicUsize,
+    wakes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Counting {
+    /// Return the handoffs so far: the tasks and the threads that started,
+    /// and the wakes of the tasks.
+    pub(crate) fn handoffs(&self) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.tasks.load(SeqCst) + self.0.threads.load(SeqCst) + self.0.wakes.load(SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Runtime for Counting {
+    fn spawn(&self, task: BoxFuture<()>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.tasks.fetch_add(1, SeqCst);
+        let handoffs = Arc::clone(&self.0);
+        let mut task = task;
+        let mut first = true;
+        Tokio.spawn(Box::pin(std::future::poll_fn(move |cx| {
+            // The first poll is the start of the task, and each later poll
+            // follows a wake.
+            if !std::mem::take(&mut first) {
+                handoffs.wakes.fetch_add(1, SeqCst);
+            }
+            task.as_mut().poll(cx)
+        })));
+    }
+
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+        self.0
+            .threads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Tokio.spawn_blocking(work);
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<()> {
+        Tokio.sleep(duration)
+    }
+
+    fn now(&self) -> Duration {
+        Tokio.now()
     }
 }
 
@@ -100,8 +169,6 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use tokio::sync::mpsc;
 
     use super::*;
