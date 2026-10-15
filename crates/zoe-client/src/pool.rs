@@ -698,8 +698,9 @@ impl PoolTransaction {
     }
 
     /// Store `data`, the resolution of a conflict that a vote listed, over
-    /// the serial `committed` that the vote gave. The cache of the pool
-    /// will not hold it, as the cache of `ZEO.ClientStorage`.
+    /// the serial `committed` that the vote gave. The server stores these
+    /// bytes unchanged, so the turn adds them to the cache of the pool, as
+    /// `ZEO.ClientStorage` does.
     pub async fn store_resolved(
         &mut self,
         oid: Oid,
@@ -707,9 +708,7 @@ impl PoolTransaction {
         data: &[u8],
     ) -> Result<(), Error> {
         self.txn().store(oid, committed, data).await?;
-        if self.lease.shared.cache.is_some() {
-            self.writes.push((oid, None));
-        }
+        self.keep(oid, data);
         Ok(())
     }
 

@@ -502,11 +502,13 @@ class _NativeClientStorage(ClientStorage):
 
     `tpc_vote` resolves the conflicts that the vote lists with
     `tryToResolveConflict`, on the thread of the transaction, stores each
-    result and votes again, for at most nine rounds, as ZEO does. It
-    returns the oids that the server or the client resolved. The client
-    cache never holds the pickle of such an oid. A conflict that does not
-    resolve raises `ConflictError`, drops the cache entry of its oid and
-    leaves the transaction to `tpc_abort`.
+    result and votes again, as ZEO does, for at most nine rounds. A vote
+    that still lists a conflict after the ninth round raises
+    `ConflictError`. It returns the oids that the server or the client
+    resolved. The client cache keeps the pickle that the client resolved,
+    and never the pickle of an oid that the server resolved. An error of
+    the resolution raises, drops the cache entry of its oid and leaves the
+    transaction to `tpc_abort`.
     """
 
     def __init__(

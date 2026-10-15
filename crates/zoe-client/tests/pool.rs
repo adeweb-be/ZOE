@@ -340,7 +340,7 @@ async fn stale(pool: &Pool, oid: Oid, data: &[u8]) -> (PoolTransaction, Tid, Tid
 }
 
 #[tokio::test]
-async fn a_conflict_that_the_client_resolves_never_enters_the_cache() {
+async fn a_conflict_that_the_client_resolves_enters_the_cache_with_its_resolution() {
     let server = start("cache-resolved");
     let pool = open_cached(&server, 2).await;
     let cache = pool.cache().unwrap().clone();
@@ -360,15 +360,15 @@ async fn a_conflict_that_the_client_resolves_never_enters_the_cache() {
     assert!(voted.resolved.is_empty());
     assert_eq!(cache.load(oid), Some((record(b"b"), second)));
 
-    // The resolution commits, and its turn ends the entry of the oid
-    // without a new one.
+    // The resolution commits, and its turn replaces the entry of the oid
+    // with the resolved pickle.
     txn.store_resolved(oid, second, &record(b"d"))
         .await
         .unwrap();
     assert_eq!(txn.vote_listed().await.unwrap(), Voted::default());
     let turn = txn.finish().await.unwrap().turn().await.unwrap();
     let tid = turn.tid();
-    assert_eq!(cache.load(oid), None);
+    assert_eq!(cache.load(oid), Some((record(b"d"), tid)));
     let ended = cache.load_before(oid, tid).unwrap();
     assert_eq!((ended.tid, ended.end), (second, Some(tid)));
     drop(turn);

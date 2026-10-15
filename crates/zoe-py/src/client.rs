@@ -839,9 +839,10 @@ impl NativeTransaction {
     /// `resolve(oid, committed, read, data)` on this thread, with no lock
     /// held, stores the result over `committed` and votes again, for at
     /// most `ROUNDS` rounds. A vote that fails ends the transaction: the
-    /// server aborted it. An error of `resolve`, or a conflict still listed
-    /// after the last round, drops the cache entry of the oid, raises, and
-    /// leaves the transaction open for its abort.
+    /// server aborted it. An error of `resolve` or of the store of its
+    /// result, or a conflict still listed after the last round, drops the
+    /// cache entry of the oid, raises, and leaves the transaction open for
+    /// its abort.
     fn vote<'py>(
         &self,
         py: Python<'py>,
@@ -899,13 +900,16 @@ impl NativeTransaction {
                 };
                 let trace = traceparent(py, self.traceparent.as_ref())?;
                 let bytes = data.as_bytes();
-                py.detach(|| {
+                let stored = py.detach(|| {
                     let mut slot = lock(&self.txn);
                     let txn = slot.as_mut().ok_or_else(not_open)?;
                     let store = txn.store_resolved(listed.oid, listed.committed, bytes);
                     runtime.block_on(traced(trace, store))
-                })
-                .map_err(|e| client_error(py, e))?;
+                });
+                if let Err(error) = stored {
+                    self.unresolved(py, listed.oid);
+                    return Err(client_error(py, error));
+                }
                 if !resolved.contains(&listed.oid) {
                     resolved.push(listed.oid);
                 }
