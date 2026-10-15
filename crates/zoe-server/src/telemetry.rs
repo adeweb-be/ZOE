@@ -298,6 +298,10 @@ mod tests {
             .with_filter(Select(is_logged));
         let subscriber = tracing_subscriber::registry().with(logs);
         tracing::subscriber::with_default(subscriber, || {
+            // The interest of a callsite is global. Another test can cache
+            // it while only its own subscriber lives. A new cache counts
+            // this subscriber too.
+            tracing::callsite::rebuild_interest_cache();
             assert!(request("loadBefore", "1", None).is_disabled());
             assert!(!tracing::info_span!("connection").is_disabled());
         });
