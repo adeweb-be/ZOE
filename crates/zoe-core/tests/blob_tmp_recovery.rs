@@ -151,6 +151,10 @@ fn files_in(dir: &Path) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs a file system that tells case apart: Linux only"
+)]
 fn a_restart_keeps_the_temporary_files_of_the_clients_of_a_shared_blob_directory() {
     let dir = fresh_dir("shared");
     let store = open_shared(&dir);

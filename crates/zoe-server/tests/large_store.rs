@@ -111,6 +111,10 @@ fn ready(admin: std::net::SocketAddr) -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the memory of the server in /proc: Linux only"
+)]
 fn a_large_store_starts_fast_and_serves_in_bounded_memory() {
     let store_mb = env_mb("ZOE_LARGE_STORE_MB", 128);
     let cache_mb = env_mb("ZOE_CACHE_SIZE_MB", 16);

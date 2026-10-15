@@ -189,6 +189,10 @@ fn a_server_killed_during_a_vote_commits_nothing_of_it() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the socket buffers of macOS can hold every reply, so the hub queue does not always fill: Linux only"
+)]
 fn a_client_that_does_not_read_is_closed_and_the_others_go_on() {
     let dir = fresh_dir("slow");
     let server = Server::start(

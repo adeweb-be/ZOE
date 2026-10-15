@@ -86,6 +86,10 @@ fn heartbeat() -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "macOS reports a reset that follows the FIN as a reset, not as the end: Linux only"
+)]
 fn a_stop_closes_only_when_the_send_queue_is_empty() {
     let dir = fresh_dir("drained-close");
     let path = dir.join("store");

@@ -11,6 +11,7 @@ use std::os::fd::RawFd;
 /// the value of `TIOCOUTQ`. The count is 0 when the peer has every byte
 /// and, on TCP, the FIN. `fd` must be the descriptor of a TCP or unix
 /// domain socket that the caller holds open.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn unacked(fd: RawFd) -> io::Result<usize> {
     let mut count: libc::c_int = 0;
@@ -20,6 +21,39 @@ pub(crate) fn unacked(fd: RawFd) -> io::Result<usize> {
     // no other memory. The pointer points to `count`, a local `c_int` that
     // lives until the call returns.
     let result = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &raw mut count) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(count).map_err(|_| io::Error::other("a negative send queue"))
+}
+
+/// Return the count of bytes in the send buffer of the socket `fd`, from
+/// the socket option `SO_NWRITE` of macOS. For a TCP socket, these are the
+/// bytes that the kernel did not send yet and the bytes that the peer did
+/// not acknowledge yet. The FIN does not count. For a unix domain socket,
+/// the count is always 0: the kernel moves the bytes into the buffer of
+/// the peer at once, and the peer can read them after the close. `fd` must
+/// be the descriptor of a TCP or unix domain socket that the caller holds
+/// open.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn unacked(fd: RawFd) -> io::Result<usize> {
+    let mut count: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: The caller holds the stream of `fd` open for the whole call.
+    // `getsockopt` with `SO_NWRITE` writes at most `len` bytes, one
+    // `c_int`, through its fourth argument, and stores the count of bytes
+    // that it wrote in `len`. Both pointers point to locals that live until
+    // the call returns.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            (&raw mut count).cast(),
+            &raw mut len,
+        )
+    };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -43,6 +77,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "macOS counts no bytes for a unix domain socket: Linux only"
+    )]
     fn a_unix_socket_counts_the_bytes_that_its_peer_did_not_read() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
