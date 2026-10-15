@@ -52,8 +52,9 @@ def test_the_default_ratios_are_constants_of_the_gate():
     assert gate.default_ratio("zoe") == 1.0
 
 
-def test_only_zoe_native_counts_read_hot_at_100_kb():
-    assert set(gate.left_out("zoe-native")) == {("read_hot", KB)}
+def test_zoe_native_leaves_out_no_cell():
+    # The cost rule of ADR 0037 counts every cell of zoe-native.
+    assert gate.left_out("zoe-native") == {}
     assert gate.left_out("zoe-server") == gate.LEFT_OUT
     assert gate.left_out("zoe") == gate.LEFT_OUT
 
@@ -67,20 +68,12 @@ def verdicts(lines, scenario):
     ]
 
 
-def test_zoe_native_leaves_out_read_hot_at_1_kb_and_counts_it_at_100_kb(tmp_path):
-    sizes = (KB, 100 * KB)
-    write(tmp_path, "zeo", "cp313", {"add": 1000.0, "read_hot": 1000.0}, sizes)
-    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0, "read_hot": 2900.0}, sizes)
+def test_the_cost_rule_of_zoe_native_reads_the_gate_set_only(tmp_path):
+    write(tmp_path, "zeo", "cp313", {"add": 1000.0})
+    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0})
     code, lines = report(tmp_path, "zoe-native")
     assert code == 1
-    assert verdicts(lines, "read_hot") == [(KB, "left out"), (100 * KB, "FAIL")]
-    assert verdicts(lines, "add") == [(KB, "pass"), (100 * KB, "pass")]
-    assert [line for line in lines if line.startswith("left out: ")] == [
-        "left out: read_hot at 1 KB, because ZODB itself takes most of the "
-        "time of a hit there"
-    ]
-    assert "at least 3x in each cell but read_hot at 1 KB;" in lines[-1]
-    assert lines[-1].endswith("4 cells, 1 below, 0 missing, 1 left out")
+    assert lines == [f"gate: no gate result of zeo under {tmp_path}"]
 
 
 def test_zoe_server_leaves_out_read_hot_in_both_sizes(tmp_path):
@@ -99,10 +92,10 @@ def test_zoe_server_leaves_out_read_hot_in_both_sizes(tmp_path):
 
 def test_a_build_counts_and_the_other_prints_beside_it(tmp_path):
     write(tmp_path, "zeo", "cp314t", {"add": 1000.0})
-    write(tmp_path, "zoe-native", "cp314t", {"add": 3000.0})
+    write(tmp_path, "zoe-server", "cp314t", {"add": 1000.0})
     write(tmp_path, "zeo", "cp313", {"add": 1000.0})
-    write(tmp_path, "zoe-native", "cp313", {"add": 1500.0})
-    code, lines = report(tmp_path, "zoe-native", "cp314t")
+    write(tmp_path, "zoe-server", "cp313", {"add": 500.0})
+    code, lines = report(tmp_path, "zoe-server", "cp314t")
     assert code == 0, lines
     headers = [line for line in lines if line.startswith("== ")]
     assert headers == [
@@ -116,14 +109,14 @@ def test_a_build_counts_and_the_other_prints_beside_it(tmp_path):
     assert " on cp314t," in lines[-1]
 
     # Without a build, both count.
-    code, lines = report(tmp_path, "zoe-native")
+    code, lines = report(tmp_path, "zoe-server")
     assert code == 1
     assert lines[-1].endswith("2 cells, 1 below, 0 missing, 0 left out")
 
 
 def test_a_build_without_a_result_of_the_baseline_fails(tmp_path):
     write(tmp_path, "zeo", "cp313", {"add": 1000.0})
-    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0})
-    code, lines = report(tmp_path, "zoe-native", "cp314t")
+    write(tmp_path, "zoe-server", "cp313", {"add": 1000.0})
+    code, lines = report(tmp_path, "zoe-server", "cp314t")
     assert code == 1
     assert lines == [f"gate: no result of zeo on cp314t under {tmp_path}"]

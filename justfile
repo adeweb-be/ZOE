@@ -493,9 +493,11 @@ plone scenario="zoe" command="start" *args:
 # `just bench test` runs the tests of the harness and `just bench gate DIR`
 # compares zoe serve with ZEO cell by cell. The gate of zoe-server checks
 # parity by default and leaves read_hot out (phase 2). The gate of
-# `--storage zoe-native` checks 3 times ZEO by default in every cell but
-# read_hot at 1 KB, which it reports and does not count (phase 3), and
-# `--python cp314t` counts only that build. `run` runs each
+# `--storage zoe-native` reads the gate set and checks, in every cell, a
+# storage cost of at most a third of the one of ZEO over the floor storage
+# (phase 3, ADR 0037), and `--python cp314t` counts only that build.
+# `run --gate --storage zeo zoe-native floor` runs the gate set in rounds
+# that interleave the storages, and `--cell` picks some of its cells. `run` runs each
 # value of zodbshootout on a fresh store under target/bench/work, removes
 # the store when the value ends, and fails a cell before it starts when that
 # disk has less free space than one value needs. Each result records the GIL

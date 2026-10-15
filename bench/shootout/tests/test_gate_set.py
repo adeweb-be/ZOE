@@ -8,7 +8,7 @@ from shootout import GATE, KB, Cell, gate, set_name
 from shootout.layout import result_path, run_set
 
 
-def test_the_gate_set_is_six_cells_with_three_values():
+def test_the_gate_set_is_six_cells_with_seven_rounds():
     assert set(GATE.cells) == {
         Cell("threads", 1, KB),
         Cell("threads", 16, KB),
@@ -18,7 +18,7 @@ def test_the_gate_set_is_six_cells_with_three_values():
         Cell("processes", 16, 100 * KB),
     }
     assert set(GATE.cells) <= set(shootout.FULL.cells)
-    assert GATE.processes * GATE.values == 3
+    assert GATE.processes * GATE.values == 7
 
 
 def test_the_name_of_a_set():
@@ -68,13 +68,13 @@ def test_a_gate_run_goes_under_gate_and_an_old_full_run_under_results(tmp_path):
 
 
 def test_the_gate_report_counts_a_gate_run_as_its_own_set(tmp_path):
-    for storage, ops in (("zeo", 1000.0), ("zoe-native", 3500.0)):
+    for storage, ops in (("zeo", 1000.0), ("zoe-server", 3500.0)):
         doc = result(storage, GATE_RUN, ops)
         path = result_path(tmp_path, doc)
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps(doc))
     out = io.StringIO()
-    code = gate.report(tmp_path, "zoe-native", "zeo", 3.0, out)
+    code = gate.report(tmp_path, "zoe-server", "zeo", 3.0, out)
     lines = out.getvalue().splitlines()
     assert code == 0, lines
     assert lines[0] == "== reference cp314t gate"

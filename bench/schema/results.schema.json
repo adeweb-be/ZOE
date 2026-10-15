@@ -12,7 +12,7 @@
       "const": 1
     },
     "storage": {
-      "description": "The storage under test: filestorage, zeo, relstorage (PostgreSQL), relstorage-hf (PostgreSQL, keep-history false), zoe (ZOE in-process), zoe-server (zoe serve, through a ZEO client) or zoe-native (zoe serve, through the native client of zoe.zeo.ClientStorage).",
+      "description": "The storage under test: filestorage, zeo, relstorage (PostgreSQL), relstorage-hf (PostgreSQL, keep-history false), zoe (ZOE in-process), zoe-server (zoe serve, through a ZEO client), zoe-native (zoe serve, through the native client of zoe.zeo.ClientStorage) or floor (the minimal storage in memory of the harness, the floor of the phase 3 gate).",
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$"
     },
@@ -69,7 +69,7 @@
       "required": ["quick", "started", "commit"],
       "properties": {
         "quick": { "description": "True for the quick set of the pull-request gate, false for the full nightly set.", "type": "boolean" },
-        "set": { "description": "The set of the run: quick, gate (the head-to-head of the phase gates: 6 cells, 3 values each) or full.", "enum": ["quick", "gate", "full"] },
+        "set": { "description": "The set of the run: quick, gate (the head-to-head of the phase gates: 6 cells, 7 rounds each) or full.", "enum": ["quick", "gate", "full"] },
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
         "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" }
       }
@@ -110,6 +110,20 @@
           },
           "p50_seconds": { "description": "The median of the same times.", "type": "number", "exclusiveMinimum": 0 },
           "p99_seconds": { "description": "The 99th percentile of the same times.", "type": "number", "exclusiveMinimum": 0 },
+          "values": {
+            "description": "The gate set only: the round and the time of each value, the time for the slowest worker to do one transaction. A round runs one value of each storage of the run; the results of one run have the same start. Optional: results without it stay valid.",
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["round", "seconds"],
+              "properties": {
+                "round": { "type": "integer", "minimum": 0 },
+                "seconds": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            }
+          },
           "workers": {
             "description": "One item per Python process of the zodbshootout runs of this scenario and cell that imported ZODB: the zodbshootout process, its pyperf worker and, in the processes mode, the process of each worker. Optional: results without it stay valid.",
             "type": "array",
