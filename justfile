@@ -496,8 +496,8 @@ plone scenario="zoe" command="start" *args:
 # `just bench client` runs the client benchmark: ZEO.ClientStorage against
 # the native client, through the storage API, against zoe serve and a ZEO
 # server. It writes target/bench/client/<started>.json and prints the
-# rows. `just bench client report FILE` prints the rows of a result and
-# its verdict. It builds `zoe` in release too.
+# rows, and builds `zoe` in release first. `just bench client report FILE`
+# prints the rows of a result and its verdict, and builds nothing.
 # `just bench load` and `just bench saturate` build `zoe` and `zoe-bench` in release, start
 # `zoe serve` on a new store in target/bench/work/zoe-bench, run
 # `zoe-bench load` or `zoe-bench saturate` with its default settings and the
@@ -556,7 +556,12 @@ bench *args="run":
         export LD_LIBRARY_PATH="$libstdcxx${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
     shootout=(uv run --locked --project bench/shootout)
-    if { [ "${1:-}" = run ] || [ "${1:-}" = test ] || [ "${1:-}" = client ]; } && [ -z "${ZOE_BINARY:-}" ]; then
+    builds=false
+    case "${1:-} ${2:-}" in
+        "client report") ;;
+        run\ * | test\ * | client\ *) builds=true ;;
+    esac
+    if [ "$builds" = true ] && [ -z "${ZOE_BINARY:-}" ]; then
         cargo build --release --locked -p zoe-server --bin zoe
         ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
         export ZOE_BINARY

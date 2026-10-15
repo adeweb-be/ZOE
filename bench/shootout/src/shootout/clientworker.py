@@ -9,10 +9,15 @@ In the threads mode, the workers are threads of this process on one
 client. In the processes mode, this process starts one process per worker,
 each with its own client, and waits for them. It opens no client itself.
 
-The modules of the clients load only in the processes that open a client.
-So the GIL record of a process names the modules of one client only.
+Each round runs in a fresh process. The native client imports ZEO too,
+so the processes of both clients load ZEO and ZODB. Each process imports
+its client and the modules of the calls before the clock starts. So the
+clock of a warm round covers the open of the client and the verification
+of its cache, and no import.
 """
 
+import functools
+import importlib
 import json
 import logging
 import multiprocessing
@@ -29,6 +34,14 @@ RECORD_STEP = 977
 ZEO_CLIENT = "ZEO.ClientStorage"
 NATIVE_CLIENT = "zoe.zeo.ClientStorage"
 WAIT_TIMEOUT = 120
+# For each client: its module, its class, the other modules that its open
+# and its calls import, and the arguments that select it.
+CLIENT_CLASSES = {
+    ZEO_CLIENT: ("ZEO.ClientStorage", "ClientStorage", (), {}),
+    NATIVE_CLIENT: ("zoe.zeo", "ClientStorage", ("zoe._zoe",), {"native": True}),
+}
+# The modules that the calls of both clients import.
+CALL_MODULES = ("ZODB.utils", "ZODB.Connection")
 
 
 def cpu() -> float:
@@ -37,13 +50,26 @@ def cpu() -> float:
     return usage.ru_utime + usage.ru_stime
 
 
-def commits_per_worker(objects: int) -> int:
-    """Return the commits of one worker in a commit row."""
-    return max(1, objects // RECORDS_PER_COMMIT)
+def default_commits(objects: int) -> int:
+    """Return the commits of one worker in a commit round, by default."""
+    return max(1, objects // 50)
 
 
-def open_client(spec: dict, worker: int):
-    """Open the client of the spec, with the cache file of the worker."""
+def client_class(spec: dict):
+    """Import the client of the spec and the modules of its calls.
+
+    Return a callable that opens the client. The caller calls this function
+    before the clock starts.
+    """
+    module, name, others, kw = CLIENT_CLASSES[spec["client"]]
+    for other in CALL_MODULES + others:
+        importlib.import_module(other)
+    return functools.partial(getattr(importlib.import_module(module), name), **kw)
+
+
+def open_client(spec: dict, worker: int, opener):
+    """Open the client of the spec with opener, with the cache file of the
+    worker."""
     host, port = spec["address"]
     kw = {
         "storage": "1",
@@ -56,13 +82,7 @@ def open_client(spec: dict, worker: int):
         # it. The warm round reopens it.
         kw["client"] = f"w{worker}"
         kw["var"] = spec["var"]
-    if spec["client"] == ZEO_CLIENT:
-        from ZEO.ClientStorage import ClientStorage
-
-        return ClientStorage((host, port), **kw)
-    from zoe.zeo import ClientStorage
-
-    return ClientStorage((host, port), native=True, **kw)
+    return opener((host, port), **kw)
 
 
 def oids_of(spec: dict, worker: int) -> list[bytes]:
@@ -129,7 +149,7 @@ def commit(storage, records: list[bytes], commits: int) -> list[float]:
 def work(spec: dict, storage, worker: int, prepared) -> list[float]:
     """Run the workload of one worker on an open client."""
     if spec["workload"] == "commit":
-        return commit(storage, prepared, commits_per_worker(spec["objects"]))
+        return commit(storage, prepared, spec["commits"])
     return load(storage, prepared)
 
 
@@ -144,12 +164,13 @@ def run_threads(spec: dict) -> dict:
     workers = spec["concurrency"]
     prepared = [prepare(spec, w) for w in range(workers)]
     times = [None] * workers
+    opener = client_class(spec)
     warm = spec["workload"] == "warm"
-    storage = None if warm else open_client(spec, 0)
+    storage = None if warm else open_client(spec, 0, opener)
     start, cpu_start = time.monotonic(), cpu()
     if warm:
         # The open and its verification count in a warm round.
-        storage = open_client(spec, 0)
+        storage = open_client(spec, 0, opener)
 
     def target(w):
         times[w] = work(spec, storage, w, prepared[w])
@@ -173,12 +194,13 @@ def _process(spec: dict, worker: int, barrier, queue) -> None:
     logging.basicConfig(level=logging.WARNING)
     try:
         prepared = prepare(spec, worker)
+        opener = client_class(spec)
         warm = spec["workload"] == "warm"
-        storage = None if warm else open_client(spec, worker)
+        storage = None if warm else open_client(spec, worker, opener)
         barrier.wait()
         start, cpu_start = time.monotonic(), cpu()
         if warm:
-            storage = open_client(spec, worker)
+            storage = open_client(spec, worker, opener)
         times = work(spec, storage, worker, prepared)
         end, cpu_end = time.monotonic(), cpu()
         storage.close()

@@ -45,7 +45,7 @@ from shootout.clientworker import (
     NATIVE_CLIENT,
     RECORDS_PER_COMMIT,
     ZEO_CLIENT,
-    commits_per_worker,
+    default_commits,
     records_of,
 )
 from shootout.storages import (
@@ -87,7 +87,7 @@ def cache_size(objects: int, size: int) -> int:
     return objects * (size + CACHE_ENTRY_OVERHEAD) * 5 // 4 + 1024 * KB
 
 
-def disk_needed(objects: int, size: int) -> int:
+def disk_needed(objects: int, size: int, commits: int) -> int:
     """Return an upper bound of the bytes that one server and size take.
 
     The load store holds the records of the most workers. The cache files
@@ -102,8 +102,8 @@ def disk_needed(objects: int, size: int) -> int:
         return cache_size(n, size) * 9 // 8 + 64 * KB
 
     caches = 2 * max(cache_file(MOST * objects), MOST * cache_file(objects))
-    commits = MOST * commits_per_worker(objects) * RECORDS_PER_COMMIT * record
-    return load_store + caches + commits + STORE_OVERHEAD
+    commit_store = MOST * commits * RECORDS_PER_COMMIT * record
+    return load_store + caches + commit_store + STORE_OVERHEAD
 
 
 def run(
@@ -112,8 +112,14 @@ def run(
     workdir: Path | None = None,
     machine: str | None = None,
     rounds: int = ROUNDS,
+    commits: int | None = None,
 ) -> dict:
-    """Run every row against each server and return the result document."""
+    """Run every row against each server and return the result document.
+
+    Each worker of a commit round commits `commits` times, by default
+    `default_commits(objects)`.
+    """
+    commits = commits or default_commits(objects)
     if rounds < ROUNDS:
         raise ValueError(f"the benchmark runs at least {ROUNDS} rounds")
     workdir = Path(workdir or tempfile.gettempdir())
@@ -124,7 +130,7 @@ def run(
     workers_of = defaultdict(list)
     for server in servers:
         for size in SIZES:
-            needed = disk_needed(objects, size)
+            needed = disk_needed(objects, size, commits)
             free = shutil.disk_usage(root).free
             if free < needed:
                 shutil.rmtree(root)
@@ -136,7 +142,7 @@ def run(
             print(f"== {server}, records of {size} bytes", flush=True)
             base = root / f"{server}-{size}"
             _load_rounds(server, size, objects, rounds, base, rounds_of, workers_of)
-            _commit_rounds(server, size, objects, rounds, base, rounds_of, workers_of)
+            _commit_rounds(server, size, commits, rounds, base, rounds_of, workers_of)
             shutil.rmtree(base)
     shutil.rmtree(root)
 
@@ -165,6 +171,7 @@ def run(
             "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "commit": environment.commit(),
             "objects": objects,
+            "commits": commits,
         },
         "rows": rows,
     }
@@ -211,12 +218,14 @@ def _server(server: str, directory: Path) -> Iterator[tuple[tuple, str | None]]:
 def _populate(address: tuple, size: int, count: int, path: Path) -> None:
     """Commit `count` records of `size` bytes, and write their oids to path.
 
-    A client of ZEO writes them, in commits of 100 records. No round
+    A client of ZEO writes them, in commits of 100 records. Then a new
+    client of ZEO, with an empty cache, loads each record once. So the
+    first cold round finds the server as warm as the next ones. No round
     measures it.
     """
     from ZEO.ClientStorage import ClientStorage
     from ZODB.Connection import TransactionMetaData
-    from ZODB.utils import z64
+    from ZODB.utils import p64, u64, z64
 
     records = records_of(size, 0)
     storage = ClientStorage(address, wait=True, wait_timeout=120)
@@ -233,6 +242,13 @@ def _populate(address: tuple, size: int, count: int, path: Path) -> None:
             storage.tpc_vote(txn)
             storage.tpc_finish(txn)
             oids += batch
+    finally:
+        storage.close()
+    storage = ClientStorage(address, wait=True, wait_timeout=120)
+    try:
+        before = p64(u64(storage.lastTransaction()) + 1)
+        for oid in oids:
+            storage.loadBefore(oid, before)
     finally:
         storage.close()
     path.write_bytes(b"".join(oids))
@@ -283,7 +299,7 @@ def _load_rounds(server, size, objects, rounds, base, rounds_of, workers_of):
                 shutil.rmtree(caches)
 
 
-def _commit_rounds(server, size, objects, rounds, base, rounds_of, workers_of):
+def _commit_rounds(server, size, commits, rounds, base, rounds_of, workers_of):
     """Run each commit round on a fresh store."""
     for number in range(rounds):
         for mode, concurrency in SHAPES:
@@ -299,7 +315,7 @@ def _commit_rounds(server, size, objects, rounds, base, rounds_of, workers_of):
                         "concurrency": concurrency,
                         "workload": "commit",
                         "record_size": size,
-                        "objects": objects,
+                        "commits": commits,
                         "cache_size": cache_size(RECORDS_PER_COMMIT, size),
                     }
                     result, workers = _round(spec, directory)
@@ -393,7 +409,7 @@ def _row(key: tuple, results: list[dict], workers: list[dict]) -> dict:
 
 ROW = (
     "{:<9} {:>2} {:<6} {:>6} {:<9} {:>10} {:>10} {:>6} {:>8} {:>8}"
-    " {:>8} {:>8} {:>6}  {}"
+    " {:>8} {:>8} {:>8} {:>8} {:>6}  {}"
 )
 
 
@@ -445,6 +461,8 @@ def report(result: dict, out) -> int:
             "ratio",
             "ZEO cpu",
             "nat cpu",
+            "ZEO p50",
+            "nat p50",
             "ZEO p99",
             "nat p99",
             "spread",
@@ -452,14 +470,14 @@ def report(result: dict, out) -> int:
         ),
         file=out,
     )
-    print(" " * 64 + "(µs per object)    (ms per call)", file=out)
+    print(" " * 64 + "(µs per object)    (ms per call, p50 then p99)", file=out)
     lose, missing = [], []
     for key in keys:
         zeo, native = rows.get((ZEO_CLIENT, key)), rows.get((NATIVE_CLIENT, key))
         counts = key[4] == VERDICT_SERVER
         if zeo is None or native is None:
             missing.append(key)
-            numbers = ["-"] * 8
+            numbers = ["-"] * 10
             verdict = "missing"
         else:
             beats = (
@@ -476,6 +494,8 @@ def report(result: dict, out) -> int:
                 f"{native['calls_per_second'] / zeo['calls_per_second']:.2f}",
                 f"{zeo['client_cpu_per_object_seconds'] * 1e6:.1f}",
                 f"{native['client_cpu_per_object_seconds'] * 1e6:.1f}",
+                f"{zeo['p50_seconds'] * 1e3:.3f}",
+                f"{native['p50_seconds'] * 1e3:.3f}",
                 f"{zeo['p99_seconds'] * 1e3:.3f}",
                 f"{native['p99_seconds'] * 1e3:.3f}",
                 f"{max(zeo['spread'], native['spread']):.0%}",

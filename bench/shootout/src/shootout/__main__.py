@@ -98,8 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         "--objects",
         type=_positive,
         default=client.OBJECTS,
-        help="the objects that each worker loads in a cold or warm round; each "
-        "worker commits max(1, objects // 100) times (default: %(default)s)",
+        help="the objects that each worker loads in a cold or warm round "
+        "(default: %(default)s)",
     )
     client_run.add_argument(
         "--server",
@@ -107,6 +107,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=client.SERVERS,
         default=list(client.SERVERS),
         help="the servers to run against (default: both)",
+    )
+    client_run.add_argument(
+        "--commits",
+        type=_positive,
+        help="the commits of each worker in a commit round "
+        "(default: max(1, objects // 50))",
     )
     client_run.add_argument(
         "--rounds",
@@ -183,6 +189,15 @@ def _client(args, parser) -> int:
     """Run the client benchmark, or report on a result of it."""
     if args.client_command == "report":
         result = json.loads(args.result.read_text())
+        try:
+            jsonschema.validate(result, json.loads(client.SCHEMA.read_text()))
+        except jsonschema.ValidationError as error:
+            print(
+                f"{args.result} is not a result of the client benchmark: "
+                f"{error.message}",
+                file=sys.stderr,
+            )
+            return 2
         return client.report(result, sys.stdout)
     if args.rounds < client.ROUNDS:
         parser.error(f"--rounds must be at least {client.ROUNDS}")
@@ -192,6 +207,7 @@ def _client(args, parser) -> int:
         workdir=args.workdir,
         machine=args.machine,
         rounds=args.rounds,
+        commits=args.commits,
     )
     jsonschema.validate(result, json.loads(client.SCHEMA.read_text()))
     output = args.output

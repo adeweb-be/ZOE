@@ -85,7 +85,8 @@
       "properties": {
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
         "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
-        "objects": { "description": "The objects that each worker loads in a cold or warm row. Each worker commits max(1, objects // 100) times in a commit row.", "type": "integer", "minimum": 1 }
+        "objects": { "description": "The objects that each worker loads in a cold or warm round.", "type": "integer", "minimum": 1 },
+        "commits": { "description": "The commits of 100 records that each worker makes in a commit round. Optional: results without it stay valid.", "type": "integer", "minimum": 1 }
       }
     },
     "rows": {

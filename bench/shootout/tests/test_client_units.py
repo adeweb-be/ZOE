@@ -1,6 +1,9 @@
 """Unit tests of the client benchmark: the rows, the report and the checks."""
 
 import io
+import queue
+import sys
+import threading
 
 import pytest
 
@@ -145,15 +148,18 @@ def test_the_cache_holds_the_records_of_a_round():
 
 def test_the_disk_bound_counts_the_store_and_both_caches():
     objects, size = 1000, 100 * 1024
-    needed = client.disk_needed(objects, size)
+    needed = client.disk_needed(objects, size, 20)
     assert needed > client.MOST * objects * size + 2 * client.cache_size(
         client.MOST * objects, size
+    )
+    assert client.disk_needed(objects, size, 40) - needed >= (
+        client.MOST * 20 * client.RECORDS_PER_COMMIT * size
     )
 
 
 def test_a_worker_commits_at_least_once():
-    assert clientworker.commits_per_worker(10) == 1
-    assert clientworker.commits_per_worker(1000) == 10
+    assert clientworker.default_commits(10) == 1
+    assert clientworker.default_commits(1000) == 20
 
 
 def test_the_records_of_a_commit_are_distinct_and_of_their_size():
@@ -162,3 +168,95 @@ def test_the_records_of_a_commit_are_distinct_and_of_their_size():
     assert {len(r) for r in records} == {1024}
     assert len(set(records)) == len(records)
     assert records == clientworker.records_of(1024, 3)
+
+
+# A client that a test imports instead of a real one. Its module and the
+# module of its extension mark their import.
+FAKE_CLIENT = """\
+import fakeextension
+
+
+class ClientStorage:
+    def __init__(self, addr, **kw):
+        self.kw = kw
+
+    def lastTransaction(self):
+        return bytes(8)
+
+    def loadBefore(self, oid, tid):
+        return b"", bytes(8), None
+
+    def close(self):
+        pass
+"""
+FAKE_MODULES = ("fakeclient", "fakeextension")
+
+
+@pytest.fixture
+def fake_client(tmp_path, monkeypatch):
+    """Make the client "fake" importable, and record at each start of the
+    CPU clock whether its modules are imported."""
+    (tmp_path / "fakeclient.py").write_text(FAKE_CLIENT)
+    (tmp_path / "fakeextension.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(
+        clientworker.CLIENT_CLASSES,
+        "fake",
+        ("fakeclient", "ClientStorage", ("fakeextension",), {}),
+    )
+    for name in FAKE_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    imported = []
+    real = clientworker.cpu
+
+    def cpu():
+        imported.append(all(name in sys.modules for name in FAKE_MODULES))
+        return real()
+
+    monkeypatch.setattr(clientworker, "cpu", cpu)
+    oids = tmp_path / "oids"
+    oids.write_bytes(bytes(8) + bytes(7) + b"\x01")
+    spec = {
+        "client": "fake",
+        "address": ["127.0.0.1", 1],
+        "mode": "threads",
+        "concurrency": 1,
+        "workload": "warm",
+        "record_size": 1024,
+        "objects": 2,
+        "oids": str(oids),
+        "var": str(tmp_path),
+        "cache_size": 1024,
+    }
+    yield spec, imported
+    for name in FAKE_MODULES:
+        sys.modules.pop(name, None)
+
+
+def test_a_warm_round_of_threads_imports_its_client_before_the_clock(fake_client):
+    spec, imported = fake_client
+    result = clientworker.run_threads(spec)
+    assert result["calls"] == 2
+    # The first call starts the clock, the second one stops it.
+    assert imported == [True, True]
+
+
+def test_a_warm_round_of_a_process_imports_its_client_before_the_clock(fake_client):
+    spec, imported = fake_client
+    reports = queue.Queue()
+    clientworker._process(spec, 0, threading.Barrier(1), reports)
+    *_, times, error = reports.get_nowait()
+    assert error is None
+    assert len(times) == 2
+    assert imported == [True, True]
+
+
+@pytest.mark.parametrize("name", [ZEO, NATIVE])
+def test_each_client_imports_the_modules_of_its_calls(name):
+    opener = clientworker.client_class({"client": name})
+    assert {"ZODB.utils", "ZODB.Connection"} <= set(sys.modules)
+    if name == NATIVE:
+        assert "zoe._zoe" in sys.modules
+        assert opener.keywords == {"native": True}
+    else:
+        assert opener.keywords == {}
