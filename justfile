@@ -38,7 +38,10 @@ test:
     just deploy check
 
 # Run the zoe-core tests and the race canary under ThreadSanitizer.
-tsan:
+# `just tsan` runs the tests of zoe-core under ThreadSanitizer.
+# `just tsan zoe-server FILTER` runs the tests of the library of zoe-server
+# whose name holds FILTER instead. The canary test runs in both cases.
+tsan crate="zoe-core" filter="":
     #!/usr/bin/env bash
     set -euo pipefail
     # ThreadSanitizer writes each report to a file in this directory. A test
@@ -56,14 +59,19 @@ tsan:
     export RUSTFLAGS="-Zsanitizer=thread"
     export RUSTDOCFLAGS="-Zsanitizer=thread"
     tsan=(cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
-        --target-dir target/tsan --locked -p zoe-core)
+        --target-dir target/tsan --locked)
+    if [ "{{crate}}" = zoe-core ]; then
+        run=("${tsan[@]}" -p zoe-core)
+    else
+        run=("${tsan[@]}" -p "{{crate}}" --lib -- "{{filter}}")
+    fi
     # A report from a child process that a test kills does not change an
     # exit code. So also look for a report in the files and in the output.
     status=0
-    "${tsan[@]}" 2>&1 | tee "$tmp/output" || status=$?
+    "${run[@]}" 2>&1 | tee "$tmp/output" || status=$?
     if [ "$status" -ne 0 ] || grep -q -s 'SUMMARY: ThreadSanitizer:' "$tmp"/*; then
         cat "$tmp"/report.* 2>/dev/null || true
-        echo "just tsan: the zoe-core tests failed under ThreadSanitizer." >&2
+        echo "just tsan: the tests of {{crate}} failed under ThreadSanitizer." >&2
         exit 1
     fi
     # The canary test holds a deliberate data race. ThreadSanitizer must
@@ -71,7 +79,7 @@ tsan:
     echo "== The canary test must make ThreadSanitizer report a data race"
     rm -f "$tmp"/*
     status=0
-    "${tsan[@]}" --test tsan_canary -- --ignored --exact \
+    "${tsan[@]}" -p zoe-core --test tsan_canary -- --ignored --exact \
         a_deliberate_data_race_is_reported >"$tmp/output" 2>&1 || status=$?
     if [ "$status" -eq 0 ]; then
         cat "$tmp/output"
