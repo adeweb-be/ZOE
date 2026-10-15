@@ -727,13 +727,22 @@ impl Cache {
     /// lock of the file. A second close does nothing.
     pub fn close(&self) {
         let _counts = self.lock();
-        let file = self.file.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if self.disabled.load(Ordering::Relaxed) && file.is_none() {
             return;
         }
         match file {
             None => self.clear_locked(),
-            Some(_) => self.write_clean(),
+            Some(file) => {
+                self.write_clean();
+                // The mapping holds the open file of the lock until the
+                // unmap, so the close of the file alone does not free it.
+                let _ = file.unlock();
+            }
         }
         self.disabled.store(true, Ordering::Relaxed);
     }

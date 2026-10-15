@@ -23,6 +23,9 @@
 //!
 //! The close writes the whole mapping to the disk, then marks the file
 //! clean with the checksum of the state, then writes the header page again.
+//! Then it frees the lock: the mapping holds the open file until the unmap,
+//! so only an explicit unlock frees the lock at the close. A closed cache
+//! never reads or writes its mapping again.
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io;
@@ -33,8 +36,8 @@ use std::sync::atomic::Ordering;
 
 use super::mapping;
 use super::{
-    Cache, H_BOOT, H_CLEAN, H_HEAD, H_MAGIC, H_RING, H_SLOTS, H_STATE_SUM,
-    H_STATIC_SUM, H_STORAGE, HEADER_WORDS, Layout, STATIC_WORDS, words_sum,
+    Cache, H_BOOT, H_CLEAN, H_HEAD, H_MAGIC, H_RING, H_SLOTS, H_STATE_SUM, H_STATIC_SUM, H_STORAGE,
+    HEADER_WORDS, Layout, STATIC_WORDS, words_sum,
 };
 
 /// The file that gives the boot id of the kernel.
@@ -111,8 +114,10 @@ impl Cache {
             let mut page = vec![0u8; HEADER_WORDS * 8];
             file.read_exact_at(&mut page, 0)?;
             let header: Vec<u64> = page
-                .chunks_exact(8)
-                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap_or_default()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk))
                 .collect();
             trustworthy(&header, &fixed, len, &layout)
         };

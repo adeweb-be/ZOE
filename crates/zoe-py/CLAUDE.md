@@ -8,7 +8,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `src/errors.rs`: the mapping of core errors to the exceptions of ZODB and to `zoe.WrongThread`, and of the errors that stop a pack.
 - `src/publish.rs`: the publication of commits, in commit order.
 - `src/sequence.rs`: `zoe._zoe.Sequence`, which `Storage.sequence(name)` returns.
-- `src/client.rs`: `zoe._zoe.Client`, the native client of `zoe.zeo.ClientStorage`, on `zoe-client`, and the tokio runtime of the native clients. ADR 0035 records the decision.
+- `src/client.rs`: `zoe._zoe.Client`, the native client of `zoe.zeo.ClientStorage`, on `zoe-client`, and the tokio runtime of the native clients. ADR 0035 records the decision. With `cache_path`, its cache is a file (ADR 0034, stage 2): the open opens the file before it connects, a file that another open holds raises `zc.lockfile.LockError`, and with `wait` the open waits at most `wait_timeout` for the verification of the file (`Pool::ready`).
 - `src/signals.rs`: the handlers of SIGTERM and SIGHUP, the watcher thread that closes the open storages of the process at a signal, and the at-fork hook. ADR 0031 records the design.
 - `python/zoedb/src/zoe/component.xml` and `python/zoedb/src/zoe/config.py`: the `<zoe>`, `<zoeclient>` and `<zoe-server>` sections of ZConfig and the `zoe://` URI of zodburi.
 - `python/zoedb/src/zoe/zeo.py`: `zoe.zeo.ClientStorage`, the client of a ZOE server, in Python, and `_NativeClientStorage`, the same class with the native client inside.
