@@ -56,15 +56,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use rmpv::Value;
 use tokio::sync::watch;
 use zoe_core::{Oid, Tid};
 
 use crate::Error;
 use crate::cache::Cache;
 use crate::client::{
-    Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction, Voted,
+    Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction, Voted, merge,
 };
-use crate::protocol::MAX_TID;
+use crate::protocol::{self, MAX_TID};
 use crate::runtime::{BoxFuture, Runtime};
 
 /// A function that opens one more connection of the pool to the server of
@@ -361,6 +362,15 @@ impl Shared {
             .ok_or(Error::Disconnected)
     }
 
+    /// Load as `Pool::load_before` does.
+    async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
+        let (record, position) = self.any_connection()?.load_before_at(oid, tid).await?;
+        if let (Some(cache), Some(record)) = (&self.cache, &record) {
+            cache.store(oid, record.tid, record.end, &record.data, position);
+        }
+        Ok((record, position))
+    }
+
     /// Forget the connection `client`, which closed or which the pool
     /// closes.
     fn forget(&self, client: &Arc<Client>) {
@@ -529,15 +539,102 @@ impl Pool {
     /// the pool has one: a current record only when `applied` of the cache
     /// is not above that position.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
-        let (record, position) = self
-            .shared
-            .any_connection()?
-            .load_before_at(oid, tid)
-            .await?;
-        if let (Some(cache), Some(record)) = (&self.shared.cache, &record) {
-            cache.store(oid, record.tid, record.end, &record.data, position);
+        self.shared.load_before(oid, tid).await
+    }
+
+    /// Prefetch the records of `oids` before `tid` into the cache, as
+    /// `prefetch` of `ZEO.ClientStorage` does. Each oid that the cache does
+    /// not hold for `tid` gets one load, and all the loads run at once, as
+    /// tasks of the pool. Return the number of loads at once: the tasks
+    /// wait for the replies, and store each one as `load_before` does. So a
+    /// current record that an invalidation ended while its reply was on its
+    /// way does not go in. A load that fails changes nothing. The loads
+    /// carry no traceparent.
+    ///
+    /// Without a cache, it loads nothing. While the pool has no listener,
+    /// or after the close, it fails with `Error::Disconnected` and loads
+    /// nothing.
+    pub fn prefetch(&self, oids: &[Oid], tid: Tid) -> Result<usize, Error> {
+        let shared = &self.shared;
+        {
+            let state = shared.lock();
+            if state.closed || state.lost {
+                return Err(Error::Disconnected);
+            }
         }
-        Ok((record, position))
+        let Some(cache) = &shared.cache else {
+            return Ok(0);
+        };
+        let mut seen = HashSet::new();
+        let mut sent = 0;
+        for &oid in oids {
+            if !seen.insert(oid) || cache.load_before_with(oid, tid, |_, _| Some(())).is_some() {
+                continue;
+            }
+            let shared = shared.clone();
+            shared.runtime.clone().spawn(Box::pin(async move {
+                let _ = shared.load_before(oid, tid).await;
+            }));
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    /// Call `ping` on the listener, as `sync` of `ZEO.ClientStorage` does
+    /// with `server_sync`, then wait until the pool delivered each tid that
+    /// the listener read before the reply. So a read after `sync` sees each
+    /// commit that the server published before its reply. A lost listener
+    /// or the close ends the wait. A caller that runs a delivery must not
+    /// wait: with `wait` false, `sync` returns after the reply.
+    pub async fn sync(&self, wait: bool) -> Result<(), Error> {
+        let listener = self.shared.listener()?;
+        listener.ping().await?;
+        if !wait {
+            return Ok(());
+        }
+        let position = listener.last_transaction().0;
+        self.shared
+            .until(|state| (state.last >= position || state.closed || state.lost).then_some(()))
+            .await;
+        Ok(())
+    }
+
+    /// Call `method` of the server with `args` on the listener, and return
+    /// its reply, as `_call` of `ZEO.ClientStorage` does on its one
+    /// connection. The state that a call keeps on the server, as an
+    /// iterator, stays on the listener, so the calls that follow find it
+    /// there. A call of a transaction fails with `Error::Invalid` and sends
+    /// nothing: the listener never commits. While the pool has no listener,
+    /// it fails with `Error::Disconnected`.
+    pub async fn call(&self, method: &str, args: Vec<Value>) -> Result<Value, Error> {
+        check_listener_call(method)?;
+        self.shared.listener()?.call(method, args).await
+    }
+
+    /// Send `method` with `args` on the listener as a call without a reply,
+    /// as `_async` of `ZEO.ClientStorage` does. The rules of `call` apply.
+    pub async fn notify(&self, method: &str, args: Vec<Value>) -> Result<(), Error> {
+        check_listener_call(method)?;
+        self.shared.listener()?.notify(method, args).await
+    }
+
+    /// Return the reply of `get_info` of the listener, with the map of the
+    /// last `info` call that the server sent on a connection of the pool
+    /// over it. Return `None` while the pool has no listener.
+    pub fn info(&self) -> Option<Value> {
+        let server = self.shared.server();
+        let listener = server.listener.as_ref()?;
+        let mut info = listener.info().clone();
+        let newest = server
+            .conns
+            .iter()
+            .chain([listener])
+            .filter_map(|client| client.pushed_info())
+            .max_by_key(|(stamp, _)| *stamp);
+        if let (Value::Map(into), Some((_, Value::Map(pushed)))) = (&mut info, newest) {
+            merge(into, &pushed);
+        }
+        Some(info)
     }
 
     /// Load the current record of `oid` from the server, through any
@@ -546,10 +643,7 @@ impl Pool {
     pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
         match self.load_before(oid, MAX_TID).await? {
             (Some(record), _) => Ok((record.data, record.tid)),
-            (None, _) => Err(Error::Server {
-                class: "ZODB.POSException.POSKeyError".into(),
-                message: format!("{oid:?}"),
-            }),
+            (None, _) => Err(protocol::pos_key_error(oid)),
         }
     }
 
@@ -862,6 +956,43 @@ impl PoolTransaction {
         Ok(())
     }
 
+    /// Delete `oid`, as `Transaction::delete_object` does. The turn ends
+    /// the current entry of `oid` in the cache of the pool.
+    pub async fn delete_object(&mut self, oid: Oid, serial: Tid) -> Result<(), Error> {
+        self.txn().delete_object(oid, serial).await?;
+        self.forget(oid);
+        Ok(())
+    }
+
+    /// Copy a record of another storage, as `Transaction::restore` does.
+    /// The turn ends the current entry of `oid` in the cache of the pool,
+    /// and adds nothing.
+    pub async fn restore(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: Option<&[u8]>,
+        prev_txn: Option<Tid>,
+    ) -> Result<(), Error> {
+        self.txn().restore(oid, serial, data, prev_txn).await?;
+        self.forget(oid);
+        Ok(())
+    }
+
+    /// Undo the transaction `trans_id`, as `Transaction::undo` does. The
+    /// vote lists the oids of the undo as resolved by the server, and the
+    /// turn ends their current entries in the cache of the pool.
+    pub async fn undo(&mut self, trans_id: &[u8]) -> Result<(), Error> {
+        self.txn().undo(trans_id).await
+    }
+
+    /// Keep a write of `oid` without data, for the cache of the pool.
+    fn forget(&mut self, oid: Oid) {
+        if self.lease.shared.cache.is_some() {
+            self.writes.push((oid, None));
+        }
+    }
+
     /// Check `serial` of `oid` at the vote, as
     /// `Transaction::check_current_serial` does.
     pub async fn check_current_serial(&mut self, oid: Oid, serial: Tid) -> Result<(), Error> {
@@ -962,14 +1093,24 @@ impl PoolTransaction {
     }
 
     /// Keep no pickle of the oids that the server resolved for the cache.
+    /// An oid that the transaction did not store, as an oid of an undo,
+    /// becomes a write without data, as `TransactionBuffer` of ZEO gives
+    /// it: the turn ends its current entry.
     fn server_resolved(&mut self, resolved: &[Oid]) {
-        if resolved.is_empty() {
+        if resolved.is_empty() || self.lease.shared.cache.is_none() {
             return;
         }
-        let resolved: HashSet<Oid> = resolved.iter().copied().collect();
+        let mut left: HashSet<Oid> = resolved.iter().copied().collect();
         for (oid, data) in &mut self.writes {
             if resolved.contains(oid) {
                 *data = None;
+                left.remove(oid);
+            }
+        }
+        // The order of the reply, for a fixed order in the cache.
+        for oid in resolved {
+            if left.remove(oid) {
+                self.writes.push((*oid, None));
             }
         }
     }
@@ -1206,6 +1347,37 @@ impl std::fmt::Debug for Turn {
             .field("stale", &self.stale)
             .finish()
     }
+}
+
+/// The calls of a transaction, which the listener never sends.
+const TRANSACTION_CALLS: [&str; 15] = [
+    "register",
+    "tpc_begin",
+    "storea",
+    "restorea",
+    "deleteObject",
+    "checkCurrentSerialInTransaction",
+    "undoa",
+    "vote",
+    "tpc_finish",
+    "tpc_abort",
+    "storeBlobStart",
+    "storeBlobChunk",
+    "storeBlobEnd",
+    "storeBlobShared",
+    "sendBlob",
+];
+
+/// Fail with `Error::Invalid` for a call that the listener never sends: a
+/// call of a transaction, `register`, or `sendBlob`, whose pieces only
+/// `Pool::send_blob` reads.
+fn check_listener_call(method: &str) -> Result<(), Error> {
+    if TRANSACTION_CALLS.contains(&method) {
+        return Err(Error::Invalid(format!(
+            "{method} does not go through the listener"
+        )));
+    }
+    Ok(())
 }
 
 /// Return the last write of each oid of `writes`, in the order of these

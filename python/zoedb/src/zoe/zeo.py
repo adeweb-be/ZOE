@@ -43,27 +43,32 @@ client the conflicts that a vote lists, as `ZEO.ClientStorage` does. When
 it loses its server, it connects again in the background and verifies its
 cache, as ZEO does. It has no cache file. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
-installed, and sends the traceparent as the client of ZEO does. It speaks
-only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
-`_NOT_BUILT` names the arguments whose feature it does not have yet.
-`native` is false by default.
+installed, and sends the traceparent as the client of ZEO does. It has the
+rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
+`record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
+`deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
+`new_addr` and `client_label`. It speaks only the msgpack protocol `M5`: a
+stock ZEO server needs `msgpack true`. `_NOT_BUILT` names the arguments
+whose feature it does not have yet. `native` is false by default.
 """
 
 import contextvars
 import logging
 import os
 import threading
+import time
+import weakref
 
 import ZEO.interfaces
 import ZODB.blob
 import ZODB.event
+import ZODB.interfaces
 import zope.interface
 from ZEO.asyncio.client import ClientIO, ClientThread, Fallback, Protocol
 from ZEO.asyncio.futures import run_coroutine_threadsafe
 from ZEO.ClientStorage import BlobCacheLayout, _lock_blob
 from ZEO.ClientStorage import ClientStorage as ZEOClientStorage
 from ZEO.Exceptions import ClientDisconnected
-from ZODB.interfaces import IBlobStorage
 from ZODB.POSException import (
     POSKeyError,
     ReadOnlyError,
@@ -372,11 +377,9 @@ _MB = 1024**2
 # not have yet, each with the value that leaves its feature off. Any other
 # value fails the open with an error that names the argument.
 _NOT_BUILT = {
-    "client_label": None,
     "cache": None,
     "client": None,
     "var": None,
-    "server_sync": False,
 }
 
 # The extensions that the native client declares: those of the client of
@@ -392,6 +395,16 @@ _DISCONNECT_POLL = 1
 
 # The longest time that `close` waits for the thread of the invalidations.
 _JOIN_TIMEOUT = 30
+
+# The interfaces of the server that `ZEO.ClientStorage` declares too.
+_SERVER_INTERFACES = (
+    ZODB.interfaces.IStorageRestoreable,
+    ZODB.interfaces.IStorageIteration,
+    ZODB.interfaces.IStorageUndoable,
+    ZODB.interfaces.IStorageCurrentRecordIteration,
+    ZODB.interfaces.IBlobStorage,
+    ZODB.interfaces.IExternalGC,
+)
 
 # The most connections of the native client that commit at once. A
 # transaction that finds them all busy waits for a free one. The listener
@@ -529,6 +542,25 @@ class _NativeClientStorage(ClientStorage):
     and never the pickle of an oid that the server resolved. An error of
     the resolution raises, drops the cache entry of its oid and leaves the
     transaction to `tpc_abort`.
+
+    The other calls of the server go through `_call` and `_async`, on the
+    listener, as on the one connection of `ZEO.ClientStorage`, and raise
+    what `ZEO.ClientStorage` raises for the same reply. So the iterators,
+    `history`, `record_iternext`, `pack`, `undoInfo`, `undoLog` and
+    `server_status` are those of `ZEO.ClientStorage`. An iterator of the
+    server lives on the listener. After the drop of its Python iterator,
+    the next end of a transaction releases it with `iterator_gc`, as ZEO
+    does, and the loss of the listener forgets it. `deleteObject`,
+    `restore` and `undo` go on the connection of their transaction.
+
+    `prefetch(oids, tid)` loads each oid that the cache does not hold for
+    `tid`, all at once, and returns before the replies, which fill the
+    cache. `sync()` with `server_sync` pings the listener, and returns when
+    the DB got each commit that the server published before the reply. Each
+    connection sends `client_label` to the server. `new_addr` gives the
+    addresses of the next connection: the client keeps its server until it
+    loses it. `len()` and `getSize()` read the last sizes that the server
+    sent.
     """
 
     def __init__(
@@ -604,8 +636,14 @@ class _NativeClientStorage(ClientStorage):
         self._setup_blobs(
             blob_dir, shared_blob_dir, blob_cache_size, blob_cache_size_check
         )
-        self.server_sync = False
+        self._client_label = client_label
+        self.server_sync = bool(server_sync)
         self.protocol_version = b"M5"
+        # The iterators of the server, as ZEO keeps them. The lock covers
+        # both.
+        self._iterators = weakref.WeakValueDictionary()
+        self._iterator_ids = set()
+        self._iterator_lock = threading.Lock()
         # The open transactions, each with its transaction of the native
         # client. The lock covers the check and the change of the dict.
         self._transactions = {}
@@ -633,6 +671,7 @@ class _NativeClientStorage(ClientStorage):
             traceparent=_traceparent,
             wait=bool(wait),
             disconnect_poll=float(disconnect_poll or _DISCONNECT_POLL),
+            client_label=client_label,
         )
         self._cache = _NativeCache(self._native)
         try:
@@ -671,10 +710,11 @@ class _NativeClientStorage(ClientStorage):
     def _take_server(self):
         """Take the info and the address of the server of the native client."""
         self._info.update(self._native.info())
-        # Of the interfaces of the server, the client declares only the one
-        # that it has, as ZEO declares them.
-        if ("ZODB.interfaces", "IBlobStorage") in self._info["interfaces"]:
-            zope.interface.alsoProvides(self, IBlobStorage)
+        # The client declares the interfaces of the server that ZEO
+        # declares.
+        for iface in _SERVER_INTERFACES:
+            if (iface.__module__, iface.__name__) in self._info["interfaces"]:
+                zope.interface.alsoProvides(self, iface)
         address = self._native.address()
         if address is not None:
             self.set_server_addr(address)
@@ -722,14 +762,17 @@ class _NativeClientStorage(ClientStorage):
                 "the client was opened in another process, before a fork"
             )
 
-    # The calls that the native client does not have yet.
+    # The calls of the server, on the listener.
 
-    def _call(self, method, *args, **kw):
+    def _call(self, method, *args, timeout=None, wait=True):
+        # ZEO waits `timeout` for a connection. The native client raises
+        # `ClientDisconnected` at once without one, so it ignores `timeout`.
+        self._check_process()
         # The code of ZEO for the blob cache downloads a blob with this
         # call, under the lock of the blob.
         if method == "sendBlob":
             return self._send_blob(*args)
-        raise Unsupported(f"the native client does not call {method} yet")
+        return self._native.call(method, args)
 
     def _send_blob(self, oid, serial):
         """Download the blob of `oid` at `serial` into the blob cache."""
@@ -739,13 +782,94 @@ class _NativeClientStorage(ClientStorage):
         self._blob_bytes_came(size)
 
     def _async(self, method, *args):
-        raise Unsupported(f"the native client does not call {method} yet")
+        self._check_process()
+        self._native.call_async(method, args)
 
     def _async_iter(self, it):
         raise Unsupported("the native client does not upload blobs yet")
 
     def new_addr(self, addr):
-        raise Unsupported("the native client does not change its address yet")
+        self._check_process()
+        self._native.new_addr(
+            [_native_address(one) for one in self._normalize_addr(addr)]
+        )
+        self._addr = addr
+
+    def ping(self):
+        self._call("ping")
+
+    def sync(self):
+        if not self.server_sync:
+            return
+        self._check_process()
+        # A thread that gives a tid to the DB does not wait for itself.
+        self._native.sync(not getattr(self._local, "delivering", False))
+
+    # The iterators of the server, as ZEO keeps them, with a lock: several
+    # transactions end at once.
+
+    def _setup_iterator(self, factory, iid, *args):
+        iterator = factory(self, iid, *args)
+        with self._iterator_lock:
+            self._iterators[iid] = iterator
+            self._iterator_ids.add(iid)
+        return iterator
+
+    def _forget_iterator(self, iid):
+        with self._iterator_lock:
+            self._iterators.pop(iid, None)
+            self._iterator_ids.discard(iid)
+
+    def _iterator_gc(self, disconnected=False):
+        with self._iterator_lock:
+            if not self._iterator_ids:
+                return
+            if disconnected:
+                for iterator in self._iterators.values():
+                    iterator._iid = -1
+                self._iterators.clear()
+                self._iterator_ids.clear()
+                return
+            iids = self._iterator_ids - set(self._iterators)
+            # ZEO's tests read the time of the last collection.
+            self._iterators._last_gc = time.time()
+            if not iids:
+                return
+            self._iterator_ids -= iids
+        try:
+            self._async("iterator_gc", list(iids))
+        except ClientDisconnected:
+            # The server dropped every iterator of the connection.
+            self._iterator_gc(True)
+
+    # The calls of a transaction.
+
+    def deleteObject(self, oid, serial, txn):
+        self._check_trans(txn, "deleteObject").delete_object(oid, serial)
+
+    def restore(self, oid, serial, data, version, prev_txn, transaction):
+        if version:
+            raise Unsupported("versions are not supported")
+        native = self._check_trans(transaction, "restore")
+        native.restore(oid, serial, data, prev_txn)
+
+    def undo(self, trans_id, txn):
+        self._check_trans(txn, "undo").undo(trans_id)
+
+    # The info of the server: `get_info` and the last `info` call.
+
+    def _update_info(self):
+        info = self._native.info()
+        if info:
+            self._info.update(info)
+
+    def __len__(self):
+        self._update_info()
+        return self._info["length"]
+
+    def getSize(self):
+        self._update_info()
+        return self._info["size"]
 
     # The blobs. `loadBlob`, `openCommittedBlobFile` and
     # `temporaryDirectory` are those of `ZEO.ClientStorage`.
@@ -795,8 +919,8 @@ class _NativeClientStorage(ClientStorage):
             self._blob_bytes_came(size)
 
     def prefetch(self, oids, tid):
-        # The client does not prefetch: each load fills the cache.
-        pass
+        self._check_process()
+        self._native.prefetch(list(oids), tid)
 
     # The state of the connection.
 
@@ -807,9 +931,6 @@ class _NativeClientStorage(ClientStorage):
         return self._is_read_only
 
     isReadOnly = is_read_only
-
-    def supportsUndo(self):
-        return False
 
     def close(self):
         self._check_process()
@@ -858,6 +979,8 @@ class _NativeClientStorage(ClientStorage):
                         self.__name__,
                         self._server_addr,
                     )
+                    # The iterators of the server went with the listener.
+                    self._iterator_gc(True)
                     # The client lost its listener: any object can be stale.
                     if self._db is not None:
                         self._db.invalidateCache()
@@ -1015,6 +1138,7 @@ class _NativeClientStorage(ClientStorage):
                 _remove_files(blobs)
             elif not self.shared_blob_dir:
                 self._cache_blobs(blobs, tid)
+            self._iterator_gc()
         return tid
 
     def tpc_abort(self, txn, timeout=None):
@@ -1033,6 +1157,7 @@ class _NativeClientStorage(ClientStorage):
             # files. In a shared directory, the server already moved each
             # file that it staged.
             _remove_files(blobs)
+            self._iterator_gc()
 
     def tpc_end(self, txn):
         if txn is not None:
