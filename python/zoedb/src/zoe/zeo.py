@@ -33,8 +33,10 @@ and no thread of ZEO starts. It connects as ZEO does: to a `(host, port)`
 address, to the path of a unix domain socket, or to the first server of a
 list that opens, with TLS from the `<ssl>` section of `<zoeclient>`. It
 takes no `ssl` context: TLS runs in Rust, and a context does not give back
-the files of its certificate and key. It has one connection, one
-transaction at a time, no cache, no blob and no reconnect. It declares
+the files of its certificate and key. It runs several transactions at once,
+each on its own connection of a pool, with one more connection that orders
+the invalidations (ADR 0036). It has no cache, no blob and no reconnect. It
+declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It speaks
 only the msgpack protocol `M5`: a stock ZEO server needs `msgpack true`.
@@ -382,6 +384,11 @@ _NEW_OIDS = 100
 # The longest time that `close` waits for the thread of the invalidations.
 _JOIN_TIMEOUT = 30
 
+# The most connections of the native client that commit at once. A
+# transaction that finds them all busy waits for a free one. The listener
+# connection comes on top. The threads cells of zodbshootout run 64 threads.
+_POOL_BOUND = 64
+
 
 def _as_bytes(value):
     """Return the bytes of a user name or a description."""
@@ -446,10 +453,13 @@ class _NativeClientStorage(ClientStorage):
     one server: with `read_only_fallback`, a writable server before a
     read-only one.
 
-    A thread of the client gives the invalidations of the other clients to
-    the DB, in tid order. `lastTransaction()` gives a tid only after the DB
-    got the invalidations of that tid. `tpc_finish` calls its callback
-    before `lastTransaction()` gives the tid to another thread.
+    Each transaction runs on its own connection of a pool of at most
+    `_POOL_BOUND` connections, which open on demand. One more connection,
+    the listener, orders the tids. A thread of the client gives the
+    invalidations of the other clients to the DB, in tid order, once each.
+    `tpc_finish` returns, and runs its callback, at the place of its tid in
+    that order. `lastTransaction()` gives a tid only after the DB got its
+    invalidations or the callback of its commit ran.
     """
 
     def __init__(
@@ -527,12 +537,13 @@ class _NativeClientStorage(ClientStorage):
         self.fshelper = None
         self.server_sync = False
         self.protocol_version = b"M5"
-        # One transaction at a time, as ZEO's client.
-        self._commit_lock = threading.Lock()
-        self._transaction = None
-        # The delivery of the invalidations, `lastTransaction()` and the
-        # callback of `tpc_finish` take this lock.
-        self._deliver_lock = threading.RLock()
+        # The open transactions, each with its transaction of the native
+        # client. The lock covers the check and the change of the dict.
+        self._transactions = {}
+        self._transactions_lock = threading.Lock()
+        # A thread that gives a tid to the DB marks itself here. Its own
+        # call of `lastTransaction()` does not wait for that tid.
+        self._local = threading.local()
         self._delivery = None
 
         from zoe import _zoe
@@ -544,13 +555,13 @@ class _NativeClientStorage(ClientStorage):
             read_only_fallback=self._read_only_fallback,
             extensions=list(_NATIVE_EXTENSIONS),
             wait_timeout=float(wait_timeout or 30),
+            pool_bound=_POOL_BOUND,
             tls=tls,
             traceparent=_traceparent,
         )
         try:
             # A read-only fallback registers read-only.
             self._is_read_only = self._native.read_only()
-            self._last_tid = self._native.opened_at()
             self._info.update(self._native.info())
             self.set_server_addr(self._native.address())
             self._connection_generation = 1
@@ -628,56 +639,43 @@ class _NativeClientStorage(ClientStorage):
     # The invalidations.
 
     def _deliver_forever(self):
-        """Give each invalidation to the DB until the connection closes."""
+        """Give each delivery of the native client to the DB until the close.
+
+        The native client gives the commits of the other clients in tid
+        order, once each, and a mark when it lost its listener. It gives the
+        next one only after this thread confirmed the last one.
+        """
         native = self._native
-        try:
-            while native.wait_invalidation():
-                with self._deliver_lock:
-                    self._deliver()
-        except Exception:
-            logger.exception("%s the invalidations stopped", self.__name__)
-
-    def _deliver(self, tid=None, callback=None):
-        """Give the invalidations that wait to the DB, in tid order.
-
-        With `tid`, call `callback(tid)` for the commit of this client at
-        its place in the tid order. The caller holds `_deliver_lock`.
-        """
-        lagged, items = self._native.drain()
-        if lagged and self._db is not None:
-            # The client missed invalidations: the cache of the DB is stale.
-            self._db.invalidateCache()
-        failure = None
-        for item_tid, oids in items:
-            if tid is not None and item_tid > tid:
-                failure = self._committed(tid, callback)
-                tid = None
-            if self._db is not None:
-                self._db.invalidate(item_tid, oids)
-            self._last_tid = max(self._last_tid, item_tid)
-        if tid is not None:
-            failure = self._committed(tid, callback)
-        if failure is not None:
-            raise failure
-
-    def _committed(self, tid, callback):
-        """Call `callback(tid)` and raise the last tid to `tid`.
-
-        Return the exception of the callback, or None.
-        """
-        try:
-            callback(tid)
-        except Exception as error:
-            return error
-        finally:
-            self._last_tid = max(self._last_tid, tid)
-        return None
+        while True:
+            try:
+                delivery = native.next_delivery()
+            except Exception:
+                logger.exception("%s the invalidations stopped", self.__name__)
+                return
+            if delivery is None:
+                return
+            self._local.delivering = True
+            try:
+                db = self._db
+                if db is None:
+                    pass
+                elif delivery[0] == "stale":
+                    # The client lost its listener: any object can be stale.
+                    db.invalidateCache()
+                else:
+                    db.invalidate(delivery[1], delivery[2])
+            except Exception:
+                logger.exception("%s the DB refused an invalidation", self.__name__)
+            finally:
+                self._local.delivering = False
+                native.delivered()
 
     def lastTransaction(self):
         self._check_process()
-        with self._deliver_lock:
-            self._deliver()
-            return self._last_tid
+        # A thread that gives a tid to the DB gets the last tid at once. Any
+        # other thread waits for the tid that the DB gets now, if any.
+        wait = not getattr(self._local, "delivering", False)
+        return self._native.last_transaction(wait)
 
     # The loads.
 
@@ -711,27 +709,34 @@ class _NativeClientStorage(ClientStorage):
     # The two-phase commit.
 
     def _check_trans(self, trans, meth):
+        """Return the native transaction of trans."""
         if self._is_read_only:
             raise ReadOnlyError()
-        if trans is None or trans is not self._transaction:
+        native = self._transactions.get(trans) if trans is not None else None
+        if native is None:
             raise StorageTransactionError("Transaction not committing", meth, trans)
+        return native
 
     def tpc_transaction(self):
-        return self._transaction
+        """Return the transaction that began last and did not end, or None."""
+        with self._transactions_lock:
+            return next(reversed(self._transactions), None)
 
     def tpc_begin(self, txn, tid=None, status=" "):
         self._check_process()
         if self._is_read_only:
             raise ReadOnlyError()
-        if txn is self._transaction:
-            raise StorageTransactionError(
-                "Duplicate tpc_begin calls for same transaction"
-            )
-        self._commit_lock.acquire()
+        with self._transactions_lock:
+            if txn in self._transactions:
+                raise StorageTransactionError(
+                    "Duplicate tpc_begin calls for same transaction"
+                )
+            # The entry holds the place until the native transaction exists.
+            self._transactions[txn] = None
         try:
             if isinstance(status, bytes):
                 status = status.decode("ascii")
-            self._native.begin(
+            native = self._native.begin(
                 _as_bytes(txn.user),
                 _as_bytes(txn.description),
                 txn.extension,
@@ -739,50 +744,55 @@ class _NativeClientStorage(ClientStorage):
                 status,
             )
         except BaseException:
-            self._commit_lock.release()
+            with self._transactions_lock:
+                self._transactions.pop(txn, None)
             raise
-        self._transaction = txn
+        with self._transactions_lock:
+            self._transactions[txn] = native
 
     def store(self, oid, serial, data, version, txn):
         if version:
             raise Unsupported("versions are not supported")
-        self._check_trans(txn, "store")
-        self._native.store(oid, serial or z64, data)
+        self._check_trans(txn, "store").store(oid, serial or z64, data)
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
-        self._check_trans(transaction, "checkCurrentSerialInTransaction")
-        self._native.check_current_serial(oid, serial)
+        native = self._check_trans(transaction, "checkCurrentSerialInTransaction")
+        native.check_current_serial(oid, serial)
 
     def tpc_vote(self, txn):
-        self._check_trans(txn, "tpc_vote")
-        return self._native.vote() or None
+        return self._check_trans(txn, "tpc_vote").vote() or None
 
     def tpc_finish(self, txn, f=lambda tid: None):
         self._check_process()
-        self._check_trans(txn, "tpc_finish")
+        native = self._check_trans(txn, "tpc_finish")
         try:
-            # The lock covers the round trip. So the thread of the
-            # invalidations gives no later tid to the DB before `f(tid)`.
-            # The call waits only for the server, never for that thread.
-            with self._deliver_lock:
-                tid = self._native.finish()
-                self._deliver(tid, f)
+            # The finish returns at the turn of its tid: the DB got every
+            # tid below it. The client gives no later tid to the DB until
+            # `done`, so `f(tid)` runs at the place of the tid.
+            tid = native.finish()
+            self._local.delivering = True
+            try:
+                f(tid)
+            finally:
+                self._local.delivering = False
+                native.done()
         finally:
             self.tpc_end(txn)
         return tid
 
     def tpc_abort(self, txn, timeout=None):
         self._check_process()
-        if txn is None or txn is not self._transaction:
+        native = self._transactions.get(txn) if txn is not None else None
+        if native is None:
             return
         try:
-            self._native.abort()
+            native.abort()
         except ClientDisconnected:
             logger.debug("%s ClientDisconnected in tpc_abort() ignored", self.__name__)
         finally:
             self.tpc_end(txn)
 
     def tpc_end(self, txn):
-        if txn is not None and txn is self._transaction:
-            self._transaction = None
-            self._commit_lock.release()
+        if txn is not None:
+            with self._transactions_lock:
+                self._transactions.pop(txn, None)
