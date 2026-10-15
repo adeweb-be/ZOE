@@ -1,4 +1,4 @@
-//! The client cache: the layout of ADR 0034 (proposed) in one mapping,
+//! The client cache: the layout of ADR 0034 in one mapping,
 //! with the semantics of `ZEO.cache.ClientCache`. The mapping is anonymous
 //! (`Cache::new`), or a file that one process maps (`Cache::open`, in
 //! `file.rs`). The same code reads and writes both.
