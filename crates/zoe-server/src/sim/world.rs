@@ -16,7 +16,10 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use zoe_core::Store;
+
 use super::net::Conn;
+use super::pool::PoolLog;
 use super::rng::Rng;
 use super::{Faults, Report};
 use crate::protocol::Storages;
@@ -108,6 +111,8 @@ pub(crate) struct ServerState {
     pub(crate) generation: u32,
     pub(crate) up: bool,
     pub(crate) storages: Option<Arc<Storages>>,
+    /// The store of the server process, while it is up.
+    pub(crate) store: Option<Arc<Store>>,
     /// The store did not open again: the run stops.
     pub(crate) halted: bool,
 }
@@ -184,6 +189,26 @@ pub(crate) struct State {
     /// The phase of a crash that a client reached. The driver crashes the
     /// server after the step of that client.
     pub(crate) crash_now: Option<&'static str>,
+    /// The listeners of pools that the network can still break.
+    pub(crate) listener_losses: usize,
+    /// What the pools of the run delivered.
+    pub(crate) pools: Pools,
+}
+
+/// What the pools of a run delivered, and the counts of their holds.
+#[derive(Debug, Default)]
+pub(crate) struct Pools {
+    /// The log of each pool, at its close.
+    pub(crate) logs: Vec<PoolLog>,
+    /// The tids of other clients that the pools delivered.
+    pub(crate) foreign: usize,
+    /// The tids that a listener held.
+    pub(crate) held: usize,
+    /// The finishes whose reply came while their pool held a lower tid.
+    pub(crate) waited: usize,
+    /// The finishes that had their reply when their listener was lost, and
+    /// returned their tid.
+    pub(crate) lost_listener_finishes: usize,
 }
 
 /// A fault of the network that starts at a planned frame.
@@ -293,6 +318,12 @@ impl State {
             crash_phases: Vec::new(),
             verify: Vec::new(),
             elapsed: self.now,
+            order_faults: Vec::new(),
+            foreign_deliveries: self.pools.foreign,
+            own_deliveries: 0,
+            held: self.pools.held,
+            waited_finishes: self.pools.waited,
+            lost_listener_finishes: self.pools.lost_listener_finishes,
         }
     }
 }
@@ -373,6 +404,8 @@ impl Shared {
                 clients_done: 0,
                 crash_plan,
                 crash_now: None,
+                listener_losses: 0,
+                pools: Pools::default(),
             }),
             ready: Ready::default(),
             permits: IdSet::default(),
