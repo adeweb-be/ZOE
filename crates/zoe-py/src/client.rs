@@ -61,8 +61,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
-    Address, Cache, Connect, Delivery, Endpoint, Error, Options, Pool, PoolTransaction, Tls,
-    TlsOptions, Tokio, Turn, traced,
+    Address, Cache, Connect, Copier, Delivery, Endpoint, Error, Options, Pool, PoolTransaction,
+    Tls, TlsOptions, Tokio, Turn, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -996,15 +996,14 @@ impl Drop for NativeTransaction {
     }
 }
 
-/// The `out` of a lookup of the cache: a `bytes` of `len` bytes that `fill`
-/// fills and checks, or `None` when the check fails.
-fn bytes<'py>(
-    py: Python<'py>,
-    len: usize,
-    fill: &mut dyn FnMut(&mut [u8]) -> bool,
-) -> Option<Bound<'py, PyBytes>> {
-    PyBytes::new_with(py, len, |buf| {
-        if fill(buf) {
+/// The `out` of a lookup of the cache: a `bytes` of `len` bytes that
+/// `copy` writes and checks, or `None` when the check fails. The writer
+/// does not fill the bytes with zeros first, so the data takes one pass.
+fn bytes<'py>(py: Python<'py>, len: usize, copy: &mut Copier<'_>) -> Option<Bound<'py, PyBytes>> {
+    PyBytes::new_with_writer(py, len, |writer| {
+        let mut written = true;
+        let good = copy(&mut |block| written &= writer.write_all(block).is_ok());
+        if good && written {
             Ok(())
         } else {
             Err(PyValueError::new_err("the entry changed during the copy"))
