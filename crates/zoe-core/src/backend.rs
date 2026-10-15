@@ -115,6 +115,18 @@ pub trait Backend: Send + Sync {
         oids.map(|oid| self.load_before(oid, Tid::MAX)).collect()
     }
 
+    /// Return the serial of the current version of each oid of `oids`, in
+    /// the order of `oids`: the tid of its newest record, or `None` for an
+    /// oid without a record. A backend can read them all in one snapshot,
+    /// from the keys of the records alone, so the call decodes no record.
+    fn current_serials(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
+        let records = self.load_current(oids)?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.map(|record| record.tid))
+            .collect())
+    }
+
     /// Return the pickle that `tid` wrote for `oid`.
     fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>>;
 

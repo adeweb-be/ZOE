@@ -798,7 +798,7 @@ mod tests {
         index: AtomicBool,
         /// The commit of a write transaction writes, then fails.
         landed: AtomicBool,
-        /// `load_current` gives one record fewer than it got oids.
+        /// `current_serials` gives one serial fewer than it got oids.
         short: AtomicBool,
     }
 
@@ -866,14 +866,14 @@ mod tests {
             self.inner.load_before(oid, tid)
         }
 
-        fn load_current(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Record>>> {
-            let mut records: Vec<_> = oids
-                .map(|oid| self.load_before(oid, Tid::MAX))
+        fn current_serials(&self, oids: &mut dyn Iterator<Item = Oid>) -> Result<Vec<Option<Tid>>> {
+            let mut serials: Vec<_> = oids
+                .map(|oid| Ok(self.load_before(oid, Tid::MAX)?.map(|record| record.tid)))
                 .collect::<Result<_>>()?;
             if self.faults.short.load(Ordering::Relaxed) {
-                records.pop();
+                serials.pop();
             }
-            Ok(records)
+            Ok(serials)
         }
 
         fn load_serial(&self, oid: Oid, tid: Tid) -> Result<Option<Bytes>> {
@@ -1035,7 +1035,7 @@ mod tests {
         assert!(matches!(error, ZoeError::Backend(_)), "{error}");
         assert_eq!(
             error.to_string(),
-            "backend error: the backend gave 1 current records for 2 oids"
+            "backend error: the backend gave 1 current serials for 2 oids"
         );
         assert!(store.locks.is_empty());
     }

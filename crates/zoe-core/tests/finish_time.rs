@@ -19,8 +19,10 @@
 //! finish.
 //!
 //! `ZOE_FINISH_TXNS` sets the number of transactions of each scenario,
-//! 500 by default. `ZOE_FINISH_DIR` sets the directory of the store, the
-//! temporary directory of cargo by default.
+//! 500 by default. `ZOE_FINISH_SIZE` sets the size of a record in bytes,
+//! 1024 by default; 102400 gives the 100 KB records of zodbshootout.
+//! `ZOE_FINISH_DIR` sets the directory of the store, the temporary
+//! directory of cargo by default.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -36,8 +38,16 @@ use zoe_core::{Compression, Oid, Options, Store, SystemClock, Tid};
 /// The records of a transaction.
 const RECORDS: usize = 100;
 
-/// The size of a record.
-const SIZE: usize = 1024;
+/// The size of a record without `ZOE_FINISH_SIZE`.
+const DEFAULT_SIZE: usize = 1024;
+
+/// Return the size of a record: `ZOE_FINISH_SIZE`, or the default.
+fn size() -> usize {
+    std::env::var("ZOE_FINISH_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SIZE)
+}
 
 /// The transactions that run before each scenario and are not measured.
 const WARMUP: usize = 20;
@@ -275,29 +285,32 @@ impl tracing::Subscriber for FsyncSpans {
     }
 }
 
-/// The record of `oid` in its `version`: 1 KB, the size of a record of
-/// zodbshootout. The first half is text that zstd compresses well, the
-/// second half is pseudo-random bytes that it does not.
+/// The record of `oid` in its `version`, of `size()` bytes: 1 KB by
+/// default, the size of a record of zodbshootout. The first half is text
+/// that zstd compresses well, the second half is pseudo-random bytes that
+/// it does not.
 fn record(oid: Oid, version: u64) -> Vec<u8> {
-    let mut data = Vec::with_capacity(SIZE);
+    let size = size();
+    let mut data = Vec::with_capacity(size);
     data.extend_from_slice(b"\x80\x03czodbshootout.speedtest\nPObject\nq\x00.\x80\x03}q\x01(");
-    while data.len() < SIZE / 2 {
+    while data.len() < size / 2 {
         data.extend_from_slice(b"X\x04\x00\x00\x00attrq\x02K\x01X\x04\x00\x00\x00dataq\x03");
     }
     let mut state = oid.0 ^ (version << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    while data.len() < SIZE {
+    while data.len() < size {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         data.extend_from_slice(&state.to_le_bytes());
     }
-    data.truncate(SIZE);
+    data.truncate(size);
     data
 }
 
 /// The numbers of one scenario, one entry for each transaction.
 #[derive(Default)]
 struct Samples {
+    vote: Vec<Duration>,
     finish: Vec<Duration>,
     fsync: Vec<Duration>,
     sync: Vec<Duration>,
@@ -328,6 +341,7 @@ impl Samples {
             self.writes / txns,
             self.written / txns
         );
+        println!("  vote              {}", summary(&self.vote));
         println!("  finish            {}", summary(&self.finish));
         println!("  span fsync        {}", summary(&self.fsync));
         println!("  sync of the file  {}", summary(&self.sync));
@@ -340,24 +354,30 @@ impl Samples {
 }
 
 /// Commit one transaction that writes `oids` in `version`. Return the
-/// time of `finish` and the oids with their new serial. `io` counts only
-/// the syncs and the writes of `finish`.
+/// time of `vote`, the time of `finish` and the oids with their new
+/// serial. `io` counts only the syncs and the writes of `finish`.
 fn commit(
     store: &Store,
     io: &Io,
     oids: &[(Oid, Tid)],
     version: u64,
-) -> (Duration, Vec<(Oid, Tid)>) {
+) -> (Duration, Duration, Vec<(Oid, Tid)>) {
     let mut txn = store.tpc_begin(b"user", b"finish time", b"").unwrap();
     for &(oid, serial) in oids {
         txn.store(oid, serial, &record(oid, version)).unwrap();
     }
+    let start = Instant::now();
     txn.vote().unwrap();
+    let vote = start.elapsed();
     io.take();
     let start = Instant::now();
     let tid = txn.finish().unwrap();
     let elapsed = start.elapsed();
-    (elapsed, oids.iter().map(|&(oid, _)| (oid, tid)).collect())
+    (
+        vote,
+        elapsed,
+        oids.iter().map(|&(oid, _)| (oid, tid)).collect(),
+    )
 }
 
 /// Run `txns` transactions of `scenario` in a new store in `dir` with
@@ -389,21 +409,23 @@ fn run(dir: &Path, compression: Compression, scenario: &str, txns: usize) -> Sam
     tracing::dispatcher::with_default(&dispatch, || {
         let mut written = Vec::new();
         for _ in 0..WARMUP {
-            let (_, oids) = commit(&store, &io, &new_oids(&store), 0);
+            let (_, _, oids) = commit(&store, &io, &new_oids(&store), 0);
             written.push(oids);
         }
         spans.take();
         for i in 0..txns {
-            let finish = if scenario == "add" {
-                commit(&store, &io, &new_oids(&store), 0).0
+            let (vote, finish) = if scenario == "add" {
+                let (vote, finish, _) = commit(&store, &io, &new_oids(&store), 0);
+                (vote, finish)
             } else {
                 let slot = i % written.len();
-                let (finish, oids) = commit(&store, &io, &written[slot], i as u64 + 1);
+                let (vote, finish, oids) = commit(&store, &io, &written[slot], i as u64 + 1);
                 written[slot] = oids;
-                finish
+                (vote, finish)
             };
             let taken = io.take();
             assert!(taken.syncs >= 1, "the finish syncs the database file");
+            samples.vote.push(vote);
             samples.finish.push(finish);
             samples.fsync.push(spans.take());
             samples.sync.push(taken.sync);
@@ -437,7 +459,7 @@ fn finish_time_at_concurrency_1_with_1_kb_records() {
     ] {
         for scenario in ["add", "update"] {
             let samples = run(&dir, compression, scenario, txns);
-            samples.print(&format!("{scenario}, compression {name}"));
+            samples.print(&format!("{scenario}, {} bytes, compression {name}", size()));
         }
     }
 }
