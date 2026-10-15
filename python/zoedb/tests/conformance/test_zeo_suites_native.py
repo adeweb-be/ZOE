@@ -161,6 +161,18 @@ OUT = {
     ),
 }
 
+# The tests that the run against a stock ZEO server does not run, and why.
+# The run against zoe serve runs them.
+OUT_ZEO = {
+    "MultiprocessingTests.test_work_with_multiprocessing": (
+        "on 3.14 the start method of multiprocessing is forkserver; the run "
+        "against zoe serve starts the fork server in this test, while "
+        "tempfile.tempdir is a test directory that the test removes, so the "
+        "second run finds no socket of the fork server; the run against "
+        "zoe serve runs the test"
+    ),
+}
+
 # The classes of ZEO's tests that the cards of phase 3 name. The tests of
 # FullGenericTests run in its subclasses.
 NAMED_CLASSES = {
@@ -320,4 +332,4 @@ def test_the_suites_of_zeo_pass_with_the_native_client_against_zeo(monkeypatch):
     # runzeo speaks M5 when ZEO_MSGPACK is set and its configuration does
     # not set msgpack.
     monkeypatch.setenv("ZEO_MSGPACK", "1")
-    run_all((zoe.testing.NATIVE_LAYER,), OUT, 424)
+    run_all((zoe.testing.NATIVE_LAYER,), {**OUT, **OUT_ZEO}, 423)
