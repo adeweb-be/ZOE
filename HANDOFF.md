@@ -6,7 +6,7 @@
 | Base | `main` at `c0db22b` (ZOE-192), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
 | Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main` and the port of the harness to macOS (section 4.4). |
 | Card | None: the work came as a direct request. When a card exists, move this file to `docs/handoffs/<card>.md`, as `CLAUDE.md` asks, and name the card in the commits of the follow-up. |
-| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios done on `zeo` and `zoe-native`, on Linux. On macOS: the builds, the fixture and three smoke runs of `edit` pass; no campaign yet. Nothing runs now. |
+| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so step 1 of section 5 is done there. The source of the 5–13× disk bytes is measured (section 4.6). Nothing runs now. |
 | Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the interim results); then this file. |
 
 ---
@@ -114,7 +114,7 @@ The runner writes `zope.conf` and `wsgi.ini` of every instance from one template
 | `contention-folder` | edit form, own Document each, all in `bench/shared` | UI |
 | `contention-fields` | REST PATCH; users 2k and 2k+1 share `bench/shared/doc-k`, one writes title, the other description | REST |
 | `contention-same` | REST PATCH title of `bench/hot/doc-(k mod 4)` | REST |
-| `warmup` | browse_anon 2, browse_member 1, search 1, warm 1 (GET edit and add forms, no save) | UI |
+| `warmup` | browse_anon 2, browse_member 1, search 1, warm 1 (GET the edit form and cancel it, GET the add form; no save) | UI |
 
 Roles go to users by a smooth weighted round robin over the largest step (`assign_roles`), so any prefix follows the weights. Editors own disjoint Documents (`Targets.own_docs`), so only the contention scenarios collide on purpose. Each user stays on one instance (sticky, like a load balancer with sessions). Think time 0 by default: a closed workload at maximum pressure.
 
@@ -123,7 +123,7 @@ Roles go to users by a smooth weighted round robin over the largest step (`assig
 1. Check the fixture and the prerequisites (interpreters of the scenarios, the `zoe` binary in `target/release`).
 2. Copy the store of the stack from the fixture (`cp -a --reflink=auto`) into `target/bench/plone/runs/<UTC>-<scenario>-<stack>-r<n>/store`.
 3. Start the server (pinned), then the instances (pinned), and wait until each serves `/Plone`.
-4. Warm up: the `warmup` scenario, 8 users, `--warmup` seconds (no write), its own ledger.
+4. Warm up: the `warmup` scenario, 8 users, `--warmup` seconds, its own ledger. It saves no content; the edit form writes a lock and its cancel removes it.
 5. Read `server_status` (and `/metrics` for zoe), run Locust with the steps, read them again.
 6. Stop the instances (SIGTERM). Run `inzope/observe.py` in a client process of its own through the still-running server: read-only, never commits. Judge the ledger against it.
 7. Stop the server. Analyse. Write `result.json`. Remove the store copy (unless `--keep-store`; kept when the run failed).
@@ -193,6 +193,15 @@ What the data says, measured:
 7. **Wasted resolution:** zoe-native clients resolved 800–1,750 bucket conflicts per step in `edit`/`create-*`; the ZEO server resolved 2,588 in the `edit` run and failed on 160. A vote that meets one unresolvable object fails whole after resolving the others, and the publisher redoes the request.
 8. **Disk writes per operation:** the `zoe serve` process wrote 5–13× more bytes per write operation than the ZEO server at 1 user (edit 4.3 MB vs 0.33 MB; create 5.2 MB vs 0.64–0.67 MB; workflow 1.1 MB vs 0.04 MB), 2–6× at 4 and 16 users. The mean `zoe_fsync_batch_size` is 1.0 in every run: no batching at these commit rates. Latency did not suffer on this VM.
 
+### 3.1 The macOS series
+
+Runs: the lists `target/bench/plone/campaigns/macos-baseline-final.txt` (14 runs) and `macos-zeo-plain-final.txt` (4 runs of ZEO with `--zeo-fsync plain`), not in git. Same steps, warmup and trim as section 3. Commit `c50c71d`; the three `edit` runs ran again with the warmup fix (section 4.5) before it was committed. The report is `docs/findings/plone-end-to-end/macos-report.md`, and the finding (items 9–14) says what it shows. In short:
+
+- Reads at parity, within 2 %. Pages cost 36–47 ms of Zope CPU here, against 90–110 ms on the Linux VM.
+- Writes: ZOE equal or up to 15 % ahead in rate; with one repetition, not significant. `edit` at 16 users fails 1.4 % on ZEO and 0 % on ZOE once the warmup fix is in.
+- `UniqueIdGeneratorTool` conflicts on ZEO only; read conflicts on ZOE in the creation scenarios (42 and 115).
+- Full durability (`F_FULLFSYNC`) costs ZEO about 4 ms per `tpc_finish`, and at most 3 % of rate and p50. The table is in `target/bench/plone/reports/fsync-table.md`.
+
 ## 4. Things learned the hard way
 
 ### 4.1 The hex token bias (fixed in `2ef5560`, data not yet redone)
@@ -243,13 +252,34 @@ The human made macOS a target, and the harness now runs on an Apple M3 Pro (6 pe
 - **The rest.** `environment` reads `sysctl` and psutil instead of `/proc` and `/sys`. Store copies use `/bin/cp -c` (APFS clones): the devenv shell puts GNU `cp` first on PATH, and GNU `cp` has no `-c`. Buildout puts the eggs in `target/plone/eggs/cp313/` here, so `stack.egg_paths()` looks one level down too.
 - **Environment.** `devenv shell` works; `just plone zeo|zoeclient|zeoclient build` and `cargo build --release` passed without change. `just bench plone prepare` built the same fixture as on Linux (`small-ba01ff255313`, 685 objects, equivalent) in 49 s.
 
-Smoke runs (`edit`, 4 users × 20 s, warmup 10 s; not in any finding): `20261015T223110Z-edit-zeo-r0` (full fsync), `20261015T223220Z-edit-zoe-native-r0`, `20261015T223322Z-edit-zeo-r0` (plain fsync). All pass the verification. `zoe serve` wrote 333 MB in the 14 s window and the ZEO server 52 MB: the gap of finding 8 shows on macOS too.
+Three smoke runs of `edit` (4 users × 20 s) passed the verification before the campaign. Their directories are deleted.
 
 **Open question: the Python of the instances.** The instances run CPython 3.13 with the GIL, because the Plone build of the repository pins 3.13 (`justfile`, recipe `plone`; `plone/README.md`: "the newest version that Plone 6.1 supports"). So the benchmark cannot show what free-threaded 3.14t would give Plone. Moving the instances to 3.14 or 3.14t changes `plone/` and the `justfile` for the whole repository, and needs a Plone that supports it. The human decides.
 
+### 4.5 The warmup left edit locks (fixed)
+
+In the first macOS series, `edit` at 16 users had 25 % of its operations `rejected` on both stacks: `GET @@edit` gave 200 without the save form. The rejections came only from `editor-004`, `-008` and `-012`, the other editors of `section-00`, and all 27 rejected Documents were Documents that the warmup had opened. The `warm` role of the warmup runs as `editor-000` and owns every Document of `section-00`. Plone locks an item when its edit form opens, and only a save, a cancel or the timeout of the lock releases it. So the measured editors met items locked by `editor-000`. `role_warm` now posts the cancel button of each edit form that it opens and checks "Edit cancelled". A rerun gave no rejected operation. The Linux `edit` runs of section 3 have the same artifact in their failure share.
+
+### 4.6 Why `zoe serve` writes more bytes (measured)
+
+A throwaway program replays commits on a copy of the fixture store through a `Vfs` that counts the writes to `zoe.redb`. It rewrites k existing objects with their own pickles, 100 commits per case. Its source is in `target/bench/plone/wamp/` (not in git: a crate outside the workspace that depends on `zoe-core` by path; build it with `cargo build --release` in that directory). Its output is `target/bench/plone/reports/wamp-result.md`:
+
+| k objects | placement | pickle KB/commit | redb KB/commit | redb ÷ pickles | OS disk KB/commit | page writes/commit |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | – | 0.4 | 53 | 122 | 196 | 14 |
+| 10 | random | 4.3 | 137 | 32 | 522 | 35 |
+| 10 | adjacent | 4.4 | 63 | 14 | 236 | 17 |
+| 80 | random | 39 | 632 | 16 | 2,309 | 158 |
+| 80 | adjacent | 38 | 149 | 4 | 487 | 38 |
+
+- redb writes whole 4 KiB pages copy-on-write: each changed leaf and its branch pages, the system tables (allocated and freed pages) and the header. About 53 KB per commit is fixed, and each object at a separate place adds about 7 KB. Nearly every write is one 4 KiB page.
+- macOS counts a scattered 4 KiB write as 16 KiB of disk write, with `F_FULLFSYNC` or `fsync`. A plain file test, without redb, gives the same 4×; contiguous writes count 1×. So 632 KB of redb pages show as 2.3 MB: the 2.7–3.4 MB per `edit` operation of the server.
+- The key of a record is the oid, then the tid (`format::record_key`). So the objects of one commit lie at the places of their oids, and a Plone save touches about 80 objects spread over the catalog.
+- Anything that changes this (a key order, a log in front of the B-tree) is a format change: `crates/zoe-core/src/format/` is a red zone. This is a finding, not a card.
+
 ## 5. Next steps, in order
 
-The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, first rerun the primary scenarios (`browse`, `catalog`, `workflow`, and step 1 below) as the new baseline. Then rerun the step-1 command with `--zeo-fsync plain`, to show the cost of full durability on ZEO.
+The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, step 1 is done (section 3.1). Steps 2–6 and 8 have not run on either machine. Run them on macOS with `--zeo-fsync full` (the default), so they join the macOS series.
 
 1. **Rerun the write scenarios with the word codes** (≈ 35 min, 8 runs):
    ```sh
@@ -269,7 +299,7 @@ The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choi
 6. **Sustained writes** (≈ 25 min): `--scenarios create-spread --steps 8:600 --warmup 30`, then `--timeline 60`: watch latency drift, server RSS, bytes written, fsync batch, store growth.
 7. **Investigations** (each a short experiment):
    - classify the `_wordinfo` conflicts (same key, split, deletion) on a kept store;
-   - why `zoe serve` writes 5–13× more bytes per commit (redb copy-on-write pages? sync of the free list?) and never batches fsyncs at 1–16 users: the sustained run with `/proc/diskstats` flushes, then the core commit path (read `crates/zoe-core/CLAUDE.md`; `src/format/` is a red zone);
+   - the bytes per commit are explained on macOS (section 4.6). Left: replay the oids of real Plone commits (from a kept store's `txn_oids`) instead of random ones; measure the factor of the Linux file system; see why fsync batches stay at 1.0 at 16 users (the sustained run);
    - the `ReadConflictError`s that only zoe-native shows (about 10–25 per step in writes): BTrees `readCurrent` under per-oid locks;
    - resolution order: count resolutions spent in failed votes; try unresolvable classes first.
 8. **A medium fixture** (`just bench plone prepare --preset medium`: ≈ 4,900 objects, a build of perhaps 15–20 min), then `browse`, `catalog`, `edit` and the cold start on it: the storage weighs more when the site exceeds the caches.

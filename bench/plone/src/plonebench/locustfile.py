@@ -607,8 +607,24 @@ class PloneUser(HttpUser):
 
         def forms_only(attempt: Attempt) -> OpResult:
             first = attempt.request("GET", f"{doc['path']}/@@edit", "GET edit form")
+            # The edit form locks the item, and only a save or a cancel
+            # releases the lock. A lock that stays makes the edit form of
+            # another editor show the locked item. So cancel, as a browser
+            # user does.
+            form = forms.parse(first.text).form_with("form.buttons.cancel")
+            cancelled = form is not None
+            if cancelled:
+                cancel = attempt.request(
+                    "POST",
+                    form.action,
+                    "POST edit form cancel",
+                    data=form.fields(**{"form.buttons.cancel": "Cancel"}),
+                )
+                cancelled = cancel.status_code == 200 and any(
+                    "Edit cancelled" in m for m in forms.status_messages(cancel.text)
+                )
             second = attempt.request("GET", f"{folder}/++add++Document", "GET add form")
-            ok = first.status_code == 200 and second.status_code == 200
+            ok = first.status_code == 200 and cancelled and second.status_code == 200
             return self.judge(second, ok, target=doc["path"])
 
         self.operation("warm-forms", forms_only)

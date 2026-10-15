@@ -130,8 +130,8 @@ SCENARIOS = {
     "warmup": Scenario(
         "warmup",
         {"browse_anon": 2, "browse_member": 1, "search": 1, "warm": 1},
-        description="the warmup: pages, searches, and the edit and add forms "
-        "without a save",
+        description="the warmup: pages, searches, the edit form and its cancel, "
+        "and the add form, without a save",
         writes=False,
     ),
 }
