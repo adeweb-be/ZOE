@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zoe_core::Tid;
 
-use super::outbox::{Frame, Outbox, Pushed, Room};
+use super::outbox::{Frame, Outbox, Parts, Pushed, Room};
 
 /// The id of a connection in the hub.
 pub(crate) type ClientId = u64;
@@ -181,9 +181,9 @@ impl Invalidations {
         self.lock().clients.remove(&id);
     }
 
-    /// Put `frame` at the next place with `room` when the hub published no
-    /// commit after `seen`, or leave the place empty when `frame` is
-    /// `None`. Return false when the connection is closed. When the hub
+    /// Put the frame of the parts `frame` at the next place with `room`
+    /// when the hub published no commit after `seen`, or leave the place
+    /// empty when `frame` is `None`. Return false when the connection is closed. When the hub
     /// published a commit after `seen`, give the room back.
     ///
     /// A reader reads the last published tid, then the store, then makes
@@ -194,11 +194,11 @@ impl Invalidations {
         &self,
         seen: Tid,
         room: Room,
-        frame: Option<Vec<u8>>,
+        frame: Option<Parts>,
     ) -> Result<bool, Room> {
         let state = self.lock();
         if state.published == seen {
-            Ok(room.put(frame))
+            Ok(room.put_parts(frame))
         } else {
             Err(room)
         }
@@ -213,11 +213,11 @@ impl Invalidations {
     pub(crate) fn read_put<T>(
         &self,
         room: Room,
-        read: impl FnOnce(Tid) -> (T, Option<Vec<u8>>),
+        read: impl FnOnce(Tid) -> (T, Option<Parts>),
     ) -> (T, bool) {
         let state = self.lock();
         let (value, frame) = read(state.published);
-        (value, room.put(frame))
+        (value, room.put_parts(frame))
     }
 
     /// Return the publication of `commit`. Dropping the publication
@@ -525,7 +525,8 @@ mod tests {
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
         let seen = hub.published();
-        let load = Some(b"load".to_vec());
+        // A reply in two parts goes out as one frame.
+        let load = Some(vec![b"lo".to_vec(), b"ad".to_vec()]);
         let put = hub.put_since(seen, reader.outbox.blocking_room(), load.clone());
         assert!(put.unwrap());
         // A commit after the reply goes out after it.
@@ -548,7 +549,7 @@ mod tests {
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
         let (seen, put) = hub.read_put(reader.outbox.blocking_room(), |published| {
-            (published, Some(b"load".to_vec()))
+            (published, Some(vec![b"load".to_vec()]))
         });
         assert_eq!(seen, Tid(4));
         assert!(put);
