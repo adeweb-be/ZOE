@@ -20,7 +20,7 @@ mod protocol;
 pub mod runtime;
 mod tls;
 
-pub use cache::{Cache, CacheCounts};
+pub use cache::{Cache, CacheCounts, Copier};
 pub use client::{
     BLOB_CHUNK, Client, HEARTBEAT, HistoryEntry, Invalidation, Invalidations, Options, Record,
     Transaction, traced,
