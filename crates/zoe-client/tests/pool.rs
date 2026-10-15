@@ -559,8 +559,7 @@ async fn blobs_download_through_any_connection_of_the_pool() {
     txn.vote().await.unwrap();
     let tid = txn.finish().await.unwrap().turn().await.unwrap().tid();
 
-    // Each load takes the next connection: the listener and the connection
-    // of the commit both carry a download.
+    // The downloads take the connection of the commit, not the listener.
     for _ in 0..4 {
         let mut sink = Vec::new();
         let size = pool.send_blob(oid, tid, &mut sink).await.unwrap();
