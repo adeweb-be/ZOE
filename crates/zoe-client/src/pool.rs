@@ -30,8 +30,16 @@
 //! `Delivery::Stale`. Then each finish that had its reply gets its turn,
 //! in tid order, with `Turn::stale` true. A finish that had no reply fails
 //! with `Error::Disconnected`, and so does each later `begin` and finish.
+//!
+//! A pool can hold a client cache (ADR 0034). The dispatcher applies each
+//! tid to the cache before the consumer or the finish gets it: a tid of
+//! another client ends the current entry of each of its oids, and a tid of
+//! the pool also adds the data of its commit. A load stores its reply with
+//! the position of the connection that carried it. A lost or lagged
+//! listener, and the close, drop every entry, and the cache stores nothing
+//! more.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
@@ -39,7 +47,9 @@ use tokio::sync::watch;
 use zoe_core::{Oid, Tid};
 
 use crate::Error;
+use crate::cache::Cache;
 use crate::client::{Client, HistoryEntry, Invalidation, Invalidations, Record, Transaction};
+use crate::protocol::MAX_TID;
 use crate::runtime::{BoxFuture, Runtime};
 
 /// A function that opens one more connection of the pool to the server of
@@ -77,6 +87,8 @@ struct Shared {
     listener: Arc<Client>,
     connect: Connect,
     bound: usize,
+    /// The client cache, if the pool has one.
+    cache: Option<Arc<Cache>>,
     /// The connections that commit and are open. A load picks one of them
     /// or the listener. The lock is held only to pick or to change one.
     conns: RwLock<Vec<Arc<Client>>>,
@@ -201,6 +213,19 @@ impl Pool {
         connect: Connect,
         bound: usize,
     ) -> Pool {
+        Pool::with_cache(runtime, listener, connect, bound, None)
+    }
+
+    /// Start a pool as `new` does, with the client cache `cache`. The
+    /// cache must be empty: its `applied` moves to the last tid of the
+    /// listener.
+    pub fn with_cache(
+        runtime: Arc<dyn Runtime>,
+        listener: Client,
+        connect: Connect,
+        bound: usize,
+        cache: Option<Cache>,
+    ) -> Pool {
         // Subscribe first, then read the last tid: the reader raises the
         // last tid before it sends an invalidation.
         let invalidations = listener.invalidations();
@@ -208,10 +233,15 @@ impl Pool {
             last: listener.last_transaction().0,
             ..State::default()
         };
+        // An empty cache is true at any tid.
+        if let Some(cache) = &cache {
+            cache.apply(Tid(state.last), &[]);
+        }
         let shared = Arc::new(Shared {
             listener: Arc::new(listener),
             connect,
             bound: bound.max(1),
+            cache: cache.map(Arc::new),
             conns: RwLock::new(Vec::new()),
             next_load: AtomicUsize::new(0),
             state: Mutex::new(state),
@@ -230,6 +260,12 @@ impl Pool {
     /// Return the most connections that commit at once.
     pub fn bound(&self) -> usize {
         self.shared.bound
+    }
+
+    /// Return the client cache of the pool, if it has one. A hit there
+    /// sends nothing to the server.
+    pub fn cache(&self) -> Option<&Arc<Cache>> {
+        self.shared.cache.as_ref()
     }
 
     /// Return the counts of the hold.
@@ -265,16 +301,35 @@ impl Pool {
         self.shared.listener.new_oids(n).await
     }
 
-    /// Load the record of `oid` that was current just before `tid`, through
-    /// any connection of the pool. Return the position of that connection
-    /// with the record (see `Client::load_before_at`).
+    /// Load the record of `oid` that was current just before `tid` from
+    /// the server, through any connection of the pool. Return the position
+    /// of that connection with the record (see `Client::load_before_at`).
+    /// It does not read the cache. It stores the record in the cache, if
+    /// the pool has one: a current record only when `applied` of the cache
+    /// is not above that position.
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
-        self.shared.any_connection().load_before_at(oid, tid).await
+        let (record, position) = self
+            .shared
+            .any_connection()
+            .load_before_at(oid, tid)
+            .await?;
+        if let (Some(cache), Some(record)) = (&self.shared.cache, &record) {
+            cache.store(oid, record.tid, record.end, &record.data, position);
+        }
+        Ok((record, position))
     }
 
-    /// Load the current record of `oid`, through any connection.
+    /// Load the current record of `oid` from the server, through any
+    /// connection, and store it in the cache as `load_before` does. An oid
+    /// without a record fails with the `POSKeyError` of the server.
     pub async fn load(&self, oid: Oid) -> Result<(Vec<u8>, Tid), Error> {
-        self.shared.any_connection().load(oid).await
+        match self.load_before(oid, MAX_TID).await? {
+            (Some(record), _) => Ok((record.data, record.tid)),
+            (None, _) => Err(Error::Server {
+                class: "ZODB.POSException.POSKeyError".into(),
+                message: format!("{oid:?}"),
+            }),
+        }
     }
 
     /// Load the record of `oid` that the transaction `serial` wrote,
@@ -313,6 +368,7 @@ impl Pool {
         Ok(PoolTransaction {
             txn: Some(txn),
             lease,
+            writes: Vec::new(),
         })
     }
 
@@ -406,6 +462,9 @@ impl Pool {
             state.closed = true;
             std::mem::take(&mut state.free)
         };
+        if let Some(cache) = &self.shared.cache {
+            cache.disable();
+        }
         self.shared.bump();
         self.shared.listener.disconnect();
         let conns = self
@@ -500,6 +559,10 @@ pub struct PoolTransaction {
     // another transaction takes the connection.
     txn: Option<Transaction>,
     lease: Lease,
+    /// The stores of the transaction, for the cache of the pool, in order.
+    /// The data is `None` when the cache cannot hold it, or when the server
+    /// resolved the oid. Empty when the pool has no cache.
+    writes: Vec<(Oid, Option<Vec<u8>>)>,
 }
 
 impl PoolTransaction {
@@ -507,9 +570,19 @@ impl PoolTransaction {
         self.txn.as_mut().expect("an open transaction")
     }
 
+    /// Keep the store of `data` for `oid`, for the cache of the pool.
+    fn keep(&mut self, oid: Oid, data: &[u8]) {
+        if let Some(cache) = &self.lease.shared.cache {
+            let data = cache.fits(data.len()).then(|| data.to_vec());
+            self.writes.push((oid, data));
+        }
+    }
+
     /// Store `data` for `oid`, as `Transaction::store` does.
     pub async fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<(), Error> {
-        self.txn().store(oid, serial, data).await
+        self.txn().store(oid, serial, data).await?;
+        self.keep(oid, data);
+        Ok(())
     }
 
     /// Check `serial` of `oid` at the vote, as
@@ -527,17 +600,40 @@ impl PoolTransaction {
         data: &[u8],
         blob: &[u8],
     ) -> Result<(), Error> {
-        self.txn().store_blob(oid, serial, data, blob).await
+        self.txn().store_blob(oid, serial, data, blob).await?;
+        self.keep(oid, data);
+        Ok(())
     }
 
-    /// Vote, as `Transaction::vote_resolved` does.
+    /// Vote, as `Transaction::vote_resolved` does. The cache of the pool
+    /// will not hold the pickles of the oids that the server resolved. A
+    /// conflict drops the current entry of its oid from the cache, as
+    /// `tpc_vote` of `ZEO.ClientStorage` does.
     pub async fn vote_resolved(&mut self) -> Result<Vec<Oid>, Error> {
-        self.txn().vote_resolved().await
+        let voted = self.txn().vote_resolved().await;
+        if let Some(cache) = &self.lease.shared.cache {
+            match &voted {
+                Ok(resolved) => {
+                    let resolved: HashSet<Oid> = resolved.iter().copied().collect();
+                    for (oid, data) in &mut self.writes {
+                        if resolved.contains(oid) {
+                            *data = None;
+                        }
+                    }
+                }
+                Err(Error::Conflict { oid, .. } | Error::ReadConflict { oid, .. }) => {
+                    cache.drop_current(*oid);
+                }
+                Err(_) => {}
+            }
+        }
+        voted
     }
 
-    /// Vote, as `Transaction::vote` does.
+    /// Vote, as `Transaction::vote` does, with the cache rules of
+    /// `vote_resolved`.
     pub async fn vote(&mut self) -> Result<(), Error> {
-        self.txn().vote().await
+        self.vote_resolved().await.map(drop)
     }
 
     /// Finish the transaction after its vote, and wait for the reply of the
@@ -567,6 +663,7 @@ impl PoolTransaction {
             armed: true,
         };
         let txn = self.txn.take().expect("an open transaction");
+        let writes = std::mem::take(&mut self.writes);
         let tid = txn.finish().await?;
         {
             let mut state = shared.lock();
@@ -588,6 +685,7 @@ impl PoolTransaction {
             shared,
             tid,
             armed: true,
+            writes,
         })
     }
 
@@ -639,6 +737,8 @@ pub struct Finished {
     tid: Tid,
     /// `true` until `turn` took the turn.
     armed: bool,
+    /// The stores of the commit, for the cache of the pool.
+    writes: Vec<(Oid, Option<Vec<u8>>)>,
 }
 
 impl Finished {
@@ -651,6 +751,10 @@ impl Finished {
     /// The caller runs the callback of its finish, then drops the `Turn`.
     /// After a lost listener, the turn comes after `Delivery::Stale`. After
     /// the close, it fails with `Error::Disconnected`.
+    ///
+    /// At the turn, before it returns, the commit goes into the cache of the
+    /// pool: it ends the current entry of each oid that it wrote, and adds
+    /// the data of each store that the server did not resolve.
     pub async fn turn(mut self) -> Result<Turn, Error> {
         let tid = self.tid;
         let stale = self
@@ -667,6 +771,11 @@ impl Finished {
             })
             .await?;
         self.armed = false;
+        if let Some(cache) = &self.shared.cache
+            && !stale
+        {
+            cache.commit(tid, &last_writes(&self.writes));
+        }
         Ok(Turn {
             shared: self.shared.clone(),
             tid,
@@ -741,6 +850,20 @@ impl std::fmt::Debug for Turn {
     }
 }
 
+/// Return the last write of each oid of `writes`, in the order of these
+/// last writes.
+fn last_writes(writes: &[(Oid, Option<Vec<u8>>)]) -> Vec<(Oid, Option<&[u8]>)> {
+    let mut seen = HashSet::new();
+    let mut last: Vec<_> = writes
+        .iter()
+        .rev()
+        .filter(|(oid, _)| seen.insert(*oid))
+        .map(|(oid, data)| (*oid, data.as_deref()))
+        .collect();
+    last.reverse();
+    last
+}
+
 /// How the dispatcher delivers one tid.
 enum Route {
     /// A commit of another client.
@@ -812,7 +935,6 @@ async fn deliver(shared: &Shared, invalidation: Invalidation) -> Step {
         }
         // A finish counted after the tid came commits a later tid.
         if state.in_flight.range(..horizon).next().is_none() {
-            state.offer = Some((Delivery::Invalidate(invalidation.clone()), false));
             state.started += 1;
             return Some(Some(Route::Foreign));
         }
@@ -836,20 +958,28 @@ async fn deliver(shared: &Shared, invalidation: Invalidation) -> Step {
     };
     shared.bump();
     let delivered = match route {
-        Route::Foreign => wait_for_consumer(shared).await,
+        Route::Foreign => offer(shared, invalidation).await,
         Route::Own => match wait_for_turn(shared, tid).await {
             // The finish dropped before it ran: the consumer gets the tid.
-            Some(true) => {
-                shared.lock().offer = Some((Delivery::Invalidate(invalidation), false));
-                shared.bump();
-                wait_for_consumer(shared).await
-            }
+            Some(true) => offer(shared, invalidation).await,
             Some(false) => true,
             None => false,
         },
     };
     shared.lock().head = None;
     if delivered { Step::Next } else { Step::Closed }
+}
+
+/// Apply the commit of another client to the cache, then offer it to the
+/// consumer, and wait until the consumer confirmed it. Return false after
+/// the close.
+async fn offer(shared: &Shared, invalidation: Invalidation) -> bool {
+    if let Some(cache) = &shared.cache {
+        cache.apply(invalidation.tid, &invalidation.oids);
+    }
+    shared.lock().offer = Some((Delivery::Invalidate(invalidation), false));
+    shared.bump();
+    wait_for_consumer(shared).await
 }
 
 /// Wait until the consumer confirmed the offer. Return false after the
@@ -891,6 +1021,11 @@ async fn wait_for_turn(shared: &Shared, tid: u64) -> Option<bool> {
 /// reply. Give the consumer `Delivery::Stale`, then give each finish that
 /// has its reply its turn, in tid order.
 async fn lose(shared: &Shared) {
+    // The cache no longer gets the commits in order: an empty cache is true
+    // at any tid.
+    if let Some(cache) = &shared.cache {
+        cache.disable();
+    }
     {
         let mut state = shared.lock();
         state.lost = true;

@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zoe_client::{
-    Client, Connect, Delivery, Error, Invalidation, Pool, PoolTransaction, Tokio, Turn,
+    Cache, Client, Connect, Delivery, Error, Invalidation, Pool, PoolTransaction, Tokio, Turn,
 };
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
@@ -52,6 +52,15 @@ async fn open(server: &Server, bound: usize) -> Pool {
     let listener = Client::connect(addr, "1").await.unwrap();
     let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
     Pool::new(Arc::new(Tokio), listener, connect, bound)
+}
+
+/// Open a pool as `open` does, with a client cache of 1 MB.
+async fn open_cached(server: &Server, bound: usize) -> Pool {
+    let addr = server.addr();
+    let listener = Client::connect(addr, "1").await.unwrap();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    let cache = Cache::new(1 << 20).unwrap();
+    Pool::with_cache(Arc::new(Tokio), listener, connect, bound, Some(cache))
 }
 
 /// Commit `data` for `oid` through `client`, as another client.
@@ -256,6 +265,110 @@ async fn a_load_gives_the_position_of_its_connection() {
     let own = commit_other(&client, oid, tid, &record(b"b")).await;
     let (_, position) = client.load_before_at(oid, Tid(u64::MAX)).await.unwrap();
     assert_eq!(position, own);
+}
+
+#[tokio::test]
+async fn the_cache_applies_a_tid_of_another_client_before_its_delivery() {
+    let server = start("cache-foreign");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oid = other.new_oids(1).await.unwrap()[0];
+    let first = commit_other(&other, oid, Tid(0), &record(b"a")).await;
+    assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+    assert_eq!(cache.applied(), first);
+    pool.delivered();
+
+    // A load stores its reply. The next lookup hits.
+    let after = Tid(first.0 + 1);
+    let (loaded, _) = pool.load_before(oid, after).await.unwrap();
+    assert_eq!(loaded.as_ref().unwrap().end, None);
+    assert_eq!(cache.load_before(oid, after), loaded);
+
+    // The consumer gets the next tid after the cache ended the entry.
+    let second = commit_other(&other, oid, first, &record(b"b")).await;
+    assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+    assert_eq!(cache.applied(), second);
+    assert_eq!(cache.load(oid), None);
+    let ended = cache.load_before(oid, second).unwrap();
+    assert_eq!((ended.tid, ended.end), (first, Some(second)));
+    pool.delivered();
+}
+
+#[tokio::test]
+async fn a_commit_of_the_pool_enters_the_cache_at_its_turn() {
+    let server = start("cache-own");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let turn = commit(&pool, oid, Tid(0), &record(b"a")).await.unwrap();
+    // The callback of the finish runs here: the cache already has the data.
+    assert_eq!(cache.applied(), turn.tid());
+    assert_eq!(cache.load(oid), Some((record(b"a"), turn.tid())));
+    assert!(pool.last_transaction() < turn.tid());
+    drop(turn);
+}
+
+#[tokio::test]
+async fn a_conflict_of_a_vote_drops_the_current_entry() {
+    let server = start("cache-conflict");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let tid = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    assert_eq!(cache.load(oid), Some((record(b"a"), tid)));
+    let stale = commit(&pool, oid, Tid(0), &record(b"b")).await;
+    assert!(matches!(stale, Err(Error::Conflict { .. })), "{stale:?}");
+    assert_eq!(cache.load(oid), None);
+}
+
+#[tokio::test]
+async fn the_cache_applies_the_tid_of_a_dropped_finish_before_its_delivery() {
+    let server = start("cache-dropped");
+    let pool = open_cached(&server, 1).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let first = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    assert_eq!(cache.load(oid), Some((record(b"a"), first)));
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oid, first, &record(b"b")).await.unwrap();
+    txn.vote().await.unwrap();
+    let finished = txn.finish().await.unwrap();
+    let tid = finished.tid();
+    drop(finished);
+    // The tid reaches the consumer as a tid of another client. The cache
+    // applied it first: the entry of the oid ends at the tid, and the data
+    // of the dropped finish is not in the cache.
+    assert!(matches!(next(&pool).await, Delivery::Invalidate(_)));
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(oid), None);
+    let ended = cache.load_before(oid, tid).unwrap();
+    assert_eq!((ended.tid, ended.end), (first, Some(tid)));
+    pool.delivered();
+}
+
+#[tokio::test]
+async fn a_lost_listener_empties_the_cache() {
+    let server = start("cache-lost");
+    let pool = open_cached(&server, 2).await;
+    let cache = pool.cache().unwrap().clone();
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let tid = commit(&pool, oid, Tid(0), &record(b"a"))
+        .await
+        .unwrap()
+        .tid();
+    assert!(cache.load(oid).is_some());
+    pool.listener().disconnect();
+    assert_eq!(next(&pool).await, Delivery::Stale);
+    assert_eq!(cache.load(oid), None);
+    assert!(!cache.store(oid, tid, None, &record(b"a"), tid));
+    pool.delivered();
 }
 
 /// A TCP proxy to the server. While `pause` holds `true`, the proxy keeps
