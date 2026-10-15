@@ -501,9 +501,9 @@ plone scenario="zoe" command="start" *args:
 # `run` runs each value of zodbshootout on a fresh store under
 # target/bench/work, removes the store when the value ends, and fails a
 # cell before it starts when that disk has less free space than one value
-# needs. Each result records the GIL
-# of each worker process. `run` and `test` build `zoe` in release for the
-# storages zoe-server and zoe-native, unless ZOE_BINARY names a binary.
+# needs. Each result records the GIL of each worker process. `run` and
+# `test` build `zoe` in release for the storages zoe-server and
+# zoe-native, unless ZOE_BINARY names a binary.
 # `just bench test FILE...` runs only the tests of those files.
 # `just bench client` runs the client benchmark: ZEO.ClientStorage against
 # the native client, through the storage API, against zoe serve and a ZEO

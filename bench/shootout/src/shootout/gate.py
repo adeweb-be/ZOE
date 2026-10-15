@@ -272,7 +272,7 @@ def _cost_row(runs, cell, storage: str, baseline: str, ratio: float) -> list:
         for name in (baseline, storage, FLOOR)
     }
     ratios = [_cost_ratio(r[baseline], r[storage], r[FLOOR]) for r in complete]
-    # With an even number of rounds, the lower of the two middle ratios.
+    # With an even number of rounds, the median is the lower middle ratio.
     median = statistics.median_low(ratios)
     cost = statistics.median(r[baseline] - r[FLOOR] for r in complete)
     if cost < NOISE * times[baseline]:
