@@ -1,0 +1,14 @@
+<component prefix="shootout.floor">
+  <description>
+    The storage floor of the harness: a minimal storage in memory, the
+    floor of the phase 3 gate.
+  </description>
+  <sectiontype name="floor" datatype=".FloorConfig" implements="ZODB.storage">
+    <key name="path" required="yes">
+      <description>
+        The file of the records of the populate. Each process of
+        zodbshootout starts from it.
+      </description>
+    </key>
+  </sectiontype>
+</component>

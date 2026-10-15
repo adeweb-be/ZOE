@@ -161,7 +161,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     storages = args.storage or [
-        s for s in STORAGES if args.dsn or not STORAGES[s].needs_dsn
+        s
+        for s in STORAGES
+        if STORAGES[s].default and (args.dsn or not STORAGES[s].needs_dsn)
     ]
     needs_dsn = [s for s in storages if STORAGES[s].needs_dsn]
     if needs_dsn and not args.dsn:

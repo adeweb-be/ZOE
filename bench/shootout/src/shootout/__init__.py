@@ -9,6 +9,7 @@ checks that the server of `zoe-native` loaded each object that a
 
 import datetime
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -44,6 +45,10 @@ STORE_OVERHEAD = 64 * 1024 * KB
 
 # The zodbshootout benchmarks, the scenario names in the results, and the
 # text that zodbshootout puts in the benchmark name.
+# The start of a record of the log of zodbshootout: its date, its time
+# and its level.
+RECORD = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ (\w+)")
+
 SCENARIOS = {
     "add": ("add", "add {n} objects"),
     "update": ("update", "update {n} objects"),
@@ -112,17 +117,23 @@ def disk_needed(storage: str, cell: Cell) -> int:
     scenario: the warmup and the value. The calls of update, or of add on a
     store that zodbshootout cannot zap, write the most. The data of
     relstorage and relstorage-hf goes to PostgreSQL, so only the logs and
-    the pyperf output of a value go to the work directory.
+    the pyperf output of a value go to the work directory. `floor` writes
+    only the records of the populate, and two files of them at most while
+    it replaces one.
     """
     if storage in RELSTORAGE:
         return STORE_OVERHEAD
     c = cell.concurrency
     n = OBJECTS_PER_TRANSACTION
     # The populate writes n objects per worker and n more. The root, the
-    # tree and the mappings of the workers take c + 3 records. Each call of
-    # update or add writes c × L transactions of at most n + 1 records: add
-    # also writes the mapping of the worker again.
-    records = (c * n + n) + (c + 3) + 2 * c * _inner_loops(c) * (n + 1)
+    # tree and the mappings of the workers take c + 3 records.
+    populate = (c * n + n) + (c + 3)
+    if storage == "floor":
+        records = 2 * populate
+    else:
+        # Each call of update or add writes c × L transactions of at most
+        # n + 1 records: add also writes the mapping of the worker again.
+        records = populate + 2 * c * _inner_loops(c) * (n + 1)
     return records * (cell.object_size + RECORD_OVERHEAD) + STORE_OVERHEAD
 
 
@@ -307,6 +318,12 @@ def _run_value(
     name = SCENARIOS[bench][0]
     if done.returncode != 0 or not output.exists():
         raise RuntimeError(f"zodbshootout failed for {name} in {cell}:\n{_tail(log)}")
+    if errors := _errors(log):
+        # zodbshootout logs the exception of a benchmark, and reports a time
+        # for it all the same.
+        raise RuntimeError(
+            f"zodbshootout logged an error for {name} in {cell}:\n{errors}"
+        )
     benchmark = _benchmark(pyperf.BenchmarkSuite.load(str(output)), bench, cell, log)
     if count_loads:
         check_cold_loads(store.name, _objects(benchmark, cell), loads[1] - loads[0])
@@ -365,6 +382,23 @@ def _percentile(values: list[float], p: int) -> float:
     if len(values) == 1:
         return values[0]
     return statistics.quantiles(values, n=100, method="inclusive")[p - 1]
+
+
+def _errors(log: Path) -> str:
+    """Return the records of level ERROR or CRITICAL of a zodbshootout log.
+
+    A record starts with its date, its time and its level, cut to 5
+    characters. The lines that follow it, such as a traceback, are part of
+    it.
+    """
+    out = []
+    inside = False
+    for line in log.read_text(errors="replace").splitlines():
+        if record := RECORD.match(line):
+            inside = record[1] in ("ERROR", "CRITI")
+        if inside:
+            out.append(line)
+    return "\n".join(out)
 
 
 def _tail(log: Path, lines: int = 40) -> str:
