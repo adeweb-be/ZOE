@@ -83,7 +83,7 @@ These rounds are valid. Only the client CPU of the 3.14t processes rows is missi
 
 - the scripts at 49113ee: `bench/poc/ZOE-150/`, with the launcher of the cloud machine;
 - the raw results at e6cf4aa, under `bench/poc/ZOE-150/results/`: `run.jsonl` (236 runs), the log, the machine, the fsync, the GIL checks and the py-spy samples;
-- the table at 36ba912: `terms.py`. The terms of this finding are those of `terms.py` with the corrections of the review (see the section Cells under 3×).
+- the table at d53528b: `terms.py`, which prints the two tables of this finding.
 
 ## Results
 
@@ -309,7 +309,7 @@ That time minus the ZODB time of a hit is what the cache may cost. The ZODB time
 | threads | 64 | 100 KB | 3.13 | 4,498 | 13,496 | 1 | not profiled (62 µs for a whole hit at concurrency 1) | 74 µs | not known |
 | processes | 4 | 1 KB | 3.13 | 121,369 | 364,107 | 4 | 16 µs | 11 µs | none |
 | processes | 16 | 1 KB | 3.13 | 427,639 | 1,282,918 | 16 | 16 µs | 12 µs | none |
-| processes | 64 | 1 KB | 3.13 | 456,378 | 1,369,134 | 64 | 16 µs | 47 µs | 31 µs |
+| processes | 64 | 1 KB | 3.13 | 456,378 | 1,369,134 | 64 | 16 µs | 47 µs | 31 µs at most |
 | processes | 4 | 100 KB | 3.13 | 33,080 | 99,240 | 4 | not profiled (62 µs for a whole hit at concurrency 1) | 40 µs | not known |
 | processes | 16 | 100 KB | 3.13 | 129,618 | 388,855 | 16 | not profiled (62 µs for a whole hit at concurrency 1) | 41 µs | not known |
 | processes | 64 | 100 KB | 3.13 | 122,078 | 366,233 | 64 | not profiled (62 µs for a whole hit at concurrency 1) | 175 µs | not known |
@@ -321,20 +321,20 @@ That time minus the ZODB time of a hit is what the cache may cost. The ZODB time
 | threads | 64 | 100 KB | 3.14t | 4,626 | 13,880 | 12 | not profiled (37 µs for a whole hit at concurrency 1) | 865 µs | not known |
 | processes | 4 | 1 KB | 3.14t | 128,522 | 385,566 | 4 | 17 µs | 10 µs | none |
 | processes | 16 | 1 KB | 3.14t | 395,100 | 1,185,299 | 16 | 17 µs | 13 µs | none |
-| processes | 64 | 1 KB | 3.14t | 875,325 | 2,625,976 | 64 | 17 µs | 24 µs | 8 µs |
+| processes | 64 | 1 KB | 3.14t | 875,325 | 2,625,976 | 64 | 17 µs | 24 µs | 8 µs at most |
 | processes | 4 | 100 KB | 3.14t | 77,745 | 233,235 | 4 | not profiled (37 µs for a whole hit at concurrency 1) | 17 µs | not known |
 | processes | 16 | 100 KB | 3.14t | 154,899 | 464,697 | 16 | not profiled (37 µs for a whole hit at concurrency 1) | 34 µs | not known |
 | processes | 64 | 100 KB | 3.14t | 5,692 | 17,074 | 64 | not profiled (37 µs for a whole hit at concurrency 1) | 3748 µs | not known |
 
 - **No cache can give 3× in 6 of these rows,** all at 1 KB: threads at concurrency 4 and 16 on 3.13, and processes at concurrency 4 and 16 on both builds. There the time of a hit at 3× is below the ZODB time of a hit, because ZEO.cache is already cheap or because the GIL holds ZODB to one core. With the 2 rows at concurrency 1 and 1 KB, this makes the 8 `read_hot` rows that no card can move.
-- **At 1 KB, in the other rows, a hit may cost 8 to 31 µs on 3.13 and 0 to 262 µs on 3.14t.** In the threads rows ZEO.cache waits on its lock.
+- **At 1 KB, in the other rows, a hit may cost 8 to 31 µs on 3.13 and 0 to 262 µs on 3.14t.** In the threads rows ZEO.cache waits on its lock. The values of processes 64 are upper values: they count every worker as running in parallel, and the workers do not all overlap.
 - **At 100 KB the bound is not known.** A hit through ZEO.cache also reads 100 KB from the cache file, so the 62 µs (3.13) and 37 µs (3.14t) of a hit at concurrency 1 may be partly cache: a cost that a native cache can cut. These rows count as client cache rows. The `processes, 64, 100 KB, 3.14t` row has a zeo spread of 320 %: a ZEO.cache of 20 MB holds the 100 objects of 100 KB of a worker on some rounds only.
 
 ZOE-156 (the cache of one process) and ZOE-162 (the persistent cache) move the 20 client cache rows. For the 8 bounded rows they can only bring parity: about 1× ZEO, against 0.12 to 1.05× now.
 
 ## Cells under 3×
 
-114 of the 140 rows are under 3×. Each row has one term. `terms.py` gives a first term; the review of this finding corrected three of its rules, so the terms here follow these rules, in this order:
+114 of the 140 rows are under 3×. Each row has one term. `terms.py` (d53528b) gives the term from these rules, in this order:
 
 1. **`read_hot`.** The POC client has no cache, so each hit goes to the server.
    - At 1 KB, if the workers that run in parallel cannot run 3× the hits of ZEO at the ZODB time of a hit, the term is *ZODB per hit*, and no card can move the row (see the section The client cache).
@@ -343,7 +343,7 @@ ZOE-156 (the cache of one process) and ZOE-162 (the persistent cache) move the 2
 3. **Commits** (`add`, `update`, `read_warm`). At 100 KB the term is the *100 KB commit*. At 1 KB it is the *commit latency* at concurrency 1 and the *commit* above. Each gives the median `tpc_finish` of the server.
 4. **Loads** (`read_cold`). At 100 KB the term is the *100 KB load*. At 1 KB it is the *load round trip*.
 
-The rule of `terms.py` on the floor of each cell is gone: the floor bounds no row (see the section Floors). Its 24 rows now have rule 2 or the term of their scenario. 9 `read_hot` rows of *ZODB per hit* in `terms.py` are client cache rows now: the 7 at 100 KB, which have no profile, and the 2 of processes 64 at 1 KB, where the workers do not share the cores.
+An earlier version of `terms.py` (36ba912) had a rule on the floor of each cell. The floor bounds no row (see the section Floors), so its 24 rows have rule 2 or the term of their scenario. 9 `read_hot` rows that the earlier version gave *ZODB per hit* are client cache rows: the 7 at 100 KB, which have no profile, and the 2 of processes 64 at 1 KB, where the workers do not all overlap.
 
 | term | rows | card |
 | --- | --- | --- |
@@ -502,7 +502,7 @@ No server change moves these rows:
 
 - **Not the full set of the harness.** There is no warmup, each worker runs 1 to 16 transactions per scenario instead of 100 or 30, and there are three samples per row instead of 20. A cell with few transactions per worker weighs the start of a run more: the first commit, the first loads.
 - **Over the time cap.** The run took 23.5 minutes, so it skipped its two optional phases. There is no span split of the server and no row for `zoe serve` as on `main`. The server terms come from `/metrics` and the floors, not from the spans of N17.
-- **The floor is not a zero-cost storage, and it bounds no row.** Above concurrency 1 it adds the DemoStorage, the MappingStorage, the commit lock and the switching of the GIL to ZODB. For reads, its DemoStorage loads from a read-only FileStorage, so in `read_hot` it is slower than a hit in ZEO.cache. the section The client cache bounds a hit with the ZEO time at concurrency 1 instead. In the processes mode, its `add` measures the start of the workers.
+- **The floor is not a zero-cost storage, and it bounds no row.** Above concurrency 1 it adds the DemoStorage, the MappingStorage, the commit lock and the switching of the GIL to ZODB. For reads, its DemoStorage loads from a read-only FileStorage, so in `read_hot` it is slower than a hit in ZEO.cache. The section The client cache bounds a hit with the ZEO time at concurrency 1 instead. In the processes mode, its `add` measures the start of the workers.
 - **Few transactions per worker.** In the processes mode a worker's few transactions can run while the other workers still start, and the workers do not all overlap. So `add` in the processes mode is not measured, and ops/s in the processes mode is not bound by the cores.
 - **The `read_hot` bound at 100 KB is not known:** the profile exists at 1 KB only, and on 3.13 only.
 - **The ZEO server runs on the build of the client.** On 3.14t its one thread is slower, and ZEO's numbers in the 3.14t processes rows fall: `read_cold`, processes, 64, 1 KB gives 32,457 ops/s on 3.13 and 14,001 on 3.14t. 9 of the 26 rows at 3× or above are 3.14t processes rows.
