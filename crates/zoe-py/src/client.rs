@@ -462,7 +462,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let reply = py
             .detach(move || runtime.block_on(traced(trace, pool.call(&method, args))))
-            .map_err(|e| zeo_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         to_python(py, &reply, 0)
     }
 
@@ -595,7 +595,8 @@ impl NativeClient {
     /// pickle, its serial and the serial of the next record or `None`.
     /// Return `None` when `oid` has no record before `tid`. A hit of the
     /// cache sends nothing to the server. A miss stores the reply in the
-    /// cache.
+    /// cache. An error of the server raises what ZEO raises for it, as for
+    /// `call`.
     #[allow(clippy::type_complexity)]
     fn load_before<'py>(
         &self,
@@ -626,7 +627,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
-            .map_err(|e| client_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| {
             (
                 PyBytes::new(py, &record.data),
@@ -639,7 +640,8 @@ impl NativeClient {
     /// Return the current record of `oid`: its pickle and its serial, or
     /// `None` when `oid` has no record. A hit of the current entry of the
     /// cache sends nothing to the server, as `load` of `ZEO.ClientStorage`
-    /// does. A miss stores the reply in the cache.
+    /// does. A miss stores the reply in the cache. An error of the server
+    /// raises what ZEO raises for it, as for `call`.
     #[allow(clippy::type_complexity)]
     fn load<'py>(
         &self,
@@ -658,7 +660,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, MAX_TID))))
-            .map_err(|e| client_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(record.map(|record| (PyBytes::new(py, &record.data), p64(py, record.tid.0))))
     }
 
@@ -670,6 +672,22 @@ impl NativeClient {
             py.detach(|| cache.clear());
         }
         Ok(())
+    }
+
+    /// Return the entries of the cache as a list of `(oid, start, end)`,
+    /// with `None` as the end of a current entry. Without a cache, return
+    /// an empty list.
+    fn cache_entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        self.check_process()?;
+        let entries = match &self.cache {
+            Some(cache) => py.detach(|| cache.entries()),
+            None => Vec::new(),
+        };
+        let items = entries.into_iter().map(|(oid, start, end)| {
+            let end = end.map(|end| p64(py, end.0));
+            (p64(py, oid.0), p64(py, start.0), end)
+        });
+        PyList::new(py, items)
     }
 
     /// Return the pickle of `oid` that the transaction `serial` wrote. An
@@ -686,7 +704,7 @@ impl NativeClient {
         let runtime = self.runtime;
         let data = py
             .detach(move || runtime.block_on(traced(trace, pool.load_serial(oid, serial))))
-            .map_err(|e| zeo_error(py, e))?;
+            .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
         Ok(PyBytes::new(py, &data))
     }
 
@@ -910,6 +928,16 @@ impl NativeClient {
     }
 
     /// Return the listener of the pool, if the client is open and has one.
+    /// Return the address of the server as ZEO names its connection in
+    /// its logs: `('host', port)`, or the path of a unix domain socket.
+    fn peer_name(&self) -> String {
+        match self.listener().map(|listener| listener.address().clone()) {
+            Some(Address::Tcp(addr)) => format!("('{}', {})", addr.ip(), addr.port()),
+            Some(Address::Unix(path)) => path.to_string_lossy().into_owned(),
+            None => String::new(),
+        }
+    }
+
     fn listener(&self) -> Option<Arc<zoe_client::Client>> {
         if self.pid != std::process::id() {
             return None;
@@ -1693,8 +1721,18 @@ fn not_open() -> Error {
 /// Return the exception of Python for an error of the client.
 fn client_error(py: Python<'_>, error: Error) -> PyErr {
     match error {
-        Error::Conflict { oid, serials } => {
-            errors::conflict(py, errors::conflict_class(py), oid, serials, None)
+        Error::Conflict {
+            oid,
+            serials,
+            class_name,
+        } => {
+            let error = errors::conflict(py, errors::conflict_class(py), oid, serials, None);
+            // ZEO gives the class that the server names to the error, so
+            // its text names the class of the object.
+            if let Some(class_name) = class_name {
+                let _ = error.value(py).setattr("class_name", class_name);
+            }
+            error
         }
         Error::ReadConflict { oid, serials } => {
             errors::conflict(py, errors::read_conflict_class(py), oid, serials, None)
@@ -1716,7 +1754,7 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
 /// raises what its factory makes of the value, and another class raises
 /// `ZEO.Exceptions.ServerException(class, value)`. Each other error raises
 /// as `client_error` gives it.
-fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
+fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
     let Error::Server {
         class,
         value,
@@ -1727,9 +1765,20 @@ fn zeo_error(py: Python<'_>, error: Error) -> PyErr {
     };
     let made = (|| -> PyResult<PyErr> {
         let value = to_python(py, &value, 0)?;
-        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
+        let client = py.import("ZEO.asyncio.client")?;
+        let factories = client.getattr("exc_factories")?;
         let exception = match factories.get_item(&class) {
-            Ok(factory) => factory.call1((&class, value))?,
+            Ok(factory) => {
+                let exception = factory.call1((&class, &value))?;
+                // ZEO logs an error of the server that its factories make,
+                // but a POSKeyError and a ConflictError.
+                if !exception.is_instance(&client.getattr("unlogged_exceptions")?)? {
+                    client
+                        .getattr("logger")?
+                        .call_method1("error", ("%s from server: %s:%s", name, &class, &value))?;
+                }
+                exception
+            }
             Err(_) => py
                 .import("ZEO.Exceptions")?
                 .getattr("ServerException")?

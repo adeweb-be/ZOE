@@ -1064,6 +1064,7 @@ impl Transaction {
         let error = Error::Conflict {
             oid: listed.oid,
             serials: Some((listed.committed, listed.read)),
+            class_name: None,
         };
         self.end().await;
         Err(error)

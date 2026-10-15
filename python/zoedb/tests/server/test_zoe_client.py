@@ -128,11 +128,16 @@ def test_the_native_key_opens_the_native_client(tmp_path):
                 storage.close()
 
 
-def test_the_native_client_is_off_by_default(tmp_path):
+def test_the_native_client_is_on_by_default(tmp_path):
     import zoe.zeo
 
     with ZoeServer(str(tmp_path / "store")) as server:
         storage = client(server)
+        try:
+            assert isinstance(storage, zoe.zeo._NativeClientStorage)
+        finally:
+            storage.close()
+        storage = client(server, native=False)
         try:
             assert not isinstance(storage, zoe.zeo._NativeClientStorage)
         finally:
@@ -408,3 +413,9 @@ def test_native_on_another_subclass_raises_type_error():
 
     with pytest.raises(TypeError, match="native=True"):
         Mine(("127.0.0.1", 1), native=True)
+    # A subclass keeps the client of ZEO by default.
+    storage = Mine(("127.0.0.1", 1), wait=False)
+    try:
+        assert not isinstance(storage, zoe.zeo._NativeClientStorage)
+    finally:
+        storage.close()

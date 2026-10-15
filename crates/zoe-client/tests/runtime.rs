@@ -313,7 +313,7 @@ async fn a_listed_conflict_fails_the_vote_and_aborts() {
     let mut txn = client.begin(b"u", b"d", b"").await.unwrap();
     txn.store(Oid(5), Tid(2), b"p").await.unwrap();
     match txn.vote().await {
-        Err(Error::Conflict { oid, serials }) => {
+        Err(Error::Conflict { oid, serials, .. }) => {
             assert_eq!(oid, Oid(5));
             assert_eq!(serials, Some((Tid(3), Tid(2))));
         }

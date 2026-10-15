@@ -26,23 +26,25 @@ OpenTelemetry.
 Its `<ssl>` section gives the files of TLS: the client builds its TLS from
 them, as ZEO's `<clientstorage>` does.
 
-`ClientStorage(..., native=True)` runs the client on the native client of
-`zoe._zoe`, built on the Rust crate `zoe-client`, and not on the asyncio
-client of ZEO. It is still an instance of `ZEO.ClientStorage.ClientStorage`,
-and no thread of ZEO starts. It connects as ZEO does: to a `(host, port)`
-address, to the path of a unix domain socket, or to the first server of a
-list that opens, with TLS from the `<ssl>` section of `<zoeclient>`. It
-takes no `ssl` context: TLS runs in Rust, and a context does not give back
-the files of its certificate and key. It runs several transactions at once,
-each on its own connection of a pool, with one more connection that orders
-the invalidations (ADR 0036). It keeps a client cache of `cache_size`
-bytes, with the semantics of the cache of ZEO (ADR 0034): in memory, or in
-a file with `client` and `var`, or `cache`. It has
-blobs in both modes of ZEO: a blob cache in `blob_dir`, or a blob directory
-that it shares with the server (`shared_blob_dir`). It resolves in the
-client the conflicts that a vote lists, as `ZEO.ClientStorage` does. When
-it loses its server, it connects again in the background and verifies its
-cache, as ZEO does. It declares
+`ClientStorage` runs on the native client of `zoe._zoe`, built on the Rust
+crate `zoe-client`, and not on the asyncio client of ZEO. This is the
+default. `native=False` keeps the asyncio client of ZEO inside. A subclass
+of `ClientStorage` keeps the asyncio client of ZEO, because it can change
+its methods. The native client is still an instance of
+`ZEO.ClientStorage.ClientStorage`, and no thread of ZEO starts. It connects
+as ZEO does: to a `(host, port)` address, to the path of a unix domain
+socket, or to the first server of a list that opens, with TLS from the
+`<ssl>` section of `<zoeclient>`. It takes no `ssl` context: TLS runs in
+Rust, and a context does not give back the files of its certificate and
+key. It runs several transactions at once, each on its own connection of a
+pool, with one more connection that orders the invalidations (ADR 0036). It
+keeps a client cache of `cache_size` bytes, with the semantics of the cache
+of ZEO (ADR 0034): in memory, or in a file with `client` and `var`, or
+`cache`. It has blobs in both modes of ZEO: a blob cache in `blob_dir`, or
+a blob directory that it shares with the server (`shared_blob_dir`). It
+resolves in the client the conflicts that a vote lists, as
+`ZEO.ClientStorage` does. When it loses its server, it connects again in
+the background and verifies its cache, as ZEO does. It declares
 `sequences`, and `trace_context` when the package `opentelemetry` is
 installed, and sends the traceparent as the client of ZEO does. It has the
 rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
@@ -50,7 +52,7 @@ rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
 `deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
 `new_addr` and `client_label`. It speaks only the msgpack protocol `M5`: a
 stock ZEO server needs `msgpack true`. `_NOT_BUILT` names the arguments
-whose feature it does not have yet. `native` is false by default.
+whose feature it does not have yet. It is empty.
 """
 
 import concurrent.futures
@@ -92,6 +94,11 @@ else:
 __all__ = ["EXTENSIONS", "ClientStorage", "Sequence"]
 
 logger = logging.getLogger(__name__)
+
+# The native client logs the events of its connection under the logger of
+# `ZEO.ClientStorage`, with the words of ZEO, so a filter of the logs of
+# ZEO keeps them.
+_zeo_logger = logging.getLogger("ZEO.ClientStorage")
 
 # The extension that lets a call carry the trace context of the client.
 _TRACE_CONTEXT = "trace_context"
@@ -315,11 +322,15 @@ class Sequence:
 class ClientStorage(ZEOClientStorage):
     """`ZEO.ClientStorage` with the ZOE extensions that the server accepts.
 
-    With `native=True`, the instance is a `_NativeClientStorage`: the
-    native client runs inside.
+    By default, the instance is a `_NativeClientStorage`: the native client
+    runs inside. With `native=False`, the asyncio client of ZEO runs
+    inside. A subclass runs the asyncio client of ZEO by default, and
+    `native=True` on it raises `TypeError`.
     """
 
-    def __new__(cls, *args, native=False, **kw):
+    def __new__(cls, *args, native=None, **kw):
+        if native is None:
+            native = issubclass(cls, _NativeClientStorage) or cls is ClientStorage
         if native and cls is ClientStorage:
             cls = _NativeClientStorage
         elif native and not issubclass(cls, _NativeClientStorage):
@@ -332,7 +343,7 @@ class ClientStorage(ZEOClientStorage):
     def __init__(
         self,
         *args,
-        native=False,
+        native=None,
         _client_factory=_ClientThread,
         _ssl_section=None,
         **kw,
@@ -511,14 +522,96 @@ def _native_address(addr):
 
 
 class _NativeCache:
-    """The `_cache` of the native client: its client cache, in Rust."""
+    """The `_cache` of the native client: its client cache, in Rust.
 
-    def __init__(self, native):
+    `maxsize`, `path`, `len()`, `contents()` and `clear()` give what those
+    of `ZEO.cache.ClientCache` give: the size of the cache, the path of its
+    file or None, the number of its entries, the oid and the tid of each
+    current entry, and the drop of every entry.
+    """
+
+    def __init__(self, native, maxsize, path):
         self._native = native
+        self.maxsize = maxsize
+        self.path = path
+
+    def __len__(self):
+        return len(self._native.cache_entries())
+
+    def contents(self):
+        """Yield the oid and the start tid of each current entry."""
+        for oid, start, end in self._native.cache_entries():
+            if end is None:
+                yield oid, start
 
     def clear(self):
         """Drop every entry of the cache. zodbshootout calls it."""
         self._native.cache_clear()
+
+
+# The words of ZEO for how the verification of the cache ended, by the
+# kinds of the native client.
+_VERIFY_RESULTS = {
+    "kept": "Cache up to date",
+    "quick": "quick verification",
+    "dropped": "cache too old, clearing",
+    "failed": "cache too old, clearing",
+    "ahead": "Cache newer than server",
+}
+
+
+class _NativeConnection:
+    """The connection of the native client to its server, as
+    `notify_connected` gets it, in place of the `ClientIO` of ZEO.
+
+    `get_peername()` gives the address of the server, `protocol_version`
+    the protocol, `is_read_only()` tells if the connection registered
+    read-only, and `verify_result` tells how the verification of the cache
+    ended, in the words of ZEO. `call_async` sends a call without a reply.
+    """
+
+    def __init__(self, storage, address, read_only, verify_result):
+        self._storage = storage
+        self._address = address
+        self._read_only = read_only
+        self.protocol_version = storage.protocol_version
+        self.verify_result = verify_result
+
+    def get_peername(self):
+        return self._address
+
+    def is_read_only(self):
+        return self._read_only
+
+    def call_async(self, method, args):
+        self._storage._async(method, *args)
+
+
+class _NativeServer:
+    """The `_server` of the native client, in place of the client thread of
+    ZEO: its calls that do not need asyncio.
+
+    `call` and `async_` send a call of the server, as `_call` and `_async`
+    do. `timeout` is the longest wait for a connection. `client` is the
+    current `_NativeConnection`, or None before the first connection.
+    """
+
+    def __init__(self, storage, timeout):
+        self._storage = storage
+        self.timeout = timeout
+        self.client = None
+
+    def call(self, method, *args, wait=True, timeout=None):
+        return self._storage._call(method, *args, wait=wait)
+
+    def async_(self, method, *args):
+        self._storage._async(method, *args)
+
+    def is_connected(self):
+        return self._storage.is_connected()
+
+    def is_read_only(self):
+        return self._storage.is_read_only()
 
 
 class _NativeClientStorage(ClientStorage):
@@ -538,12 +631,15 @@ class _NativeClientStorage(ClientStorage):
     server. Without it, the open does not wait: the client connects in the
     background. When the client loses its server, it connects again in the
     background, at once, then every `disconnect_poll` seconds (1 by
-    default). While it has no server, each call that needs the server
-    raises `ClientDisconnected`, and a transaction that began before the
-    loss fails at its next step. After each connection, it verifies its
-    cache as `verify` of ZEO does: through `getInvalidations`, or it drops
-    the cache. It refuses a server whose last transaction is before its
-    own, and logs it as critical. `min_disconnect_poll`,
+    default). While it has no server, a call that needs the server waits
+    for one at most `wait_timeout` seconds, as ZEO does, then raises
+    `ClientDisconnected`. A transaction that began before the loss fails
+    at its next step. After each connection, it verifies its cache as
+    `verify` of ZEO does: through `getInvalidations`, or it drops the
+    cache. Then it calls `notify_connected(conn, info)`, and at each loss
+    `notify_disconnected()`, as ZEO does. It refuses a server whose last
+    transaction is before its own, and logs it as critical. It logs these
+    events under the logger `ZEO.ClientStorage`. `min_disconnect_poll`,
     `max_disconnect_poll` and `drop_cache_rather_verify` change nothing,
     as for ZEO 6.
 
@@ -557,7 +653,8 @@ class _NativeClientStorage(ClientStorage):
 
     The client cache holds `cache_size` bytes of records, 20 MB by default.
     0 turns it off. The client applies each tid to the cache before the DB
-    gets it. `_cache.clear()` empties it. Without `client` and `cache`, the
+    gets it. `_cache` gives `maxsize`, `path`, `len()`, `contents()` and
+    `clear()`, as the cache of ZEO does. Without `client` and `cache`, the
     cache is in memory. With `client`, it is the file
     `<client>-<storage>.zoec` in `var`, or in the current directory; a str
     `cache` names the file of ZEO, whose `.zec` becomes `.zoec`. The open
@@ -610,6 +707,9 @@ class _NativeClientStorage(ClientStorage):
     sent.
     """
 
+    # The native client speaks only the msgpack protocol of ZEO 6.
+    protocol_version = b"M5"
+
     def __init__(
         self,
         addr,
@@ -642,7 +742,7 @@ class _NativeClientStorage(ClientStorage):
         native=True,
         _ssl_section=None,
     ):
-        if not native:
+        if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
         given = locals()
         # Refuse a feature that is not built before any other step.
@@ -660,6 +760,8 @@ class _NativeClientStorage(ClientStorage):
         tls = None
         if _ssl_section is not None:
             tls = _native_tls(_ssl_section, ssl_server_hostname)
+        if isinstance(addr, int):
+            addr = ("127.0.0.1", addr)
         self.__name__ = name or str(addr)
         addr = self._normalize_addr(addr)
         # ZEO's tests read `_addr` to open a second client.
@@ -686,7 +788,6 @@ class _NativeClientStorage(ClientStorage):
         )
         self._client_label = client_label
         self.server_sync = bool(server_sync)
-        self.protocol_version = b"M5"
         # The iterators of the server, as ZEO keeps them. The lock covers
         # both.
         self._iterators = weakref.WeakValueDictionary()
@@ -703,6 +804,11 @@ class _NativeClientStorage(ClientStorage):
         # call of `lastTransaction()` does not wait for that tid.
         self._local = threading.local()
         self._delivery = None
+        self._server = _NativeServer(self, wait_timeout or 30)
+        # Set while the DB has the server of the client: the thread of the
+        # deliveries sets it at each connection and clears it at the loss.
+        self._operational = threading.Event()
+        self._closed = False
 
         from zoe import _zoe
 
@@ -722,25 +828,18 @@ class _NativeClientStorage(ClientStorage):
             client_label=client_label,
             cache_path=cache_path,
         )
-        self._cache = _NativeCache(self._native)
+        self._cache = _NativeCache(self._native, cache_size, cache_path)
         try:
             # Without `wait`, the event of the first connection takes the
             # server, so the client takes it once for each connection.
             if wait and self._native.is_connected():
-                self._take_server()
-                logger.info(
-                    "%s native client connected to storage %r at %s",
-                    self.__name__,
-                    storage,
-                    self._server_addr,
-                )
+                self._take_server(self._verify_result(self._check_cache_file()))
             else:
                 logger.info(
                     "%s native client connects to storage %r in the background",
                     self.__name__,
                     storage,
                 )
-            self._check_cache_file()
             self._delivery = threading.Thread(
                 target=self._deliver_forever,
                 name=f"{self.__name__} zoe native client invalidations",
@@ -759,18 +858,57 @@ class _NativeClientStorage(ClientStorage):
             return self._read_only
         return native.read_only()
 
-    def _take_server(self):
-        """Take the info and the address of the server of the native client."""
-        self._info.update(self._native.info())
+    def _take_server(self, verify_result):
+        """Take the server of the native client: call `notify_connected`
+        with its connection and its info, as ZEO does at each connection."""
+        conn = _NativeConnection(
+            self, self._native.address(), self._native.read_only(), verify_result
+        )
+        self._server.client = conn
+        self.notify_connected(conn, self._native.info())
+        self._operational.set()
+
+    def notify_connected(self, conn, info):
+        """Take the info and the address of a new connection, as ZEO does.
+
+        The native client verified its cache before the call.
+        """
+        address = conn.get_peername()
+        if address is not None:
+            self.set_server_addr(address)
+        self.protocol_version = conn.protocol_version
+        _zeo_logger.info(
+            "%s %s to storage: %s",
+            self.__name__,
+            "Reconnected" if self._connection_generation else "Connected",
+            self._server_addr,
+        )
+        self._connection_generation += 1
+        self._info.update(info)
         # The client declares the interfaces of the server that ZEO
         # declares.
         for iface in _SERVER_INTERFACES:
             if (iface.__module__, iface.__name__) in self._info["interfaces"]:
                 zope.interface.alsoProvides(self, iface)
-        address = self._native.address()
-        if address is not None:
-            self.set_server_addr(address)
+
+    def notify_disconnected(self):
+        """The client lost its server: forget the iterators of the server,
+        as ZEO does."""
+        _zeo_logger.info(
+            "%s Disconnected from storage: %r", self.__name__, self._server_addr
+        )
+        self._iterator_gc(True)
         self._connection_generation += 1
+
+    def _verify_result(self, kind):
+        """Return how the verification of the cache ended, in the words of
+        ZEO, from a kind of the native client or None. A cache without
+        entries gives "empty cache", as for ZEO."""
+        if kind in ("dropped", "failed", "ahead"):
+            return _VERIFY_RESULTS[kind]
+        if not len(self._cache):
+            return "empty cache"
+        return _VERIFY_RESULTS.get(kind, "Cache up to date")
 
     def _setup_blobs(self, blob_dir, shared, cache_size, cache_size_check):
         """Set the blob directory up as `ZEO.ClientStorage` does."""
@@ -816,9 +954,38 @@ class _NativeClientStorage(ClientStorage):
 
     # The calls of the server, on the listener.
 
+    def _wait(self, timeout=None):
+        """Wait for a server, as ZEO does before a call.
+
+        Wait at most `timeout` seconds, `_server.timeout` by default, then
+        raise `ClientDisconnected`. After `close`, raise at once.
+        """
+        if timeout is None:
+            timeout = self._server.timeout
+        deadline = time.monotonic() + timeout
+        while not self._native.is_connected():
+            left = deadline - time.monotonic()
+            if self._closed or left <= 0:
+                raise ClientDisconnected("the client has no server")
+            # The native client connects before the thread of the
+            # deliveries sets the event, and the event stays set for a
+            # moment after the loss: wait in short steps.
+            if self._operational.wait(min(left, 0.1)):
+                time.sleep(min(left, 0.01))
+
+    def _with_server(self, call, timeout=None):
+        """Return `call()`. Without a server, wait for one as ZEO does and
+        call again. A call that loses its server raises."""
+        try:
+            return call()
+        except ClientDisconnected:
+            if self._closed or self._native.is_connected():
+                raise
+        self._wait(timeout)
+        return call()
+
     def _call(self, method, *args, timeout=None, wait=True):
-        # ZEO waits `timeout` for a connection. The native client raises
-        # `ClientDisconnected` at once without one, so it ignores `timeout`.
+        # As ZEO, wait at most `timeout` for a server before the call.
         self._check_process()
         if not wait:
             # As ZEO, return a future of the reply. A thread waits for it,
@@ -842,6 +1009,8 @@ class _NativeClientStorage(ClientStorage):
             return future
         # The code of ZEO for the blob cache downloads a blob with this
         # call, under the lock of the blob.
+        if not self._native.is_connected():
+            self._wait(timeout)
         if method == "sendBlob":
             return self._send_blob(*args)
         return self._native.call(method, args)
@@ -962,6 +1131,7 @@ class _NativeClientStorage(ClientStorage):
         with self._transactions_lock:
             self._transaction_blobs.setdefault(txn, []).append((oid, target))
         data = _as_bytes(data)
+        serial = _serial(serial)
         if self.shared_blob_dir:
             native.store_blob_shared(oid, serial, data, os.path.basename(target))
         else:
@@ -1007,6 +1177,7 @@ class _NativeClientStorage(ClientStorage):
 
     def close(self):
         self._check_process()
+        self._closed = True
         self._native.close()
         delivery = self._delivery
         if delivery is not None and delivery is not threading.current_thread():
@@ -1047,13 +1218,9 @@ class _NativeClientStorage(ClientStorage):
                 elif kind == "refused":
                     self._refused(delivery[1])
                 elif kind == "stale":
-                    logger.info(
-                        "%s Disconnected from storage: %r",
-                        self.__name__,
-                        self._server_addr,
-                    )
+                    self._operational.clear()
                     # The iterators of the server went with the listener.
-                    self._iterator_gc(True)
+                    self.notify_disconnected()
                     # The client lost its listener: any object can be stale.
                     if self._db is not None:
                         self._db.invalidateCache()
@@ -1066,17 +1233,18 @@ class _NativeClientStorage(ClientStorage):
                 native.delivered()
 
     def _connected(self, verification):
-        """The native client connected again, after the verification of
-        its cache: `kept`, `quick` or `dropped`."""
-        self._take_server()
-        logger.info("%s Reconnected to storage: %s", self.__name__, self._server_addr)
+        """The native client connected, after the verification of its
+        cache: `kept`, `quick` or `dropped`."""
+        # A pool that opened without a server verifies its cache file at its
+        # first connection.
+        check = self._check_cache_file()
         if verification == "dropped":
             # The server does not keep the commits after the last tid of
             # the client: its cache is empty, and any object can be stale.
             self._stale_cache()
-        # A pool that opened without a server verifies its cache file at its
-        # first connection.
-        self._check_cache_file()
+        if check is not None and self._connection_generation == 0:
+            verification = check
+        self._take_server(self._verify_result(verification))
 
     def _stale_cache(self, text=""):
         """The client dropped its cache: notify `StaleCache` and log it as
@@ -1084,16 +1252,17 @@ class _NativeClientStorage(ClientStorage):
         try:
             ZODB.event.notify(ZEO.interfaces.StaleCache(self))
         except Exception:
-            logger.exception("%s sending StaleCache event", self.__name__)
+            _zeo_logger.exception("%s sending StaleCache event", self.__name__)
         if text:
-            logger.critical("%s dropping stale cache: %s", self.__name__, text)
+            _zeo_logger.critical("%s dropping stale cache: %s", self.__name__, text)
         else:
-            logger.critical("%s dropping stale cache", self.__name__)
+            _zeo_logger.critical("%s dropping stale cache", self.__name__)
         if self._db is not None:
             self._db.invalidateCache()
 
     def _check_cache_file(self):
-        """Log how the verification of the cache file ended, once.
+        """Log how the verification of the cache file ended, once, and
+        return its kind, or None.
 
         A server that does not keep the commits after the file, or a failed
         `getInvalidations`, drops the file as ZEO drops a stale cache. A
@@ -1103,11 +1272,11 @@ class _NativeClientStorage(ClientStorage):
         """
         check = self._native.take_cache_check()
         if check is None:
-            return
+            return None
         kind, text = check
         if kind == "ahead":
-            logger.critical(
-                "%s Client cache is out of sync with the server: the native "
+            _zeo_logger.critical(
+                "%s Client cache is out of sync with the server. The native "
                 "client drops its cache file. Verify that this is expected: %s",
                 self.__name__,
                 text,
@@ -1116,11 +1285,12 @@ class _NativeClientStorage(ClientStorage):
             self._stale_cache()
         elif kind == "failed":
             self._stale_cache(f"getInvalidations failed: {text}")
+        return kind
 
     def _refused(self, text):
         """The native client refused a server that is behind it."""
-        logger.critical(
-            "%s Client cache is out of sync with the server: the client "
+        _zeo_logger.critical(
+            "%s Client cache is out of sync with the server. The client "
             "refuses the server and tries again later. Verify that this is "
             "expected: %s",
             self.__name__,
@@ -1138,16 +1308,16 @@ class _NativeClientStorage(ClientStorage):
 
     def load(self, oid, version=""):
         # The current entry of the cache answers, as for ZEO.
-        result = self._native.load(oid)
+        result = self._with_server(lambda: self._native.load(oid))
         if result is None:
             raise POSKeyError(oid)
         return result
 
     def loadBefore(self, oid, tid):
-        return self._native.load_before(oid, tid)
+        return self._with_server(lambda: self._native.load_before(oid, tid))
 
     def loadSerial(self, oid, serial):
-        return self._native.load_serial(oid, serial)
+        return self._with_server(lambda: self._native.load_serial(oid, serial))
 
     def getTid(self, oid):
         return self.load(oid)[1]
@@ -1158,7 +1328,8 @@ class _NativeClientStorage(ClientStorage):
             raise ReadOnlyError()
         with self._oids_lock:
             if not self._oids:
-                self._oids = list(reversed(self._native.new_oids(_NEW_OIDS)))
+                oids = self._with_server(lambda: self._native.new_oids(_NEW_OIDS))
+                self._oids = list(reversed(oids))
             return self._oids.pop()
 
     def _sequence_next(self, name):

@@ -34,6 +34,10 @@ pub enum Error {
         oid: Oid,
         /// The committed serial and the serial that the transaction read.
         serials: Option<(Tid, Tid)>,
+        /// The class of the object, when the error of the server names it
+        /// in `class_name`, as a stock server does after its own
+        /// resolution failed.
+        class_name: Option<String>,
     },
 
     /// An object that the transaction read is no longer current: a
