@@ -384,6 +384,31 @@ fn a_large_entry_comes_back_in_blocks() {
 }
 
 #[test]
+fn a_store_writes_the_data_its_xxh3_and_zeros_after_it() {
+    let cache = cache_at(1024 * KB, 100);
+    // Fill the whole ring with ones: the next entries take words that
+    // held ones, so the zeros after their data come from the store.
+    for oid in 1000..1020 {
+        assert!(cache.store(Oid(oid), Tid(5), None, &[0xff; 64 * 1024], Tid(100)));
+    }
+    let lengths: [usize; 10] = [0, 1, 7, 8, 9, 4095, 4096, 4097, 8200, 100 * 1024 + 3];
+    for (i, len) in lengths.into_iter().enumerate() {
+        let data: Vec<u8> = (0..len).map(|k| (k * 13 + len) as u8 | 1).collect();
+        let oid = Oid(i as u64);
+        assert!(cache.store(oid, Tid(5), None, &data, Tid(100)));
+        let entry = cache.chain(oid.0).next().unwrap();
+        assert_eq!(entry.data_sum, xxh3_64(&data));
+        let at = cache.at(entry.pos) + HEAD_WORDS;
+        let stored: Vec<u8> = cache.map.words()[at..at + len.div_ceil(8)]
+            .iter()
+            .flat_map(|word| word.load(Ordering::Relaxed).to_le_bytes())
+            .collect();
+        assert_eq!(stored[..len], data[..]);
+        assert!(stored[len..].iter().all(|byte| *byte == 0));
+    }
+}
+
+#[test]
 fn a_copy_that_the_ring_overtakes_fails() {
     let cache = Arc::new(cache_at(256 * KB, 10));
     let data = vec![9u8; 100 * 1024 + 5];
