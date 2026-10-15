@@ -9,14 +9,15 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zoe_client::{
-    Cache, Client, Connect, Delivery, Error, Invalidation, Listed, Pool, PoolTransaction, Tokio,
-    Turn, Voted,
+    Cache, Client, Connect, Delivery, Error, Event, Invalidation, Listed, Open, Options, Pool,
+    PoolTransaction, Reconnect, Tokio, Turn, Verification, Voted,
 };
 use zoe_core::{Oid, Tid};
 use zoe_server::serve::{ServeOptions, Server};
@@ -233,7 +234,7 @@ async fn a_lost_listener_gives_the_stale_mark_and_fails_new_transactions() {
     let server = start("lost");
     let pool = open(&server, 2).await;
     assert!(pool.is_connected());
-    pool.listener().disconnect();
+    pool.listener().unwrap().disconnect();
     assert_eq!(next(&pool).await, Delivery::Stale);
     pool.delivered();
     assert!(!pool.is_connected());
@@ -429,11 +430,293 @@ async fn a_lost_listener_empties_the_cache() {
         .unwrap()
         .tid();
     assert!(cache.load(oid).is_some());
-    pool.listener().disconnect();
+    pool.listener().unwrap().disconnect();
     assert_eq!(next(&pool).await, Delivery::Stale);
     assert_eq!(cache.load(oid), None);
     assert!(!cache.store(oid, tid, None, &record(b"a"), tid));
     pool.delivered();
+}
+
+/// The time between two attempts of a pool to connect again, in the tests.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Return an `Open` that connects to `server` while `gate` holds `true`,
+/// with `options`, and fails with `Error::Disconnected` else. With
+/// `writable`, it opens no client.
+fn gated(server: SocketAddr, options: Options, gate: watch::Receiver<bool>) -> Open {
+    Arc::new(move |writable| {
+        let (options, open) = (options.clone(), *gate.borrow());
+        Box::pin(async move {
+            if !open || writable {
+                return Err(Error::Disconnected);
+            }
+            let client = Client::open(Arc::new(Tokio), server, "1", &options).await?;
+            let connect: Connect = Arc::new(move || Box::pin(Client::connect(server, "1")));
+            Ok((client, connect))
+        })
+    })
+}
+
+/// Open a pool with a cache of 1 MB on `server`, that connects again to it
+/// through `open`.
+async fn open_reconnecting(server: &Server, open: Open) -> Pool {
+    let addr = server.addr();
+    let listener = Client::connect(addr, "1").await.unwrap();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    let cache = Cache::new(1 << 20).unwrap();
+    let reconnect = Reconnect::new(open, POLL);
+    Pool::with_reconnect(
+        Arc::new(Tokio),
+        Some((listener, connect)),
+        2,
+        Some(cache),
+        reconnect,
+    )
+}
+
+async fn next_event(pool: &Pool) -> Event {
+    tokio::time::timeout(TIMEOUT, pool.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Commit and load two new oids through `pool`, so the cache holds both.
+/// Return them with the tid of the commit.
+async fn cached_pair(pool: &Pool) -> (Oid, Oid, Tid) {
+    let oids = pool.new_oids(2).await.unwrap();
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oids[0], Tid(0), &record(b"a")).await.unwrap();
+    txn.store(oids[1], Tid(0), &record(b"b")).await.unwrap();
+    txn.vote().await.unwrap();
+    let tid = txn.finish().await.unwrap().turn().await.unwrap().tid();
+    let cache = pool.cache().unwrap();
+    assert!(cache.load(oids[0]).is_some() && cache.load(oids[1]).is_some());
+    (oids[0], oids[1], tid)
+}
+
+/// Lose the listener of `pool`, and confirm the stale mark.
+async fn lose(pool: &Pool) {
+    pool.listener().unwrap().disconnect();
+    assert_eq!(next_event(pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert!(!pool.is_connected());
+}
+
+#[tokio::test]
+async fn a_pool_connects_again_and_verifies_its_cache_through_get_invalidations() {
+    let server = start("reconnect-quick");
+    let (gate, opened) = watch::channel(false);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (changed, kept, first) = cached_pair(&pool).await;
+    // A transaction that begins before the loss never commits after it.
+    let mut lost = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    lose(&pool).await;
+    assert!(matches!(pool.load(kept).await, Err(Error::Disconnected)));
+    assert!(matches!(
+        pool.begin_with(b"", b"", b"", None, " ").await,
+        Err(Error::Disconnected)
+    ));
+
+    // Another client commits while the pool has no listener.
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let tid = commit_other(&other, changed, first, &record(b"c")).await;
+    gate.send_replace(true);
+
+    // The pool gets the commit through getInvalidations, once, before
+    // its last tid moves.
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid,
+            oids: vec![changed],
+        }))
+    );
+    assert_eq!(pool.last_transaction(), first);
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert!(pool.is_connected());
+
+    // The entry of the changed oid ends. The other entry stays.
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.load(changed), None);
+    assert_eq!(cache.load(kept), Some((record(b"b"), first)));
+    assert_eq!(pool.load(changed).await.unwrap(), (record(b"c"), tid));
+
+    // The transaction of the lost server fails, and the pool commits.
+    lost.store(kept, first, &record(b"d")).await.ok();
+    lost.vote().await.ok();
+    assert!(matches!(lost.finish().await, Err(Error::Disconnected)));
+    let again = commit(&pool, kept, first, &record(b"e")).await.unwrap();
+    assert!(again.tid() > tid);
+    drop(again);
+
+    // The next commit of the other client comes on the new listener.
+    let later = commit_other(&other, changed, tid, &record(b"f")).await;
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid: later,
+            oids: vec![changed],
+        }))
+    );
+    pool.delivered();
+}
+
+#[tokio::test]
+async fn a_pool_without_a_commit_on_the_server_keeps_its_cache() {
+    let server = start("reconnect-kept");
+    let (gate, opened) = watch::channel(true);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (changed, kept, first) = cached_pair(&pool).await;
+    lose(&pool).await;
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), first);
+    let cache = pool.cache().unwrap();
+    assert!(cache.load(changed).is_some() && cache.load(kept).is_some());
+    drop(gate);
+}
+
+#[tokio::test]
+async fn a_pool_drops_its_cache_when_the_server_does_not_keep_the_commits() {
+    let dir = fresh_dir("reconnect-dropped");
+    let server =
+        Server::start(ServeOptions::new(dir.join("store")).invalidation_queue_size(1)).unwrap();
+    let (gate, opened) = watch::channel(false);
+    let pool = open_reconnecting(&server, gated(server.addr(), Options::default(), opened)).await;
+    let (changed, kept, first) = cached_pair(&pool).await;
+    lose(&pool).await;
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let tid = commit_other(&other, changed, first, &record(b"c")).await;
+    let tid = commit_other(&other, changed, tid, &record(b"d")).await;
+    gate.send_replace(true);
+
+    // The consumer gets no invalidation, but the mark of a dropped cache.
+    // Its confirmation moves the last tid.
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Dropped)
+    );
+    assert_eq!(pool.last_transaction(), first);
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.load(kept), None);
+    assert_eq!(cache.applied(), tid);
+}
+
+#[tokio::test]
+async fn a_pool_refuses_a_server_behind_its_cache() {
+    let server = start("reconnect-refused");
+    let empty = start("reconnect-empty");
+    let (gate, opened) = watch::channel(true);
+    let pool = open_reconnecting(&server, gated(empty.addr(), Options::default(), opened)).await;
+    cached_pair(&pool).await;
+    lose(&pool).await;
+    let Event::Refused(text) = next_event(&pool).await else {
+        panic!("the pool did not refuse the server");
+    };
+    assert!(text.contains(&empty.addr().to_string()), "{text}");
+    pool.delivered();
+    assert!(!pool.is_connected());
+    assert!(matches!(pool.new_oids(1).await, Err(Error::Disconnected)));
+    drop(gate);
+}
+
+#[tokio::test]
+async fn a_pool_without_a_listener_connects_in_the_background() {
+    let server = start("reconnect-fresh");
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let oid = other.new_oids(1).await.unwrap()[0];
+    let tid = commit_other(&other, oid, Tid(0), &record(b"a")).await;
+    let (gate, opened) = watch::channel(false);
+    let reconnect = Reconnect::new(gated(server.addr(), Options::default(), opened), POLL);
+    let cache = Cache::new(1 << 20).unwrap();
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, Some(cache), reconnect);
+    assert!(!pool.is_connected());
+    assert!(pool.listener().is_none());
+    assert!(matches!(pool.load(oid).await, Err(Error::Disconnected)));
+
+    gate.send_replace(true);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    assert!(pool.is_connected());
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(pool.load(oid).await.unwrap(), (record(b"a"), tid));
+    assert_eq!(pool.cache().unwrap().applied(), tid);
+}
+
+#[tokio::test]
+async fn a_pool_on_a_read_only_server_takes_a_writable_one() {
+    let dir = fresh_dir("reconnect-upgrade");
+    drop(Server::start(ServeOptions::new(dir.join("read-only"))).unwrap());
+    let read_only =
+        Server::start(ServeOptions::new(dir.join("read-only")).read_only(true)).unwrap();
+    let writable = start("reconnect-writable");
+    let (gate, opened) = watch::channel(false);
+    let (ro, rw) = (read_only.addr(), writable.addr());
+    let open: Open = Arc::new(move |only_writable| {
+        let open = *opened.borrow();
+        Box::pin(async move {
+            let (addr, options) = match (only_writable, open) {
+                (true, false) => return Err(Error::Disconnected),
+                (true, true) => (rw, Options::default()),
+                (false, _) => {
+                    let fallback = Options {
+                        read_only_fallback: true,
+                        ..Options::default()
+                    };
+                    (ro, fallback)
+                }
+            };
+            let client = Client::open(Arc::new(Tokio), addr, "1", &options).await?;
+            let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+            Ok((client, connect))
+        })
+    });
+    let reconnect = Reconnect {
+        upgrade: true,
+        ..Reconnect::new(open, POLL)
+    };
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, None, reconnect);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    assert!(pool.listener().unwrap().read_only());
+
+    // When the writable server opens, the pool leaves the read-only one.
+    gate.send_replace(true);
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    let listener = pool.listener().unwrap();
+    assert!(!listener.read_only());
+    assert_eq!(listener.address(), &zoe_client::Address::Tcp(rw));
+    let oid = pool.new_oids(1).await.unwrap()[0];
+    let tid = commit(&pool, oid, Tid(0), &record(b"w"))
+        .await
+        .unwrap()
+        .tid();
+    let check = Client::connect(rw, "1").await.unwrap();
+    assert_eq!(check.load(oid).await.unwrap(), (record(b"w"), tid));
 }
 
 /// A TCP proxy to the server. While `pause` holds `true`, the proxy keeps
@@ -598,7 +881,7 @@ async fn a_finish_in_flight_when_the_listener_is_lost_fails() {
     proxy.pause.send_replace(true);
     let finish = tokio::spawn(txn.finish());
     wait_until(|| pool.counters().held == 1, "hold of the tid").await;
-    pool.listener().disconnect();
+    pool.listener().unwrap().disconnect();
     assert_eq!(next(&pool).await, Delivery::Stale);
     pool.delivered();
     // The reply comes after the loss: the outcome of the finish counts as
@@ -645,4 +928,231 @@ async fn blobs_download_through_any_connection_of_the_pool() {
         matches!(&missing, Err(Error::Server { class, .. }) if class.ends_with("POSKeyError")),
         "{missing:?}"
     );
+}
+
+/// Open a pool with a cache of 1 MB on `server`, with `listener`. The
+/// connections that commit reach the server directly, and so does each
+/// listener after a loss.
+fn open_listener_proxied(server: &Server, listener: Client) -> Pool {
+    let addr = server.addr();
+    let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+    let (_gate, opened) = watch::channel(true);
+    let reconnect = Reconnect::new(gated(addr, Options::default(), opened), POLL);
+    let cache = Cache::new(1 << 20).unwrap();
+    Pool::with_reconnect(
+        Arc::new(Tokio),
+        Some((listener, connect)),
+        2,
+        Some(cache),
+        reconnect,
+    )
+}
+
+/// Commit `data` for `oid` through `pool` while the listener sees no tid.
+/// Lose the listener, confirm the stale mark, and run the stale turn.
+/// Return the tid of the commit.
+async fn commit_then_lose(pool: &Pool, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
+    let mut txn = pool.begin_with(b"", b"", b"", None, " ").await.unwrap();
+    txn.store(oid, serial, data).await.unwrap();
+    txn.vote().await.unwrap();
+    let finished = txn.finish().await.unwrap();
+    let tid = finished.tid();
+    let turn = tokio::spawn(finished.turn());
+    pool.listener().unwrap().disconnect();
+    assert_eq!(next_event(pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    let turn = turn.await.unwrap().unwrap();
+    assert!(turn.stale());
+    drop(turn);
+    assert_eq!(pool.last_transaction(), tid);
+    tid
+}
+
+#[tokio::test]
+async fn a_quick_verification_at_the_last_tid_gives_its_oids_and_keeps_the_last_tid() {
+    let server = start("reconnect-stale-turn");
+    let proxy = proxy(server.addr()).await;
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let pool = open_listener_proxied(&server, listener);
+    let (changed, kept, first) = cached_pair(&pool).await;
+
+    // The finish has its reply, but the listener does not see its tid. The
+    // stale turn moves the last tid past `applied` of the cache.
+    proxy.pause.send_replace(true);
+    let tid = commit_then_lose(&pool, changed, first, &record(b"c")).await;
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.applied(), first);
+
+    // getInvalidations(applied) gives the tid of the pool. The consumer
+    // gets its oids, and the last tid stays.
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid,
+            oids: vec![changed],
+        }))
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(changed), None);
+    assert_eq!(cache.load(kept), Some((record(b"b"), first)));
+    assert_eq!(pool.load(changed).await.unwrap(), (record(b"c"), tid));
+}
+
+#[tokio::test]
+async fn a_commit_of_another_client_lost_with_the_listener_reaches_the_consumer_after_a_stale_turn()
+{
+    let server = start("reconnect-lost-foreign");
+    let proxy = proxy(server.addr()).await;
+    let listener = Client::connect(proxy.addr, "1").await.unwrap();
+    let pool = open_listener_proxied(&server, listener);
+    let (foreign, own, first) = cached_pair(&pool).await;
+
+    // From here on, the listener sees no tid. Another client commits, then
+    // the pool commits. The listener is lost before it sees either tid.
+    proxy.pause.send_replace(true);
+    let other = Client::connect(server.addr(), "1").await.unwrap();
+    let lost = commit_other(&other, foreign, first, &record(b"x")).await;
+    let tid = commit_then_lose(&pool, own, first, &record(b"c")).await;
+    assert!(lost < tid);
+
+    // The stale turn moved the last tid to the tid of the pool. The consumer
+    // never got the commit of the other client, and the server has no
+    // commit after the tid of the pool.
+    let cache = pool.cache().unwrap();
+    assert_eq!(cache.applied(), first);
+    assert_eq!(cache.load(foreign), Some((record(b"a"), first)));
+
+    // getInvalidations(applied) gives both oids at the tid of the pool. The
+    // consumer gets them, so the DB drops the object of the other client.
+    let Event::Delivery(Delivery::Invalidate(invalidation)) = next_event(&pool).await else {
+        panic!("the consumer got no invalidation for the lost commit");
+    };
+    assert_eq!(invalidation.tid, tid);
+    let mut oids = invalidation.oids;
+    oids.sort();
+    let mut expected = vec![foreign, own];
+    expected.sort();
+    assert_eq!(oids, expected);
+    assert_eq!(pool.last_transaction(), tid);
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), tid);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Quick)
+    );
+    pool.delivered();
+    assert_eq!(cache.applied(), tid);
+    assert_eq!(cache.load(foreign), None);
+    assert_eq!(pool.load(foreign).await.unwrap(), (record(b"x"), lost));
+
+    // The next commit of the other client comes on the new listener.
+    let later = commit_other(&other, foreign, lost, &record(b"y")).await;
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Delivery(Delivery::Invalidate(Invalidation {
+            tid: later,
+            oids: vec![foreign],
+        }))
+    );
+    pool.delivered();
+    assert_eq!(pool.last_transaction(), later);
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_listener_changed_during_the_open_tries_again() {
+    let dir = fresh_dir("reconnect-upgrade-race");
+    drop(Server::start(ServeOptions::new(dir.join("read-only"))).unwrap());
+    let read_only =
+        Server::start(ServeOptions::new(dir.join("read-only")).read_only(true)).unwrap();
+    let writable = start("reconnect-upgrade-race-writable");
+    let (ro, rw) = (read_only.addr(), writable.addr());
+    // The first writable open waits until the test releases it.
+    let (release, released) = watch::channel(false);
+    let upgrades = Arc::new(AtomicUsize::new(0));
+    let count = upgrades.clone();
+    let open: Open = Arc::new(move |only_writable| {
+        let first = only_writable && count.fetch_add(1, Ordering::SeqCst) == 0;
+        let mut released = released.clone();
+        Box::pin(async move {
+            if first {
+                let _ = released.wait_for(|released| *released).await;
+            }
+            let (addr, options) = match only_writable {
+                true => (rw, Options::default()),
+                false => {
+                    let fallback = Options {
+                        read_only_fallback: true,
+                        ..Options::default()
+                    };
+                    (ro, fallback)
+                }
+            };
+            let client = Client::open(Arc::new(Tokio), addr, "1", &options).await?;
+            let connect: Connect = Arc::new(move || Box::pin(Client::connect(addr, "1")));
+            Ok((client, connect))
+        })
+    });
+    let reconnect = Reconnect {
+        upgrade: true,
+        ..Reconnect::new(open, POLL)
+    };
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, None, reconnect);
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    wait_until(|| upgrades.load(Ordering::SeqCst) >= 1, "upgrade").await;
+
+    // The read-only listener is lost while the upgrade opens, and the pool
+    // connects again to the read-only server.
+    pool.listener().unwrap().disconnect();
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    assert!(pool.listener().unwrap().read_only());
+
+    // The late writable listener does not count. The next attempt takes
+    // the writable server.
+    release.send_replace(true);
+    assert_eq!(next_event(&pool).await, Event::Delivery(Delivery::Stale));
+    pool.delivered();
+    assert_eq!(
+        next_event(&pool).await,
+        Event::Connected(Verification::Kept)
+    );
+    pool.delivered();
+    let listener = pool.listener().unwrap();
+    assert!(!listener.read_only());
+    assert_eq!(listener.address(), &zoe_client::Address::Tcp(rw));
+    assert!(upgrades.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn a_closed_pool_opens_no_listener() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let count = opens.clone();
+    let open: Open = Arc::new(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(Error::Disconnected) })
+    });
+    let pool = Pool::with_reconnect(Arc::new(Tokio), None, 2, None, Reconnect::new(open, POLL));
+    wait_until(|| opens.load(Ordering::SeqCst) >= 3, "attempt").await;
+    pool.disconnect();
+    let after = opens.load(Ordering::SeqCst);
+    tokio::time::sleep(POLL * 10).await;
+    assert_eq!(opens.load(Ordering::SeqCst), after);
+    assert_eq!(pool.next_event().await, None);
 }

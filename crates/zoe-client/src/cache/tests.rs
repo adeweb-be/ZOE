@@ -212,6 +212,42 @@ fn clear_drops_every_entry_and_keeps_applied() {
 }
 
 #[test]
+fn a_verification_drops_the_current_entries_of_the_changed_oids() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"one", Tid(10)));
+    assert!(cache.store(Oid(2), Tid(6), None, b"two", Tid(10)));
+    assert!(cache.store(Oid(1), Tid(3), Some(Tid(5)), b"old", Tid(10)));
+    cache.verify(Tid(20), Some(&[Oid(1)]));
+    assert_eq!(cache.applied(), Tid(20));
+    // The changed oid has no current entry. Its entry with an end stays.
+    assert_eq!(cache.load(Oid(1)), None);
+    assert_eq!(cache.load_before(Oid(1), Tid(21)), None);
+    assert_eq!(
+        cache.load_before(Oid(1), Tid(4)),
+        Some(record(b"old", 3, Some(5)))
+    );
+    // The other current entry now serves the snapshots up to 20.
+    assert_eq!(
+        cache.load_before(Oid(2), Tid(21)),
+        Some(record(b"two", 6, None))
+    );
+    // A current reply from before the verification is refused.
+    assert!(!cache.store(Oid(1), Tid(15), None, b"late", Tid(12)));
+}
+
+#[test]
+fn a_verification_without_the_commits_drops_every_entry() {
+    let cache = cache_at(64 * KB, 10);
+    assert!(cache.store(Oid(1), Tid(5), None, b"one", Tid(10)));
+    assert!(cache.store(Oid(2), Tid(3), Some(Tid(5)), b"old", Tid(10)));
+    cache.verify(Tid(20), None);
+    assert_eq!(cache.applied(), Tid(20));
+    assert_eq!(cache.load(Oid(1)), None);
+    assert_eq!(cache.load_before(Oid(2), Tid(4)), None);
+    assert!(cache.store(Oid(1), Tid(18), None, b"new", Tid(20)));
+}
+
+#[test]
 fn a_disabled_cache_drops_every_entry_and_stores_nothing() {
     let cache = cache_at(64 * KB, 10);
     assert!(cache.store(Oid(1), Tid(5), None, b"five", Tid(10)));

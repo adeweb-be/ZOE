@@ -31,18 +31,30 @@
 //! in tid order, with `Turn::stale` true. A finish that had no reply fails
 //! with `Error::Disconnected`, and so does each later `begin` and finish.
 //!
+//! A pool of `Pool::with_reconnect` then connects again, as
+//! `ZEO.ClientStorage` does. It closes every connection of the lost server,
+//! so a transaction that began before the loss never commits. It opens a
+//! new listener at once, then every `poll`, and verifies the cache and the
+//! last tid of the pool against it, as `verify` of ZEO does. Only then do
+//! the connections of the new server serve calls. While the pool has no
+//! listener, each call fails with `Error::Disconnected`. With `upgrade`, a
+//! pool on a read-only server tries a writable server every `poll`, and
+//! takes it.
+//!
 //! A pool can hold a client cache (ADR 0034). The dispatcher applies each
 //! tid to the cache before the consumer or the finish gets it: a tid of
 //! another client ends the current entry of each of its oids, and a tid of
 //! the pool also adds the data of its commit. A load stores its reply with
-//! the position of the connection that carried it. A lost or lagged
-//! listener, and the close, drop every entry, and the cache stores nothing
-//! more.
+//! the position of the connection that carried it. The close drops every
+//! entry, and the cache stores nothing more. So does a lost or lagged
+//! listener, unless the pool connects again: then the cache stays, and the
+//! verification keeps it, ends some of its entries, or drops them all.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use zoe_core::{Oid, Tid};
@@ -59,6 +71,49 @@ use crate::runtime::{BoxFuture, Runtime};
 /// the listener.
 pub type Connect = Arc<dyn Fn() -> BoxFuture<Result<Client, Error>> + Send + Sync>;
 
+/// A function that opens a new listener, and returns it with the `Connect`
+/// of its server. With `true`, it opens only a writable listener.
+pub type Open = Arc<dyn Fn(bool) -> BoxFuture<Result<(Client, Connect), Error>> + Send + Sync>;
+
+/// The time between two attempts after the pool refused a server, as the
+/// `register_failed_poll` of `ZEO.ClientStorage`.
+pub const REFUSED_POLL: Duration = Duration::from_secs(9);
+
+/// How a pool connects again after it lost its listener.
+#[derive(Clone)]
+pub struct Reconnect {
+    /// Opens a new listener.
+    pub open: Open,
+    /// The time between two attempts.
+    pub poll: Duration,
+    /// The time before the next attempt after the pool refused a server.
+    pub refused_poll: Duration,
+    /// On a read-only server, try a writable server every `poll`.
+    pub upgrade: bool,
+}
+
+impl Reconnect {
+    /// Connect again through `open` every `poll`, without `upgrade`.
+    pub fn new(open: Open, poll: Duration) -> Reconnect {
+        Reconnect {
+            open,
+            poll,
+            refused_poll: REFUSED_POLL.max(poll),
+            upgrade: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Reconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reconnect")
+            .field("poll", &self.poll)
+            .field("refused_poll", &self.refused_poll)
+            .field("upgrade", &self.upgrade)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A tid that the pool gives to its consumer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
@@ -66,6 +121,36 @@ pub enum Delivery {
     Invalidate(Invalidation),
     /// The pool lost its listener. Any object can be stale.
     Stale,
+}
+
+/// The result of the verification of a new listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// The server had no commit after the last tid of the pool, or the pool
+    /// never had a listener.
+    Kept,
+    /// `getInvalidations` gave the commits after the base: `applied` of the
+    /// cache, or the last tid of the pool without a cache. The consumer got
+    /// them first, as one `Delivery::Invalidate`, also when the pool
+    /// already delivered their tid.
+    Quick,
+    /// The server does not keep the commits after the last tid of the
+    /// pool. The cache dropped every entry, and any object can be stale.
+    Dropped,
+}
+
+/// What the pool gives to its consumer: a delivery, or a change of the
+/// connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A tid, or the stale mark.
+    Delivery(Delivery),
+    /// The pool connected again, after the verification.
+    Connected(Verification),
+    /// The pool refused a server whose last tid is below the last tid of
+    /// the pool or of its cache, as ZEO refuses it. It stays disconnected,
+    /// and tries again after `Reconnect::refused_poll`.
+    Refused(String),
 }
 
 /// The counts of the hold of a pool.
@@ -87,26 +172,46 @@ pub struct Pool {
 /// The state that the pool, its transactions, its turns and its dispatcher
 /// share.
 struct Shared {
-    listener: Arc<Client>,
-    connect: Connect,
+    runtime: Arc<dyn Runtime>,
     bound: usize,
     /// The client cache, if the pool has one.
     cache: Option<Arc<Cache>>,
-    /// The connections that commit and are open. A load picks one of them
-    /// or the listener. The lock is held only to pick or to change one.
-    conns: RwLock<Vec<Arc<Client>>>,
+    /// How the pool connects again, if it does.
+    reconnect: Option<Reconnect>,
+    /// The connections of the server. A load picks one of them. The lock is
+    /// held only to pick or to change one. A writer takes `state` first.
+    server: RwLock<Server>,
     next_load: AtomicUsize,
     state: Mutex<State>,
     /// A new value tells each waiter that the state changed.
     changed: watch::Sender<u64>,
 }
 
+/// The connections to the server of the pool.
+#[derive(Default)]
+struct Server {
+    /// The listener, or `None` while the pool is disconnected.
+    listener: Option<Arc<Client>>,
+    /// The connections that commit and are open.
+    conns: Vec<Arc<Client>>,
+}
+
 /// The state of the connections and of the order of the pool.
 #[derive(Default)]
 struct State {
     closed: bool,
-    /// The listener is lost or lagged.
+    /// The pool has no listener: it lost it, or it never had one.
     lost: bool,
+    /// The pool never had a listener.
+    fresh: bool,
+    /// The number of the server. It changes when a pool that connects
+    /// again loses its listener. A connection of another number never
+    /// serves again.
+    generation: u64,
+    /// The function that opens a connection to the server of the listener.
+    connect: Option<Connect>,
+    /// A writable listener that the upgrade opened, for the next connection.
+    pending: Option<(Client, Connect)>,
     /// The connections that commit and wait for a transaction.
     free: Vec<Arc<Client>>,
     /// The connections that commit: open, or that open now.
@@ -126,15 +231,23 @@ struct State {
     abandoned: BTreeSet<u64>,
     /// The tid that the dispatcher delivers now.
     head: Option<u64>,
-    /// The delivery that waits for the consumer, and whether the consumer
-    /// took it.
-    offer: Option<(Delivery, bool)>,
+    /// The event that waits for the consumer.
+    offer: Option<Offer>,
     /// The deliveries that the dispatcher started, and those that ended.
     started: u64,
     ended: u64,
     /// The last tid that the pool delivered.
     last: u64,
     counters: Counters,
+}
+
+/// An event for the consumer.
+struct Offer {
+    event: Event,
+    /// The consumer took it.
+    taken: bool,
+    /// The tid that `last` moves to when the consumer confirms it.
+    tid: Option<u64>,
 }
 
 /// A finish that has its reply.
@@ -153,6 +266,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         lock(&self.state)
+    }
+
+    fn server(&self) -> RwLockReadGuard<'_, Server> {
+        self.server.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn server_mut(&self) -> RwLockWriteGuard<'_, Server> {
+        self.server.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wake each waiter, so that it reads the state again.
@@ -174,44 +295,79 @@ impl Shared {
         }
     }
 
+    /// Wait until the pool closes.
+    async fn closed(&self) {
+        self.until(|state| state.closed.then_some(())).await;
+    }
+
+    /// Wait for `duration`. Return false when the pool closes first.
+    async fn pause(&self, duration: Duration) -> bool {
+        tokio::select! {
+            biased;
+            () = self.closed() => false,
+            () = self.runtime.sleep(duration) => true,
+        }
+    }
+
+    /// Run `future` until it ends, or return `None` when the pool closes
+    /// first.
+    async fn unless_closed<T>(&self, future: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.closed() => None,
+            value = future => Some(value),
+        }
+    }
+
+    /// Return the listener, or fail with `Error::Disconnected` while the
+    /// pool has none.
+    fn listener(&self) -> Result<Arc<Client>, Error> {
+        self.server().listener.clone().ok_or(Error::Disconnected)
+    }
+
     /// Return a connection of the pool for a load, in turn: the listener
     /// or a connection that commits. Skip a connection that is lost. When
     /// all are lost, return the listener, so the load fails with
-    /// `Error::Disconnected`.
-    fn any_connection(&self) -> Arc<Client> {
-        let conns = self.conns.read().unwrap_or_else(PoisonError::into_inner);
-        let count = conns.len() + 1;
+    /// `Error::Disconnected`. Without a listener, fail with it.
+    fn any_connection(&self) -> Result<Arc<Client>, Error> {
+        let server = self.server();
+        let count = server.conns.len() + 1;
         let start = self.next_load.fetch_add(1, Ordering::Relaxed);
         for step in 0..count {
             let conn = match ((start + step) % count).checked_sub(1) {
-                Some(i) => &conns[i],
-                None => &self.listener,
+                Some(i) => Some(&server.conns[i]),
+                None => server.listener.as_ref(),
             };
-            if conn.is_connected() {
-                return conn.clone();
+            if let Some(conn) = conn
+                && conn.is_connected()
+            {
+                return Ok(conn.clone());
             }
         }
-        self.listener.clone()
+        server.listener.clone().ok_or(Error::Disconnected)
     }
 
     /// Return a connection of the pool for a download, in turn: a
     /// connection that commits and is not lost. When there is none, return
-    /// the listener.
-    fn download_connection(&self) -> Arc<Client> {
-        let conns = self.conns.read().unwrap_or_else(PoisonError::into_inner);
+    /// the listener. Without a listener, fail with `Error::Disconnected`.
+    fn download_connection(&self) -> Result<Arc<Client>, Error> {
+        let server = self.server();
+        let conns = &server.conns;
         let start = self.next_load.fetch_add(1, Ordering::Relaxed);
         (0..conns.len())
             .map(|step| &conns[(start + step) % conns.len()])
             .find(|conn| conn.is_connected())
-            .unwrap_or(&self.listener)
-            .clone()
+            .or(server.listener.as_ref())
+            .cloned()
+            .ok_or(Error::Disconnected)
     }
 
     /// Forget the connection `client`, which closed or which the pool
     /// closes.
     fn forget(&self, client: &Arc<Client>) {
-        let mut conns = self.conns.write().unwrap_or_else(PoisonError::into_inner);
-        conns.retain(|conn| !Arc::ptr_eq(conn, client));
+        self.server_mut()
+            .conns
+            .retain(|conn| !Arc::ptr_eq(conn, client));
     }
 }
 
@@ -222,7 +378,8 @@ impl Pool {
     ///
     /// The pool starts at the last tid of the listener. It reads the
     /// invalidations of the listener from now on. The pool needs a consumer
-    /// of its deliveries: the dispatcher waits for each one.
+    /// of its deliveries: the dispatcher waits for each one. A lost
+    /// listener ends the pool: it does not connect again.
     pub fn new(
         runtime: Arc<dyn Runtime>,
         listener: Client,
@@ -242,35 +399,76 @@ impl Pool {
         bound: usize,
         cache: Option<Cache>,
     ) -> Pool {
-        // Subscribe first, then read the last tid: the reader raises the
-        // last tid before it sends an invalidation.
-        let invalidations = listener.invalidations();
-        let state = State {
-            last: listener.last_transaction().0,
-            ..State::default()
-        };
+        Pool::start(runtime, Some((listener, connect)), bound, cache, None)
+    }
+
+    /// Start a pool as `with_cache` does, that connects again through
+    /// `reconnect` when it loses its listener. Without `first`, the pool
+    /// starts disconnected and connects in the background: each call fails
+    /// with `Error::Disconnected` until then.
+    pub fn with_reconnect(
+        runtime: Arc<dyn Runtime>,
+        first: Option<(Client, Connect)>,
+        bound: usize,
+        cache: Option<Cache>,
+        reconnect: Reconnect,
+    ) -> Pool {
+        Pool::start(runtime, first, bound, cache, Some(reconnect))
+    }
+
+    fn start(
+        runtime: Arc<dyn Runtime>,
+        first: Option<(Client, Connect)>,
+        bound: usize,
+        cache: Option<Cache>,
+        reconnect: Option<Reconnect>,
+    ) -> Pool {
+        let mut state = State::default();
+        let mut server = Server::default();
+        let mut invalidations = None;
+        match first {
+            Some((listener, connect)) => {
+                // Subscribe first, then read the last tid: the reader raises
+                // the last tid before it sends an invalidation.
+                invalidations = Some(listener.invalidations());
+                state.last = listener.last_transaction().0;
+                state.connect = Some(connect);
+                server.listener = Some(Arc::new(listener));
+            }
+            None => {
+                state.lost = true;
+                state.fresh = true;
+            }
+        }
         // An empty cache is true at any tid.
         if let Some(cache) = &cache {
             cache.apply(Tid(state.last), &[]);
         }
+        let upgrade = reconnect
+            .as_ref()
+            .is_some_and(|reconnect| reconnect.upgrade);
         let shared = Arc::new(Shared {
-            listener: Arc::new(listener),
-            connect,
+            runtime: runtime.clone(),
             bound: bound.max(1),
             cache: cache.map(Arc::new),
-            conns: RwLock::new(Vec::new()),
+            reconnect,
+            server: RwLock::new(server),
             next_load: AtomicUsize::new(0),
             state: Mutex::new(state),
             changed: watch::channel(0).0,
         });
         runtime.spawn(Box::pin(dispatch(shared.clone(), invalidations)));
+        if upgrade {
+            runtime.spawn(Box::pin(upgrade_forever(shared.clone())));
+        }
         Pool { shared }
     }
 
     /// Return the listener: the reply of its `get_info`, its extensions,
-    /// its address and whether it registered read-only.
-    pub fn listener(&self) -> &Client {
-        &self.shared.listener
+    /// its address and whether it registered read-only. Return `None`
+    /// while the pool has no listener.
+    pub fn listener(&self) -> Option<Arc<Client>> {
+        self.shared.server().listener.clone()
     }
 
     /// Return the most connections that commit at once.
@@ -289,10 +487,18 @@ impl Pool {
         self.shared.lock().counters
     }
 
-    /// Tell if the pool is open: not closed, and its listener is not lost.
+    /// Tell if the pool is open: not closed, and it has a listener that is
+    /// not lost.
     pub fn is_connected(&self) -> bool {
         let state = self.shared.lock();
-        !state.closed && !state.lost && self.shared.listener.is_connected()
+        !state.closed
+            && !state.lost
+            && self
+                .shared
+                .server()
+                .listener
+                .as_ref()
+                .is_some_and(|listener| listener.is_connected())
     }
 
     /// Return the last tid that the pool delivered: the tid of `register`
@@ -314,7 +520,7 @@ impl Pool {
 
     /// Return `n` new oids, through the listener.
     pub async fn new_oids(&self, n: usize) -> Result<Vec<Oid>, Error> {
-        self.shared.listener.new_oids(n).await
+        self.shared.listener()?.new_oids(n).await
     }
 
     /// Load the record of `oid` that was current just before `tid` from
@@ -326,7 +532,7 @@ impl Pool {
     pub async fn load_before(&self, oid: Oid, tid: Tid) -> Result<(Option<Record>, Tid), Error> {
         let (record, position) = self
             .shared
-            .any_connection()
+            .any_connection()?
             .load_before_at(oid, tid)
             .await?;
         if let (Some(cache), Some(record)) = (&self.shared.cache, &record) {
@@ -351,7 +557,7 @@ impl Pool {
     /// Load the record of `oid` that the transaction `serial` wrote,
     /// through any connection.
     pub async fn load_serial(&self, oid: Oid, serial: Tid) -> Result<Vec<u8>, Error> {
-        self.shared.any_connection().load_serial(oid, serial).await
+        self.shared.any_connection()?.load_serial(oid, serial).await
     }
 
     /// Download the blob of `oid` that the transaction `serial` wrote into
@@ -370,25 +576,25 @@ impl Pool {
         sink: &mut W,
     ) -> Result<u64, Error> {
         self.shared
-            .download_connection()
+            .download_connection()?
             .send_blob(oid, serial, sink)
             .await
     }
 
     /// Return at most `size` entries of the history of `oid`.
     pub async fn history(&self, oid: Oid, size: usize) -> Result<Vec<HistoryEntry>, Error> {
-        self.shared.any_connection().history(oid, size).await
+        self.shared.any_connection()?.history(oid, size).await
     }
 
     /// Return the next value of the sequence `name`, through the listener.
     pub async fn sequence_next(&self, name: &str) -> Result<u64, Error> {
-        self.shared.listener.sequence_next(name).await
+        self.shared.listener()?.sequence_next(name).await
     }
 
     /// Begin a transaction on a free connection, as `Client::begin_with`
     /// does. Open a connection when none is free and the pool has less than
-    /// its bound. Else wait for a free one. After the close or a lost
-    /// listener, fail with `Error::Disconnected`.
+    /// its bound. Else wait for a free one. After the close, or while the
+    /// pool has no listener, fail with `Error::Disconnected`.
     pub async fn begin_with(
         &self,
         user: &[u8],
@@ -421,14 +627,16 @@ impl Pool {
                 }
                 while let Some(client) = state.free.pop() {
                     if client.is_connected() {
-                        return Some(Ok(Some(client)));
+                        return Some(Ok((Ok(client), state.generation)));
                     }
                     state.opened = state.opened.saturating_sub(1);
                     dead.push(client);
                 }
-                if state.opened < shared.bound {
+                if state.opened < shared.bound
+                    && let Some(connect) = &state.connect
+                {
                     state.opened += 1;
-                    return Some(Ok(None));
+                    return Some(Ok((Err(connect.clone()), state.generation)));
                 }
                 None
             })
@@ -437,37 +645,47 @@ impl Pool {
             shared.forget(client);
             client.disconnect();
         }
-        let client = match taken? {
-            Some(client) => client,
-            None => {
+        let (taken, generation) = taken?;
+        let client = match taken {
+            Ok(client) => client,
+            Err(connect) => {
                 // The slot goes back to the pool when the connect fails or
                 // its future drops.
                 let mut slot = Opening {
                     shared: shared.clone(),
+                    generation,
                     armed: true,
                 };
-                let client = Arc::new((shared.connect)().await?);
+                let client = Arc::new(connect().await?);
+                let state = shared.lock();
+                // The pool lost the server while the connection opened.
+                if state.closed || state.lost || state.generation != generation {
+                    drop(state);
+                    client.disconnect();
+                    return Err(Error::Disconnected);
+                }
                 slot.armed = false;
-                let mut conns = shared.conns.write().unwrap_or_else(PoisonError::into_inner);
-                conns.push(client.clone());
+                shared.server_mut().conns.push(client.clone());
+                drop(state);
                 client
             }
         };
         Ok(Lease {
             shared: shared.clone(),
             client: Some(client),
+            generation,
         })
     }
 
-    /// Return the next delivery for the consumer. Wait until the dispatcher
-    /// gives one. Return `None` after the close. The consumer confirms each
-    /// delivery with `delivered`.
-    pub async fn next_delivery(&self) -> Option<Delivery> {
+    /// Return the next event for the consumer: a delivery, or a change of
+    /// the connection. Wait until the dispatcher gives one. Return `None`
+    /// after the close. The consumer confirms each event with `delivered`.
+    pub async fn next_event(&self) -> Option<Event> {
         self.shared
             .until(|state| match &mut state.offer {
-                Some((delivery, taken @ false)) => {
-                    *taken = true;
-                    Some(Some(delivery.clone()))
+                Some(offer) if !offer.taken => {
+                    offer.taken = true;
+                    Some(Some(offer.event.clone()))
                 }
                 _ if state.closed => Some(None),
                 _ => None,
@@ -475,15 +693,30 @@ impl Pool {
             .await
     }
 
-    /// Confirm the delivery that `next_delivery` gave: the consumer applied
-    /// it. The pool then delivers the next tid.
+    /// Return the next delivery for the consumer, as `next_event` does. It
+    /// confirms each other event itself. The consumer confirms each
+    /// delivery with `delivered`. The consumer of a pool of
+    /// `with_reconnect` must call `next_event`: only that call gives
+    /// `Event::Connected(Verification::Dropped)`, after which any object
+    /// can be stale.
+    pub async fn next_delivery(&self) -> Option<Delivery> {
+        loop {
+            match self.next_event().await? {
+                Event::Delivery(delivery) => return Some(delivery),
+                _ => self.delivered(),
+            }
+        }
+    }
+
+    /// Confirm the event that `next_event` or `next_delivery` gave: the
+    /// consumer applied it. The pool then goes on.
     pub fn delivered(&self) {
         let mut state = self.shared.lock();
-        if !matches!(state.offer, Some((_, true))) {
+        let Some(offer) = state.offer.take_if(|offer| offer.taken) else {
             return;
-        }
-        if let Some((Delivery::Invalidate(invalidation), _)) = state.offer.take() {
-            state.last = state.last.max(invalidation.tid.0);
+        };
+        if let Some(tid) = offer.tid {
+            state.last = state.last.max(tid);
         }
         state.ended += 1;
         drop(state);
@@ -492,28 +725,28 @@ impl Pool {
 
     /// Close the pool and each of its connections, and do not wait for
     /// their tasks. Each call that waits fails with `Error::Disconnected`,
-    /// and `next_delivery` gives `None`.
+    /// and `next_delivery` gives `None`. The pool stops to connect again.
     pub fn disconnect(&self) {
-        let free = {
+        let (free, pending) = {
             let mut state = self.shared.lock();
             state.closed = true;
-            std::mem::take(&mut state.free)
+            (std::mem::take(&mut state.free), state.pending.take())
         };
         if let Some(cache) = &self.shared.cache {
             cache.disable();
         }
         self.shared.bump();
-        self.shared.listener.disconnect();
-        let conns = self
-            .shared
-            .conns
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        for conn in &conns {
-            conn.disconnect();
+        {
+            let server = self.shared.server();
+            if let Some(listener) = &server.listener {
+                listener.disconnect();
+            }
+            for conn in &server.conns {
+                conn.disconnect();
+            }
         }
         drop(free);
+        drop(pending);
     }
 }
 
@@ -532,10 +765,13 @@ impl std::fmt::Debug for Pool {
 }
 
 /// A connection that a transaction holds. The drop gives it back to the
-/// pool, or closes it when it is lost or the pool is closed.
+/// pool, or closes it when it is lost, when the pool is closed, or when the
+/// pool lost its server.
 struct Lease {
     shared: Arc<Shared>,
     client: Option<Arc<Client>>,
+    /// The number of the server of the connection.
+    generation: u64,
 }
 
 impl Lease {
@@ -551,13 +787,18 @@ impl Drop for Lease {
         };
         let keep = {
             let mut state = self.shared.lock();
-            let keep = !state.closed && client.is_connected();
-            if keep {
-                state.free.push(client.clone());
+            // The pool already forgot the connections of another server.
+            if state.generation != self.generation {
+                false
             } else {
-                state.opened = state.opened.saturating_sub(1);
+                let keep = !state.closed && !state.lost && client.is_connected();
+                if keep {
+                    state.free.push(client.clone());
+                } else {
+                    state.opened = state.opened.saturating_sub(1);
+                }
+                keep
             }
-            keep
         };
         if !keep {
             self.shared.forget(&client);
@@ -568,9 +809,10 @@ impl Drop for Lease {
 }
 
 /// A slot of `opened` for a connection that opens now. The drop gives the
-/// slot back, unless the connection opened.
+/// slot back, unless the connection opened or the pool lost its server.
 struct Opening {
     shared: Arc<Shared>,
+    generation: u64,
     armed: bool,
 }
 
@@ -581,7 +823,9 @@ impl Drop for Opening {
         }
         {
             let mut state = self.shared.lock();
-            state.opened = state.opened.saturating_sub(1);
+            if state.generation == self.generation {
+                state.opened = state.opened.saturating_sub(1);
+            }
         }
         self.shared.bump();
     }
@@ -752,15 +996,16 @@ impl PoolTransaction {
     ///
     /// The finish counts as in flight from before its frame goes out, until
     /// its reply or its failure, also when its future is dropped. After the
-    /// close or a lost listener, it fails with `Error::Disconnected` and
-    /// sends nothing. A finish that waited for its reply when the listener
-    /// was lost fails with `Error::Disconnected` too: its outcome counts as
+    /// close, after a lost listener, or on a connection of a server that
+    /// the pool lost, it fails with `Error::Disconnected` and sends
+    /// nothing. A finish that waited for its reply when the listener was
+    /// lost fails with `Error::Disconnected` too: its outcome counts as
     /// unknown.
     pub async fn finish(mut self) -> Result<Finished, Error> {
         let shared = self.lease.shared.clone();
         let seq = {
             let mut state = shared.lock();
-            if state.closed || state.lost {
+            if state.closed || state.lost || state.generation != self.lease.generation {
                 return Err(Error::Disconnected);
             }
             let seq = state.next_seq;
@@ -865,7 +1110,9 @@ impl Finished {
     ///
     /// At the turn, before it returns, the commit goes into the cache of the
     /// pool: it ends the current entry of each oid that it wrote, and adds
-    /// the data of each store that the server did not resolve.
+    /// the data of each store that the server did not resolve. A turn after
+    /// a lost listener only drops the current entry of each oid that it
+    /// wrote: the cache did not get the commits before it.
     pub async fn turn(mut self) -> Result<Turn, Error> {
         let tid = self.tid;
         let stale = self
@@ -882,10 +1129,14 @@ impl Finished {
             })
             .await?;
         self.armed = false;
-        if let Some(cache) = &self.shared.cache
-            && !stale
-        {
-            cache.commit(tid, &last_writes(&self.writes));
+        if let Some(cache) = &self.shared.cache {
+            if stale {
+                for (oid, _) in &self.writes {
+                    cache.drop_current(*oid);
+                }
+            } else {
+                cache.commit(tid, &last_writes(&self.writes));
+            }
         }
         Ok(Turn {
             shared: self.shared.clone(),
@@ -983,27 +1234,47 @@ enum Route {
     Own,
 }
 
-/// The dispatcher: deliver each tid of the listener in turn, until the
-/// close or the loss of the listener.
-async fn dispatch(shared: Arc<Shared>, mut invalidations: Invalidations) {
+/// The dispatcher: deliver each tid of the listener in turn. When the
+/// listener is lost, give the stale mark, then connect again if the pool
+/// does. Stop at the close.
+async fn dispatch(shared: Arc<Shared>, mut stream: Option<Invalidations>) {
     loop {
-        match invalidations.recv().await {
-            Ok(invalidation) => match deliver(&shared, invalidation).await {
-                Step::Next => {}
-                Step::Closed => return,
-                Step::Lost => {
-                    if !shared.lock().closed {
-                        lose(&shared).await;
-                    }
-                    return;
-                }
-            },
-            Err(_) => {
-                if !shared.lock().closed {
-                    lose(&shared).await;
-                }
+        if let Some(mut invalidations) = stream.take() {
+            let Ok(listener) = shared.listener() else {
+                return;
+            };
+            if !serve(&shared, &listener, &mut invalidations).await {
                 return;
             }
+            if shared.lock().closed {
+                return;
+            }
+            lose(&shared, &listener).await;
+            if shared.lock().closed {
+                return;
+            }
+        }
+        if shared.reconnect.is_none() {
+            return;
+        }
+        match reconnect(&shared).await {
+            Some(invalidations) => stream = Some(invalidations),
+            None => return,
+        }
+    }
+}
+
+/// Deliver each tid of `listener` until the loss of the listener: then
+/// return true. Return false after the close.
+async fn serve(shared: &Shared, listener: &Client, invalidations: &mut Invalidations) -> bool {
+    loop {
+        match invalidations.recv().await {
+            Ok(invalidation) => match deliver(shared, listener, invalidation).await {
+                Step::Next => {}
+                Step::Closed => return false,
+                Step::Lost => return true,
+            },
+            Err(_) => return true,
         }
     }
 }
@@ -1018,15 +1289,16 @@ enum Step {
     Lost,
 }
 
-/// Deliver the tid of `invalidation`.
-async fn deliver(shared: &Shared, invalidation: Invalidation) -> Step {
+/// Deliver the tid of `invalidation`, which came on `listener`.
+async fn deliver(shared: &Shared, listener: &Client, invalidation: Invalidation) -> Step {
     let tid = invalidation.tid.0;
     let horizon = {
         let mut state = shared.lock();
         if state.closed {
             return Step::Closed;
         }
-        // A tid at or before the start of the pool was before the open.
+        // A tid at or before the last tid of the pool came before the open,
+        // or before the verification of a new listener.
         if tid <= state.last {
             return Step::Next;
         }
@@ -1059,7 +1331,7 @@ async fn deliver(shared: &Shared, invalidation: Invalidation) -> Step {
     let route = tokio::select! {
         biased;
         route = hold => route,
-        () = shared.listener.closed() => {
+        () = listener.closed() => {
             shared.lock().head = None;
             return Step::Lost;
         }
@@ -1088,8 +1360,28 @@ async fn offer(shared: &Shared, invalidation: Invalidation) -> bool {
     if let Some(cache) = &shared.cache {
         cache.apply(invalidation.tid, &invalidation.oids);
     }
-    shared.lock().offer = Some((Delivery::Invalidate(invalidation), false));
+    let tid = invalidation.tid.0;
+    let event = Event::Delivery(Delivery::Invalidate(invalidation));
+    put(shared, event, Some(tid));
+    wait_for_consumer(shared).await
+}
+
+/// Offer `event` to the consumer. Its confirmation moves `last` to `tid`.
+/// The caller counts the delivery in `started`.
+fn put(shared: &Shared, event: Event, tid: Option<u64>) {
+    shared.lock().offer = Some(Offer {
+        event,
+        taken: false,
+        tid,
+    });
     shared.bump();
+}
+
+/// Count a delivery, offer `event` to the consumer, and wait until the
+/// consumer confirmed it. Return false after the close.
+async fn announce(shared: &Shared, event: Event, tid: Option<u64>) -> bool {
+    shared.lock().started += 1;
+    put(shared, event, tid);
     wait_for_consumer(shared).await
 }
 
@@ -1131,22 +1423,47 @@ async fn wait_for_turn(shared: &Shared, tid: u64) -> Option<bool> {
 /// The listener is lost or lagged. Fail the finishes that wait for their
 /// reply. Give the consumer `Delivery::Stale`, then give each finish that
 /// has its reply its turn, in tid order.
-async fn lose(shared: &Shared) {
-    // The cache no longer gets the commits in order: an empty cache is true
-    // at any tid.
-    if let Some(cache) = &shared.cache {
+///
+/// A pool that connects again also closes each connection of the server
+/// and forgets them: a transaction on one of them fails at its next call.
+async fn lose(shared: &Shared, listener: &Client) {
+    let reconnects = shared.reconnect.is_some();
+    // Without a new connection, the cache no longer gets the commits in
+    // order: an empty cache is true at any tid. With one, the verification
+    // keeps what stays true.
+    if let Some(cache) = &shared.cache
+        && !reconnects
+    {
         cache.disable();
     }
-    {
+    let (free, conns) = {
         let mut state = shared.lock();
         state.lost = true;
         let in_flight = std::mem::take(&mut state.in_flight);
         state.doomed.extend(in_flight);
-        state.offer = Some((Delivery::Stale, false));
+        state.offer = Some(Offer {
+            event: Event::Delivery(Delivery::Stale),
+            taken: false,
+            tid: None,
+        });
         state.started += 1;
-    }
+        if reconnects {
+            state.generation += 1;
+            state.opened = 0;
+            state.connect = None;
+            let free = std::mem::take(&mut state.free);
+            let mut server = shared.server_mut();
+            server.listener = None;
+            (free, std::mem::take(&mut server.conns))
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    };
     shared.bump();
-    shared.listener.disconnect();
+    listener.disconnect();
+    for conn in conns.iter().chain(&free) {
+        conn.disconnect();
+    }
     if !wait_for_consumer(shared).await {
         return;
     }
@@ -1173,6 +1490,214 @@ async fn lose(shared: &Shared) {
             }
             Some(false) => {}
             None => return,
+        }
+    }
+}
+
+/// The outcome of the verification of a new listener.
+enum Verified {
+    /// The pool takes the server. The confirmation of `Event::Connected`
+    /// moves `last` to the tid.
+    Taken(Verification, Option<u64>),
+    /// The pool refuses the server: its last tid is below the pool's.
+    Refused(String),
+    /// The verification failed: the connection is lost, or the server
+    /// failed `getInvalidations`.
+    Failed,
+    /// The pool closed.
+    Closed,
+}
+
+/// Connect again: open a listener at once, then every `poll`, until one
+/// passes the verification. Then take its server, and return its stream of
+/// invalidations. Return `None` after the close.
+async fn reconnect(shared: &Shared) -> Option<Invalidations> {
+    let settings = shared.reconnect.clone()?;
+    let mut delay = Duration::ZERO;
+    loop {
+        if !delay.is_zero() && !shared.pause(delay).await {
+            return None;
+        }
+        delay = settings.poll;
+        // A pending listener that the server closed since is of no use.
+        let pending = shared.lock().pending.take();
+        let pending = pending.filter(|(client, _)| client.is_connected());
+        let opened = match pending {
+            Some(opened) => Ok(opened),
+            None => shared.unless_closed((settings.open)(false)).await?,
+        };
+        let Ok((client, connect)) = opened else {
+            continue;
+        };
+        // Subscribe first, then read the last tid: the reader raises the
+        // last tid before it sends an invalidation.
+        let invalidations = client.invalidations();
+        match verify(shared, &client).await {
+            Verified::Taken(verification, tid) => {
+                take(shared, client, connect);
+                if !announce(shared, Event::Connected(verification), tid).await {
+                    return None;
+                }
+                return Some(invalidations);
+            }
+            Verified::Refused(text) => {
+                client.disconnect();
+                delay = settings.refused_poll;
+                if !announce(shared, Event::Refused(text), None).await {
+                    return None;
+                }
+            }
+            Verified::Failed => client.disconnect(),
+            Verified::Closed => return None,
+        }
+    }
+}
+
+/// Verify the cache and the last tid of the pool against the new listener
+/// `client`, as `verify` of `ZEO/asyncio/client.py` does.
+///
+/// The base is `applied` of the cache, or the last tid of the pool without
+/// a cache. A server whose last tid is the base keeps the cache. A last tid
+/// below the base, or below the last tid of the pool, refuses the server.
+/// A last tid above the base asks `getInvalidations(base)`: the cache drops
+/// the current entry of each oid that it gives, and the consumer gets them
+/// as one invalidation at the tid of the reply. Its confirmation never
+/// moves the last tid of the pool back. When the server answers `None`, the
+/// cache drops every entry. A pool that never had a listener takes the
+/// server as it is.
+async fn verify(shared: &Shared, client: &Client) -> Verified {
+    let server_tid = client.last_transaction();
+    let (last, fresh) = {
+        let mut state = shared.lock();
+        let fresh = std::mem::take(&mut state.fresh);
+        if fresh {
+            state.last = state.last.max(server_tid.0);
+        }
+        (state.last, fresh)
+    };
+    if fresh {
+        if let Some(cache) = &shared.cache {
+            cache.verify(server_tid, Some(&[]));
+        }
+        return Verified::Taken(Verification::Kept, None);
+    }
+    let base = shared
+        .cache
+        .as_ref()
+        .map_or(last, |cache| cache.applied().0);
+    if base.max(last) > server_tid.0 {
+        return Verified::Refused(format!(
+            "the last transaction {:016x} of the server at {} is before the last \
+             transaction {last:016x} of the client or {base:016x} of its cache",
+            server_tid.0,
+            client.address(),
+        ));
+    }
+    if base == server_tid.0 {
+        return Verified::Taken(Verification::Kept, None);
+    }
+    let reply = match shared
+        .unless_closed(client.get_invalidations(Tid(base)))
+        .await
+    {
+        None => return Verified::Closed,
+        Some(Err(_)) => return Verified::Failed,
+        Some(Ok(reply)) => reply,
+    };
+    match reply {
+        Some(invalidation) => {
+            if let Some(cache) = &shared.cache {
+                cache.verify(invalidation.tid, Some(&invalidation.oids));
+            }
+            // The consumer always gets the oids of the reply, as ZEO calls
+            // `invalidateTransaction` after `getInvalidations`. The tid can
+            // be the last tid of the pool: a turn after the loss moved the
+            // last tid past the base, and the commits of other clients
+            // between the base and that tid never reached the consumer.
+            // Then the confirmation keeps the last tid.
+            let tid = invalidation.tid.0;
+            let event = Event::Delivery(Delivery::Invalidate(invalidation));
+            if !announce(shared, event, Some(tid)).await {
+                return Verified::Closed;
+            }
+            Verified::Taken(Verification::Quick, None)
+        }
+        None => {
+            if let Some(cache) = &shared.cache {
+                cache.verify(server_tid, None);
+            }
+            Verified::Taken(Verification::Dropped, Some(server_tid.0))
+        }
+    }
+}
+
+/// Take the server of the new listener `client`: the pool is connected.
+fn take(shared: &Shared, client: Client, connect: Connect) {
+    {
+        let mut state = shared.lock();
+        if state.closed {
+            drop(state);
+            client.disconnect();
+            return;
+        }
+        state.lost = false;
+        state.connect = Some(connect);
+        shared.server_mut().listener = Some(Arc::new(client));
+    }
+    shared.bump();
+}
+
+/// While the listener is read-only, try a writable server every `poll`.
+/// When one opens, keep it for the next connection, and close the
+/// listener: the dispatcher then connects again, on that server. Stop at
+/// the close.
+async fn upgrade_forever(shared: Arc<Shared>) {
+    let Some(settings) = shared.reconnect.clone() else {
+        return;
+    };
+    loop {
+        if !shared.pause(settings.poll).await {
+            return;
+        }
+        let ready = {
+            let state = shared.lock();
+            !state.lost && state.pending.is_none()
+        };
+        let listener = shared.server().listener.clone();
+        let Some(listener) = listener.filter(|listener| ready && listener.read_only()) else {
+            continue;
+        };
+        let Some(opened) = shared.unless_closed((settings.open)(true)).await else {
+            return;
+        };
+        if let Ok((client, connect)) = opened
+            && !client.read_only()
+        {
+            let kept = {
+                let mut state = shared.lock();
+                if state.closed {
+                    return;
+                }
+                // The listener can change during the open: the pool lost it,
+                // and connected again. Then the writable listener comes too
+                // late, and the next attempt opens a new one.
+                let same = !state.lost
+                    && shared
+                        .server()
+                        .listener
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &listener));
+                if same {
+                    state.pending = Some((client, connect));
+                    None
+                } else {
+                    Some(client)
+                }
+            };
+            match kept {
+                None => listener.disconnect(),
+                Some(client) => client.disconnect(),
+            }
         }
     }
 }
