@@ -2,12 +2,14 @@
 //! certificates.
 //!
 //! The client always checks the chain of the server certificate against
-//! `authenticate`. With `check_hostname`, it also checks the name. A failed
-//! check fails the open, and the client never speaks without TLS.
+//! `authenticate`: a file, a directory, or the CA certificates of the
+//! system when it has none. With `check_hostname`, it also checks the name.
+//! A failed check fails the open, and the client never speaks without TLS.
 //!
 //! The test makes its certificates with the `openssl` command, as the TLS
 //! tests of `zoe-server` do, so the repository holds no key.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -130,8 +132,14 @@ async fn open(
     )
     .key(certs.join("client.key"))
     .check_hostname(check);
+    open_with(server.addr(), options, name).await
+}
+
+/// Open a client of `addr` with the TLS of `options` and the server name
+/// `name`.
+async fn open_with(addr: SocketAddr, options: TlsOptions, name: &str) -> Result<Client, Error> {
     let tls = Tls::load(&options).unwrap();
-    let endpoint = Endpoint::new(server.addr()).tls(tls, name).unwrap();
+    let endpoint = Endpoint::new(addr).tls(tls, name).unwrap();
     Client::open_endpoint(Arc::new(Tokio), &endpoint, "1", &Options::default()).await
 }
 
@@ -171,4 +179,99 @@ async fn a_tls_client_never_speaks_to_a_server_without_tls() {
     let server = Server::start(ServeOptions::new(fresh_dir("plain").join("store"))).unwrap();
     let opened = open(&server, "server-ca", false, "localhost").await;
     assert!(opened.is_err(), "{opened:?}");
+}
+
+/// Return a new directory `name` with a copy of the CA certificate of each
+/// of `cas`.
+fn ca_dir(name: &str, cas: &[&str]) -> PathBuf {
+    let dir = fresh_dir(name);
+    for ca in cas {
+        let file = format!("{ca}.pem");
+        std::fs::copy(certs().join(&file), dir.join(&file)).unwrap();
+    }
+    dir
+}
+
+#[tokio::test]
+async fn a_directory_of_ca_files_as_authenticate_checks_the_chain() {
+    let server = serve("dir");
+    let (cert, key) = (certs().join("client.pem"), certs().join("client.key"));
+    let dir = ca_dir("dir-good", &["other-ca", "server-ca"]);
+    let options = TlsOptions::new(&cert, &dir).key(&key);
+    let client = open_with(server.addr(), options, "localhost")
+        .await
+        .unwrap();
+    client.close().await;
+    let dir = ca_dir("dir-other", &["other-ca"]);
+    for check in [true, false] {
+        let options = TlsOptions::new(&cert, &dir).key(&key).check_hostname(check);
+        let refused = open_with(server.addr(), options, "localhost").await;
+        assert!(matches!(refused, Err(Error::Io(_))), "{check}: {refused:?}");
+    }
+}
+
+/// The variable that starts the open of [`child_opens_with_the_system_store`]:
+/// the address of the server, `open` or `refused`, and the directory of
+/// the certificates.
+const CHILD: &str = "ZOE_CLIENT_TLS_TEST_CHILD";
+
+/// The line that the child prints when it ran.
+const CHILD_RAN: &str = "the child opened with the system store";
+
+/// Run [`child_opens_with_the_system_store`] in a new process of this test
+/// binary, with `SSL_CERT_FILE` set to the CA certificate `ca` and without
+/// `SSL_CERT_DIR`. So the store of the system holds `ca` only. The child
+/// expects `outcome`. Fail when the child fails or does not run.
+fn in_child(name: &str, ca: &str, outcome: &str) {
+    let server = serve(name);
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_opens_with_the_system_store",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_remove("SSL_CERT_DIR")
+        .env("SSL_CERT_FILE", certs().join(format!("{ca}.pem")))
+        .env(
+            CHILD,
+            format!("{} {outcome} {}", server.addr(), certs().display()),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains(CHILD_RAN), "{stdout}\n{stderr}");
+}
+
+/// Open a client without `authenticate` when [`CHILD`] is set, else do
+/// nothing. [`in_child`] runs it with the system store that it sets.
+#[tokio::test]
+async fn child_opens_with_the_system_store() {
+    let Some(spec) = std::env::var_os(CHILD) else {
+        return;
+    };
+    let spec = spec.into_string().unwrap();
+    let mut parts = spec.splitn(3, ' ');
+    let (addr, outcome) = (parts.next().unwrap(), parts.next().unwrap());
+    let certs = Path::new(parts.next().unwrap());
+    let options = TlsOptions::system(certs.join("client.pem")).key(certs.join("client.key"));
+    let opened = open_with(addr.parse().unwrap(), options, "localhost").await;
+    match outcome {
+        "open" => opened.unwrap().close().await,
+        _ => assert!(matches!(opened, Err(Error::Io(_))), "{opened:?}"),
+    }
+    println!("{CHILD_RAN}");
+}
+
+#[test]
+fn without_authenticate_a_ca_of_the_system_store_checks_the_chain() {
+    in_child("system", "server-ca", "open");
+}
+
+#[test]
+fn without_authenticate_a_ca_that_the_system_store_does_not_hold_fails_the_open() {
+    in_child("system-other", "other-ca", "refused");
 }
