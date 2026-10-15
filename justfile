@@ -155,13 +155,15 @@ fuzz seconds="60" *targets="frame handshake":
 # Run the test suites of ZODB in-process against zoe.Storage, and ZEO's
 # suites against zoe serve, on every interpreter. `just test` does not
 # collect them. The test forker of ZEO starts the `zoe` binary of the debug
-# build.
-conformance:
+# build. `just conformance PYTHONS TESTS` runs only the given interpreters
+# and pytest arguments, for example
+# `just conformance 3.13 zoedb/tests/conformance/test_zeo_suites.py`.
+conformance only=pythons *tests="zoedb/tests/conformance":
     cargo build --locked -p zoe-server --bin zoe
     export ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe"; \
-    for py in {{ pythons }}; do \
+    for py in {{ only }}; do \
         echo "== CPython $py"; \
-        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q zoedb/tests/conformance; \
+        UV_PROJECT_ENVIRONMENT=.venv-$py uv run --locked --directory python --python $py pytest -q {{ tests }}; \
     done
 
 # Run the process kill loop against `zoe serve` for `runs` rounds, on

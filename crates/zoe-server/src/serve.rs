@@ -603,7 +603,8 @@ impl Server {
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
             let named = named
                 .read_only(read_only)
-                .shared_blob_dir(options.shared_blob_dir);
+                .shared_blob_dir(options.shared_blob_dir)
+                .timeout(!options.idle_timeout.is_zero());
             storages.push(Arc::new(named));
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
