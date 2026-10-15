@@ -91,12 +91,14 @@ in
     LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
   };
 
-  # Heap profiles for the memory spikes. Enter the profile with
+  # Heap and CPU profiles for the spikes. Enter the profile with
   # `devenv --profile profiling shell`. The default shell and CI do not
-  # fetch it, because heaptrack brings Qt.
+  # fetch it, because heaptrack brings Qt. perf needs a
+  # `kernel.perf_event_paranoid` of 2 or less on the host.
   profiles.profiling.module = {
     packages = [
       pkgs.heaptrack
+      pkgs.perf
     ];
   };
 

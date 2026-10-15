@@ -20,12 +20,24 @@ pub(crate) struct Extension {
     pub(crate) methods: &'static [&'static str],
 }
 
+/// The extension that lets a call carry the trace context of its client
+/// (N17). It adds no method: a call of the connection can have a fifth
+/// element, a map with the W3C `traceparent` of the client.
+pub(crate) const TRACE_CONTEXT: &str = "trace_context";
+
 /// The extensions that the server serves. `sequences` adds
 /// `sequence_next(name)`, the next value of a sequence of the store (F29).
-pub(crate) const SERVED: &[Extension] = &[Extension {
-    name: "sequences",
-    methods: &["sequence_next"],
-}];
+/// `trace_context` adds the trace context of a call.
+pub(crate) const SERVED: &[Extension] = &[
+    Extension {
+        name: "sequences",
+        methods: &["sequence_next"],
+    },
+    Extension {
+        name: TRACE_CONTEXT,
+        methods: &[],
+    },
+];
 
 /// Return the names of the declaration `value`, the third argument of
 /// `register`. A value that is not a list of strings is an error.
@@ -117,6 +129,10 @@ mod tests {
         assert!(accept(&["unknown"], TEST_SERVED).is_empty());
         assert!(accept(&["first"], SERVED).is_empty());
         assert_eq!(accept(&["unknown", "sequences"], SERVED), ["sequences"]);
+        assert_eq!(
+            accept(&["trace_context", "sequences"], SERVED),
+            ["trace_context", "sequences"]
+        );
     }
 
     #[test]

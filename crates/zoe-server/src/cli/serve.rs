@@ -7,6 +7,9 @@
 //! store, and so does each `[storages.NAME]` table of the configuration
 //! file of `--config`.
 //!
+//! `--listen` takes `HOST:PORT` or, with a `/`, the path of a unix domain
+//! socket, as the `address` of the `<zeo>` section of ZEO does.
+//!
 //! The command writes the line `listening <address>` to stdout once it
 //! accepts connections, so a port of 0 gives a free port. With
 //! `--admin-listen`, it writes the line `admin <address>` before it. The
@@ -16,8 +19,9 @@
 //! signal during the start stops the server when the start ends, so a
 //! store that the start creates is complete and closes cleanly.
 //!
-//! The console script of the wheel has no server: its extension never
-//! links tokio. There, the command fails with 1 and names the `zoe` binary.
+//! The console script of the wheel has no server: its extension is built
+//! without the feature `serve`. There, the command fails with 1 and names
+//! the `zoe` binary.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -60,20 +64,27 @@ pub(super) struct ServeArgs {
     /// A TOML file of options. Its top-level keys are the options of zoe
     /// serve without --, except config and storage, such as listen =
     /// "127.0.0.1:8100". Each [storages.NAME] table adds a store, with the
-    /// keys path, blob-dir and read-only. An option on the command line or
-    /// in its twin wins over the file. An unknown key is an error.
+    /// keys path, blob-dir, read-only and pack-gc. An option on the command
+    /// line or in its twin wins over the file. An unknown key is an error.
     #[arg(long, env = "ZOE_CONFIG", value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// The address of the ZEO port, as HOST:PORT. A port of 0 takes a free
-    /// port.
+    /// The address of the ZEO port: HOST:PORT, or the path of a unix domain
+    /// socket. A value with a / is a path, such as ./zeo.sock, as the
+    /// address of the <zeo> section of ZEO. A port of 0 takes a free port.
+    /// The server binds a relative path as it is, relative to its current
+    /// directory, so the path must be shorter than 108 bytes. At its start,
+    /// the server removes a socket file on which no process accepts
+    /// connections, and fails when a process accepts connections there. At
+    /// its stop, it removes its socket file. TLS needs HOST:PORT.
     #[arg(
         long,
         env = "ZOE_LISTEN",
-        value_name = "HOST:PORT",
-        default_value = "127.0.0.1:8100"
+        value_name = "ADDRESS",
+        default_value = "127.0.0.1:8100",
+        value_parser = listen_address
     )]
-    listen: SocketAddr,
+    listen: Listen,
 
     /// The address of the admin port, as HOST:PORT: an HTTP port for the
     /// probes. GET /healthz gives 200 while every store is open. GET
@@ -93,6 +104,22 @@ pub(super) struct ServeArgs {
         default_value_t = 100_000
     )]
     invalidation_queue_size: usize,
+
+    /// Past --invalidation-queue-size, getInvalidations also covers every
+    /// transaction after the tid of a client when the time of that tid is
+    /// less than this before the clock of the server, as the key
+    /// invalidation-age of the <zeo> section of ZEO. In whole seconds,
+    /// such as 3600, 60m or 1h. A client that comes back within this time
+    /// keeps its cache. The server reads the transaction index of the
+    /// store for it. 0, the default, turns it off.
+    #[arg(
+        long,
+        env = "ZOE_INVALIDATION_AGE",
+        value_name = "SECONDS",
+        default_value = "0",
+        value_parser = whole_seconds
+    )]
+    invalidation_age: Duration,
 
     /// The most invalidations that wait for one client. Past it, the server
     /// closes the connection, and the client reconnects and verifies its
@@ -230,8 +257,10 @@ pub(super) struct ServeArgs {
     blocking_threads: Option<NonZeroUsize>,
 
     /// Serve every store for reads only. The server opens each store
-    /// read-only: it changes no byte of the store, and holds its lock, so
-    /// no writer opens the store meanwhile. The store must exist, and a
+    /// read-only, and holds its lock, so no writer opens the store
+    /// meanwhile. It changes no byte of a store that was closed cleanly. It
+    /// writes zoe.redb only when it repairs a store that a writer left
+    /// open, and then logs a warning. The store must exist, and a
     /// store with blobs must get its blob directory. A client that
     /// registers to write gets ReadOnlyError; a client with
     /// read_only_fallback then registers read-only. A transaction fails at
@@ -249,6 +278,26 @@ pub(super) struct ServeArgs {
         action = clap::ArgAction::Set
     )]
     read_only: bool,
+
+    /// Pack each store with garbage collection, the default. With false, a
+    /// pack removes old revisions only, as the pack-gc of FileStorage does:
+    /// it keeps the newest revision of each object at or before the pack
+    /// time, also when no reader can reach the object. An object whose
+    /// newest revision there is a deletion goes. The key pack-gc = false of
+    /// a [storages.NAME] table sets it for one store. The store records
+    /// nothing, so give it at each start.
+    #[arg(
+        long,
+        env = "ZOE_PACK_GC",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    pack_gc: bool,
 
     /// Accept storeBlobShared: the server and its clients share the blob
     /// directory of each store, as with the option shared-blob-dir of a ZEO
@@ -322,6 +371,27 @@ pub(super) struct ServeArgs {
     storages: Vec<Storage>,
 }
 
+/// The value of `--listen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Listen {
+    /// `HOST:PORT`, with an IP address as host.
+    Tcp(SocketAddr),
+    /// The path of a unix domain socket, as the value gives it.
+    Unix(PathBuf),
+}
+
+/// Parse the value of `--listen`. A value that holds a `/` is the path of
+/// a unix domain socket, as ZConfig reads the `address` of the `<zeo>`
+/// section. Any other value is `HOST:PORT`.
+fn listen_address(value: &str) -> Result<Listen, String> {
+    if value.contains('/') {
+        return Ok(Listen::Unix(PathBuf::from(value)));
+    }
+    value.parse().map(Listen::Tcp).map_err(|_| {
+        format!("{value} is neither HOST:PORT nor the path of a unix domain socket with a /")
+    })
+}
+
 /// The format of the log lines of `zoe serve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(super) enum LogFormat {
@@ -341,6 +411,9 @@ pub(super) struct Storage {
     pub(super) blob_dir: Option<PathBuf>,
     /// True when the server serves the store for reads only.
     pub(super) read_only: bool,
+    /// False when a pack of the store keeps the objects that no reader can
+    /// reach.
+    pub(super) pack_gc: bool,
 }
 
 /// Parse the value of `--storage`: `NAME=PATH`. The name ends at the first
@@ -352,6 +425,7 @@ fn named_storage(value: &str) -> Result<Storage, String> {
             path: PathBuf::from(path),
             blob_dir: None,
             read_only: false,
+            pack_gc: true,
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
@@ -431,6 +505,13 @@ pub(super) fn configure(
         Cli::try_parse_from(args)?
     };
     if let Command::Serve(serve) = &mut cli.command {
+        if let (Listen::Unix(path), Some(_)) = (&serve.listen, &serve.tls_cert) {
+            return Err(usage_error(format!(
+                "--tls-cert needs --listen HOST:PORT: TLS does not apply to the unix \
+                 domain socket {}",
+                path.display()
+            )));
+        }
         serve.storages = storages(serve, config.storages).map_err(usage_error)?;
     }
     Ok(cli)
@@ -478,6 +559,7 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
         path: path.clone(),
         blob_dir: args.blob_dir.clone(),
         read_only: false,
+        pack_gc: true,
     });
     let storages: Vec<Storage> = path
         .chain(args.storage.iter().cloned())
@@ -505,23 +587,30 @@ fn storages(args: &ServeArgs, file: Vec<Storage>) -> Result<Vec<Storage>, String
 pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> {
     use std::num::NonZeroU32;
 
-    use crate::serve::{ServeOptions, Server, StorageOptions, TlsOptions};
+    use crate::serve::{Address, ServeOptions, Server, StorageOptions, TlsOptions};
 
     let storages = args.storages.iter().map(|storage| {
-        let options =
-            StorageOptions::new(&storage.name, &storage.path).read_only(storage.read_only);
+        let options = StorageOptions::new(&storage.name, &storage.path)
+            .read_only(storage.read_only)
+            .pack_gc(storage.pack_gc);
         match &storage.blob_dir {
             Some(dir) => options.blob_dir(dir),
             None => options,
         }
     });
+    let listen = match &args.listen {
+        Listen::Tcp(addr) => Address::Tcp(*addr),
+        Listen::Unix(path) => Address::Unix(path.clone()),
+    };
     let mut options = ServeOptions::with_storages(storages)
-        .listen(args.listen)
+        .listen(listen)
         .invalidation_queue_size(args.invalidation_queue_size)
+        .invalidation_age(args.invalidation_age)
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
         .idle_timeout(args.idle_timeout)
         .read_only(args.read_only)
+        .pack_gc(args.pack_gc)
         .shared_blob_dir(args.shared_blob_dir);
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
@@ -624,6 +713,68 @@ mod tests {
     }
 
     #[test]
+    fn listen_takes_host_and_port_or_a_path_with_a_slash() {
+        assert_eq!(
+            serve(&[]).unwrap().listen,
+            Listen::Tcp("127.0.0.1:8100".parse().unwrap())
+        );
+        let args = serve(&["--listen", "[::1]:0"]).unwrap();
+        assert_eq!(args.listen, Listen::Tcp("[::1]:0".parse().unwrap()));
+        for path in ["./zeo.sock", "/run/zoe/zeo.sock", "dir/zeo.sock"] {
+            let args = serve(&["--listen", path]).unwrap();
+            assert_eq!(args.listen, Listen::Unix(PathBuf::from(path)), "{path}");
+        }
+        for value in ["zeo.sock", "localhost:8100", "8100"] {
+            let error = serve(&["--listen", value]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn the_key_listen_of_the_configuration_file_takes_a_path() {
+        use std::ffi::OsString;
+
+        let file = std::env::temp_dir().join(format!("zoe-listen-{}.toml", std::process::id()));
+        std::fs::write(&file, "path = \"store\"\nlisten = \"./zeo.sock\"\n").unwrap();
+        let line = ["zoe", "serve", "--config"].map(OsString::from);
+        let parsed = super::super::parse([&line[..], &[file.clone().into()]].concat());
+        std::fs::remove_file(&file).unwrap();
+        let Command::Serve(args) = parsed.unwrap().command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.listen, Listen::Unix(PathBuf::from("./zeo.sock")));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn tls_on_a_unix_domain_socket_is_a_usage_error_that_names_both_options() {
+        let line = [
+            "zoe",
+            "serve",
+            "--path",
+            "store",
+            "--listen",
+            "./zeo.sock",
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "k.pem",
+        ];
+        let error = super::super::parse(line.map(Into::into).to_vec()).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        let text = error.to_string();
+        assert!(
+            text.contains("--tls-cert") && text.contains("--listen"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn the_queue_sizes_have_their_defaults_and_a_client_queue_holds_one_message() {
         let args = serve(&[]).unwrap();
         assert_eq!(args.invalidation_queue_size, 100_000);
@@ -632,6 +783,17 @@ mod tests {
         assert_eq!(args.invalidation_queue_size, 0);
         assert_eq!(args.client_queue_size, 1);
         let error = serve(&["--client-queue-size", "0"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_invalidation_age_is_off_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().invalidation_age, Duration::ZERO);
+        let args = serve(&["--invalidation-age", "1h"]).unwrap();
+        assert_eq!(args.invalidation_age, Duration::from_secs(3_600));
+        let args = serve(&["--invalidation-age", "100"]).unwrap();
+        assert_eq!(args.invalidation_age, Duration::from_secs(100));
+        let error = serve(&["--invalidation-age", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
@@ -697,6 +859,16 @@ mod tests {
         assert!(serve(&["--read-only=true"]).unwrap().read_only);
         assert!(!serve(&["--read-only=false"]).unwrap().read_only);
         let error = serve(&["--read-only=maybe"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn pack_gc_is_true_by_default_and_takes_a_boolean() {
+        assert!(serve(&[]).unwrap().pack_gc);
+        assert!(serve(&["--pack-gc"]).unwrap().pack_gc);
+        assert!(serve(&["--pack-gc=true"]).unwrap().pack_gc);
+        assert!(!serve(&["--pack-gc=false"]).unwrap().pack_gc);
+        let error = serve(&["--pack-gc=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

@@ -4,8 +4,8 @@
 //! [`Folder`] opens a store folder for reads only and holds the lock of
 //! the store. It shows each object as an [`Object`]: the class, the oid,
 //! the serial, the size, the decoded state as JSON and the outbound
-//! references. It resolves the paths of a Plone site. It never writes to
-//! the folder.
+//! references. It resolves the paths of a Plone site. It writes to the
+//! folder only to repair a store that a writer left open, at the open.
 //!
 //! Loupe also travels in time. [`Folder::as_of`] gives a [`Snapshot`]: the
 //! store as it was after a transaction. [`Folder::history`] lists the
@@ -52,7 +52,8 @@ pub enum Error {
     },
 
     /// The store failed. For example, another process holds the lock, the
-    /// store was not closed cleanly, or the oid has no record.
+    /// repair of a store that was not closed cleanly failed, or the oid has
+    /// no record.
     #[error(transparent)]
     Store(#[from] ZoeError),
 
@@ -166,12 +167,17 @@ pub struct Folder {
 }
 
 impl Folder {
-    /// Open the store in the folder `path` for reads only.
+    /// Open the store in the folder `path` for reads only, with
+    /// `Store::open_read_only_repairing`.
     ///
     /// The call fails with `NoStore` when `path` holds no store, and with
-    /// `Locked` when another process holds the lock of the store. A store
-    /// that was not closed cleanly fails with `NotClosedCleanly`. The call
-    /// writes nothing.
+    /// `Locked` when another process holds the lock of the store. On a
+    /// store that was closed cleanly, the call writes nothing. A store that
+    /// a writer left open gets its repair first: the call writes only the
+    /// database file, and `Store::repaired` of [`Folder::store`] tells it.
+    /// The caller shows the operator that the open repaired the store. A
+    /// repair that fails gives `RepairFailed`, for example on a read-only
+    /// file system.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_blob_dir(path, None)
     }
@@ -180,15 +186,15 @@ impl Folder {
     /// [`Folder::open`] does, with the blob directory `blob_dir`.
     ///
     /// The store does not record its blob directory. With `None`, the blob
-    /// directory is `blobs` in the folder. The call writes nothing, also
-    /// in the blob directory and in its parent.
+    /// directory is `blobs` in the folder. The call writes nothing in the
+    /// blob directory and in its parent, also when it repairs the store.
     pub fn open_with_blob_dir(path: impl AsRef<Path>, blob_dir: Option<&Path>) -> Result<Self> {
         let path = path.as_ref();
         let options = Options {
             blob_dir: blob_dir.map(Path::to_path_buf),
             ..Options::default()
         };
-        let store = Store::open_read_only_with(path, options).map_err(|e| match e {
+        let store = Store::open_read_only_repairing(path, options).map_err(|e| match e {
             ZoeError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => Error::NoStore {
                 path: path.display().to_string(),
             },
@@ -783,6 +789,29 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("zoe-loupe-none-{}", std::process::id()));
         let error = Folder::open(&missing).err();
         assert!(matches!(error, Some(Error::NoStore { .. })), "{error:?}");
+    }
+
+    #[test]
+    fn a_folder_repairs_a_store_that_a_writer_left_open() {
+        let root = std::env::temp_dir().join(format!("zoe-loupe-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (live, copy) = (root.join("live"), root.join("copy"));
+        // A copy of the database of an open store is what a crash leaves.
+        let store = Store::open(&live).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid(0), b"root").unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(live.join("zoe.redb"), copy.join("zoe.redb")).unwrap();
+        drop(store);
+
+        let folder = Folder::open(&copy).unwrap();
+        assert!(folder.store().repaired());
+        assert_eq!(folder.last_tid(), tid);
+        drop(folder);
+        let folder = Folder::open(&copy).unwrap();
+        assert!(!folder.store().repaired());
     }
 
     #[test]
