@@ -4,7 +4,7 @@ Status: accepted. The human chose it while the phase 3 gate ran on the developme
 
 ## Context
 
-The specification makes a commit durable with an fsync before the acknowledgement. ADR 0038 lets macOS open the development shell and run the tests and the benchmarks, but macOS is not a target.
+The specification makes a commit durable with an fsync before the acknowledgement. macOS is a target (ADR 0038).
 
 On Apple systems, `File::sync_all` and `File::sync_data` of the Rust standard library call `fcntl(F_FULLFSYNC)`. It also flushes the write cache of the drive, and on the development laptop it costs a few milliseconds more than `fsync(2)` for each commit. FileStorage, under ZEO, calls `os.fsync`, which is `fsync(2)`. SQLite and PostgreSQL also call `fsync(2)` on macOS by default.
 
@@ -16,8 +16,8 @@ On Apple systems, every sync of `OsVfs` calls `fsync(2)`: the sync of the databa
 
 ## Consequences
 
-- On macOS, ZOE makes the same promise as FileStorage: a commit survives a crash of the process and of the system, and a loss of power can lose the commits that the drive cache held. A store on macOS is a store for development.
-- Linux, the target, does not change.
+- On macOS, ZOE makes the same promise as FileStorage: a commit survives a crash of the process and of the system, and a loss of power can lose the commits that the drive cache held.
+- Linux does not change.
 - `OsVfs::File` is `OsFile`, a type of `zoe-core`, and no longer `redb::backends::FileBackend`. The tests that wrap the file of an `OsVfs` name the new type.
 - The gate on the development laptop compares the two storages with the same sync.
 
@@ -25,4 +25,4 @@ On Apple systems, every sync of `OsVfs` calls `fsync(2)`: the sync of the databa
 
 - **Keep `F_FULLFSYNC`.** The commit cells of the gate then fail on macOS for a cost that ZEO does not pay, and only a run on Linux could pass the gate.
 - **Run the gate in a Linux container on macOS.** The virtual disk of the container has syncs of its own, which neither storage has in production.
-- **A setting for the sync.** The specification names no such setting, and macOS is not a target.
+- **A setting for the sync.** The specification names no such setting.

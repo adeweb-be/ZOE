@@ -8,7 +8,7 @@ The wheel, the server binary and Loupe must be built and tested on every target.
 
 ## Decision
 
-The targets are CPython 3.12, 3.13 and 3.14, plus the free-threaded 3.14t build, on Linux x86-64. The extension module declares that it does not use the GIL. 3.13t is not a target; 3.15 joins when it ships; macOS and Windows come in a later phase.
+The targets are CPython 3.12, 3.13 and 3.14, plus the free-threaded 3.14t build, on Linux x86-64. The extension module declares that it does not use the GIL. 3.13t is not a target; 3.15 joins when it ships; macOS on Apple silicon is a target too (ADR 0038). The release builds for macOS and Windows come in a later phase.
 
 ## Consequences
 

@@ -99,7 +99,7 @@ What this means for the design:
 
 **Python free-threading timeline.** 3.13 (Oct 2024) experimental; 3.14 (Oct 2025) officially supported under [PEP 779](https://peps.python.org/pep-0779/); 3.15 (Oct 2026) adds the free-threaded stable ABI `abi3t` under [PEP 803](https://peps.python.org/pep-0803). Making it the default is left to a future PEP. PyO3 supports free-threaded builds since 0.23 and assumes modules are thread-safe since 0.28 ([guide](https://pyo3.rs/latest/free-threading.html)).
 
-**Targets.** CPython 3.12, 3.13 and 3.14, with 3.14t as the free-threaded build; 3.13t is not a target and 3.15 joins when it ships. Linux x86-64 for the first phases; macOS and Windows later, for the wheels, the server binary and Loupe alike.
+**Targets.** CPython 3.12, 3.13 and 3.14, with 3.14t as the free-threaded build; 3.13t is not a target and 3.15 joins when it ships. Linux x86-64 and macOS on Apple silicon, and a run on either is evidence (ADR 0038). The release builds for macOS and Windows come later, for the wheels, the server binary and Loupe alike.
 
 **Prior art**
 
