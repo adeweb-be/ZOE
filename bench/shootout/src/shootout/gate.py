@@ -14,22 +14,43 @@ them.
 cells that the gate leaves out for it, by scenario and object size. Both
 read constants of this module, not options. For most storages the gate
 leaves out `read_hot` in every size, because no read of it reaches the
-server through `ZEO.ClientStorage`. For `zoe-native` it leaves out only
-`read_hot` at 1 KB, because ZODB itself takes most of the time of a hit
-there. The report prints these cells with the verdict `left out`. They
-count neither as below nor as missing.
+server through `ZEO.ClientStorage`. The report prints these cells with the
+verdict `left out`. They count neither as below nor as missing.
+
+`zoe-native` has the cost rule of ADR 0037 instead, on the gate set only.
+The cost of a storage is its time minus the time of the storage `floor`
+of the same round. For each cell, the report takes the last run of the
+baseline that holds the cell, and the values of the storage and of the
+floor of the same run, paired by round. Each scenario and cell of the gate
+set counts: a cell that no run holds is missing. A round that lacks one of the
+three does not count. The ratio of a round is the cost of the baseline
+divided by the cost of the storage. A cost of the storage at or below 0
+gives an infinite ratio. A cell passes when the median of its ratios is
+at least the ratio of the gate; with an even number of rounds, the median
+is the lower of the two middle ratios. A cell where the median cost of the
+baseline is below 10 % of its median time gets the verdict `below the
+noise`, and counts neither as below nor as missing. A cell without a
+complete round is missing. The time is the time of the slowest worker
+for one transaction, and the report prints it per object.
 """
 
 import datetime
 import json
+import math
+import statistics
 from pathlib import Path
 from typing import TextIO
 
-from shootout import KB
+from shootout import GATE, KB, SCENARIOS
 from shootout.environment import python_tag
 from shootout.layout import run_set
 
 ROW = "{:<10} {:<9} {:>3} {:>7} {:>12} {:>12} {:>7}  {}"
+# A row of the cost rule: the cell, the median times per object in µs of
+# the baseline, the storage and the floor, the ratio of the whole times,
+# the median and the range of the ratios of the costs, the rounds that
+# count and the verdict.
+COST_ROW = "{:<10} {:<9} {:>3} {:>7} {:>10} {:>10} {:>10} {:>6} {:>6} {:>11} {:>2}  {}"
 
 # The cells that the gate leaves out, as (scenario, object size) with a
 # reason. A size of None means every size.
@@ -43,14 +64,15 @@ LEFT_OUT: LeftOut = {
     "reaches the server",
 }
 
-# The cells that the gate leaves out for each other storage. The native
-# client of zoe-native has a cache of its own, so its read_hot at 100 KB
-# counts.
-LEFT_OUT_OF: dict[str, LeftOut] = {
-    "zoe-native": {
-        ("read_hot", KB): "ZODB itself takes most of the time of a hit there",
-    },
-}
+# The cells that the gate leaves out for each other storage. The cost rule
+# of zoe-native counts every cell.
+LEFT_OUT_OF: dict[str, LeftOut] = {"zoe-native": {}}
+
+# The storages of the cost rule (ADR 0037), the storage of the floor, and
+# the share of the time of the baseline below which its cost is noise.
+COST = frozenset({"zoe-native"})
+FLOOR = "floor"
+NOISE = 0.10
 
 # The default ratio of each storage: 3 for the phase 3 gate. Any other
 # storage gets parity, the phase 2 gate.
@@ -90,6 +112,8 @@ def report(
 
     With python, such as cp314t, only the groups of that Python build count.
     """
+    if storage in COST:
+        return _cost_report(root, storage, baseline, ratio, out, python)
     last = _last_results(root)
     groups = sorted({group for group, name in last if name == baseline})
     counted = [group for group in groups if python in (None, group[1])]
@@ -155,6 +179,161 @@ def report(
         file=out,
     )
     return 0 if passed else 1
+
+
+def _cost_report(
+    root: Path,
+    storage: str,
+    baseline: str,
+    ratio: float,
+    out: TextIO,
+    python: str | None,
+) -> int:
+    """Write the report of the cost rule. Return 0 when the gate passes."""
+    runs = _gate_results(root)
+    groups = sorted(group for group in runs if baseline in runs[group])
+    counted = [group for group in groups if python in (None, group[1])]
+    where = f" on {python}" if python else ""
+    if not counted:
+        print(f"gate: no gate result of {baseline}{where} under {root}", file=out)
+        return 1
+
+    below = missing = noise = total = 0
+    for group in counted + [g for g in groups if g not in counted]:
+        machine, build, kind = group
+        counts = group in counted
+        beside = "" if counts else f" (beside {python}, does not count)"
+        print(f"== {machine} {build} {kind}{beside}", file=out)
+        for name in (baseline, storage, FLOOR):
+            results = runs[group].get(name, [])
+            names = ", ".join(_name(r) for r in results) or "no result"
+            print(f"{name}: {names}", file=out)
+        print(
+            COST_ROW.format(
+                "scenario",
+                "mode",
+                "c",
+                "size",
+                f"{baseline} us",
+                f"{storage} us",
+                f"{FLOOR} us",
+                "whole",
+                "cost",
+                "range",
+                "n",
+                "",
+            ),
+            file=out,
+        )
+        for cell in _every_cell():
+            row = _cost_row(runs[group], cell, storage, baseline, ratio)
+            verdict = row[-1]
+            if counts:
+                total += 1
+                missing += verdict == "missing"
+                below += verdict == "FAIL"
+                noise += verdict == "below the noise"
+            else:
+                # A row beside the gate gives its verdict in lower case.
+                row[-1] = verdict.lower()
+            print(COST_ROW.format(*row), file=out)
+
+    passed = below == 0 and missing == 0
+    print(
+        f"gate {'passed' if passed else 'failed'}: {storage} against {baseline}"
+        f"{where}, a cost ratio of at least {ratio:g} over {FLOOR} in each cell "
+        f"(ADR 0037); {total} cells, {below} below, {missing} missing, "
+        f"{noise} below the noise",
+        file=out,
+    )
+    return 0 if passed else 1
+
+
+def _cost_row(runs, cell, storage: str, baseline: str, ratio: float) -> list:
+    """Return the fields of the row of a cell under the cost rule."""
+    held = [(_started(r), e) for r in runs[baseline] if (e := _entry(r, cell))]
+    if not held:
+        return [*cell, "-", "-", "-", "-", "-", "-", 0, "missing"]
+    base_started, base = max(held, key=lambda pair: pair[0])
+    rounds = {}
+    for name in (baseline, storage, FLOOR):
+        entry = base if name == baseline else None
+        for result in runs.get(name, []):
+            if entry is None and _started(result) == base_started:
+                entry = _entry(result, cell)
+        for value in entry["values"] if entry else ():
+            rounds.setdefault(value["round"], {})[name] = value["seconds"]
+    complete = [r for r in rounds.values() if len(r) == 3]
+    if not complete:
+        return [*cell, "-", "-", "-", "-", "-", "-", 0, "missing"]
+    objects = base["objects_per_transaction"]
+    times = {
+        name: statistics.median(r[name] for r in complete)
+        for name in (baseline, storage, FLOOR)
+    }
+    ratios = [_cost_ratio(r[baseline], r[storage], r[FLOOR]) for r in complete]
+    # With an even number of rounds, the median is the lower middle ratio.
+    median = statistics.median_low(ratios)
+    cost = statistics.median(r[baseline] - r[FLOOR] for r in complete)
+    if cost < NOISE * times[baseline]:
+        verdict = "below the noise"
+    elif median < ratio:
+        verdict = "FAIL"
+    else:
+        verdict = "pass"
+    return [
+        *cell,
+        *(f"{times[name] / objects * 1e6:.1f}" for name in (baseline, storage, FLOOR)),
+        f"{times[baseline] / times[storage]:.2f}",
+        _ratio(median),
+        f"{_ratio(min(ratios))}-{_ratio(max(ratios))}",
+        len(complete),
+        verdict,
+    ]
+
+
+def _cost_ratio(base: float, storage: float, floor: float) -> float:
+    """Return the cost of base over the cost of storage, above floor."""
+    cost = storage - floor
+    return math.inf if cost <= 0 else (base - floor) / cost
+
+
+def _ratio(value: float) -> str:
+    return "inf" if math.isinf(value) else f"{value:.2f}"
+
+
+def _entry(result: dict, cell: tuple[str, str, int, int]) -> dict | None:
+    """Return the scenario entry of a cell of a result, when it has values."""
+    for s in result["scenarios"]:
+        if (s["name"], s["mode"], s["concurrency"], s["object_size"]) == cell:
+            return s if s.get("values") else None
+    return None
+
+
+def _every_cell() -> list[tuple[str, str, int, int]]:
+    """Return each scenario and cell of the gate set, in the order of the report."""
+    return sorted(
+        (name, cell.mode, cell.concurrency, cell.object_size)
+        for name, _ in SCENARIOS.values()
+        for cell in GATE.cells
+    )
+
+
+def _gate_results(root: Path) -> dict[tuple[str, str, str], dict[str, list[dict]]]:
+    """Return every result of the gate set under root, by group and storage.
+
+    A gate job can run some cells only, so a group can hold several runs of
+    one storage.
+    """
+    runs = {}
+    for path in sorted((root / "gate").glob("*/*/*/*.json")):
+        result = json.loads(path.read_text())
+        group = (result["machine"]["name"], python_tag(result["python"]), "gate")
+        runs.setdefault(group, {}).setdefault(result["storage"], []).append(result)
+    for group in runs.values():
+        for results in group.values():
+            results.sort(key=_started)
+    return runs
 
 
 def _last_results(root: Path) -> dict[tuple[tuple[str, str, str], str], dict]:

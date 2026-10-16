@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jsonschema
 
-from shootout import client, gate, run
+from shootout import GATE, Cell, client, gate, run, run_gate
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
@@ -26,7 +26,15 @@ def main(argv: list[str] | None = None) -> int:
     sets.add_argument(
         "--gate",
         action="store_true",
-        help="run the gate set: 6 cells, 3 values each",
+        help="run the gate set: 6 cells, 7 rounds each; a round runs one value "
+        "of each storage, in an order that rotates",
+    )
+    run_cmd.add_argument(
+        "--cell",
+        nargs="+",
+        type=_cell,
+        help="with --gate, run only these cells of the gate set, as "
+        "MODE:CONCURRENCY:SIZE, such as processes:16:102400",
     )
     run_cmd.add_argument(
         "--storage",
@@ -174,24 +182,43 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{skipped} skipped: no PostgreSQL DSN", file=sys.stderr)
 
     schema = json.loads(SCHEMA.read_text())
-    for storage in storages:
-        print(f"== {storage}", flush=True)
-        result = run(
-            storage,
-            quick=args.quick,
-            gate=args.gate,
+    if args.cell and not args.gate:
+        parser.error("--cell needs --gate")
+    if args.gate:
+        print(f"== gate: {' '.join(storages)}", flush=True)
+        results = run_gate(
+            storages,
             workdir=args.workdir,
             dsn=args.dsn,
             machine=args.machine,
+            cells=args.cell,
         )
-        jsonschema.validate(result, schema)
-        path = result_path(args.output, result)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(result, indent=2) + "\n")
-        _summary(result)
-        print(path, flush=True)
+        for result in results:
+            _write(result, args.output, schema)
+    else:
+        for storage in storages:
+            print(f"== {storage}", flush=True)
+            result = run(
+                storage,
+                quick=args.quick,
+                workdir=args.workdir,
+                dsn=args.dsn,
+                machine=args.machine,
+            )
+            _write(result, args.output, schema)
     write_index(args.output)
     return 0
+
+
+def _write(result: dict, root: Path, schema: dict) -> None:
+    """Validate a result, write it under root and print its rows."""
+    jsonschema.validate(result, schema)
+    path = result_path(root, result)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"== {result['storage']}", flush=True)
+    _summary(result)
+    print(path, flush=True)
 
 
 def _client(args, parser) -> int:
@@ -236,6 +263,20 @@ def _positive(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"the value must be positive: {text}")
     return value
+
+
+def _cell(text: str) -> Cell:
+    """Parse MODE:CONCURRENCY:SIZE, a cell of the gate set."""
+    try:
+        mode, concurrency, size = text.split(":")
+        cell = Cell(mode, int(concurrency), int(size))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"a cell is MODE:CONCURRENCY:SIZE: {text}"
+        ) from None
+    if cell not in GATE.cells:
+        raise argparse.ArgumentTypeError(f"not a cell of the gate set: {text}")
+    return cell
 
 
 def _ratio(text: str) -> float:

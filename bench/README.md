@@ -10,7 +10,8 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | --- | --- |
 | `just bench` | the full set against every storage but `floor`; writes to `target/bench/results` |
 | `just bench run --quick` | the quick set, the regression gate of a pull request |
-| `just bench run --gate --storage zeo zoe-native` | the gate set, the head-to-head that the phase gates count; results go under `gate/` |
+| `just bench run --gate --storage zeo zoe-native floor` | the gate set, the head-to-head that the phase gates count, in rounds that interleave the storages; results go under `gate/` |
+| `just bench run --gate --storage zeo zoe-native floor --cell processes:16:102400` | one cell of the gate set, one job of the phase 3 gate |
 | `just bench run --storage zeo --quick` | one storage only |
 | `just bench run --gate --storage floor` | the floor of the gate set; `floor` runs only when `--storage` names it |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
@@ -19,7 +20,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench client report FILE` | the rows of a result of the client benchmark and its verdict |
 | `just bench index DIR` | rewrites `index.json` of a results tree |
 | `just bench gate DIR` | the parity gate of phase 2: `zoe-server` against `zeo` in each cell of a results tree but `read_hot` (see [The gate](#the-gate)) |
-| `just bench gate --storage zoe-native --python cp314t DIR` | the phase 3 gate: `zoe-native` at least 3× `zeo` in each cell of the 3.14t results but `read_hot` at 1 KB, with the other builds printed beside them |
+| `just bench gate --storage zoe-native --python cp314t DIR` | the phase 3 gate (ADR 0037): the storage cost of `zoe-native` at most a third of the one of `zeo`, over `floor`, in each cell of the 3.14t gate set, with the other builds printed beside them |
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -44,10 +45,11 @@ zodbshootout runs five scenarios: `add`, `update`, `read_cold`, `read_warm` (zod
 | Set | Cells | Values per scenario and cell |
 | --- | --- | --- |
 | quick | threads, concurrency 1 and 16, objects of 1 KB | 5 |
-| gate | threads, concurrency 1 and 16; processes at 16; objects of 1 KB and 100 KB | 3 |
+| gate | threads, concurrency 1 and 16; processes at 16; objects of 1 KB and 100 KB | 7 rounds |
 | full | threads at concurrency 1, 4, 16 and 64; processes at 4, 16 and 64; objects of 1 KB and 100 KB | 20 |
 
 - Each value runs in its own zodbshootout run, on a fresh store: one scenario, one pyperf worker process, one warmup, then the value (`--processes 1 --warmups 1 --values 1 --loops 1`). The warmup runs in the same process and on the same store as the value, so the costs of a first call stay out of the value. The other options are the same for every value.
+- The gate set runs its storages together, in rounds. For each scenario and cell, a round runs one value of each storage, each on a fresh store, and the order of the storages rotates: round r starts with the storage at index r modulo the number of storages. So a drift of the machine falls on every storage. The results of one gate run have one start, and each scenario entry keeps the round and the time of each value in `values`. `--cell` runs only some cells, so that each cell can be its own job.
 - Only `add` gets `--zap force`: zodbshootout zaps the store before each call of `add`, and it refuses a zap without `add`. For the other scenarios, zodbshootout populates the fresh store before the calls: the tree with 100 objects per worker and the shared mapping of conflicts.
 - For each value, the harness makes a new directory under the work directory, starts the ZEO server or `zoe serve` on a new store in it, runs zodbshootout, stops the server and removes the directory: the store, the logs and the pyperf output. For `relstorage` and `relstorage-hf`, it empties the database with RelStorage's `zap_all` before and after each value. RelStorage refuses to open a database that has the schema of the other history mode, so before the first value of each of the two storages, the harness drops the tables, the sequences, the views and the functions of RelStorage in both modes. A value that fails keeps its directory and its logs, and the run stops.
 - In the threads mode, one process runs the workers as threads that share one `DB`, as in one Zope process. In the processes mode, each worker is a process with its own `DB`, as in several Zope processes.
@@ -86,7 +88,7 @@ Each run of one storage gives one JSON document that validates against [`schema/
 
 ## The gate
 
-N4 sets two gates against ZEO 6 through `ZEO.ClientStorage`. The phase 2 gate is parity: `zoe-server` at least 1× `zeo` in each zodbshootout cell that reaches the server. The phase 3 gate is `zoe-native`, `zoe serve` through the native client, at least 3× `zeo` in every cell but `read_hot` at 1 KB. `python -m shootout gate`, or `just bench gate DIR`, reads the results tree DIR in the layout below and turns a gate into a pass or a fail per cell:
+N4 sets two gates against ZEO 6 through `ZEO.ClientStorage`. The phase 2 gate is parity: `zoe-server` at least 1× `zeo` in each zodbshootout cell that reaches the server. The phase 3 gate (ADR 0037) is `zoe-native`, `zoe serve` through the native client, at a storage cost of at most a third of the storage cost of `zeo`, in every cell of the gate set. The cost of a storage is its time minus the time of `floor` in the same round. `python -m shootout gate`, or `just bench gate DIR`, reads the results tree DIR in the layout below and turns a gate into a pass or a fail per cell:
 
 ```sh
 just bench gate target/bench/results
@@ -95,11 +97,19 @@ just bench gate --storage zoe-native --python cp314t target/bench/results
 
 - For each machine, Python build and set (quick or full), it keeps the last result of each storage, by the start of the run. So it compares one machine, one Python build and the same cells, and never a quick run with a full run.
 - For each scenario and cell of the baseline, it prints `ops_per_second` of both storages and their ratio.
-- The rules of each storage are constants of `shootout/gate.py`, not options. `--storage zoe-native` checks a ratio of 3 by default and counts every cell but `read_hot` at 1 KB: the native client has a cache of its own, so its `read_hot` is a number of ZOE, but at 1 KB ZODB itself takes most of the time of a hit. Its `read_hot` at 100 KB counts. Every other storage, `zoe-server` first, checks parity by default and leaves `read_hot` out: zodbshootout's `read_hot` empties the object cache of the connection, then reads the objects from the cache of `ZEO.ClientStorage`, so no read reaches the server. The report prints each cell that it leaves out with the numbers that exist and the verdict `left out`, and says why in a `left out:` line, such as `left out: read_hot at 1 KB, because ...`. Such a cell counts neither as below nor as missing. The summary line names the cells that it leaves out: `each cell but read_hot at 1 KB` for `zoe-native`, `each cell but read_hot` for the others. `read_hot` still runs and stays in the results.
-- It exits with 0 when the ratio of each cell that counts is at least the ratio of the gate. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline.
+- The rules of each storage are constants of `shootout/gate.py`, not options. `--storage zoe-native` has the cost rule, on the gate set only:
+  - For each cell, the report takes the last gate run of `zeo` that holds the cell, and the values of `zoe-native` and `floor` of the same run, paired by round. A round that lacks one of the three does not count.
+  - The ratio of a round is `(t_zeo − t_floor) / (t_zoe − t_floor)`, where `t` is the time for the slowest worker to do one transaction. A cost of `zoe-native` at or below 0 gives `inf`. The cell passes when the median of its ratios is at least 3 by default.
+  - With an even number of rounds that count, the median is the lower of the two middle ratios.
+  - A cell where the median cost of `zeo` over the rounds is below 10 % of its median time gets the verdict `below the noise`. It counts neither as below nor as missing.
+  - Each scenario and cell of the gate set counts. A cell that no run holds, or that has no complete round, is `missing`: a job of one cell that fails shows.
+  - The row of a cell gives the median times per object of `zeo`, `zoe-native` and `floor` in µs, the ratio of the whole times, the median and the range of the ratios of the costs, the rounds that count and the verdict. `read_hot` counts in every size: the native client has a cache of its own.
+  - In the processes mode, each worker process of `floor` reads a record of the populate file at its first load. That adds a little to the floor of a cold read, never to the other storages.
+- Every other storage, `zoe-server` first, checks parity of `ops_per_second` by default and leaves `read_hot` out: zodbshootout's `read_hot` empties the object cache of the connection, then reads the objects from the cache of `ZEO.ClientStorage`, so no read reaches the server. The report prints each cell that it leaves out with the numbers that exist and the verdict `left out`, and says why in a `left out:` line, such as `left out: read_hot at 1 KB, because ...`. Such a cell counts neither as below nor as missing. The summary line names the cells that it leaves out: `each cell but read_hot`. `read_hot` still runs and stays in the results.
+- It exits with 0 when the ratio of each cell that counts is at least the ratio of the gate. It exits with 1 when a ratio is below, when a cell of the baseline has no counterpart in the storage, or when the tree holds no result of the baseline (for `zoe-native`, no gate result of it).
 - `--storage zoe-server --baseline zeo` are the defaults. `--ratio` takes any positive value in place of the default ratio of the storage.
 - `--python cp314t` counts only the results of that build. The report prints the groups of the other builds after them, marked `does not count`, with their verdicts in lower case. Without `--python`, every build counts.
-- The phase 2 gate counts only the full set of the reference machine. The phase 3 gate counts the gate set (`--gate`), a head-to-head of `zeo` and `zoe-native` on 6 cells; the full set is the comprehensive benchmark of a later phase. It counts the results on CPython 3.14t, each storage as its stack runs there, with the report of 3.13 printed beside it: on 3.13 the threads cells measure one client process under the GIL, and on 3.14t they measure the storage when it commits in parallel. The GIL record of each result says which workers ran with the GIL. The RelStorage row of N4 counts `relstorage` and `relstorage-hf`.
+- The phase 2 gate counts only the full set of the reference machine. The phase 3 gate counts the gate set (`--gate`), a head-to-head of `zeo` and `zoe-native` over `floor` on 6 cells, each cell its own job; the full set is the comprehensive benchmark of a later phase. It counts the results on CPython 3.14t, each storage as its stack runs there, with the report of 3.13 printed beside it: on 3.13 the threads cells measure one client process under the GIL, and on 3.14t they measure the storage when it commits in parallel. The GIL record of each result says which workers ran with the GIL. The RelStorage row of N4 counts `relstorage` and `relstorage-hf`.
 
 ## The client benchmark
 

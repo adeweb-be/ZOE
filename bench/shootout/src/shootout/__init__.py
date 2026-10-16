@@ -95,13 +95,13 @@ FULL = Profile(
 )
 
 # The gate set is the head-to-head of the phase gates of N4: one thread,
-# 16 threads in one process and 16 processes, at 1 KB and 100 KB, with 3
-# values each. One storage on one interpreter runs in about 15 minutes.
+# 16 threads in one process and 16 processes, at 1 KB and 100 KB. Each
+# cell runs 7 rounds: one value of each storage per round (ADR 0037).
 GATE = Profile(
     cells=_cells(["threads"], [1, 16], [KB, 100 * KB])
     + _cells(["processes"], [16], [KB, 100 * KB]),
     processes=1,
-    values=3,
+    values=7,
 )
 
 
@@ -175,48 +175,143 @@ def run(
     store in a new directory under workdir. When the value succeeds, the
     function removes that directory. Before each cell, the function checks
     that the disk of workdir has the free space of one value. Each scenario
-    entry records the GIL of each worker process of its values.
+    entry records the GIL of each worker process of its values. With gate,
+    the function runs the gate set as `run_gate` does.
     """
+    if gate:
+        [result] = run_gate([storage], workdir=workdir, dsn=dsn, machine=machine)
+        return result
     store = STORAGES[storage]
-    profile = QUICK if quick else GATE if gate else FULL
+    profile = QUICK if quick else FULL
     cells = [c for c in profile.cells if c.mode == "threads" or store.multi_process]
-    workdir = Path(workdir or tempfile.gettempdir())
-    workdir.mkdir(parents=True, exist_ok=True)
-    started = datetime.datetime.now(datetime.UTC)
-    software = environment.SOFTWARE
-    if storage in RELSTORAGE:
-        software += environment.RELSTORAGE_SOFTWARE
-    elif storage in ("zoe", "zoe-native"):
-        software += environment.ZOE_SOFTWARE
-
+    workdir = _workdir(workdir)
+    started = _now()
     # relstorage and relstorage-hf share the database, and each needs the
     # schema of its own history mode.
     reset_database(store, dsn)
     root = Path(tempfile.mkdtemp(prefix=f"{storage}-", dir=workdir))
     scenarios = []
     for index, cell in enumerate(cells):
-        needed = disk_needed(storage, cell)
-        free = shutil.disk_usage(workdir).free
-        if free < needed:
-            # The cells before left nothing in root.
-            shutil.rmtree(root)
-            raise RuntimeError(
-                f"not enough free disk for {storage} in {cell}: one value needs"
-                f" {needed} bytes, and the disk of {workdir} has {free} bytes free"
-            )
+        _check_disk([store], cell, workdir, [root])
         name = f"{index}-{cell.mode}-{cell.concurrency}-{cell.object_size}"
         scenarios += _run_cell(store, cell, profile, root, name, dsn)
     shutil.rmtree(root)
+    return _document(
+        store, set_name(quick, False), started, scenarios, workdir, dsn, machine
+    )
 
+
+def run_gate(
+    storages: list[str],
+    workdir: Path | None = None,
+    dsn: str | None = None,
+    machine: str | None = None,
+    cells: list[Cell] | None = None,
+) -> list[dict]:
+    """Run the gate set against storages and return one document for each.
+
+    Each scenario of a cell runs in rounds. A round runs one value of each
+    storage, each on a fresh store, in an order that rotates from round to
+    round: round r starts with the storage at index r modulo the number of
+    storages. The documents have one start, which pairs their rounds, and
+    each scenario entry keeps the round and the time of each value. cells
+    picks some cells of the gate set, so that one job can run one cell.
+    """
+    stores = [STORAGES[name] for name in storages]
+    cells = list(GATE.cells if cells is None else cells)
+    if outside := [cell for cell in cells if cell not in GATE.cells]:
+        raise ValueError(f"not cells of the gate set: {outside}")
+    workdir = _workdir(workdir)
+    started = _now()
+    for store in stores:
+        reset_database(store, dsn)
+    roots = {
+        store.name: Path(tempfile.mkdtemp(prefix=f"{store.name}-", dir=workdir))
+        for store in stores
+    }
+    scenarios = {store.name: [] for store in stores}
+    for cell in cells:
+        index = GATE.cells.index(cell)
+        name = f"{index}-{cell.mode}-{cell.concurrency}-{cell.object_size}"
+        runs = [s for s in stores if cell.mode == "threads" or s.multi_process]
+        if not runs:
+            # Only one process can open these storages.
+            continue
+        _check_disk(runs, cell, workdir, roots.values())
+        for bench, (scenario, _) in SCENARIOS.items():
+            values = {store.name: [] for store in runs}
+            rounds = {store.name: [] for store in runs}
+            workers = {store.name: [] for store in runs}
+            for number in range(GATE.processes * GATE.values):
+                shift = number % len(runs)
+                for store in runs[shift:] + runs[:shift]:
+                    valuedir = roots[store.name] / f"{name}-{bench}-{number}"
+                    times, records = _value(store, cell, bench, valuedir, dsn)
+                    values[store.name] += times
+                    rounds[store.name] += [number] * len(times)
+                    workers[store.name] += records
+            for store in runs:
+                entry = _scenario(
+                    scenario, cell, values[store.name], workers[store.name]
+                )
+                entry["values"] = [
+                    {"round": number, "seconds": seconds}
+                    for number, seconds in zip(
+                        rounds[store.name], values[store.name], strict=True
+                    )
+                ]
+                scenarios[store.name].append(entry)
+    for root in roots.values():
+        shutil.rmtree(root)
+    return [
+        _document(store, "gate", started, scenarios[store.name], workdir, dsn, machine)
+        for store in stores
+    ]
+
+
+def _workdir(workdir: Path | None) -> Path:
+    workdir = Path(workdir or tempfile.gettempdir())
+    workdir.mkdir(parents=True, exist_ok=True)
+    return workdir
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def _check_disk(stores, cell: Cell, workdir: Path, roots) -> None:
+    """Fail before a cell when the disk has not the free space of one value."""
+    for store in stores:
+        needed = disk_needed(store.name, cell)
+        free = shutil.disk_usage(workdir).free
+        if free < needed:
+            # The cells before left nothing in the roots.
+            for root in roots:
+                shutil.rmtree(root)
+            raise RuntimeError(
+                f"not enough free disk for {store.name} in {cell}: one value needs"
+                f" {needed} bytes, and the disk of {workdir} has {free} bytes free"
+            )
+
+
+def _document(
+    store, kind: str, started: datetime.datetime, scenarios, workdir, dsn, machine
+) -> dict:
+    """Return the result document of a run of store."""
+    software = environment.SOFTWARE
+    if store.name in RELSTORAGE:
+        software += environment.RELSTORAGE_SOFTWARE
+    elif store.name in ("zoe", "zoe-native"):
+        software += environment.ZOE_SOFTWARE
     return {
         "schema_version": SCHEMA_VERSION,
-        "storage": storage,
+        "storage": store.name,
         "machine": environment.machine(workdir, machine),
         "python": environment.python(),
         "software": environment.software(software) | server_versions(store, dsn),
         "run": {
-            "quick": quick,
-            "set": set_name(quick, gate),
+            "quick": kind == "quick",
+            "set": kind,
             "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "commit": environment.commit(),
         },
@@ -234,17 +329,23 @@ def _run_cell(
         workers = []
         for number in range(profile.processes * profile.values):
             valuedir = root / f"{name}-{bench}-{number}"
-            valuedir.mkdir()
-            empty_database(store, dsn)
-            # _run_value raises when the value fails. Then the directory and
-            # its logs stay.
-            times, records = _run_value(store, cell, bench, valuedir, dsn)
+            times, records = _value(store, cell, bench, valuedir, dsn)
             values += times
             workers += records
-            shutil.rmtree(valuedir)
-            empty_database(store, dsn)
         scenarios.append(_scenario(scenario, cell, values, workers))
     return scenarios
+
+
+def _value(store, cell: Cell, bench: str, valuedir: Path, dsn):
+    """Run one value in valuedir on a fresh store, then remove valuedir."""
+    valuedir.mkdir()
+    empty_database(store, dsn)
+    # _run_value raises when the value fails. Then the directory and its
+    # logs stay.
+    times, records = _run_value(store, cell, bench, valuedir, dsn)
+    shutil.rmtree(valuedir)
+    empty_database(store, dsn)
+    return times, records
 
 
 def _run_value(
