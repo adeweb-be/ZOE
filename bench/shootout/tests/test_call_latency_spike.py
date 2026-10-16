@@ -102,8 +102,9 @@ def test_the_time_of_one_call_is_a_table_of_terms_for_both_storages():
 def test_each_proposed_card_names_the_cells_that_it_moves():
     cards = section(FINDING.read_text(), "## Cards")
     # Each card is a heading or an item of a list.
-    entries = re.split(r"\n(?=###\s|[-*]\s|\d+\.\s)", cards)
-    proposed = [entry for entry in entries if re.match(r"(###\s|[-*]\s|\d+\.\s)", entry)]
+    item = r"(?:###\s|[-*]\s|\d+\.\s)"
+    entries = re.split(rf"\n(?={item})", cards)
+    proposed = [entry for entry in entries if re.match(item, entry)]
     assert proposed, "the section ## Cards proposes no card"
     for entry in proposed:
         assert any(scenario in entry for scenario in SCENARIOS), entry

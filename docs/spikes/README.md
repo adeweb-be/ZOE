@@ -4,6 +4,7 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 
 | Finding | Question |
 | --- | --- |
+| [call-latency.md](call-latency.md) | What bounds the gate cells where one call waits for the one before it, and is 3× ZEO reachable there? |
 | [client-cache.md](client-cache.md) | Which layout lets the native client keep one cache in memory, in a private file and in a file that the processes of a node share, and what does a hit cost through ZODB? |
 | [concurrent-commits.md](concurrent-commits.md) | Can one client process run several transactions at once, and which rule keeps the invalidation contract of ZODB? |
 | [deterministic-simulation.md](deterministic-simulation.md) | How do the server and its clients run in one process on a simulated network and clock with seeded schedules, and should the simulator use turmoil, madsim or an executor of our own? |
