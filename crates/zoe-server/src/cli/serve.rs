@@ -654,6 +654,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         writeln!(out, "listening {addr}")?;
         out.flush()
     })?;
+    crate::spike_trace::dump("server");
     Ok(())
 }
 

@@ -686,6 +686,7 @@ impl NativeClient {
             Option<Bound<'py, PyBytes>>,
         )>,
     > {
+        zoe_client::spike_trace::mark(16);
         let (oid, tid) = (Oid(u64_of(oid)?), Tid(u64_of(tid)?));
         self.check_process()?;
         if let Some(cache) = &self.cache
@@ -704,6 +705,7 @@ impl NativeClient {
         let (record, _position) = py
             .detach(move || runtime.block_on(traced(trace, pool.load_before(oid, tid))))
             .map_err(|e| zeo_error(py, &self.peer_name(), e))?;
+        zoe_client::spike_trace::mark(15);
         Ok(record.map(|record| {
             let data = PyBytes::new(py, &record.data);
             // The buffer goes back to the client for the next long reply.
@@ -974,6 +976,7 @@ impl NativeClient {
     /// close does nothing.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.check_process()?;
+        zoe_client::spike_trace::dump("client");
         let runtime = self.runtime;
         let pool = {
             let mut slot = lock(&self.pool);

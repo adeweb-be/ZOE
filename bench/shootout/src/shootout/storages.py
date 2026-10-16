@@ -242,11 +242,21 @@ def _zeo_server(workdir: Path, msgpack: bool = False) -> Iterator[int]:
     if msgpack:
         environ["ZEO_MSGPACK"] = "1"
     with log.open("wb") as out:
+        # Spike ZOE-188: on macOS, SPIKE_ZEO_FULLFSYNC makes os.fsync of the
+        # ZEO server use F_FULLFSYNC, as zoe serve does.
+        start = ["-m", "ZEO.runzeo"]
+        if sys.platform == "darwin" and os.environ.get("SPIKE_ZEO_FULLFSYNC"):
+            start = [
+                "-c",
+                "import fcntl, os, runpy, sys; "
+                "os.fsync = lambda fd: fcntl.fcntl(fd, fcntl.F_FULLFSYNC); "
+                "sys.argv[0] = 'runzeo'; "
+                "runpy.run_module('ZEO.runzeo', run_name='__main__')",
+            ]
         server = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "ZEO.runzeo",
+                *start,
                 "-a",
                 f"127.0.0.1:{port}",
                 "-f",
@@ -302,6 +312,8 @@ def _zoe_server(workdir: Path, admin: bool = False) -> Iterator[str]:
     out = workdir / "zoe-serve.out"
     log = workdir / "zoe-serve.log"
     environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
+    # Spike ZOE-188: the switches of the prototypes reach the server.
+    environ.update({k: v for k, v in os.environ.items() if k.startswith("ZOE_SPIKE_")})
     command = [zoe_binary(), "serve", "--path", str(workdir / "store")]
     # The port 0 takes a free port. `zoe serve` writes `listening <address>`
     # to stdout once it accepts connections.

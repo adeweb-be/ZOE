@@ -660,8 +660,10 @@ impl Session {
     /// the status and the metrics of the storage. The call puts its reply
     /// with `reply`, or takes a place there.
     pub(crate) fn call(&self, call: &Call, reply: &mut Reply) -> Outcome {
+        crate::spike_trace::mark(22);
         let started = Instant::now();
         let outcome = self.dispatch(call, reply);
+        crate::spike_trace::mark(23);
         if call.method == "loadBefore" {
             let metrics = &self.storage.metrics;
             metrics.load_latency.observe_duration(started.elapsed());

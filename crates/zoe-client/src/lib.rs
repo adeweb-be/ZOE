@@ -19,6 +19,7 @@ mod endpoint;
 mod error;
 mod pool;
 mod protocol;
+pub mod spike_trace;
 pub mod runtime;
 mod tls;
 

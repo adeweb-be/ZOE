@@ -404,6 +404,8 @@ def _run_value(
         # pyperf starts its workers with a reduced environment. The variables
         # of the GIL record reach them, and change nothing else.
         inherit = list(gil.INHERIT)
+        # Spike ZOE-188: the switches of the prototypes reach the workers.
+        inherit += [k for k in os.environ if k.startswith("ZOE_SPIKE_")]
         if "LD_LIBRARY_PATH" in os.environ:
             inherit.append("LD_LIBRARY_PATH")
         args += ["--inherit-environ", ",".join(inherit)]

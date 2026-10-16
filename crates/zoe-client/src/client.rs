@@ -1178,6 +1178,7 @@ impl Inner {
         args: Vec<Value>,
         finish: bool,
     ) -> (Result<Value, Error>, Tid) {
+        crate::spike_trace::mark(10);
         let (sender, reply) = oneshot::channel();
         let id = {
             let mut calls = lock(&self.calls);
@@ -1198,6 +1199,7 @@ impl Inner {
         if self.outgoing.send(frame).await.is_err() {
             return (Err(Error::Disconnected), self.position());
         }
+        crate::spike_trace::mark(11);
         reply
             .await
             .unwrap_or_else(|_| (Err(Error::Disconnected), self.position()))
@@ -1502,7 +1504,10 @@ async fn read(inner: Arc<Inner>, mut stream: ReadHalf<Box<dyn Stream>>, _alive: 
             frame = protocol::read_payload(&mut stream) => frame,
         };
         let Ok(Some(payload)) = frame else { break };
-        match protocol::decode_payload(payload).and_then(|message| inner.dispatch(message)) {
+        crate::spike_trace::mark(13);
+        let dispatched = protocol::decode_payload(payload).and_then(|message| inner.dispatch(message));
+        crate::spike_trace::mark(14);
+        match dispatched {
             Ok(None) => {}
             Ok(Some((pieces, piece))) => {
                 // A download that stopped drops its receiver: the send then
@@ -1540,6 +1545,7 @@ async fn write(
             () = closed(&mut closing) => break,
             written = stream.write_all(&frame) => written,
         };
+        crate::spike_trace::mark(12);
         if written.is_err() {
             break;
         }

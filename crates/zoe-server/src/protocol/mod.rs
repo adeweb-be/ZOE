@@ -548,6 +548,7 @@ pub(crate) async fn serve_stream(
                     () = closing.wait() => break,
                     written = frame::write_parts(&mut writer, &parts) => written,
                 };
+                crate::spike_trace::mark(24);
                 drop(parts);
                 if written.is_err() {
                     break;
@@ -598,7 +599,10 @@ pub(crate) async fn serve_stream(
             }
         };
         let bytes = match read {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) => {
+                crate::spike_trace::mark(21);
+                bytes
+            }
             Ok(None) => break,
             Err(error) => {
                 // A frame longer than the limit, or a failed read. After a

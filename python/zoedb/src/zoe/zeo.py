@@ -1041,6 +1041,10 @@ class _NativeClientStorage(ClientStorage):
         """
         self.__dict__["_server_address"] = addr
         self.__dict__["_canonical_addr"] = None
+        # Spike ZOE-188: ZOE_SPIKE_EAGER_ADDR looks up the canonical name
+        # now, at the connection, as ZEO does.
+        if os.environ.get("ZOE_SPIKE_EAGER_ADDR"):
+            self._server_addr  # noqa: B018
 
     @property
     def _server_address(self):
