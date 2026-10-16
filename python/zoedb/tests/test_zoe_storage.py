@@ -149,6 +149,13 @@ def test_a_version_is_unsupported(storage):
     storage.tpc_abort(txn)
 
 
+@pytest.mark.parametrize("compression", ["lz4", "zstd:", ""])
+def test_a_bad_compression_is_refused(tmp_path, compression):
+    with pytest.raises(ValueError, match="none, zstd or zstd:LEVEL"):
+        zoe.Storage(str(tmp_path / "store"), compression=compression)
+    assert not (tmp_path / "store").exists()
+
+
 @pytest.mark.parametrize("lock_timeout", [-1.0, float("nan")])
 def test_a_negative_lock_timeout_is_refused(tmp_path, lock_timeout):
     with pytest.raises(ValueError):

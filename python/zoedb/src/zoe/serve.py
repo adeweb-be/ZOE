@@ -44,6 +44,7 @@ KEYS = (
     "invalidation-age",
     "client-queue-size",
     "cache-size",
+    "compression",
     "lock-timeout",
     "max-frame-size",
     "shutdown-timeout",

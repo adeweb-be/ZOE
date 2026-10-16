@@ -76,6 +76,17 @@ def test_lock_timeout_takes_whole_seconds():
         seconds("-5s")
 
 
+def test_compression_takes_none_zstd_or_zstd_and_a_level():
+    compression = config.KEYS["compression"]
+    assert compression("none") == "none"
+    assert compression(" ZSTD ") == "zstd"
+    assert compression("zstd:-1") == "zstd:-1"
+    assert compression("zstd:+3") == "zstd:+3"
+    for text in ("lz4", "zstd:", "zstd:high", "zstd 3", "zstd:--1"):
+        with pytest.raises(ValueError, match="none, zstd or zstd:LEVEL"):
+            compression(text)
+
+
 def test_a_key_of_the_section_wins_over_its_twin(tmp_path, monkeypatch):
     monkeypatch.setenv("ZOE_PATH", str(tmp_path / "other"))
     monkeypatch.setenv("ZOE_READ_ONLY", "true")

@@ -1,6 +1,6 @@
 # 0037. The phase 3 gate counts the cost of the storage against a floor
 
-Status: accepted. The human chose the rule, the statistics and the end of ZOE-190 (#389, #390) after the finding of ZOE-187 (#385), and accepted this ADR with the noise threshold of 10 % and the comparison on one Python build. The harness builds it in ZOE-192 (the floor storage) and ZOE-193 (the rule and the report).
+Status: superseded by ADR 0039. Accepted before that: the human chose the rule, the statistics and the end of ZOE-190 (#389, #390) after the finding of ZOE-187 (#385), and accepted this ADR with the noise threshold of 10 % and the comparison on one Python build. The harness builds it in ZOE-192 (the floor storage) and ZOE-193 (the rule and the report).
 
 ## Context
 

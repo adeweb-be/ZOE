@@ -104,7 +104,8 @@ pub struct Options {
     /// fails the vote with `Conflict`. This is `lock-timeout` in the
     /// configuration.
     pub lock_timeout: Duration,
-    /// How the store writes new records. The default is zstd at level 3.
+    /// How the store writes new records. The default is `None`: the records
+    /// are raw (ADR 0041).
     /// The store reads records of every codec, whatever this option.
     pub compression: Compression,
     /// The most bytes of staged pickles that one transaction keeps in
@@ -170,7 +171,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             lock_timeout: Duration::from_secs(10),
-            compression: Compression::default(),
+            compression: Compression::None,
             staging_memory: 16 << 20,
             max_record_size: None,
             max_transaction_size: None,
@@ -779,12 +780,48 @@ impl Store {
     }
 }
 
+/// The text of a compression setting: `none`, `zstd` (zstd at its default
+/// level), or `zstd:LEVEL` with a whole level, in any case. `zoe serve`
+/// and the in-process storage take it.
+impl std::str::FromStr for Compression {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "zstd" => Ok(Self::default()),
+            other => other
+                .strip_prefix("zstd:")
+                .and_then(|level| level.parse::<i32>().ok())
+                .map(|level| Self::Zstd { level })
+                .ok_or_else(|| format!("{text} is not none, zstd or zstd:LEVEL")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_compression_parses_from_none_zstd_or_zstd_and_a_level() {
+        for (text, compression) in [
+            ("none", Compression::None),
+            (" NONE ", Compression::None),
+            ("zstd", Compression::default()),
+            ("zstd:1", Compression::Zstd { level: 1 }),
+            ("ZSTD:-3", Compression::Zstd { level: -3 }),
+        ] {
+            assert_eq!(text.parse::<Compression>(), Ok(compression), "{text}");
+        }
+        for text in ["", "lz4", "zstd:", "zstd:high", "zstd 3"] {
+            let error = text.parse::<Compression>().unwrap_err();
+            assert!(error.contains("none, zstd or zstd:LEVEL"), "{error}");
+        }
+    }
 
     use super::*;
     use crate::backend::{

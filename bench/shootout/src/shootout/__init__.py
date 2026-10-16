@@ -94,20 +94,10 @@ FULL = Profile(
     values=10,
 )
 
-# The gate set is the head-to-head of the phase gates of N4: one thread,
-# 16 threads in one process and 16 processes, at 1 KB and 100 KB. Each
-# cell runs 7 rounds: one value of each storage per round (ADR 0037).
-GATE = Profile(
-    cells=_cells(["threads"], [1, 16], [KB, 100 * KB])
-    + _cells(["processes"], [16], [KB, 100 * KB]),
-    processes=1,
-    values=7,
-)
 
-
-def set_name(quick: bool, gate: bool) -> str:
-    """Return the name of the set of a run: quick, gate or full."""
-    return "quick" if quick else "gate" if gate else "full"
+def set_name(quick: bool) -> str:
+    """Return the name of the set of a run: quick or full."""
+    return "quick" if quick else "full"
 
 
 def disk_needed(storage: str, cell: Cell) -> int:
@@ -117,9 +107,7 @@ def disk_needed(storage: str, cell: Cell) -> int:
     scenario: the warmup and the value. The calls of update, or of add on a
     store that zodbshootout cannot zap, write the most. The data of
     relstorage and relstorage-hf goes to PostgreSQL, so only the logs and
-    the pyperf output of a value go to the work directory. `floor` writes
-    only the records of the populate, and two files of them at most while
-    it replaces one.
+    the pyperf output of a value go to the work directory.
     """
     if storage in RELSTORAGE:
         return STORE_OVERHEAD
@@ -128,12 +116,9 @@ def disk_needed(storage: str, cell: Cell) -> int:
     # The populate writes n objects per worker and n more. The root, the
     # tree and the mappings of the workers take c + 3 records.
     populate = (c * n + n) + (c + 3)
-    if storage == "floor":
-        records = 2 * populate
-    else:
-        # Each call of update or add writes c × L transactions of at most
-        # n + 1 records: add also writes the mapping of the worker again.
-        records = populate + 2 * c * _inner_loops(c) * (n + 1)
+    # Each call of update or add writes c × L transactions of at most
+    # n + 1 records: add also writes the mapping of the worker again.
+    records = populate + 2 * c * _inner_loops(c) * (n + 1)
     return records * (cell.object_size + RECORD_OVERHEAD) + STORE_OVERHEAD
 
 
@@ -164,7 +149,6 @@ def check_cold_loads(storage: str, objects_read: int, server_loads: int) -> None
 def run(
     storage: str,
     quick: bool = False,
-    gate: bool = False,
     workdir: Path | None = None,
     dsn: str | None = None,
     machine: str | None = None,
@@ -175,12 +159,8 @@ def run(
     store in a new directory under workdir. When the value succeeds, the
     function removes that directory. Before each cell, the function checks
     that the disk of workdir has the free space of one value. Each scenario
-    entry records the GIL of each worker process of its values. With gate,
-    the function runs the gate set as `run_gate` does.
+    entry records the GIL of each worker process of its values.
     """
-    if gate:
-        [result] = run_gate([storage], workdir=workdir, dsn=dsn, machine=machine)
-        return result
     store = STORAGES[storage]
     profile = QUICK if quick else FULL
     cells = [c for c in profile.cells if c.mode == "threads" or store.multi_process]
@@ -196,77 +176,7 @@ def run(
         name = f"{index}-{cell.mode}-{cell.concurrency}-{cell.object_size}"
         scenarios += _run_cell(store, cell, profile, root, name, dsn)
     shutil.rmtree(root)
-    return _document(
-        store, set_name(quick, False), started, scenarios, workdir, dsn, machine
-    )
-
-
-def run_gate(
-    storages: list[str],
-    workdir: Path | None = None,
-    dsn: str | None = None,
-    machine: str | None = None,
-    cells: list[Cell] | None = None,
-) -> list[dict]:
-    """Run the gate set against storages and return one document for each.
-
-    Each scenario of a cell runs in rounds. A round runs one value of each
-    storage, each on a fresh store, in an order that rotates from round to
-    round: round r starts with the storage at index r modulo the number of
-    storages. The documents have one start, which pairs their rounds, and
-    each scenario entry keeps the round and the time of each value. cells
-    picks some cells of the gate set, so that one job can run one cell.
-    """
-    stores = [STORAGES[name] for name in storages]
-    cells = list(GATE.cells if cells is None else cells)
-    if outside := [cell for cell in cells if cell not in GATE.cells]:
-        raise ValueError(f"not cells of the gate set: {outside}")
-    workdir = _workdir(workdir)
-    started = _now()
-    for store in stores:
-        reset_database(store, dsn)
-    roots = {
-        store.name: Path(tempfile.mkdtemp(prefix=f"{store.name}-", dir=workdir))
-        for store in stores
-    }
-    scenarios = {store.name: [] for store in stores}
-    for cell in cells:
-        index = GATE.cells.index(cell)
-        name = f"{index}-{cell.mode}-{cell.concurrency}-{cell.object_size}"
-        runs = [s for s in stores if cell.mode == "threads" or s.multi_process]
-        if not runs:
-            # Only one process can open these storages.
-            continue
-        _check_disk(runs, cell, workdir, roots.values())
-        for bench, (scenario, _) in SCENARIOS.items():
-            values = {store.name: [] for store in runs}
-            rounds = {store.name: [] for store in runs}
-            workers = {store.name: [] for store in runs}
-            for number in range(GATE.processes * GATE.values):
-                shift = number % len(runs)
-                for store in runs[shift:] + runs[:shift]:
-                    valuedir = roots[store.name] / f"{name}-{bench}-{number}"
-                    times, records = _value(store, cell, bench, valuedir, dsn)
-                    values[store.name] += times
-                    rounds[store.name] += [number] * len(times)
-                    workers[store.name] += records
-            for store in runs:
-                entry = _scenario(
-                    scenario, cell, values[store.name], workers[store.name]
-                )
-                entry["values"] = [
-                    {"round": number, "seconds": seconds}
-                    for number, seconds in zip(
-                        rounds[store.name], values[store.name], strict=True
-                    )
-                ]
-                scenarios[store.name].append(entry)
-    for root in roots.values():
-        shutil.rmtree(root)
-    return [
-        _document(store, "gate", started, scenarios[store.name], workdir, dsn, machine)
-        for store in stores
-    ]
+    return _document(store, set_name(quick), started, scenarios, workdir, dsn, machine)
 
 
 def _workdir(workdir: Path | None) -> Path:

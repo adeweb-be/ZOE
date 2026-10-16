@@ -44,6 +44,16 @@ fn small(title: &str) -> Vec<u8> {
     data
 }
 
+/// Open a store in memory that compresses its records with zstd, so that
+/// the fixture holds a zstd frame.
+fn open_zstd() -> Store {
+    let options = Options {
+        compression: Compression::Zstd { level: 3 },
+        ..Options::default()
+    };
+    Store::open_full(MemVfs::new(), zoe_core::SystemClock, options).unwrap()
+}
+
 /// A record that zstd shrinks, so that a store with compression keeps it
 /// with codec 1.
 fn compressible() -> Vec<u8> {
@@ -374,7 +384,7 @@ fn assert_intact(store: &Store, fixture: &Fixture) {
 /// pickle.
 #[test]
 fn a_blob_record_in_the_place_of_a_record_raises_corrupt_record() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.blobs.keys() {
@@ -388,7 +398,7 @@ fn a_blob_record_in_the_place_of_a_record_raises_corrupt_record() {
 
 #[test]
 fn a_record_in_the_place_of_a_blob_record_raises_corrupt_blob() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.blobs.keys() {
@@ -402,7 +412,7 @@ fn a_record_in_the_place_of_a_blob_record_raises_corrupt_blob() {
 
 #[test]
 fn a_transaction_row_in_the_place_of_a_record_raises_corrupt_record() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.records.keys() {
@@ -416,7 +426,7 @@ fn a_transaction_row_in_the_place_of_a_record_raises_corrupt_record() {
 
 #[test]
 fn a_record_in_the_place_of_a_transaction_row_raises_corrupt_txn() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.records.keys() {
@@ -431,7 +441,7 @@ fn a_record_in_the_place_of_a_transaction_row_raises_corrupt_txn() {
 
 #[test]
 fn a_transaction_row_in_the_place_of_a_blob_record_raises_corrupt_blob() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.blobs.keys() {
@@ -445,7 +455,7 @@ fn a_transaction_row_in_the_place_of_a_blob_record_raises_corrupt_blob() {
 
 #[test]
 fn a_blob_record_in_the_place_of_a_transaction_row_raises_corrupt_txn() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_zstd();
     let fixture = fill(&store);
 
     for &(oid, tid) in fixture.blobs.keys() {
@@ -478,9 +488,13 @@ fn a_store_without_compression_reads_back_what_it_wrote() {
 #[test]
 fn a_store_with_zstd_reads_back_what_it_wrote() {
     let dir = fresh_dir("zstd");
-    let fixture = fill(&Store::open(&dir).unwrap());
+    let options = || Options {
+        compression: Compression::Zstd { level: 3 },
+        ..Options::default()
+    };
+    let fixture = fill(&Store::open_with(&dir, options()).unwrap());
 
-    let store = Store::open(&dir).unwrap();
+    let store = Store::open_with(&dir, options()).unwrap();
     assert_intact(&store, &fixture);
     let (oid, tid) = fixture.compressed;
     let info = store.record_info(oid, tid).unwrap();

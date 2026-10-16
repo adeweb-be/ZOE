@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jsonschema
 
-from shootout import GATE, Cell, client, gate, run, run_gate
+from shootout import client, gate, native, run
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
@@ -21,21 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     run_cmd = commands.add_parser("run", help="run the baseline and write the results")
-    sets = run_cmd.add_mutually_exclusive_group()
-    sets.add_argument("--quick", action="store_true", help="run the quick set only")
-    sets.add_argument(
-        "--gate",
-        action="store_true",
-        help="run the gate set: 6 cells, 7 rounds each; a round runs one value "
-        "of each storage, in an order that rotates",
-    )
-    run_cmd.add_argument(
-        "--cell",
-        nargs="+",
-        type=_cell,
-        help="with --gate, run only these cells of the gate set, as "
-        "MODE:CONCURRENCY:SIZE, such as processes:16:102400",
-    )
+    run_cmd.add_argument("--quick", action="store_true", help="run the quick set only")
     run_cmd.add_argument(
         "--storage",
         nargs="+",
@@ -89,9 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     gate_cmd.add_argument(
         "--ratio",
         type=_ratio,
-        help="the smallest ratio of ops/s in each cell that counts (default: "
-        + ", ".join(f"{k} {v:g}" for k, v in gate.RATIOS.items())
-        + f", else {gate.PARITY:g}, parity)",
+        help=f"the smallest ratio of ops/s in each cell that counts "
+        f"(default: {gate.PARITY:g}, parity)",
     )
     gate_cmd.add_argument(
         "--python",
@@ -156,22 +141,65 @@ def main(argv: list[str] | None = None) -> int:
     )
     client_report.add_argument("result", type=Path)
 
+    native_cmd = commands.add_parser(
+        "native",
+        help="the phase 3 gate: zoe serve through the native client against ZEO",
+    )
+    native_cmds = native_cmd.add_subparsers(dest="native_command", required=True)
+    native_run = native_cmds.add_parser(
+        "run", help="run the gate, write one result and print the report"
+    )
+    native_run.add_argument(
+        "--cell",
+        nargs="+",
+        type=_native_cell,
+        help="run only these cells, as MODE:CONCURRENCY:SIZE, such as "
+        "processes:16:102400 (default: the 6 cells of the gate)",
+    )
+    native_run.add_argument(
+        "--scenario",
+        nargs="+",
+        choices=native.SCENARIOS,
+        help="run only these scenarios (default: all 5)",
+    )
+    native_run.add_argument(
+        "--machine",
+        help="the machine name in the result "
+        "(default: $ZOE_BENCH_MACHINE, else the CPU model)",
+    )
+    native_run.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("target/bench/work"),
+        help="where the servers write their stores; each cell runs on fresh "
+        "stores that the gate removes when the cell ends (default: %(default)s)",
+    )
+    native_run.add_argument(
+        "--output",
+        type=Path,
+        help="the result file (default: target/bench/native/<started>.json)",
+    )
+    native_report = native_cmds.add_parser(
+        "report", help="print the rows of a result and the verdict"
+    )
+    native_report.add_argument("result", type=Path)
+
     args = parser.parse_args(argv)
     if args.command == "client":
         return _client(args, parser)
+    if args.command == "native":
+        return _native(args)
     if args.command == "index":
         print(write_index(args.root))
         return 0
     if args.command == "gate":
-        ratio = args.ratio or gate.default_ratio(args.storage)
+        ratio = args.ratio or gate.PARITY
         return gate.report(
             args.root, args.storage, args.baseline, ratio, sys.stdout, args.python
         )
 
     storages = args.storage or [
-        s
-        for s in STORAGES
-        if STORAGES[s].default and (args.dsn or not STORAGES[s].needs_dsn)
+        s for s in STORAGES if args.dsn or not STORAGES[s].needs_dsn
     ]
     needs_dsn = [s for s in storages if STORAGES[s].needs_dsn]
     if needs_dsn and not args.dsn:
@@ -182,30 +210,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{skipped} skipped: no PostgreSQL DSN", file=sys.stderr)
 
     schema = json.loads(SCHEMA.read_text())
-    if args.cell and not args.gate:
-        parser.error("--cell needs --gate")
-    if args.gate:
-        print(f"== gate: {' '.join(storages)}", flush=True)
-        results = run_gate(
-            storages,
+    for storage in storages:
+        print(f"== {storage}", flush=True)
+        result = run(
+            storage,
+            quick=args.quick,
             workdir=args.workdir,
             dsn=args.dsn,
             machine=args.machine,
-            cells=args.cell,
         )
-        for result in results:
-            _write(result, args.output, schema)
-    else:
-        for storage in storages:
-            print(f"== {storage}", flush=True)
-            result = run(
-                storage,
-                quick=args.quick,
-                workdir=args.workdir,
-                dsn=args.dsn,
-                machine=args.machine,
-            )
-            _write(result, args.output, schema)
+        _write(result, args.output, schema)
     write_index(args.output)
     return 0
 
@@ -258,25 +272,56 @@ def _client(args, parser) -> int:
     return 0
 
 
+def _native(args) -> int:
+    """Run the native gate, or report on a result of it."""
+    schema = json.loads(native.SCHEMA.read_text())
+    if args.native_command == "report":
+        result = json.loads(args.result.read_text())
+        try:
+            jsonschema.validate(result, schema)
+        except jsonschema.ValidationError as error:
+            print(
+                f"{args.result} is not a result of the native gate: {error.message}",
+                file=sys.stderr,
+            )
+            return 2
+        return native.report(result, sys.stdout)
+    result = native.run(
+        cells=args.cell or native.CELLS,
+        scenarios=args.scenario or native.SCENARIOS,
+        workdir=args.workdir,
+        machine=args.machine,
+    )
+    jsonschema.validate(result, schema)
+    output = args.output
+    if output is None:
+        stamp = result["run"]["started"].replace("-", "").replace(":", "")
+        output = Path("target/bench/native") / f"{stamp}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(output, flush=True)
+    return native.report(result, sys.stdout)
+
+
+def _native_cell(text: str) -> native.Cell:
+    """Parse MODE:CONCURRENCY:SIZE, a cell of the native gate."""
+    try:
+        mode, concurrency, size = text.split(":")
+        cell = native.Cell(mode, int(concurrency), int(size))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"a cell is MODE:CONCURRENCY:SIZE: {text}"
+        ) from None
+    if cell not in native.CELLS:
+        raise argparse.ArgumentTypeError(f"not a cell of the native gate: {text}")
+    return cell
+
+
 def _positive(text: str) -> int:
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError(f"the value must be positive: {text}")
     return value
-
-
-def _cell(text: str) -> Cell:
-    """Parse MODE:CONCURRENCY:SIZE, a cell of the gate set."""
-    try:
-        mode, concurrency, size = text.split(":")
-        cell = Cell(mode, int(concurrency), int(size))
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"a cell is MODE:CONCURRENCY:SIZE: {text}"
-        ) from None
-    if cell not in GATE.cells:
-        raise argparse.ArgumentTypeError(f"not a cell of the gate set: {text}")
-    return cell
 
 
 def _ratio(text: str) -> float:

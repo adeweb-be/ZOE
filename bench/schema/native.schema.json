@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/native.schema.json",
+  "title": "ZOE native gate result",
+  "description": "One run of the native gate, the phase 3 gate of N4 (ADR 0039): zoe serve through the native client (zoe-native) against ZEO 6 through ZEO.ClientStorage (zeo), in alternating batches, on one machine, with one Python build. Results are numbers about a synthetic corpus, never data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine", "python", "software", "run", "rule", "cells"],
+  "$defs": {
+    "workers": {
+      "description": "One item per worker process of one storage in the cell: one process in the threads mode, one per worker in the processes mode.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gil_enabled", "gil_enabled_by"],
+        "properties": {
+          "gil_enabled": { "description": "sys._is_gil_enabled() when the process ended; true on a build with the GIL.", "type": "boolean" },
+          "gil_enabled_by": {
+            "description": "The modules that turned the GIL back on in the process, from the warnings of CPython. Empty on a build with the GIL.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "seconds": { "description": "The time of the slowest worker for one transaction.", "type": "number", "exclusiveMinimum": 0 }
+  },
+  "properties": {
+    "schema_version": {
+      "description": "The version of this schema. A change that a reader of the previous version cannot read increments it.",
+      "const": 1
+    },
+    "machine": {
+      "description": "The machine that ran the gate, as in the results of the harness. It holds no host name, user name or path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "cpu", "logical_cpus", "memory_bytes", "os", "kernel", "arch", "disk"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "cpu": { "type": "string", "minLength": 1 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "kernel": { "type": "string", "minLength": 1 },
+        "arch": { "type": "string", "minLength": 1 },
+        "disk": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["model", "rotational"],
+          "properties": {
+            "model": { "type": ["string", "null"] },
+            "rotational": { "type": ["boolean", "null"] }
+          }
+        }
+      }
+    },
+    "python": {
+      "description": "The Python build that ran both clients.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "version", "free_threaded", "compiler"],
+      "properties": {
+        "implementation": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+        "free_threaded": { "description": "True for a build without the GIL, such as 3.14t.", "type": "boolean" },
+        "compiler": { "type": "string" }
+      }
+    },
+    "software": {
+      "description": "The version of each distribution and server in the run, keyed by name.",
+      "type": "object",
+      "required": ["ZEO", "zoedb"],
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started", "commit", "seconds"],
+      "properties": {
+        "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
+        "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "seconds": { "description": "The wall time of the run.", "type": "number", "minimum": 0 }
+      }
+    },
+    "rule": {
+      "description": "The rule that stopped the pairs of each scenario. The report applies it again to the pairs.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_pairs", "max_pairs", "max_seconds", "level", "batch_seconds", "max_transactions"],
+      "properties": {
+        "min_pairs": { "description": "The pairs before a verdict can stop a scenario.", "type": "integer", "minimum": 2 },
+        "max_pairs": { "description": "The most pairs of a scenario.", "type": "integer", "minimum": 2 },
+        "max_seconds": { "description": "The time after which a scenario takes no new pair.", "type": "number", "exclusiveMinimum": 0 },
+        "level": { "description": "The confidence level of the interval of the mean of the log of the ratios.", "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+        "batch_seconds": { "description": "The time that a batch lasts about: the warmup pair of a scenario sets its transactions per batch from it.", "type": "number", "exclusiveMinimum": 0 },
+        "max_transactions": { "description": "The most transactions of a batch.", "type": "integer", "minimum": 1 }
+      }
+    },
+    "cells": {
+      "description": "One entry per cell that the run measured.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mode", "concurrency", "object_size", "objects_per_transaction", "workers", "scenarios"],
+        "properties": {
+          "mode": { "description": "threads: the workers are threads of one process on one DB. processes: each worker is a process with its own DB.", "enum": ["threads", "processes"] },
+          "concurrency": { "description": "The number of workers.", "type": "integer", "minimum": 1 },
+          "object_size": { "description": "The size of each object, in bytes.", "type": "integer", "minimum": 1 },
+          "objects_per_transaction": { "type": "integer", "minimum": 1 },
+          "workers": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["zeo", "zoe-native"],
+            "properties": {
+              "zeo": { "$ref": "#/$defs/workers" },
+              "zoe-native": { "$ref": "#/$defs/workers" }
+            }
+          },
+          "scenarios": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "transactions", "pairs"],
+              "properties": {
+                "name": { "enum": ["add", "update", "read_cold", "read_warm", "read_hot"] },
+                "transactions": { "description": "The transactions that each worker runs in a row in one batch. A time of a pair is the time of the slowest worker for one of them.", "type": "integer", "minimum": 1 },
+                "pairs": {
+                  "description": "The pairs in the order that they ran. The warmup pair is not in the list.",
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["first", "seconds"],
+                    "properties": {
+                      "first": { "description": "The storage whose batch ran first in the pair.", "enum": ["zeo", "zoe-native"] },
+                      "seconds": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["zeo", "zoe-native"],
+                        "properties": {
+                          "zeo": { "$ref": "#/$defs/seconds" },
+                          "zoe-native": { "$ref": "#/$defs/seconds" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

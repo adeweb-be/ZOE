@@ -17,7 +17,7 @@ use std::time::Duration;
 use redb::StorageBackend;
 use zoe_core::testing::{self, Key};
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Codec, Oid, Store, Tid, ZoeError};
+use zoe_core::{Codec, Compression, Oid, Options, Store, SystemClock, Tid, ZoeError};
 
 /// The seed of the flips. A failure message names the byte and the bit.
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -43,6 +43,26 @@ fn fresh_dir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Open the store in `dir` with zstd at level 3. So `fill` writes records
+/// of both codecs.
+fn open_zstd(dir: impl AsRef<Path>) -> Store {
+    Store::open_with(dir, zstd()).unwrap()
+}
+
+/// Open the store in `vfs` with zstd at level 3.
+fn open_zstd_vfs(vfs: MemVfs) -> zoe_core::Result<Store> {
+    Store::open_full(vfs, SystemClock, zstd())
+}
+
+/// The options of a store that compresses its records with zstd at
+/// level 3.
+fn zstd() -> Options {
+    Options {
+        compression: Compression::Zstd { level: 3 },
+        ..Options::default()
+    }
 }
 
 /// A small protocol-3 record.
@@ -205,7 +225,7 @@ fn assert_intact(store: &Store, records: &Records) {
 
 #[test]
 fn every_flipped_bit_in_a_record_frame_raises_corrupt_record() {
-    let store = Store::open(fresh_dir("records")).unwrap();
+    let store = open_zstd(fresh_dir("records"));
     let records = fill(&store);
     let mut rng = Rng::new();
 
@@ -239,7 +259,7 @@ fn every_flipped_bit_in_a_record_frame_raises_corrupt_record() {
 
 #[test]
 fn every_cut_or_grown_record_frame_raises_corrupt_record() {
-    let store = Store::open(fresh_dir("cuts")).unwrap();
+    let store = open_zstd(fresh_dir("cuts"));
     let records = fill(&store);
 
     for &(oid, tid) in records.records.keys() {
@@ -259,7 +279,7 @@ fn every_cut_or_grown_record_frame_raises_corrupt_record() {
 
 #[test]
 fn a_frame_under_another_key_raises_corrupt_record() {
-    let store = Store::open(fresh_dir("moved")).unwrap();
+    let store = open_zstd(fresh_dir("moved"));
     let records = fill(&store);
     let keys: Vec<(Oid, Tid)> = records.records.keys().copied().collect();
 
@@ -307,7 +327,7 @@ fn read_txn(store: &Store, tid: Tid, oid: Oid) -> Vec<(&'static str, Result<(), 
 
 #[test]
 fn every_flipped_bit_in_a_transaction_row_raises_corrupt_txn() {
-    let store = Store::open(fresh_dir("txns")).unwrap();
+    let store = open_zstd(fresh_dir("txns"));
     let records = fill(&store);
     let mut rng = Rng::new();
 
@@ -511,7 +531,7 @@ fn within_time<T: Send + 'static>(what: String, check: impl FnOnce() -> T + Send
 fn flips_in_the_database_file_never_return_wrong_data() {
     let vfs = MemVfs::new();
     let (records, frames) = {
-        let store = Store::open_vfs(vfs.clone()).unwrap();
+        let store = open_zstd_vfs(vfs.clone()).unwrap();
         let records = fill(&store);
         let frames: Vec<((Oid, Tid), Vec<u8>)> = records
             .records
@@ -546,7 +566,7 @@ fn flips_in_the_database_file_never_return_wrong_data() {
             let what = format!("byte {byte} bit {bit} of the stored frame of {oid:?} at {tid:?}");
             let (oid, tid, records) = (*oid, *tid, std::sync::Arc::clone(&records));
             within_time(what.clone(), move || {
-                let Ok(store) = Store::open_vfs(with_database(&flipped)) else {
+                let Ok(store) = open_zstd_vfs(with_database(&flipped)) else {
                     return;
                 };
                 assert_corrupt_record(&store, &records, oid, tid, &what);
@@ -566,7 +586,7 @@ fn flips_in_the_database_file_never_return_wrong_data() {
             let mut wrong = Vec::new();
             // A panic is a refusal: it returns no data.
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                let Ok(store) = Store::open_vfs(with_database(&flipped)) else {
+                let Ok(store) = open_zstd_vfs(with_database(&flipped)) else {
                     return;
                 };
                 for (&(oid, tid), data) in &records.records {

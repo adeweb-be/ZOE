@@ -67,7 +67,13 @@ fn raw_load(conn: &mut Conn, oid: u64, tid: Value) -> (Value, Vec<u8>) {
 #[test]
 fn a_load_reply_is_the_msgpack_frame_of_the_record_for_each_size() {
     let dir = fresh_dir("load-bytes-sizes");
-    let server = Server::path(&dir.join("store"));
+    // The store compresses with zstd, so the replies of the records that
+    // compress come from zstd frames.
+    let store = dir.join("store");
+    let server = Server::start(
+        &["--path", store.to_str().unwrap(), "--compression", "zstd"],
+        &[],
+    );
     let mut writer = server.client("1");
     let mut reader = Conn::open(server.addr);
     // The reader does not register with the hub before the commits, so it
@@ -113,7 +119,13 @@ fn a_load_reply_is_the_msgpack_frame_of_the_record_for_each_size() {
 #[test]
 fn a_load_never_shows_a_large_record_of_a_transaction_that_did_not_finish() {
     let dir = fresh_dir("load-bytes-unfinished");
-    let server = Server::path(&dir.join("store"));
+    // The store compresses with zstd, so the replies of the records that
+    // compress come from zstd frames.
+    let store = dir.join("store");
+    let server = Server::start(
+        &["--path", store.to_str().unwrap(), "--compression", "zstd"],
+        &[],
+    );
     let mut writer = server.client("1");
     let mut reader = server.client("1");
     let oid = new_oids(&mut writer, 1)[0];

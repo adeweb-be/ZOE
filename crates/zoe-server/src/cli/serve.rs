@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
+use zoe_core::Compression;
 
 use super::Failure;
 
@@ -255,6 +256,18 @@ pub(super) struct ServeArgs {
         value_parser = clap::value_parser!(NonZeroUsize)
     )]
     blocking_threads: Option<NonZeroUsize>,
+
+    /// The compression of the records that the stores write: `none`, `zstd`,
+    /// or `zstd:LEVEL`, such as `zstd:3`. A store reads every compression,
+    /// whatever this option. The default is the default of the store, none:
+    /// the records are raw.
+    #[arg(
+        long,
+        env = "ZOE_COMPRESSION",
+        value_name = "CODEC",
+        value_parser = clap::builder::ValueParser::new(str::parse::<Compression>)
+    )]
+    compression: Option<Compression>,
 
     /// Serve every store for reads only. The server opens each store
     /// read-only, and holds its lock, so no writer opens the store
@@ -618,6 +631,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     if let Some(bytes) = args.cache_size {
         options = options.cache_size(bytes);
     }
+    if let Some(compression) = args.compression {
+        options = options.compression(compression);
+    }
     if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
         options = options.lock_warn(threshold);
     }
@@ -870,6 +886,29 @@ mod tests {
         assert!(!serve(&["--pack-gc=false"]).unwrap().pack_gc);
         let error = serve(&["--pack-gc=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_compression_keeps_the_default_of_the_store_and_takes_none_or_zstd() {
+        assert_eq!(serve(&[]).unwrap().compression, None);
+        for (value, compression) in [
+            ("none", Compression::None),
+            ("NONE", Compression::None),
+            ("zstd", Compression::default()),
+            ("zstd:1", Compression::Zstd { level: 1 }),
+            ("zstd:19", Compression::Zstd { level: 19 }),
+        ] {
+            let args = serve(&["--compression", value]).unwrap();
+            assert_eq!(args.compression, Some(compression), "{value}");
+        }
+        for value in ["lz4", "zstd:", "zstd:high", ""] {
+            let error = serve(&["--compression", value]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
     }
 
     #[test]

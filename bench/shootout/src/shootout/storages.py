@@ -2,10 +2,9 @@
 
 Every storage runs with its default settings, but `relstorage-hf` keeps no
 history. `zconfig` starts a server on a new store when the storage needs
-one. `floor` is the floor of the phase 3 gate (ADR 0037): a minimal
-storage in memory of the harness, in `shootout/floor.py`. `reset_database`
-and `empty_database` prepare the database of `relstorage` and
-`relstorage-hf`, which keep their data outside the work directory.
+one. `reset_database` and `empty_database` prepare the database of
+`relstorage` and `relstorage-hf`, which keep their data outside the work
+directory.
 """
 
 import contextlib
@@ -30,8 +29,6 @@ class Storage:
     # A server takes the connections of several processes.
     multi_process: bool
     needs_dsn: bool
-    # A run without --storage runs only the storages with default true.
-    default: bool = True
 
 
 STORAGES = {
@@ -44,9 +41,6 @@ STORAGES = {
         Storage("zoe-server", multi_process=True, needs_dsn=False),
         Storage("zoe-native", multi_process=True, needs_dsn=False),
         Storage("relstorage-hf", multi_process=True, needs_dsn=True),
-        # The floor keeps every record of a value in memory: `add` at
-        # concurrency 64 and 100 KB in the full set holds about 19 GB.
-        Storage("floor", multi_process=True, needs_dsn=False, default=False),
     )
 }
 
@@ -96,12 +90,6 @@ def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
                 "native true",
                 "</zoeclient>",
             )
-    elif storage.name == "floor":
-        # Each process of zodbshootout starts from the records of the
-        # populate in this file.
-        yield "%import shootout\n" + _section(
-            storage.name, "<floor>", f"path {workdir / 'floor.records'}", "</floor>"
-        )
     else:
         raise ValueError(f"unknown storage {storage.name!r}")
 

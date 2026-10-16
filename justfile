@@ -491,18 +491,19 @@ plone scenario="zoe" command="start" *args:
 # Run the benchmarks. `just bench` runs the zodbshootout baseline into
 # target/bench/results, `just bench run --quick` runs the quick set,
 # `just bench test` runs the tests of the harness and `just bench gate DIR`
-# compares zoe serve with ZEO cell by cell. The gate of zoe-server checks
-# parity by default and leaves read_hot out (phase 2). The gate of
-# `--storage zoe-native` reads the gate set and checks, in every cell, a
-# storage cost of at most a third of the one of ZEO over the floor storage
-# (phase 3, ADR 0037), and `--python cp314t` counts only that build.
-# `run --gate --storage zeo zoe-native floor` runs the gate set in rounds
-# that interleave the storages, and `--cell` picks some of its cells.
+# compares zoe serve with ZEO cell by cell: parity, read_hot left out
+# (phase 2), and `--python cp314t` counts only that build.
+# `just bench native` runs the phase 3 gate (ADR 0039): zoe serve through
+# the native client against ZEO in alternating batches, in the 30 cells of
+# the gate set. It writes target/bench/native/<started>.json, prints the
+# report and fails when a cell is not faster. `--cell` and `--scenario`
+# run a part of it. `just bench native report FILE` prints the report of a
+# result and builds nothing.
 # `run` runs each value of zodbshootout on a fresh store under
 # target/bench/work, removes the store when the value ends, and fails a
 # cell before it starts when that disk has less free space than one value
-# needs. Each result records the GIL of each worker process. `run` and
-# `test` build `zoe` in release for the storages zoe-server and
+# needs. Each result records the GIL of each worker process. `run`, `test`
+# and `native` build `zoe` in release for the storages zoe-server and
 # zoe-native, unless ZOE_BINARY names a binary.
 # `just bench test FILE...` runs only the tests of those files.
 # `just bench client` runs the client benchmark: ZEO.ClientStorage against
@@ -520,10 +521,12 @@ bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
-    # `just bench client OPTIONS` stands for `just bench client run OPTIONS`.
-    if [ "${1:-}" = client ] && [ "${2:-}" != run ] && [ "${2:-}" != report ]; then
+    # `just bench client OPTIONS` stands for `just bench client run OPTIONS`,
+    # and `just bench native OPTIONS` for `just bench native run OPTIONS`.
+    if { [ "${1:-}" = client ] || [ "${1:-}" = native ]; } && [ "${2:-}" != run ] && [ "${2:-}" != report ]; then
+        command="$1"
         shift
-        set -- client run "$@"
+        set -- "$command" run "$@"
     fi
     if [ "${1:-}" = load ] || [ "${1:-}" = saturate ]; then
         command="$1"
@@ -570,8 +573,8 @@ bench *args="run":
     shootout=(uv run --locked --project bench/shootout)
     builds=false
     case "${1:-} ${2:-}" in
-        "client report") ;;
-        run\ * | test\ * | client\ *) builds=true ;;
+        "client report" | "native report") ;;
+        run\ * | test\ * | client\ * | native\ *) builds=true ;;
     esac
     if [ "$builds" = true ] && [ -z "${ZOE_BINARY:-}" ]; then
         cargo build --release --locked -p zoe-server --bin zoe

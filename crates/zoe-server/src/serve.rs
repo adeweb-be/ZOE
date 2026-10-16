@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
-use zoe_core::{Options, Store, ZoeError};
+use zoe_core::{Compression, Options, Store, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
 use crate::protocol::{self, Connection, NamedStorage, Pool, Queues, Stopping, Storages};
@@ -165,6 +165,7 @@ pub struct ServeOptions {
     queues: Queues,
     lock_timeout: Option<Duration>,
     cache_size: Option<usize>,
+    compression: Option<Compression>,
     lock_warn: Option<Duration>,
     transaction_warn: Option<Duration>,
     max_frame_size: NonZeroU32,
@@ -201,6 +202,7 @@ impl ServeOptions {
             queues: Queues::DEFAULT,
             lock_timeout: None,
             cache_size: None,
+            compression: None,
             lock_warn: None,
             transaction_warn: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -275,6 +277,15 @@ impl ServeOptions {
     #[must_use]
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = Some(bytes);
+        self
+    }
+
+    /// Write the new records of each store with `compression`. Without this
+    /// call, each store keeps the default of the store, none. A store reads
+    /// every compression, whatever this setting.
+    #[must_use]
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
         self
     }
 
@@ -401,6 +412,9 @@ impl ServeOptions {
             options.lock_timeout = timeout;
         }
         options.cache_size = self.cache_size;
+        if let Some(compression) = self.compression {
+            options.compression = compression;
+        }
         options.lock_warn = self.lock_warn;
         options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);

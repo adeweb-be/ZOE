@@ -41,22 +41,8 @@ def write(root, storage, python, ops, sizes=(KB,)):
 
 def report(root, storage, python=None):
     out = io.StringIO()
-    ratio = gate.default_ratio(storage)
-    code = gate.report(root, storage, "zeo", ratio, out, python)
+    code = gate.report(root, storage, "zeo", gate.PARITY, out, python)
     return code, out.getvalue().splitlines()
-
-
-def test_the_default_ratios_are_constants_of_the_gate():
-    assert gate.default_ratio("zoe-native") == 3.0
-    assert gate.default_ratio("zoe-server") == 1.0
-    assert gate.default_ratio("zoe") == 1.0
-
-
-def test_zoe_native_leaves_out_no_cell():
-    # The cost rule of ADR 0037 counts every cell of zoe-native.
-    assert gate.left_out("zoe-native") == {}
-    assert gate.left_out("zoe-server") == gate.LEFT_OUT
-    assert gate.left_out("zoe") == gate.LEFT_OUT
 
 
 def verdicts(lines, scenario):
@@ -66,14 +52,6 @@ def verdicts(lines, scenario):
         for line in lines
         if line.startswith(f"{scenario} ")
     ]
-
-
-def test_the_cost_rule_of_zoe_native_reads_the_gate_set_only(tmp_path):
-    write(tmp_path, "zeo", "cp313", {"add": 1000.0})
-    write(tmp_path, "zoe-native", "cp313", {"add": 3000.0})
-    code, lines = report(tmp_path, "zoe-native")
-    assert code == 1
-    assert lines == [f"gate: no gate result of zeo under {tmp_path}"]
 
 
 def test_zoe_server_leaves_out_read_hot_in_both_sizes(tmp_path):
