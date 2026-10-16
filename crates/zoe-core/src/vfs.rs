@@ -496,14 +496,18 @@ pub struct OsFile {
     /// The writes that the file has not made yet, by offset. They do not
     /// overlap.
     pending: Mutex<Pending>,
-    /// True while `pending` holds a write. A read checks it without the
-    /// mutex.
+    /// True while `pending` holds a write. It turns false only after the
+    /// writes are made. A read checks it without the mutex.
     has_pending: AtomicBool,
     /// True for a database file, the file of `Vfs::open`: it holds its
     /// writes and fills its growth with zeros. Another file, such as a
     /// spill file of `Vfs::create_new`, makes each write at once and grows
     /// sparse.
     database: bool,
+    /// A test stops a `make` after its first write here: it waits on the
+    /// first barrier, then on the second.
+    #[cfg(test)]
+    pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -522,6 +526,8 @@ impl OsFile {
             pending: Mutex::new(Pending::default()),
             has_pending: AtomicBool::new(false),
             database,
+            #[cfg(test)]
+            pause: Mutex::new(None),
         })
     }
 
@@ -529,7 +535,19 @@ impl OsFile {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Make the pending writes, if any.
+    /// Wait on the barriers of a test, once.
+    #[cfg(test)]
+    fn paused(&self) {
+        let pause = self.pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.wait();
+            release.wait();
+        }
+    }
+
+    /// Make the pending writes, if any, before a read. A read that finds no
+    /// pending write takes no mutex: the flag turns false only after the
+    /// writes are made.
     fn make_pending(&self) -> io::Result<()> {
         if self.has_pending.load(Ordering::Acquire) {
             self.make(&mut self.lock())?;
@@ -539,26 +557,32 @@ impl OsFile {
 
     /// Make the writes of `pending` in the order of their offsets, each run
     /// of adjacent writes as one write of at most `MERGED_WRITE_MAX` bytes.
+    ///
+    /// The caller holds the mutex, so no other thread makes them at the
+    /// same time. The writes leave `pending` only when all of them are
+    /// made. After an error they stay, and the next call makes them again.
     fn make(&self, pending: &mut Pending) -> io::Result<()> {
-        let writes = std::mem::take(&mut pending.writes);
-        pending.bytes = 0;
-        self.has_pending.store(false, Ordering::Release);
         let mut run = Vec::new();
         let mut start = 0;
-        for (offset, data) in writes {
+        for (&offset, data) in &pending.writes {
             let next = start + run.len() as u64;
             if !run.is_empty() && (offset != next || run.len() + data.len() > MERGED_WRITE_MAX) {
                 redb::StorageBackend::write(&self.backend, start, &run)?;
+                #[cfg(test)]
+                self.paused();
                 run.clear();
             }
             if run.is_empty() {
                 start = offset;
             }
-            run.extend_from_slice(&data);
+            run.extend_from_slice(data);
         }
         if !run.is_empty() {
             redb::StorageBackend::write(&self.backend, start, &run)?;
         }
+        pending.writes.clear();
+        pending.bytes = 0;
+        self.has_pending.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -585,7 +609,9 @@ impl redb::StorageBackend for OsFile {
     /// bound keeps the time of one growth short. A larger growth stays
     /// sparse.
     fn set_len(&self, len: u64) -> io::Result<()> {
-        self.make_pending()?;
+        // The mutex stays held, so no held write runs past the new end.
+        let mut pending = self.lock();
+        self.make(&mut pending)?;
         let old = self.backend.len()?;
         self.backend.set_len(len)?;
         if self.database && len > old && len - old <= ZERO_FILL_MAX {
@@ -601,7 +627,9 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        self.make_pending()?;
+        // The mutex makes this sync wait for a `make` that another thread
+        // runs: its writes can be writes of the commit that syncs.
+        self.make(&mut self.lock())?;
         sync_data(&self.file)
     }
 
@@ -642,7 +670,7 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn close(&self) -> io::Result<()> {
-        self.make_pending()?;
+        self.make(&mut self.lock())?;
         self.backend.close()
     }
 }
@@ -674,12 +702,17 @@ fn fsync(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: the descriptor belongs to `file`, which stays open for the
     // call. fsync(2) reads no memory of the process.
-    #[allow(unsafe_code)]
-    let done = unsafe { libc::fsync(file.as_raw_fd()) };
-    if done == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        #[allow(unsafe_code)]
+        let done = unsafe { libc::fsync(file.as_raw_fd()) };
+        if done == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // A signal can stop the call before it ends. Then it runs again.
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -2051,6 +2084,47 @@ mod tests {
         file.close().unwrap();
         drop(file);
         assert_eq!(&on_disk()[41000..41005], b"close");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_sync_waits_for_the_held_writes_that_a_read_makes() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        let file = Arc::new(vfs.open("f").unwrap());
+        file.set_len(4 * 4096).unwrap();
+        // Two pages that are not adjacent: two writes.
+        file.write(0, &[1; 4096]).unwrap();
+        file.write(2 * 4096, &[2; 4096]).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *file.pause.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+        // A read makes the held writes, and stops after the first one.
+        let reader = {
+            let file = file.clone();
+            std::thread::spawn(move || file.read(0, &mut [0; 8]).unwrap())
+        };
+        entered.wait();
+        // A sync now must wait for the second write of the read.
+        let synced = Arc::new(AtomicBool::new(false));
+        let syncer = {
+            let (file, synced) = (file.clone(), synced.clone());
+            std::thread::spawn(move || {
+                file.sync_data().unwrap();
+                synced.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!synced.load(Ordering::SeqCst), "the sync did not wait");
+        release.wait();
+        reader.join().unwrap();
+        syncer.join().unwrap();
+        let bytes = fs::read(vfs.path("f")).unwrap();
+        assert!(bytes[..4096].iter().all(|&b| b == 1));
+        assert!(bytes[2 * 4096..3 * 4096].iter().all(|&b| b == 2));
+        drop(file);
         fs::remove_dir_all(&root).unwrap();
     }
 

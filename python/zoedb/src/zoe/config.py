@@ -67,7 +67,7 @@ def compression(value):
     parses it again.
     """
     text = value.strip().lower()
-    if re.fullmatch(r"none|zstd(:-?[0-9]+)?", text):
+    if re.fullmatch(r"none|zstd(:[+-]?[0-9]+)?", text):
         return text
     raise ValueError(f"{value!r} is not none, zstd or zstd:LEVEL")
 
