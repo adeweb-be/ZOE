@@ -29,6 +29,7 @@ import io
 import itertools
 import json
 import math
+import multiprocessing.util
 import os
 import pathlib
 import shutil
@@ -678,6 +679,12 @@ class ZeoLayer:
     `tearDown` kills every server that the layer started and puts back each
     function that `setUp` replaced.
 
+    `setUp` also makes the temporary directory of multiprocessing, before a
+    test changes `tempfile.tempdir`. The fork server of multiprocessing
+    keeps its socket in that directory, and it serves each later test of
+    the process. A ZEO test removes its own test directory, so the socket
+    must not be in it.
+
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
 
@@ -696,6 +703,7 @@ class ZeoLayer:
         # The import binds the function of ZEO in testConfig before the
         # replacement.
         importlib.import_module("ZEO.tests.testConfig")
+        multiprocessing.util.get_temp_dir()
         function = _forker.start_zeo_server
         for name, module in list(sys.modules.items()):
             if name != "ZEO" and not name.startswith("ZEO."):
@@ -836,6 +844,9 @@ def native_client(address, **kw):
     return zoe.zeo.ClientStorage(address, native=True, **kw)
 
 
+_ABSENT = object()
+
+
 class NativeLayer:
     """A layer that makes `ZEO.ClientStorage.ClientStorage` and the
     `<zoeclient>` section open the native client.
@@ -851,6 +862,14 @@ class NativeLayer:
     its base in place of the class of ZEO. The `<zoeclient>` section opens
     the native client whatever its key `native`. `tearDown` puts back the
     class of ZEO, the bases of each class and the open of `<zoeclient>`.
+
+    CPython does not reset the `__new__` slot of a class when its bases
+    change back. Then `object.__new__` refuses the arguments of the class.
+    So before `setUp` changes the bases of a class, it puts in the class the
+    `__new__` that the class gets from its bases. With it, the slot does not
+    change. In the layer, the class does not call the `__new__` of the
+    native class, which does nothing more for a subclass of the native
+    class. `tearDown` removes the `__new__` after it puts back the bases.
 
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
@@ -886,18 +905,31 @@ class NativeLayer:
                     bases = tuple(
                         native if base is original else base for base in value.__bases__
                     )
+                    if "__new__" not in vars(value):
+                        new = next(
+                            vars(cls)["__new__"]
+                            for cls in value.__mro__
+                            if "__new__" in vars(cls)
+                        )
+                        self._patch(value, "__new__", new, absent=True)
                     self._patch(value, "__bases__", bases)
         section = zoe.config.ZoeClient
         self._patch(section, "open", lambda client: client._open_client(native=True))
 
-    def _patch(self, target, name, value):
-        self._patches.append((target, name, getattr(target, name)))
+    def _patch(self, target, name, value, absent=False):
+        # With `absent`, `target` does not have `name` itself: `tearDown`
+        # removes it.
+        original = _ABSENT if absent else getattr(target, name)
+        self._patches.append((target, name, original))
         setattr(target, name, value)
 
     def tearDown(self):
         while self._patches:
             target, name, original = self._patches.pop()
-            setattr(target, name, original)
+            if original is _ABSENT:
+                delattr(target, name)
+            else:
+                setattr(target, name, original)
 
 
 NATIVE_LAYER = NativeLayer("NATIVE_LAYER")
