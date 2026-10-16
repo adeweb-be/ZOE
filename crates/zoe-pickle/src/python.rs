@@ -1,0 +1,1252 @@
+//! The objects that Python's unpickler builds from a record, with their
+//! identity, and a pickler that writes them as zodbpickle does with
+//! protocol 3.
+//!
+//! A merge of states, as the conflict resolution of BTrees does it, works
+//! on these objects. ZODB's resolver unpickles three states, merges them
+//! and pickles the result with one `Pickler` for the class and the state.
+//! The bytes of that pickle depend on the identity of the objects: the
+//! pickler writes an object that it saw before as a memo get. So a
+//! [`Heap`] keeps the identity of each object as Python's unpickler gives
+//! it:
+//!
+//! - Each opcode that makes a str, bytes, tuple, list or dict makes a new
+//!   object. A memo get gives the object of its put.
+//! - CPython shares some objects: the empty str, each str of one character
+//!   below U+0100, the empty bytes and each bytes of one byte. A heap
+//!   shares them too, across all the pickles that it loads.
+//! - A class is one object for each module and name, as the `find_global`
+//!   of ZODB's resolver caches it.
+//! - A persistent reference is one object for each persistent id, as the
+//!   `PersistentReferenceFactory` of ZODB's resolver keeps it across the
+//!   states of one resolution.
+//!
+//! The model refuses what it does not model, with [`Unsupported`]: an
+//! opaque node, a REDUCE, a Python 2 str, a protocol 0 unicode or list, an
+//! int that does not fit 128 bits, a dict key that is not an int, a str or
+//! bytes, a persistent id of an unknown shape, a container that holds
+//! itself. A caller then leaves the work to Python.
+//!
+//! No function here calls itself once per nesting level. The loader, the
+//! comparisons and the pickler use explicit stacks. The objects live in
+//! one vector and refer to each other by index, so a drop does not
+//! recurse either.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use crate::opcode::*;
+use crate::tree::{Bool, Float, Int, Node, Tree, Unicode};
+
+/// What a [`Heap`] or a [`Pickler`] does not model. The text names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("not modeled: {0}")]
+pub struct Unsupported(pub &'static str);
+
+/// The index of an object in its [`Heap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObjectId(u32);
+
+/// A value of a pickle. An atom holds its value. Other values are objects
+/// of a [`Heap`], with an identity.
+///
+/// The pickler never memoizes an atom, so an atom needs no identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Value {
+    /// `None`.
+    None,
+    /// A bool.
+    Bool(bool),
+    /// An int.
+    Int(i128),
+    /// A float.
+    Float(f64),
+    /// An object of the heap.
+    Object(ObjectId),
+}
+
+/// An object of a [`Heap`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Object {
+    /// A `str`.
+    Str(String),
+    /// A `bytes`.
+    Bytes(Vec<u8>),
+    /// A tuple.
+    Tuple(Vec<Value>),
+    /// A list.
+    List(Vec<Value>),
+    /// A dict: the items in the order of insertion, each key once.
+    Dict(Vec<(Value, Value)>),
+    /// A class, from a GLOBAL.
+    Class {
+        /// The module, for example `BTrees.OOBTree`.
+        module: String,
+        /// The name in the module, for example `OOBucket`.
+        name: String,
+    },
+    /// A persistent reference: the `PersistentReference` of ZODB's
+    /// resolver.
+    Reference(Reference),
+}
+
+/// A persistent reference, as ZODB's resolver reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reference {
+    /// The persistent id: the value that the pickler writes before
+    /// BINPERSID.
+    pub data: Value,
+    /// The oid of the object that it refers to.
+    pub oid: Vec<u8>,
+    /// The name of the database of the object, for a reference into
+    /// another database.
+    pub database: Option<String>,
+    /// True for a weak reference.
+    pub weak: bool,
+}
+
+/// Why a comparison of [`Heap::compare`], [`Heap::eq`] or [`Heap::lt`] has
+/// no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Undecided {
+    /// The model does not know what Python gives: values of mixed types,
+    /// a list or a dict, an int against a float. Python can raise or give
+    /// an answer.
+    Unknown,
+    /// Python raises. A persistent reference compares only with an equal
+    /// one.
+    Raises,
+}
+
+/// The identity of a persistent id: the key of the
+/// `PersistentReferenceFactory` of ZODB's resolver, `tuple(ref)`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ReferenceKey {
+    /// An oid alone.
+    Oid(Vec<u8>),
+    /// `(oid, class)`.
+    WithClass(Vec<u8>, ObjectId),
+    /// `['w', (oid,)]` or `['w', (oid, database)]`.
+    Weak(Vec<u8>, Option<String>),
+    /// `['m', (database, oid, class)]`.
+    Multi(String, Vec<u8>, ObjectId),
+    /// `['n', (database, oid)]`.
+    MultiOid(String, Vec<u8>),
+}
+
+/// A key of a dict that the model keeps.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DictKey {
+    Int(i128),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+/// The objects of the pickles that a merge reads, and of the state that it
+/// builds.
+#[derive(Clone, Debug, Default)]
+pub struct Heap {
+    objects: Vec<Object>,
+    /// The shared str of one character below U+0100, by character.
+    chars: HashMap<char, ObjectId>,
+    /// The shared empty str.
+    empty_str: Option<ObjectId>,
+    /// The shared bytes of one byte, by byte.
+    bytes: HashMap<u8, ObjectId>,
+    /// The shared empty bytes.
+    empty_bytes: Option<ObjectId>,
+    /// The classes, by module and name.
+    classes: HashMap<(String, String), ObjectId>,
+    /// The persistent references, by their identity.
+    references: HashMap<ReferenceKey, ObjectId>,
+}
+
+impl Heap {
+    /// Returns an empty heap.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Loads a record: its class pickle, then its state pickle, with one
+    /// memo, as ZODB's unpickler reads them. Returns the class value and the
+    /// state value.
+    ///
+    /// The persistent references of the record join those of the records
+    /// that the heap loaded before. ZODB's resolver loads the new state
+    /// first, then the old one, then the committed one, so a caller loads
+    /// them in that order: a reference takes its persistent id from the
+    /// first record that holds it.
+    pub fn load(&mut self, tree: &Tree) -> Result<(Value, Value), Unsupported> {
+        let mut loader = Loader {
+            heap: self,
+            memo: HashMap::new(),
+            open: Vec::new(),
+        };
+        let class = loader.load(tree.class())?;
+        let state = loader.load(tree.state())?;
+        Ok((class, state))
+    }
+
+    /// Returns the object of `id`.
+    pub fn get(&self, id: ObjectId) -> &Object {
+        &self.objects[id.0 as usize]
+    }
+
+    /// Returns the object of `value`, or `None` for an atom.
+    pub fn object(&self, value: Value) -> Option<&Object> {
+        match value {
+            Value::Object(id) => Some(self.get(id)),
+            _ => None,
+        }
+    }
+
+    /// Returns the items of `value` if it is a tuple.
+    pub fn tuple(&self, value: Value) -> Option<&[Value]> {
+        match self.object(value)? {
+            Object::Tuple(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Returns the items of `value` if it is a dict.
+    pub fn dict(&self, value: Value) -> Option<&[(Value, Value)]> {
+        match self.object(value)? {
+            Object::Dict(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Returns the reference of `value` if it is a persistent reference.
+    pub fn reference(&self, value: Value) -> Option<&Reference> {
+        match self.object(value)? {
+            Object::Reference(reference) => Some(reference),
+            _ => None,
+        }
+    }
+
+    /// Returns the module and the name of `value` if it is a class.
+    pub fn class(&self, value: Value) -> Option<(&str, &str)> {
+        match self.object(value)? {
+            Object::Class { module, name } => Some((module, name)),
+            _ => None,
+        }
+    }
+
+    /// Returns a new tuple of `items`.
+    pub fn new_tuple(&mut self, items: Vec<Value>) -> Value {
+        Value::Object(self.push(Object::Tuple(items)))
+    }
+
+    /// Returns a new dict of `items`. Each key must be there once.
+    pub fn new_dict(&mut self, items: Vec<(Value, Value)>) -> Value {
+        Value::Object(self.push(Object::Dict(items)))
+    }
+
+    /// Returns the class of `module` and `name`: the same object at each
+    /// call.
+    pub fn new_class(&mut self, module: &str, name: &str) -> Value {
+        let key = (module.to_owned(), name.to_owned());
+        if let Some(&id) = self.classes.get(&key) {
+            return Value::Object(id);
+        }
+        let id = self.push(Object::Class {
+            module: key.0.clone(),
+            name: key.1.clone(),
+        });
+        self.classes.insert(key, id);
+        Value::Object(id)
+    }
+
+    fn push(&mut self, object: Object) -> ObjectId {
+        let id = ObjectId(u32::try_from(self.objects.len()).expect("fewer than 2^32 objects"));
+        self.objects.push(object);
+        id
+    }
+
+    /// Returns a str object of `text`, shared when CPython shares it.
+    fn str_object(&mut self, text: &str) -> Value {
+        let mut chars = text.chars();
+        let shared = match (chars.next(), chars.next()) {
+            (None, _) => Some(&mut self.empty_str),
+            (Some(c), None) if (c as u32) < 0x100 => {
+                if let Some(&id) = self.chars.get(&c) {
+                    return Value::Object(id);
+                }
+                let id = self.push(Object::Str(text.to_owned()));
+                self.chars.insert(c, id);
+                return Value::Object(id);
+            }
+            _ => None,
+        };
+        match shared {
+            Some(Some(id)) => Value::Object(*id),
+            Some(None) => {
+                let id = self.push(Object::Str(String::new()));
+                self.empty_str = Some(id);
+                Value::Object(id)
+            }
+            None => Value::Object(self.push(Object::Str(text.to_owned()))),
+        }
+    }
+
+    /// Returns a bytes object of `data`, shared when the unpickler shares
+    /// it.
+    fn bytes_object(&mut self, data: &[u8]) -> Value {
+        match data {
+            [] => {
+                if let Some(id) = self.empty_bytes {
+                    return Value::Object(id);
+                }
+                let id = self.push(Object::Bytes(Vec::new()));
+                self.empty_bytes = Some(id);
+                Value::Object(id)
+            }
+            [byte] => {
+                if let Some(&id) = self.bytes.get(byte) {
+                    return Value::Object(id);
+                }
+                let id = self.push(Object::Bytes(vec![*byte]));
+                self.bytes.insert(*byte, id);
+                Value::Object(id)
+            }
+            _ => Value::Object(self.push(Object::Bytes(data.to_vec()))),
+        }
+    }
+
+    /// Returns the persistent reference of the persistent id `data`: the
+    /// reference that the heap has for its identity, or a new one.
+    fn reference_of(&mut self, data: Value) -> Result<Value, Unsupported> {
+        let (key, reference) = self.read_reference(data)?;
+        if let Some(&id) = self.references.get(&key) {
+            return Ok(Value::Object(id));
+        }
+        let id = self.push(Object::Reference(reference));
+        self.references.insert(key, id);
+        Ok(Value::Object(id))
+    }
+
+    /// Reads a persistent id in one of the forms of ZODB's `serialize.py`.
+    fn read_reference(&self, data: Value) -> Result<(ReferenceKey, Reference), Unsupported> {
+        let unknown = Unsupported("a persistent id of an unknown shape");
+        let bytes = |value: Value| match self.object(value) {
+            Some(Object::Bytes(bytes)) => Some(bytes.clone()),
+            _ => None,
+        };
+        let text = |value: Value| match self.object(value) {
+            Some(Object::Str(text)) => Some(text.clone()),
+            _ => None,
+        };
+        let class = |value: Value| match (value, self.object(value)) {
+            (Value::Object(id), Some(Object::Class { .. })) => Some(id),
+            _ => None,
+        };
+        let reference = |oid: &[u8], database: Option<String>, weak: bool| Reference {
+            data,
+            oid: oid.to_vec(),
+            database,
+            weak,
+        };
+        match self.object(data).ok_or(unknown)? {
+            Object::Bytes(oid) => Ok((ReferenceKey::Oid(oid.clone()), reference(oid, None, false))),
+            Object::Tuple(items) => match items[..] {
+                [oid, klass] => {
+                    let (oid, klass) = bytes(oid).zip(class(klass)).ok_or(unknown)?;
+                    let made = reference(&oid, None, false);
+                    Ok((ReferenceKey::WithClass(oid, klass), made))
+                }
+                _ => Err(unknown),
+            },
+            Object::List(items) => {
+                let [kind, args] = items[..] else {
+                    return Err(unknown);
+                };
+                let args = self.tuple(args).ok_or(unknown)?;
+                match (text(kind).as_deref(), args) {
+                    (Some("w"), &[oid]) => {
+                        let oid = bytes(oid).ok_or(unknown)?;
+                        let made = reference(&oid, None, true);
+                        Ok((ReferenceKey::Weak(oid, None), made))
+                    }
+                    (Some("w"), &[oid, database]) => {
+                        let (oid, database) = bytes(oid).zip(text(database)).ok_or(unknown)?;
+                        let made = reference(&oid, Some(database.clone()), true);
+                        Ok((ReferenceKey::Weak(oid, Some(database)), made))
+                    }
+                    (Some("m"), &[database, oid, klass]) => {
+                        let database = text(database).ok_or(unknown)?;
+                        let (oid, klass) = bytes(oid).zip(class(klass)).ok_or(unknown)?;
+                        let made = reference(&oid, Some(database.clone()), false);
+                        Ok((ReferenceKey::Multi(database, oid, klass), made))
+                    }
+                    (Some("n"), &[database, oid]) => {
+                        let (database, oid) = text(database).zip(bytes(oid)).ok_or(unknown)?;
+                        let made = reference(&oid, Some(database.clone()), false);
+                        Ok((ReferenceKey::MultiOid(database, oid), made))
+                    }
+                    _ => Err(unknown),
+                }
+            }
+            _ => Err(unknown),
+        }
+    }
+
+    /// Compares two keys or two values as BTrees does: `object_compare` of
+    /// `BTreeModuleTemplate.c`. `None` is below every other value. Else the
+    /// result is `a < b`, then `a == b`.
+    pub fn compare(&self, a: Value, b: Value) -> Result<Ordering, Undecided> {
+        match (a, b) {
+            (Value::None, Value::None) => return Ok(Ordering::Equal),
+            (Value::None, _) => return Ok(Ordering::Less),
+            (_, Value::None) => return Ok(Ordering::Greater),
+            _ => {}
+        }
+        if self.lt(a, b)? {
+            return Ok(Ordering::Less);
+        }
+        Ok(if self.eq(a, b)? {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        })
+    }
+
+    /// Tells if `a == b`, as `PyObject_RichCompareBool(a, b, Py_EQ)`: an
+    /// object is equal to itself, and two tuples are equal item by item.
+    pub fn eq(&self, a: Value, b: Value) -> Result<bool, Undecided> {
+        // Each frame is a pair of tuples and the index of their next pair
+        // of items.
+        let mut frames: Vec<(&[Value], &[Value], usize)> = Vec::new();
+        let mut pair = (a, b);
+        loop {
+            let mut answer = match self.eq_leaf(pair.0, pair.1)? {
+                Leaf::Answer(answer) => answer,
+                Leaf::Tuples(x, y) => {
+                    frames.push((x, y, 0));
+                    true
+                }
+            };
+            // Give the answer to the frames, until a frame has a next pair.
+            loop {
+                let Some(frame) = frames.last_mut() else {
+                    return Ok(answer);
+                };
+                let (x, y, next) = *frame;
+                if answer && next < x.len().min(y.len()) {
+                    frame.2 += 1;
+                    pair = (x[next], y[next]);
+                    break;
+                }
+                if answer {
+                    answer = x.len() == y.len();
+                }
+                frames.pop();
+            }
+        }
+    }
+
+    /// Tells if `a < b`, as `PyObject_RichCompare(a, b, Py_LT)`. Two tuples
+    /// compare at their first pair of items that are not equal, or by
+    /// their length.
+    pub fn lt(&self, mut a: Value, mut b: Value) -> Result<bool, Undecided> {
+        loop {
+            let (Some(x), Some(y)) = (self.tuple(a), self.tuple(b)) else {
+                return self.lt_leaf(a, b);
+            };
+            let mut differ = None;
+            for (index, (&p, &q)) in x.iter().zip(y).enumerate() {
+                if !self.eq(p, q)? {
+                    differ = Some(index);
+                    break;
+                }
+            }
+            let Some(index) = differ else {
+                return Ok(x.len() < y.len());
+            };
+            a = x[index];
+            b = y[index];
+        }
+    }
+
+    /// Compares two values that are not two tuples for `==`, or gives the
+    /// items of two tuples.
+    fn eq_leaf(&self, a: Value, b: Value) -> Result<Leaf<'_>, Undecided> {
+        let answer = match (a, b) {
+            (Value::Object(x), Value::Object(y)) if x == y => true,
+            (Value::None, Value::None) => true,
+            (Value::Bool(_) | Value::Int(_), Value::Bool(_) | Value::Int(_)) => {
+                int_of(a) == int_of(b)
+            }
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Int(_) | Value::Bool(_), Value::Float(_))
+            | (Value::Float(_), Value::Int(_) | Value::Bool(_)) => {
+                return Err(Undecided::Unknown);
+            }
+            (Value::Object(x), Value::Object(y)) => match (self.get(x), self.get(y)) {
+                (Object::Tuple(x), Object::Tuple(y)) => return Ok(Leaf::Tuples(x, y)),
+                (Object::Reference(x), Object::Reference(y)) => {
+                    if equivalent(x, y) {
+                        true
+                    } else {
+                        return Err(Undecided::Raises);
+                    }
+                }
+                (Object::Reference(_), _) | (_, Object::Reference(_)) => {
+                    return Err(Undecided::Raises);
+                }
+                (Object::Str(x), Object::Str(y)) => x == y,
+                (Object::Bytes(x), Object::Bytes(y)) => x == y,
+                (Object::List(_), Object::List(_)) | (Object::Dict(_), Object::Dict(_)) => {
+                    return Err(Undecided::Unknown);
+                }
+                // Objects of two types, or two classes that are not the
+                // same object.
+                _ => false,
+            },
+            (Value::Object(x), _) | (_, Value::Object(x)) => match self.get(x) {
+                Object::Reference(_) => return Err(Undecided::Raises),
+                _ => false,
+            },
+            // None, a bool, an int or a float against another of them.
+            _ => false,
+        };
+        Ok(Leaf::Answer(answer))
+    }
+
+    /// Compares two values that are not two tuples for `<`.
+    fn lt_leaf(&self, a: Value, b: Value) -> Result<bool, Undecided> {
+        match (a, b) {
+            (Value::Bool(_) | Value::Int(_), Value::Bool(_) | Value::Int(_)) => {
+                Ok(int_of(a) < int_of(b))
+            }
+            (Value::Float(x), Value::Float(y)) => Ok(x < y),
+            (Value::Object(x), Value::Object(y)) => match (self.get(x), self.get(y)) {
+                (Object::Reference(p), Object::Reference(q)) => {
+                    // `__lt__` of a reference is `__cmp__(other) < 0`: false
+                    // for an equal reference, and a ValueError for another.
+                    if x == y || equivalent(p, q) {
+                        Ok(false)
+                    } else {
+                        Err(Undecided::Raises)
+                    }
+                }
+                (Object::Reference(_), _) | (_, Object::Reference(_)) => Err(Undecided::Raises),
+                (Object::Str(p), Object::Str(q)) => Ok(p < q),
+                (Object::Bytes(p), Object::Bytes(q)) => Ok(p < q),
+                _ => Err(Undecided::Unknown),
+            },
+            (Value::Object(x), _) | (_, Value::Object(x)) => match self.get(x) {
+                Object::Reference(_) => Err(Undecided::Raises),
+                _ => Err(Undecided::Unknown),
+            },
+            _ => Err(Undecided::Unknown),
+        }
+    }
+}
+
+/// The answer of [`Heap::eq_leaf`].
+enum Leaf<'a> {
+    Answer(bool),
+    Tuples(&'a [Value], &'a [Value]),
+}
+
+/// Returns the int of a bool or an int.
+fn int_of(value: Value) -> i128 {
+    match value {
+        Value::Bool(value) => i128::from(value),
+        Value::Int(value) => value,
+        _ => unreachable!("int_of takes a bool or an int"),
+    }
+}
+
+/// Tells if two references are equal for `PersistentReference.__cmp__`:
+/// the same oid and database, neither of them weak.
+fn equivalent(a: &Reference, b: &Reference) -> bool {
+    a.oid == b.oid && a.database == b.database && !a.weak && !b.weak
+}
+
+/// Builds the objects of one record into a heap.
+struct Loader<'h> {
+    heap: &'h mut Heap,
+    /// The memo of the unpickler.
+    memo: HashMap<u32, Value>,
+    /// The lists and dicts whose items the loader still reads. A memo get
+    /// of one of them makes a container that holds itself.
+    open: Vec<ObjectId>,
+}
+
+/// One step of the loader.
+enum Task<'a> {
+    /// Load a node and push its value.
+    Enter(&'a Node),
+    /// Make a tuple of the last values.
+    Tuple(usize),
+    /// Put the last values into a list.
+    List(ObjectId, usize),
+    /// Put the last pairs of values into a dict.
+    Dict(ObjectId, usize),
+    /// Keep the last value in the memo under these indices.
+    Remember(Vec<u32>),
+    /// Make the persistent reference of the last value.
+    Persistent,
+}
+
+impl Loader<'_> {
+    fn load(&mut self, root: &Node) -> Result<Value, Unsupported> {
+        let mut tasks = vec![Task::Enter(root)];
+        let mut values: Vec<Value> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Enter(node) => self.enter(node, &mut tasks, &mut values)?,
+                Task::Tuple(len) => {
+                    let items = values.split_off(values.len() - len);
+                    values.push(self.heap.new_tuple(items));
+                }
+                Task::List(id, len) => {
+                    let items = values.split_off(values.len() - len);
+                    self.heap.objects[id.0 as usize] = Object::List(items);
+                    self.close(id);
+                    values.push(Value::Object(id));
+                }
+                Task::Dict(id, pairs) => {
+                    let flat = values.split_off(values.len() - 2 * pairs);
+                    let items = self.dict_items(&flat)?;
+                    self.heap.objects[id.0 as usize] = Object::Dict(items);
+                    self.close(id);
+                    values.push(Value::Object(id));
+                }
+                Task::Remember(indices) => {
+                    let value = *values.last().expect("a value to remember");
+                    for index in indices {
+                        self.memo.insert(index, value);
+                    }
+                }
+                Task::Persistent => {
+                    let data = values.pop().expect("a persistent id");
+                    values.push(self.heap.reference_of(data)?);
+                }
+            }
+        }
+        match values[..] {
+            [value] => Ok(value),
+            _ => Err(Unsupported("a pickle that leaves other than one value")),
+        }
+    }
+
+    fn enter<'a>(
+        &mut self,
+        node: &'a Node,
+        tasks: &mut Vec<Task<'a>>,
+        values: &mut Vec<Value>,
+    ) -> Result<(), Unsupported> {
+        let value = match node {
+            Node::None => Value::None,
+            Node::Bool(Bool::New(value)) => Value::Bool(*value),
+            Node::Bool(text @ Bool::Text(_)) => Value::Bool(text.value()),
+            Node::Int(int) => Value::Int(int_value(int)?),
+            Node::Float(Float::Binary(value)) => Value::Float(*value),
+            Node::Float(Float::Text(text)) => Value::Float(
+                text.trim()
+                    .parse()
+                    .map_err(|_| Unsupported("a FLOAT text"))?,
+            ),
+            Node::Bytes(bytes) => self.heap.bytes_object(&bytes.data),
+            Node::Unicode(Unicode::Binary(text)) => self.heap.str_object(text),
+            Node::Global(global) => self.heap.new_class(&global.module, &global.name),
+            Node::Tuple(tuple) => {
+                tasks.push(Task::Tuple(tuple.items.len()));
+                tasks.extend(tuple.items.iter().rev().map(Task::Enter));
+                return Ok(());
+            }
+            Node::List(_) | Node::Dict(_) => {
+                self.container(node, Vec::new(), tasks)?;
+                return Ok(());
+            }
+            Node::Persistent(pid) => {
+                tasks.push(Task::Persistent);
+                tasks.push(Task::Enter(pid));
+                return Ok(());
+            }
+            Node::Put(put) => {
+                let mut indices = vec![put.index];
+                let mut inner: &Node = &put.value;
+                while let Node::Put(put) = inner {
+                    indices.push(put.index);
+                    inner = &put.value;
+                }
+                if matches!(inner, Node::List(_) | Node::Dict(_)) {
+                    // The put comes before the items of a list or a dict.
+                    self.container(inner, indices, tasks)?;
+                } else {
+                    tasks.push(Task::Remember(indices));
+                    tasks.push(Task::Enter(inner));
+                }
+                return Ok(());
+            }
+            Node::Get(get) => {
+                let value = *self
+                    .memo
+                    .get(&get.index)
+                    .ok_or(Unsupported("a memo get without its put"))?;
+                if let Value::Object(id) = value
+                    && self.open.contains(&id)
+                {
+                    return Err(Unsupported("a container that holds itself"));
+                }
+                value
+            }
+            Node::ByteString(_) => return Err(Unsupported("a Python 2 str")),
+            Node::Unicode(Unicode::Text(_)) => return Err(Unsupported("a protocol 0 unicode")),
+            Node::Reduce(_) => return Err(Unsupported("a REDUCE")),
+            Node::Opaque(_) => return Err(Unsupported("an opaque node")),
+        };
+        values.push(value);
+        Ok(())
+    }
+
+    /// Makes an empty list or dict, keeps it under the memo indices of its
+    /// puts, and plans the load of its items.
+    fn container<'a>(
+        &mut self,
+        node: &'a Node,
+        indices: Vec<u32>,
+        tasks: &mut Vec<Task<'a>>,
+    ) -> Result<(), Unsupported> {
+        let id = self.heap.push(Object::List(Vec::new()));
+        for index in indices {
+            self.memo.insert(index, Value::Object(id));
+        }
+        self.open.push(id);
+        match node {
+            Node::List(list) => {
+                if list.initial.is_some() {
+                    return Err(Unsupported("a protocol 0 list"));
+                }
+                let items: Vec<&Node> = list.batches.iter().flat_map(|b| &b.items).collect();
+                tasks.push(Task::List(id, items.len()));
+                tasks.extend(items.into_iter().rev().map(Task::Enter));
+            }
+            Node::Dict(dict) => {
+                if dict.initial.is_some() {
+                    return Err(Unsupported("a protocol 0 dict"));
+                }
+                let pairs: Vec<&(Node, Node)> =
+                    dict.batches.iter().flat_map(|b| &b.items).collect();
+                tasks.push(Task::Dict(id, pairs.len()));
+                for (key, value) in pairs.into_iter().rev() {
+                    tasks.push(Task::Enter(value));
+                    tasks.push(Task::Enter(key));
+                }
+            }
+            _ => unreachable!("container takes a list or a dict"),
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, id: ObjectId) {
+        self.open.retain(|&open| open != id);
+    }
+
+    /// Returns the items of a dict from its keys and values in pickle
+    /// order, as `d[key] = value` gives them: a key that comes again keeps
+    /// its place and takes the later value.
+    fn dict_items(&self, flat: &[Value]) -> Result<Vec<(Value, Value)>, Unsupported> {
+        let mut items: Vec<(Value, Value)> = Vec::with_capacity(flat.len() / 2);
+        let mut places: HashMap<DictKey, usize> = HashMap::new();
+        for &[key, value] in flat.as_chunks::<2>().0 {
+            let dict_key = match key {
+                Value::Int(int) => DictKey::Int(int),
+                Value::Object(id) => match self.heap.get(id) {
+                    Object::Str(text) => DictKey::Str(text.clone()),
+                    Object::Bytes(bytes) => DictKey::Bytes(bytes.clone()),
+                    _ => return Err(Unsupported("a dict key of another type")),
+                },
+                _ => return Err(Unsupported("a dict key of another type")),
+            };
+            match places.get(&dict_key) {
+                Some(&place) => items[place].1 = value,
+                None => {
+                    places.insert(dict_key, items.len());
+                    items.push((key, value));
+                }
+            }
+        }
+        Ok(items)
+    }
+}
+
+/// Returns the value of an int node, if it fits 128 bits.
+fn int_value(int: &Int) -> Result<i128, Unsupported> {
+    let too_large = Unsupported("an int that does not fit 128 bits");
+    match int {
+        Int::U8(value) => Ok(i128::from(*value)),
+        Int::U16(value) => Ok(i128::from(*value)),
+        Int::I32(value) => Ok(i128::from(*value)),
+        Int::Long { bytes, .. } => {
+            if bytes.len() > 16 {
+                return Err(too_large);
+            }
+            let fill = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+                0xff
+            } else {
+                0
+            };
+            let mut le = [fill; 16];
+            le[..bytes.len()].copy_from_slice(bytes);
+            Ok(i128::from_le_bytes(le))
+        }
+        Int::Text(text) => text.trim().parse().map_err(|_| too_large),
+        Int::LongText(text) => text
+            .trim()
+            .trim_end_matches('L')
+            .parse()
+            .map_err(|_| too_large),
+    }
+}
+
+/// The size of a batch of SETITEMS or APPENDS: `BATCHSIZE` of the pickler.
+const BATCH: usize = 1000;
+
+/// A pickler of the objects of a [`Heap`]: the C pickler of zodbpickle with
+/// protocol 3, as ZODB's `PersistentPickler` runs it.
+///
+/// Like one `Pickler` object of Python, it keeps its memo from one
+/// [`Pickler::dump`] to the next. ZODB writes the class pickle and the
+/// state pickle of a record with one pickler, so the state can refer to
+/// the class with a memo get.
+///
+/// A persistent reference writes its persistent id, then BINPERSID, as
+/// `persistent_id` of ZODB's resolver makes the pickler do. The reference
+/// itself never goes into the memo.
+pub struct Pickler<'h> {
+    heap: &'h Heap,
+    memo: HashMap<ObjectId, u32>,
+    out: Vec<u8>,
+}
+
+/// One step of the pickler.
+enum Step {
+    /// Save a value: a memo get if the pickler saw it, else its opcodes.
+    Save(Value),
+    /// Write one opcode byte.
+    Byte(u8),
+    /// Put an object in the memo, and write the put.
+    Memoize(ObjectId),
+}
+
+impl<'h> Pickler<'h> {
+    /// Returns a pickler of the objects of `heap` with an empty memo.
+    pub fn new(heap: &'h Heap) -> Self {
+        Pickler {
+            heap,
+            memo: HashMap::new(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Writes one pickle of `value`: PROTO 3, the value, STOP.
+    pub fn dump(&mut self, value: Value) -> Result<(), Unsupported> {
+        self.out.extend([PROTO, 3]);
+        let mut steps = vec![Step::Save(value)];
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Byte(byte) => self.out.push(byte),
+                Step::Memoize(id) => self.memoize(id),
+                Step::Save(value) => self.save(value, &mut steps)?,
+            }
+        }
+        self.out.push(STOP);
+        Ok(())
+    }
+
+    /// Returns the bytes of the pickles.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.out
+    }
+
+    fn save(&mut self, value: Value, steps: &mut Vec<Step>) -> Result<(), Unsupported> {
+        let id = match value {
+            Value::None => {
+                self.out.push(NONE);
+                return Ok(());
+            }
+            Value::Bool(true) => {
+                self.out.push(NEWTRUE);
+                return Ok(());
+            }
+            Value::Bool(false) => {
+                self.out.push(NEWFALSE);
+                return Ok(());
+            }
+            Value::Int(int) => {
+                self.save_int(int);
+                return Ok(());
+            }
+            Value::Float(float) => {
+                self.out.push(BINFLOAT);
+                self.out.extend(float.to_be_bytes());
+                return Ok(());
+            }
+            Value::Object(id) => id,
+        };
+        let object = self.heap.get(id);
+        // `persistent_id` comes first: the pickler saves the persistent id
+        // of a reference and never looks for the reference in the memo.
+        if let Object::Reference(reference) = object {
+            steps.push(Step::Byte(BINPERSID));
+            steps.push(Step::Save(reference.data));
+            return Ok(());
+        }
+        if let Some(&index) = self.memo.get(&id) {
+            self.memo_op(index, BINGET, LONG_BINGET);
+            return Ok(());
+        }
+        match object {
+            Object::Str(text) => {
+                self.out.push(BINUNICODE);
+                self.length(text.len(), 4)?;
+                self.out.extend(text.as_bytes());
+                self.memoize(id);
+            }
+            Object::Bytes(bytes) => {
+                if bytes.len() <= 0xff {
+                    self.out.extend([SHORT_BINBYTES, bytes.len() as u8]);
+                } else {
+                    self.out.push(BINBYTES);
+                    self.length(bytes.len(), 4)?;
+                }
+                self.out.extend(bytes);
+                self.memoize(id);
+            }
+            Object::Class { module, name } => {
+                self.out.push(GLOBAL);
+                self.out.extend(module.as_bytes());
+                self.out.push(b'\n');
+                self.out.extend(name.as_bytes());
+                self.out.push(b'\n');
+                self.memoize(id);
+            }
+            Object::Tuple(items) => match items.len() {
+                0 => self.out.push(EMPTY_TUPLE),
+                len @ 1..=3 => {
+                    steps.push(Step::Memoize(id));
+                    steps.push(Step::Byte([TUPLE1, TUPLE2, TUPLE3][len - 1]));
+                    steps.extend(items.iter().rev().map(|&item| Step::Save(item)));
+                }
+                _ => {
+                    steps.push(Step::Memoize(id));
+                    steps.push(Step::Byte(TUPLE));
+                    steps.extend(items.iter().rev().map(|&item| Step::Save(item)));
+                    steps.push(Step::Byte(MARK));
+                }
+            },
+            Object::List(items) => {
+                self.out.push(EMPTY_LIST);
+                self.memoize(id);
+                steps.extend(list_steps(items).into_iter().rev());
+            }
+            Object::Dict(items) => {
+                self.out.push(EMPTY_DICT);
+                self.memoize(id);
+                steps.extend(dict_steps(items).into_iter().rev());
+            }
+            Object::Reference(_) => unreachable!("a reference is saved above"),
+        }
+        Ok(())
+    }
+
+    /// Writes an int as `save_long` does with protocol 2 and later.
+    fn save_int(&mut self, int: i128) {
+        if let Ok(small) = i32::try_from(int) {
+            let le = small.to_le_bytes();
+            if le[2] != 0 || le[3] != 0 {
+                self.out.push(BININT);
+                self.out.extend(le);
+            } else if le[1] != 0 {
+                self.out.extend([BININT2, le[0], le[1]]);
+            } else {
+                self.out.extend([BININT1, le[0]]);
+            }
+            return;
+        }
+        // LONG1: the two's complement, little-endian, in the fewest bytes
+        // that keep the sign. An int that needs no 32 bits took a form
+        // above, so it is never 0 here.
+        let le = int.to_le_bytes();
+        let mut len = 16;
+        let fill = if int < 0 { 0xff } else { 0 };
+        while len > 1 && le[len - 1] == fill && (le[len - 2] & 0x80) == (fill & 0x80) {
+            len -= 1;
+        }
+        self.out.extend([LONG1, len as u8]);
+        self.out.extend(&le[..len]);
+    }
+
+    /// Writes a length of `width` bytes, little-endian.
+    fn length(&mut self, len: usize, width: usize) -> Result<(), Unsupported> {
+        let len = u32::try_from(len).map_err(|_| Unsupported("a value of 4 GiB or more"))?;
+        self.out.extend(&len.to_le_bytes()[..width]);
+        Ok(())
+    }
+
+    fn memoize(&mut self, id: ObjectId) {
+        let index = u32::try_from(self.memo.len()).expect("fewer than 2^32 memo entries");
+        self.memo.insert(id, index);
+        self.memo_op(index, BINPUT, LONG_BINPUT);
+    }
+
+    fn memo_op(&mut self, index: u32, short: u8, long: u8) {
+        match u8::try_from(index) {
+            Ok(index) => self.out.extend([short, index]),
+            Err(_) => {
+                self.out.push(long);
+                self.out.extend(index.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The steps of the items of a list, as `batch_list_exact` writes them: one
+/// item and APPEND, or batches of MARK, at most 1,000 items, APPENDS.
+fn list_steps(items: &[Value]) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if let [item] = items {
+        steps.push(Step::Save(*item));
+        steps.push(Step::Byte(APPEND));
+        return steps;
+    }
+    for batch in items.chunks(BATCH) {
+        steps.push(Step::Byte(MARK));
+        steps.extend(batch.iter().map(|&item| Step::Save(item)));
+        steps.push(Step::Byte(APPENDS));
+    }
+    steps
+}
+
+/// The steps of the items of a dict, as `batch_dict_exact` writes them:
+/// one item and SETITEM, or batches of MARK, at most 1,000 items, SETITEMS.
+/// A batch of 1,000 items is always followed by one more batch, empty when
+/// no item is left.
+fn dict_steps(items: &[(Value, Value)]) -> Vec<Step> {
+    let mut steps = Vec::new();
+    match items {
+        [] => {}
+        [(key, value)] => {
+            steps.extend([Step::Save(*key), Step::Save(*value), Step::Byte(SETITEM)]);
+        }
+        _ => {
+            let mut rest = items;
+            loop {
+                let (batch, after) = rest.split_at(rest.len().min(BATCH));
+                steps.push(Step::Byte(MARK));
+                for &(key, value) in batch {
+                    steps.push(Step::Save(key));
+                    steps.push(Step::Save(value));
+                }
+                steps.push(Step::Byte(SETITEMS));
+                if batch.len() < BATCH {
+                    break;
+                }
+                rest = after;
+            }
+        }
+    }
+    steps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode_record;
+
+    /// The class pickle of a record of `m.C`, as ZODB writes it.
+    const CLASS: &[u8] = b"\x80\x03cm\nC\nq\x00.";
+
+    /// Loads the record of the class pickle `CLASS` and `state`.
+    fn load(heap: &mut Heap, state: &[u8]) -> (Value, Value) {
+        let record = [CLASS, state].concat();
+        heap.load(&decode_record(&record).unwrap()).unwrap()
+    }
+
+    /// Pickles the class and the state as ZODB's resolver does.
+    fn dump(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
+        let mut pickler = Pickler::new(heap);
+        pickler.dump(class).unwrap();
+        pickler.dump(state).unwrap();
+        pickler.into_bytes()
+    }
+
+    #[test]
+    fn a_state_pickles_to_the_bytes_that_it_came_from() {
+        // The pickles of Python 3.13 with ZODB's pickler.
+        for state in [
+            &b"\x80\x03X\x03\x00\x00\x00abcq\x01h\x01\x86q\x02."[..],
+            b"\x80\x03X\x03\x00\x00\x00abcq\x01X\x03\x00\x00\x00abcq\x02\x86q\x03.",
+            b"\x80\x03(\x8a\x05\x00\x00\x00\x80\x00\x8a\x05\xff\xff\xff\x7f\xff\
+              \x8a\x05\x00\x00\x00\x00\x80\x8a\t\x00\x00\x00\x00\x00\x00\x00\x80\x00\
+              \x8a\t\xff\xff\xff\xff\xff\xff\xff\xff\x00K\x00J\xff\xff\xff\xffK\xffM\x00\x01\
+              M\xff\xffJ\x00\x00\x01\x00tq\x01.",
+            b"\x80\x03}q\x01K\x01K\x02s.",
+            b"\x80\x03}q\x01(K\x01K\x02K\x03G@\x12\x00\x00\x00\x00\x00\x00u.",
+            b"\x80\x03]q\x01K\x01a.",
+            b"\x80\x03h\x00.",
+            b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x07q\x01h\x00\x86q\x02Q.",
+            b"\x80\x03(N\x88\x89)tq\x01.",
+        ] {
+            let mut heap = Heap::new();
+            let (class, value) = load(&mut heap, state);
+            assert_eq!(
+                dump(&heap, class, value),
+                [CLASS, state].concat(),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dict_of_1000_items_ends_with_an_empty_batch() {
+        let mut heap = Heap::new();
+        let items = (0..1000).map(|i| (Value::Int(i), Value::Int(i))).collect();
+        let dict = heap.new_dict(items);
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(dict).unwrap();
+        let bytes = pickler.into_bytes();
+        assert!(
+            bytes.ends_with(b"M\xe7\x03M\xe7\x03u(u."),
+            "{:?}",
+            &bytes[bytes.len() - 12..]
+        );
+        assert!(bytes.starts_with(b"\x80\x03}q\x00(K\x00K\x00K\x01K\x01"));
+        let items = (0..1001).map(|i| (Value::Int(i), Value::Int(0))).collect();
+        let dict = heap.new_dict(items);
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(dict).unwrap();
+        assert!(pickler.into_bytes().ends_with(b"M\xe8\x03K\x00u."));
+    }
+
+    #[test]
+    fn short_strs_and_bytes_are_shared_across_records() {
+        let mut heap = Heap::new();
+        let state = b"\x80\x03(X\x00\x00\x00\x00X\x01\x00\x00\x00aX\x02\x00\x00\x00\xc3\xa9\
+                      X\x02\x00\x00\x00\xc4\x80C\x00C\x01aC\x02abt.";
+        let (_, first) = load(&mut heap, state);
+        let (_, second) = load(&mut heap, state);
+        let first = heap.tuple(first).unwrap().to_vec();
+        let second = heap.tuple(second).unwrap().to_vec();
+        let shared: Vec<bool> = first.iter().zip(&second).map(|(a, b)| a == b).collect();
+        assert_eq!(shared, [true, true, true, false, true, true, false]);
+        // The pickler writes a shared object again as a memo get.
+        let both = heap.new_tuple(vec![first[1], second[1], first[6], second[6]]);
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(both).unwrap();
+        assert_eq!(
+            pickler.into_bytes(),
+            b"\x80\x03(X\x01\x00\x00\x00aq\x00h\x00C\x02abq\x01C\x02abq\x02tq\x03."
+        );
+    }
+
+    #[test]
+    fn a_reference_is_one_object_for_its_persistent_id() {
+        let mut heap = Heap::new();
+        let state = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x07q\x01h\x00\x86q\x02Q.";
+        let (class, first) = load(&mut heap, state);
+        let (_, second) = load(&mut heap, state);
+        assert_eq!(first, second);
+        let reference = heap.reference(first).unwrap();
+        assert_eq!(reference.oid, 7u64.to_be_bytes());
+        assert!(!reference.weak);
+        // Two uses of one reference: the persistent id is a memo get.
+        let pair = heap.new_tuple(vec![first, second]);
+        assert_eq!(
+            dump(&heap, class, pair),
+            b"\x80\x03cm\nC\nq\x00.\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x07q\x01h\x00\x86q\x02Qh\x02Q\x86q\x03."
+        );
+    }
+
+    #[test]
+    fn comparisons_follow_python() {
+        let mut heap = Heap::new();
+        let state = b"\x80\x03(X\x01\x00\x00\x00aX\x01\x00\x00\x00bC\x01aK\x01X\x01\x00\x00\x00a\
+                      \x86K\x01X\x01\x00\x00\x00b\x86K\x01\x85t.";
+        let (_, value) = load(&mut heap, state);
+        let v = heap.tuple(value).unwrap().to_vec();
+        let (a, b, bytes_a, t1a, t1b, t1) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+        assert_eq!(heap.compare(a, b), Ok(Ordering::Less));
+        assert_eq!(heap.compare(b, a), Ok(Ordering::Greater));
+        assert_eq!(heap.compare(Value::None, a), Ok(Ordering::Less));
+        assert_eq!(heap.compare(t1a, t1b), Ok(Ordering::Less));
+        assert_eq!(heap.compare(t1, t1a), Ok(Ordering::Less));
+        assert_eq!(
+            heap.compare(Value::Int(2), Value::Bool(true)),
+            Ok(Ordering::Greater)
+        );
+        assert_eq!(heap.eq(a, bytes_a), Ok(false));
+        assert_eq!(heap.compare(a, bytes_a), Err(Undecided::Unknown));
+        assert_eq!(
+            heap.compare(Value::Int(1), Value::Float(1.0)),
+            Err(Undecided::Unknown)
+        );
+        assert_eq!(
+            heap.compare(Value::Float(f64::NAN), Value::Float(f64::NAN)),
+            Ok(Ordering::Greater)
+        );
+        // Two tuples that differ at their first items never compare the
+        // items after them.
+        let mixed = heap.new_tuple(vec![Value::Int(1), a]);
+        let other = heap.new_tuple(vec![Value::Int(2), Value::Int(3)]);
+        assert_eq!(heap.compare(mixed, other), Ok(Ordering::Less));
+    }
+
+    #[test]
+    fn a_reference_compares_only_with_an_equal_one() {
+        let mut heap = Heap::new();
+        let one = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x07h\x00\x86q\x01Q.";
+        let two = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x08h\x00\x86q\x01Q.";
+        let alone = b"\x80\x03C\x08\x00\x00\x00\x00\x00\x00\x00\x07Q.";
+        let (_, seven) = load(&mut heap, one);
+        let (_, eight) = load(&mut heap, two);
+        let (_, spelled) = load(&mut heap, alone);
+        assert_ne!(seven, spelled);
+        assert_eq!(heap.compare(seven, spelled), Ok(Ordering::Equal));
+        assert_eq!(heap.compare(seven, eight), Err(Undecided::Raises));
+        assert_eq!(heap.compare(seven, Value::Int(1)), Err(Undecided::Raises));
+        assert_eq!(heap.compare(Value::None, seven), Ok(Ordering::Less));
+    }
+
+    #[test]
+    fn the_model_refuses_what_it_does_not_model() {
+        for (state, what) in [
+            (
+                &b"\x80\x03]q\x01h\x01a."[..],
+                "a container that holds itself",
+            ),
+            (b"\x80\x03U\x01a.", "a Python 2 str"),
+            (b"\x80\x03cbuiltins\nset\n]\x85R.", "a REDUCE"),
+            (b"\x80\x03}(N\x88u.", "a dict key of another type"),
+            (
+                b"\x80\x03X\x01\x00\x00\x00aQ.",
+                "a persistent id of an unknown shape",
+            ),
+        ] {
+            let mut heap = Heap::new();
+            let record = [CLASS, state].concat();
+            let tree = decode_record(&record).unwrap();
+            assert_eq!(heap.load(&tree), Err(Unsupported(what)), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_that_comes_again_keeps_its_place_and_takes_the_later_value() {
+        let mut heap = Heap::new();
+        let (_, dict) = load(
+            &mut heap,
+            b"\x80\x03}q\x01(K\x01K\x02K\x03K\x04K\x01K\x05u.",
+        );
+        assert_eq!(
+            heap.dict(dict).unwrap(),
+            [
+                (Value::Int(1), Value::Int(5)),
+                (Value::Int(3), Value::Int(4))
+            ]
+        );
+    }
+}
