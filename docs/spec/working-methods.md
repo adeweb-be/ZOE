@@ -220,7 +220,7 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 
 **Open questions**
 
-- [ ] Which conflict classes dominate the production logs of a real site? A one-week log sample decides the native-merge list before phase 4.
+- [x] Which conflict classes dominate the production logs of a real site? The synthetic logs of B5 and B6 replace the one-week log sample (step 0 of the ConflictError strategy in the specification). B5 ranks the posting dicts of ZCTextIndex first, then the shared `BTrees.Length` counters.
 - [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
 - [ ] Should the async Python client ship with the server in phase 2 for collective.starlette, or later?
 - [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 6 design.
