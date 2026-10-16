@@ -4,7 +4,7 @@ Status: proposed. A checkpoint of ZOE-203: the human approves it on the pull req
 
 ## Context
 
-ZCTextIndex keeps the postings of a word, a dict of document id to score, as a value of the IOBTree `_wordinfo` (`LOBTree` with `family64`) until the dict holds `DICT_CUTOFF` entries, 10. `_add_wordinfo` converts a dict of exactly 10 entries to an `IFBTree` of its own before it adds the next entry. `_del_wordinfo` deletes the key of the word when its dict becomes empty, and each change of the set of words changes the `Length` of the index by one.
+ZCTextIndex (in Products.ZCatalog) keeps the postings of a word, a dict of document id to score, as a value of the IOBTree `_wordinfo` until the dict holds `DICT_CUTOFF` entries, 10. `_add_wordinfo` and `_mass_add_wordinfo` convert a dict of exactly 10 entries to an `IIBTree` of its own before they add the next entry. `_del_wordinfo` deletes the key of the word when its dict becomes empty, and each change of the set of words changes the `Length` of the index by one.
 
 When two transactions index documents that share a rare word, both change the dict of that word in the same bucket. The bucket resolver of BTrees compares two values with `object_compare`, which calls `dict < dict`, and that raises `TypeError`. So ZODB's resolver refuses every bucket in which it must compare two dicts, also when only one side changed the dict. On B5 these refusals are most of the failed saves (finding items 3, 24 and 25 of `docs/findings/plone-end-to-end.md`): `IOBucket: Conflicting changes` is 172 of 212 failed client resolutions in `create-spread` and 279 of 285 in `edit` on `zoe-native` in the baseline of ZOE-203.
 
@@ -22,7 +22,7 @@ In a bucket, or a BTree that holds one bucket inline, of a family with integer k
 2. When both sides changed the value of one key and the three values are posting dicts, the rule merges them entry by entry against the old dict. An entry that only one side changed, added or deleted takes that change. An entry that both sides changed in the same way takes it. The merged dict keeps the order of the committed dict, and the entries that the new transaction added come after them, as if the new transaction had run after the committed one.
 3. The rule refuses, with a conflict:
    - an entry that both sides changed to different values, or that one side changed and the other deleted;
-   - a value that is not a posting dict on one side when both sides changed the key: a dict against the reference to the `IFBTree` of a converted posting;
+   - a value that is not a posting dict on one side when both sides changed the key: a dict against the reference to the `IIBTree` of a converted posting;
    - a merged dict of more than 10 entries: ZCTextIndex converts a dict only at exactly 10, so a dict of 11 would never become a tree;
    - a merged dict of no entry: ZCTextIndex deletes the word instead.
 4. The rule never changes the number of words of an index. A word that both sides add stays a refusal (reason 4 or 6 of BTrees), and so does a word that one side deletes and the other changes (2 or 3): both change `length`. A score of an int against a float on the two sides gives no answer: the conflict goes on as without the rule.
@@ -66,7 +66,7 @@ Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) 
 
 ## Alternatives
 
-- **Convert every posting to an `IFBTree`.** Step 1 of ZOE-203 measures this in a scratch fixture (`docs/spikes/posting-dicts.md`). It needs a change of ZCTextIndex or a migration of each site, and more objects per word.
+- **Convert every posting to an `IIBTree`.** Step 1 of ZOE-203 measures this in a scratch fixture (`docs/spikes/posting-dicts.md`). It needs a change of ZCTextIndex or a migration of each site, and more objects per word.
 - **A merge of posting dicts without the limit of 10.** A dict of more than 10 entries would never become a tree, and the index would grow dicts without bound.
 - **The rule on by default.** It merges where ZODB refuses, so a store opts in.
 - **The resolution log in the Python logging of Zope, or in the server log.** The server log has no user or description by rule; Zope's event log is not available to `zoe serve`. One file key for both modes is the simplest that holds.
