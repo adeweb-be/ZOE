@@ -18,7 +18,7 @@ The tinted boxes are the only two places the human is in the loop; a card that t
 | --- | --- | --- | --- |
 | Product owner and architect | the human | owns the technical specification and the ADRs, approves cards, reviews red zones, runs the batch review and the retro | writes code by hand except spikes and acceptance tests |
 | Planner | agent, fresh session per planning run | slices a roadmap phase into cards, orders them by dependency and risk, writes the acceptance test skeleton for each, keeps the board current | starts implementation |
-| Builder | agent, one Claude Code session per card in its own git worktree | implements one card until its acceptance test is green, writes unit tests, opens the PR with a claims-and-evidence section | edits acceptance tests, CI configuration, or files outside the card's scope fence |
+| Builder | agent, one or more Claude Code sessions per card, in the card's own git worktree | implements one card until its acceptance test is green, writes unit tests, opens the PR with a claims-and-evidence section | edits acceptance tests, CI configuration, or files outside the card's scope fence |
 | Reviewer | agent, fresh context, never the builder's session | reviews the diff against the card, the specification and the crate's invariants file; checks the claims against the evidence; requests changes or approves | merges |
 | Verifier | CI, plus an agent that reads the results | runs the harness tier for the PR, the benchmark quick set and the regression gate; posts numbers on the PR | approves on green alone when a red zone is touched |
 | Documenter | agent, after every merge | diffs code against the specification and the ADRs, proposes updates and new ADRs, maintains CONTEXT.md | changes a decision |
@@ -64,7 +64,12 @@ Inner loop: `devenv shell`, then `just <recipe>`, which runs `cargo`, `uv run py
 
 ## Units of work
 
-The unit is the card: one card, one builder session, one pull request, and a card carries everything a builder needs without the conversation that produced it.
+The unit is the card: one card, one pull request, and a card carries everything a builder needs without the conversation that produced it. A card holds one whole mechanism: the core, the server, the client, `zoe.plone`, the tests, the benchmarks and the change of the specification or of an ADR that the mechanism needs. So the mechanism is tested end to end and reviewed once, and a phase needs few merges. Cut a mechanism into two cards only when each part ships and is measured on its own.
+
+- **Steps.** The card lists its steps in order. A step is one commit or more. The description of the pull request gives the evidence of each step, so a reviewer can read the commits in order.
+- **Sessions.** A card takes as many builder sessions as its budget gives. Each session ends with `docs/handoffs/<card>.md` up to date: the step reached, what failed, the next step.
+- **Checkpoints.** When a step changes the on-disk format, the wire protocol, a public Python API, a trait signature that another crate uses, or a behaviour that the specification states, the card names the change. The first commit of that step is the ADR. The builder stops and asks for the human's approval of the ADR on the pull request, then builds on it. A checkpoint is a planned stop-and-ask, not a card of its own.
+- **Unknowns.** An unknown that the card must answer is the first step of the card, and its finding goes into `docs/spikes/` in the same pull request.
 
 **The task card**
 
@@ -72,29 +77,32 @@ The unit is the card: one card, one builder session, one pull request, and a car
 # ZOE-142 — group commit: coalesce concurrent tpc_finish into one fsync
 Phase 2 · crate zoe-core · red zone: no
 
-Goal: 50 concurrent writers on a 10 ms fsync device reach ≥ 1,000 commits/s (N5).
+Requirement: N5
+Goal: 50 concurrent writers on a 10 ms fsync device reach ≥ 1,000 commits/s.
+Steps: 1. the batch and its leader; 2. one fsync for each batch, and a failed fsync fails every member; 3. the metrics of the batches and the contention benchmark
 Acceptance tests (do not edit): tests/commit/group_commit.rs, bench/contention.rs@n5
 Scope fence: crates/zoe-core/src/commit/**, crates/zoe-core/tests/commit/**
 Out of scope: lock manager, backend trait
 Invariants: locks held by members stay held until the batch is durable; a failed fsync fails every member
+Checkpoints: none
 Spike or build: build
-Budget: one session; a spent budget means stop and ask, not try harder
+Budget: three sessions; a spent budget means stop and ask, not try harder
 Done when: acceptance green, bench posted, reviewer approved
 ```
 
 Cards come from the roadmap phase and the requirements table of the specification, so every card cites a requirement id, and every requirement is closed by the set of cards that cite it.
 
-**Definition of Ready.** A card has a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
+**Definition of Ready.** A card has a requirement id, an acceptance test that fails today, its steps and its checkpoints, a scope fence, written invariants, a budget, and no dependency on an unmerged card.
 
 **Definition of Done.** Acceptance test green; unit tests added; the PR harness tier green; benchmark numbers posted and within the regression gate; the claims-and-evidence section lists what was tested and what was not; reviewer approval; human approval when a red zone is touched; the specification or an ADR updated when behaviour changed.
 
 **Stop-and-ask rules for builders.** A builder stops and writes a question on the card instead of guessing when a change would alter the on-disk format, the wire protocol, a public Python API, a trait signature used by another crate, or an acceptance test; when the budget is spent; and when the only way to make the test green is to weaken it.
 
-**Spikes.** A time-boxed exploration card ends in a written finding in `docs/spikes/` and no merged code. The big unknowns are spikes before they are builds: redb versus the append-only log, pickle round-trip on a production copy, the early-lock hook in ZODB.
+**Spikes.** A spike card ends in a written finding in `docs/spikes/` and no merged code. A spike is a card of its own only when its answer decides whether a build card exists; otherwise it is the first step of the build card (units of work, above). The big unknowns are spikes before they are builds: redb versus the append-only log, pickle round-trip on a production copy, the early-lock hook in ZODB.
 
 **Order of work inside a phase.** Walking skeleton first: the thinnest end-to-end slice (open store, store one object, finish, reload, kill, reopen) with the crash simulation attached, then widen. Hardest unknowns next, as spikes.
 
-**Process metrics**, on the same dashboard as the benchmarks: cards merged per batch, first-review rejection rate, red-zone PRs waiting on the human, flaky-test count, benchmark drift, cost in tokens per merged card. When rejection rate rises, the retro fixes the card template or the invariants file; when cost per card rises, cards are too big.
+**Process metrics**, on the same dashboard as the benchmarks: cards merged per batch, first-review rejection rate, red-zone PRs waiting on the human, flaky-test count, benchmark drift, cost in tokens per merged card. When rejection rate rises, the retro fixes the card template or the invariants file; when a card spends its budget before its last step, the retro cuts the card at a step or gives it a larger budget.
 
 ## Sessions
 
@@ -102,7 +110,7 @@ The work goes through interactive sessions: the human and an agent, with no auto
 
 **Guardrails.** `.github/` (the workflows and `CODEOWNERS`) and `loops/` are human-only. Agents never hold production credentials or data (project organisation, below).
 
-**Handoffs.** A session that ends unfinished (budget, crash, stop-and-ask) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The next session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
+**Handoffs.** A session that ends before its card is done (the end of the session, the budget, a crash, a stop-and-ask, a checkpoint) writes `docs/handoffs/<card>.md`: state, what was tried, what failed, the next step. The next session starts from that file and the branch, not from a conversation. Sessions are disposable; files are the memory.
 
 ## Roadmap
 
@@ -220,7 +228,7 @@ ZOE is adeweb's project, built on its owner's own time, hardware and accounts; t
 
 **Open questions**
 
-- [ ] Which conflict classes dominate the production logs of a real site? A one-week log sample decides the native-merge list before phase 4.
+- [x] Which conflict classes dominate the production logs of a real site? The synthetic logs of B5 and B6 replace the one-week log sample (step 0 of the ConflictError strategy in the specification). B5 ranks the posting dicts of ZCTextIndex first, then the shared `BTrees.Length` counters.
 - [ ] Is the reference machine a developer workstation, an on-premise server or a cloud VM? The benchmark numbers only mean something on one fixed box.
 - [ ] Should the async Python client ship with the server in phase 2 for collective.starlette, or later?
 - [ ] How are the three field-store spike criteria weighted (conflicts and write amplification, throughput, ergonomics)? Decided when the numbers exist, before phase 6 design.

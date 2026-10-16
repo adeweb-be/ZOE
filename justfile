@@ -529,10 +529,33 @@ plone scenario="zoe" command="start" *args:
 # options that follow, and write the JSON result to stdout and to
 # target/bench/zoe-bench/<command>-<started>.json. The criterion benchmarks
 # are not built yet.
+# `just bench plone COMMAND` runs the Plone end-to-end benchmark of
+# bench/plone: Locust against a synthetic Plone site on ZEO and on zoe
+# serve (`prepare`, `run`, `campaign`, `report`, `serve`, `fixtures`), and
+# `just bench plone test` runs its tests. It needs the Plone instances of
+# `just plone zeo build`, `just plone zoeclient build` and
+# `just plone zeoclient build`, and builds `zoe` in release first.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
+    if [ "${1:-}" = plone ]; then
+        shift
+        export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/plone/venv"
+        plonebench=(uv run --locked --python 3.13 --project bench/plone)
+        if [ "${1:-}" = test ]; then
+            shift
+            exec "${plonebench[@]}" pytest -q "${@:-bench/plone/tests}"
+        fi
+        case "${1:-}" in
+            prepare | run | campaign | serve)
+                if [ -z "${ZOE_BINARY:-}" ]; then
+                    cargo build --release --locked -p zoe-server --bin zoe
+                fi
+                ;;
+        esac
+        exec "${plonebench[@]}" python -m plonebench "$@"
+    fi
     # `just bench client OPTIONS` stands for `just bench client run OPTIONS`,
     # and `just bench native OPTIONS` for `just bench native run OPTIONS`.
     if { [ "${1:-}" = client ] || [ "${1:-}" = native ]; } && [ "${2:-}" != run ] && [ "${2:-}" != report ]; then
