@@ -535,3 +535,32 @@ def test_a_subclass_of_the_zeo_client_opens_it_after_the_native_layer(tmp_path):
             assert not isinstance(storage, zoe.zeo.ClientStorage)
         finally:
             storage.close()
+
+
+def test_the_fork_server_that_a_zeo_test_starts_serves_a_later_test(
+    tmp_path, monkeypatch
+):
+    import multiprocessing
+    import shutil
+    import tempfile
+
+    def run_process():
+        process = multiprocessing.get_context("forkserver").Process(target=os.getpid)
+        process.start()
+        process.join(30)
+        assert process.exitcode == 0
+
+    layer = zoe.testing.ZeoLayer("TEST_ZEO_LAYER")
+    layer.setUp()
+    try:
+        # A ZEO test makes a test directory the temporary directory, then
+        # removes it. The first process starts the fork server.
+        directory = tmp_path / "test"
+        directory.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(directory))
+        run_process()
+        shutil.rmtree(directory)
+        monkeypatch.undo()
+        run_process()
+    finally:
+        layer.tearDown()

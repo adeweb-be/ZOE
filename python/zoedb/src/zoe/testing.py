@@ -29,6 +29,7 @@ import io
 import itertools
 import json
 import math
+import multiprocessing.util
 import os
 import pathlib
 import shutil
@@ -678,6 +679,12 @@ class ZeoLayer:
     `tearDown` kills every server that the layer started and puts back each
     function that `setUp` replaced.
 
+    `setUp` also makes the temporary directory of multiprocessing, before a
+    test changes `tempfile.tempdir`. The fork server of multiprocessing
+    keeps its socket in that directory, and it serves each later test of
+    the process. A ZEO test removes its own test directory, so the socket
+    must not be in it.
+
     zope.testrunner names a layer by `__name__` and `__bases__`.
     """
 
@@ -696,6 +703,7 @@ class ZeoLayer:
         # The import binds the function of ZEO in testConfig before the
         # replacement.
         importlib.import_module("ZEO.tests.testConfig")
+        multiprocessing.util.get_temp_dir()
         function = _forker.start_zeo_server
         for name, module in list(sys.modules.items()):
             if name != "ZEO" and not name.startswith("ZEO."):
