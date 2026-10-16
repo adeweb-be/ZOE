@@ -259,13 +259,13 @@ pub(super) struct ServeArgs {
 
     /// The compression of the records that the stores write: `none`, `zstd`,
     /// or `zstd:LEVEL`, such as `zstd:3`. A store reads every compression,
-    /// whatever this option. The default is the default of the store, zstd
-    /// at level 3.
+    /// whatever this option. The default is the default of the store, none:
+    /// the records are raw.
     #[arg(
         long,
         env = "ZOE_COMPRESSION",
         value_name = "CODEC",
-        value_parser = compression
+        value_parser = clap::builder::ValueParser::new(str::parse::<Compression>)
     )]
     compression: Option<Compression>,
 
@@ -462,20 +462,6 @@ fn whole_seconds(value: &str) -> Result<Duration, String> {
         .and_then(|n| n.checked_mul(unit))
         .map(Duration::from_secs)
         .ok_or_else(|| format!("{value} is not a whole number of seconds, 0 or more"))
-}
-
-/// Parse the value of `--compression`: `none`, `zstd` (zstd at its default
-/// level), or `zstd:LEVEL` with a whole level.
-fn compression(value: &str) -> Result<Compression, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Ok(Compression::None),
-        "zstd" => Ok(Compression::default()),
-        text => text
-            .strip_prefix("zstd:")
-            .and_then(|level| level.parse::<i32>().ok())
-            .map(|level| Compression::Zstd { level })
-            .ok_or_else(|| format!("{value} is not none, zstd or zstd:LEVEL")),
-    }
 }
 
 /// Parse a size in bytes, as ZConfig's `byte-size` does: a whole number,

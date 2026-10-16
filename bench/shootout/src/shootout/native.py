@@ -70,8 +70,6 @@ LEVEL = 0.99
 # worker, as the inner loops of zodbshootout do.
 BATCH_SECONDS = 0.02
 MAX_TRANSACTIONS = 20
-# `zoe serve` writes its records raw, as FileStorage does (ADR 0039).
-ZOE_COMPRESSION = "none"
 SOFTWARE = ("zodbshootout", "ZODB", "ZEO", "persistent", "transaction", "zoedb")
 
 
@@ -198,7 +196,6 @@ def run(
             "max_pairs": MAX_PAIRS,
             "max_seconds": MAX_SECONDS,
             "level": LEVEL,
-            "zoe_compression": ZOE_COMPRESSION,
             "batch_seconds": BATCH_SECONDS,
             "max_transactions": MAX_TRANSACTIONS,
         },
@@ -215,7 +212,7 @@ def _cell(cell: Cell, scenarios, directory: Path, out: TextIO) -> dict:
             store = directory / name
             store.mkdir(parents=True)
             records[name].mkdir()
-            config = stack.enter_context(zconfig(STORAGES[name], store, None, raw=True))
+            config = stack.enter_context(zconfig(STORAGES[name], store, None))
             groups[name] = stack.enter_context(_Group(config, cell, records[name]))
         admin = admin_address(directory / STORAGE)
         for group in groups.values():
@@ -427,8 +424,7 @@ def report(result: dict, out: TextIO) -> int:
     run = result["run"]
     print(
         f"{STORAGE} against {BASELINE} on {python}, {result['machine']['name']}, "
-        f"commit {run['commit'] or 'unknown'}, {run['seconds']:.0f} s, "
-        f"zoe serve with --compression {rule['zoe_compression']}",
+        f"commit {run['commit'] or 'unknown'}, {run['seconds']:.0f} s",
         file=out,
     )
     found = {}

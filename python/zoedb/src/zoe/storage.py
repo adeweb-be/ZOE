@@ -53,8 +53,8 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
     `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
-    pack_gc=True)` opens the store in `path` and creates the directory when
-    it is missing.
+    pack_gc=True, compression=None)` opens the store in `path` and creates
+    the directory when it is missing.
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
     lock of an object. A longer wait raises `ConflictError`. `None` keeps the
     default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
@@ -89,6 +89,13 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     when no reader can reach the object. An object whose newest record at or
     before the pack time is a deletion goes. The store does not record
     `pack_gc`, so each open gives it.
+
+    `compression` is the compression of the records that the store writes:
+    `"none"`, `"zstd"` or `"zstd:LEVEL"`, such as `"zstd:3"`. `None` keeps
+    the default of the store, none: the records are raw. `"zstd"`
+    compresses each record with zstd at level 3. A store reads every
+    compression, so the setting can change between opens. Another value
+    raises `ValueError`.
 
     `deleteObject` writes a deletion, so the class declares `IExternalGC`.
 

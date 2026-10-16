@@ -20,6 +20,7 @@ same converters.
 """
 
 import os
+import re
 import urllib.parse
 
 from ZConfig.datatypes import stock_datatypes
@@ -59,6 +60,18 @@ def lock_timeout(value):
     return seconds
 
 
+def compression(value):
+    """Return the compression of the records that the store writes.
+
+    The value is `none`, `zstd` or `zstd:LEVEL`, in any case. The store
+    parses it again.
+    """
+    text = value.strip().lower()
+    if re.fullmatch(r"none|zstd(:-?[0-9]+)?", text):
+        return text
+    raise ValueError(f"{value!r} is not none, zstd or zstd:LEVEL")
+
+
 # The keys and the converters of their values.
 KEYS = {
     "path": stock_datatypes["string"],
@@ -68,6 +81,7 @@ KEYS = {
     "early-locks": early_locks,
     "read-only": stock_datatypes["boolean"],
     "pack-gc": stock_datatypes["boolean"],
+    "compression": compression,
 }
 
 
@@ -102,6 +116,7 @@ def open_storage(settings):
         lock_timeout=settings.get("lock-timeout"),
         blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
         pack_gc=settings.get("pack-gc", True),
+        compression=settings.get("compression"),
     )
 
 

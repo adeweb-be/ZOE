@@ -32,6 +32,15 @@ fn open(dir: &Path, options: Options) -> Store {
     Store::open_with(dir, options).unwrap()
 }
 
+/// The options of a store that compresses its records with zstd at
+/// level 3.
+fn zstd() -> Options {
+    Options {
+        compression: Compression::Zstd { level: 3 },
+        ..Options::default()
+    }
+}
+
 /// A pickle of `len` bytes that zstd compresses well.
 fn compressible(oid: u64, len: usize) -> Vec<u8> {
     let mut data = b"\x80\x03cplone.app.content\nItem".to_vec();
@@ -96,7 +105,7 @@ fn finish(mut txn: Txn<&Store>) -> (Tid, u64) {
 #[test]
 fn the_finish_compresses_no_record_whose_payload_is_attached() {
     let dir = fresh_dir("attached");
-    let store = open(&dir, Options::default());
+    let store = open(&dir, zstd());
     let records = records();
 
     // Without an attached payload, the finish compresses each record.
@@ -173,7 +182,7 @@ fn an_attached_payload_gives_the_frames_of_an_inline_compression() {
 #[test]
 fn a_payload_of_other_bytes_or_another_compression_is_not_attached() {
     let dir = fresh_dir("refused");
-    let store = open(&dir, Options::default());
+    let store = open(&dir, zstd());
     let data = compressible(1, 4096);
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(Oid(1), Tid::ZERO, &data).unwrap();
@@ -199,7 +208,7 @@ fn a_payload_of_other_bytes_or_another_compression_is_not_attached() {
 #[test]
 fn a_later_store_of_the_oid_drops_its_attached_payload() {
     let dir = fresh_dir("restored");
-    let store = open(&dir, Options::default());
+    let store = open(&dir, zstd());
     let (first, second) = (compressible(1, 4096), compressible(2, 4096));
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(Oid(1), Tid::ZERO, &first).unwrap();

@@ -54,15 +54,8 @@ COUNTS_COLD_LOADS = frozenset({"zoe-native"})
 
 
 @contextlib.contextmanager
-def zconfig(
-    storage: Storage, workdir: Path, dsn: str | None, raw: bool = False
-) -> Iterator[str]:
-    """Start what the storage needs in workdir and yield its ZConfig text.
-
-    With raw, `zoe serve` writes its records without compression
-    (`--compression none`), as FileStorage and ZEO do. Otherwise it keeps
-    its default.
-    """
+def zconfig(storage: Storage, workdir: Path, dsn: str | None) -> Iterator[str]:
+    """Start what the storage needs in workdir and yield its ZConfig text."""
     if storage.name == "filestorage":
         yield _section(
             storage.name,
@@ -83,13 +76,13 @@ def zconfig(
             storage.name, "<zoe>", f"path {workdir / 'store'}", "</zoe>"
         )
     elif storage.name == "zoe-server":
-        with _zoe_server(workdir, raw=raw) as address:
+        with _zoe_server(workdir) as address:
             yield _section(
                 storage.name, "<zeoclient>", f"server {address}", "</zeoclient>"
             )
     elif storage.name == "zoe-native":
         # The key native selects the native inside of zoe.zeo.ClientStorage.
-        with _zoe_server(workdir, admin=True, raw=raw) as address:
+        with _zoe_server(workdir, admin=True) as address:
             yield "%import zoe\n" + _section(
                 storage.name,
                 "<zoeclient>",
@@ -287,12 +280,12 @@ def zoe_binary() -> str:
 
 
 @contextlib.contextmanager
-def _zoe_server(workdir: Path, admin: bool = False, raw: bool = False) -> Iterator[str]:
+def _zoe_server(workdir: Path, admin: bool = False) -> Iterator[str]:
     """Run `zoe serve` on a store in workdir and yield its address.
 
-    The server runs with its default settings, but the compression with
-    raw: no `ZOE_*` variable of the environment reaches it. With admin, it
-    also listens on an admin port, and `admin_address` gives that address.
+    The server runs with its default settings: no `ZOE_*` variable of the
+    environment reaches it. With admin, it also listens on an admin port,
+    and `admin_address` gives that address.
     """
     out = workdir / "zoe-serve.out"
     log = workdir / "zoe-serve.log"
@@ -301,8 +294,6 @@ def _zoe_server(workdir: Path, admin: bool = False, raw: bool = False) -> Iterat
     # The port 0 takes a free port. `zoe serve` writes `listening <address>`
     # to stdout once it accepts connections.
     command += ["--listen", "127.0.0.1:0"]
-    if raw:
-        command += ["--compression", "none"]
     if admin:
         # zoe serve writes `admin <address>` before `listening <address>`.
         command += ["--admin-listen", "127.0.0.1:0"]

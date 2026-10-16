@@ -50,7 +50,7 @@ use redb::StorageBackend;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use zoe_core::testing::{self, Key};
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Codec, Oid, Store, Tid, ZoeError};
+use zoe_core::{Codec, Compression, Oid, Options, Store, SystemClock, Tid, ZoeError};
 
 /// The default seed of the flips.
 const SEED: u64 = 0x2545_f491_4f6c_dd1d;
@@ -377,13 +377,23 @@ fn blob_bytes(oid: Oid, tid: Tid) -> Vec<u8> {
     pickle(oid, tid, 300 + (oid.0 as usize % 7) * 100)
 }
 
+/// Open the store in `vfs` with zstd at level 3. So the store writes
+/// records of both codecs.
+fn open_vfs(vfs: MemVfs) -> zoe_core::Result<Store> {
+    let options = Options {
+        compression: Compression::Zstd { level: 3 },
+        ..Options::default()
+    };
+    Store::open_full(vfs, SystemClock, options)
+}
+
 /// Commit 100 restore transactions on 40 oids in `vfs`: records in several
 /// revisions, compressed records, deletions and blobs. The tables are large
 /// enough to have branch pages. The tids and the
 /// data depend on nothing else, so the database file is the same at each
 /// run.
 fn build(vfs: &MemVfs) -> Model {
-    let store = Store::open_vfs(vfs.clone()).unwrap();
+    let store = open_vfs(vfs.clone()).unwrap();
     let mut model = Model::default();
     let mut current: BTreeMap<Oid, Tid> = BTreeMap::new();
     let mut rng = Rng::new(0x0123_4567_89ab_cdef);
@@ -445,7 +455,7 @@ fn build(vfs: &MemVfs) -> Model {
 
 /// Return the stored frames of every row of `model` in the store of `vfs`.
 fn frames(vfs: &MemVfs, model: &Model) -> Vec<Vec<u8>> {
-    let store = Store::open_vfs(vfs.clone()).unwrap();
+    let store = open_vfs(vfs.clone()).unwrap();
     let keys = model
         .records
         .keys()
@@ -796,7 +806,7 @@ impl Fixture {
         let files = files(&vfs);
         {
             // The intact store gives the exact answer to every read.
-            let store = Store::open_vfs(filesystem(&files, &files["zoe.redb"])).unwrap();
+            let store = open_vfs(filesystem(&files, &files["zoe.redb"])).unwrap();
             let mut reads = Reads::default();
             classify(&store, &model, &mut reads);
             assert_eq!(reads.counts[1..], [0; 4], "{:?}", reads.notes);
@@ -846,7 +856,7 @@ fn raw_outcome(fixture: &Fixture, at: usize, bit: usize) -> Outcome {
     check_in_time(move || {
         let mut reads = Reads::default();
         let opened = panic::catch_unwind(AssertUnwindSafe(|| {
-            let store = Store::open_vfs(filesystem(&files, &flipped)).ok()?;
+            let store = open_vfs(filesystem(&files, &flipped)).ok()?;
             classify(&store, &model, &mut reads);
             // The close of the database can panic too.
             drop(store);
@@ -1153,7 +1163,7 @@ fn flips_in_stored_frames_and_blob_files_are_errors_and_hide_nothing() {
     let fixture = Fixture::new();
     let model = &fixture.model;
     let vfs = filesystem(&fixture.files, fixture.database());
-    let store = Store::open_vfs(vfs.clone()).unwrap();
+    let store = open_vfs(vfs.clone()).unwrap();
     let keys = model
         .records
         .keys()
@@ -1290,7 +1300,7 @@ fn read_current(
 /// error.
 #[test]
 fn a_damaged_zstd_payload_under_a_valid_checksum_raises_corrupt_record_or_decodes() {
-    let store = Store::open_vfs(MemVfs::new()).unwrap();
+    let store = open_vfs(MemVfs::new()).unwrap();
     let (oid, tid) = (Oid(1), Tid(FIRST_TID));
     let data = compressible(oid, tid);
     let mut txn = store.tpc_begin_restore(tid, b"", b"zstd", b"").unwrap();

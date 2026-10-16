@@ -22,8 +22,9 @@ import pytest
 
 import zoe
 
-# The keys of the stanza: the keys of the example in the specification, and
-# read-only, as in <filestorage> and <zeoclient>.
+# The keys of the stanza: the keys of the example in the specification,
+# read-only, as in <filestorage> and <zeoclient>, and compression, as the
+# option of zoe serve.
 KEYS = {
     "path",
     "blob-dir",
@@ -32,6 +33,7 @@ KEYS = {
     "early-locks",
     "read-only",
     "pack-gc",
+    "compression",
 }
 # The ways to give a value to a key.
 SOURCES = ["stanza", "environment", "uri"]
@@ -288,6 +290,26 @@ def test_lock_timeout_sets_the_longest_lock_wait(tmp_path, monkeypatch, source):
     # The default lock timeout is much longer than the one that the test sets.
     assert isinstance(error, ConflictError)
     assert 0.5 <= waited < 5
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_compression_sets_the_compression_of_new_records(tmp_path, monkeypatch, source):
+    # zstd makes a run of one byte almost nothing. Stored raw, it takes its
+    # whole size in the database file.
+    data = b"x" * (4 << 20)
+    sizes = {}
+    for value in ("none", "zstd:3"):
+        store = tmp_path / value.replace(":", "-")
+        settings = {"compression": value}
+        with closing(open_storage(source, store, settings, monkeypatch)) as storage:
+            commit(storage, storage.new_oid(), ZERO, data)
+        sizes[value] = (store / "zoe.redb").stat().st_size
+    assert sizes["none"] >= len(data)
+    assert sizes["zstd:3"] < len(data) // 2, sizes
+
+    settings = {"compression": "lz4"}
+    with pytest.raises(ValueError):
+        open_storage(source, tmp_path / "other", settings, monkeypatch).close()
 
 
 @pytest.mark.parametrize("source", SOURCES)

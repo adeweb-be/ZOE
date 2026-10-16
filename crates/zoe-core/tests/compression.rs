@@ -1,6 +1,7 @@
 //! Acceptance test of record compression: the payload of a record frame is
 //! zstd-compressed when that makes it smaller, and the codec byte says so.
 //! A store reads records of every codec, whatever its current setting.
+//! The default options store records raw.
 
 use std::path::{Path, PathBuf};
 
@@ -55,11 +56,16 @@ fn commit(store: &Store, oid: Oid, data: &[u8]) -> Tid {
 }
 
 #[test]
-fn zstd_is_the_default() {
-    assert!(matches!(
-        Options::default().compression,
-        Compression::Zstd { .. }
-    ));
+fn raw_is_the_default() {
+    assert_eq!(Options::default().compression, Compression::None);
+    let store = Store::open(fresh_dir("default")).unwrap();
+    assert_eq!(store.compression(), Compression::None);
+    let oid = store.new_oid().unwrap();
+    let data = repetitive_pickle();
+    let tid = commit(&store, oid, &data);
+    let info = store.record_info(oid, tid).unwrap();
+    assert_eq!(info.codec, Codec::None);
+    assert_eq!(info.stored_len, data.len() as u64);
 }
 
 #[test]

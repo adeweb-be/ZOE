@@ -6,8 +6,6 @@ client (`zoe-native`) is faster than ZEO 6 through `ZEO.ClientStorage`
 zodbshootout in 3 shapes (threads 1, threads 16, processes 16), at 1 KB and
 at 100 KB: 30 cells. A transaction holds 100 objects at 1 KB and 10 at
 100 KB.
-`zoe serve` runs with `--compression none`: it writes its records raw, as
-FileStorage does.
 
 `shootout.native` drives both storages itself. For each cell, each storage
 gets one server, one populate and one set of worker processes. A scenario
@@ -137,7 +135,6 @@ def result_of(ratios_of):
             "max_pairs": 100,
             "max_seconds": 10,
             "level": 0.99,
-            "zoe_compression": "none",
             "batch_seconds": 0.02,
             "max_transactions": 20,
         },
@@ -175,8 +172,6 @@ def test_the_rule_is_a_constant_of_the_gate():
     assert native.MAX_SECONDS == 10
     assert native.LEVEL == 0.99
     assert native.PAIR == ("zeo", "zoe-native")
-    # zoe serve writes its records raw, as FileStorage does.
-    assert native.ZOE_COMPRESSION == "none"
 
 
 def test_a_batch_lasts_about_20_ms_with_at_most_20_transactions():
@@ -295,7 +290,6 @@ def test_a_tiny_gate_runs_end_to_end(tmp_path, schema, monkeypatch):
         result = native.run(cells=cells, workdir=tmp_path / "work", out=stream)
     jsonschema.validate(result, schema)
     assert result["rule"]["min_pairs"] == 2
-    assert result["rule"]["zoe_compression"] == "none"
     assert [(c["mode"], c["concurrency"]) for c in result["cells"]] == [
         ("threads", 2),
         ("processes", 2),

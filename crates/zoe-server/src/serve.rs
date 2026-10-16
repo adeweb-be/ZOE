@@ -281,8 +281,8 @@ impl ServeOptions {
     }
 
     /// Write the new records of each store with `compression`. Without this
-    /// call, each store keeps the default of the store, zstd at level 3. A
-    /// store reads every compression, whatever this setting.
+    /// call, each store keeps the default of the store, none. A store reads
+    /// every compression, whatever this setting.
     #[must_use]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = Some(compression);

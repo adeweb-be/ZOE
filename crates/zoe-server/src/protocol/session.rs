@@ -5242,7 +5242,8 @@ mod tests {
         }
 
         /// A storage whose votes wait at most 200 ms for a lock, so a test
-        /// sees a lock that stays.
+        /// sees a lock that stays. Its store compresses with zstd at level
+        /// 3, so its transactions encode on the compression pool.
         fn storage(name: &str) -> Arc<NamedStorage> {
             let dir = std::env::temp_dir().join(format!(
                 "zoe-session-compress-{name}-{}",
@@ -5251,6 +5252,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             let options = Options {
                 lock_timeout: Duration::from_millis(200),
+                compression: Compression::Zstd { level: 3 },
                 ..Options::default()
             };
             let store = Arc::new(Store::open_with(&dir, options).unwrap());

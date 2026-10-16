@@ -47,7 +47,7 @@ use std::time::Duration;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use zoe_core::{BlobFile, Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Compression, Oid, Options, Store, Tid, Txn, ZoeError};
 
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
@@ -336,13 +336,16 @@ impl Storage {
     /// seconds. `blob_dir` is the directory of the blob files, `None` for
     /// `<path>/blobs`. The core takes it as `Options::blob_dir`. With
     /// `pack_gc` false, a pack keeps the objects that no reader can reach:
-    /// the core takes it as `Options::pack_gc`.
+    /// the core takes it as `Options::pack_gc`. `compression` is the
+    /// compression of the records that the store writes, as text: `none`,
+    /// `zstd` or `zstd:LEVEL`; `None` keeps the default of the store. The
+    /// core takes it as `Options::compression`.
     ///
     /// The open installs the handlers of SIGTERM and SIGHUP that close the
     /// stores of the process, each only when its action is the default
     /// (see `signals`).
     #[new]
-    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true))]
+    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true, compression = None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -350,8 +353,14 @@ impl Storage {
         lock_timeout: Option<f64>,
         blob_dir: Option<PathBuf>,
         pack_gc: bool,
+        compression: Option<&str>,
     ) -> PyResult<Self> {
         let mut options = Options::default();
+        if let Some(text) = compression {
+            options.compression = text
+                .parse::<Compression>()
+                .map_err(|e| PyValueError::new_err(format!("compression {e}")))?;
+        }
         if let Some(seconds) = lock_timeout {
             options.lock_timeout = Duration::try_from_secs_f64(seconds).map_err(|_| {
                 PyValueError::new_err("lock_timeout is a number of seconds, 0 or more")

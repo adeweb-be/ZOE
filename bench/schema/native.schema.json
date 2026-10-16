@@ -88,13 +88,12 @@
       "description": "The rule that stopped the pairs of each scenario. The report applies it again to the pairs.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["min_pairs", "max_pairs", "max_seconds", "level", "zoe_compression", "batch_seconds", "max_transactions"],
+      "required": ["min_pairs", "max_pairs", "max_seconds", "level", "batch_seconds", "max_transactions"],
       "properties": {
         "min_pairs": { "description": "The pairs before a verdict can stop a scenario.", "type": "integer", "minimum": 2 },
         "max_pairs": { "description": "The most pairs of a scenario.", "type": "integer", "minimum": 2 },
         "max_seconds": { "description": "The time after which a scenario takes no new pair.", "type": "number", "exclusiveMinimum": 0 },
         "level": { "description": "The confidence level of the interval of the mean of the log of the ratios.", "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
-        "zoe_compression": { "description": "The value of --compression of zoe serve: none, so that zoe serve writes its records raw, as FileStorage does.", "type": "string", "minLength": 1 },
         "batch_seconds": { "description": "The time that a batch lasts about: the warmup pair of a scenario sets its transactions per batch from it.", "type": "number", "exclusiveMinimum": 0 },
         "max_transactions": { "description": "The most transactions of a batch.", "type": "integer", "minimum": 1 }
       }
