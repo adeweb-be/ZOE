@@ -4,7 +4,7 @@
 | --- | --- |
 | Branch | `claude/plone-zeo-zoe-locust-benchmark-pvkgea`. No pull request yet. |
 | Base | `main` at `1180b2f` (ZOE-194), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
-| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main`; `c50c71d` the port of the harness to macOS (section 4.4); `ee42ff8` the macOS series and the warmup fix; then steps 2–6 on macOS (section 3.2); the merge of `main` at `1180b2f`; `3f9e4cd` the reasons of failed resolutions, the lost resolutions and `--zoe-cache-size`; then steps 7–9 (section 3.3). |
+| Commits | Rebased on `main` at `1180b2f`, with no merge commit: `69ea39c` the harness; `ccb34b0` the timeline of the report; `748c244` the word codes in titles and `inzope/oidmap.py`; `6a10958` the interim findings and this file; `f8e6f7b` the detailed handoff; `8b76944` the port of the harness to macOS (section 4.4); `a4cd483` the macOS series and the warmup fix; `ee8c6f5` steps 2–6 on macOS (section 3.2); `fe15acd` the reasons of failed resolutions, the lost resolutions and `--zoe-cache-size`; then steps 7–9 (section 3.3). The results record the ids from before the rebase: `c50c71d` is `8b76944`, `ee42ff8` is `a4cd483`, `431a403` has the tree of `ee8c6f5`, `3f9e4cd` is `fe15acd`. |
 | Card | None: the work came as a direct request. When a card exists, move this file to `docs/handoffs/<card>.md`, as `CLAUDE.md` asks, and name the card in the commits of the follow-up. |
 | Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so steps 1–9 of section 5 are done there (sections 3.1–3.3), and the finding is final for this series. Left: the Linux steps, the follow-up experiments of the ranked table, and the pull request when the human asks (section 5). Nothing runs now. |
 | Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the results); then this file. |
@@ -195,7 +195,7 @@ What the data says, measured:
 
 ### 3.1 The macOS series
 
-Runs: the lists `target/bench/plone/campaigns/macos-baseline-final.txt` (14 runs) and `macos-zeo-plain-final.txt` (4 runs of ZEO with `--zeo-fsync plain`), not in git. Same steps, warmup and trim as section 3. Commit `c50c71d`; the three `edit` runs ran again with the warmup fix (section 4.5) before it was committed. The report is `docs/findings/plone-end-to-end/macos-report.md`, and the finding (items 9–14) says what it shows. In short:
+Runs: the lists `target/bench/plone/campaigns/macos-baseline-final.txt` (14 runs) and `macos-zeo-plain-final.txt` (4 runs of ZEO with `--zeo-fsync plain`), not in git. Same steps, warmup and trim as section 3. Commit `8b76944` (`c50c71d` in the results); the three `edit` runs ran again with the warmup fix (section 4.5) before it was committed. The report is `docs/findings/plone-end-to-end/macos-report.md`, and the finding (items 9–14) says what it shows. In short:
 
 - Reads at parity, within 2 %. Pages cost 36–47 ms of Zope CPU here, against 90–110 ms on the Linux VM.
 - Writes: ZOE equal or up to 15 % ahead in rate; with one repetition, not significant. `edit` at 16 users fails 1.4 % on ZEO and 0 % on ZOE once the warmup fix is in.
@@ -204,7 +204,7 @@ Runs: the lists `target/bench/plone/campaigns/macos-baseline-final.txt` (14 runs
 
 ### 3.2 The macOS series, steps 2–6
 
-Runs: the lists `macos-contention.txt` (16), `macos-background.txt`, `macos-cold.txt`, `macos-probe-on.txt`, `macos-probe-off.txt` and `macos-sustained.txt` (2 each) under `target/bench/plone/campaigns/`, not in git; all `verification pass`. Commit `ee42ff8`, `--zeo-fsync full`. The report is `docs/findings/plone-end-to-end/macos-next-report.md`; the finding says what it shows (items 15–20). In short:
+Runs: the lists `macos-contention.txt` (16), `macos-background.txt`, `macos-cold.txt`, `macos-probe-on.txt`, `macos-probe-off.txt` and `macos-sustained.txt` (2 each) under `target/bench/plone/campaigns/`, not in git; all `verification pass`. Commit `a4cd483` (`ee42ff8` in the results), `--zeo-fsync full`. The report is `docs/findings/plone-end-to-end/macos-next-report.md`; the finding says what it shows (items 15–20). In short:
 
 - The native client is what makes ZOE faster: `zoe-native` is 5–14 % ahead of ZEO in the contention scenarios and uses 4–5 ms less Zope CPU per REST write; `zoe-stock` and `zoe-asyncio` (stock ZEO client against `zoe serve`) are about 10 % behind ZEO in the REST scenarios and level in the form scenarios. Stock and asyncio are equal.
 - `contention-fields`: 190–210 `IOBucket` conflicts against 16–37 on the `Document` per stack. The expectation of step 2 holds: a field-level merge of the Document alone would not remove the conflicts. The starving of the title writer was not checked per role.
@@ -228,7 +228,7 @@ The scripts of the investigations are in `target/bench/plone/tools/` (not in git
 
 ## 4. Things learned the hard way
 
-### 4.1 The hex token bias (fixed in `2ef5560`, data not yet redone)
+### 4.1 The hex token bias (fixed in `748c244`; the macOS series uses the fix)
 
 Titles carried `Edit <8 hex>` / `New <12 hex>`: a new word per save. ZCTextIndex's Lexicon gives a new word the next word id from a `Length`; two concurrent saves read the same length, take the same wid, and insert the same key with different words into `_words`/`_wids`, and the same wid into `_wordinfo`: unresolvable. So every pair of concurrent saves conflicted. Titles now start with a prefix (`Edit`, `New`, `Patch`, `Import`) and four words of `corpus.code_words` (vocabulary ranks 100–1100, which the site already holds). The verification parses the code with `verification._TOKEN` and searches it in the Title index (an AND of the four words). A sanity run of `edit` with codes (zoe-native, 4 users, 30 s; run dir `20261015T211021Z-edit-zoe-native-sanity`, not in the reports) still had 63 conflicts, in `SearchableText._wordinfo` (38), `sortable_title._index` (7), `Description._wordinfo` (10), others: the text index contention is real Plone behaviour; the lexicon conflicts were the artifact. The prefix words are new to the lexicons at their first use; that costs a few early conflicts only.
 
