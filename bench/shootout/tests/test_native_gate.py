@@ -6,12 +6,17 @@ client (`zoe-native`) is faster than ZEO 6 through `ZEO.ClientStorage`
 zodbshootout in 3 shapes (threads 1, threads 16, processes 16), at 1 KB and
 at 100 KB: 30 cells. A transaction holds 100 objects at 1 KB and 10 at
 100 KB.
+`zoe serve` runs with `--compression none`: it writes its records raw, as
+FileStorage does.
 
 `shootout.native` drives both storages itself. For each cell, each storage
 gets one server, one populate and one set of worker processes. A scenario
 runs in pairs of batches, one batch of each storage, and the first storage
-changes from one pair to the next. The ratio of a pair is `t_zeo / t_zoe`,
-where `t` is the time of the slowest worker for one transaction. After at
+changes from one pair to the next. A batch runs the same number of
+transactions in a row in each worker, as the inner loops of zodbshootout
+do: about 20 ms of them, at most 20, from the time of the warmup pair.
+The ratio of a pair is `t_zeo / t_zoe`, where `t` is the time of the
+slowest worker for one transaction. After at
 least 10 pairs, a scenario passes when the 99 % confidence interval of the
 mean of the log of the ratios is above 0, and fails when it is below 0. It
 stops at its first verdict, at 100 pairs or after 10 s of pairs. A scenario
@@ -90,7 +95,7 @@ def result_of(ratios_of):
     cells = []
     for cell in native.CELLS:
         scenarios = [
-            {"name": name, "pairs": pairs_of(r)}
+            {"name": name, "transactions": 1, "pairs": pairs_of(r)}
             for name in SCENARIOS
             if (r := ratios_of(cell, name)) is not None
         ]
@@ -127,7 +132,15 @@ def result_of(ratios_of):
         },
         "software": {"ZEO": "6", "zoedb": "0", "zoe": "0"},
         "run": {"started": "2026-01-01T00:00:00Z", "commit": "0" * 12, "seconds": 60},
-        "rule": {"min_pairs": 10, "max_pairs": 100, "max_seconds": 10, "level": 0.99},
+        "rule": {
+            "min_pairs": 10,
+            "max_pairs": 100,
+            "max_seconds": 10,
+            "level": 0.99,
+            "zoe_compression": "none",
+            "batch_seconds": 0.02,
+            "max_transactions": 20,
+        },
         "cells": cells,
     }
 
@@ -162,6 +175,17 @@ def test_the_rule_is_a_constant_of_the_gate():
     assert native.MAX_SECONDS == 10
     assert native.LEVEL == 0.99
     assert native.PAIR == ("zeo", "zoe-native")
+    # zoe serve writes its records raw, as FileStorage does.
+    assert native.ZOE_COMPRESSION == "none"
+
+
+def test_a_batch_lasts_about_20_ms_with_at_most_20_transactions():
+    assert native.BATCH_SECONDS == 0.02
+    assert native.MAX_TRANSACTIONS == 20
+    assert native.transactions_for(0.0035) == 6
+    assert native.transactions_for(0.05) == 1
+    assert native.transactions_for(0.0001) == 20
+    assert native.transactions_for(0.0) == 20
 
 
 def test_the_first_storage_changes_from_one_pair_to_the_next():
@@ -271,6 +295,7 @@ def test_a_tiny_gate_runs_end_to_end(tmp_path, schema, monkeypatch):
         result = native.run(cells=cells, workdir=tmp_path / "work", out=stream)
     jsonschema.validate(result, schema)
     assert result["rule"]["min_pairs"] == 2
+    assert result["rule"]["zoe_compression"] == "none"
     assert [(c["mode"], c["concurrency"]) for c in result["cells"]] == [
         ("threads", 2),
         ("processes", 2),
@@ -282,6 +307,7 @@ def test_a_tiny_gate_runs_end_to_end(tmp_path, schema, monkeypatch):
             assert len(cell["workers"][name]) == processes, cell["workers"]
         for scenario in cell["scenarios"]:
             pairs = scenario["pairs"]
+            assert 1 <= scenario["transactions"] <= 20, scenario
             assert 2 <= len(pairs) <= 3, scenario
             assert [p["first"] for p in pairs] == [
                 native.order(k)[0] for k in range(len(pairs))

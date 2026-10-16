@@ -43,3 +43,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0037](0037-the-phase-3-gate-counts-the-cost-of-the-storage.md) | The phase 3 gate counts the cost of the storage against a floor (superseded by ADR 0039) |
 | [0038](0038-macos-for-development.md) | macOS opens the development shell (accepted) |
 | [0039](0039-the-phase-3-gate-is-a-quick-head-to-head.md) | The phase 3 gate is a quick head-to-head: faster than ZEO in every cell; it supersedes ADR 0037 (accepted) |
+| [0040](0040-a-sync-on-macos-is-fsync.md) | A sync on macOS is fsync(2), as for FileStorage (accepted) |

@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
+use zoe_core::Compression;
 
 use super::Failure;
 
@@ -256,6 +257,18 @@ pub(super) struct ServeArgs {
     )]
     blocking_threads: Option<NonZeroUsize>,
 
+    /// The compression of the records that the stores write: `none`, `zstd`,
+    /// or `zstd:LEVEL`, such as `zstd:3`. A store reads every compression,
+    /// whatever this option. The default is the default of the store, zstd
+    /// at level 3.
+    #[arg(
+        long,
+        env = "ZOE_COMPRESSION",
+        value_name = "CODEC",
+        value_parser = compression
+    )]
+    compression: Option<Compression>,
+
     /// Serve every store for reads only. The server opens each store
     /// read-only, and holds its lock, so no writer opens the store
     /// meanwhile. It changes no byte of a store that was closed cleanly. It
@@ -451,6 +464,20 @@ fn whole_seconds(value: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{value} is not a whole number of seconds, 0 or more"))
 }
 
+/// Parse the value of `--compression`: `none`, `zstd` (zstd at its default
+/// level), or `zstd:LEVEL` with a whole level.
+fn compression(value: &str) -> Result<Compression, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(Compression::None),
+        "zstd" => Ok(Compression::default()),
+        text => text
+            .strip_prefix("zstd:")
+            .and_then(|level| level.parse::<i32>().ok())
+            .map(|level| Compression::Zstd { level })
+            .ok_or_else(|| format!("{value} is not none, zstd or zstd:LEVEL")),
+    }
+}
+
 /// Parse a size in bytes, as ZConfig's `byte-size` does: a whole number,
 /// 0 or more, with the suffix `KB`, `MB` or `GB` in any case, or none for
 /// bytes. A suffix is a power of 1024.
@@ -617,6 +644,9 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     }
     if let Some(bytes) = args.cache_size {
         options = options.cache_size(bytes);
+    }
+    if let Some(compression) = args.compression {
+        options = options.compression(compression);
     }
     if let Some(threshold) = args.lock_warn.filter(|t| !t.is_zero()) {
         options = options.lock_warn(threshold);
@@ -870,6 +900,29 @@ mod tests {
         assert!(!serve(&["--pack-gc=false"]).unwrap().pack_gc);
         let error = serve(&["--pack-gc=maybe"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_compression_keeps_the_default_of_the_store_and_takes_none_or_zstd() {
+        assert_eq!(serve(&[]).unwrap().compression, None);
+        for (value, compression) in [
+            ("none", Compression::None),
+            ("NONE", Compression::None),
+            ("zstd", Compression::default()),
+            ("zstd:1", Compression::Zstd { level: 1 }),
+            ("zstd:19", Compression::Zstd { level: 19 }),
+        ] {
+            let args = serve(&["--compression", value]).unwrap();
+            assert_eq!(args.compression, Some(compression), "{value}");
+        }
+        for value in ["lz4", "zstd:", "zstd:high", ""] {
+            let error = serve(&["--compression", value]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
     }
 
     #[test]

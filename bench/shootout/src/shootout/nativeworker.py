@@ -17,9 +17,13 @@ transaction, with its objects and its data (`SpeedTestData`):
 - `read_hot`: empty the cache of a primed connection, and read each object
   from the cache of the storage.
 
-Before a batch of `read_cold` or `read_warm`, the process empties the
-cache of each connection and the cache of the storage, as zodbshootout
-does. That work is not timed.
+Before a transaction of `read_cold` or `read_warm`, the process empties
+the cache of each connection and the cache of the storage, as
+zodbshootout does. That work is not timed.
+
+A batch runs a number of transactions in a row in each worker, as the
+inner loops of zodbshootout do, and gives the time of each worker for all
+of them.
 
 The driver sends one command at a time. The process answers each one with
 `("ok", value)`, or with `("error", traceback)`, and then it stops.
@@ -63,10 +67,14 @@ def main(pipe, config: str, workers: list[int], concurrency: int, objects: int, 
                 threads = [_Worker(db, data, worker) for worker in workers]
                 pipe.send(("ok", None))
             elif command == "batch":
-                [scenario] = args
-                if scenario in ("read_cold", "read_warm"):
-                    _clear_caches(db)
-                pipe.send(("ok", _batch(threads, scenario)))
+                scenario, transactions = args
+                totals = [0.0] * len(threads)
+                for _ in range(transactions):
+                    if scenario in ("read_cold", "read_warm"):
+                        _clear_caches(db)
+                    times = _batch(threads, scenario)
+                    totals = [a + b for a, b in zip(totals, times, strict=True)]
+                pipe.send(("ok", totals))
             else:
                 raise ValueError(f"unknown command {command!r}")
     except BaseException:

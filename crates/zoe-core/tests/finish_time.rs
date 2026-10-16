@@ -104,7 +104,7 @@ impl fmt::Debug for Io {
 /// `io`. Another file has no `io`.
 #[derive(Debug)]
 struct TimedFile {
-    file: redb::backends::FileBackend,
+    file: zoe_core::vfs::OsFile,
     io: Option<Arc<Io>>,
 }
 
@@ -159,7 +159,7 @@ struct TimedVfs {
 }
 
 impl TimedVfs {
-    fn timed(&self, name: &str, file: redb::backends::FileBackend) -> TimedFile {
+    fn timed(&self, name: &str, file: zoe_core::vfs::OsFile) -> TimedFile {
         let io = (name == DATABASE).then(|| self.io.clone());
         TimedFile { file, io }
     }

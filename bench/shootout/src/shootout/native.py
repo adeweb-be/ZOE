@@ -11,8 +11,11 @@ holds 100 objects at 1 KB and 10 objects at 100 KB.
 
 For each cell, each storage gets one server on a fresh store, one populate
 and one set of worker processes (`shootout.nativeworker`). Then each
-scenario runs in pairs of batches. A batch is one transaction in each
-worker of one storage, and its time is the time of the slowest worker. A
+scenario runs in pairs of batches. A batch runs the same number of
+transactions in a row in each worker of one storage, as the inner loops of
+zodbshootout do, and its time is the time of the slowest worker for one
+transaction. The warmup pair sets that number for the scenario: a batch
+lasts about `BATCH_SECONDS`, with at most `MAX_TRANSACTIONS`. A
 pair is one batch of each storage. The first storage of a pair changes
 from one pair to the next. Only one storage works at a time. One pair
 before the first one warms the scenario up and does not count.
@@ -63,6 +66,12 @@ MIN_PAIRS = 10
 MAX_PAIRS = 100
 MAX_SECONDS = 10.0
 LEVEL = 0.99
+# A batch runs about this long: its transactions run in a row in each
+# worker, as the inner loops of zodbshootout do.
+BATCH_SECONDS = 0.02
+MAX_TRANSACTIONS = 20
+# `zoe serve` writes its records raw, as FileStorage does (ADR 0039).
+ZOE_COMPRESSION = "none"
 SOFTWARE = ("zodbshootout", "ZODB", "ZEO", "persistent", "transaction", "zoedb")
 
 
@@ -130,6 +139,17 @@ def _t_quantile(p: float, df: int) -> float:
     return z + sum(term / df ** (k + 1) for k, term in enumerate(terms))
 
 
+def transactions_for(seconds: float) -> int:
+    """Return the transactions of a batch whose one transaction takes seconds.
+
+    A batch lasts about `BATCH_SECONDS`, with 1 to `MAX_TRANSACTIONS`
+    transactions.
+    """
+    if seconds <= 0:
+        return MAX_TRANSACTIONS
+    return max(1, min(MAX_TRANSACTIONS, math.ceil(BATCH_SECONDS / seconds)))
+
+
 def order(number: int) -> tuple[str, str]:
     """Return the storages of pair number, in the order that they run."""
     return PAIR if number % 2 == 0 else PAIR[::-1]
@@ -178,6 +198,9 @@ def run(
             "max_pairs": MAX_PAIRS,
             "max_seconds": MAX_SECONDS,
             "level": LEVEL,
+            "zoe_compression": ZOE_COMPRESSION,
+            "batch_seconds": BATCH_SECONDS,
+            "max_transactions": MAX_TRANSACTIONS,
         },
         "cells": entries,
     }
@@ -192,15 +215,17 @@ def _cell(cell: Cell, scenarios, directory: Path, out: TextIO) -> dict:
             store = directory / name
             store.mkdir(parents=True)
             records[name].mkdir()
-            config = stack.enter_context(zconfig(STORAGES[name], store, None))
+            config = stack.enter_context(zconfig(STORAGES[name], store, None, raw=True))
             groups[name] = stack.enter_context(_Group(config, cell, records[name]))
         admin = admin_address(directory / STORAGE)
         for group in groups.values():
             group.populate()
         entries = []
         for scenario in scenarios:
-            pairs = _pairs(groups, cell, scenario, admin)
-            entries.append({"name": scenario, "pairs": pairs})
+            transactions, pairs = _pairs(groups, cell, scenario, admin)
+            entries.append(
+                {"name": scenario, "transactions": transactions, "pairs": pairs}
+            )
             print(
                 _row(cell, cell.objects, scenario, pairs, MIN_PAIRS, LEVEL)[0],
                 file=out,
@@ -220,19 +245,24 @@ def _cell(cell: Cell, scenarios, directory: Path, out: TextIO) -> dict:
     }
 
 
-def _pairs(groups, cell: Cell, scenario: str, admin: str) -> list[dict]:
-    """Run the pairs of one scenario until the rule stops them."""
+def _pairs(groups, cell: Cell, scenario: str, admin: str) -> tuple[int, list[dict]]:
+    """Run the pairs of one scenario until the rule stops them.
+
+    Return the transactions of each batch and the pairs.
+    """
     cold = scenario == "read_cold"
     if cold:
         before = server_loads(admin)
     # The warmup pair primes the caches of read_hot and the first commit.
-    for name in PAIR:
-        groups[name].batch(scenario)
+    # Its slower storage sets the transactions of a batch, the same for
+    # both storages.
+    slowest = max(groups[name].batch(scenario, 1) for name in PAIR)
+    transactions = transactions_for(slowest)
     pairs = []
     start = time.monotonic()
     while True:
         names = order(len(pairs))
-        seconds = {name: groups[name].batch(scenario) for name in names}
+        seconds = {name: groups[name].batch(scenario, transactions) for name in names}
         pairs.append({"first": names[0], "seconds": seconds})
         if (
             decide(ratios(pairs), LEVEL, MIN_PAIRS).verdict
@@ -241,10 +271,10 @@ def _pairs(groups, cell: Cell, scenario: str, admin: str) -> list[dict]:
         ):
             break
     if cold:
-        batches = len(pairs) + 1
-        read = batches * cell.concurrency * cell.objects
+        reads = 1 + len(pairs) * transactions
+        read = reads * cell.concurrency * cell.objects
         check_cold_loads(STORAGE, read, server_loads(admin) - before)
-    return pairs
+    return transactions, pairs
 
 
 class _Group:
@@ -317,11 +347,16 @@ class _Group:
         for _, pipe in self.processes:
             self._answer(pipe)
 
-    def batch(self, scenario: str) -> float:
-        """Run one batch of scenario. Return the time of the slowest worker."""
+    def batch(self, scenario: str, transactions: int) -> float:
+        """Run one batch of scenario, `transactions` in a row in each worker.
+
+        Return the time of the slowest worker for one transaction: its time
+        for the batch divided by `transactions`.
+        """
         for _, pipe in self.processes:
-            pipe.send(("batch", scenario))
-        return max(t for _, pipe in self.processes for t in self._answer(pipe))
+            pipe.send(("batch", scenario, transactions))
+        times = [t for _, pipe in self.processes for t in self._answer(pipe)]
+        return max(times) / transactions
 
     def _answer(self, pipe):
         try:
@@ -392,7 +427,8 @@ def report(result: dict, out: TextIO) -> int:
     run = result["run"]
     print(
         f"{STORAGE} against {BASELINE} on {python}, {result['machine']['name']}, "
-        f"commit {run['commit'] or 'unknown'}, {run['seconds']:.0f} s",
+        f"commit {run['commit'] or 'unknown'}, {run['seconds']:.0f} s, "
+        f"zoe serve with --compression {rule['zoe_compression']}",
         file=out,
     )
     found = {}

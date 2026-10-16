@@ -17,9 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::StorageBackend;
-use redb::backends::FileBackend;
 use zoe_convert::{ProblemKind, from_datafs};
-use zoe_core::vfs::{DirLock, MemVfs, OsVfs, Vfs, WriteFile};
+use zoe_core::vfs::{DirLock, MemVfs, OsFile, OsVfs, Vfs, WriteFile};
 use zoe_core::{Oid, Store, SystemClock, Tid};
 
 /// The record of a blob: the class pickle of `ZODB.blob.Blob`, then the
@@ -126,13 +125,13 @@ struct Counting {
 /// A file of `Counting`.
 #[derive(Debug)]
 struct CountedFile {
-    file: FileBackend,
+    file: OsFile,
     /// The counter of the database file, `None` for another file.
     syncs: Option<Arc<AtomicU64>>,
 }
 
 impl Counting {
-    fn counted(&self, name: &str, file: FileBackend) -> CountedFile {
+    fn counted(&self, name: &str, file: OsFile) -> CountedFile {
         let syncs = (name == DATABASE).then(|| self.syncs.clone());
         CountedFile { file, syncs }
     }

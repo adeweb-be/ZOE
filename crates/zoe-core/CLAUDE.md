@@ -39,6 +39,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`, once 
 - The index keeps the xxh3-64 hash of each spilled pickle, and each read checks it. So the bytes that `finish` writes are the bytes staged. A mismatch fails the read with `InvalidData`. `staged` reads a spilled pickle from the file and returns the error of a failed read, never `None` for a staged oid.
 - A staged blob stays with its oid when the pickle of the oid spills.
 - Every spill file operation goes through the `Vfs`, so the crash simulation covers it.
+- The file of an `OsVfs` (`OsFile`) holds the writes of redb, and makes them before the next sync, read, change of the length or close, in the order of their offsets, each run of adjacent writes as one. So every call sees every write before it, and a sync makes durable every write before it. A growth of at most 64 MiB gets zeros. On Apple systems, a sync of an `OsVfs` is `fsync(2)` (ADR 0040).
 - The lock table has an entry only for an oid that a transaction holds or waits for.
 - `Store::lock_table_is_empty` is a documented public method. It gives true when no transaction holds or waits for a lock, and it changes nothing. The lock table of a store that the process just opened is empty, so the readiness of `zoe serve` reads the method once after the open of each store. It tells nothing about other processes, because the lock table lives in the memory of one process.
 - No conflict tier runs Python on the server.
