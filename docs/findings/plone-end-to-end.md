@@ -1,6 +1,6 @@
 # Finding: where ZOE helps a Plone site, and where it does not yet
 
-The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). One repetition of each run, by the choice of the human, in two series: a Linux VM (items 1–9) and an Apple M3 Pro (items 10–29). Never compare numbers across the two series. Every scenario ran on its stacks with the current harness on macOS, on the small fixture and partly on the medium fixture; every run passed its verification. `HANDOFF.md` at the root of the repository gives the state and what is left.
+The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). One repetition of each run, by the choice of the human, in two series: a Linux VM (items 1–9) and an Apple M3 Pro (items 10–29). Never compare numbers across the two series. Every run here predates ADR 0040 and ADR 0041: `zoe serve` synced with `F_FULLFSYNC` on macOS and compressed its records with zstd at level 3. Since then it syncs with `fsync(2)` on macOS and writes raw records by default, so the sync times and the bytes of a commit on `main` differ from the ones below; the harness now gives both servers `fsync(2)` on macOS by default (`--zeo-fsync plain`). Every scenario ran on its stacks with the current harness on macOS, on the small fixture and partly on the medium fixture; every run passed its verification. `HANDOFF.md` at the root of the repository gives the state and what is left.
 
 ## The Linux series
 
@@ -27,7 +27,7 @@ The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). 
 
 - Tables: [`plone-end-to-end/macos-report.md`](plone-end-to-end/macos-report.md). Machine-readable: [`plone-end-to-end/macos-summary.json`](plone-end-to-end/macos-summary.json).
 - Commit under test: `8b76944` (`c50c71d` in the results, before the rebase on `main`); the three `edit` runs ran with the warmup fix of item 9 on top of it.
-- Machine: Apple M3 Pro, 6 performance and 6 efficiency cores, 36 GiB, APFS on the internal SSD. No CPU pinning: macOS has none. CPython 3.13, GIL on. Both servers sync with `F_FULLFSYNC` (the harness makes the ZEO server use it, as `zoe serve` does).
+- Machine: Apple M3 Pro, 6 performance and 6 efficiency cores, 36 GiB, APFS on the internal SSD. No CPU pinning: macOS has none. CPython 3.13, GIL on. Both servers sync with `F_FULLFSYNC` (the harness makes the ZEO server use it, as `zoe serve` did then).
 - The same fixture (`small-ba01ff255313`), steps, warmup and trim as the Linux series. Every run passed its verification. Locust used under 10 % of a CPU in every step.
 
 Measured:
@@ -82,7 +82,7 @@ Same machine, `--zeo-fsync full`, one repetition, every run `verification pass`.
 ## Not measured
 
 - Field-level merges, structural merges in Rust, shadow mode and early write-intent locks: phase 4, not built. No stack has them; nothing here measures them.
-- Compression off: `zoe serve` has no option for it.
+- Raw records against zstd: every run here used zstd, the default before ADR 0041. `--zoe-compression` now chooses it.
 - Free-threaded Python: Plone 6.1 supports CPython up to 3.13; the instances run 3.13 with the GIL on (recorded in each result).
 - Cold filesystem pages: neither machine can drop the page cache in the harness.
 - The `large` fixture, and a site larger than the caches: the medium site still fits.

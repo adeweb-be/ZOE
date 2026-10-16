@@ -37,6 +37,7 @@ def settings_of(args) -> stack.Settings:
         probe=not args.no_probe,
         zeo_fsync=args.zeo_fsync,
         zoe_cache_size=args.zoe_cache_size,
+        zoe_compression=args.zoe_compression,
     )
 
 
@@ -60,14 +61,20 @@ def add_settings(parser: argparse.ArgumentParser) -> None:
         "--zeo-fsync",
         choices=("full", "plain"),
         default=defaults.zeo_fsync,
-        help="macOS: the ZEO server syncs with F_FULLFSYNC (full, as zoe serve "
-        "does) or with stock fsync(2) (plain)",
+        help="macOS: the ZEO server syncs with stock fsync(2) (plain, as zoe "
+        "serve does) or with F_FULLFSYNC (full, a stronger sync than zoe serve)",
     )
     parser.add_argument(
         "--zoe-cache-size",
         default=defaults.zoe_cache_size,
         help="the --cache-size of zoe serve, such as 128MB; by default the "
         "server keeps the default of the store",
+    )
+    parser.add_argument(
+        "--zoe-compression",
+        default=defaults.zoe_compression,
+        help="the --compression of zoe serve: none, zstd or zstd:LEVEL; by "
+        "default the server keeps the default of the store (raw records)",
     )
 
 

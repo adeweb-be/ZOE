@@ -12,6 +12,12 @@ through each store and compares them. The fixture lives under
     store/filestorage/Data.fs, store/blobstorage/   the ZEO store
     store/zoe/          the ZOE store (zoe.redb and blobs/)
     convert.txt         the report of zoe convert
+
+`zoe convert` writes the records with the default compression of the store at
+the commit that ran it: raw since ADR 0041, zstd before. `equivalence.json`
+records that commit under `converted_at`. `zoe serve` reads every codec, so
+an older fixture still runs, but its records stay compressed: prepare it again
+with `--force` to measure raw records.
     digest-zeo.json, digest-zoe.json, equivalence.json
 
 A run never opens these stores: it copies them first (`restore`).
@@ -27,7 +33,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from plonebench import corpus, stack
+from plonebench import corpus, environment, stack
 
 
 def fixture_dir(name: str) -> Path:
@@ -132,6 +138,7 @@ def prepare(
     right = json.loads((target / "digest-zoe.json").read_text())
     equivalence = compare(left, right)
     equivalence["build_seconds"] = round(built, 1)
+    equivalence["converted_at"] = environment.git("rev-parse", "HEAD")
     equivalence["store_bytes"] = {
         "filestorage": _size(target / "store" / "filestorage"),
         "blobstorage": _size(target / "store" / "blobstorage"),

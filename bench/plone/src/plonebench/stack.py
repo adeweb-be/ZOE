@@ -71,7 +71,8 @@ STACKS = {
             "zoedb[plone] installed: the intended production combination"
         ),
         differs=(
-            "server: zoe serve (redb store, zstd level 3, per-oid locks, group commit)",
+            "server: zoe serve (redb store, raw records unless --zoe-compression, "
+            "per-oid locks, group commit)",
             "client: native Rust client (msgpack M5), extensions sequences and "
             "trace_context declared",
             "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
@@ -137,16 +138,32 @@ class Settings:
     server_port: int = 18100
     admin_port: int = 18199
     probe: bool = True
-    # How the ZEO server syncs a commit on macOS: `full` makes os.fsync use
-    # F_FULLFSYNC, as `zoe serve` does; `plain` keeps stock fsync(2). Linux
+    # How the ZEO server syncs a commit on macOS: `plain` keeps stock
+    # fsync(2), as `zoe serve` does (ADR 0040); `full` makes os.fsync use
+    # F_FULLFSYNC, a stronger sync than the one of `zoe serve`. Linux
     # ignores it.
-    zeo_fsync: str = "full"
+    zeo_fsync: str = "plain"
     # The page cache of the store of `zoe serve` (`--cache-size`). None
     # gives no option, so the server keeps the default of the store.
     zoe_cache_size: str | None = None
+    # The compression of the records that `zoe serve` writes
+    # (`--compression`): `none`, `zstd` or `zstd:LEVEL`. None gives no
+    # option, so the server keeps the default of the store: raw records.
+    zoe_compression: str | None = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
+
+
+def serve_options(settings: Settings) -> list[str]:
+    """The options of `zoe serve` that come from the settings. A setting
+    that is None gives no option, so the server keeps its default."""
+    options = []
+    if settings.zoe_cache_size is not None:
+        options += ["--cache-size", settings.zoe_cache_size]
+    if settings.zoe_compression is not None:
+        options += ["--compression", settings.zoe_compression]
+    return options
 
 
 def pinning() -> str:
@@ -478,8 +495,7 @@ class Stack:
                 "--admin-listen",
                 f"127.0.0.1:{self.settings.admin_port}",
             ]
-            if self.settings.zoe_cache_size is not None:
-                command += ["--cache-size", self.settings.zoe_cache_size]
+            command += serve_options(self.settings)
             process = subprocess.Popen(
                 command,
                 env=clean_environment(),

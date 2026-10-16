@@ -8,10 +8,10 @@ interpreter of the instance puts the same eggs on sys.path the way
 buildout does. This script loads the probe of plonebench_zeoprobe.py, then
 runs ZEO.runzeo with the configuration file.
 
-On macOS, os.fsync leaves the data in the cache of the drive, and the Rust
-std of `zoe serve` uses F_FULLFSYNC. When PLONEBENCH_ZEO_FSYNC is `full`,
-this script makes os.fsync use F_FULLFSYNC too, so both servers make a
-commit durable the same way.
+On macOS, os.fsync leaves the data in the cache of the drive, as the
+fsync(2) of `zoe serve` does (ADR 0040). When PLONEBENCH_ZEO_FSYNC is
+`full`, this script makes os.fsync use F_FULLFSYNC, which also flushes the
+cache of the drive: a stronger sync than the one of `zoe serve`.
 """
 
 import os

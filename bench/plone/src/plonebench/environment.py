@@ -98,15 +98,18 @@ def filesystem(path: Path) -> str | None:
 def durability(zeo_fsync: str) -> dict:
     """How each server makes a commit durable. On macOS, fsync(2) leaves
     the data in the cache of the drive; only fcntl F_FULLFSYNC writes it to
-    the medium. Rust's File::sync_data uses F_FULLFSYNC there, and
-    Python's os.fsync does not, unless the harness patches it."""
+    the medium. `zoe serve` calls fsync(2) there (ADR 0040), as Python's
+    os.fsync does, unless the harness makes os.fsync use F_FULLFSYNC."""
     if sys.platform == "darwin":
         zeo = (
             "F_FULLFSYNC: the harness makes os.fsync of the ZEO server use it"
             if zeo_fsync == "full"
             else "fsync(2) in FileStorage: the drive may still cache the data"
         )
-        return {"zeo": zeo, "zoe": "F_FULLFSYNC (Rust File::sync_data)"}
+        return {
+            "zeo": zeo,
+            "zoe": "fsync(2) (ADR 0040): the drive may still cache the data",
+        }
     return {"zeo": "fsync(2) in FileStorage", "zoe": "fdatasync(2)"}
 
 
@@ -178,7 +181,7 @@ def zope_python() -> dict:
         return {}
 
 
-def record(store_dir: Path, zeo_fsync: str = "full") -> dict:
+def record(store_dir: Path, zeo_fsync: str = "plain") -> dict:
     from plonebench.sampler import disk_of
 
     disk = disk_of(store_dir)

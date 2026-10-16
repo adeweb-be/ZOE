@@ -5,7 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-from plonebench import analysis, sampler, servers
+from plonebench import analysis, environment, sampler, servers, stack
 from plonebench.ledger import FAILED, OK, Ledger, Record, read
 
 
@@ -203,3 +203,25 @@ def test_sampler_summary(tmp_path):
     assert server["write_bytes"] == 2000
     assert summary["disk"]["writes"] == 20
     assert summary["machine"]["steal_seconds"] == 0.2
+
+
+def test_serve_options_and_durability(monkeypatch):
+    assert stack.serve_options(stack.Settings()) == []
+    settings = stack.Settings(zoe_cache_size="128MB", zoe_compression="zstd:3")
+    assert stack.serve_options(settings) == [
+        "--cache-size",
+        "128MB",
+        "--compression",
+        "zstd:3",
+    ]
+    assert stack.Settings().zeo_fsync == "plain"
+    monkeypatch.setattr(environment.sys, "platform", "darwin")
+    plain = environment.durability("plain")
+    assert plain["zeo"].startswith("fsync(2)")
+    assert plain["zoe"].startswith("fsync(2)")
+    assert environment.durability("full")["zeo"].startswith("F_FULLFSYNC")
+    monkeypatch.setattr(environment.sys, "platform", "linux")
+    assert environment.durability("plain") == {
+        "zeo": "fsync(2) in FileStorage",
+        "zoe": "fdatasync(2)",
+    }

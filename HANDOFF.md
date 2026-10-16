@@ -77,11 +77,11 @@ docs/SUMMARY.md      links the finding
 | Name | Server | Client section | Eggs (buildout scenario) | Purpose |
 | --- | --- | --- | --- | --- |
 | `zeo` | ZEO 6.2 `runzeo`, FileStorage, pickle protocol Z5, `invalidation-queue-size 100` (the recipe default) | `<zeoclient>` | `zeo` | baseline; the ZEO server resolves conflicts in its process |
-| `zoe-native` | `zoe serve --path ... --listen ... --admin-listen ...`, no other option (defaults: zstd 3, lock timeout 10 s, redb cache 1 GiB) | `<zoeclient>` with `native true` | `zoeclient` (`zoedb[plone]`) | the production combination: native client, extensions `sequences` (+ `trace_context` only if opentelemetry were installed: it is not), `zoe.plone` uidgenerator wiring; tier 3 client resolution |
+| `zoe-native` | `zoe serve --path ... --listen ... --admin-listen ...`, no other option (defaults then: zstd 3, lock timeout 10 s, redb cache 1 GiB; since ADR 0041 raw records, and `--zoe-compression` and `--zoe-cache-size` give the options) | `<zoeclient>` with `native true` | `zoeclient` (`zoedb[plone]`) | the production combination: native client, extensions `sequences` (+ `trace_context` only if opentelemetry were installed: it is not), `zoe.plone` uidgenerator wiring; tier 3 client resolution |
 | `zoe-asyncio` | same | `<zoeclient>` with `native false` | `zoeclient` | sequence wiring without the native client |
 | `zoe-stock` | same | `<zeoclient>` (stock client over M5) | `zeoclient` (msgpack, no zoedb) | the server alone, no client extension |
 
-Not built in ZOE, so no stack has them and no switch exists: tier 1 native merges, tier 2 field-level merges and their policy, shadow mode, the resolution log, early write-intent locks (`early-locks on` raises), append/CRDT fields, undo. Compression has no option in `zoe serve` (always zstd level 3). These facts come from `crates/zoe-core/CLAUDE.md`, `crates/zoe-server/CLAUDE.md`, `python/zoedb/src/zoe/component.xml` and `config.py`.
+Not built in ZOE, so no stack has them and no switch exists: tier 1 native merges, tier 2 field-level merges and their policy, shadow mode, the resolution log, early write-intent locks (`early-locks on` raises), append/CRDT fields, undo. Compression had no option in `zoe serve` when the runs of sections 3–3.3 ran (always zstd level 3); since ADR 0041 records are raw by default and `--compression` chooses it. These facts come from `crates/zoe-core/CLAUDE.md`, `crates/zoe-server/CLAUDE.md`, `python/zoedb/src/zoe/component.xml` and `config.py`.
 
 ### 2.3 The constants (`stack.Settings`, recorded in each result)
 
@@ -271,7 +271,7 @@ Then run `inzope/oidmap.py` against a read-only FileStorage copy of the fixture,
 The human made macOS a target, and the harness now runs on an Apple M3 Pro (6 performance and 6 efficiency cores, APFS). `bench/README.md`, paragraph "On macOS", is the user manual. What changed and why:
 
 - **No CPU pinning.** macOS has no CPU affinity API. `stack.pin()` returns no prefix there, and each result records `cpu_pinning: "none: macOS has no CPU affinity"` and `core_kinds`. The `--*-cpus` options stay, for Linux.
-- **Durability.** On macOS `os.fsync` returns in 0.04 ms and `F_FULLFSYNC` in 3 ms (measured on this machine): `fsync(2)` leaves the data in the cache of the drive. The Rust std of `zoe serve` uses `F_FULLFSYNC`. So `probe/zeoserver/launch.py` makes `os.fsync` of the ZEO server use `F_FULLFSYNC` before ZODB is imported (FileStorage binds `os.fsync` at import). `--zeo-fsync plain` keeps stock ZEO. Measured with `edit`, 4 users: ZEO `tpc_finish` 6.5 ms per commit with `full`, 3.3 ms with `plain`; `zoe serve` 7.3 ms. Each result records `durability`, and the report prints it in its header. The runs of one stack pool in the report, so never mix the two modes in one report.
+- **Durability.** On macOS `os.fsync` returns in 0.04 ms and `F_FULLFSYNC` in 3 ms (measured on this machine): `fsync(2)` leaves the data in the cache of the drive. The Rust std of `zoe serve` used `F_FULLFSYNC` when the runs of sections 3.1–3.3 ran, so `probe/zeoserver/launch.py` made `os.fsync` of the ZEO server use `F_FULLFSYNC` before ZODB is imported (FileStorage binds `os.fsync` at import). Since ADR 0040, `zoe serve` calls `fsync(2)` on macOS, and the default of the harness is `--zeo-fsync plain`; `--zeo-fsync full` still gives ZEO `F_FULLFSYNC`. Measured with `edit`, 4 users: ZEO `tpc_finish` 6.5 ms per commit with `full`, 3.3 ms with `plain`; `zoe serve` 7.3 ms. Each result records `durability`, and the report prints it in its header. The runs of one stack pool in the report, so never mix the two modes in one report.
 - **The sampler.** `sampler._Darwin` reads `proc_pid_rusage` (`rusage_info_v4`) and `proc_pidinfo` through ctypes: CPU, RSS, bytes read and written to disk, threads, context switches. The run delay is the runnable time minus the CPU time, because `ri_runnable_time` counts the time on a CPU too. Checked against psutil, and under 3× oversubscription. The machine CPU and the disk counters come from psutil (now a direct dependency). The disk is the physical store under the APFS volume of the run (`diskutil`). Absent on macOS: steal, iowait, disk flushes, and the split of voluntary and involuntary switches (one `switches` key).
 - **The rest.** `environment` reads `sysctl` and psutil instead of `/proc` and `/sys`. Store copies use `/bin/cp -c` (APFS clones): the devenv shell puts GNU `cp` first on PATH, and GNU `cp` has no `-c`. Buildout puts the eggs in `target/plone/eggs/cp313/` here, so `stack.egg_paths()` looks one level down too.
 - **Environment.** `devenv shell` works; `just plone zeo|zoeclient|zeoclient build` and `cargo build --release` passed without change. `just bench plone prepare` built the same fixture as on Linux (`small-ba01ff255313`, 685 objects, equivalent) in 49 s.
@@ -308,7 +308,7 @@ A throwaway program replays commits on a copy of the fixture store through a `Vf
 
 ## 5. Next steps, in order
 
-On macOS, steps 1–9 are done (sections 3.1–3.3). What is left: the Linux steps, if a Linux machine runs this again (as a series of its own); the experiments of the ranked table of the finding; step 10.
+On macOS, steps 1–9 are done (sections 3.1–3.3). What is left: the Linux steps, if a Linux machine runs this again (as a series of its own); the experiments of the ranked table of the finding; step 10. Since ADR 0040 and ADR 0041, a new macOS series is a series of its own too: prepare the fixtures again with `--force` (raw records), and run with the defaults (`fsync(2)` for both servers, raw records), with `--zoe-compression zstd` as a separate experiment.
 
 The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, steps 1–6 are done (sections 3.1 and 3.2). Step 8 has not run on either machine. Run it on macOS with `--zeo-fsync full` (the default), so it joins the macOS series.
 
@@ -349,9 +349,9 @@ The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choi
 
 - Synthetic site, small fixture: everything fits in every cache. Not a production benchmark.
 - One machine per series: a shared Linux VM with 4 vCPUs, or an Apple M3 Pro with no CPU pinning and two kinds of core. One repetition by the human's choice, so differences of a few percent are noise.
-- On macOS, both servers sync with `F_FULLFSYNC` by default, and stock ZEO does not (section 4.4).
+- On macOS, the runs of sections 3.1–3.3 synced both servers with `F_FULLFSYNC`, which stock ZEO does not do (section 4.4). Since ADR 0040 both use `fsync(2)` by default.
 - Closed workload, no think time; the offered rate falls when the server slows.
 - CPython 3.13 with the GIL, 2 instances × 2 threads; free-threaded Plone is out of reach (Plone 6.1 stops at 3.13).
 - The page cache cannot be dropped: no cold-disk claim.
-- Compression is always on in ZOE; ZEO's FileStorage has none. Store sizes and bytes written reflect that.
+- Compression was always on in ZOE for every run here (zstd level 3); ZEO's FileStorage has none. Store sizes and bytes written reflect that. Since ADR 0041 ZOE writes raw records by default, and the fixtures prepared before it still hold zstd records (`prepare --force` makes them again).
 - The probe adds a WSGI filter and wrappers on the storage methods; on macOS it costs under 1 % of rate in `browse` (section 3.2).
