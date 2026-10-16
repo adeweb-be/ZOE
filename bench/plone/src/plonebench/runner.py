@@ -344,6 +344,19 @@ def _analyse(result: dict, run_dir: Path, options: RunOptions) -> None:
             key: end[key] - base.get(key, 0)
             for key in ("resolved", "resolve_failed", "resolve_seconds")
         }
+        if "resolved_in_failed_votes" in end:
+            result["probe"]["zeoserver_resolution"]["resolved_in_failed_votes"] = end[
+                "resolved_in_failed_votes"
+            ] - base.get("resolved_in_failed_votes", 0)
+        if "resolve_reasons" in end:
+            before = base.get("resolve_reasons", {})
+            reasons = {
+                reason: count - before.get(reason, 0)
+                for reason, count in end["resolve_reasons"].items()
+            }
+            result["probe"]["zeoserver_resolution"]["resolve_reasons"] = {
+                reason: count for reason, count in reasons.items() if count
+            }
 
 
 def _print_summary(result: dict) -> None:

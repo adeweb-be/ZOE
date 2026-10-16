@@ -141,6 +141,9 @@ class Settings:
     # F_FULLFSYNC, as `zoe serve` does; `plain` keeps stock fsync(2). Linux
     # ignores it.
     zeo_fsync: str = "full"
+    # The page cache of the store of `zoe serve` (`--cache-size`). None
+    # gives no option, so the server keeps the default of the store.
+    zoe_cache_size: str | None = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -475,6 +478,8 @@ class Stack:
                 "--admin-listen",
                 f"127.0.0.1:{self.settings.admin_port}",
             ]
+            if self.settings.zoe_cache_size is not None:
+                command += ["--cache-size", self.settings.zoe_cache_size]
             process = subprocess.Popen(
                 command,
                 env=clean_environment(),

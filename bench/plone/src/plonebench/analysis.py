@@ -87,6 +87,7 @@ def server_totals(records: list[dict]) -> dict:
     """Add up the probe records of a set of requests."""
     totals = Counter()
     conflicts = Counter()
+    reasons = Counter()
     for r in records:
         totals["requests"] += 1
         totals["attempts"] += r["attempts"]
@@ -113,7 +114,9 @@ def server_totals(records: list[dict]) -> dict:
             "resolve_seconds",
         ):
             totals[key] += r.get(key, 0.0)
+        reasons.update(r.get("resolve_reasons", ()))
         for error in r["errors"]:
+            totals["resolved_in_failed_attempts"] += error.get("resolved", 0)
             if "conflict" in error:
                 totals["conflicts_" + error["conflict"]] += 1
                 conflicts[error.get("class") or "<read conflict>"] += 1
@@ -128,6 +131,7 @@ def server_totals(records: list[dict]) -> dict:
             totals["retried_seconds"] += r["seconds"]
     result = dict(totals)
     result["conflict_classes"] = dict(conflicts.most_common())
+    result["resolve_reasons"] = dict(reasons.most_common())
     return result
 
 

@@ -17,12 +17,14 @@ It counts:
 - the attempts of the publisher: `PubStart` events. An attempt after the
   first is a retry of ZPublisher after a `TransientError`;
 - the errors of each failed attempt, with the class of the object of a
-  `ConflictError`, and whether the publisher retried;
+  `ConflictError`, whether the publisher retried, and the conflicts that
+  the attempt resolved before it failed;
 - the time of the commit of each attempt: from `PubBeforeCommit` to
   `PubSuccess` or `PubFailure`;
 - the calls of the storage in the thread of the request: `loadBefore`,
   `store`, `tpc_vote`, `tpc_finish` and `tpc_abort`, with their time and
-  their bytes; and `tryToResolveConflict`, with its outcome;
+  their bytes; and `tryToResolveConflict`, with its outcome and the
+  reason of each failure (for a bucket, the reason of BTrees);
 - the CPU time of the thread of the request (`time.thread_time`).
 
 The times overlap: the commit holds the vote and the finish, and a
@@ -47,6 +49,7 @@ _state = {"in_flight": 0, "out": None, "installed": False}
 
 class _Context:
     __slots__ = (
+        "attempt_resolved",
         "attempts",
         "commit_seconds",
         "commit_start",
@@ -58,6 +61,7 @@ class _Context:
         "load_seconds",
         "loads",
         "resolve_failed",
+        "resolve_reasons",
         "resolve_seconds",
         "resolved",
         "retries",
@@ -70,6 +74,7 @@ class _Context:
 
     def __init__(self):
         self.attempts = 0
+        self.attempt_resolved = 0
         self.retries = 0
         self.errors = []
         self.commit_start = None
@@ -86,6 +91,7 @@ class _Context:
         self.aborts = 0
         self.resolved = 0
         self.resolve_failed = 0
+        self.resolve_reasons = []
         self.resolve_seconds = 0.0
         self.cpu_start = time.thread_time()
 
@@ -110,6 +116,7 @@ def _on_event(event):
     name = type(event).__name__
     if name == "PubStart":
         context.attempts += 1
+        context.attempt_resolved = context.resolved
         context.commit_start = None
     elif name == "PubBeforeCommit":
         context.commit_start = time.perf_counter()
@@ -122,7 +129,10 @@ def _on_event(event):
             retry = bool(event.retry)
             if retry:
                 context.retries += 1
-            context.errors.append(_error(exc, retry, context.attempts))
+            error = _error(exc, retry, context.attempts)
+            # The conflicts that this attempt resolved before it failed.
+            error["resolved"] = context.resolved - context.attempt_resolved
+            context.errors.append(error)
 
 
 def _error(exc, retry, attempt):
@@ -188,6 +198,36 @@ def _measure_abort(context, seconds, args, result):
     context.aborts += 1
 
 
+def failure_reason(args):
+    """Return the reason of a failed resolution from the arguments of the
+    debug message of ZODB's resolver: the class of the object, then the
+    message of its error without the positions of a BTrees error."""
+    klass, error, message = args
+    name = getattr(klass, "__name__", str(klass))
+    if error == "BTreesConflictError" and ": " in message:
+        message = message.split(": ", 1)[1]
+    return f"{name}: {error}: {message}"
+
+
+class _ResolverLogger:
+    """Stand in for the logger of `ZODB.ConflictResolution`. Its debug
+    message tells why a resolution failed: the logger keeps the reason
+    for the thread and drops the message. Every other call goes to the
+    real logger."""
+
+    def __init__(self, logger):
+        self._logger = logger
+
+    def debug(self, message, *args, **kwargs):
+        if len(args) == 3:
+            _local.reason = failure_reason(args)
+        else:
+            self._logger.debug(message, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
 def _install_resolution():
     """Count the conflicts that ZODB's resolver runs in this process."""
     from ZODB import ConflictResolution
@@ -196,15 +236,19 @@ def _install_resolution():
     original = cls.tryToResolveConflict
     if getattr(original, "plonebench", False):
         return
+    ConflictResolution.logger = _ResolverLogger(ConflictResolution.logger)
 
     def tryToResolveConflict(self, *args, **kwargs):
         context = _context()
         start = time.perf_counter()
+        _local.reason = None
         try:
             result = original(self, *args, **kwargs)
         except Exception:
+            reason = getattr(_local, "reason", None) or "unexpected error"
             if context is not None:
                 context.resolve_failed += 1
+                context.resolve_reasons.append(reason)
                 context.resolve_seconds += time.perf_counter() - start
             else:
                 _count_outside("resolve_failed")
@@ -361,6 +405,7 @@ class ProbeMiddleware:
                 "aborts": context.aborts,
                 "resolved": context.resolved,
                 "resolve_failed": context.resolve_failed,
+                "resolve_reasons": context.resolve_reasons,
                 "resolve_seconds": context.resolve_seconds,
             }
         )

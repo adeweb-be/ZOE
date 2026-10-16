@@ -1,7 +1,9 @@
 """The accounting of a run: percentiles, attempts, conflicts, windows,
 server counters and samples."""
 
+import importlib.util
 import json
+from pathlib import Path
 
 from plonebench import analysis, sampler, servers
 from plonebench.ledger import FAILED, OK, Ledger, Record, read
@@ -77,6 +79,36 @@ def test_first_attempt_and_eventual_success_are_apart():
     assert server["exhausted"] == 1
     assert server["retried_requests"] == 2
     assert server["conflict_classes"] == {"BTrees.IOBTree.IOBucket": 5}
+
+
+def test_resolution_failure_reasons():
+    path = Path(analysis.__file__).parent / "probe" / "plonebench_probe.py"
+    spec = importlib.util.spec_from_file_location("plonebench_probe", path)
+    probe_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe_module)
+
+    class OOBucket:
+        pass
+
+    bucket = probe_module.failure_reason(
+        (
+            OOBucket,
+            "BTreesConflictError",
+            "BTrees conflict error at 3/-1/2: Conflicting inserts",
+        )
+    )
+    assert bucket == "OOBucket: BTreesConflictError: Conflicting inserts"
+    plain = probe_module.failure_reason(("n/a", "ConflictError", "database conflict"))
+    assert plain == "n/a: ConflictError: database conflict"
+    totals = analysis.server_totals(
+        [
+            probe("a", resolve_failed=2, resolve_reasons=[bucket, bucket]),
+            probe("b", resolve_failed=1, resolve_reasons=[plain]),
+            probe("c"),
+        ]
+    )
+    assert totals["resolve_failed"] == 3
+    assert totals["resolve_reasons"] == {bucket: 2, plain: 1}
 
 
 def test_steps_trim_their_start():

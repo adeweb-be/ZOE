@@ -36,6 +36,7 @@ def settings_of(args) -> stack.Settings:
         locust_cpus=args.locust_cpus,
         probe=not args.no_probe,
         zeo_fsync=args.zeo_fsync,
+        zoe_cache_size=args.zoe_cache_size,
     )
 
 
@@ -61,6 +62,12 @@ def add_settings(parser: argparse.ArgumentParser) -> None:
         default=defaults.zeo_fsync,
         help="macOS: the ZEO server syncs with F_FULLFSYNC (full, as zoe serve "
         "does) or with stock fsync(2) (plain)",
+    )
+    parser.add_argument(
+        "--zoe-cache-size",
+        default=defaults.zoe_cache_size,
+        help="the --cache-size of zoe serve, such as 128MB; by default the "
+        "server keeps the default of the store",
     )
 
 
