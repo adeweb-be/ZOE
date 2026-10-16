@@ -31,7 +31,8 @@ test = false
 doc = false
 bench = false
 
-# A server on a new store, and one connection over TCP for each input.
+# A server on a new store, and one connection over a unix domain socket
+# for each input.
 [[bin]]
 name = "handshake"
 path = "fuzz_targets/handshake.rs"

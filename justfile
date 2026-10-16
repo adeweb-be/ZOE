@@ -58,7 +58,9 @@ tsan crate="zoe-core" filter="":
     export RUSTC_BOOTSTRAP=1
     export RUSTFLAGS="-Zsanitizer=thread"
     export RUSTDOCFLAGS="-Zsanitizer=thread"
-    tsan=(cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+    # The sanitizer needs an explicit target. Use the target of the host.
+    triple="$(rustc -vV | sed -n 's/^host: //p')"
+    tsan=(cargo test -Zbuild-std --target "$triple" \
         --target-dir target/tsan --locked)
     if [ "{{crate}}" = zoe-core ]; then
         run=("${tsan[@]}" -p zoe-core -- "{{filter}}")
@@ -86,9 +88,12 @@ tsan crate="zoe-core" filter="":
         echo "just tsan: the canary test exited clean, so ThreadSanitizer is off." >&2
         exit 1
     fi
-    # The stack of the report must name the canary test.
+    # The stack of the report must name the canary test. Linux gives the
+    # name demangled. macOS gives the v0 symbol of Rust.
+    canary='tsan_canary::a_deliberate_data_race_is_reported'
+    canary="$canary|11tsan_canary(s[0-9A-Za-z]*_)?34a_deliberate_data_race_is_reported"
     if ! grep -q -s 'SUMMARY: ThreadSanitizer: data race' "$tmp"/* \
-        || ! grep -q -s 'tsan_canary::a_deliberate_data_race_is_reported' "$tmp"/*; then
+        || ! grep -q -s -E "$canary" "$tmp"/*; then
         cat "$tmp"/*
         echo "just tsan: ThreadSanitizer did not report the race of the canary test." >&2
         exit 1
@@ -110,18 +115,25 @@ fuzz seconds="60" *targets="frame handshake":
     # The flags of `cargo fuzz build`, so cargo-fuzz itself is not needed:
     # the coverage that libFuzzer reads, AddressSanitizer, debug assertions
     # and the cfg fuzzing. RUSTC_BOOTSTRAP lets the pinned stable toolchain
-    # accept the unstable flags, as in `just tsan`. The explicit target
-    # keeps the flags off the build scripts and the proc macros.
+    # accept the unstable flags, as in `just tsan`. The explicit target, the
+    # target of the host, keeps the flags off the build scripts and the proc
+    # macros.
+    triple="$(rustc -vV | sed -n 's/^host: //p')"
+    # The depth of the stack needs the symbol __sancov_lowest_stack.
+    # libFuzzer does not give it on macOS, so the flag is for Linux only.
+    depth=""
+    case "$triple" in
+        *-linux-*) depth="-Cllvm-args=-sanitizer-coverage-stack-depth" ;;
+    esac
     export RUSTC_BOOTSTRAP=1
     export RUSTFLAGS="-Cpasses=sancov-module \
         -Cllvm-args=-sanitizer-coverage-level=4 \
         -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
         -Cllvm-args=-sanitizer-coverage-pc-table \
         -Cllvm-args=-sanitizer-coverage-trace-compares \
-        -Cllvm-args=-sanitizer-coverage-stack-depth \
+        $depth \
         -Cllvm-args=-simplifycfg-branch-fold-threshold=0 \
         --cfg fuzzing -Zsanitizer=address -Cdebug-assertions -Ccodegen-units=1"
-    triple=x86_64-unknown-linux-gnu
     cargo build --manifest-path "$fuzz/Cargo.toml" --release --locked \
         --target "$triple" --target-dir "$out/build" \
         --config 'profile.release.debug="line-tables-only"'
@@ -143,7 +155,7 @@ fuzz seconds="60" *targets="frame handshake":
             # closes, so its stderr goes away. The message of a panic goes
             # away too: to see it, run the target on the crash file without
             # -close_fd_mask, as
-            # `target/fuzz/build/x86_64-unknown-linux-gnu/release/handshake
+            # `target/fuzz/build/<host target>/release/handshake
             # target/fuzz/artifacts/handshake/crash-...`. The threads of the
             # server free memory after the end of an input, so libFuzzer
             # would look for a leak after nearly each input, and run 20

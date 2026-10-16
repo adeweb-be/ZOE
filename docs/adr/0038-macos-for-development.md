@@ -20,7 +20,9 @@ A developer on a Mac with Apple silicon could then not edit, check or test the p
 
 ## Consequences
 
-- `just check`, the Rust tests, the Python tests and the benchmarks run on macOS, and their results count. `just tsan`, `just fuzz`, `just release` and the profiles `profiling` and `loupe` still need Linux.
+- `just check`, the Rust tests, the Python tests, the benchmarks, `just tsan` and `just fuzz` run on macOS, and their results count. `just tsan` and `just fuzz` build for the target of the host. `just release binary` builds the static Linux binary and needs Linux, and so do the profiles `profiling` and `loupe`. `just release` builds in the Linux containers of Dagger.
+- On macOS, libFuzzer does not give the symbol `__sancov_lowest_stack`, so `just fuzz` traces the depth of the stack on Linux only. A ThreadSanitizer report on macOS names the functions by their v0 symbols, so `just tsan` finds the canary test by its name or by its symbol.
+- The fuzz target `handshake` connects to its server over a unix domain socket. Over TCP, each closed connection keeps its port for 30 seconds on macOS, and a run of 30 seconds uses more connections than the 16,384 ports of macOS.
 - A run on macOS does not run the tests that are Linux only. CI runs on Linux and runs them.
 - The release builds for macOS (the wheels, the server binary and the Loupe packages) come in the later phase of N11, with Windows.
 - New code that calls an interface of Linux only gives a fallback for macOS, or runs on Linux only, behind `cfg(target_os = "linux")`.
