@@ -1,0 +1,44 @@
+# The Plone end-to-end benchmark (B5 of the specification): Locust against a
+# synthetic Plone site, on ZEO 6 and on zoe serve. It is not a package that
+# the project ships, so it is not a member of the uv workspace in python/.
+# The Plone instances come from the buildout scenarios of plone/; this
+# environment holds only the load generator, the runner and the report.
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "zoe-plonebench"
+version = "0.0.0"
+description = "Runs Locust workloads against a synthetic Plone site on ZEO and on zoe serve, and reports work, latency, conflicts and correctness."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "locust==2.46.7",
+    # The runner reads server_status of both servers through a stock client.
+    "ZEO>=6",
+    "msgpack>=1",
+    # The sampler reads the machine CPU and the disk counters on macOS.
+    "psutil>=7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+]
+
+[tool.uv.build-backend]
+module-name = "plonebench"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The scripts of inzope/ run inside Zope, which gives them `app`.
+"src/plonebench/inzope/*.py" = ["F821"]
