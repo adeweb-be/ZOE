@@ -232,6 +232,7 @@ def summarize(results: list[dict]) -> dict:
                 r.get("probe", {}).get("zeoserver_resolution", {}).get("resolved")
                 for r in group
             ],
+            "resolution": [_resolution(r) for r in group],
             "fsync_batch_mean": [
                 (h["sum"] / h["count"])
                 if (h := s.get("histograms", {}).get("zoe_fsync_batch_size"))
@@ -241,6 +242,32 @@ def summarize(results: list[dict]) -> dict:
             ],
         }
     return summary
+
+
+def _resolution(result: dict) -> dict:
+    """The conflict resolutions of a run in the instances and in the ZEO
+    server: how many, how many a failed attempt or vote lost, and the
+    reasons of the failures. A counter that the probes of the run did not
+    keep is None."""
+    probe = result.get("probe", {})
+    client = probe.get("server_totals", {})
+    zeoserver = probe.get("zeoserver_resolution", {})
+    resolved = client.get("resolved", 0) + zeoserver.get("resolved", 0)
+    has_lost = "resolved_in_failed_attempts" in client or (
+        "resolved_in_failed_votes" in zeoserver
+    )
+    lost = client.get("resolved_in_failed_attempts", 0) + zeoserver.get(
+        "resolved_in_failed_votes", 0
+    )
+    has_reasons = "resolve_reasons" in client or "resolve_reasons" in zeoserver
+    reasons = _merge(
+        [client.get("resolve_reasons", {}), zeoserver.get("resolve_reasons", {})]
+    )
+    return {
+        "resolved": resolved,
+        "lost": lost if has_lost else None,
+        "reasons": reasons if has_reasons else None,
+    }
 
 
 def _merge(dicts):
@@ -363,6 +390,19 @@ def build(runs: list[Path]) -> tuple[str, dict]:
                 f"{row['zeoserver_resolved']}, mean fsync batch "
                 f"{[_num(x) for x in row['fsync_batch_mean']]}"
             )
+        for row in rows:
+            for resolution in row["resolution"]:
+                if resolution["lost"] is None and resolution["reasons"] is None:
+                    continue
+                reasons = "; ".join(
+                    f"{k} {v}"
+                    for k, v in list((resolution["reasons"] or {}).items())[:5]
+                )
+                lines.append(
+                    f"- {row['stack']}: resolved {resolution['resolved']}, lost in "
+                    f"failed attempts or votes {resolution['lost']}; failed "
+                    f"resolutions: {reasons or 'none'}"
+                )
         lines.append("")
     return "\n".join(lines) + "\n", summary
 

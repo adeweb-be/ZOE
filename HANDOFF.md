@@ -2,12 +2,12 @@
 
 | | |
 | --- | --- |
-| Branch | `claude/plone-zeo-zoe-locust-benchmark-pvkgea`, pushed. No pull request yet. |
-| Base | `main` at `c0db22b` (ZOE-192), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
-| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main`; `c50c71d` the port of the harness to macOS (section 4.4); `ee42ff8` the macOS series and the warmup fix; then steps 2–6 on macOS (section 3.2). |
+| Branch | `claude/plone-zeo-zoe-locust-benchmark-pvkgea`. No pull request yet. |
+| Base | `main` at `1180b2f` (ZOE-194), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
+| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main`; `c50c71d` the port of the harness to macOS (section 4.4); `ee42ff8` the macOS series and the warmup fix; then steps 2–6 on macOS (section 3.2); the merge of `main` at `1180b2f`; `3f9e4cd` the reasons of failed resolutions, the lost resolutions and `--zoe-cache-size`; then steps 7–9 (section 3.3). |
 | Card | None: the work came as a direct request. When a card exists, move this file to `docs/handoffs/<card>.md`, as `CLAUDE.md` asks, and name the card in the commits of the follow-up. |
-| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so steps 1–6 of section 5 are done there (sections 3.1 and 3.2). The source of the 5–13× disk bytes is measured (section 4.6). Nothing runs now. |
-| Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the interim results); then this file. |
+| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so steps 1–9 of section 5 are done there (sections 3.1–3.3), and the finding is final for this series. Left: the Linux steps, the follow-up experiments of the ranked table, and the pull request when the human asks (section 5). Nothing runs now. |
+| Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the results); then this file. |
 
 ---
 
@@ -212,6 +212,20 @@ Runs: the lists `macos-contention.txt` (16), `macos-background.txt`, `macos-cold
 - `mixed-background`, cold start, probe on and off: no difference that one repetition can show. The probe costs under 1 %. The cold start costs about 10 % of rate in the first 10 s only, on both stacks.
 - Sustained `create-spread`, 8 users × 600 s: ZOE 5.6 against 5.1 ok/s; both drift down 15–25 % as the site grows. `zoe serve` wrote 19 GB against 2.7 GB, fsync batch still 1.0, and its RSS grew to 1.07 GB at about 100 MB a minute (ZEO server: 82 MB). The redb cache defaults to 1 GiB and `zoe serve` does not set it: probable cause, not proven. The native client instances hold about 150 MB more (their 128 MB cache is in memory).
 
+### 3.3 The macOS series, steps 7–9
+
+Runs: the lists `macos-reasons.txt` (4, small, with `--keep-store`), `macos-medium.txt` (6), `macos-medium-cold.txt` (2), `macos-waste.txt` (2) and `macos-rss.txt` (1) under `target/bench/plone/campaigns/`, not in git; all `verification pass`. Fixture `medium-8ecaa36fc3c4` (`just bench plone prepare --preset medium`: 4,865 objects, built in a few minutes on macOS). The report is `docs/findings/plone-end-to-end/macos-final-report.md`; the finding says what it shows (items 21–29). In short:
+
+- Medium site: reads and saves at parity; the cold start of ZOE is 10 s against 30 s on ZEO (one repetition).
+- The conflicts of saves are `IOBucket: Conflicting changes` in `SearchableText._wordinfo` and `Description._wordinfo`: the postings of a word of 10 documents or fewer are a `dict` inside the bucket, and BTrees cannot merge two changed dicts. The harness rewrites the whole title and description at each save: an upper bound.
+- Nearly every resolution in `edit` and `create-spread` happens in an attempt that fails after it, on both stacks. A client resolution costs 0.7 ms on ZOE against 0.11 ms in the ZEO server; the native client gives ZODB no committed data, so it loads two states with `loadSerial` (probable cause, not measured).
+- The `ReadConflictError`s come from `zoe serve` (all three ZOE stacks), and replace write conflicts: the vote checks the read-current oids before the client resolves.
+- The fsync batch stays 1.0 because every save writes the same 11 or more `BTrees.Length` objects, and their exclusive locks hold from the vote to the sync.
+- The replay of real commits (`wamp` with the oid sets of the kept ZEO stores): 658 KB of redb pages per save (6.1× the pickles), 822 KB per creation.
+- With `--zoe-cache-size 128MB` the RSS of `zoe serve` stays at 231 MB, at the same rate: the 1 GB of the default run was the page cache.
+
+The scripts of the investigations are in `target/bench/plone/tools/` (not in git): `txn_oids.py` (the oids of each transaction of a kept `Data.fs` in the measured window; run with the interpreter of the zeo scenario), `mapruns.sh` (the conflict oids of runs, named by `inzope/oidmap.py` on a copy of the kept ZEO store), `buckets.py` and `words.py` (the value types and the words of the conflicting `_wordinfo` buckets), `conflicts.py` (write and read conflicts, resolutions and reasons per run). `wamp` takes a fourth argument, a file of oid sets that `txn_oids.py` writes. `wamp/Cargo.toml` has an empty `[workspace]` table, so it builds outside the workspace.
+
 ## 4. Things learned the hard way
 
 ### 4.1 The hex token bias (fixed in `2ef5560`, data not yet redone)
@@ -287,7 +301,14 @@ A throwaway program replays commits on a copy of the fixture store through a `Vf
 - The key of a record is the oid, then the tid (`format::record_key`). So the objects of one commit lie at the places of their oids, and a Plone save touches about 80 objects spread over the catalog.
 - Anything that changes this (a key order, a log in front of the B-tree) is a format change: `crates/zoe-core/src/format/` is a red zone. This is a finding, not a card.
 
+### 4.7 A worktree, and the report
+
+- The harness finds the Plone instances and its work directory under `target/` of the checkout (`stack.PLONE`, `stack.WORK`). In a git worktree, `target/plone` and `target/bench` can be symbolic links to those of the main checkout, so the instances, the fixtures and the runs are shared; `cargo build` still builds `zoe` in the `target/release` of the worktree. The result paths then name the worktree.
+- `just bench plone report` pools the runs of one scenario and stack as repetitions. Runs of one scenario with other `--steps` make it fail with an `IndexError` in `pooled_latency`: report each group of runs on its own.
+
 ## 5. Next steps, in order
+
+On macOS, steps 1–9 are done (sections 3.1–3.3). What is left: the Linux steps, if a Linux machine runs this again (as a series of its own); the experiments of the ranked table of the finding; step 10.
 
 The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, steps 1–6 are done (sections 3.1 and 3.2). Step 8 has not run on either machine. Run it on macOS with `--zeo-fsync full` (the default), so it joins the macOS series.
 
