@@ -1623,12 +1623,15 @@ impl Transaction {
     /// vote passed.
     ///
     /// The first vote is `vote_resolving` of the core. It takes the locks
-    /// once, in oid order. A stale written oid that the client can resolve
-    /// does not fail it: the reply lists the oid, and the transaction keeps
-    /// its locks. The client resolves each conflict, stores the resolved
-    /// pickle over the committed serial and votes again. The second vote
-    /// takes no lock and checks every serial again. The server runs no
-    /// resolution code.
+    /// once, in oid order, and runs tier 1 on each stale oid of a class of
+    /// BTrees or `Length`: the reply gives each oid that tier 1 merged as a
+    /// bare oid, as a ZEO 6 server gives an oid that it resolved, and a
+    /// refusal of tier 1 fails the vote with `ConflictError`. Another stale
+    /// written oid that the client can resolve does not fail it: the reply
+    /// lists the oid, and the transaction keeps its locks. The client
+    /// resolves each conflict, stores the resolved pickle over the
+    /// committed serial and votes again. The second vote takes no lock and
+    /// checks every serial again. No Python runs on the server.
     ///
     /// Before it takes a lock, the first vote waits for each job of the
     /// compression pool of the transaction, and attaches its payload to
@@ -1646,18 +1649,20 @@ impl Transaction {
         let voted = match &mut open.txn {
             Ok(txn) if listed > 0 => txn
                 .vote()
-                .map(|()| Vec::new())
+                .map(|()| Voted::default())
                 .map_err(|error| Fault::of_vote(&error, txn)),
             Ok(txn) => attach(txn, jobs).and_then(|()| vote_resolving(txn)),
             Err(fault) => Err(fault.clone()),
         };
         match voted {
-            Ok(conflicts) => {
+            Ok(Voted { native, conflicts }) => {
                 open.listed = conflicts.len() as u64;
                 // A second vote that passes counts the conflicts that the
                 // client resolved.
                 Stats::add_n(&self.session.storage.stats.conflicts_resolved, listed);
-                Ok(Value::Array(conflicts))
+                let metrics = &self.session.storage.metrics;
+                Stats::add_n(&metrics.conflicts_native, native.len() as u64);
+                Ok(Value::Array(native.into_iter().chain(conflicts).collect()))
             }
             Err(fault) => {
                 self.open = None;
@@ -1850,16 +1855,30 @@ fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
     Ok(())
 }
 
-/// Vote with `vote_resolving` of the core. Return each stale written oid
-/// that the client can resolve, as ZEO 6 lists a conflict in the reply of
-/// `vote`: `{oid, serials: [committed, read], data}`. `data` is the pickle
-/// that the transaction stored. The client loads the two other states
-/// with `loadSerial`.
-fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Vec<Value>, Fault> {
+/// The items of the reply of a vote.
+#[derive(Default)]
+struct Voted {
+    /// The oids that tier 1 merged, each as a bare oid.
+    native: Vec<Value>,
+    /// The conflicts that the client resolves.
+    conflicts: Vec<Value>,
+}
+
+/// Vote with `vote_resolving` of the core. Return each oid that tier 1
+/// merged, and each stale written oid that the client can resolve, as ZEO 6
+/// lists a conflict in the reply of `vote`: `{oid, serials: [committed,
+/// read], data}`. `data` is the pickle that the transaction stored. The
+/// client loads the two other states with `loadSerial`.
+fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Voted, Fault> {
     let conflicts = txn
         .vote_resolving()
         .map_err(|error| Fault::of_vote(&error, txn))?;
-    conflicts
+    let native = txn
+        .natively_resolved()
+        .into_iter()
+        .map(|oid| p64(oid.0))
+        .collect();
+    let conflicts = conflicts
         .into_iter()
         .map(|(oid, committed)| {
             // A staged pickle in the spill file is read from the file, and
@@ -1876,7 +1895,8 @@ fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Vec<Value>, Fault> {
                 (Value::from("data"), Value::Binary(data.into_owned())),
             ]))
         })
-        .collect()
+        .collect::<Result<Vec<_>, Fault>>()?;
+    Ok(Voted { native, conflicts })
 }
 
 /// Add 1 to the metric `counter`.

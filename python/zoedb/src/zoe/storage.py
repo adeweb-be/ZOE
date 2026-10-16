@@ -134,12 +134,15 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     def tpc_vote(self, transaction):
         """Vote on `transaction`, and resolve its conflicts.
 
-        The vote locks the objects of the transaction. Then, for each object
-        that another transaction changed, `tryToResolveConflict` runs the
-        `_p_resolveConflict` method of its class. The vote keeps the locks
-        while the method runs. It stores the resolved state over the
-        committed serial and votes again. Return the oids of the resolved
-        objects.
+        The vote locks the objects of the transaction. The core merges the
+        conflicts of BTree buckets, sets and `Length` in Rust (tier 1), and
+        a refusal of tier 1 raises `ConflictError`. Then, for each other
+        object that another transaction changed, `tryToResolveConflict`
+        runs the `_p_resolveConflict` method of its class. The vote keeps
+        the locks while the method runs. It stores the resolved state over
+        the committed serial and votes again. Return the oids of the
+        resolved objects: those that the core merged, then those that
+        Python resolved.
 
         An object that does not resolve raises `ConflictError`. The error
         names the class of the object. A read-current object is never
@@ -148,8 +151,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         vote aborts the transaction, and that releases the locks.
         """
         conflicts = self._vote_resolving(transaction, self._crs_untransform_record_data)
+        resolved = self._natively_resolved(transaction)
         if not conflicts:
-            return []
+            return resolved
         try:
             for oid, committed, read, committed_data, data in conflicts:
                 data = self._resolve(oid, committed, read, data, committed_data)
@@ -161,7 +165,7 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
             # failed vote, and a second abort does nothing.
             self.tpc_abort(transaction)
             raise
-        return [conflict[0] for conflict in conflicts]
+        return resolved + [conflict[0] for conflict in conflicts]
 
     def _resolve(self, oid, committed, read, data, committed_data):
         """Return the resolved pickle of `oid`, or raise `ConflictError`.

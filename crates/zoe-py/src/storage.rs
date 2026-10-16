@@ -960,6 +960,28 @@ impl Storage {
             .map_err(|failure| failure.into_py(py))
     }
 
+    /// Return the oids that tier 1 of the core merged in the last vote of
+    /// `transaction` that took the locks and passed: the vote stored each
+    /// merged record over the committed serial. An empty list for a
+    /// transaction that this storage does not know, or that ended.
+    #[pyo3(name = "_natively_resolved")]
+    fn natively_resolved<'py>(
+        &self,
+        py: Python<'py>,
+        transaction: &Bound<'py, PyAny>,
+    ) -> Vec<Bound<'py, PyBytes>> {
+        let key = transaction.as_ptr() as usize;
+        // The guard drops at the end of this statement.
+        let entry = self.table().entries.get(&key).cloned();
+        let oids = match entry {
+            Some(entry) => py
+                .detach(|| entry.with(|txn| Ok(txn.natively_resolved())))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        oids.into_iter().map(|oid| p64(py, oid.0)).collect()
+    }
+
     /// Vote on `transaction` as `tpc_vote` does, but keep the locks when
     /// the vote finds conflicts that Python can resolve. An empty list
     /// means that the vote succeeded.

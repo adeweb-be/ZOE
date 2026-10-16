@@ -13,9 +13,9 @@
 //!   calls, and the `tpc_finish` calls that ended a transaction.
 //! - `zoe_fsync_batch_size`: the commits that one sync made durable.
 //! - `zoe_lock_wait_seconds`: the time of each vote to take its locks.
-//! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that a
-//!   second vote passed after the client resolved them (`python`). The
-//!   server resolves no conflict, so `native` stays 0.
+//! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that tier 1
+//!   merged in a vote that passed (`native`), and the oids that a second
+//!   vote passed after the client resolved them (`python`).
 //! - `zoe_conflicts_raised_total`: the transactions that raised a
 //!   conflict: a vote that failed with a conflict, or a transaction that
 //!   ended between the two votes, so that the client raised
@@ -118,6 +118,8 @@ pub(crate) struct Metrics {
     pub(crate) commits: AtomicU64,
     /// The conflicts that reached the client as `ConflictError`.
     pub(crate) conflicts_raised: AtomicU64,
+    /// The oids in conflict that tier 1 merged in a vote that passed.
+    pub(crate) conflicts_native: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -130,6 +132,7 @@ impl Default for Metrics {
             lock_wait: Histogram::new(SECONDS),
             commits: AtomicU64::new(0),
             conflicts_raised: AtomicU64::new(0),
+            conflicts_native: AtomicU64::new(0),
         }
     }
 }
@@ -237,7 +240,8 @@ pub(crate) fn render(storages: &[Exported]) -> String {
     );
     for (storage, labels) in &storages {
         let python = get(&storage.stats.conflicts_resolved);
-        let _ = writeln!(out, "{name}{{{labels},path=\"native\"}} 0");
+        let native = get(&storage.metrics.conflicts_native);
+        let _ = writeln!(out, "{name}{{{labels},path=\"native\"}} {native}");
         let _ = writeln!(out, "{name}{{{labels},path=\"python\"}} {python}");
     }
     scalar(
