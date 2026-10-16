@@ -1,48 +1,38 @@
-"""Acceptance test of the phase 3 gate in the harness.
+"""Acceptance test of the phase 3 gate in the harness: the native gate.
 
-N4 sets the gate of phase 3 (ADR 0037): `zoe serve` through the native
-client at a storage cost of at most a third of the cost of ZEO 6 through
-`ZEO.ClientStorage`, in every zodbshootout cell of the gate set. The cost
-of a storage is its time minus the time of the storage `floor` of the
-harness in the same round. The native client has a cache of its own, so
-`read_hot` counts in every size. The harness gets two storages:
+N4 sets the gate of phase 3 (ADR 0039): `zoe serve` through the native
+client (`zoe-native`) is faster than ZEO 6 through `ZEO.ClientStorage`
+(`zeo`) in every cell of the gate set. The gate set is the 5 scenarios of
+zodbshootout in 3 shapes (threads 1, threads 16, processes 16), at 1 KB and
+at 100 KB: 30 cells. A transaction holds 100 objects at 1 KB and 10 at
+100 KB.
 
-- `zoe-native`: `zoe serve`, started as for `zoe-server`, opened through
-  `<zoeclient>` with the native inside (the key `native true`);
-- `relstorage-hf`: RelStorage with `keep-history false` on the same
-  PostgreSQL as `relstorage`, and otherwise the same section.
+`shootout.native` drives both storages itself. For each cell, each storage
+gets one server, one populate and one set of worker processes. A scenario
+runs in pairs of batches, one batch of each storage, and the first storage
+changes from one pair to the next. The ratio of a pair is `t_zeo / t_zoe`,
+where `t` is the time of the slowest worker for one transaction. After at
+least 10 pairs, a scenario passes when the 99 % confidence interval of the
+mean of the log of the ratios is above 0, and fails when it is below 0. It
+stops at its first verdict, at 100 pairs or after 10 s of pairs. A scenario
+without a verdict is undecided and fails the gate.
 
-`python -m shootout gate --storage zoe-native --baseline zeo DIR` reads the
-gate set and checks a ratio of the costs of 3 when no `--ratio` is given:
-the median over the rounds of `(t_zeo - t_floor) / (t_zoe - t_floor)`. It
-counts every cell. With `--storage zoe-server`, the gate keeps the parity
-rules: a ratio of ops/s of 1 by default, and `read_hot` left out in every
-size.
+`python -m shootout native report FILE` prints the rows of a result and
+the verdict: 0 when every cell passes, 1 when a cell is slower, undecided
+or missing, 2 when the file is not a result of the gate.
 
-Each scenario entry of a result has a list `workers`: one item per worker
-process that ran the cell, at least one per cell. Each item records
-`gil_enabled`, whether the GIL was on at the end of the worker
-(`sys._is_gil_enabled()`), and `gil_enabled_by`, the modules that turned
-it back on. The schema accepts the list and does not require
-it.
+The harness keeps two storages for the full set of zodbshootout:
+`zoe-native` (`<zoeclient>` with `native true`) and `relstorage-hf`
+(RelStorage with `keep-history false`). `shootout.check_cold_loads` fails
+a `read_cold` of `zoe-native` that the server did not load. Each worker
+process records its GIL.
 
-`shootout.check_cold_loads(storage, objects_read, server_loads)` fails the
-run of `zoe-native` with `RuntimeError` when the server counted fewer loads
-(`zoe_loads_total` on the admin port, before and after the `read_cold`
-loops) than the objects that the loops read. A cache that `_cache.clear()`
-does not empty would turn `read_cold` into a cache read.
-
-The gate tests write synthetic gate results that are valid for the schema,
-with 7 rounds in each cell of the gate set: threads 1 and 16 and
-processes 16, at 1 KB and at 100 KB. The test of
-the GIL record runs a tiny profile of `zeo` in place of the quick set. No
-test needs the native client itself.
-
-`just bench test` runs it.
+The rule and report tests use synthetic pairs. One test runs a tiny gate
+end to end against both servers. `just bench test` runs it.
 """
 
-import datetime
 import json
+import math
 import pathlib
 import socket
 import subprocess
@@ -53,29 +43,15 @@ import jsonschema
 import pytest
 
 import shootout
-from shootout import KB, Cell, Profile, run
+from shootout import KB, Cell, Profile, native, run
 from shootout.storages import STORAGES, zconfig
 
 BENCH = pathlib.Path(__file__).parents[2]
-SCHEMA_PATH = BENCH / "schema" / "results.schema.json"
 README = BENCH / "README.md"
+RESULTS_SCHEMA = BENCH / "schema" / "results.schema.json"
 TIMEOUT = 30
 SCENARIOS = ("add", "update", "read_cold", "read_warm", "read_hot")
-# The cells of the gate set: the gate counts each of them.
-CELLS = (
-    ("threads", 1, KB),
-    ("threads", 16, KB),
-    ("processes", 16, KB),
-    ("threads", 1, 100 * KB),
-    ("threads", 16, 100 * KB),
-    ("processes", 16, 100 * KB),
-)
-# The time of a transaction of each storage in every round. The cost of
-# zoe-native above the floor is a third of the cost of ZEO.
-ZEO = dict.fromkeys(SCENARIOS, 1.0)
-FLOOR = dict.fromkeys(SCENARIOS, 0.25)
-THREE_TIMES = dict.fromkeys(SCENARIOS, 0.5)
-ROUNDS = 7
+SHAPES = (("threads", 1), ("threads", 16), ("processes", 16))
 # The key of `<zoeclient>` that selects the native inside.
 NATIVE = "native true"
 TINY = Profile(
@@ -87,47 +63,52 @@ TINY = Profile(
 
 @pytest.fixture(scope="module")
 def schema():
-    return json.loads(SCHEMA_PATH.read_text())
+    return json.loads(native.SCHEMA.read_text())
 
 
-@pytest.fixture
-def tiny(monkeypatch):
-    monkeypatch.setattr(shootout, "QUICK", TINY)
+def spread(ratio, n):
+    """Return n ratios around ratio, alternately 5 % above and below."""
+    return [ratio * (1.05 if k % 2 else 1 / 1.05) for k in range(n)]
 
 
-def cost(ratio):
-    """Return the time of zoe-native whose cost ratio to ZEO is ratio."""
-    return FLOOR["add"] + (ZEO["add"] - FLOOR["add"]) / ratio
-
-
-def result_of(storage, seconds):
-    """Return a gate result of storage, with seconds[name] in each round.
-
-    A scenario that is not a key of seconds has no cell in the result.
-    """
-    scenarios = [
+def pairs_of(ratios):
+    """Return the pairs whose ratios t_zeo / t_zoe are ratios."""
+    return [
         {
-            "name": name,
-            "mode": mode,
-            "concurrency": concurrency,
-            "object_size": size,
-            "objects_per_transaction": 100,
-            "samples": ROUNDS,
-            "ops_per_second": concurrency * 100 / seconds[name],
-            "mean_seconds": seconds[name],
-            "p50_seconds": seconds[name],
-            "p99_seconds": seconds[name],
-            "values": [
-                {"round": number, "seconds": seconds[name]} for number in range(ROUNDS)
-            ],
+            "first": native.order(k)[0],
+            "seconds": {"zeo": 0.01 * r, "zoe-native": 0.01},
         }
-        for name in SCENARIOS
-        if name in seconds
-        for mode, concurrency, size in CELLS
+        for k, r in enumerate(ratios)
     ]
+
+
+def result_of(ratios_of):
+    """Return a result of the gate with the pairs of ratios_of(cell, scenario).
+
+    A scenario for which ratios_of gives None has no entry.
+    """
+    cells = []
+    for cell in native.CELLS:
+        scenarios = [
+            {"name": name, "pairs": pairs_of(r)}
+            for name in SCENARIOS
+            if (r := ratios_of(cell, name)) is not None
+        ]
+        if not scenarios:
+            continue
+        workers = [{"gil_enabled": True, "gil_enabled_by": []}]
+        cells.append(
+            {
+                "mode": cell.mode,
+                "concurrency": cell.concurrency,
+                "object_size": cell.object_size,
+                "objects_per_transaction": cell.objects,
+                "workers": {"zeo": workers, "zoe-native": workers},
+                "scenarios": scenarios,
+            }
+        )
     return {
         "schema_version": 1,
-        "storage": storage,
         "machine": {
             "name": "reference",
             "cpu": "synthetic",
@@ -140,82 +121,184 @@ def result_of(storage, seconds):
         },
         "python": {
             "implementation": "cpython",
-            "version": "3.13.0",
-            "free_threaded": False,
+            "version": "3.14.0",
+            "free_threaded": True,
             "compiler": "gcc",
         },
-        "software": {"zodbshootout": "0", "ZODB": "6"},
-        "run": {
-            "quick": False,
-            "set": "gate",
-            "started": STARTED,
-            "commit": "0" * 12,
-        },
-        "scenarios": scenarios,
+        "software": {"ZEO": "6", "zoedb": "0", "zoe": "0"},
+        "run": {"started": "2026-01-01T00:00:00Z", "commit": "0" * 12, "seconds": 60},
+        "rule": {"min_pairs": 10, "max_pairs": 100, "max_seconds": 10, "level": 0.99},
+        "cells": cells,
     }
 
 
-# One start for the results of one gate run: it pairs their rounds.
-STARTED = datetime.datetime.now(datetime.UTC).isoformat()
-
-
-def write_result(directory, storage, seconds, schema):
-    result = result_of(storage, seconds)
+def report(tmp_path, result, schema):
     jsonschema.validate(result, schema)
-    path = directory / "gate" / "reference" / "cp313" / storage / "run.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "result.json"
     path.write_text(json.dumps(result))
-
-
-def gate(directory, storage):
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "shootout",
-            "gate",
-            "--storage",
-            storage,
-            "--baseline",
-            "zeo",
-            str(directory),
-        ],
+        [sys.executable, "-m", "shootout", "native", "report", str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
 
 
-def output(result):
-    return result.stdout + result.stderr
+def rows(done, verdict):
+    return [line for line in done.stdout.splitlines() if line.endswith(verdict)]
 
 
-def rows(result, scenario=None, size=None):
-    """Return the lines of the report that give a cell of scenario at size.
+def test_the_gate_set_is_30_cells():
+    assert native.SCENARIOS == SCENARIOS
+    assert {(c.mode, c.concurrency) for c in native.CELLS} == set(SHAPES)
+    assert {c.object_size for c in native.CELLS} == {KB, 100 * KB}
+    assert len(native.CELLS) * len(native.SCENARIOS) == 30
+    assert {c.object_size: c.objects for c in native.CELLS} == {KB: 100, 100 * KB: 10}
 
-    Without scenario, return the lines of every scenario. Without size,
-    return the lines of every size.
-    """
-    return [
-        line
-        for line in result.stdout.splitlines()
-        if line.split()[:1] in ([[scenario]] if scenario else [[s] for s in SCENARIOS])
-        and line.split()[1:2] in (["threads"], ["processes"])
-        and size in (None, int(line.split()[3]))
+
+def test_the_rule_is_a_constant_of_the_gate():
+    assert native.MIN_PAIRS == 10
+    assert native.MAX_PAIRS == 100
+    assert native.MAX_SECONDS == 10
+    assert native.LEVEL == 0.99
+    assert native.PAIR == ("zeo", "zoe-native")
+
+
+def test_the_first_storage_changes_from_one_pair_to_the_next():
+    assert [native.order(k) for k in range(4)] == [
+        ("zeo", "zoe-native"),
+        ("zoe-native", "zeo"),
+        ("zeo", "zoe-native"),
+        ("zoe-native", "zeo"),
     ]
 
 
-def failed(result):
-    return [line for line in result.stdout.splitlines() if "FAIL" in line]
+def test_a_faster_storage_passes_and_a_slower_one_fails():
+    faster = native.decide(spread(1.2, 10))
+    assert faster.verdict == "pass"
+    assert faster.low > 1
+    assert math.isclose(faster.ratio, 1.2, rel_tol=0.01)
+    slower = native.decide(spread(0.8, 10))
+    assert slower.verdict == "fail"
+    assert slower.high < 1
+
+
+def test_no_verdict_before_the_minimum_of_pairs():
+    assert native.decide(spread(3.0, 9)).verdict is None
+    assert native.decide(spread(3.0, 10)).verdict == "pass"
+
+
+def test_a_tie_gives_no_verdict():
+    assert native.decide(spread(1.0, 100)).verdict is None
+    # A noisy ratio near 1 gives none either.
+    assert native.decide(spread(1.01, 10)).verdict is None
+
+
+def test_the_interval_is_the_t_interval_at_99_percent():
+    # The quantile 0.995 of Student's t with 9 degrees of freedom is 3.2498.
+    assert math.isclose(native._t_quantile(0.995, 9), 3.2498, rel_tol=1e-3)
+    assert math.isclose(native._t_quantile(0.995, 99), 2.6264, rel_tol=1e-3)
+
+
+def test_the_gate_passes_when_every_cell_passes(tmp_path, schema):
+    done = report(tmp_path, result_of(lambda c, s: spread(1.5, 10)), schema)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(rows(done, "pass")) == 30
+    last = done.stdout.splitlines()[-1]
+    assert last.startswith("gate passed:"), last
+    assert "on cp314t" in last
+    assert last.endswith("30 cells, 0 slower, 0 undecided, 0 missing")
+
+
+def test_a_slower_cell_fails_the_gate(tmp_path, schema):
+    def ratios(cell, scenario):
+        slow = scenario == "read_warm" and cell.concurrency == 1
+        return spread(0.7 if slow else 1.5, 10)
+
+    done = report(tmp_path, result_of(ratios), schema)
+    assert done.returncode == 1, done.stdout
+    assert [line.split()[:4] for line in rows(done, "FAIL")] == [
+        ["read_warm", "threads", "1", "1024"],
+        ["read_warm", "threads", "1", "102400"],
+    ]
+    assert done.stdout.splitlines()[-1].endswith(
+        "30 cells, 2 slower, 0 undecided, 0 missing"
+    )
+
+
+def test_an_undecided_cell_fails_the_gate(tmp_path, schema):
+    def ratios(cell, scenario):
+        tie = scenario == "update" and cell == native.CELLS[0]
+        return spread(1.0, 100) if tie else spread(1.5, 10)
+
+    done = report(tmp_path, result_of(ratios), schema)
+    assert done.returncode == 1, done.stdout
+    assert len(rows(done, "UNDECIDED")) == 1
+    assert done.stdout.splitlines()[-1].endswith(
+        "30 cells, 0 slower, 1 undecided, 0 missing"
+    )
+
+
+def test_a_missing_cell_fails_the_gate(tmp_path, schema):
+    def ratios(cell, scenario):
+        return None if scenario == "read_hot" else spread(1.5, 10)
+
+    done = report(tmp_path, result_of(ratios), schema)
+    assert done.returncode == 1, done.stdout
+    assert done.stdout.splitlines()[-1].endswith(
+        "30 cells, 0 slower, 0 undecided, 6 missing"
+    )
+
+
+def test_a_file_that_is_not_a_result_is_refused(tmp_path):
+    path = tmp_path / "other.json"
+    path.write_text(json.dumps({"schema_version": 1}))
+    done = subprocess.run(
+        [sys.executable, "-m", "shootout", "native", "report", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+
+
+def test_a_tiny_gate_runs_end_to_end(tmp_path, schema, monkeypatch):
+    monkeypatch.setattr(native, "MIN_PAIRS", 2)
+    monkeypatch.setattr(native, "MAX_PAIRS", 3)
+    cells = [native.Cell("threads", 2, KB), native.Cell("processes", 2, KB)]
+    out = tmp_path / "out.txt"
+    with out.open("w") as stream:
+        result = native.run(cells=cells, workdir=tmp_path / "work", out=stream)
+    jsonschema.validate(result, schema)
+    assert result["rule"]["min_pairs"] == 2
+    assert [(c["mode"], c["concurrency"]) for c in result["cells"]] == [
+        ("threads", 2),
+        ("processes", 2),
+    ]
+    for cell in result["cells"]:
+        assert [s["name"] for s in cell["scenarios"]] == list(SCENARIOS)
+        processes = 1 if cell["mode"] == "threads" else 2
+        for name in ("zeo", "zoe-native"):
+            assert len(cell["workers"][name]) == processes, cell["workers"]
+        for scenario in cell["scenarios"]:
+            pairs = scenario["pairs"]
+            assert 2 <= len(pairs) <= 3, scenario
+            assert [p["first"] for p in pairs] == [
+                native.order(k)[0] for k in range(len(pairs))
+            ]
+    # The run prints one row per scenario, and leaves no store behind.
+    assert len(out.read_text().splitlines()) == 1 + 2 * len(SCENARIOS)
+    assert list((tmp_path / "work").iterdir()) == []
 
 
 def test_zoe_native_and_relstorage_hf_are_storages_of_the_harness():
-    native = STORAGES["zoe-native"]
-    assert native.multi_process is True
-    assert native.needs_dsn is False
+    native_storage = STORAGES["zoe-native"]
+    assert native_storage.multi_process is True
+    assert native_storage.needs_dsn is False
     history_free = STORAGES["relstorage-hf"]
     assert history_free.multi_process is True
     assert history_free.needs_dsn is True
+    assert "floor" not in STORAGES
 
 
 def test_the_zconfig_of_zoe_native_opens_zoeclient_with_the_native_inside(tmp_path):
@@ -258,111 +341,10 @@ def test_the_zconfig_of_relstorage_hf_keeps_no_history(tmp_path):
     assert settings(history_free) == settings(history)
 
 
-def test_the_default_ratio_is_three_for_zoe_native_and_parity_for_zoe_server(
-    tmp_path, schema
-):
-    passing = tmp_path / "passing"
-    write_result(passing, "zeo", ZEO, schema)
-    write_result(passing, "floor", FLOOR, schema)
-    write_result(passing, "zoe-native", THREE_TIMES, schema)
-    write_result(passing, "zoe-server", ZEO, schema)
-    result = gate(passing, "zoe-native")
-    assert result.returncode == 0, output(result)
-    result = gate(passing, "zoe-server")
-    assert result.returncode == 0, output(result)
-
-    failing = tmp_path / "failing"
-    write_result(failing, "zeo", ZEO, schema)
-    write_result(failing, "floor", FLOOR, schema)
-    write_result(failing, "zoe-native", dict.fromkeys(SCENARIOS, cost(2.99)), schema)
-    result = gate(failing, "zoe-native")
-    assert result.returncode == 1, output(result)
-    assert "2.99" in result.stdout
-    # Every cell counts, read_hot in both sizes too.
-    assert failed(result) == rows(result)
-    assert len(rows(result)) == len(SCENARIOS) * len(CELLS), result.stdout
-    assert "left out" not in result.stdout
-
-
-def test_read_hot_counts_in_every_size_for_zoe_native_and_stays_left_out_for_zoe_server(
-    tmp_path, schema
-):
-    write_result(tmp_path, "zeo", ZEO, schema)
-    write_result(tmp_path, "floor", FLOOR, schema)
-    write_result(tmp_path, "zoe-native", {**THREE_TIMES, "read_hot": cost(2.9)}, schema)
-    write_result(tmp_path, "zoe-server", {**ZEO, "read_hot": 2.0}, schema)
-
-    native = gate(tmp_path, "zoe-native")
-    assert native.returncode == 1, output(native)
-    assert "2.90" in native.stdout
-    hot = rows(native, "read_hot")
-    assert len(hot) == len(CELLS), native.stdout
-    assert failed(native) == hot, native.stdout
-
-    server = gate(tmp_path, "zoe-server")
-    assert server.returncode == 0, output(server)
-    hot = rows(server, "read_hot")
-    assert len(hot) == len(CELLS), server.stdout
-    for row in hot:
-        assert "left out" in row, row
-        assert "FAIL" not in row, row
-
-
-def test_a_missing_read_hot_cell_fails_zoe_native_only(tmp_path, schema):
-    others = [name for name in SCENARIOS if name != "read_hot"]
-    write_result(tmp_path, "zeo", ZEO, schema)
-    write_result(tmp_path, "floor", FLOOR, schema)
-    write_result(tmp_path, "zoe-native", {n: THREE_TIMES[n] for n in others}, schema)
-    write_result(tmp_path, "zoe-server", {n: ZEO[n] for n in others}, schema)
-
-    native = gate(tmp_path, "zoe-native")
-    assert native.returncode == 1, output(native)
-    hot = rows(native, "read_hot")
-    assert len(hot) == len(CELLS), native.stdout
-    for row in hot:
-        assert "missing" in row, row
-
-    server = gate(tmp_path, "zoe-server")
-    assert server.returncode == 0, output(server)
-
-
-def test_a_cell_without_the_floor_fails_zoe_native(tmp_path, schema):
-    write_result(tmp_path, "zeo", ZEO, schema)
-    write_result(tmp_path, "zoe-native", THREE_TIMES, schema)
-    native = gate(tmp_path, "zoe-native")
-    assert native.returncode == 1, output(native)
-    assert len(rows(native)) == len(SCENARIOS) * len(CELLS), native.stdout
-    for row in rows(native):
-        assert "missing" in row, row
-
-
-def with_workers(result, workers):
-    for scenario in result["scenarios"]:
-        scenario["workers"] = workers
-    return result
-
-
-def test_the_schema_accepts_the_gil_record_of_each_worker(schema):
-    workers = [
-        {"gil_enabled": False, "gil_enabled_by": []},
-        {"gil_enabled": True, "gil_enabled_by": ["psycopg2._psycopg"]},
-    ]
-    jsonschema.validate(with_workers(result_of("zeo", ZEO), workers), schema)
-    # A result without the record stays valid.
-    jsonschema.validate(result_of("zeo", ZEO), schema)
-    for worker in (
-        {"gil_enabled": True},
-        {"gil_enabled_by": []},
-        {"gil_enabled": "yes", "gil_enabled_by": []},
-        {"gil_enabled": True, "gil_enabled_by": "psycopg2._psycopg"},
-    ):
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(with_workers(result_of("zeo", ZEO), [worker]), schema)
-
-
-def test_a_run_records_the_gil_of_each_worker(tiny, schema, tmp_path):
+def test_a_run_of_zodbshootout_records_the_gil_of_each_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(shootout, "QUICK", TINY)
     result = run("zeo", quick=True, workdir=tmp_path / "zeo")
-    jsonschema.validate(result, schema)
+    jsonschema.validate(result, json.loads(RESULTS_SCHEMA.read_text()))
     free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
     for scenario in result["scenarios"]:
         workers = scenario["workers"]
@@ -389,10 +371,9 @@ def test_a_cold_read_from_the_client_cache_fails_the_run():
 
 def test_the_readme_names_the_phase_3_gate():
     text = README.read_text()
-    assert "zoe-native" in text
-    assert "relstorage-hf" in text
     assert "## The gate" in text
     section = text.split("## The gate", 1)[1].split("\n## ", 1)[0]
     assert "phase 3" in section
+    assert "just bench native" in section
     assert "zoe-native" in section
-    assert "read_hot" in section
+    assert "ADR 0039" in section
