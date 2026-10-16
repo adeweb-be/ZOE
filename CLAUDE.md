@@ -79,7 +79,7 @@ Stack the pull requests when you can. When several PRs are open at once, they fo
 - A PR that goes red or waits for the human leaves the train. The PRs after it merge the PR before it instead.
 7. The documenter updates `docs/` after the merge.
 
-Definition of Ready: a requirement id, an acceptance test that fails today, a scope fence, written invariants, a budget, no dependency on an unmerged card.
+Definition of Ready: a requirement id, an acceptance test that fails today, its steps and its checkpoints, a scope fence, written invariants, a budget, no dependency on an unmerged card. A card holds one whole mechanism; `docs/spec/working-methods.md` ("Units of work") says how.
 
 Definition of Done: acceptance test green; unit tests added; the pull-request harness tier green; benchmark numbers posted and inside the regression gate; claims and evidence list what was tested and what was not; reviewer approval; human approval for a red zone; the specification or an ADR updated when behaviour changed.
 
