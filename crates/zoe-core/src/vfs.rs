@@ -286,7 +286,7 @@ impl Vfs for OsVfs {
             .create(true)
             .truncate(false)
             .open(self.dir.join(name))?;
-        OsFile::new(file)
+        OsFile::new(file, true)
     }
 
     fn create_new(&self, name: &str) -> io::Result<Self::File> {
@@ -297,7 +297,7 @@ impl Vfs for OsVfs {
             .write(true)
             .create_new(true)
             .open(self.dir.join(name))?;
-        OsFile::new(file)
+        OsFile::new(file, false)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -482,7 +482,7 @@ const PENDING_MAX: usize = 64 << 20;
 /// sync and the growth below.
 ///
 /// redb writes the pages of a commit one at a time, in the order of its
-/// cache, and then syncs the file. The file holds these writes, and makes
+/// cache, and then syncs the file. A database file holds these writes, and makes
 /// them in the order of their offsets before the sync, each run of
 /// adjacent writes as one write. A read, a change of the length and the
 /// close make them first too, so every call sees every write before it.
@@ -499,6 +499,11 @@ pub struct OsFile {
     /// True while `pending` holds a write. A read checks it without the
     /// mutex.
     has_pending: AtomicBool,
+    /// True for a database file, the file of `Vfs::open`: it holds its
+    /// writes and fills its growth with zeros. Another file, such as a
+    /// spill file of `Vfs::create_new`, makes each write at once and grows
+    /// sparse.
+    database: bool,
 }
 
 #[derive(Debug, Default)]
@@ -508,7 +513,7 @@ struct Pending {
 }
 
 impl OsFile {
-    fn new(file: File) -> io::Result<Self> {
+    fn new(file: File, database: bool) -> io::Result<Self> {
         let clone = file.try_clone()?;
         let backend = redb::backends::FileBackend::new(file).map_err(io::Error::other)?;
         Ok(Self {
@@ -516,6 +521,7 @@ impl OsFile {
             file: clone,
             pending: Mutex::new(Pending::default()),
             has_pending: AtomicBool::new(false),
+            database,
         })
     }
 
@@ -568,8 +574,8 @@ impl redb::StorageBackend for OsFile {
         self.backend.read(offset, out)
     }
 
-    /// Set the length of the file. A growth of at most `ZERO_FILL_MAX`
-    /// bytes gets zeros in its new bytes.
+    /// Set the length of the file. A growth of a database file of at most
+    /// `ZERO_FILL_MAX` bytes gets zeros in its new bytes.
     ///
     /// A write into a hole of a sparse file allocates the blocks of the
     /// hole, and the next sync then writes that metadata too. redb grows
@@ -582,7 +588,7 @@ impl redb::StorageBackend for OsFile {
         self.make_pending()?;
         let old = self.backend.len()?;
         self.backend.set_len(len)?;
-        if len > old && len - old <= ZERO_FILL_MAX {
+        if self.database && len > old && len - old <= ZERO_FILL_MAX {
             let zeros = vec![0; ZERO_CHUNK];
             let mut at = old;
             while at < len {
@@ -600,6 +606,9 @@ impl redb::StorageBackend for OsFile {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if !self.database {
+            return self.backend.write(offset, data);
+        }
         if data.is_empty() {
             return Ok(());
         }
@@ -2042,6 +2051,21 @@ mod tests {
         file.close().unwrap();
         drop(file);
         assert_eq!(&on_disk()[41000..41005], b"close");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_os_file_of_create_new_writes_at_once() {
+        let root = std::env::temp_dir().join(format!("zoe-vfs-spill-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vfs = OsVfs::new(&root).unwrap();
+        let file = vfs.create_new("spill").unwrap();
+        file.set_len(4096).unwrap();
+        file.write(0, b"spilled").unwrap();
+        // The bytes are in the file before any sync: a spill file holds no
+        // write in memory.
+        assert_eq!(&fs::read(vfs.path("spill")).unwrap()[..7], b"spilled");
+        drop(file);
         fs::remove_dir_all(&root).unwrap();
     }
 

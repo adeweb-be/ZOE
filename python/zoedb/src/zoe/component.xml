@@ -242,6 +242,13 @@
         512MB or 1GB. The default is 1GB.
       </description>
     </key>
+    <key name="compression" datatype="string">
+      <description>
+        The compression of the records that each store writes: none,
+        zstd or zstd:LEVEL. The default is zstd at level 3. A store reads
+        every compression.
+      </description>
+    </key>
     <key name="lock-timeout" datatype="string">
       <description>
         The longest time that a vote waits for the lock of an object, in
