@@ -4,9 +4,9 @@
 | --- | --- |
 | Branch | `claude/plone-zeo-zoe-locust-benchmark-pvkgea`, pushed. No pull request yet. |
 | Base | `main` at `c0db22b` (ZOE-192), merged in. The 14 runs of section 3 measured the servers and clients of `0f03dfb` (ZOE-186), on Linux. |
-| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main` and the port of the harness to macOS (section 4.4). |
+| Commits | `40597a7` the harness; `fc435a5` the timeline of the report; `2ef5560` the word codes in titles and `inzope/oidmap.py`; `9b66b29` the interim findings and this file; then the merge of `main`; `c50c71d` the port of the harness to macOS (section 4.4); `ee42ff8` the macOS series and the warmup fix; then steps 2–6 on macOS (section 3.2). |
 | Card | None: the work came as a direct request. When a card exists, move this file to `docs/handoffs/<card>.md`, as `CLAUDE.md` asks, and name the card in the commits of the follow-up. |
-| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so step 1 of section 5 is done there. The source of the 5–13× disk bytes is measured (section 4.6). Nothing runs now. |
+| Status | Harness complete and tested, on Linux and on macOS. One repetition of the primary scenarios on `zeo` and `zoe-native` in two series: Linux (section 3) and macOS (section 3.1), all `verification pass`. The macOS series uses the word codes and the warmup fix (section 4.5), so steps 1–6 of section 5 are done there (sections 3.1 and 3.2). The source of the 5–13× disk bytes is measured (section 4.6). Nothing runs now. |
 | Read first | `bench/README.md`, section "The Plone end-to-end benchmark" (the user manual); `docs/findings/plone-end-to-end.md` (the interim results); then this file. |
 
 ---
@@ -202,6 +202,16 @@ Runs: the lists `target/bench/plone/campaigns/macos-baseline-final.txt` (14 runs
 - `UniqueIdGeneratorTool` conflicts on ZEO only; read conflicts on ZOE in the creation scenarios (42 and 115).
 - Full durability (`F_FULLFSYNC`) costs ZEO about 4 ms per `tpc_finish`, and at most 3 % of rate and p50. The table is in `target/bench/plone/reports/fsync-table.md`.
 
+### 3.2 The macOS series, steps 2–6
+
+Runs: the lists `macos-contention.txt` (16), `macos-background.txt`, `macos-cold.txt`, `macos-probe-on.txt`, `macos-probe-off.txt` and `macos-sustained.txt` (2 each) under `target/bench/plone/campaigns/`, not in git; all `verification pass`. Commit `ee42ff8`, `--zeo-fsync full`. The report is `docs/findings/plone-end-to-end/macos-next-report.md`; the finding says what it shows (items 15–20). In short:
+
+- The native client is what makes ZOE faster: `zoe-native` is 5–14 % ahead of ZEO in the contention scenarios and uses 4–5 ms less Zope CPU per REST write; `zoe-stock` and `zoe-asyncio` (stock ZEO client against `zoe serve`) are about 10 % behind ZEO in the REST scenarios and level in the form scenarios. Stock and asyncio are equal.
+- `contention-fields`: 190–210 `IOBucket` conflicts against 16–37 on the `Document` per stack. The expectation of step 2 holds: a field-level merge of the Document alone would not remove the conflicts. The starving of the title writer was not checked per role.
+- `UniqueIdGeneratorTool` conflicts appear on `zoe-stock` (55), as on ZEO (139): the stock wiring has no `zoe.plone` sequence.
+- `mixed-background`, cold start, probe on and off: no difference that one repetition can show. The probe costs under 1 %. The cold start costs about 10 % of rate in the first 10 s only, on both stacks.
+- Sustained `create-spread`, 8 users × 600 s: ZOE 5.6 against 5.1 ok/s; both drift down 15–25 % as the site grows. `zoe serve` wrote 19 GB against 2.7 GB, fsync batch still 1.0, and its RSS grew to 1.07 GB at about 100 MB a minute (ZEO server: 82 MB). The redb cache defaults to 1 GiB and `zoe serve` does not set it: probable cause, not proven. The native client instances hold about 150 MB more (their 128 MB cache is in memory).
+
 ## 4. Things learned the hard way
 
 ### 4.1 The hex token bias (fixed in `2ef5560`, data not yet redone)
@@ -279,7 +289,7 @@ A throwaway program replays commits on a copy of the fixture store through a `Vf
 
 ## 5. Next steps, in order
 
-The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, step 1 is done (section 3.1). Steps 2–6 and 8 have not run on either machine. Run them on macOS with `--zeo-fsync full` (the default), so they join the macOS series.
+The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choice). The macOS machine has 12 cores and no pinning: its results are a new series. Never pool them or compare them with the Linux runs of section 3. On macOS, steps 1–6 are done (sections 3.1 and 3.2). Step 8 has not run on either machine. Run it on macOS with `--zeo-fsync full` (the default), so it joins the macOS series.
 
 1. **Rerun the write scenarios with the word codes** (≈ 35 min, 8 runs):
    ```sh
@@ -299,7 +309,8 @@ The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choi
 6. **Sustained writes** (≈ 25 min): `--scenarios create-spread --steps 8:600 --warmup 30`, then `--timeline 60`: watch latency drift, server RSS, bytes written, fsync batch, store growth.
 7. **Investigations** (each a short experiment):
    - classify the `_wordinfo` conflicts (same key, split, deletion) on a kept store;
-   - the bytes per commit are explained on macOS (section 4.6). Left: replay the oids of real Plone commits (from a kept store's `txn_oids`) instead of random ones; measure the factor of the Linux file system; see why fsync batches stay at 1.0 at 16 users (the sustained run);
+   - the bytes per commit are explained on macOS (section 4.6). Left: replay the oids of real Plone commits (from a kept store's `txn_oids`) instead of random ones; measure the factor of the Linux file system; see why fsync batches stay at 1.0 at 16 users (and at 8 users in the sustained run);
+   - the RSS of `zoe serve` in the sustained run: rerun it with `--keep-store` and a small redb cache, and see whether the RSS levels off at the cache size;
    - the `ReadConflictError`s that only zoe-native shows (about 10–25 per step in writes): BTrees `readCurrent` under per-oid locks;
    - resolution order: count resolutions spent in failed votes; try unresolvable classes first.
 8. **A medium fixture** (`just bench plone prepare --preset medium`: ≈ 4,900 objects, a build of perhaps 15–20 min), then `browse`, `catalog`, `edit` and the cold start on it: the storage weighs more when the site exceeds the caches.
@@ -322,4 +333,4 @@ The time estimates are for the 4-vCPU Linux VM, one repetition (the human's choi
 - CPython 3.13 with the GIL, 2 instances × 2 threads; free-threaded Plone is out of reach (Plone 6.1 stops at 3.13).
 - The page cache cannot be dropped: no cold-disk claim.
 - Compression is always on in ZOE; ZEO's FileStorage has none. Store sizes and bytes written reflect that.
-- The probe adds a WSGI filter and wrappers on the storage methods; its cost is not yet measured (step 5).
+- The probe adds a WSGI filter and wrappers on the storage methods; on macOS it costs under 1 % of rate in `browse` (section 3.2).
