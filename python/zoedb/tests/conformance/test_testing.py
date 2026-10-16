@@ -496,3 +496,42 @@ def test_a_client_shares_the_blob_directory_of_the_section(layer, tmp_path):
     addr, stop = layer.start_zeo_server(FILESTORAGE, zeo_config())
     assert "--shared-blob-dir=true" not in layer._servers[-1].args
     stop()
+
+
+def test_a_subclass_of_the_zeo_client_opens_it_after_the_native_layer(tmp_path):
+    import ZEO.ClientStorage
+    from ZEO.tests.ConnectionTests import TestClientStorage
+
+    import zoe.zeo
+
+    def open_client(server):
+        return TestClientStorage(
+            server.address,
+            client="1",
+            var=str(tmp_path),
+            wait=1,
+            wait_timeout=30,
+            min_disconnect_poll=0.1,
+        )
+
+    bases = TestClientStorage.__bases__
+    layer = zoe.testing.NATIVE_LAYER
+    with zoe.testing.ZoeServer(str(tmp_path / "store")) as server:
+        layer.setUp()
+        try:
+            storage = open_client(server)
+            try:
+                assert isinstance(storage, zoe.zeo._NativeClientStorage)
+            finally:
+                storage.close()
+        finally:
+            layer.tearDown()
+        assert TestClientStorage.__bases__ == bases
+        assert "__new__" not in vars(TestClientStorage)
+
+        storage = open_client(server)
+        try:
+            assert type(storage).__mro__[1] is ZEO.ClientStorage.ClientStorage
+            assert not isinstance(storage, zoe.zeo.ClientStorage)
+        finally:
+            storage.close()
