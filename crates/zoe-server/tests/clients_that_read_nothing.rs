@@ -94,6 +94,10 @@ fn failed_loads_of_clients_that_read_nothing_hold_no_thread_of_the_read_pool() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "reads the threads of the server in /proc: Linux only"
+)]
 fn downloads_of_clients_that_read_nothing_hold_few_threads() {
     const CLIENTS: u64 = 10;
     let dir = fresh_dir("downloads");

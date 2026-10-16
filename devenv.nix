@@ -1,8 +1,13 @@
 # The only environment of the project. A tool that is not here does not
 # exist for the project.
-{ pkgs, inputs, config, ... }:
+{ pkgs, inputs, config, lib, ... }:
 
 let
+  # The shell also opens on macOS, for edits, `just check` and the tests.
+  # The parts below that only exist on Linux are on Linux only. The
+  # targets of the project stay Linux.
+  isLinux = pkgs.stdenv.isLinux;
+
   dagger = inputs.dagger.packages.${pkgs.stdenv.hostPlatform.system}.dagger;
 
   # Put only the versioned interpreter names on PATH, so that the four
@@ -63,8 +68,9 @@ in
     pkgs.nodejs_24
     pkgs.git
     dagger
+  ] ++ lib.optionals isLinux [
     setpriv
-
+  ] ++ [
     # Libraries that the Plone instances need when buildout builds an
     # egg from source.
     pkgs.pkg-config
@@ -80,23 +86,24 @@ in
     # uv uses the interpreters above and never downloads one.
     UV_PYTHON_DOWNLOADS = "never";
     UV_PYTHON_PREFERENCE = "only-system";
-
+  } // lib.optionalAttrs isLinux {
     # The static `zoe` binary: cc compiles its C code and links it with
     # the musl toolchain.
     CC_x86_64_unknown_linux_musl = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";
 
     # The Plone suites switch to Latin-1 locales. The interpreters find
-    # every locale in this archive.
+    # every locale in this archive. macOS has its own locales.
     LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
   };
 
   # Heap and CPU profiles for the spikes. Enter the profile with
   # `devenv --profile profiling shell`. The default shell and CI do not
   # fetch it, because heaptrack brings Qt. perf needs a
-  # `kernel.perf_event_paranoid` of 2 or less on the host.
+  # `kernel.perf_event_paranoid` of 2 or less on the host. Both tools are
+  # Linux only, so the profile is empty on macOS.
   profiles.profiling.module = {
-    packages = [
+    packages = lib.optionals isLinux [
       pkgs.heaptrack
       pkgs.perf
     ];
@@ -106,9 +113,12 @@ in
   # `devenv --profile loupe shell`. The default shell and CI do not build
   # it.
   profiles.loupe.module = {
+    # On macOS, a Tauri app links the WebKit of the system, and tauri-driver
+    # does not run. The profile then gives only the Tauri CLI.
     packages = [
-      # The Tauri CLI and the libraries that a Tauri app links on Linux.
       pkgs.cargo-tauri
+    ] ++ lib.optionals isLinux [
+      # The libraries that a Tauri app links on Linux.
       pkgs.webkitgtk_4_1
       pkgs.libsoup_3
       pkgs.gtk3
@@ -125,7 +135,7 @@ in
       pkgs.xvfb-run
     ];
 
-    env = {
+    env = lib.optionalAttrs isLinux {
       # The GTK file dialog of Loupe reads these GSettings schemas.
       XDG_DATA_DIRS = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}";
       # WebKitGTK needs EGL. The EGL of the shell finds no driver of the

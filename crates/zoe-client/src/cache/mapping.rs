@@ -2,7 +2,8 @@
 //!
 //! This module holds the only `unsafe` code of the crate: the `mmap`, the
 //! `msync` and the `munmap` of the mapping, the view of its bytes as
-//! `AtomicU64`, and the `fallocate` and `posix_fallocate` of a cache file.
+//! `AtomicU64`, the `fallocate` and `posix_fallocate` of a cache file on
+//! Linux, and its `lseek` and the boot session of the kernel on macOS.
 //! Every read and
 //! write of the cache goes through these atomics. Each item with `unsafe`
 //! code allows it on its own.
@@ -10,6 +11,8 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::fs::FileExt;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::AtomicU64;
 
@@ -105,6 +108,7 @@ impl Mapping {
 
 /// Give `file` the disk space of its first `len` bytes, so a write through a
 /// shared mapping never finds the disk full.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn allocate(file: &File, len: u64) -> io::Result<()> {
     let len = libc::off_t::try_from(len)
@@ -122,6 +126,7 @@ pub(crate) fn allocate(file: &File, len: u64) -> io::Result<()> {
 /// file does not change, so a mapping of it never finds its end moved.
 /// Without `FALLOC_FL_ZERO_RANGE` in the file system, punch a hole that
 /// keeps the size. Give the disk space back with `allocate` after it.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn zero(file: &File, len: u64) -> io::Result<()> {
     if len == 0 {
@@ -144,6 +149,102 @@ pub(crate) fn zero(file: &File, len: u64) -> io::Result<()> {
         }
     }
     Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+}
+
+/// Give `file` the disk space of its first `len` bytes, so a write through a
+/// shared mapping never finds the disk full. macOS has no `posix_fallocate`:
+/// write zeros into each hole of the range. The data of the file does not
+/// change.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn allocate(file: &File, len: u64) -> io::Result<()> {
+    if file.metadata()?.len() < len {
+        file.set_len(len)?;
+    }
+    let mut at = 0;
+    while at < len {
+        let hole = seek(file, at, libc::SEEK_HOLE)?.min(len);
+        if hole >= len {
+            break;
+        }
+        let data = match seek(file, hole, libc::SEEK_DATA) {
+            Ok(data) => data.min(len),
+            // No data after the hole: the hole goes to the end of the file.
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => len,
+            Err(error) => return Err(error),
+        };
+        write_zeros(file, hole, data)?;
+        at = data;
+    }
+    Ok(())
+}
+
+/// Make the first `len` bytes of `file` zero, in place: the length of the
+/// file does not change, so a mapping of it never finds its end moved.
+/// macOS has no `fallocate`: write the zeros.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn zero(file: &File, len: u64) -> io::Result<()> {
+    write_zeros(file, 0, len)
+}
+
+/// Write zeros to the bytes of `file` from `start` to `end`.
+#[cfg(not(target_os = "linux"))]
+fn write_zeros(file: &File, start: u64, end: u64) -> io::Result<()> {
+    const CHUNK: u64 = 1 << 20;
+    let zeros = vec![0u8; CHUNK.min(end.saturating_sub(start)) as usize];
+    let mut at = start;
+    while at < end {
+        let n = CHUNK.min(end - at) as usize;
+        file.write_all_at(&zeros[..n], at)?;
+        at += n as u64;
+    }
+    Ok(())
+}
+
+/// Return the offset of the next hole or the next data of `file` at or
+/// after `offset`, as `whence` asks. A file system without holes gives the
+/// end of the file as the next hole.
+#[cfg(not(target_os = "linux"))]
+#[allow(unsafe_code)]
+fn seek(file: &File, offset: u64, whence: libc::c_int) -> io::Result<u64> {
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the cache is too large"))?;
+    // SAFETY: `lseek` takes a file descriptor and two integers. A descriptor
+    // that is not valid makes it fail. The cache reads and writes its file
+    // only at explicit offsets, so the move of the offset of the file
+    // changes nothing else.
+    let found = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+    if found < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(found as u64)
+}
+
+/// Return the boot session UUID of the kernel as text, or `None` when the
+/// kernel does not give it.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn boot_session() -> Option<String> {
+    let mut buffer = [0u8; 64];
+    let mut len = buffer.len();
+    // SAFETY: the name is a C string. The buffer holds `len` writable
+    // bytes: `sysctlbyname` writes at most `len` bytes into it, and then
+    // stores the number of bytes that it wrote in `len`. It reads no new
+    // value, so the last two arguments are null and 0.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let text = buffer.get(..len)?;
+    let text = text.strip_suffix(&[0]).unwrap_or(text);
+    String::from_utf8(text.to_vec()).ok()
 }
 
 impl Drop for Mapping {

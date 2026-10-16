@@ -13,6 +13,7 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench run --gate --storage zeo zoe-native floor` | the gate set, the head-to-head that the phase gates count, in rounds that interleave the storages; results go under `gate/` |
 | `just bench run --gate --storage zeo zoe-native floor --cell processes:16:102400` | one cell of the gate set, one job of the phase 3 gate |
 | `just bench run --storage zeo --quick` | one storage only |
+| `just bench run --gate --storage floor` | the floor of the gate set; `floor` runs only when `--storage` names it |
 | `just bench test` | the tests of the harness (the acceptance test of the baseline) |
 | `just bench test FILE...` | the tests of those files only |
 | `just bench client` | the client benchmark: `ZEO.ClientStorage` against the native client (see [The client benchmark](#the-client-benchmark)) |

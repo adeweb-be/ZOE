@@ -61,12 +61,16 @@ use super::{
 const MAGIC_PREFIX: &[u8; 7] = b"ZOECACH";
 
 /// The file that gives the boot id of the kernel.
+#[cfg(target_os = "linux")]
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
 /// Return the boot id of the kernel as two words, or `None` when it does
-/// not read.
+/// not read. On macOS, the boot id is the boot session UUID of the kernel.
 fn boot_id() -> Option<[u64; 2]> {
+    #[cfg(target_os = "linux")]
     let text = std::fs::read_to_string(BOOT_ID).ok()?;
+    #[cfg(target_os = "macos")]
+    let text = mapping::boot_session()?;
     let hex: String = text.trim().chars().filter(|c| *c != '-').collect();
     let id = u128::from_str_radix(&hex, 16).ok().filter(|id| *id != 0)?;
     Some([(id >> 64) as u64, id as u64])
