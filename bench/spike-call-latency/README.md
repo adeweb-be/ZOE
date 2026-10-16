@@ -5,6 +5,7 @@ Prototypes and scripts of the call-latency spike. Nothing here merges.
 Switches:
 
 - `SPIKE_ZEO_FULLFSYNC=1`: on macOS, the ZEO server of the harness syncs with `F_FULLFSYNC`, as `zoe serve` does.
+- `ZOE_SPIKE_INLINE_LOAD=1`: `zoe serve` runs each `loadBefore` on the task of the reader, with no thread of the read pool.
 - `ZOE_SPIKE_EAGER_ADDR=1`: the native client looks up the canonical name of the server at the connection, as ZEO does, and not at the first `sortKey()`.
 - `ZOE_SPIKE_TRACE=PREFIX`: the probes of `zoe-client`, `zoe-py` and `zoe serve` write `PREFIX.<role>.<pid>`; with `trace/` on `PYTHONPATH`, so do the probes of the Python side and of ZEO.
 - The harness passes each `ZOE_SPIKE_*` variable to `zoe serve` and to the pyperf workers.

@@ -638,12 +638,19 @@ impl Calls {
                 run_call(&session, &call, ticket, &ended, &peer);
             }));
         } else {
+            // Spike ZOE-188: ZOE_SPIKE_INLINE_LOAD runs a loadBefore on the
+            // task of the reader, with no thread of the read pool.
+            let inline = spike_inline_load() && call.method == "loadBefore";
             let unrun = EndUnlessRun(Some(ended.clone()));
             let work = move || {
                 unrun.run();
                 let _mark = mark;
                 run_call(&session, &call, ticket, &ended, &peer);
             };
+            if inline {
+                work();
+                return;
+            }
             // A free thread of the read pool runs the call at once.
             // Otherwise a task waits for a free thread, so the reader does
             // not wait for the pool.
@@ -1134,4 +1141,10 @@ mod tests {
         assert_eq!(store.last_transaction(), Tid::ZERO);
         assert!(store.lock_table_is_empty());
     }
+}
+
+/// Spike ZOE-188: tell if `ZOE_SPIKE_INLINE_LOAD` is set.
+fn spike_inline_load() -> bool {
+    static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INLINE.get_or_init(|| std::env::var_os("ZOE_SPIKE_INLINE_LOAD").is_some())
 }
