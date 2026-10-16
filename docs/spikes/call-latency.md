@@ -94,10 +94,12 @@ The median of about 3,000 traced loads of `read_cold` at threads 1 and 1 KB for 
 | update | zeo | 100 `store` | 910 |
 | update | zeo | `tpc_vote` (server: 879) | 1124 |
 | update | zeo | `tpc_finish` (server: 3640, of which the fsync: 3550) | 4997 |
+| add | zoe-native | `tpc_begin` | 19 |
 | add | zoe-native | 100 `new_oid` | 150 |
 | add | zoe-native | 101 `store` | 172 |
 | add | zoe-native | `tpc_vote` (server: 42) | 133 |
 | add | zoe-native | `tpc_finish` (server `tpc_finish`, not split: 4265) | 4418 |
+| add | zeo | `tpc_begin` | 120 |
 | add | zeo | 100 `new_oid` | 290 |
 | add | zeo | 101 `store` | 778 |
 | add | zeo | `tpc_vote` | 989 |
@@ -118,7 +120,16 @@ What the terms say:
 
 ## The floor
 
-The floor of the harness (ADR 0037) gives the time of ZODB and zodbshootout in each cell. 3× ZEO then sets the largest time per object that `zoe-native` may take: `floor + (zeo − floor) ÷ 3`. The rows of this Mac come from the run without a switch of the eager A/B (see `read_warm`). The table compares the limit with the bound of a storage that talks to a server on this machine: a round trip and a read of the store for a load (about 20 µs), and one flush for a commit (3.0 ms for 100 objects, so 30 µs per object).
+The floor of the harness (ADR 0037) gives the time of ZODB and zodbshootout in each cell. 3× ZEO then sets the largest time per object that `zoe-native` may take: `floor + (zeo − floor) ÷ 3`. The rows of this Mac come from the run without a switch of the eager A/B (see `read_warm`), threads 1 at 1 KB:
+
+| scenario | zeo µs | zoe-native µs | floor µs | cost | range |
+| --- | --- | --- | --- | --- | --- |
+| add | 70.6 | 56.1 | 6.5 | 1.28 | 1.24–1.32 |
+| update | 88.7 | 76.4 | 7.8 | 1.18 | 1.16–1.19 |
+| read_cold | 75.4 | 67.1 | 4.8 | 1.12 | 1.11–1.17 |
+| read_warm | 189.2 | 216.3 | 13.6 | 0.87 | 0.61–1.09 |
+| read_hot | 6.5 | 5.1 | 4.5 | 3.34 | 3.18–4.64 |
+ The table compares the limit with the bound of a storage that talks to a server on this machine: a round trip and a read of the store for a load (about 20 µs), and one flush for a commit (3.0 ms for 100 objects, so 30 µs per object).
 
 | cell | machine | zeo µs | zoe-native µs | floor µs | 3× allows µs | bound of a storage µs | reachable |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -174,7 +185,7 @@ The A/B of the inline load (`ZOE_SPIKE_INLINE_LOAD`) on the same cell, with the 
 
 The commit scenarios of the cell do not move.
 
-**The rest.** The first commit of a new client also opens one more connection: the listener of the pool never commits (ADR 0036), so the first transaction finds no free connection. Its `tpc_begin` takes 0.43 to 0.74 ms, against 0.016 ms on a pool that has its connection. The inline load of the server (Cards, item 1) alone brings `read_warm` to the level of ZEO on this machine (1.02, table below). No run had both switches on. 3× allows 72.1 µs here, and 100 loads and one flush cost at least 64 µs. So the cell reaches 3× only at the bound of the machine.
+**The rest.** The first commit of a new client also opens one more connection: the listener of the pool never commits (ADR 0036), so the first transaction finds no free connection. Its `tpc_begin` takes 0.43 to 0.74 ms, against 0.016 ms on a pool that has its connection. The inline load of the server (Cards, item 1) alone brings `read_warm` to the level of ZEO on this machine (1.02, table above). No run had both switches on. 3× allows 72.1 µs here, and 100 loads and one flush cost at least 64 µs. So the cell reaches 3× only at the bound of the machine.
 
 **The laptop.** There the gap is 28 ms per transaction (751.2 against 469.3 µs per object), about ten times the gap here. The cost of the lookup depends on the resolver of the machine: on Linux, the order of `/etc/nsswitch.conf` and a reverse query to a DNS server can make it take tens of milliseconds. This spike did not measure it there. Run `python3 -c "import socket, time; t = time.perf_counter(); socket.gethostbyaddr('127.0.0.1'); print(time.perf_counter() - t)"` on the laptop before the card. The first commit on the laptop is also slower than on this Mac (`update` at threads 1: 167.3 µs per object there).
 
@@ -202,8 +213,8 @@ Ranked by the gain measured on this Mac. The first two are measured prototypes; 
 
 1. **`zoe serve` runs a `loadBefore` on the task of the reader** (measured: `read_cold` threads 1 at 1 KB, 67.1 to 57.6 µs per object; `read_warm` threads 1 at 1 KB, 213.9 to 194.3). Moves `read_cold` threads 1, `read_warm` threads 1, and `read_cold` processes 16 on this Mac. This changes an invariant of `zoe-server`: "Core calls run on blocking threads of the runtime, never on the async runtime threads." A load that reads the disk would then hold a worker of tokio. The card needs the human's decision first, and a rule for which loads may run there (for example, a load of a page that redb holds in memory).
 2. **The native client looks up the name of the server at the connection** (measured: `read_warm` threads 1 at 1 KB, 216.3 to 199.5 µs per object on this Mac; up to 28 ms per transaction on the laptop if the lookup is the gap there). Moves `read_warm` threads 1 at 1 KB and 100 KB. It adds margin to `read_warm` processes 16 at 1 KB, which passes on the laptop (3.02). The lookup can run on a thread that starts at the connection, so the open does not wait and the first `sortKey()` waits only for what is left. No public API changes: `sortKey()` gives what it gives today. Check first on the laptop how long the lookup takes.
-3. **The native client writes its own frame when no other frame waits** (estimate: up to 5.8 µs per call, the handoff to the writer task). Moves `read_cold` threads 1 and `read_warm` threads 1, and the round trips of the vote and the finish in `update` and `add` threads 1 by a few µs.
-4. **`zoe serve` writes a reply from the thread of the call when its writer is idle** (estimate: up to 6.3 µs per call, the handoff to the writer task). Moves `read_cold` threads 1 and `read_warm` threads 1.
+3. **`zoe serve` writes a reply from the thread of the call when its writer is idle** (estimate: up to 6.3 µs per call, the handoff to the writer task). Moves `read_cold` threads 1 and `read_warm` threads 1.
+4. **The native client writes its own frame when no other frame waits** (estimate: up to 5.8 µs per call, the handoff to the writer task). Moves `read_cold` threads 1 and `read_warm` threads 1, and the round trips of the vote and the finish in `update` and `add` threads 1 by a few µs.
 5. **The native client opens the first connection for commits at the open, in the background** (estimate: 0.43 to 0.74 ms per sample, about 5 µs per object). Moves `read_warm` threads 1. The listener still never commits (ADR 0036).
 6. **No card: `add` threads 1 and `update` threads 1 at 1 KB.** On this Mac, 3× allows a storage cost of 2.1 ms and 2.7 ms per transaction beyond the floor, and one flush takes 3.0 ms. No change of the client or the server moves the flush. The human decides whether these cells stay in the gate, or whether the gate machine's flush makes them reachable (measure it first, see The floor). On the laptop, ZOE-184 owns the part of the commit that comes from the bytes that redb writes.
 7. **`update` processes 16 at 1 KB goes to ZOE-184**: 16 writers on the commit path of the server.
