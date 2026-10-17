@@ -51,6 +51,7 @@ use crate::vfs::{DirLock, Vfs, WriteFile, parent};
 pub(crate) trait BlobDir: Send + Sync {
     fn exists(&self, name: &str) -> io::Result<bool>;
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()>;
     fn remove(&self, name: &str) -> io::Result<()>;
     fn sync_dir_at(&self, dir: &str) -> io::Result<()>;
     fn create_dir(&self, name: &str) -> io::Result<()>;
@@ -71,6 +72,10 @@ impl<V: Vfs> BlobDir for V {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         Vfs::rename(self, from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        Vfs::hard_link(self, from, to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -148,6 +153,10 @@ impl BlobDir for ReadOnlyDir {
     }
 
     fn rename(&self, from: &str, _to: &str) -> io::Result<()> {
+        Err(self.refused(from))
+    }
+
+    fn hard_link(&self, from: &str, _to: &str) -> io::Result<()> {
         Err(self.refused(from))
     }
 
@@ -272,6 +281,17 @@ impl BlobDir for Relocated {
             ));
         }
         dir.rename(&from, &to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        let (dir, from) = self.locate(from);
+        let (to_dir, to) = self.locate(to);
+        if !std::ptr::addr_eq(dir, to_dir) {
+            return Err(io::Error::other(
+                "a hard link between the store directory and the blob directory",
+            ));
+        }
+        dir.hard_link(&from, &to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -736,6 +756,40 @@ impl BlobStore {
         };
         blob.record = self.hash(&temp)?;
         Ok(blob)
+    }
+
+    /// Return a blob of the store `store` whose file is a hard link to the
+    /// committed blob file of `oid` at `tid`. `record` is the blob record of
+    /// that file. The link gets a new temporary name in `blobs/tmp/`, so
+    /// `place` renames it into its place as it does any other blob. No byte
+    /// is copied, and the committed file does not change. A missing file is
+    /// a corrupt blob.
+    ///
+    /// The committed file is durable, so the link needs no sync before the
+    /// intent file of the finish. A crash before the finish leaves the
+    /// temporary name, and the next open removes it, not the committed
+    /// file.
+    pub(crate) fn link(
+        &self,
+        store: Weak<Opened>,
+        oid: Oid,
+        tid: Tid,
+        record: BlobRecord,
+    ) -> Result<PendingBlob> {
+        self.make_ready()?;
+        let temp = self.new_temp_name();
+        match self.dir.hard_link(&blob_name(oid, tid), &temp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ZoeError::CorruptBlob { oid, tid });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(PendingBlob {
+            store,
+            temp: Some(temp),
+            record,
+        })
     }
 
     /// Return the name of the file at `path` in `blobs/tmp/`. Return `None`

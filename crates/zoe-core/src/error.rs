@@ -80,6 +80,18 @@ pub enum ZoeError {
         oid: Oid,
     },
 
+    /// An undo cannot undo its transaction: the transaction is at or
+    /// before the last pack, the store has no such transaction, or a later
+    /// transaction changed an object of it in a way that no tier merges.
+    /// This is the `UndoError` of ZODB. `oid` is the object that stops the
+    /// undo, when one does.
+    #[error("undo refused: {reason}")]
+    Undo {
+        /// The object that stops the undo.
+        oid: Option<Oid>,
+        /// Why the undo is refused.
+        reason: &'static str,
+    },
     /// A lock request is not in ascending oid order. The lock manager
     /// refuses it and takes no lock.
     #[error("lock request out of oid order: oid {oid:?}")]

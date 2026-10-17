@@ -53,6 +53,7 @@ mod encoded;
 mod group;
 mod observer;
 mod staging;
+mod undo;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,8 +139,12 @@ pub struct Txn<S: Deref<Target = Store>> {
     committed: Option<Tid>,
     /// The handle that ends the lock wait of a vote from another thread.
     lock_cancel: Option<LockCancel>,
-    /// What tier 1 did in the last vote that took the locks.
+    /// What tier 1 did in the undos of the transaction, then in the last
+    /// vote that took the locks.
     resolutions: Vec<Resolution>,
+    /// The number of entries of `resolutions` that the undos gave. They
+    /// come first, and a vote keeps them.
+    undo_resolutions: usize,
 }
 
 /// What the serial check of a vote found.
@@ -193,6 +198,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             committed: None,
             lock_cancel: None,
             resolutions: Vec::new(),
+            undo_resolutions: 0,
         }
     }
 
@@ -700,10 +706,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
         &self.description
     }
 
-    /// Return what tier 1 did in the last vote that took the locks: one
-    /// entry for each stale written oid of a class of tier 1 whose mode is
-    /// not `Off`, in oid order. The vote that comes after `vote_resolving`
-    /// keeps the entries of `vote_resolving`.
+    /// Return what tier 1 did in the undos of the transaction, then in the
+    /// last vote that took the locks: one entry for each three-way merge of
+    /// an undo, and one for each stale written oid of the vote, of a class
+    /// of tier 1 whose mode is not `Off`, in oid order. The vote that comes
+    /// after `vote_resolving` keeps the entries of `vote_resolving`.
     pub fn resolutions(&self) -> &[Resolution] {
         &self.resolutions
     }
@@ -744,7 +751,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// locks and passed. Their staged records hold the merged records, over
     /// the serial of the committed records.
     pub fn natively_resolved(&self) -> Vec<Oid> {
-        self.resolutions
+        self.resolutions[self.undo_resolutions..]
             .iter()
             .filter(|resolution| resolution.applied && resolution.outcome == Resolved::Merged)
             .map(|resolution| resolution.oid)
@@ -795,7 +802,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// or an error, fails the check and releases the locks.
     fn check(&mut self, resolve: bool, native: bool) -> Result<Vec<(Oid, Record)>> {
         if native {
-            self.resolutions.clear();
+            self.resolutions.truncate(self.undo_resolutions);
         }
         let checked = self
             .check_serials(resolve, native)
@@ -867,7 +874,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.staged.put(area, *oid, *serial, pickle, false)?;
         }
         self.stored_bytes = stored_bytes;
-        for resolution in &mut self.resolutions {
+        for resolution in &mut self.resolutions[self.undo_resolutions..] {
             if resolution.outcome == Resolved::Merged
                 && merged.iter().any(|(oid, _, _)| *oid == resolution.oid)
             {

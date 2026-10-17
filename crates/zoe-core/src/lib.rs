@@ -24,6 +24,7 @@ mod store;
 #[doc(hidden)]
 pub mod testing;
 mod types;
+mod undo;
 pub mod vfs;
 
 pub use backend::{
@@ -43,3 +44,4 @@ pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactio
 pub use sequence::Sequence;
 pub use store::{Options, Store};
 pub use types::{Oid, Tid};
+pub use undo::{UndoConflict, Undone, undo_id, undo_tid};
