@@ -553,6 +553,17 @@ plone scenario="zoe" command="start" *args:
 # `just bench plone test` runs its tests. It needs the Plone instances of
 # `just plone zeo build`, `just plone zoeclient build` and
 # `just plone zeoclient build`, and builds `zoe` in release first.
+# `just bench replay RUN` runs the log replay of bench/replay (B6): the
+# transactions of the store that the B5 run RUN kept (`--keep-store` on
+# zeo), against ZEO and against zoe serve, in the interpreter of the
+# zoeclient Plone instance. It writes target/bench/replay/<started>.json and
+# prints the report and the verdict of the gate of phase 4, and fails when
+# the gate fails. `--zoe-serve-arg ARG` passes ARG to zoe serve, such as
+# `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`. It needs
+# `just plone zoeclient build`, whose package zoe the native client runs,
+# and builds `zoe` in release first.
+# `just bench replay report FILE` prints the report of a result, and
+# `just bench replay test` runs the tests of the replay.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -573,6 +584,44 @@ bench *args="run":
                 ;;
         esac
         exec "${plonebench[@]}" python -m plonebench "$@"
+    fi
+    if [ "${1:-}" = replay ]; then
+        shift
+        export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/replay/venv"
+        replay=(uv run --locked --python 3.13 --project bench/replay)
+        if [ "${1:-}" = report ]; then
+            shift
+            exec "${replay[@]}" python -m replay report "$@"
+        fi
+        if [ "${1:-}" != test ]; then
+            run="${1:?just bench replay: give the directory of a B5 run that kept its store}"
+            store="$run/store/filestorage/Data.fs"
+            [ -f "$store" ] || { echo "just bench replay: $run kept no FileStorage: run B5 on zeo with --keep-store" >&2; exit 1; }
+            ls "$run"/probe/instance*.jsonl >/dev/null 2>&1 || { echo "just bench replay: $run has no probe records in probe/" >&2; exit 1; }
+            # The interpreter of the instance has the eggs of the site, so
+            # the resolver of ZODB has the classes of Plone. It runs the
+            # package zoe of the last `just plone zoeclient build`.
+            interpreter="target/plone/zoeclient/parts/instance/bin/interpreter"
+            [ -x "$interpreter" ] || { echo "just bench replay: run just plone zoeclient build first" >&2; exit 1; }
+        fi
+        if [ -z "${ZOE_BINARY:-}" ]; then
+            cargo build --release --locked -p zoe-server --bin zoe
+            ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/zoe"
+            export ZOE_BINARY
+        fi
+        if [ "${1:-}" = test ]; then
+            shift
+            exec "${replay[@]}" pytest -q "${@:-bench/replay/tests}"
+        fi
+        shift
+        out="target/bench/replay/$(date -u +%Y%m%dT%H%M%SZ).json"
+        work="target/bench/work/replay"
+        rm -rf "$work"
+        export PYTHONPATH="{{ justfile_directory() }}/bench/replay/src"
+        # The interpreter warns that pkg_resources is deprecated.
+        export PYTHONWARNINGS="ignore::UserWarning"
+        exec "$interpreter" -m replay run --store "$store" --probes "$run/probe" \
+            --workdir "$work" --out "$out" "$@"
     fi
     # `just bench client OPTIONS` stands for `just bench client run OPTIONS`,
     # and `just bench native OPTIONS` for `just bench native run OPTIONS`.
