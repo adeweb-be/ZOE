@@ -118,6 +118,26 @@ _Avoid_: last tid (the last tid of the store can be ahead of it)
 A named counter in the store that gives monotonic values outside the commit locks.
 _Avoid_: counter, autoincrement
 
+**KV namespace**:
+A named set of keys and values beside the object graph, written in the transaction of a commit, with one row per key and no history. Its flavour is ephemeral or durable.
+_Avoid_: key-value store, cache, bucket
+
+**Ephemeral namespace**:
+A KV namespace whose keys each have a TTL and go without a pack: sessions and locks.
+_Avoid_: temporary storage, transient container
+
+**Durable namespace**:
+A KV namespace whose keys stay until a delete: the registry.
+_Avoid_: persistent namespace
+
+**Generation**:
+The tid of the last commit that wrote a durable namespace. A cache of the namespace stays valid while it stays the same.
+_Avoid_: version, revision
+
+**Sweep step**:
+One backend write that removes the expired keys of the ephemeral namespaces, at most 1,000.
+_Avoid_: garbage collection, expiry pack
+
 ## Server
 
 **Invalidation hub**:
