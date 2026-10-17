@@ -156,6 +156,9 @@ pub enum Undecided {
     /// Python raises. A persistent reference compares only with an equal
     /// one.
     Raises,
+    /// The comparison would take more steps than the budget of the heap
+    /// leaves ([`Heap::set_budget`]).
+    Budget,
 }
 
 /// The identity of a persistent id: the key of the
@@ -205,12 +208,40 @@ pub struct Heap {
     /// The interned strs, by text: the keys of the dict state of an object,
     /// as BUILD and `Persistent.__setstate__` intern them in CPython.
     interned: HashMap<String, ObjectId>,
+    /// The most steps that the comparisons of the heap take in all, or
+    /// `None` for no limit.
+    limit: Option<usize>,
+    /// The steps that the comparisons took.
+    spent: std::cell::Cell<usize>,
 }
 
 impl Heap {
     /// Returns an empty heap.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Gives the comparisons of the heap a budget of `steps` steps in all:
+    /// a step is one pair of values that [`Heap::eq`] or [`Heap::lt`] looks
+    /// at. Past the budget, a comparison gives [`Undecided::Budget`]. A
+    /// merge sets a budget in proportion to its records, so a value that
+    /// shares its parts many times cannot make it take more time than its
+    /// size allows.
+    pub fn set_budget(&mut self, steps: usize) {
+        self.limit = Some(steps);
+        self.spent.set(0);
+    }
+
+    /// Takes one step of the budget.
+    fn step(&self) -> Result<(), Undecided> {
+        if let Some(limit) = self.limit {
+            let spent = self.spent.get() + 1;
+            self.spent.set(spent);
+            if spent > limit {
+                return Err(Undecided::Budget);
+            }
+        }
+        Ok(())
     }
 
     /// Returns an empty heap that also models the objects of other classes
@@ -322,129 +353,6 @@ impl Heap {
     /// `builtins.set` or `builtins.frozenset`.
     pub fn new_set(&mut self, class: Value, items: Vec<Value>) -> Value {
         Value::Object(self.push(Object::Set { class, items }))
-    }
-
-    /// Tells if two values have the same structure: the same kind, the
-    /// same atoms and texts, the same items in the same order, the same
-    /// class and state for an object of another class, and the same oid,
-    /// database and weakness for a persistent reference. This is not the
-    /// `==` of Python: two dicts in another order differ here.
-    pub fn same(&self, a: Value, b: Value) -> bool {
-        let mut pairs = vec![(a, b)];
-        while let Some(pair) = pairs.pop() {
-            let same = match pair {
-                (Value::None, Value::None) => true,
-                (Value::Bool(x), Value::Bool(y)) => x == y,
-                (Value::Int(x), Value::Int(y)) => x == y,
-                (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
-                (Value::Object(x), Value::Object(y)) if x == y => true,
-                (Value::Object(x), Value::Object(y)) => match (self.get(x), self.get(y)) {
-                    (Object::Str(p), Object::Str(q)) => p == q,
-                    (Object::Bytes(p), Object::Bytes(q)) => p == q,
-                    (Object::Tuple(p), Object::Tuple(q)) | (Object::List(p), Object::List(q)) => {
-                        pairs.extend(p.iter().copied().zip(q.iter().copied()));
-                        p.len() == q.len()
-                    }
-                    (Object::Dict(p), Object::Dict(q)) => {
-                        for (&(k1, v1), &(k2, v2)) in p.iter().zip(q) {
-                            pairs.push((k1, k2));
-                            pairs.push((v1, v2));
-                        }
-                        p.len() == q.len()
-                    }
-                    (
-                        Object::Class { module, name },
-                        Object::Class {
-                            module: other_module,
-                            name: other_name,
-                        },
-                    ) => module == other_module && name == other_name,
-                    (Object::Reference(p), Object::Reference(q)) => {
-                        p.oid == q.oid && p.database == q.database && p.weak == q.weak
-                    }
-                    (Object::Instance(p), Object::Instance(q)) => {
-                        pairs.push((p.class, q.class));
-                        pairs.push((p.args, q.args));
-                        match (p.state, q.state) {
-                            (Some(x), Some(y)) => {
-                                pairs.push((x, y));
-                                p.made == q.made
-                            }
-                            (None, None) => p.made == q.made,
-                            _ => false,
-                        }
-                    }
-                    (
-                        Object::Set { class, items },
-                        Object::Set {
-                            class: other_class,
-                            items: other_items,
-                        },
-                    ) => {
-                        pairs.push((*class, *other_class));
-                        pairs.extend(items.iter().copied().zip(other_items.iter().copied()));
-                        items.len() == other_items.len()
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            if !same {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Returns the mutable objects that `value` holds, `value` too, each
-    /// once: the lists, the dicts, the sets and the objects of other
-    /// classes, but `DateTime.DateTime`, a value that no code changes in
-    /// place. Two fields that share one of them see each change of it; two
-    /// fields that share an immutable value (a str, a bytes, a tuple, a
-    /// frozenset, a `DateTime`) do not. A persistent reference and a class
-    /// are not followed: they are shared by design.
-    pub fn mutable_objects(&self, value: Value) -> Vec<ObjectId> {
-        let mut found = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut todo = vec![value];
-        while let Some(value) = todo.pop() {
-            let Value::Object(id) = value else {
-                continue;
-            };
-            if !seen.insert(id) {
-                continue;
-            }
-            match self.get(id) {
-                Object::Tuple(items) => todo.extend(items),
-                Object::List(items) => {
-                    found.push(id);
-                    todo.extend(items);
-                }
-                Object::Dict(items) => {
-                    found.push(id);
-                    for &(key, value) in items {
-                        todo.push(key);
-                        todo.push(value);
-                    }
-                }
-                Object::Instance(instance) => {
-                    if self.class(instance.class) != Some(("DateTime.DateTime", "DateTime")) {
-                        found.push(id);
-                    }
-                    todo.push(instance.args);
-                    todo.extend(instance.state);
-                }
-                Object::Set { class, items } => {
-                    if self.class(*class) != Some(("builtins", "frozenset")) {
-                        found.push(id);
-                    }
-                    todo.extend(items);
-                }
-                Object::Str(_) | Object::Bytes(_) | Object::Class { .. } | Object::Reference(_) => {
-                }
-            }
-        }
-        found
     }
 
     /// Interns the str keys of the dict `dict`, as CPython interns the keys
@@ -665,6 +573,7 @@ impl Heap {
         let mut frames: Vec<(&[Value], &[Value], usize)> = Vec::new();
         let mut pair = (a, b);
         loop {
+            self.step()?;
             let mut answer = match self.eq_leaf(pair.0, pair.1)? {
                 Leaf::Answer(answer) => answer,
                 Leaf::Tuples(x, y) => {
@@ -696,6 +605,7 @@ impl Heap {
     /// equal, or by their length.
     pub fn lt(&self, mut a: Value, mut b: Value) -> Result<bool, Undecided> {
         loop {
+            self.step()?;
             let Some((x, y)) = self.sequences(a, b) else {
                 return self.lt_leaf(a, b);
             };
@@ -808,6 +718,178 @@ impl Heap {
                 _ => Err(Undecided::Unknown),
             },
             _ => Err(Undecided::Unknown),
+        }
+    }
+}
+
+/// The structure of one value, as [`Canon`] keys it: an atom by its value,
+/// an object by its kind and the canonical ids of its parts. A set keeps
+/// the ids of its items in ascending order, so two sets with the same items
+/// in another order have one shape. The parts are ids, so a shape holds no
+/// other shape, and its hash, its comparison and its drop never recurse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Shape {
+    None,
+    Bool(bool),
+    Int(i128),
+    Float(u64),
+    Str(String),
+    Bytes(Vec<u8>),
+    Tuple(Vec<u32>),
+    List(Vec<u32>),
+    Dict(Vec<(u32, u32)>),
+    Class(String, String),
+    Reference(Vec<u8>, Option<String>, bool),
+    Instance(bool, u32, u32, Option<u32>),
+    Set(u32, Vec<u32>),
+}
+
+/// The canonical ids of the values of one heap: two values have one id
+/// when they have the same structure: the same kind, the same atoms and
+/// texts, the same items in the same order (a set in any order), the same
+/// class, arguments and state for an object of another class, and the
+/// same oid, database and weakness for a persistent reference. This is not
+/// the `==` of Python: two dicts in another order differ here.
+///
+/// Each object of the heap costs one step, and its items one step each,
+/// once, whatever the number of values that share it: the ids are kept
+/// for the life of the `Canon`. Past its budget of steps, [`Canon::id`]
+/// gives [`Undecided::Budget`]. The walk uses an explicit stack.
+#[derive(Debug)]
+pub struct Canon {
+    ids: HashMap<ObjectId, u32>,
+    shapes: HashMap<Shape, u32>,
+    left: usize,
+}
+
+impl Canon {
+    /// Returns a `Canon` with a budget of `steps` steps.
+    pub fn new(steps: usize) -> Self {
+        Canon {
+            ids: HashMap::new(),
+            shapes: HashMap::new(),
+            left: steps,
+        }
+    }
+
+    /// Tells if `a` and `b` have the same structure.
+    pub fn same(&mut self, heap: &Heap, a: Value, b: Value) -> Result<bool, Undecided> {
+        Ok(self.id(heap, a)? == self.id(heap, b)?)
+    }
+
+    /// Returns the canonical id of `value`.
+    pub fn id(&mut self, heap: &Heap, value: Value) -> Result<u32, Undecided> {
+        let Value::Object(root) = value else {
+            return self.part(value);
+        };
+        // Each entry is an object and true once its parts are on the stack.
+        let mut stack = vec![(root, false)];
+        while let Some(&(id, expanded)) = stack.last() {
+            if self.ids.contains_key(&id) {
+                stack.pop();
+                continue;
+            }
+            if !expanded {
+                stack.last_mut().expect("an entry").1 = true;
+                let parts = parts(heap, id);
+                self.spend(1 + parts.len())?;
+                for part in parts {
+                    if let Value::Object(part) = part
+                        && !self.ids.contains_key(&part)
+                    {
+                        stack.push((part, false));
+                    }
+                }
+                continue;
+            }
+            stack.pop();
+            let shape = self.shape(heap, id)?;
+            let canonical = self.intern(shape);
+            self.ids.insert(id, canonical);
+        }
+        Ok(self.ids[&root])
+    }
+
+    fn spend(&mut self, steps: usize) -> Result<(), Undecided> {
+        self.left = self.left.checked_sub(steps).ok_or(Undecided::Budget)?;
+        Ok(())
+    }
+
+    fn intern(&mut self, shape: Shape) -> u32 {
+        let next = u32::try_from(self.shapes.len()).expect("fewer than 2^32 shapes");
+        *self.shapes.entry(shape).or_insert(next)
+    }
+
+    /// Returns the id of an atom, or of an object whose id the walk gave.
+    fn part(&mut self, value: Value) -> Result<u32, Undecided> {
+        Ok(match value {
+            Value::None => self.intern(Shape::None),
+            Value::Bool(b) => self.intern(Shape::Bool(b)),
+            Value::Int(int) => self.intern(Shape::Int(int)),
+            Value::Float(float) => self.intern(Shape::Float(float.to_bits())),
+            // An object that holds itself has no id yet: the model never
+            // builds one, and it gets no answer.
+            Value::Object(id) => *self.ids.get(&id).ok_or(Undecided::Unknown)?,
+        })
+    }
+
+    /// Returns the shape of an object whose parts have their ids.
+    fn shape(&mut self, heap: &Heap, id: ObjectId) -> Result<Shape, Undecided> {
+        let ids = |canon: &mut Canon, values: &[Value]| -> Result<Vec<u32>, Undecided> {
+            values.iter().map(|&value| canon.part(value)).collect()
+        };
+        Ok(match heap.get(id) {
+            Object::Str(text) => Shape::Str(text.clone()),
+            Object::Bytes(bytes) => Shape::Bytes(bytes.clone()),
+            Object::Tuple(items) => Shape::Tuple(ids(self, items)?),
+            Object::List(items) => Shape::List(ids(self, items)?),
+            Object::Dict(items) => Shape::Dict(
+                items
+                    .iter()
+                    .map(|&(key, value)| Ok((self.part(key)?, self.part(value)?)))
+                    .collect::<Result<_, Undecided>>()?,
+            ),
+            Object::Class { module, name } => Shape::Class(module.clone(), name.clone()),
+            Object::Reference(reference) => Shape::Reference(
+                reference.oid.clone(),
+                reference.database.clone(),
+                reference.weak,
+            ),
+            Object::Instance(instance) => Shape::Instance(
+                instance.made == Made::New,
+                self.part(instance.class)?,
+                self.part(instance.args)?,
+                instance.state.map(|state| self.part(state)).transpose()?,
+            ),
+            Object::Set { class, items } => {
+                let mut items = ids(self, items)?;
+                items.sort_unstable();
+                Shape::Set(self.part(*class)?, items)
+            }
+        })
+    }
+}
+
+/// Returns the parts of an object that its shape names.
+fn parts(heap: &Heap, id: ObjectId) -> Vec<Value> {
+    match heap.get(id) {
+        Object::Tuple(items) | Object::List(items) => items.clone(),
+        Object::Dict(items) => items
+            .iter()
+            .flat_map(|&(key, value)| [key, value])
+            .collect(),
+        Object::Instance(instance) => {
+            let mut parts = vec![instance.class, instance.args];
+            parts.extend(instance.state);
+            parts
+        }
+        Object::Set { class, items } => {
+            let mut parts = vec![*class];
+            parts.extend(items);
+            parts
+        }
+        Object::Str(_) | Object::Bytes(_) | Object::Class { .. } | Object::Reference(_) => {
+            Vec::new()
         }
     }
 }
@@ -1048,21 +1130,12 @@ impl Heap {
         mut items: Vec<(Value, Value)>,
         flat: &[Value],
     ) -> Result<Vec<(Value, Value)>, Unsupported> {
-        let key_of = |key: Value| match key {
-            Value::Int(int) => Ok(DictKey::Int(int)),
-            Value::Object(id) => match self.get(id) {
-                Object::Str(text) => Ok(DictKey::Str(text.clone())),
-                Object::Bytes(bytes) => Ok(DictKey::Bytes(bytes.clone())),
-                _ => Err(Unsupported("a dict key of another type")),
-            },
-            _ => Err(Unsupported("a dict key of another type")),
-        };
         let mut places: HashMap<DictKey, usize> = HashMap::new();
         for (place, &(key, _)) in items.iter().enumerate() {
-            places.insert(key_of(key)?, place);
+            places.insert(self.dict_key(key)?, place);
         }
         for &[key, value] in flat.as_chunks::<2>().0 {
-            let dict_key = key_of(key)?;
+            let dict_key = self.dict_key(key)?;
             match places.get(&dict_key) {
                 Some(&place) => items[place].1 = value,
                 None => {
@@ -1072,6 +1145,48 @@ impl Heap {
             }
         }
         Ok(items)
+    }
+
+    /// Returns the key of a dict key that the model keeps.
+    fn dict_key(&self, key: Value) -> Result<DictKey, Unsupported> {
+        match key {
+            Value::Int(int) => Ok(DictKey::Int(int)),
+            Value::Object(id) => match self.get(id) {
+                Object::Str(text) => Ok(DictKey::Str(text.clone())),
+                Object::Bytes(bytes) => Ok(DictKey::Bytes(bytes.clone())),
+                _ => Err(Unsupported("a dict key of another type")),
+            },
+            _ => Err(Unsupported("a dict key of another type")),
+        }
+    }
+
+    /// Runs `d[key] = value` on the dict of `id` for each pair of `flat`.
+    /// `places` holds the place of each key of the dict, and the call
+    /// keeps it up to date, so each pair costs a constant time.
+    fn fill_dict(
+        &mut self,
+        id: ObjectId,
+        places: &mut HashMap<DictKey, usize>,
+        flat: &[Value],
+    ) -> Result<(), Unsupported> {
+        let pairs = flat.as_chunks::<2>().0;
+        let keys = pairs
+            .iter()
+            .map(|&[key, _]| self.dict_key(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Object::Dict(items) = &mut self.objects[id.0 as usize] else {
+            return Err(Unsupported("an opaque construct of another form"));
+        };
+        for (dict_key, &[key, value]) in keys.into_iter().zip(pairs) {
+            match places.get(&dict_key) {
+                Some(&place) => items[place].1 = value,
+                None => {
+                    places.insert(dict_key, items.len());
+                    items.push((key, value));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the object that REDUCE makes of `callable` and `args`: a set
@@ -1128,7 +1243,9 @@ impl Loader<'_> {
     /// itself.
     fn opaque(&mut self, bytes: &[u8]) -> Result<Value, Unsupported> {
         let other = Unsupported("an opaque construct of another form");
-        let mut stack: Vec<Slot> = Vec::new();
+        let mut stack = Stack::default();
+        // The place of each key of each dict that the bytes fill.
+        let mut places: HashMap<ObjectId, HashMap<DictKey, usize>> = HashMap::new();
         let mut pos = 0;
         while let Some(&opcode) = bytes.get(pos) {
             let rest = &bytes[pos + 1..];
@@ -1137,7 +1254,7 @@ impl Loader<'_> {
             pos += 1 + len;
             let value = match opcode {
                 MARK => {
-                    stack.push(Slot::Mark);
+                    stack.push(Slot::Mark, self.heap);
                     continue;
                 }
                 NONE => Value::None,
@@ -1169,22 +1286,22 @@ impl Loader<'_> {
                 EMPTY_TUPLE => self.heap.new_tuple(Vec::new()),
                 TUPLE1 | TUPLE2 | TUPLE3 => {
                     let n = usize::from(opcode - TUPLE1) + 1;
-                    let items = pop_values(&mut stack, n)?;
+                    let items = stack.pop_values(n)?;
                     self.heap.new_tuple(items)
                 }
                 TUPLE => {
-                    let items = pop_mark(&mut stack)?;
+                    let items = stack.pop_mark()?;
                     self.heap.new_tuple(items)
                 }
                 EMPTY_LIST => Value::Object(self.heap.push(Object::List(Vec::new()))),
                 EMPTY_DICT => Value::Object(self.heap.push(Object::Dict(Vec::new()))),
                 APPEND | APPENDS => {
                     let items = if opcode == APPEND {
-                        pop_values(&mut stack, 1)?
+                        stack.pop_values(1)?
                     } else {
-                        pop_mark(&mut stack)?
+                        stack.pop_mark()?
                     };
-                    let id = fillable(&stack)?;
+                    let id = stack.fillable()?;
                     match &mut self.heap.objects[id.0 as usize] {
                         Object::List(list) => list.extend(items),
                         _ => return Err(other),
@@ -1193,16 +1310,15 @@ impl Loader<'_> {
                 }
                 SETITEM | SETITEMS => {
                     let flat = if opcode == SETITEM {
-                        pop_values(&mut stack, 2)?
+                        stack.pop_values(2)?
                     } else {
-                        pop_mark(&mut stack)?
+                        stack.pop_mark()?
                     };
-                    let id = fillable(&stack)?;
-                    let Object::Dict(items) = self.heap.get(id) else {
-                        return Err(other);
-                    };
-                    let items = self.heap.set_items(items.clone(), &flat)?;
-                    self.heap.objects[id.0 as usize] = Object::Dict(items);
+                    let id = stack.fillable()?;
+                    // A dict that the bytes fill comes from EMPTY_DICT of
+                    // the bytes, so its places start empty.
+                    let places = places.entry(id).or_default();
+                    self.heap.fill_dict(id, places, &flat)?;
                     continue;
                 }
                 BINPUT | LONG_BINPUT => {
@@ -1211,7 +1327,7 @@ impl Loader<'_> {
                     } else {
                         u32::from_le_bytes(arg.try_into().map_err(|_| other)?)
                     };
-                    let Some(Slot::Value(value, _)) = stack.last() else {
+                    let Some(Slot::Value(value, _)) = stack.slots.last() else {
                         return Err(other);
                     };
                     self.memo.insert(index, *value);
@@ -1227,31 +1343,28 @@ impl Loader<'_> {
                         .memo
                         .get(&index)
                         .ok_or(Unsupported("a memo get without its put"))?;
-                    if let Value::Object(id) = value {
-                        let on_stack = stack.iter().any(
-                            |slot| matches!(slot, Slot::Value(Value::Object(x), _) if *x == id),
-                        );
-                        if (on_stack && self.heap.fillable(id)) || self.open.contains(&id) {
-                            return Err(Unsupported("a container that holds itself"));
-                        }
+                    if let Value::Object(id) = value
+                        && (stack.holds(id) || self.open.contains(&id))
+                    {
+                        return Err(Unsupported("a container that holds itself"));
                     }
-                    stack.push(Slot::Value(value, true));
+                    stack.push(Slot::Value(value, true), self.heap);
                     continue;
                 }
                 BINPERSID => {
-                    let [data] = pop_values(&mut stack, 1)?[..] else {
+                    let [data] = stack.pop_values(1)?[..] else {
                         return Err(other);
                     };
                     self.heap.reference_of(data)?
                 }
                 REDUCE => {
-                    let [callable, args] = pop_values(&mut stack, 2)?[..] else {
+                    let [callable, args] = stack.pop_values(2)?[..] else {
                         return Err(other);
                     };
                     self.heap.reduce(callable, args)?
                 }
                 NEWOBJ => {
-                    let [class, args] = pop_values(&mut stack, 2)?[..] else {
+                    let [class, args] = stack.pop_values(2)?[..] else {
                         return Err(other);
                     };
                     if self.heap.class(class).is_none() || self.heap.tuple(args).is_none() {
@@ -1265,10 +1378,10 @@ impl Loader<'_> {
                     })))
                 }
                 BUILD => {
-                    let [state] = pop_values(&mut stack, 1)?[..] else {
+                    let [state] = stack.pop_values(1)?[..] else {
                         return Err(other);
                     };
-                    let id = fillable(&stack)?;
+                    let id = stack.fillable()?;
                     match &mut self.heap.objects[id.0 as usize] {
                         Object::Instance(instance) if instance.state.is_none() => {
                             instance.state = Some(state);
@@ -1286,9 +1399,9 @@ impl Loader<'_> {
                 }
                 _ => return Err(Unsupported("an opcode that the model does not model")),
             };
-            stack.push(Slot::Value(value, false));
+            stack.push(Slot::Value(value, false), self.heap);
         }
-        match stack[..] {
+        match stack.slots[..] {
             [Slot::Value(value, _)] => Ok(value),
             _ => Err(other),
         }
@@ -1306,38 +1419,70 @@ impl Heap {
     }
 }
 
-/// Returns the object on top of the stack of [`Loader::opaque`], to fill it.
-/// An object that a memo get pushed is complete and takes nothing more.
-fn fillable(stack: &[Slot]) -> Result<ObjectId, Unsupported> {
-    match stack.last() {
-        Some(Slot::Value(Value::Object(id), false)) => Ok(*id),
-        _ => Err(Unsupported("a fill of a value that is complete")),
+/// The stack of [`Loader::opaque`], with the number of times that each
+/// list, dict or object of another class is on it, so a memo get tells in a
+/// constant time if it would make a value that holds itself.
+#[derive(Default)]
+struct Stack {
+    slots: Vec<Slot>,
+    counts: HashMap<ObjectId, usize>,
+}
+
+impl Stack {
+    fn push(&mut self, slot: Slot, heap: &Heap) {
+        if let Slot::Value(Value::Object(id), _) = slot
+            && heap.fillable(id)
+        {
+            *self.counts.entry(id).or_default() += 1;
+        }
+        self.slots.push(slot);
     }
-}
 
-/// Pops the last `n` values of the stack of [`Loader::opaque`], in order.
-fn pop_values(stack: &mut Vec<Slot>, n: usize) -> Result<Vec<Value>, Unsupported> {
-    let other = Unsupported("an opaque construct of another form");
-    let start = stack.len().checked_sub(n).ok_or(other)?;
-    stack
-        .drain(start..)
-        .map(|slot| match slot {
-            Slot::Value(value, _) => Ok(value),
-            Slot::Mark => Err(other),
-        })
-        .collect()
-}
+    /// Tells if the list, dict or object of `id` is on the stack: it is
+    /// still taking its items or its state.
+    fn holds(&self, id: ObjectId) -> bool {
+        self.counts.get(&id).is_some_and(|&count| count > 0)
+    }
 
-/// Pops the values above the last mark of the stack of [`Loader::opaque`],
-/// and the mark.
-fn pop_mark(stack: &mut Vec<Slot>) -> Result<Vec<Value>, Unsupported> {
-    let mark = stack
-        .iter()
-        .rposition(|slot| matches!(slot, Slot::Mark))
-        .ok_or(Unsupported("an opaque construct of another form"))?;
-    let values = pop_values(stack, stack.len() - mark - 1)?;
-    stack.pop();
-    Ok(values)
+    /// Returns the object on top of the stack, to fill it. An object that a
+    /// memo get pushed is complete and takes nothing more.
+    fn fillable(&self) -> Result<ObjectId, Unsupported> {
+        match self.slots.last() {
+            Some(Slot::Value(Value::Object(id), false)) => Ok(*id),
+            _ => Err(Unsupported("a fill of a value that is complete")),
+        }
+    }
+
+    /// Pops the last `n` values, in order.
+    fn pop_values(&mut self, n: usize) -> Result<Vec<Value>, Unsupported> {
+        let other = Unsupported("an opaque construct of another form");
+        let start = self.slots.len().checked_sub(n).ok_or(other)?;
+        let mut values = Vec::with_capacity(n);
+        for slot in self.slots.drain(start..) {
+            let Slot::Value(value, _) = slot else {
+                return Err(other);
+            };
+            if let Value::Object(id) = value
+                && let Some(count) = self.counts.get_mut(&id)
+            {
+                *count -= 1;
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    /// Pops the values above the last mark, and the mark.
+    fn pop_mark(&mut self) -> Result<Vec<Value>, Unsupported> {
+        let mark = self
+            .slots
+            .iter()
+            .rposition(|slot| matches!(slot, Slot::Mark))
+            .ok_or(Unsupported("an opaque construct of another form"))?;
+        let values = self.pop_values(self.slots.len() - mark - 1)?;
+        self.slots.pop();
+        Ok(values)
+    }
 }
 
 /// Returns the int of the two's complement bytes of LONG1 or LONG4,
@@ -1935,14 +2080,21 @@ mod tests {
     }
 
     #[test]
-    fn same_compares_the_structure() {
+    fn canonical_ids_compare_the_structure() {
         let mut heap = Heap::with_instances();
         let (_, one) = heap.load(&decode_record(DOC).unwrap()).unwrap();
         let (_, two) = heap.load(&decode_record(DOC).unwrap()).unwrap();
         assert_ne!(one, two);
-        assert!(heap.same(one, two));
-        assert!(!heap.same(Value::Int(1), Value::Bool(true)));
-        assert!(heap.same(Value::Float(f64::NAN), Value::Float(f64::NAN)));
+        let mut canon = Canon::new(usize::MAX);
+        assert_eq!(canon.same(&heap, one, two), Ok(true));
+        assert_eq!(
+            canon.same(&heap, Value::Int(1), Value::Bool(true)),
+            Ok(false)
+        );
+        assert_eq!(
+            canon.same(&heap, Value::Float(f64::NAN), Value::Float(f64::NAN)),
+            Ok(true)
+        );
         let a = heap.new_dict(vec![
             (Value::Int(1), Value::Int(1)),
             (Value::Int(2), Value::Int(2)),
@@ -1951,7 +2103,12 @@ mod tests {
             (Value::Int(2), Value::Int(2)),
             (Value::Int(1), Value::Int(1)),
         ]);
-        assert!(!heap.same(a, b));
+        assert_eq!(canon.same(&heap, a, b), Ok(false));
+        // Two sets with the same items in another order are the same.
+        let class = heap.new_class("builtins", "set");
+        let x = heap.new_set(class, vec![Value::Int(1), Value::Int(2)]);
+        let y = heap.new_set(class, vec![Value::Int(2), Value::Int(1)]);
+        assert_eq!(canon.same(&heap, x, y), Ok(true));
         // Python cannot tell if two objects of another class are equal.
         let fields = heap.dict(one).unwrap().to_vec();
         let other = heap.dict(two).unwrap().to_vec();
@@ -1959,18 +2116,82 @@ mod tests {
     }
 
     #[test]
-    fn mutable_objects_lists_what_a_value_holds() {
-        let mut heap = Heap::with_instances();
-        let (_, state) = heap.load(&decode_record(DOC).unwrap()).unwrap();
-        let fields = heap.dict(state).unwrap().to_vec();
-        // A str, a tuple of strs and a DateTime are immutable.
-        assert!(heap.mutable_objects(fields[0].1).is_empty());
-        assert!(heap.mutable_objects(fields[2].1).is_empty());
-        assert!(heap.mutable_objects(fields[1].1).is_empty());
-        // A set is mutable.
-        assert_eq!(heap.mutable_objects(fields[3].1).len(), 1);
-        // The state itself is a dict.
-        assert_eq!(heap.mutable_objects(state).len(), 2);
+    fn a_shared_or_deep_value_takes_steps_in_proportion_to_its_objects() {
+        let mut heap = Heap::new();
+        // `x = (x, x)` 60 times: 2^60 leaves, 61 objects.
+        let mut shared = heap.new_tuple(vec![Value::Int(1)]);
+        for _ in 0..60 {
+            shared = heap.new_tuple(vec![shared, shared]);
+        }
+        let mut canon = Canon::new(1_000);
+        assert!(canon.id(&heap, shared).is_ok());
+        // A tuple nested 1,000,000 deep, without recursion.
+        let mut deep = heap.new_tuple(Vec::new());
+        for _ in 0..1_000_000 {
+            deep = heap.new_tuple(vec![deep]);
+        }
+        let mut canon = Canon::new(usize::MAX);
+        assert!(canon.id(&heap, deep).is_ok());
+        // Past its budget, a canon gives no answer.
+        let mut small = Canon::new(100);
+        assert_eq!(small.id(&heap, deep), Err(Undecided::Budget));
+    }
+
+    #[test]
+    fn the_comparisons_of_a_heap_stop_at_its_budget() {
+        let mut heap = Heap::new();
+        let mut shared = heap.new_tuple(vec![Value::Int(1)]);
+        for _ in 0..60 {
+            shared = heap.new_tuple(vec![shared, shared]);
+        }
+        let mut other = heap.new_tuple(vec![Value::Int(1)]);
+        for _ in 0..60 {
+            other = heap.new_tuple(vec![other, other]);
+        }
+        heap.set_budget(10_000);
+        assert_eq!(heap.eq(shared, other), Err(Undecided::Budget));
+        heap.set_budget(10_000);
+        assert_eq!(heap.lt(shared, other), Err(Undecided::Budget));
+        // Within its budget, a comparison gives its answer.
+        heap.set_budget(10_000);
+        assert_eq!(
+            heap.compare(Value::Int(1), Value::Int(2)),
+            Ok(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn a_large_opaque_value_loads_in_linear_time() {
+        // An object whose state is a dict filled by 100,000 SETITEMs, and an
+        // object of 200,000 memo gets of one str.
+        let mut setitems = b"\x80\x03cm\nM\nq\x01)\x81}".to_vec();
+        for i in 0..100_000 {
+            let key = format!("k{i}");
+            setitems.push(b'X');
+            setitems.extend(u32::try_from(key.len()).unwrap().to_le_bytes());
+            setitems.extend(key.as_bytes());
+            setitems.extend(b"K\x01s");
+        }
+        setitems.extend(b"b.");
+        let mut gets = b"\x80\x03cm\nM\nq\x01(X\x03\x00\x00\x00abcq\x02".to_vec();
+        for _ in 0..200_000 {
+            gets.extend(b"h\x02");
+        }
+        gets.extend(b"t\x81.");
+        for state in [setitems, gets] {
+            let record = [CLASS, &state].concat();
+            let tree = crate::decode_record_with(
+                &record,
+                crate::Limits {
+                    node_budget: record.len(),
+                },
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let mut heap = Heap::with_instances();
+            heap.load(&tree).unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
     }
 
     #[test]

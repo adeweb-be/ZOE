@@ -4,44 +4,55 @@
 //!
 //! The state of such an object is the dict of its attributes, its fields.
 //! A field changed on one side when its value there does not have the
-//! structure of its value in the old state (`Heap::same`). A field that
-//! one side changed takes that change; a field that both sides changed to
-//! the same value takes it. A field that both sides changed to different
-//! values takes the strategy of the policy. Coupled fields stay strict.
+//! structure of its value in the old state (`Canon`). A field that one
+//! side changed takes that change; a field that both sides changed to the
+//! same value takes it. A field that both sides changed to different values
+//! takes the strategy of the policy. Coupled fields stay strict.
 //!
 //! The merged state is the committed dict with the merged values in place,
 //! then the fields that only the new side added. The record is the class
 //! pickle of the new record and that state, pickled as zodbpickle does.
+//!
+//! The work is linear in the three records, within a step budget in
+//! proportion to their lengths: past it, the merge gives no answer.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use zoe_pickle::python::{Heap, Object, Pickler, Undecided, Value};
+use zoe_pickle::python::{Canon, Heap, Object, ObjectId, Pickler, Undecided, Value};
 
 use super::policy::{ClassPolicy, Strategy};
-use super::{MAX_KEYS, Merge, Outcome, Reason, Trees};
+use super::{MAX_KEYS, Merge, Outcome, Reason, Trees, budget};
 
 /// Merges the three records of a conflict with the entry of their class,
 /// and notes in `merge` the fields that the new record changed.
 pub(super) fn merge(trees: &Trees, entry: &ClassPolicy, merge: &mut Merge) -> Outcome {
     let mut heap = Heap::with_instances();
+    heap.set_budget(budget(trees.len));
     // As ZODB's resolver: the new record, then the old one, then the
     // committed one. A persistent reference takes its persistent id from
     // the first record that holds it.
     let loaded = heap.load(&trees.new).and_then(|(class, new)| {
-        let (_, old) = heap.load(&trees.old)?;
-        let (_, committed) = heap.load(&trees.committed)?;
-        Ok((class, [old, committed, new]))
+        let (old_class, old) = heap.load(&trees.old)?;
+        let (committed_class, committed) = heap.load(&trees.committed)?;
+        Ok(([old_class, committed_class, class], [old, committed, new]))
     });
-    let (class, states) = match loaded {
+    let (classes, states) = match loaded {
         Ok(loaded) => loaded,
         Err(unsupported) => return Outcome::Undecided(unsupported.0),
     };
     // ZODB writes the class of an ordinary persistent object as a GLOBAL
-    // alone.
+    // alone, and the heap keeps one class object for each name.
+    let class = classes[2];
     if heap.class(class).is_none() {
         return Outcome::Undecided("a class pickle of another format");
     }
-    match merge_fields(&mut heap, entry, &states, merge) {
+    // A merge that took the fields of an old class over the record of a
+    // new one would undo a change of class.
+    if classes.iter().any(|&other| other != class) {
+        return Outcome::Undecided("records of different classes");
+    }
+    let mut canon = Canon::new(budget(trees.len));
+    match merge_fields(&mut heap, &mut canon, entry, &states, merge) {
         Ok(state) => {
             let mut pickler = Pickler::new(&heap);
             match pickler.dump(class).and_then(|()| pickler.dump(state)) {
@@ -53,12 +64,23 @@ pub(super) fn merge(trees: &Trees, entry: &ClassPolicy, merge: &mut Merge) -> Ou
     }
 }
 
+/// Returns the outcome of a comparison without an answer.
+fn undecided(undecided: Undecided) -> Outcome {
+    match undecided {
+        Undecided::Budget => Outcome::Undecided("a merge over its step budget"),
+        Undecided::Raises | Undecided::Unknown => {
+            Outcome::Undecided("values that the model cannot compare")
+        }
+    }
+}
+
 /// The fields of one state, in order.
 type Fields = Vec<(Value, Value)>;
 
 /// Merges the fields of the three states. Returns the merged state.
 fn merge_fields(
     heap: &mut Heap,
+    canon: &mut Canon,
     entry: &ClassPolicy,
     states: &[Value; 3],
     merge: &mut Merge,
@@ -91,23 +113,24 @@ fn merge_fields(
         .chain(committed_map.keys())
         .chain(new_map.keys())
         .collect();
-    let changed = |side: &HashMap<String, Value>, name: &str| -> bool {
-        match (old_map.get(name), side.get(name)) {
-            (None, None) => false,
-            (Some(&a), Some(&b)) => !heap.same(a, b),
-            _ => true,
-        }
+    let changed = |canon: &mut Canon, side: &HashMap<String, Value>, name: &str| match (
+        old_map.get(name),
+        side.get(name),
+    ) {
+        (None, None) => Ok(false),
+        (Some(&a), Some(&b)) => Ok(!canon.same(heap, a, b).map_err(undecided)?),
+        _ => Ok(true),
     };
-    let by_committed: BTreeSet<&String> = names
-        .iter()
-        .copied()
-        .filter(|name| changed(&committed_map, name))
-        .collect();
-    let by_new: BTreeSet<&String> = names
-        .iter()
-        .copied()
-        .filter(|name| changed(&new_map, name))
-        .collect();
+    let mut by_committed: BTreeSet<&String> = BTreeSet::new();
+    let mut by_new: BTreeSet<&String> = BTreeSet::new();
+    for &name in &names {
+        if changed(canon, &committed_map, name)? {
+            by_committed.insert(name);
+        }
+        if changed(canon, &new_map, name)? {
+            by_new.insert(name);
+        }
+    }
     merge.changed = by_new.len();
     merge.keys = by_new
         .iter()
@@ -119,15 +142,16 @@ fn merge_fields(
     for group in &entry.coupled {
         let touched = |set: &BTreeSet<&String>| group.iter().any(|field| set.contains(field));
         if touched(&by_committed) && touched(&by_new) {
-            let agree =
-                group.iter().all(
-                    |field| match (committed_map.get(field), new_map.get(field)) {
-                        (None, None) => true,
-                        (Some(&a), Some(&b)) => heap.same(a, b),
-                        _ => false,
-                    },
-                );
+            let mut agree = true;
+            for field in group {
+                agree &= match (committed_map.get(field), new_map.get(field)) {
+                    (None, None) => true,
+                    (Some(&a), Some(&b)) => canon.same(heap, a, b).map_err(undecided)?,
+                    _ => false,
+                };
+            }
             if !agree {
+                merge.fields = group.clone();
                 return Err(Outcome::Refused(Reason::Coupled));
             }
         }
@@ -141,12 +165,22 @@ fn merge_fields(
             (false, true) => n,
             (true, true) => match (c, n) {
                 (None, None) => None,
-                (Some(c), Some(n)) if heap.same(c, n) => Some(c),
+                (Some(c), Some(n)) if canon.same(heap, c, n).map_err(undecided)? => Some(c),
                 (Some(c), Some(n)) => {
                     let old = old_map.get(name).copied();
-                    Some(both_changed(heap, entry.strategy(name), old, c, n)?)
+                    let strategy = entry.strategy(name);
+                    match both_changed(heap, canon, strategy, old, c, n) {
+                        Ok(value) => Some(value),
+                        Err(outcome) => {
+                            merge.fields = vec![name.clone()];
+                            return Err(outcome);
+                        }
+                    }
                 }
-                _ => return Err(Outcome::Refused(Reason::FieldDeleted)),
+                _ => {
+                    merge.fields = vec![name.clone()];
+                    return Err(Outcome::Refused(Reason::FieldDeleted));
+                }
             },
         };
         merged.insert(name, value);
@@ -180,25 +214,126 @@ fn fields_of(heap: &Heap, state: Value) -> Result<Fields, Outcome> {
     Ok(items.to_vec())
 }
 
+/// Tells if an object can change in place: a list, a dict, a set, or an
+/// object of another class but `DateTime.DateTime`, a value that no code
+/// changes in place. A str, a bytes, a tuple, a frozenset, a class and a
+/// persistent reference cannot.
+fn is_mutable(heap: &Heap, id: ObjectId) -> bool {
+    match heap.get(id) {
+        Object::List(_) | Object::Dict(_) => true,
+        Object::Instance(instance) => {
+            heap.class(instance.class) != Some(("DateTime.DateTime", "DateTime"))
+        }
+        Object::Set { class, .. } => heap.class(*class) != Some(("builtins", "frozenset")),
+        Object::Str(_)
+        | Object::Bytes(_)
+        | Object::Tuple(_)
+        | Object::Class { .. }
+        | Object::Reference(_) => false,
+    }
+}
+
+/// Returns the objects that an object holds directly. A persistent
+/// reference and a class hold nothing that a merge can split.
+fn parts(heap: &Heap, id: ObjectId) -> Vec<ObjectId> {
+    let objects = |values: &mut dyn Iterator<Item = Value>| -> Vec<ObjectId> {
+        values
+            .filter_map(|value| match value {
+                Value::Object(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    };
+    match heap.get(id) {
+        Object::Tuple(items) | Object::List(items) => objects(&mut items.iter().copied()),
+        Object::Dict(items) => objects(&mut items.iter().flat_map(|&(k, v)| [k, v])),
+        Object::Instance(instance) => objects(
+            &mut [instance.args]
+                .into_iter()
+                .chain(instance.state)
+                .chain([instance.class]),
+        ),
+        Object::Set { items, .. } => objects(&mut items.iter().copied()),
+        Object::Str(_) | Object::Bytes(_) | Object::Class { .. } | Object::Reference(_) => {
+            Vec::new()
+        }
+    }
+}
+
 /// Gives no answer for a state where two fields hold one mutable object: a
 /// merge that takes the fields from two records would split it in two, and
-/// a change of it through one field would not show through the other.
+/// a change of it through one field would not show through the other. Two
+/// fields may share an immutable value that holds no mutable object.
+///
+/// One walk of the state: each object is walked once, under the first field
+/// that reaches it. A second field that reaches it looks only at whether it
+/// holds a mutable object, which `holds` knows once for each object.
 fn check_shared(heap: &Heap, fields: &Fields) -> Result<(), Outcome> {
-    let mut seen = HashSet::new();
-    for &(_, value) in fields {
-        for id in heap.mutable_objects(value) {
-            if !seen.insert(id) {
-                return Err(Outcome::Undecided("an object that two fields share"));
+    let shared = Outcome::Undecided("an object that two fields share");
+    let mut owner: HashMap<ObjectId, usize> = HashMap::new();
+    let mut holds: HashMap<ObjectId, bool> = HashMap::new();
+    for (field, &(_, value)) in fields.iter().enumerate() {
+        let Value::Object(root) = value else {
+            continue;
+        };
+        let mut todo = vec![root];
+        while let Some(id) = todo.pop() {
+            match owner.get(&id) {
+                Some(&first) if first == field => continue,
+                Some(_) => {
+                    if holds_mutable(heap, id, &mut holds) {
+                        return Err(shared);
+                    }
+                    continue;
+                }
+                None => {
+                    owner.insert(id, field);
+                    todo.extend(parts(heap, id));
+                }
             }
         }
     }
     Ok(())
 }
 
+/// Tells if the object of `id` is mutable or holds a mutable object. The
+/// answer of each object goes into `memo`, so each object is looked at
+/// once. The walk uses an explicit stack.
+fn holds_mutable(heap: &Heap, id: ObjectId, memo: &mut HashMap<ObjectId, bool>) -> bool {
+    let mut stack = vec![(id, false)];
+    while let Some(&(id, expanded)) = stack.last() {
+        if memo.contains_key(&id) {
+            stack.pop();
+            continue;
+        }
+        if !expanded {
+            stack.last_mut().expect("an entry").1 = true;
+            if is_mutable(heap, id) {
+                memo.insert(id, true);
+                stack.pop();
+                continue;
+            }
+            for part in parts(heap, id) {
+                if !memo.contains_key(&part) {
+                    stack.push((part, false));
+                }
+            }
+            continue;
+        }
+        stack.pop();
+        let held = parts(heap, id)
+            .iter()
+            .any(|part| memo.get(part).copied().unwrap_or(true));
+        memo.insert(id, held);
+    }
+    memo[&id]
+}
+
 /// Merges a field that both sides changed to different values, with its
 /// strategy. `old` is its value in the old state, if it had one.
 fn both_changed(
     heap: &mut Heap,
+    canon: &mut Canon,
     strategy: Strategy,
     old: Option<Value>,
     committed: Value,
@@ -207,11 +342,12 @@ fn both_changed(
     match strategy {
         Strategy::Strict => Err(Outcome::Refused(Reason::FieldChanged)),
         Strategy::Lww => Ok(new),
-        // `max(committed, new)` of Python: the new value when it is
+        // `max(committed, new)` of Python 3: the new value when it is
         // greater, else the committed one.
         Strategy::Max => match less(heap, committed, new) {
             Ok(true) => Ok(new),
             Ok(false) => Ok(committed),
+            Err(Undecided::Budget) => Err(undecided(Undecided::Budget)),
             Err(_) => Err(Outcome::Undecided(
                 "values that the strategy max cannot order",
             )),
@@ -226,13 +362,13 @@ fn both_changed(
                 "values that the strategy sum does not add",
             )),
         },
-        Strategy::Union => union(heap, old, committed, new),
-        Strategy::Append => append(heap, old, committed, new),
+        Strategy::Union => union(heap, canon, old, committed, new),
+        Strategy::Append => append(heap, canon, old, committed, new),
     }
 }
 
-/// Tells if `a < b` as Python does. Two `DateTime`s compare by their time,
-/// the first item of their state, as their `__lt__` does.
+/// Tells if `a < b` as Python 3 does (`Heap::lt`). Two `DateTime`s compare
+/// by their time, the first item of their state, as their `__lt__` does.
 fn less(heap: &Heap, a: Value, b: Value) -> Result<bool, Undecided> {
     match (date_time(heap, a), date_time(heap, b)) {
         (Some(a), Some(b)) => heap.lt(a, b),
@@ -278,55 +414,16 @@ fn make(heap: &mut Heap, kind: Kind, items: Vec<Value>) -> Value {
     }
 }
 
-/// A key of an item for `union`: two items are one when they are equal
-/// for the model (`Heap::same`): the same kind and the same value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ItemKey {
-    None,
-    Bool(bool),
-    Int(i128),
-    Float(u64),
-    Str(String),
-    Bytes(Vec<u8>),
-    Tuple(Vec<ItemKey>),
-    List(Vec<ItemKey>),
-}
-
-/// Returns the key of an item, or `None` for an item that `union` does not
-/// take: a dict, a set, an object of another class, a persistent
-/// reference or a class.
-fn item_key(heap: &Heap, value: Value) -> Option<ItemKey> {
-    Some(match value {
-        Value::None => ItemKey::None,
-        Value::Bool(b) => ItemKey::Bool(b),
-        Value::Int(int) => ItemKey::Int(int),
-        Value::Float(float) => ItemKey::Float(float.to_bits()),
-        Value::Object(_) => match heap.object(value)? {
-            Object::Str(text) => ItemKey::Str(text.clone()),
-            Object::Bytes(bytes) => ItemKey::Bytes(bytes.clone()),
-            Object::Tuple(items) => ItemKey::Tuple(
-                items
-                    .iter()
-                    .map(|&item| item_key(heap, item))
-                    .collect::<Option<_>>()?,
-            ),
-            Object::List(items) => ItemKey::List(
-                items
-                    .iter()
-                    .map(|&item| item_key(heap, item))
-                    .collect::<Option<_>>()?,
-            ),
-            _ => return None,
-        },
-    })
-}
-
 /// The strategy `union`: the items of the old value that neither side
 /// removed, then the items that the committed side added, then the items
 /// that the new side added, each item once, in the kind of the new value.
-/// The three values are lists, tuples or sets.
+/// The three values are lists, tuples or sets, and two items are one when
+/// they have the same structure. A reorder of the items on one side does
+/// not show in the result: the order is that of the old value, then of the
+/// committed one, then of the new one.
 fn union(
     heap: &mut Heap,
+    canon: &mut Canon,
     old: Option<Value>,
     committed: Value,
     new: Value,
@@ -336,26 +433,29 @@ fn union(
         .and_then(|old| items(heap, old))
         .ok_or(not_items.clone())?;
     let (_, committed_items) = items(heap, committed).ok_or(not_items.clone())?;
-    let (kind, new_items) = items(heap, new).ok_or(not_items.clone())?;
-    let keys = |items: &[Value]| -> Option<Vec<ItemKey>> {
-        items.iter().map(|&item| item_key(heap, item)).collect()
+    let (kind, new_items) = items(heap, new).ok_or(not_items)?;
+    let mut keys = |items: &[Value]| -> Result<Vec<u32>, Outcome> {
+        items
+            .iter()
+            .map(|&item| canon.id(heap, item).map_err(undecided))
+            .collect()
     };
-    let old_keys = keys(&old_items).ok_or(not_items.clone())?;
-    let committed_keys = keys(&committed_items).ok_or(not_items.clone())?;
-    let new_keys = keys(&new_items).ok_or(not_items)?;
-    let old_set: HashSet<&ItemKey> = old_keys.iter().collect();
-    let committed_set: HashSet<&ItemKey> = committed_keys.iter().collect();
-    let new_set: HashSet<&ItemKey> = new_keys.iter().collect();
-    let mut taken: HashSet<&ItemKey> = HashSet::new();
+    let old_keys = keys(&old_items)?;
+    let committed_keys = keys(&committed_items)?;
+    let new_keys = keys(&new_items)?;
+    let old_set: HashSet<u32> = old_keys.iter().copied().collect();
+    let committed_set: HashSet<u32> = committed_keys.iter().copied().collect();
+    let new_set: HashSet<u32> = new_keys.iter().copied().collect();
+    let mut taken: HashSet<u32> = HashSet::new();
     let mut result = Vec::new();
-    for (item, key) in old_items.iter().zip(&old_keys) {
-        if committed_set.contains(key) && new_set.contains(key) && taken.insert(key) {
+    for (item, &key) in old_items.iter().zip(&old_keys) {
+        if committed_set.contains(&key) && new_set.contains(&key) && taken.insert(key) {
             result.push(*item);
         }
     }
     for (side, side_keys) in [(&committed_items, &committed_keys), (&new_items, &new_keys)] {
-        for (item, key) in side.iter().zip(side_keys) {
-            if !old_set.contains(key) && taken.insert(key) {
+        for (item, &key) in side.iter().zip(side_keys) {
+            if !old_set.contains(&key) && taken.insert(key) {
                 result.push(*item);
             }
         }
@@ -369,6 +469,7 @@ fn union(
 /// value.
 fn append(
     heap: &mut Heap,
+    canon: &mut Canon,
     old: Option<Value>,
     committed: Value,
     new: Value,
@@ -387,12 +488,15 @@ fn append(
     if tuple(old_kind) != tuple(kind) || tuple(committed_kind) != tuple(kind) {
         return Err(not_append);
     }
-    let prefix = |items: &[Value]| {
-        items.len() >= old_items.len()
-            && old_items.iter().zip(items).all(|(&a, &b)| heap.same(a, b))
-    };
-    if !prefix(&committed_items) || !prefix(&new_items) {
-        return Err(not_append);
+    for items in [&committed_items, &new_items] {
+        if items.len() < old_items.len() {
+            return Err(not_append);
+        }
+        for (&a, &b) in old_items.iter().zip(items.iter()) {
+            if !canon.same(heap, a, b).map_err(undecided)? {
+                return Err(not_append);
+            }
+        }
     }
     let mut result = committed_items;
     result.extend_from_slice(&new_items[old_items.len()..]);

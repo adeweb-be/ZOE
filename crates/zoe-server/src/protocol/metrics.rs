@@ -16,8 +16,9 @@
 //! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that tier 1
 //!   or tier 2 merged in a vote that passed (`native`), and the oids that a
 //!   second vote passed after the client resolved them (`python`).
-//! - `zoe_structural_merges_total{mode, outcome}`: the results of tier 1
-//!   in the votes, merged, refused or undecided, in mode `on` or `shadow`.
+//! - `zoe_structural_merges_total{tier, mode, outcome}`: the results of
+//!   tier 1 and of tier 2 in the votes, merged, refused or undecided, in
+//!   mode `on` or `shadow`.
 //! - `zoe_shadow_verifications_total{tier, same}`: the merges of shadow
 //!   mode that the second vote compared with the record of the client,
 //!   by tier and by whether the two records are the same.
@@ -126,19 +127,20 @@ pub(crate) struct Metrics {
     /// The oids in conflict that tier 1 or tier 2 merged in a vote that
     /// passed.
     pub(crate) conflicts_native: AtomicU64,
-    /// The results of tier 1, by mode (`on`, `shadow`) and outcome
-    /// (`merged`, `refused`, `undecided`).
-    pub(crate) structural_merges: [[AtomicU64; 3]; 2],
+    /// The results of tiers 1 and 2, by tier, mode (`on`, `shadow`) and
+    /// outcome (`merged`, `refused`, `undecided`).
+    pub(crate) structural_merges: [[[AtomicU64; 3]; 2]; 2],
     /// The checks of the merges of shadow mode, by tier (1, 2) and by
     /// whether the records are the same (`true`, `false`).
     pub(crate) shadow_verifications: [[AtomicU64; 2]; 2],
 }
 
 impl Metrics {
-    /// Count the results of tier 1 of one vote.
+    /// Count the results of tiers 1 and 2 of one vote.
     pub(crate) fn count_resolutions(&self, resolutions: &[zoe_core::Resolution]) {
         use zoe_core::{Mode, Resolved};
-        for resolution in resolutions.iter().filter(|resolution| resolution.tier == 1) {
+        for resolution in resolutions {
+            let tier = usize::from(resolution.tier == 2);
             let mode = match resolution.mode {
                 Mode::On => 0,
                 Mode::Shadow => 1,
@@ -149,7 +151,7 @@ impl Metrics {
                 Resolved::Refused(_) => 1,
                 Resolved::Undecided(_) => 2,
             };
-            self.structural_merges[mode][outcome].fetch_add(1, Ordering::Relaxed);
+            self.structural_merges[tier][mode][outcome].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -292,16 +294,18 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         &mut out,
         name,
         "counter",
-        "The number of results of the structural merges (tier 1) in the votes, by mode and outcome.",
+        "The number of results of the merges of tier 1 and tier 2 in the votes, by tier, mode and outcome.",
     );
     for (storage, labels) in &storages {
-        for (m, mode) in ["on", "shadow"].into_iter().enumerate() {
-            for (o, outcome) in ["merged", "refused", "undecided"].into_iter().enumerate() {
-                let count = get(&storage.metrics.structural_merges[m][o]);
-                let _ = writeln!(
-                    out,
-                    "{name}{{{labels},mode=\"{mode}\",outcome=\"{outcome}\"}} {count}"
-                );
+        for (t, tier) in ["1", "2"].into_iter().enumerate() {
+            for (m, mode) in ["on", "shadow"].into_iter().enumerate() {
+                for (o, outcome) in ["merged", "refused", "undecided"].into_iter().enumerate() {
+                    let count = get(&storage.metrics.structural_merges[t][m][o]);
+                    let _ = writeln!(
+                        out,
+                        "{name}{{{labels},tier=\"{tier}\",mode=\"{mode}\",outcome=\"{outcome}\"}} {count}"
+                    );
+                }
             }
         }
     }
@@ -419,12 +423,14 @@ mod tests {
             text.contains("zoe_conflicts_resolved_total{storage=\"1\",path=\"native\"} 0\n"),
             "{text}"
         );
-        for mode in ["on", "shadow"] {
-            for outcome in ["merged", "refused", "undecided"] {
-                let line = format!(
-                    "zoe_structural_merges_total{{storage=\"1\",mode=\"{mode}\",outcome=\"{outcome}\"}} 0\n"
-                );
-                assert!(text.contains(&line), "{text}");
+        for tier in ["1", "2"] {
+            for mode in ["on", "shadow"] {
+                for outcome in ["merged", "refused", "undecided"] {
+                    let line = format!(
+                        "zoe_structural_merges_total{{storage=\"1\",tier=\"{tier}\",mode=\"{mode}\",outcome=\"{outcome}\"}} 0\n"
+                    );
+                    assert!(text.contains(&line), "{text}");
+                }
             }
         }
         for tier in ["1", "2"] {
@@ -458,7 +464,7 @@ mod tests {
         assert!(help("zoe_fsync_batch_size").contains("in commits"));
         assert!(help("zoe_conflicts_resolved_total").contains("oids"));
         assert!(help("zoe_conflicts_raised_total").contains("transactions"));
-        assert!(help("zoe_structural_merges_total").contains("mode and outcome"));
+        assert!(help("zoe_structural_merges_total").contains("tier, mode and outcome"));
         assert!(
             help("zoe_invalidation_queue_depth")
                 .contains("the deepest hub queue among the connections of the storage")

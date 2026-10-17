@@ -234,10 +234,25 @@ pub struct Merge {
     /// rules give when a rule compared a dict or let a first key go. The
     /// outcome of the merge is then the outcome without the rules.
     pub shadow: Option<Outcome>,
+    /// For a refusal of tier 2, the fields that it names: the field whose
+    /// strategy refused, or the coupled group. Empty otherwise.
+    pub fields: Vec<String>,
 }
 
 /// The most keys that a [`Merge`] lists.
 pub const MAX_KEYS: usize = 20;
+
+/// The steps that the comparisons of one merge may take, for each byte of
+/// its three records.
+const STEPS_PER_BYTE: usize = 64;
+
+/// Returns the step budget of a merge whose three records hold `len`
+/// bytes in all. A merge of records of normal shapes takes a few steps for
+/// each value; a value that shares its parts many times takes more, and
+/// past the budget the merge gives no answer.
+pub(crate) fn budget(len: usize) -> usize {
+    len.saturating_mul(STEPS_PER_BYTE).saturating_add(4096)
+}
 
 /// Returns the class of `record` as `module.name` when tier 1 merges that
 /// class. Reads the class pickle alone.
@@ -264,6 +279,7 @@ pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: Mode) -> O
         keys: Vec::new(),
         changed: 0,
         shadow: None,
+        fields: Vec::new(),
     };
     merge.outcome = match decode(old, committed, new) {
         Ok(trees) => btrees::merge(&trees, class, posting_dicts, &mut merge),
@@ -289,6 +305,7 @@ pub fn tier2(
         keys: Vec::new(),
         changed: 0,
         shadow: None,
+        fields: Vec::new(),
     };
     merge.outcome = match decode(old, committed, new) {
         Ok(trees) => fields::merge(&trees, entry, &mut merge),
@@ -310,6 +327,8 @@ struct Trees {
     new: zoe_pickle::Tree,
     old: zoe_pickle::Tree,
     committed: zoe_pickle::Tree,
+    /// The bytes of the three records, for the step budget.
+    len: usize,
 }
 
 /// Decodes the three records. Each budget is the length of its record, so
@@ -325,6 +344,7 @@ fn decode(old: &[u8], committed: &[u8], new: &[u8]) -> Result<Trees, &'static st
         new: read(new)?,
         old: read(old)?,
         committed: read(committed)?,
+        len: old.len() + committed.len() + new.len(),
     })
 }
 
@@ -361,6 +381,9 @@ pub struct Resolution {
     /// a rule compared a dict or let a first key go; `outcome` is then the
     /// outcome without the rules.
     pub shadow: Option<Resolved>,
+    /// For a refusal of tier 2, the field whose strategy refused, or the
+    /// coupled group. Empty otherwise.
+    pub fields: Vec<String>,
 }
 
 /// What a tier gave for a conflict, without the merged record.
@@ -454,6 +477,8 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
     field("keys", format!("[{}]", keys.join(",")));
     field("changed", resolution.changed.to_string());
+    let fields: Vec<String> = resolution.fields.iter().map(|name| json(name)).collect();
+    field("fields", format!("[{}]", fields.join(",")));
     field(
         "committed",
         json(&format!("0x{:016x}", resolution.committed.0)),
@@ -548,6 +573,7 @@ impl Resolution {
             committed,
             read,
             shadow: merge.shadow.as_ref().map(Resolved::of),
+            fields: merge.fields.clone(),
         }
     }
 }

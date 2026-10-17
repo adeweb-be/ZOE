@@ -490,16 +490,84 @@ fn shadow_mode_merges_for_the_log_and_checks_the_resolution_of_the_caller() {
     }
 }
 
+/// Runs a conflict of a change of the title and a change of the
+/// description of a Document. Returns the outcome of the vote: true when
+/// the vote merged it, false when it listed it for the caller.
+fn title_and_description(store: &Store) -> bool {
+    let (oid, read) = conflict(
+        store,
+        &doc(&base()),
+        &doc(&changed(&[("title", V::Str("B"))])),
+    );
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &doc(&changed(&[("description", V::Str("two"))])))
+        .unwrap();
+    let conflicts = txn.vote_resolving().unwrap();
+    conflicts.is_empty()
+}
+
 #[test]
 fn a_new_version_of_the_policy_applies_at_the_next_conflict() {
     let (store, policy_oid, serial) = with_policy(ON);
+    // A conflict reads the policy before its change.
+    assert!(title_and_description(&store));
     let off: Entry = &[("tier2", Setting::Text("off"))];
-    commit(
+    let serial = commit(
         &store,
         policy_oid,
         serial,
         &policy(2, &[("m.Document", off)]),
     );
+    assert!(!title_and_description(&store));
+    // A change of the root alone reads the same policy again.
+    let root_serial = store.load(Oid(0)).unwrap().1;
+    commit(&store, Oid(0), root_serial, &root(policy_oid));
+    assert!(!title_and_description(&store));
+    commit(
+        &store,
+        policy_oid,
+        serial,
+        &policy(3, &[("m.Document", ON)]),
+    );
+    assert!(title_and_description(&store));
+}
+
+#[test]
+fn records_of_different_classes_give_no_answer() {
+    let (store, _, _) = with_policy(ON);
+    // The committed transaction changed the class of the object.
+    let other = record(("m", "Other"), &changed(&[("title", V::Str("B"))]));
+    let (oid, read) = conflict(&store, &doc(&base()), &other);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &doc(&changed(&[("description", V::Str("two"))])))
+        .unwrap();
+    assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+    assert_eq!(
+        txn.resolutions()[0].outcome,
+        Resolved::Undecided("records of different classes")
+    );
+}
+
+#[test]
+fn a_refusal_names_its_field_or_its_group() {
+    let (store, _, _) = with_policy(ON);
+    let (oid, read) = conflict(
+        &store,
+        &doc(&base()),
+        &doc(&changed(&[("title", V::Str("B"))])),
+    );
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &doc(&changed(&[("title", V::Str("C"))])))
+        .unwrap();
+    assert!(txn.vote_resolving().is_err());
+    assert_eq!(txn.resolutions()[0].fields, ["title"]);
+    let line = &txn.resolution_log_lines(std::time::UNIX_EPOCH, None)[0];
+    assert!(line.contains("\"fields\":[\"title\"]"), "{line}");
+    const COUPLED: Entry = &[
+        ("tier2", Setting::Text("on")),
+        ("coupled", Setting::Coupled(&[&["title", "description"]])),
+    ];
+    let (store, _, _) = with_policy(COUPLED);
     let (oid, read) = conflict(
         &store,
         &doc(&base()),
@@ -508,8 +576,131 @@ fn a_new_version_of_the_policy_applies_at_the_next_conflict() {
     let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
     txn.store(oid, read, &doc(&changed(&[("description", V::Str("two"))])))
         .unwrap();
-    assert_eq!(txn.vote_resolving().unwrap().len(), 1);
-    assert!(txn.resolutions().is_empty());
+    assert!(txn.vote_resolving().is_err());
+    assert_eq!(txn.resolutions()[0].fields, ["title", "description"]);
+}
+
+/// Returns the record of a Document whose state `make` builds.
+fn built(make: impl FnOnce(&mut Heap) -> Vec<(Value, Value)>) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class(DOCUMENT.0, DOCUMENT.1);
+    let items = make(&mut heap);
+    let state = heap.new_dict(items);
+    let mut pickler = Pickler::new(&heap);
+    pickler.dump(class).unwrap();
+    pickler.dump(state).unwrap();
+    pickler.into_bytes()
+}
+
+/// Runs a conflict of three records with the entry `entry`, on a thread with
+/// a stack of 1 MiB. Returns the outcome of tier 2.
+fn tier2_outcome(entry: Entry, old: Vec<u8>, committed: Vec<u8>, new: Vec<u8>) -> Resolved {
+    std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let (store, _, _) = with_policy(entry);
+            let (oid, read) = conflict(&store, &old, &committed);
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, read, &new).unwrap();
+            let _ = txn.vote_resolving();
+            txn.resolutions()[0].outcome
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn a_deep_item_of_a_union_needs_no_deep_stack() {
+    const UNION: Entry = &[
+        ("tier2", Setting::Text("on")),
+        ("fields", Setting::Fields(&[("tags", "union")])),
+    ];
+    let with = |heap: &mut Heap, tags: Vec<Value>| {
+        let key = heap.new_str("tags");
+        let list = heap.new_list(tags);
+        vec![(key, list)]
+    };
+    let old = built(|heap| with(heap, Vec::new()));
+    // A tuple nested 100,000 deep.
+    let committed = built(|heap| {
+        let mut deep = heap.new_tuple(Vec::new());
+        for _ in 0..100_000 {
+            deep = heap.new_tuple(vec![deep]);
+        }
+        with(heap, vec![deep])
+    });
+    let new = built(|heap| with(heap, vec![Value::Int(7)]));
+    assert_eq!(tier2_outcome(UNION, old, committed, new), Resolved::Merged);
+}
+
+#[test]
+fn a_value_that_shares_its_parts_merges_in_proportion_to_its_record() {
+    // `x = (x, x)` 40 times in one field: 2^40 leaves, 41 objects.
+    let make = |title: &'static str| {
+        built(move |heap| {
+            let mut shared = heap.new_tuple(vec![Value::Int(1)]);
+            for _ in 0..40 {
+                shared = heap.new_tuple(vec![shared, shared]);
+            }
+            let (key, value) = (heap.new_str("tree"), shared);
+            let (title_key, title) = (heap.new_str("title"), heap.new_str(title));
+            vec![(key, value), (title_key, title)]
+        })
+    };
+    let started = std::time::Instant::now();
+    let outcome = tier2_outcome(ON, make("A"), make("B"), make("A"));
+    assert_eq!(outcome, Resolved::Merged);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn two_fields_can_share_an_immutable_value_and_not_a_list() {
+    for (list, expected) in [(false, true), (true, false)] {
+        let make = |title: &'static str| {
+            built(move |heap| {
+                let parts = vec![Value::Int(1), Value::Int(2)];
+                let shared = if list {
+                    heap.new_list(parts)
+                } else {
+                    heap.new_tuple(parts)
+                };
+                let (a, b) = (heap.new_str("a"), heap.new_str("b"));
+                let (title_key, title) = (heap.new_str("title"), heap.new_str(title));
+                vec![(a, shared), (b, shared), (title_key, title)]
+            })
+        };
+        let outcome = tier2_outcome(ON, make("A"), make("B"), make("A"));
+        assert_eq!(outcome == Resolved::Merged, expected, "list: {list}");
+    }
+}
+
+#[test]
+fn a_set_in_another_order_is_not_a_change() {
+    let make = |order: [i128; 2], title: &'static str, description: &'static str| {
+        built(move |heap| {
+            let class = heap.new_class("builtins", "set");
+            let items = order.iter().map(|&n| Value::Int(n)).collect();
+            let set = heap.new_set(class, items);
+            let fields = [("tags", set), ("title", heap.new_str(title))];
+            let mut items: Vec<(Value, Value)> = fields
+                .into_iter()
+                .map(|(name, value)| (heap.new_str(name), value))
+                .collect();
+            let key = heap.new_str("description");
+            items.push((key, heap.new_str(description)));
+            items
+        })
+    };
+    // The committed record holds the set in another order and the new title;
+    // the new record changes the description: two fields, no conflict.
+    let outcome = tier2_outcome(
+        ON,
+        make([1, 2], "A", "one"),
+        make([2, 1], "B", "one"),
+        make([1, 2], "A", "two"),
+    );
+    assert_eq!(outcome, Resolved::Merged);
 }
 
 #[test]

@@ -639,7 +639,7 @@ fn a_line_of_the_resolution_log_names_both_transactions() {
         "{{\"time\":1760000000.000001,\"storage\":\"main\",\"oid\":\"0x{:016x}\",\
          \"class\":\"BTrees.IIBTree.IIBucket\",\"tier\":1,\"mode\":\"on\",\"policy\":null,\
          \"outcome\":\"merged\",\"code\":null,\"reason\":null,\"shadow\":null,\"applied\":true,\
-         \"keys\":[\"3\"],\"changed\":1,\"committed\":\"0x{:016x}\",\"read\":\"0x{:016x}\",\
+         \"keys\":[\"3\"],\"changed\":1,\"fields\":[],\"committed\":\"0x{:016x}\",\"read\":\"0x{:016x}\",\
          \"user\":\"second\",\"description\":\"/doc/edit\",\"committed_user\":\"first\",\
          \"committed_description\":\"/doc/edit \\\"one\\\"\"}}",
         oid.0, committed.0, read.0

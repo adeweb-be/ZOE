@@ -1134,6 +1134,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 keys: Vec::new(),
                 changed: 0,
                 shadow: None,
+                fields: Vec::new(),
             };
             return Ok(Some((mode, merge)));
         };

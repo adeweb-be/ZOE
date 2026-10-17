@@ -3041,7 +3041,7 @@ mod tests {
         );
         let metrics = &s.storage.metrics;
         assert_eq!(get_counter(&metrics.conflicts_native), 1);
-        assert_eq!(get_counter(&metrics.structural_merges[0][0]), 1);
+        assert_eq!(get_counter(&metrics.structural_merges[0][0][0]), 1);
         // The client resolved nothing.
         let status = s.storage.status().to_value();
         assert_eq!(count(&status, "conflicts_resolved"), 0);

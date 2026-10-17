@@ -1,6 +1,6 @@
 # 0046. The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2
 
-Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human". During the build the human approved two changes, which the text below holds: the digest of a merge of shadow mode is BLAKE3, the hash that the core already links, in place of sha256; and the strs and bytes that CPython shares in every record (the empty ones, those of one character below U+0100, and the interned keys of dict states) do not count as an object that two fields share. The second checkpoint of the card, the classes of `zoe.plone` (section 9), is approved too.
+Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human". During the build the human approved two changes, which the text below holds: the digest of a merge of shadow mode is BLAKE3, the hash that the core already links, in place of sha256; and the strs and bytes that CPython shares in every record (the empty ones, those of one character below U+0100, and the interned keys of dict states) do not count as an object that two fields share. The second checkpoint of the card, the classes of `zoe.plone` (section 9), is approved too. The review of the build then asked for changes; the human was away and asked Claude to decide them, and section 10 holds those decisions, which are Claude's.
 
 ## Context
 
@@ -46,7 +46,8 @@ Its state holds plain values only (`str`, ints, lists, tuples, dicts), so that t
 }
 ```
 
-- `zoe.policy.install(connection, policy)` validates a dict of this form, writes it to the object (it creates the object and the name of the root the first time), and adds 1 to `version`. The caller commits, so a policy commits or aborts with its transaction. `zoe.policy.read(connection)` gives the dict, or `None`.
+- `zoe.policy.install(connection, policy)` validates a dict of this form, writes it to the object (it creates the object and the name of the root the first time), and adds 1 to `version`. The caller commits, so a policy commits or aborts with its transaction. `zoe.policy.read(connection)` gives the dict, or `None`. `zoe.policy.validate(policy)` checks a dict of this form and gives a copy of plain values: each text a plain `str`, each mode and strategy one of the constants of the module, so the core reads every value.
+- An entry can also hold `"blocked": True`: the class never merges in tier 2, whatever its other keys say. `zoe.plone` blocks a class whose invariant it cannot read (section 9).
 - `zoe.plone` writes the policy with its profile (step 4 of the card); a site without `zoe.plone` writes it with `zoe.policy.install`.
 
 ### 2. How the core reads it, and when it reads it again
@@ -70,7 +71,7 @@ Tier 2 runs at the vote, after tier 1, on a stale written oid whose class is not
 4. A field that both sides changed to different values takes the strategy of its entry in `fields`, else `default`:
    - `strict`: refuses.
    - `lww`: the value of the new record: the transaction that votes now is the last writer.
-   - `max`: the greater of the two values, with the order of `Heap::compare` of tier 1; values that it cannot order give no answer. For `modification_date`, two `DateTime`s order by their time.
+   - `max`: the greater of the two values, with the order of Python 3 (`Heap::lt`); values that it cannot order give no answer. For `modification_date`, two `DateTime`s order by their time.
    - `sum`: committed + new − old, for ints only.
    - `union`: for lists, tuples, sets and frozensets of values that the model orders: the items of the old value that neither side removed, then the items that the committed side added, then the items that the new side added, each item once, in the kind of the new value. A set keeps the order of the model.
    - `append`: for lists and tuples: the old value must be a prefix of both; the result is the committed value, then the items that the new side added after the old prefix. Else it refuses.
@@ -80,7 +81,7 @@ Tier 2 runs at the vote, after tier 1, on a stale written oid whose class is not
 
 A refusal of tier 2 fails the vote with `ConflictError` at once. No answer leaves the conflict to tier 3: the client resolves it if the class has a `_p_resolveConflict`, else raises `ConflictError`, as today.
 
-The merge is linear in the size of the three states. No Python runs in the core or on the server.
+The merge is linear in the size of the three records, within a step budget in proportion to their lengths: a value that shares its parts many times costs its objects, not its expansion, and past the budget the merge gives no answer. Three records whose class pickles name different classes give no answer: a merge would undo the change of class of the committed transaction. No Python runs in the core or on the server.
 
 ### 5. F30: the merge primitives as strategies
 
@@ -102,11 +103,31 @@ Tier 2 and the policy are in `zoe-core`, so `zoe.Storage` and `zoe serve` have t
 
 ### 9. The classes of `zoe.plone` (the second checkpoint)
 
-- `zoe.plone.history.WorkflowHistory` holds `workflow_history`: a `Persistent` mapping of workflow id to the tuple of its status dicts, whose state is the mapping itself, so each workflow is a field. Its `__setstate__` interns the keys. Its entry is `{"tier2": "on", "default": "append"}` (`zoe.plone.history.policy()`). The opt-in Dexterity behaviour `zoe.plone.history` gives a new object of a type with the behaviour a `WorkflowHistory` when it is created, before its first status; an upgrade step moves the stock `PersistentMapping` histories of the content with the behaviour. A type without the behaviour keeps the stock history.
+- `zoe.plone.history.WorkflowHistory` holds `workflow_history`: a `Persistent` mapping of workflow id to the tuple of its status dicts, whose state is the mapping itself, so each workflow is a field. Its `__setstate__` interns the keys. Its entry is `{"tier2": "on", "default": "append"}` (`zoe.plone.history.policy()`). The opt-in Dexterity behaviour `zoe.plone.history` gives an object of a type with the behaviour a `WorkflowHistory` at its next status, through its status adapter; the import step of the profile moves the stock `PersistentMapping` histories of the content with the behaviour (section 10). A type without the behaviour keeps the stock history.
 - Comments get no class of their own: the `Conversation` of plone.app.discussion keeps them in BTrees and a `Length`, which tier 1 merges.
 - Audit entries get no class: Plone 6.1 keeps no audit log in the ZODB. A package that keeps an append-only list in an object gives its class an entry with `append`.
-- The profile of `zoe.plone` writes the policy with `zoe.policy.install`. It derives an entry for the class of each Dexterity type: the class merges field by field; the fields that an `@invariant` of the schema or of a behaviour of a type of that class names are a coupled group; a class with an invariant whose fields the derivation cannot find gets no entry; `modification_date` takes `max`, and the other fields `strict`. An overrides file of the profile changes the mode or the strategies of a class.
-- As built (`zoe.plone.merges`): the derivation reads the names that the code of an invariant uses, and a field that the factory of its behaviour stores under another name (`effective` as `effective_date`) takes both names in its group. The derived entries are in shadow mode, as the specification asks a class to merge only after shadow mode showed that its merges are right; the key `tier2` of the overrides gives another mode. The overrides are the file `zoe-merge-policy.json` of a profile, and the import step `zoe.plone.merge_policy` runs for each profile that holds one, so a policy package of a site gives its own. The upgrade step moves the histories in batches of 100 objects, one transaction each.
+- The profile of `zoe.plone` writes the policy with `zoe.policy.install`. It derives an entry for the class of each Dexterity type: the class merges field by field; the fields that an `@invariant` of the schema or of a behaviour of a type of that class names are a coupled group; a class with an invariant whose group would be empty is blocked; `modification_date` takes `max`, and the other fields `strict`. An overrides file of the profile changes the mode or the strategies of a class.
+- As built (`zoe.plone.merges`): the derivation reads the names that the code of an invariant uses, and a field that the factory of its behaviour stores under another name (`effective` as `effective_date`) takes both names in its group. The derived entries are in shadow mode, as the specification asks a class to merge only after shadow mode showed that its merges are right; the key `tier2` of the overrides gives another mode. The overrides are the file `zoe-merge-policy.json` of a profile, and the import step `zoe.plone.merge_policy` runs for each profile that holds one, so a policy package of a site gives its own. The import step moves the histories in batches of 100 objects, one transaction each.
+
+### 10. The review of the build (Claude's decisions, under the delegation of the human)
+
+The core:
+
+- **No recursion, a budget.** The structure of a value is its canonical id (`zoe_pickle::python::Canon`): a value gets a small id from its kind and the ids of its parts, with an explicit stack, once for each object. Change detection, `union`, `append` and the coupled groups compare these ids, so no merge recurses over a value and a shared part costs one step. Each merge has a step budget of 64 steps for each byte of its three records, and the comparisons of tier 1 (`Heap::eq`, `Heap::lt`) take the same budget: past it, the merge gives no answer. A merge of records of normal shapes stays far under it, so the merges and the bytes of tier 1 do not change.
+- **Sets.** A set compares without order: two sets with the same items are the same value, whatever the order of their pickles.
+- **The loader.** The loader of opaque values keeps the place of each key of a dict that it fills, and a count of the lists, dicts and objects on its stack, so a large record loads in linear time.
+- **One walk for sharing.** The check of an object that two fields share is one walk of the state: an object that a second field reaches stops the merge only when it is mutable or holds a mutable object, which is known once for each object.
+- **The log and the metric.** A refusal of tier 2 names the field whose strategy refused, or the coupled group, in the field `fields` of its line. `zoe_structural_merges_total` has the label `tier`, so it counts the results of tier 2 too.
+- **The root.** The reader of the root decodes it with a heap of instances, as the root can hold objects of other classes.
+
+`zoe.plone`:
+
+- **The status adapter.** The behaviour gives an object its `WorkflowHistory` at its next status, through a status adapter (`zoe.plone.status`) whose `set` moves the history first. So a history that a check-in of plone.app.iterate or an import of a site puts back is moved at the next transition, and an object of a type without a workflow gets no history.
+- **The moves.** The move of a history marks the stock history as changed, so a move and a transition from one snapshot conflict in both orders, and the retry loses no status. The import step `zoe.plone.history` of the profile moves the histories at each import; an upgrade step would not run, as the profile has one version. It finds the objects by the types whose behaviours resolve to the marker, by name or by interface, as the index `object_provides` of an object indexed before the behaviour does not hold the marker. The profile `zoe.plone:uninstall` removes the behaviour and gives each history back as the stock `PersistentMapping` of Zope.
+- **The coupled groups.** An invariant couples every field of the interface that declares it, the fields that its code reads, and their stored names, never a part of them. A class whose group would be empty is blocked.
+- **The names.** The policy names a class by its `__module__` and `__qualname__`, as its records do, not by the text of the type.
+- **The import of the policy.** The import step depends on `typeinfo`. The site keeps the overrides of each profile under its profile id, so the import of one profile keeps those of the others. An override adds its coupled groups to the derived ones and cannot unblock a class: the class stays blocked and the import logs a warning. The policy composes with the one in the database, so several sites in one database add up: the coupled groups of a class join, its fields join, a blocked class stays blocked, and the other keys take the new value. A change of a Dexterity type derives the policy again.
+- **The mapping.** `WorkflowHistory` is a `MutableMapping`.
 
 ## Consequences
 
@@ -115,6 +136,9 @@ Tier 2 and the policy are in `zoe-core`, so `zoe.Storage` and `zoe serve` have t
 - `zoe_pickle::python` models instances of other classes. Tier 1 refuses or gives no answer on them as today: the merges of BTrees do not change.
 - A wrong policy can merge two changes that the application meant to exclude each other. That is why a class is strict until its entry says otherwise, and why shadow mode comes first.
 - A change of the policy applies from the next conflict, without a restart.
+- `append` merges two transitions of one object from one snapshot. Two transitions that change the state from one state can then both commit, when the permission fields of the object and the `review_state` of the catalog do not conflict: the history holds both statuses, and the last one gives the state. A named merge that refuses two changes of state is a later card.
+- `union` keeps no reorder of the items on one side: the order of the result is that of the old value, then of the committed one, then of the new one.
+- Shadow mode verifies a merge only when the client resolves the conflict with a `_p_resolveConflict`. A Dexterity class has none, so shadow mode of tier 2 on it logs its merges and checks none of them.
 
 ## Alternatives
 

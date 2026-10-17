@@ -165,13 +165,9 @@ impl Policy {
     pub fn has_shadow(&self) -> bool {
         self.structural_merges == Some(Mode::Shadow)
             || self.posting_dicts == Some(Mode::Shadow)
-            || self
-                .classes
-                .values()
-                .any(|entry| {
-                    entry.tier1 == Some(Mode::Shadow)
-                        || (entry.tier2 == Mode::Shadow && !entry.blocked)
-                })
+            || self.classes.values().any(|entry| {
+                entry.tier1 == Some(Mode::Shadow) || (entry.tier2 == Mode::Shadow && !entry.blocked)
+            })
     }
 }
 
@@ -179,7 +175,8 @@ impl Policy {
 /// [`ROOT_NAME`], or `None` when it names none. The root is a
 /// `PersistentMapping`: its state is `{'data': {name: value}}`.
 pub fn policy_oid(root: &[u8]) -> std::result::Result<Option<Oid>, &'static str> {
-    let mut heap = Heap::new();
+    // The root can hold objects of other classes beside the policy.
+    let mut heap = Heap::with_instances();
     let (_, state) = load(&mut heap, root)?;
     let fields = str_dict(&heap, state).ok_or("a root state that is not a dict")?;
     let Some(&(_, data)) = fields
