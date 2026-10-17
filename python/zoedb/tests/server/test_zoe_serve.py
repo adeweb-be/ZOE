@@ -5,12 +5,15 @@ rest: the keys against the options of `zoe serve`, the TOML file, the
 twins, the search for the binary, the errors, and the process that runs.
 """
 
+import ctypes
 import io
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 import pytest
@@ -240,6 +243,46 @@ def test_a_file_without_the_section_is_a_usage_error(tmp_path, capsys):
     assert "zoe-server" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("memory_file", [True, False])
+def test_the_configuration_file_has_no_name_on_disk(tmp_path, monkeypatch, memory_file):
+    if memory_file and not hasattr(os, "memfd_create"):
+        pytest.skip("this platform has no memory file")
+    if not memory_file:
+        # The fallback of a platform without memfd_create runs on Linux too.
+        monkeypatch.delattr(os, "memfd_create", raising=False)
+    # The temporary file of a platform without memfd_create goes here.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    text = 'listen = "127.0.0.1:0"\n'
+    descriptor, path = serve.config_file(text)
+    try:
+        assert os.get_inheritable(descriptor)
+        if memory_file:
+            assert path == f"/proc/self/fd/{descriptor}"
+        else:
+            assert path == f"/dev/fd/{descriptor}"
+            assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
+            # On macOS an open of the path reads from this offset.
+            assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
+        # zoe serve opens the path and reads the whole file.
+        with open(path) as file:
+            assert file.read() == text
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        os.close(descriptor)
+
+
+def program_path(pid):
+    """Return the path of the program that the process `pid` runs, on macOS."""
+    proc_pidpath = ctypes.CDLL(None, use_errno=True).proc_pidpath
+    proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+    proc_pidpath.restype = ctypes.c_int
+    # The size is PROC_PIDPATHINFO_MAXSIZE of libproc.
+    buffer = ctypes.create_string_buffer(4096)
+    if proc_pidpath(pid, buffer, ctypes.sizeof(buffer)) <= 0:
+        raise OSError(ctypes.get_errno(), f"proc_pidpath({pid}) failed")
+    return os.fsdecode(buffer.value)
+
+
 def test_the_process_becomes_zoe_serve_without_the_settings_in_its_arguments(
     tmp_path,
 ):
@@ -262,13 +305,27 @@ def test_the_process_becomes_zoe_serve_without_the_settings_in_its_arguments(
                 break
         else:
             raise AssertionError(f"zoe.serve stopped with {process.wait()}")
-        proc = f"/proc/{process.pid}"
-        assert os.path.realpath(f"{proc}/exe") == os.path.realpath(binary)
-        with open(f"{proc}/cmdline", "rb") as file:
-            argv = file.read().split(b"\0")[:-1]
-        assert argv[1:3] == [b"serve", b"--config"]
-        assert re.fullmatch(rb"/proc/self/fd/\d+", argv[3])
-        assert len(argv) == 4
+        if sys.platform == "linux":
+            proc = f"/proc/{process.pid}"
+            assert os.path.realpath(f"{proc}/exe") == os.path.realpath(binary)
+            with open(f"{proc}/cmdline", "rb") as file:
+                argv = file.read().split(b"\0")[:-1]
+            assert argv[1:3] == [b"serve", b"--config"]
+            assert re.fullmatch(rb"/proc/self/fd/\d+", argv[3])
+            assert len(argv) == 4
+        else:
+            # macOS has no /proc. libproc gives the path of the program, and
+            # ps gives the arguments, joined with spaces.
+            program = program_path(process.pid)
+            assert os.path.realpath(program) == os.path.realpath(binary)
+            command = subprocess.run(
+                ["ps", "-ww", "-o", "command=", "-p", str(process.pid)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.rstrip("\n")
+            pattern = re.escape(binary) + r" serve --config /dev/fd/\d+"
+            assert re.fullmatch(pattern, command)
     finally:
         process.send_signal(signal.SIGTERM)
         assert process.wait(TIMEOUT) == 0

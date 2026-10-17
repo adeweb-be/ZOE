@@ -8,11 +8,12 @@ keys `path`, `blob-dir`, `read-only` and `pack-gc`. The key
 `structural-merge-class`, once for each class, is the table
 `[structural-merge-classes]`.
 
-The module writes the settings as a TOML file into a memory file, which
-has no path on disk, and replaces itself with `zoe serve --config` on
-that file. So no Python stays in the process of the server, a supervisor
-stops the server with SIGTERM, and no value of the section goes into the
-arguments of the process.
+The module writes the settings as a TOML file into a file that has no
+name on disk, and replaces itself with `zoe serve --config` on that file.
+On Linux, the file is a memory file. On other platforms, it is a
+temporary file whose name the module removes. So no Python stays in the
+process of the server, a supervisor stops the server with SIGTERM, and no
+value of the section goes into the arguments of the process.
 
 The wheel has no server. The binary is the `binary` key of the section,
 else `ZOE_BINARY`, else the `zoe` binary on the PATH. The search on the
@@ -26,6 +27,7 @@ import argparse
 import io
 import os
 import sys
+import tempfile
 
 import ZConfig
 from ZConfig.datatypes import stock_datatypes
@@ -231,6 +233,51 @@ def find_binary(section, environ):
     return None
 
 
+def _write_all(descriptor, data):
+    """Write all of `data` to `descriptor`, or raise `OSError`.
+
+    A short write that ends at a line would give a valid file without its
+    last keys.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written == 0:
+            raise OSError("the configuration file of zoe serve took no byte")
+        view = view[written:]
+
+
+def config_file(text):
+    """Write `text` into a file that has no name on disk.
+
+    Return the inheritable descriptor of the file, and the path through
+    which `zoe serve` opens it. On Linux, the file is a memory file, and
+    the path is in /proc. Other platforms have no memory file. There, the
+    file is a temporary file of mode 0600 in a private directory. The
+    function removes the name of the file and the directory at once, and
+    the path is in /dev/fd.
+    """
+    data = text.encode()
+    if hasattr(os, "memfd_create"):
+        descriptor = os.memfd_create("zoe-serve.toml", 0)
+        _write_all(descriptor, data)
+        path = f"/proc/self/fd/{descriptor}"
+    else:
+        directory = tempfile.mkdtemp(prefix="zoe-serve-")
+        try:
+            descriptor, name = tempfile.mkstemp(suffix=".toml", dir=directory)
+            os.unlink(name)
+        finally:
+            os.rmdir(directory)
+        _write_all(descriptor, data)
+        # On macOS, an open of /dev/fd/N shares the offset of the
+        # descriptor. So zoe serve reads from that offset, and it must be 0.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        path = f"/dev/fd/{descriptor}"
+    os.set_inheritable(descriptor, True)
+    return descriptor, path
+
+
 def main(argv=None):
     """Run `zoe serve` with the `<zoe-server>` section of the file of `-C`.
 
@@ -261,12 +308,15 @@ def main(argv=None):
             file=sys.stderr,
         )
         return FAILURE
-    # The memory file stays open in zoe serve, which reads it through its
-    # path in /proc.
-    descriptor = os.memfd_create("zoe-serve.toml", 0)
-    os.write(descriptor, text.encode())
-    os.set_inheritable(descriptor, True)
-    command = [binary, "serve", "--config", f"/proc/self/fd/{descriptor}"]
+    # The file stays open in zoe serve, which reads it through `path`.
+    try:
+        descriptor, path = config_file(text)
+    except OSError as error:
+        print(
+            f"{parser.prog}: cannot write the configuration: {error}", file=sys.stderr
+        )
+        return FAILURE
+    command = [binary, "serve", "--config", path]
     sys.stdout.flush()
     sys.stderr.flush()
     try:
