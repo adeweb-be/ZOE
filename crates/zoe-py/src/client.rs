@@ -879,7 +879,14 @@ impl NativeClient {
                     if intents.is_none() {
                         *intents = Some(pool.intents().await?);
                     }
-                    intents.as_mut().expect("an owner").lock(&oids).await
+                    let held = intents.as_mut().expect("an owner");
+                    let locked = held.lock(&oids).await;
+                    // An owner that holds nothing, or whose connection is
+                    // lost, gives its connection back to the pool.
+                    if locked.is_err() && (!held.holds() || !held.is_connected()) {
+                        *intents = None;
+                    }
+                    locked
                 }))
             })
             .map_err(|e| client_error(py, e))?;

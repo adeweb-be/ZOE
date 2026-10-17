@@ -111,7 +111,9 @@ _TRACE_CONTEXT = "trace_context"
 # The extensions that each connection declares in `register`. Without
 # OpenTelemetry, the client has no trace context to send.
 _TRACES = () if _PROPAGATOR is None else (_TRACE_CONTEXT,)
-EXTENSIONS = ("sequences", "lock_intent", *_TRACES)
+# The extension of the early write-intent locks (ADR 0045).
+_LOCK_INTENT = "lock_intent"
+EXTENSIONS = ("sequences", _LOCK_INTENT, *_TRACES)
 
 
 def _traceparent():
@@ -832,7 +834,7 @@ class _NativeClientStorage(ClientStorage):
         from zoe import zodb
 
         # A bad list of hot classes raises before the client connects.
-        self.early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
+        self._early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
         given = dict(locals())
         given.pop("zodb")
         fall_back = self.__dict__.pop("_fall_back", False) and wait
@@ -933,7 +935,7 @@ class _NativeClientStorage(ClientStorage):
         self._native_ready.set()
         self._default_intents = self._native.intents()
         self._bound_intents = threading.local()
-        if self.early_lock_classes:
+        if self._early_lock_classes:
             zodb.install()
         try:
             if wait:
@@ -977,6 +979,15 @@ class _NativeClientStorage(ClientStorage):
             for key, value in given.items()
             if key not in ("self", "native", "_ssl_section", "__class__")
         }
+        # The client of ZEO takes no early locks. The locks are advisory, so
+        # the client goes on without them.
+        if args.pop("early_locks") and args.pop("early_lock_classes"):
+            logger.warning(
+                "%s the client of ZEO takes no early lock: early-locks on "
+                "needs a server that speaks M5",
+                self.__name__,
+            )
+        args.pop("early_lock_classes", None)
         self.__dict__.clear()
         self.__class__ = ClientStorage
         ClientStorage.__init__(
@@ -1031,6 +1042,26 @@ class _NativeClientStorage(ClientStorage):
         ]
         if declared:
             zope.interface.alsoProvides(self, *declared)
+        # The locks are advisory: without the extension, the client takes no
+        # early lock, and says so once for the connection. A read-only
+        # client writes nothing, so it takes no early lock.
+        classes = self._early_lock_classes
+        if classes and _LOCK_INTENT not in self._info.get("extensions", ()):
+            logger.warning(
+                "%s the server did not accept the extension lock_intent: "
+                "early-locks on takes no early lock",
+                self.__name__,
+            )
+            classes = None
+        self._hot_classes = None if self._is_read_only else classes
+
+    @property
+    def early_lock_classes(self):
+        """The hot classes of early locks on the server of the last
+        connection, or None: without early locks, before the first
+        connection, on a read-only client, or when the server did not accept
+        the extension `lock_intent`."""
+        return self.__dict__.get("_hot_classes")
 
     def notify_disconnected(self):
         """The client lost its server: forget the iterators of the server,
@@ -1576,7 +1607,7 @@ class _NativeClientStorage(ClientStorage):
         A wait past the lock timeout of the server raises `ConflictError`.
         """
         self._check_process()
-        if "lock_intent" not in self._info.get("extensions", ()):
+        if _LOCK_INTENT not in self._info.get("extensions", ()):
             raise Unsupported("the server does not serve the extension lock_intent")
         owner = self._default_intents if owner is None else owner
         return self._with_server(lambda: self._native.lock_intent(owner, list(oids)))

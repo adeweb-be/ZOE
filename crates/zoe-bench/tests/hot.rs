@@ -76,5 +76,5 @@ fn writers_of_a_length_merge_at_the_vote() {
     assert_eq!(number(&report, "value"), 80.0);
     assert_eq!(number(&report, "conflicts"), 0.0, "{report}");
     assert_eq!(report["settings"]["object"], "length");
-    assert!(number(&report, "syncs_per_commit") >= 1.0);
+    assert!(number(&report, "commits_per_sync") >= 1.0);
 }

@@ -17,6 +17,7 @@
 //! `receiveBlobStop`, then the reply. The reader gives these calls to the
 //! download of their oid and serial.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
@@ -745,9 +746,11 @@ impl Client {
 
     /// Send `unlock_intent` and do not wait for its reply. The server
     /// answers the calls of a connection in order, so a later call of the
-    /// connection comes after the release.
-    pub fn unlock_intent_later(&self) {
-        self.inner.send_later("unlock_intent", vec![]);
+    /// connection comes after the release. `keep` drops only after the
+    /// frame is in the channel: a pool gives the connection back with it,
+    /// so the next transaction of the connection comes after the release.
+    pub fn unlock_intent_later(&self, keep: Box<dyn Any + Send>) {
+        self.inner.send_later("unlock_intent", vec![], keep);
     }
 
     /// Fail with `Error::Unsupported` when the server did not accept the
@@ -1359,14 +1362,11 @@ impl Inner {
         TRACEPARENT.try_with(Clone::clone).ok().flatten()
     }
 
-    /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
-    /// reply. The reader drops the reply, because no call waits for its id.
-    /// `guard` is the commit lock of the transaction. It is released only
-    /// after the frame is in the channel, so the `tpc_begin` of the next
-    /// transaction always comes after this abort.
     /// Send `method` with `args` as a call whose reply nothing waits for,
-    /// without a wait for room in the queue: a drop sends it.
-    fn send_later(&self, method: &str, args: Vec<Value>) {
+    /// without a wait for room in the queue: a drop sends it. The reader
+    /// drops the reply, because no call waits for its id. `keep` drops only
+    /// after the frame is in the channel.
+    fn send_later(&self, method: &str, args: Vec<Value>, keep: Box<dyn Any + Send>) {
         let id = {
             let mut calls = lock(&self.calls);
             if calls.closed {
@@ -1383,10 +1383,16 @@ impl Inner {
             let outgoing = self.outgoing.clone();
             self.runtime.spawn(Box::pin(async move {
                 let _ = outgoing.send(frame).await;
+                drop(keep);
             }));
         }
     }
 
+    /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
+    /// reply. The reader drops the reply, because no call waits for its id.
+    /// `guard` is the commit lock of the transaction. It is released only
+    /// after the frame is in the channel, so the `tpc_begin` of the next
+    /// transaction always comes after this abort.
     fn abort_later(&self, txn: u64, guard: Option<tokio::sync::OwnedMutexGuard<()>>) {
         let id = {
             let mut calls = lock(&self.calls);

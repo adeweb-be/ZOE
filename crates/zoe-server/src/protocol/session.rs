@@ -413,7 +413,7 @@ const TRANSACTION_CALLS: [&str; 14] = [
 ];
 
 /// The longest time that a session holds intent locks without a
-/// `tpc_begin`. Then the server releases them (ADR 0045).
+/// `tpc_begin`, by default. Then the server releases them (ADR 0045).
 pub(crate) const INTENT_HOLD: Duration = Duration::from_secs(60);
 
 /// Tell if `method` is a call of the transaction of the connection.
@@ -1384,7 +1384,7 @@ impl Transaction {
             return None;
         }
         let held_for = self.intents.as_ref()?.held_for()?;
-        Some(INTENT_HOLD.saturating_sub(held_for))
+        Some(self.session.storage.intent_hold.saturating_sub(held_for))
     }
 
     /// Release the intent locks that the session held past the bound
@@ -1401,7 +1401,7 @@ impl Transaction {
             tracing::warn!(
                 oids = oids.len(),
                 first = format!("0x{:016x}", first.0),
-                held_s = INTENT_HOLD.as_secs(),
+                held_ms = self.session.storage.intent_hold.as_millis() as u64,
                 "released the intent locks that a client held without tpc_begin"
             );
         }
@@ -1531,6 +1531,13 @@ impl Transaction {
                 && let Err(error) = begun.adopt_intents(intents)
             {
                 txn = Err(error.into());
+            }
+            // A transaction that does not begin adopts nothing: the intent
+            // locks of the session go.
+            if txn.is_err()
+                && let Some(intents) = self.intents.as_mut()
+            {
+                intents.release();
             }
             self.open = Some(Open {
                 id: id.clone(),
@@ -3433,6 +3440,25 @@ mod tests {
         assert!(!s.txn.is_open());
         assert_eq!(s.txn.intent_hold_left(), None);
         done(lock_intent(&mut other, &[3]));
+    }
+
+    #[test]
+    fn a_begin_that_fails_releases_the_intent_locks_of_the_session() {
+        let storage = storage("intent-failed-begin", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        done(lock_intent(&mut s, &[3]));
+        // A status that the server does not support fails the begin.
+        let begin = vec![
+            Value::from(7),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            Value::Nil,
+            Value::from("u"),
+        ];
+        done(call(&mut s, "tpc_begin", begin));
+        assert!(!s.txn.holds_intents());
+        assert!(storage.store.lock_table_is_empty());
     }
 
     #[test]

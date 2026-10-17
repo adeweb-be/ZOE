@@ -127,8 +127,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     blob directory, as `cleanup` of FileStorage removes its files.
 
     `early_locks=True` turns on the early write-intent locks of ADR 0045 for
-    the classes of `early_lock_classes`, each as `module.name`:
-    `early_lock_classes` is then the frozenset of these hot classes, and the
+    the classes of `early_lock_classes`, each as `module.name`, which must
+    be leaf records: `early_lock_classes` is then the frozenset of these hot
+    classes (None on a read-only storage), and the
     storage puts the methods of `zoe.zodb.LockingConnection` on the
     `Connection` of ZODB. A class of tier 1 in the list raises `ValueError`.
     `lock_intent(oids, owner)` takes the intent lock of each oid, in
@@ -155,7 +156,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     ):
         # The extension opens the store. Keep the blob directory for cleanup.
         self._blob_dir = None if blob_dir is None else os.path.abspath(blob_dir)
-        self.early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
+        # A read-only storage writes nothing, so it takes no early lock.
+        classes = zodb.hot_classes(early_locks, early_lock_classes)
+        self.early_lock_classes = None if self.isReadOnly() else classes
         self._default_intents = self._intents()
         self._bound_intents = threading.local()
         if self.early_lock_classes:

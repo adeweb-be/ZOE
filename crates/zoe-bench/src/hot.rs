@@ -131,7 +131,7 @@ pub struct Hot {
     /// The commits that these syncs made durable.
     pub synced_commits: Option<f64>,
     /// The mean commits of a sync: the mean `zoe_fsync_batch_size`.
-    pub syncs_per_commit: Option<f64>,
+    pub commits_per_sync: Option<f64>,
     /// The lock hand-offs of the run (ADR 0044).
     pub lock_handoffs: Option<f64>,
     /// The intent locks of the run (ADR 0045).
@@ -244,7 +244,7 @@ pub async fn hot(
         commits_per_second: commits as f64 / elapsed,
         syncs: delta.map(|d| d.syncs),
         synced_commits: delta.map(|d| d.synced),
-        syncs_per_commit: delta.filter(|d| d.syncs > 0.0).map(|d| d.synced / d.syncs),
+        commits_per_sync: delta.filter(|d| d.syncs > 0.0).map(|d| d.synced / d.syncs),
         lock_handoffs: delta.map(|d| d.handoffs),
         intent_locks: delta.map(|d| d.intents),
     };
@@ -277,7 +277,16 @@ async fn write(client: &Client, oid: Oid, settings: &HotSettings) -> Result<Tall
                 break;
             }
             let (data, serial) = if settings.early_locks {
-                let serial = client.lock_intent(&[oid]).await?[0];
+                // A lock wait past the lock timeout fails the attempt as a
+                // conflict.
+                let serial = match client.lock_intent(&[oid]).await {
+                    Ok(serials) => serials[0],
+                    Err(ClientError::Conflict { .. }) => {
+                        tally.conflicts += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 (client.load_serial(oid, serial).await?, serial)
             } else {
                 client.load(oid).await?

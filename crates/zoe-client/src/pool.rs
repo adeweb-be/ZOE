@@ -1103,6 +1103,16 @@ impl PoolIntents {
         self.lease.as_ref().expect("a lease").client()
     }
 
+    /// Tell if the server granted a lock of the owner.
+    pub fn holds(&self) -> bool {
+        self.held
+    }
+
+    /// Tell if the connection of the owner is connected.
+    pub fn is_connected(&self) -> bool {
+        self.client().is_connected()
+    }
+
     /// Take the intent locks of `oids`, as `Client::lock_intent` does, and
     /// return their current serials.
     pub async fn lock(&mut self, oids: &[Oid]) -> Result<Vec<Tid>, Error> {
@@ -1144,10 +1154,15 @@ impl PoolIntents {
 
 impl Drop for PoolIntents {
     fn drop(&mut self) {
-        if self.held
-            && let Some(lease) = &self.lease
+        if !self.held {
+            return;
+        }
+        // The lease goes back to the pool only after the release is in the
+        // channel of the connection.
+        if let Some(lease) = self.lease.take()
+            && let Some(client) = lease.client.clone()
         {
-            lease.client().unlock_intent_later();
+            client.unlock_intent_later(Box::new(lease));
         }
     }
 }

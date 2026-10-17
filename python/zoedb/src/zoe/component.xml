@@ -54,9 +54,12 @@
     <key name="early-lock-classes" datatype="string">
       <description>
         The hot classes of early-locks, each as module.name, separated by
-        spaces or commas. A class that the structural merges (tier 1) merge
-        raises an error: the lock hand-off serves it. Without it, early-locks
-        on takes no lock.
+        spaces or commas. A hot class must be a leaf record, whose state
+        refers to no other persistent object: a hot object read past the
+        snapshot can name a child that the snapshot does not hold, and the
+        load of that child can raise ReadConflictError. A class that the
+        structural merges (tier 1) merge raises an error: the lock hand-off
+        serves it. Without it, early-locks on takes no lock.
       </description>
     </key>
     <key name="read-only" datatype="string">
@@ -207,7 +210,9 @@
         If true, an object of a class of early-lock-classes takes its early
         write-intent lock on the server when its state loads (ADR 0045), as
         in the zoe section. It needs the native client: with native false,
-        the open raises an error. The default is false.
+        the open raises an error. A server that does not accept the
+        extension lock_intent, or that does not speak M5, gives no early
+        lock and one warning. The default is false.
       </description>
     </key>
     <key name="early-lock-classes" datatype="string">
