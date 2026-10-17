@@ -244,9 +244,14 @@ def test_a_namespace_keeps_no_history(mode, flavour, tmp_path):
             assert namespace(reader, flavour).get(b"key") == b"two"
             manager.abort()
             reader.close()
-            written = [txn for txn in db.storage.iterator(start) if txn.tid != start]
+            # Read the records of a transaction while the iterator is on it.
+            written = [
+                [(r.oid, r.data) for r in txn]
+                for txn in db.storage.iterator(start)
+                if txn.tid != start
+            ]
             assert len(written) == 2
-            assert all(list(txn) == [] for txn in written)
+            assert all(records == [] for records in written)
         finally:
             db.close()
 
@@ -383,9 +388,12 @@ def test_a_stock_client_sees_nothing_new(tmp_path):
             with db.transaction() as conn:
                 namespace(conn, "durable", "registry").set(b"key", b"value")
             tid = db.lastTransaction()
-            # The stock client sees a transaction without records.
-            (txn,) = list(stock.iterator(tid, tid))
-            assert list(txn) == []
+            # The stock client sees a transaction without records. It reads
+            # the records while the iterator is on the transaction.
+            (records,) = [
+                [(r.oid, r.data) for r in txn] for txn in stock.iterator(tid, tid)
+            ]
+            assert records == []
 
             # It commits and loads as before.
             oid = stock.new_oid()
