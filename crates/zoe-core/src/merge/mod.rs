@@ -1,5 +1,7 @@
-//! Tier 1 of the conflict resolution: the structural merges of BTrees and
-//! `Length`, in Rust, at the vote.
+//! Tiers 1 and 2 of the conflict resolution, in Rust, at the vote: the
+//! structural merges of BTrees and `Length` (tier 1), and the merges of the
+//! fields of the classes that the merge policy marks mergeable (tier 2,
+//! `fields.rs`, ADR 0046). `policy.rs` reads the merge policy.
 //!
 //! [`tier1`] takes the record that a transaction read (old), the record
 //! that another transaction committed since (committed) and the record of
@@ -31,6 +33,8 @@
 //! No Python runs here.
 
 mod btrees;
+mod fields;
+pub mod policy;
 mod posting;
 
 use std::collections::BTreeMap;
@@ -91,7 +95,9 @@ pub fn class_mode(text: &str) -> Result<(String, Mode), String> {
     Ok((class.to_owned(), mode.parse()?))
 }
 
-/// The settings of the structural merges (tier 1) of a store.
+/// The settings of the structural merges (tier 1) of a store: the keys of
+/// `<zoe>` and of `zoe serve`. The merge policy of the store wins over
+/// them (`policy::Rules`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralMerges {
     /// The mode of each class of tier 1 that `classes` does not name.
@@ -101,6 +107,9 @@ pub struct StructuralMerges {
     /// The mode of the posting-dict rule and of the first-key rule of ADR
     /// 0042, inside the classes where tier 1 runs.
     pub posting_dicts: Mode,
+    /// True when the skin writes the resolution log. Without it, the store
+    /// warns at each version of a policy that sets a shadow mode.
+    pub resolution_log: bool,
 }
 
 impl Default for StructuralMerges {
@@ -110,6 +119,7 @@ impl Default for StructuralMerges {
             mode: Mode::On,
             classes: BTreeMap::new(),
             posting_dicts: Mode::Off,
+            resolution_log: false,
         }
     }
 }
@@ -138,6 +148,16 @@ pub enum Reason {
     PostingTooLarge,
     /// The posting-dict rule: the merged dict is empty.
     PostingEmpty,
+    /// Tier 2: both sides changed a field to different values, and its
+    /// strategy is `strict`.
+    FieldChanged,
+    /// Tier 2: one side deleted a field that the other side changed.
+    FieldDeleted,
+    /// Tier 2: both sides changed a group of coupled fields.
+    Coupled,
+    /// Tier 2: a field of the strategy `append` that is not an append to
+    /// its old value on both sides.
+    NotAppend,
 }
 
 impl Reason {
@@ -173,6 +193,10 @@ impl Reason {
             Reason::PostingNotDict => "Posting value that is not a dict",
             Reason::PostingTooLarge => "Posting dict of more than 10 entries",
             Reason::PostingEmpty => "Posting dict without entries",
+            Reason::FieldChanged => "Field changed on both sides",
+            Reason::FieldDeleted => "Field deleted on one side and changed on the other",
+            Reason::Coupled => "Coupled fields changed on both sides",
+            Reason::NotAppend => "Field that is not an append to its old value",
         }
     }
 }
@@ -189,17 +213,19 @@ pub enum Outcome {
     Undecided(&'static str),
 }
 
-/// The result of tier 1 for one conflict.
+/// The result of tier 1 or tier 2 for one conflict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Merge {
+    /// The tier: 1 or 2.
+    pub tier: u8,
     /// The class of the record, as `module.name`.
     pub class: String,
     /// The outcome.
     pub outcome: Outcome,
     /// The keys that the new record changed, inserted or deleted, as text,
-    /// in key order. At most [`MAX_KEYS`]; `changed` counts them all. With
-    /// the rules of ADR 0042 in shadow mode, they are the keys of the merge
-    /// of the rules.
+    /// in key order: the fields for tier 2. At most [`MAX_KEYS`]; `changed`
+    /// counts them all. With the rules of ADR 0042 in shadow mode, they are
+    /// the keys of the merge of the rules.
     pub keys: Vec<String>,
     /// The number of keys that the new record changed, inserted or
     /// deleted.
@@ -208,10 +234,25 @@ pub struct Merge {
     /// rules give when a rule compared a dict or let a first key go. The
     /// outcome of the merge is then the outcome without the rules.
     pub shadow: Option<Outcome>,
+    /// For a refusal of tier 2, the fields that it names: the field whose
+    /// strategy refused, or the coupled group. Empty otherwise.
+    pub fields: Vec<String>,
 }
 
 /// The most keys that a [`Merge`] lists.
 pub const MAX_KEYS: usize = 20;
+
+/// The steps that the comparisons of one merge may take, for each byte of
+/// its three records.
+const STEPS_PER_BYTE: usize = 64;
+
+/// Returns the step budget of a merge whose three records hold `len`
+/// bytes in all. A merge of records of normal shapes takes a few steps for
+/// each value; a value that shares its parts many times takes more, and
+/// past the budget the merge gives no answer.
+pub(crate) fn budget(len: usize) -> usize {
+    len.saturating_mul(STEPS_PER_BYTE).saturating_add(4096)
+}
 
 /// Returns the class of `record` as `module.name` when tier 1 merges that
 /// class. Reads the class pickle alone.
@@ -232,11 +273,13 @@ pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: Mode) -> O
     let (module, name) = zoe_pickle::decode_class_name(new).ok()??;
     let class = classify(&module, &name)?;
     let mut merge = Merge {
+        tier: 1,
         class: format!("{module}.{name}"),
         outcome: Outcome::Undecided(""),
         keys: Vec::new(),
         changed: 0,
         shadow: None,
+        fields: Vec::new(),
     };
     merge.outcome = match decode(old, committed, new) {
         Ok(trees) => btrees::merge(&trees, class, posting_dicts, &mut merge),
@@ -245,12 +288,47 @@ pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: Mode) -> O
     Some(merge)
 }
 
+/// Merges the conflict of a record whose class has the entry `entry` in the
+/// merge policy, field by field (tier 2): `old`, `committed` and `new` as
+/// for [`tier1`]. `class` is the class of `new`, as `module.name`.
+pub fn tier2(
+    old: &[u8],
+    committed: &[u8],
+    new: &[u8],
+    class: &str,
+    entry: &policy::ClassPolicy,
+) -> Merge {
+    let mut merge = Merge {
+        tier: 2,
+        class: class.to_owned(),
+        outcome: Outcome::Undecided(""),
+        keys: Vec::new(),
+        changed: 0,
+        shadow: None,
+        fields: Vec::new(),
+    };
+    merge.outcome = match decode(old, committed, new) {
+        Ok(trees) => fields::merge(&trees, entry, &mut merge),
+        Err(why) => Outcome::Undecided(why),
+    };
+    merge
+}
+
+/// Returns the class of `record` as `module.name`, from its class pickle
+/// alone.
+pub fn class_name(record: &[u8]) -> Option<String> {
+    let (module, name) = zoe_pickle::decode_class_name(record).ok()??;
+    Some(format!("{module}.{name}"))
+}
+
 /// The decoded records of one conflict, in the order of ZODB's resolver:
 /// new, old, committed.
 struct Trees {
     new: zoe_pickle::Tree,
     old: zoe_pickle::Tree,
     committed: zoe_pickle::Tree,
+    /// The bytes of the three records, for the step budget.
+    len: usize,
 }
 
 /// Decodes the three records. Each budget is the length of its record, so
@@ -266,20 +344,25 @@ fn decode(old: &[u8], committed: &[u8], new: &[u8]) -> Result<Trees, &'static st
         new: read(new)?,
         old: read(old)?,
         committed: read(committed)?,
+        len: old.len() + committed.len() + new.len(),
     })
 }
 
-/// What tier 1 did for one conflict of a vote: one entry of the resolution
-/// log.
+/// What tier 1 or tier 2 did for one conflict of a vote: one entry of the
+/// resolution log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolution {
     /// The oid in conflict.
     pub oid: Oid,
+    /// The tier: 1 or 2.
+    pub tier: u8,
     /// The class of the record, as `module.name`.
     pub class: String,
-    /// The mode of the class: `On` or `Shadow`.
+    /// The mode of the class in its tier: `On` or `Shadow`.
     pub mode: Mode,
-    /// What tier 1 gave.
+    /// The version of the merge policy of the vote, if the store has one.
+    pub policy: Option<u64>,
+    /// What the tier gave.
     pub outcome: Resolved,
     /// True when the outcome is the outcome of the vote: the vote stored
     /// the merged record and passed, or failed on the refusal. Always false
@@ -298,17 +381,42 @@ pub struct Resolution {
     /// a rule compared a dict or let a first key go; `outcome` is then the
     /// outcome without the rules.
     pub shadow: Option<Resolved>,
+    /// For a refusal of tier 2, the field whose strategy refused, or the
+    /// coupled group. Empty otherwise.
+    pub fields: Vec<String>,
 }
 
-/// What tier 1 gave for a conflict, without the merged record.
+/// What a tier gave for a conflict, without the merged record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolved {
-    /// Tier 1 merged the records.
+    /// The tier merged the records.
     Merged,
-    /// Tier 1 refused the merge.
+    /// The tier refused the merge.
     Refused(Reason),
-    /// Tier 1 gave no answer. The text says why.
+    /// The tier gave no answer. The text says why.
     Undecided(&'static str),
+}
+
+/// A check of a merge of shadow mode against the resolution of the client
+/// (ADR 0046): the client stored its own resolution of the oid, and the
+/// vote after `vote_resolving` compared it with the merge of the tier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verification {
+    /// The oid in conflict.
+    pub oid: Oid,
+    /// The tier of the merge: 1 or 2.
+    pub tier: u8,
+    /// The class of the record, as `module.name`.
+    pub class: String,
+    /// The version of the merge policy of the merge, if any.
+    pub policy: Option<u64>,
+    /// True when the record of the client is the merged record, byte for
+    /// byte.
+    pub same: bool,
+    /// The serial of the committed record.
+    pub committed: Tid,
+    /// The serial that the transaction read.
+    pub read: Tid,
 }
 
 /// What a line of the resolution log gives beside a [`Resolution`].
@@ -350,8 +458,9 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     );
     field("oid", json(&format!("0x{:016x}", resolution.oid.0)));
     field("class", json(&resolution.class));
-    field("tier", "1".to_owned());
+    field("tier", resolution.tier.to_string());
     field("mode", json(resolution.mode.as_str()));
+    field("policy", version(resolution.policy));
     let (outcome, code, reason) = resolution.outcome.json_parts();
     field("outcome", outcome);
     field("code", code);
@@ -368,6 +477,8 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
     field("keys", format!("[{}]", keys.join(",")));
     field("changed", resolution.changed.to_string());
+    let fields: Vec<String> = resolution.fields.iter().map(|name| json(name)).collect();
+    field("fields", format!("[{}]", fields.join(",")));
     field(
         "committed",
         json(&format!("0x{:016x}", resolution.committed.0)),
@@ -382,6 +493,42 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     field("committed_description", text(context.committed_description));
     line.push('}');
     line
+}
+
+/// Returns the line of the resolution log of `verification`: one JSON
+/// object, without the line feed (ADR 0046).
+pub fn verification_line(verification: &Verification, context: &LogContext<'_>) -> String {
+    let time = context
+        .time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let text = |bytes: Option<&[u8]>| {
+        bytes.map_or_else(|| "null".to_owned(), |b| json(&String::from_utf8_lossy(b)))
+    };
+    format!(
+        "{{\"time\":{}.{:06},\"storage\":{},\"oid\":{},\"class\":{},\"tier\":{},\"mode\":\"shadow\",\
+         \"policy\":{},\"outcome\":\"verified\",\"same\":{},\"committed\":{},\"read\":{},\
+         \"user\":{},\"description\":{},\"committed_user\":{},\"committed_description\":{}}}",
+        time.as_secs(),
+        time.subsec_micros(),
+        context.storage.map_or_else(|| "null".to_owned(), json),
+        json(&format!("0x{:016x}", verification.oid.0)),
+        json(&verification.class),
+        verification.tier,
+        version(verification.policy),
+        verification.same,
+        json(&format!("0x{:016x}", verification.committed.0)),
+        json(&format!("0x{:016x}", verification.read.0)),
+        text(Some(context.user)),
+        text(Some(context.description)),
+        text(context.committed_user),
+        text(context.committed_description),
+    )
+}
+
+/// Returns the version of a policy as a JSON value.
+fn version(policy: Option<u64>) -> String {
+    policy.map_or_else(|| "null".to_owned(), |version| version.to_string())
 }
 
 /// Returns `text` as a JSON string.
@@ -405,11 +552,20 @@ fn json(text: &str) -> String {
 
 impl Resolution {
     /// Returns the entry of a merge in `mode` of `oid`, not applied yet.
-    pub(crate) fn of(oid: Oid, mode: Mode, merge: &Merge, committed: Tid, read: Tid) -> Self {
+    pub(crate) fn of(
+        oid: Oid,
+        mode: Mode,
+        policy: Option<u64>,
+        merge: &Merge,
+        committed: Tid,
+        read: Tid,
+    ) -> Self {
         Resolution {
             oid,
+            tier: merge.tier,
             class: merge.class.clone(),
             mode,
+            policy,
             outcome: Resolved::of(&merge.outcome),
             applied: false,
             keys: merge.keys.clone(),
@@ -417,6 +573,7 @@ impl Resolution {
             committed,
             read,
             shadow: merge.shadow.as_ref().map(Resolved::of),
+            fields: merge.fields.clone(),
         }
     }
 }

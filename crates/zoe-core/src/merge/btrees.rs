@@ -48,6 +48,7 @@ pub(super) fn merge(
 /// delete of a first key through.
 fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (Outcome, bool) {
     let mut heap = Heap::new();
+    heap.set_budget(super::budget(trees.len));
     // ZODB's resolver loads the new record, then the old one, then the
     // committed one. A persistent reference takes its persistent id from
     // the first record that holds it.
@@ -548,6 +549,7 @@ fn undecided(undecided: Undecided) -> Outcome {
     match undecided {
         Undecided::Unknown => Outcome::Undecided("values that Python compares, and Rust cannot"),
         Undecided::Raises => Outcome::Refused(Reason::Uncomparable),
+        Undecided::Budget => Outcome::Undecided("comparisons over the step budget"),
     }
 }
 
