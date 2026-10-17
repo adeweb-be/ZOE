@@ -1,4 +1,7 @@
-<configure xmlns="http://namespaces.zope.org/zope">
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:genericsetup="http://namespaces.zope.org/genericsetup"
+    xmlns:plone="http://namespaces.plone.org/plone">
 
   <!-- Plone loads this file through the plone.autoinclude entry point of
        zoedb. When Zope opened its database, the handler gives
@@ -6,6 +9,47 @@
   <subscriber
       for="zope.processlifetime.IDatabaseOpenedWithRoot"
       handler=".uidgenerator.database_opened"
+      />
+
+  <include package="plone.behavior" file="meta.zcml" />
+  <include package="Products.GenericSetup" file="meta.zcml" />
+
+  <!-- The opt-in behaviour of the append-only workflow history: an object
+       of a type with the behaviour gets a WorkflowHistory when it is
+       added. -->
+  <plone:behavior
+      name="zoe.plone.history"
+      title="Append-only workflow history"
+      description="Keeps the workflow history in a class whose transitions merge at the vote of the store, so that two transitions of one object do not conflict."
+      provides=".history.IAppendOnlyHistory"
+      />
+  <subscriber
+      for=".history.IAppendOnlyHistory
+           zope.lifecycleevent.interfaces.IObjectAddedEvent"
+      handler=".history.added"
+      />
+
+  <!-- The profile writes the merge policy of the site into the store. -->
+  <genericsetup:registerProfile
+      name="default"
+      title="ZOE"
+      directory="profiles/default"
+      description="Writes the merge policy of the site into the ZOE store, from its Dexterity types."
+      provides="Products.GenericSetup.interfaces.EXTENSION"
+      />
+  <genericsetup:importStep
+      name="zoe.plone.merge_policy"
+      title="ZOE merge policy"
+      description="Derives the merge policy of the site and writes it into the store, when the profile holds zoe-merge-policy.json."
+      handler=".merges.import_merge_policy"
+      />
+  <genericsetup:upgradeStep
+      title="Move the workflow histories"
+      description="Gives each object of a type with the behaviour zoe.plone.history a WorkflowHistory."
+      source="*"
+      destination="1000"
+      handler=".history.upgrade"
+      profile="zoe.plone:default"
       />
 
 </configure>

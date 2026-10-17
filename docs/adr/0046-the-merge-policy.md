@@ -1,6 +1,6 @@
 # 0046. The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2
 
-Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human".
+Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human". During the build the human approved two changes, which the text below holds: the digest of a merge of shadow mode is BLAKE3, the hash that the core already links, in place of sha256; and the strs and bytes that CPython shares in every record (the empty ones, those of one character below U+0100, and the interned keys of dict states) do not count as an object that two fields share. The second checkpoint of the card, the classes of `zoe.plone` (section 9), is approved too.
 
 ## Context
 
@@ -99,6 +99,13 @@ A line of tier 2 has `"tier": 2`, the class, the outcome, the reason (the strate
 ### 8. Both modes
 
 Tier 2 and the policy are in `zoe-core`, so `zoe.Storage` and `zoe serve` have the same merges, the same switches and the same log. A stock `ZEO.ClientStorage` sees a vote that resolved an oid, as from a ZEO 6 server.
+
+### 9. The classes of `zoe.plone` (the second checkpoint)
+
+- `zoe.plone.history.WorkflowHistory` holds `workflow_history`: a `Persistent` mapping of workflow id to the tuple of its status dicts, whose state is the mapping itself, so each workflow is a field. Its `__setstate__` interns the keys. Its entry is `{"tier2": "on", "default": "append"}` (`zoe.plone.history.policy()`). The opt-in Dexterity behaviour `zoe.plone.history` gives a new object of a type with the behaviour a `WorkflowHistory` when it is created, before its first status; an upgrade step moves the stock `PersistentMapping` histories of the content with the behaviour. A type without the behaviour keeps the stock history.
+- Comments get no class of their own: the `Conversation` of plone.app.discussion keeps them in BTrees and a `Length`, which tier 1 merges.
+- Audit entries get no class: Plone 6.1 keeps no audit log in the ZODB. A package that keeps an append-only list in an object gives its class an entry with `append`.
+- The profile of `zoe.plone` writes the policy with `zoe.policy.install`. It derives an entry for the class of each Dexterity type: the class merges field by field; the fields that an `@invariant` of the schema or of a behaviour of a type of that class names are a coupled group; a class with an invariant whose fields the derivation cannot find gets no entry; `modification_date` takes `max`, and the other fields `strict`. An overrides file of the profile changes the mode or the strategies of a class.
 
 ## Consequences
 
