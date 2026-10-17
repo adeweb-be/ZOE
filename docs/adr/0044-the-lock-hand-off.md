@@ -1,6 +1,6 @@
 # 0044. The lock hand-off: a merge at the vote takes the lock of a commit that is in a commit batch
 
-Status: proposed. A checkpoint of ZOE-204 (step 2): it changes the invariant of group commit in section 5 of the specification. The human approves it on the pull request. "Questions for the human" lists the choices that need approval.
+Status: accepted. A checkpoint of ZOE-204 (step 2): it changes the invariant of group commit in section 5 of the specification. The human approved it as written, with the answers of its draft to the questions below.
 
 ## Context
 
@@ -77,9 +77,17 @@ A counter `zoe_lock_handoffs_total` counts the hand-offs, and `zoe_fsync_batch_s
 - **Merge in the batch, by the leader.** The leader would run tier 1 on the members that conflict. It takes Rust merges into the write path under the sequencer, and a refusal would fail a member after its vote passed. Refused.
 - **No lock at all for the classes of tier 1.** The commits would merge at the finish. Same objection.
 
-## Questions for the human
+## The answers of the human
 
-1. The hand-off starts when the finish of the holder starts, so commits on a hot oid can share one batch. Is that the reading of step 2 ("a commit that is already in a commit batch: its tid and its state are final"), whose tid is final only in the batch, not in the queue?
-2. A conflict on a handed-off oid that goes to the client waits for the durability of the holder, in `lock-timeout`. Is that right, or should such a vote wait in the queue as today, without the hand-off?
-3. Is there a limit on the commits of one batch, so that a long chain on a hot oid does not make one write too long? Today group commit takes every finish that waits.
-4. The name of the counter: `zoe_lock_handoffs_total`.
+1. The hand-off starts when the finish of the holder starts, so the commits on a hot oid can share one batch.
+2. A conflict on a handed-off oid that goes to the client waits for the durability of the holder, in `lock-timeout`.
+3. No limit on the commits of one batch: group commit takes every finish that waits, as before.
+4. The counter is `zoe_lock_handoffs_total`.
+
+## Notes of the build
+
+- The holder hands off only an oid whose staged record is of a class that tier 1 merges in mode `on`. For another oid, the new owner could only wait for the durability of the holder, which is what the queue gives without a hand-off, so the holder keeps the lock and copies nothing.
+- The hand-off comes after the member of the holder is in the queue of group commit, so a finish that starts after the hand-off is later in the commit order.
+- A new owner that releases the lock before the holder is durable (a failed vote, an abort) leaves the hand-off in the entry: the next exclusive request takes the lock with it, and a shared request waits until the holder is durable. So no vote reads the oid from the store while the store does not hold its last commit.
+- The merged record of the new owner gets the tid of the holder as its previous serial when its batch writes it. A member whose holder got no tid fails with `Protocol`; the holder then failed alone only when no tid is left, and the member gets no tid either.
+- A refusal at once gives no `serials` when the holder has no tid yet, as a lock timeout does. A line of the resolution log of a merge onto a commit in flight gives the user and the description of the holder, and its tid, or 0 when its batch did not give it one yet.
