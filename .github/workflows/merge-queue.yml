@@ -11,11 +11,17 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     # A hung step fails the job after this time.
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       # Nix fetches the github: inputs through the GitHub API with this token.
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: free disk
+        # The image holds SDKs that CI does not use. Dagger needs the space.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v7
       - name: dagger check
         uses: dagger/dagger-for-github@v8.4.1
