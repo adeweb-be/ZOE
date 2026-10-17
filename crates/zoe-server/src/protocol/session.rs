@@ -20,13 +20,21 @@
 //! A transaction of a connection encodes its staged pickles on the
 //! compression pool (`compress`): `storea` and `restorea` queue a job, and
 //! the first vote waits for the jobs before it takes a lock.
+//!
+//! `undoa` queues an undo into the open transaction, and the first vote
+//! stages it before it takes a lock, as ZEO's server does. An undo that no
+//! tier of the core merges fails the vote with `UndoError`: no Python runs
+//! on the server.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use rmpv::Value;
-use zoe_core::{BlobFile, Compression, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{
+    BlobFile, Compression, Finished, LockCancel, Oid, Store, Tid, Txn, TxnMeta, ZoeError, undo_id,
+    undo_tid,
+};
 
 use super::blob::Download;
 use super::clock;
@@ -66,6 +74,17 @@ const READ_CONFLICT_ERROR: &str = "ZODB.POSException.ReadConflictError";
 /// The class of a transaction error of ZODB.
 const TRANSACTION_ERROR: &str = "ZODB.POSException.StorageTransactionError";
 
+/// The class of the undo errors of ZODB that a stock client rebuilds: a
+/// `MultipleUndoErrors` is an `UndoError`, and the factories of
+/// `ZEO.asyncio.client` know only it.
+const UNDO_ERRORS: &str = "ZODB.POSException.MultipleUndoErrors";
+
+/// The reason of an undo that a later transaction stops, as in FileStorage.
+const CHANGED_LATER: &str = "Some data were modified by a later transaction";
+
+/// The most transactions that one read of the undo log takes.
+const UNDO_LOG_CHUNK: usize = 256;
+
 /// The text of a conflict error of ZODB.
 const CONFLICT: &str = "database conflict error";
 
@@ -75,14 +94,15 @@ const READ_CONFLICT: &str = "database read conflict error";
 /// The interfaces that the store provides, as `(module, name)`, in the
 /// order of `providedBy(zoe.Storage(path)).__iro__`. A stock client takes
 /// the storage interfaces of this list as its own. The store provides
-/// `IExternalGC`, because `deleteObject` writes a deletion. It does not
-/// provide `IStorageUndoable`.
-const INTERFACES: [(&str, &str); 8] = [
+/// `IExternalGC`, because `deleteObject` writes a deletion, and
+/// `IStorageUndoable`.
+const INTERFACES: [(&str, &str); 9] = [
     ("ZODB.interfaces", "IBlobStorageRestoreable"),
     ("ZODB.interfaces", "IBlobStorage"),
     ("ZODB.interfaces", "IStorageRestoreable"),
     ("ZODB.interfaces", "IStorageCurrentRecordIteration"),
     ("ZODB.interfaces", "IStorageIteration"),
+    ("ZODB.interfaces", "IStorageUndoable"),
     ("ZODB.interfaces", "IExternalGC"),
     ("ZODB.interfaces", "IStorage"),
     ("zope.interface", "Interface"),
@@ -137,6 +157,18 @@ impl Fault {
 
     fn storage(text: impl Into<String>) -> Self {
         Self::new("ZODB.POSException.StorageError", text)
+    }
+
+    /// An undo that `reason` refuses, on `oid` when an object stops it. A
+    /// stock client rebuilds it as a `MultipleUndoErrors` of one error,
+    /// which is an `UndoError`.
+    fn undo(reason: &str, oid: Option<Oid>) -> Self {
+        let oid = oid.map_or(Value::Nil, |oid| p64(oid.0));
+        let error = Value::Array(vec![Value::from(reason), oid]);
+        Self {
+            class: UNDO_ERRORS,
+            args: Value::Map(vec![(Value::from("_errs"), Value::Array(vec![error]))]),
+        }
     }
 
     /// The error of a call that names no object `oid`: a `POSKeyError` of
@@ -262,6 +294,7 @@ impl Fault {
                 Self::conflict(READ_CONFLICT_ERROR, READ_CONFLICT, oid, None, None)
             }
             ZoeError::ReadOnly => Self::read_only(),
+            ZoeError::Undo { oid, reason } => Self::undo(reason, oid),
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } | ZoeError::WrongThread => {
                 Self::transaction(text)
             }
@@ -392,12 +425,13 @@ impl Reply {
 
 /// The calls of the open transaction of a connection. One thread runs
 /// them in order, from `tpc_begin` to the end of the transaction.
-const TRANSACTION_CALLS: [&str; 12] = [
+const TRANSACTION_CALLS: [&str; 13] = [
     "tpc_begin",
     "storea",
     "restorea",
     "checkCurrentSerialInTransaction",
     "deleteObject",
+    "undoa",
     "vote",
     "tpc_finish",
     "tpc_abort",
@@ -459,6 +493,9 @@ struct Open {
     /// until the first vote. The end of the transaction drops them, and
     /// that cancels them.
     jobs: Vec<Job>,
+    /// The undo ids that `undoa` queued, in order. The first vote stages
+    /// their undos.
+    undos: Vec<Value>,
 }
 
 impl Open {
@@ -723,6 +760,8 @@ impl Session {
             "loadSerial" => self.load_serial(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
+            "undoLog" => self.undo_log(args),
+            "undoInfo" => self.undo_info(args),
             "record_iternext" => self.record_iternext(args),
             "iterator_start" => self.iterator_start(args),
             "iterator_next" => self.iterator_next(args),
@@ -938,7 +977,7 @@ impl Session {
                 Value::from("name"),
                 Value::from(self.storage.path.display().to_string()),
             ),
-            (Value::from("supportsUndo"), Value::Boolean(false)),
+            (Value::from("supportsUndo"), Value::Boolean(true)),
             (
                 Value::from("supports_record_iternext"),
                 Value::Boolean(true),
@@ -1028,6 +1067,85 @@ impl Session {
                 })
                 .collect(),
         ))
+    }
+
+    /// Return the transactions that an undo can undo, newest first, from
+    /// the index `first` up to `last`, `last` excluded, as the maps of
+    /// FileStorage's `undoLog`. A negative `last` gives at most `-last`
+    /// transactions. The transactions at or before the last pack are not
+    /// in the log.
+    fn undo_log(&self, args: &[Value]) -> Result<Value, Fault> {
+        let (first, last) = match args {
+            [] => (0, -20),
+            [first] => (int_of(first)?, -20),
+            [first, last] => (int_of(first)?, int_of(last)?),
+            _ => return Err(Fault::type_error("undoLog takes 0 to 2 arguments")),
+        };
+        self.undo_entries(first, last, &[])
+    }
+
+    /// Return the transactions of `undoLog(first, last)` whose map holds
+    /// each key of the map `specification` with its value, as `undoInfo`
+    /// of ZODB does.
+    fn undo_info(&self, args: &[Value]) -> Result<Value, Fault> {
+        let (first, last, specification) = match args {
+            [] => (0, -20, None),
+            [first] => (int_of(first)?, -20, None),
+            [first, last] => (int_of(first)?, int_of(last)?, None),
+            [first, last, specification] => (int_of(first)?, int_of(last)?, Some(specification)),
+            _ => return Err(Fault::type_error("undoInfo takes 0 to 3 arguments")),
+        };
+        let specification = match specification {
+            None | Some(Value::Nil) => &[][..],
+            Some(Value::Map(items)) => &items[..],
+            Some(_) => return Err(Fault::type_error("the specification is not a dict")),
+        };
+        self.undo_entries(first, last, specification)
+    }
+
+    /// Return the maps of the undo log from the index `first` up to `last`,
+    /// with only the maps that hold each item of `specification`.
+    fn undo_entries(
+        &self,
+        first: i64,
+        last: i64,
+        specification: &[(Value, Value)],
+    ) -> Result<Value, Fault> {
+        let last = if last < 0 {
+            first.saturating_sub(last)
+        } else {
+            last
+        };
+        let first = usize::try_from(first).unwrap_or(0);
+        let last = usize::try_from(last).unwrap_or(0);
+        let mut found = Vec::new();
+        let mut index = 0;
+        let mut before = Tid::MAX;
+        'log: while index < last {
+            let rows = self.store.undo_log(before, UNDO_LOG_CHUNK)?;
+            let Some(oldest) = rows.last() else { break };
+            before = oldest.tid;
+            for row in &rows {
+                let entry = undo_entry(row);
+                let Value::Map(items) = &entry else {
+                    unreachable!("an entry of the undo log is a map")
+                };
+                if !specification
+                    .iter()
+                    .all(|(key, value)| items.iter().any(|item| item.0 == *key && item.1 == *value))
+                {
+                    continue;
+                }
+                if index >= first {
+                    found.push(entry);
+                }
+                index += 1;
+                if index >= last {
+                    break 'log;
+                }
+            }
+        }
+        Ok(Value::Array(found))
     }
 
     /// Return the current record of the first oid at or after the oid of
@@ -1445,6 +1563,7 @@ impl Transaction {
             "restorea" => self.restorea(args),
             "checkCurrentSerialInTransaction" => self.check_current_serial(args),
             "deleteObject" => self.delete_object(args),
+            "undoa" => self.undoa(args),
             "vote" => self.vote(args),
             "tpc_finish" => return self.tpc_finish(&*call),
             "tpc_abort" => self.tpc_abort(args),
@@ -1479,6 +1598,7 @@ impl Transaction {
                 native: 0,
                 upload: None,
                 jobs: Vec::new(),
+                undos: Vec::new(),
             });
         }
         Ok(Value::Nil)
@@ -1622,6 +1742,15 @@ impl Transaction {
         Ok(Value::Nil)
     }
 
+    /// Queue the undo of the transaction of the undo id `trans_id` into the
+    /// open transaction `id`. `undoa` has no reply: the first vote stages
+    /// the undo, as ZEO's server does, and an error there fails the vote.
+    fn undoa(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [trans_id, id] = arity::<2>(args, "undoa")?;
+        self.current(id)?.undos.push(trans_id.clone());
+        Ok(Value::Nil)
+    }
+
     /// Vote, and return the conflicts that the client resolves, as ZEO 6
     /// does with client conflict resolution. An empty list means that the
     /// vote passed.
@@ -1637,8 +1766,11 @@ impl Transaction {
     /// committed serial and votes again. The second vote takes no lock and
     /// checks every serial again. No Python runs on the server.
     ///
-    /// Before it takes a lock, the first vote waits for each job of the
-    /// compression pool of the transaction, and attaches its payload to
+    /// Before it takes a lock, the first vote stages the undos that `undoa`
+    /// queued, in order. The reply gives each oid of an undone transaction
+    /// as a bare oid, as ZEO's server does. An undo that no tier merges
+    /// fails the vote with `UndoError`. Then the vote waits for each job of
+    /// the compression pool of the transaction, and attaches its payload to
     /// the staged record. A job that failed fails the vote with
     /// `StorageError`.
     ///
@@ -1652,13 +1784,20 @@ impl Transaction {
         let listed = std::mem::take(&mut open.listed);
         let native = std::mem::take(&mut open.native);
         let jobs = std::mem::take(&mut open.jobs);
+        let undos = std::mem::take(&mut open.undos);
         let voted = match &mut open.txn {
             Ok(txn) if listed > 0 => txn
                 .vote()
                 .map(|()| Voted::default())
                 .map_err(|error| Fault::of_vote(&error, txn)),
             Ok(txn) => {
-                let voted = attach(txn, jobs).and_then(|()| vote_resolving(txn));
+                let voted = undo(txn, &undos).and_then(|undone| {
+                    attach(txn, jobs)?;
+                    let mut voted = vote_resolving(txn)?;
+                    voted.native.retain(|oid| !undone.contains(oid));
+                    voted.undone = undone;
+                    Ok(voted)
+                });
                 // The vote that takes the locks runs tier 1: log and count
                 // its results, also when the vote failed.
                 storage.metrics.count_resolutions(txn.resolutions());
@@ -1673,6 +1812,7 @@ impl Transaction {
         };
         match voted {
             Ok(Voted {
+                undone,
                 native: merged,
                 conflicts,
             }) => {
@@ -1688,7 +1828,9 @@ impl Transaction {
                 } else {
                     open.native = merged.len() as u64;
                 }
-                Ok(Value::Array(merged.into_iter().chain(conflicts).collect()))
+                Ok(Value::Array(
+                    undone.into_iter().chain(merged).chain(conflicts).collect(),
+                ))
             }
             Err(fault) => {
                 self.open = None;
@@ -1884,10 +2026,74 @@ fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
 /// The items of the reply of a vote.
 #[derive(Default)]
 struct Voted {
+    /// The oids of the undone transactions, each as a bare oid.
+    undone: Vec<Value>,
     /// The oids that tier 1 merged, each as a bare oid.
     native: Vec<Value>,
     /// The conflicts that the client resolves.
     conflicts: Vec<Value>,
+}
+
+/// Stage in `txn` the undo of each undo id of `ids`, in order. Return the
+/// oids of the undone transactions, each once, as bare oids.
+///
+/// An undo id that names no transaction, and an undo that the core
+/// refuses, fail with `UndoError`. So does an undo that no tier of the
+/// core merges: the in-process storage resolves such an undo in Python,
+/// and no Python runs on the server.
+fn undo(txn: &mut Txn<Arc<Store>>, ids: &[Value]) -> Result<Vec<Value>, Fault> {
+    let mut oids = Vec::new();
+    for id in ids {
+        let tid = match id {
+            Value::Binary(id) => undo_tid(id),
+            Value::String(id) => undo_tid(id.as_bytes()),
+            _ => None,
+        }
+        .ok_or_else(|| Fault::undo("the undo id names no transaction", None))?;
+        let undone = txn.undo(tid)?;
+        if let Some(conflict) = undone.conflicts.first() {
+            return Err(Fault::undo(CHANGED_LATER, Some(conflict.oid)));
+        }
+        for oid in undone.oids {
+            let oid = p64(oid.0);
+            if !oids.contains(&oid) {
+                oids.push(oid);
+            }
+        }
+    }
+    Ok(oids)
+}
+
+/// Return the map of the undo log of the transaction row `row`: the keys
+/// `id`, `time`, `user_name` and `description` of FileStorage, then the
+/// keys of the extension, which replace a key of the same name, as in
+/// FileStorage. An extension that gives no msgpack map adds no key.
+fn undo_entry(row: &TxnMeta) -> Value {
+    let mut items = vec![
+        (Value::from("id"), Value::Binary(undo_id(row.tid))),
+        (Value::from("time"), Value::F64(clock::tid_time(row.tid))),
+        (Value::from("user_name"), Value::Binary(row.user.clone())),
+        (
+            Value::from("description"),
+            Value::Binary(row.description.clone()),
+        ),
+    ];
+    if let Ok(Value::Map(extension)) = extension::unpickle(&row.extension) {
+        for (key, value) in extension {
+            match items.iter_mut().find(|item| item.0 == key) {
+                Some(item) => item.1 = value,
+                None => items.push((key, value)),
+            }
+        }
+    }
+    Value::Map(items)
+}
+
+/// Return the int `value` of an argument.
+fn int_of(value: &Value) -> Result<i64, Fault> {
+    value
+        .as_i64()
+        .ok_or_else(|| Fault::type_error("an index of the undo log is not an int"))
 }
 
 /// Vote with `vote_resolving` of the core. Return each oid that tier 1
@@ -1922,7 +2128,11 @@ fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Voted, Fault> {
             ]))
         })
         .collect::<Result<Vec<_>, Fault>>()?;
-    Ok(Voted { native, conflicts })
+    Ok(Voted {
+        undone: Vec::new(),
+        native,
+        conflicts,
+    })
 }
 
 /// Add 1 to the metric `counter`.
@@ -3144,6 +3354,85 @@ mod tests {
         get(status, key).as_u64().unwrap()
     }
 
+    /// Undo the transaction of the undo id `undo_id` in the transaction
+    /// `id`. Return the reply of the vote, or its fault.
+    fn undo_in(s: &mut Client, id: i64, undo_id: Value) -> Result<Value, Fault> {
+        begin(s, id, None);
+        done(call(s, "undoa", vec![undo_id, Value::from(id)]));
+        match call(s, "vote", vec![Value::from(id)]) {
+            Outcome::Done(reply) => {
+                finish(s, Value::from(id));
+                Ok(reply)
+            }
+            outcome => Err(failed(outcome)),
+        }
+    }
+
+    #[test]
+    fn an_undo_stages_at_the_vote_and_the_reply_gives_its_oids() {
+        let mut s = registered("undo");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        let second = commit(&mut s, 2, 7, first, b"two").unwrap();
+        let log = done(call(
+            &mut s,
+            "undoLog",
+            vec![Value::from(0), Value::from(1)],
+        ));
+        let entry = &log.as_array().unwrap()[0];
+        assert_eq!(get(entry, "id"), &Value::Binary(undo_id(Tid(second))));
+        assert_eq!(get(entry, "user_name"), &Value::Binary(b"user-2".to_vec()));
+        let reply = undo_in(&mut s, 3, get(entry, "id").clone()).unwrap();
+        assert_eq!(reply, Value::Array(vec![p64(7)]));
+        let loaded = done(call(&mut s, "loadBefore", vec![p64(7), p64(u64::MAX >> 1)]));
+        assert_eq!(
+            loaded.as_array().unwrap()[0],
+            Value::Binary(b"one".to_vec())
+        );
+        // The undo is in the log, newest first.
+        let log = done(call(
+            &mut s,
+            "undoLog",
+            vec![Value::from(0), Value::from(-20)],
+        ));
+        assert_eq!(log.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_undo_that_no_tier_merges_fails_the_vote_with_an_undo_error() {
+        let mut s = registered("undo-error");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        let second = commit(&mut s, 2, 7, first, b"two").unwrap();
+        commit(&mut s, 3, 7, second, b"three").unwrap();
+        let fault = undo_in(&mut s, 4, Value::Binary(undo_id(Tid(second)))).unwrap_err();
+        assert_eq!(fault.class, "ZODB.POSException.MultipleUndoErrors");
+        let errors = item(&fault, "_errs");
+        let [error] = errors.as_array().unwrap().as_slice() else {
+            panic!("one error: {fault:?}");
+        };
+        assert_eq!(error.as_array().unwrap()[1], p64(7));
+        // An id that names no transaction fails the vote too.
+        let fault = undo_in(&mut s, 5, Value::Binary(b"not an id".to_vec())).unwrap_err();
+        assert_eq!(fault.class, "ZODB.POSException.MultipleUndoErrors");
+    }
+
+    #[test]
+    fn undo_info_keeps_the_entries_of_its_specification() {
+        let mut s = registered("undo-info");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        commit(&mut s, 2, 7, first, b"two").unwrap();
+        let specification = Value::Map(vec![(
+            Value::from("user_name"),
+            Value::Binary(b"user-1".to_vec()),
+        )]);
+        let args = vec![Value::from(0), Value::from(-20), specification];
+        let info = done(call(&mut s, "undoInfo", args));
+        let entries = info.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(get(&entries[0], "id"), &Value::Binary(undo_id(Tid(first))));
+        let all = done(call(&mut s, "undoInfo", vec![]));
+        assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn get_info_describes_the_store() {
         let mut s = registered("get-info");
@@ -3166,7 +3455,7 @@ mod tests {
             s.storage.path.to_str(),
             "the name is the directory of the store"
         );
-        assert_eq!(get(&info, "supportsUndo"), &Value::Boolean(false));
+        assert_eq!(get(&info, "supportsUndo"), &Value::Boolean(true));
         assert_eq!(
             get(&info, "supports_record_iternext"),
             &Value::Boolean(true)
@@ -3182,7 +3471,7 @@ mod tests {
             .collect();
         assert_eq!(interfaces, INTERFACES);
         assert!(interfaces.contains(&("ZODB.interfaces", "IExternalGC")));
-        assert!(!interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
+        assert!(interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
 
         let sizes = done(call(&mut s, "get_size_info", vec![]));
         assert_eq!(keys(&sizes), ["length", "size"]);
