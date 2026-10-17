@@ -30,7 +30,7 @@ from pathlib import Path
 
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import ConflictError, POSKeyError
-from ZODB.utils import get_pickle_metadata, z64
+from ZODB.utils import get_pickle_metadata, u64, z64
 
 from replay import servers
 from replay.log import Log, Record, Transaction
@@ -207,12 +207,18 @@ def copy_base(storage, base: list[Transaction]) -> None:
         storage.tpc_finish(meta)
 
 
-def install_policy(storage, policy: dict) -> None:
+def install_policy(storage, policy: dict, above: int = 0) -> None:
     """Commit `policy` as the merge policy of the store of `storage`, with
-    `zoe.policy.install`, in one transaction of its own. Close `storage`."""
+    `zoe.policy.install`, in one transaction of its own. Close `storage`.
+
+    The policy takes an oid above `above`, the highest oid of the log: a
+    transaction of the log that makes a new object writes the oid that the
+    store of the log gave it, and it would write over the policy."""
     import ZODB
     import zoe.policy
 
+    while u64(storage.new_oid()) <= above:
+        pass
     db = ZODB.DB(storage)
     try:
         with db.transaction("the merge policy of the replay") as conn:
@@ -381,7 +387,9 @@ def run_one(
         try:
             copy_base(storage, log.base)
             if policy is not None and stack != "zeo":
-                install_policy(servers.client(stack, address), policy)
+                top = max(map(u64, oids), default=0)
+                top = max([top, *(u64(r.oid) for t in log.base for r in t.records)])
+                install_policy(servers.client(stack, address), policy, top)
             reader = servers.client(stack, address)
             try:
                 with _ReadLoad(reader, oids) as load:

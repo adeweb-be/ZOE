@@ -297,11 +297,14 @@ def test_a_run_of_zoe_serve_installs_the_policy_in_its_store(tmp_path):
 
     policy = {"classes": {"m.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}
     with servers.zoe_server(tmp_path) as address:
-        runner.install_policy(servers.client("zoe-native", address), policy)
+        # The oids up to 300 are those of the log.
+        runner.install_policy(servers.client("zoe-native", address), policy, 300)
         db = ZODB.DB(servers.client("zoe-native", address))
         try:
             with db.transaction() as conn:
                 found = zoe.policy.read(conn)
+                oid = conn.root()[zoe.policy.NAME]._p_oid
         finally:
             db.close()
     assert found == {"version": 1, **policy}
+    assert int.from_bytes(oid, "big") > 300
