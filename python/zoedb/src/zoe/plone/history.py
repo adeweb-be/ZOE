@@ -156,15 +156,21 @@ def _stock():
 
 def restore(obj):
     """Give `obj` its history back as a stock `PersistentMapping`. Return
-    True when the history changed. The move marks the `WorkflowHistory` as
-    changed, as `ensure` does."""
+    True when the history changed.
+
+    The move empties the `WorkflowHistory`: it deletes each of its
+    workflows. A transaction that adds a status to it from the same
+    snapshot is then a change against a delete, which tier 2 refuses, so
+    the two conflict whichever commits first, and the retry of the
+    transition sees the stock history: no status is lost."""
     base = _base(obj)
     history = getattr(base, "workflow_history", None)
     if not isinstance(history, WorkflowHistory):
         return False
-    if getattr(history, "_p_jar", None) is not None:
-        history._p_changed = True
-    base.workflow_history = _stock()(history.items())
+    items = list(history.items())
+    for key in list(history):
+        del history[key]
+    base.workflow_history = _stock()(items)
     return True
 
 

@@ -126,6 +126,46 @@ def test_a_move_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, firs
         db.close()
 
 
+@pytest.mark.parametrize("first", ["transition", "restore"])
+def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, first):
+    db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
+    try:
+        with db.transaction() as conn:
+            policy.install(conn, history.policy())
+            doc = Doc()
+            doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
+            conn.root()["doc"] = doc
+        names = ("transition", "restore")
+        managers = {name: transaction.TransactionManager() for name in names}
+        conns = {name: db.open(transaction_manager=managers[name]) for name in names}
+        for tm in managers.values():
+            tm.begin()
+        add_status(conns["transition"].root()["doc"], 1)
+        assert history.restore(conns["restore"].root()["doc"])
+        second = "restore" if first == "transition" else "transition"
+        managers[first].commit()
+        # Whichever commits second conflicts: an append against a delete
+        # of the history, which tier 2 refuses.
+        with pytest.raises(ConflictError):
+            managers[second].commit()
+        managers[second].abort()
+        managers[second].begin()
+        doc = conns[second].root()["doc"]
+        if second == "transition":
+            add_status(doc, 1)
+        else:
+            history.restore(doc)
+        managers[second].commit()
+        for conn in conns.values():
+            conn.close()
+        with db.transaction() as conn:
+            restored = conn.root()["doc"].workflow_history
+            assert type(restored) is history._stock()
+            assert restored["wf"] == (0, 1)
+    finally:
+        db.close()
+
+
 def test_restore_gives_a_persistent_mapping_back():
     doc = Doc()
     doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
@@ -228,9 +268,12 @@ def test_the_overrides_change_add_and_remove_entries():
     assert "m.Old" not in result["classes"]
 
 
-def test_an_override_does_not_unblock_a_class(caplog):
+@pytest.mark.parametrize(
+    "override", [{"tier2": "on"}, {"blocked": False}, {"blocked": False, "tier2": "on"}]
+)
+def test_an_override_does_not_unblock_a_class(caplog, override):
     result, _ = merges.apply_overrides(
-        DERIVED, {"classes": {"m.Odd": {"tier2": "on"}}}, {"m.Odd"}
+        DERIVED, {"classes": {"m.Odd": override}}, {"m.Odd"}
     )
     assert result["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
     assert "stays blocked" in caplog.text

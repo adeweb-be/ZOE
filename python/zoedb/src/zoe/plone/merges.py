@@ -42,7 +42,9 @@ The overrides are a JSON object with these keys, each optional:
   override does not unblock a blocked class: the class stays blocked, and
   the import logs a warning.
 
-Only `derive`, `update_policy`, `profile_of` and the steps import Plone.
+Only `derive`, `site_overrides` (Acquisition), `update_policy`,
+`profile_of`, `fti_modified` (zope.component.hooks) and the import step
+import Plone or Zope.
 """
 
 import json
@@ -193,11 +195,15 @@ def apply_overrides(policy, overrides, derived=frozenset()):
         merged = dict(result["classes"].get(name, {}))
         removed.discard(name)
         if merged.get("blocked"):
-            if entry.get("tier2") not in (None, "off"):
+            if entry.get("tier2") not in (None, "off") or entry.get("blocked") is False:
                 logger.warning(
                     "%s stays blocked: an override cannot switch it on", name
                 )
-            entry = {key: value for key, value in entry.items() if key != "tier2"}
+            entry = {
+                key: value
+                for key, value in entry.items()
+                if key not in ("tier2", "blocked")
+            }
         fields = {**merged.get("fields", {}), **entry.get("fields", {})}
         coupled = _groups(merged.get("coupled"), entry.get("coupled"))
         merged.update(
