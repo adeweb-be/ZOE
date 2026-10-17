@@ -224,9 +224,11 @@ impl Merger<'_> {
         let [old, committed, new] = <[Bucket; 3]>::try_from(buckets)
             .ok()
             .expect("three buckets");
-        // A tree that holds its one bucket inline has no parent node to
-        // change. BTrees inlines only the bucket of a root, which has no
-        // next bucket.
+        // A root that holds its one bucket inline has no parent node to
+        // change. BTrees also writes a node inside a tree with its one
+        // bucket inline when that bucket has no oid at the commit. Such a
+        // node has a next bucket, except the node of the last bucket. A
+        // record cannot tell a root from that last node (ADR 0042).
         self.first_key = self.rules && tree && old.next.is_none();
         // The next buckets must be the same objects.
         for other in [committed.next, new.next] {
