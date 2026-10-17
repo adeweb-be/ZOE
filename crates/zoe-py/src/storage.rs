@@ -833,8 +833,11 @@ impl Storage {
                     None => Txn::begin(store, &user, &description, &extension),
                     Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension)?,
                 };
+                // An owner whose lock waits on another thread has no locks
+                // to give yet: the transaction begins without them.
                 if let Some(owner) = intents
-                    && let Some(held) = owner.lock().as_mut()
+                    && let Ok(mut held) = owner.intents.try_lock()
+                    && let Some(held) = held.as_mut()
                 {
                     txn.adopt_intents(held)?;
                 }

@@ -933,10 +933,11 @@ impl NativeClient {
         let txn = py
             .detach(|| {
                 runtime.block_on(traced(trace, async {
-                    let held = match intents {
-                        Some(owner) => owner.intents.lock().await.take(),
-                        None => None,
-                    };
+                    // An owner whose lock waits on another thread has no
+                    // locks to give yet: the transaction begins without them.
+                    let held = intents
+                        .and_then(|owner| owner.intents.try_lock().ok())
+                        .and_then(|mut held| held.take());
                     match held {
                         Some(held) => {
                             held.begin_with(&user, &description, &encoded, tid, &status)

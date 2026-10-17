@@ -180,6 +180,14 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         """Release every early write-intent lock of the owner."""
         self._unlock_intent(self._default_intents if owner is None else owner)
 
+    def close(self):
+        """Release the intent locks of the default owner, which hold a share
+        of the store, then close the storage."""
+        default = self.__dict__.get("_default_intents")
+        if default is not None:
+            self._unlock_intent(default)
+        super().close()
+
     def bind_intent_owner(self, owner):
         """Make `owner` the owner of the intent locks that the next
         `tpc_begin` of the calling thread adopts, or the default owner again
