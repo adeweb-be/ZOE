@@ -53,8 +53,10 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
     `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
-    pack_gc=True, compression=None)` opens the store in `path` and creates
-    the directory when it is missing.
+    pack_gc=True, compression=None, structural_merges=None,
+    structural_merge_classes=None, merge_posting_dicts=False,
+    resolution_log=None)` opens the store in `path` and creates the
+    directory when it is missing.
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
     lock of an object. A longer wait raises `ConflictError`. `None` keeps the
     default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
@@ -68,6 +70,13 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     layout file of its blobs with `StorageError`: the option is missing or
     wrong, or the directory is not mounted. A `blob_dir` that is not a
     directory raises `OSError`, and the storage creates nothing.
+
+    `structural_merges` is the mode of the structural merges (tier 1) of
+    BTree buckets, sets and `Length`: `"on"` (`None` keeps it), `"shadow"`
+    or `"off"`. `structural_merge_classes` maps a class, as `module.name`,
+    to its own mode. `merge_posting_dicts` turns on the posting-dict rule of
+    ADR 0042. `resolution_log` is a file that gets one JSON line for each
+    result of the structural merges.
 
     `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
     copy, and copies a file from elsewhere. `loadBlob` returns the path of a

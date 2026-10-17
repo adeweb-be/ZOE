@@ -43,10 +43,12 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
-use zoe_core::{Compression, Options, Store, ZoeError};
+use zoe_core::{Compression, Options, Store, StructuralMerges, ZoeError};
 
 use crate::admin::{self, Health, StoreHealth};
-use crate::protocol::{self, Connection, NamedStorage, Pool, Queues, Stopping, Storages};
+use crate::protocol::{
+    self, Connection, NamedStorage, Pool, Queues, ResolutionLog, Stopping, Storages,
+};
 use crate::runtime::Tokio;
 use crate::tls::Tls;
 pub use crate::tls::TlsOptions;
@@ -176,6 +178,8 @@ pub struct ServeOptions {
     pack_gc: bool,
     shared_blob_dir: bool,
     tls: Option<TlsOptions>,
+    structural_merges: StructuralMerges,
+    resolution_log: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -213,6 +217,8 @@ impl ServeOptions {
             pack_gc: true,
             shared_blob_dir: false,
             tls: None,
+            structural_merges: StructuralMerges::default(),
+            resolution_log: None,
         }
     }
 
@@ -390,6 +396,24 @@ impl ServeOptions {
         self
     }
 
+    /// Run the structural merges (tier 1) of each store with `merges`: the
+    /// mode of their classes and the posting-dict rule (ADR 0042). Without
+    /// this call, tier 1 is on for every class and the rule is off.
+    #[must_use]
+    pub fn structural_merges(mut self, merges: StructuralMerges) -> Self {
+        self.structural_merges = merges;
+        self
+    }
+
+    /// Write one JSON line for each result of tier 1 to the file `path`, in
+    /// append mode (ADR 0042). The start creates the file, and fails when it
+    /// cannot open it. Without this call, the server writes no such line.
+    #[must_use]
+    pub fn resolution_log(mut self, path: impl AsRef<Path>) -> Self {
+        self.resolution_log = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Speak TLS on the ZEO port with the files of `tls`. `Server::start`
     /// reads them before it listens, so a file that does not read creates
     /// no store. TLS needs a TCP address: on a unix domain socket, the
@@ -419,6 +443,7 @@ impl ServeOptions {
         options.transaction_warn = self.transaction_warn;
         options.blob_dir.clone_from(&storage.blob_dir);
         options.pack_gc = self.pack_gc && storage.pack_gc;
+        options.structural_merges = self.structural_merges.clone();
         options
     }
 
@@ -458,6 +483,8 @@ pub enum Error {
     /// A file of TLS does not read or does not fit, or the address is a
     /// unix domain socket.
     Tls(String),
+    /// The resolution log does not open.
+    ResolutionLog(PathBuf, io::Error),
 }
 
 impl fmt::Display for Error {
@@ -471,6 +498,9 @@ impl fmt::Display for Error {
             Self::Store(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Runtime(error) => write!(f, "cannot start the runtime: {error}"),
             Self::Tls(message) => write!(f, "TLS: {message}"),
+            Self::ResolutionLog(path, error) => {
+                write!(f, "the resolution log {}: {error}", path.display())
+            }
         }
     }
 }
@@ -592,6 +622,16 @@ impl Server {
             }
             None => None,
         };
+        // The resolution log opens before the stores, so a log that does
+        // not open creates no store.
+        let resolution_log = match &options.resolution_log {
+            Some(path) => {
+                Some(Arc::new(ResolutionLog::open(path).map_err(|error| {
+                    Error::ResolutionLog(path.clone(), error)
+                })?))
+            }
+            None => None,
+        };
         // This thread is not a thread of the runtime. Each store has its
         // own lock manager, and each storage its own invalidations.
         let mut storages = Vec::with_capacity(options.storages.len());
@@ -617,6 +657,7 @@ impl Server {
             let named = NamedStorage::new(&storage.name, &storage.path, store, options.queues);
             let named = named
                 .read_only(read_only)
+                .resolution_log(resolution_log.clone())
                 .shared_blob_dir(options.shared_blob_dir)
                 .timeout(!options.idle_timeout.is_zero());
             storages.push(Arc::new(named));

@@ -690,12 +690,54 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(conflicts)
     }
 
+    /// Return the user of the transaction, as `tpc_begin` gave it.
+    pub fn user(&self) -> &[u8] {
+        &self.user
+    }
+
+    /// Return the description of the transaction, as `tpc_begin` gave it.
+    pub fn description(&self) -> &[u8] {
+        &self.description
+    }
+
     /// Return what tier 1 did in the last vote that took the locks: one
     /// entry for each stale written oid of a class of tier 1 whose mode is
     /// not `Off`, in oid order. The vote that comes after `vote_resolving`
     /// keeps the entries of `vote_resolving`.
     pub fn resolutions(&self) -> &[Resolution] {
         &self.resolutions
+    }
+
+    /// Return the lines of the resolution log (ADR 0042) of what tier 1 did
+    /// in the last vote that took the locks: one JSON object for each entry
+    /// of `resolutions`, at `time`, for the storage `storage` of a server.
+    /// The user and the description of the committed transaction come from
+    /// the history of the oid; when the store no longer has that record,
+    /// the line gives null for them.
+    pub fn resolution_log_lines(&self, time: SystemTime, storage: Option<&str>) -> Vec<String> {
+        self.resolutions
+            .iter()
+            .map(|resolution| {
+                let committed = self
+                    .store
+                    .history(resolution.oid, HISTORY_SEARCH)
+                    .ok()
+                    .and_then(|entries| {
+                        entries
+                            .into_iter()
+                            .find(|entry| entry.tid == resolution.committed)
+                    });
+                let context = merge::LogContext {
+                    time,
+                    storage,
+                    user: &self.user,
+                    description: &self.description,
+                    committed_user: committed.as_ref().map(|entry| &entry.user[..]),
+                    committed_description: committed.as_ref().map(|entry| &entry.description[..]),
+                };
+                merge::log_line(resolution, &context)
+            })
+            .collect()
     }
 
     /// Return the oids that tier 1 merged in the last vote that took the
@@ -1130,6 +1172,11 @@ fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
 /// The number of oids whose current serials the vote reads in one backend
 /// read.
 const READ_CHUNK: usize = 256;
+
+/// The most records of the history of an oid that a line of the resolution
+/// log reads to find the committed record. Other commits can come after
+/// the vote, once it released its locks.
+const HISTORY_SEARCH: usize = 8;
 
 /// Check that a restore transaction can commit under `tid` when `last` is
 /// the last tid. A failed check is `Protocol`.

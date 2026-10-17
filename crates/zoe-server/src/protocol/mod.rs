@@ -30,6 +30,7 @@ pub(crate) mod metrics;
 mod negotiation;
 mod outbox;
 mod pipeline;
+mod resolution;
 mod send_queue;
 mod session;
 mod status;
@@ -60,6 +61,7 @@ use metrics::{Exported, Metrics};
 use outbox::{Closing, Outbox};
 use pipeline::Calls;
 pub(crate) use pipeline::Pool;
+pub(crate) use resolution::ResolutionLog;
 use status::Stats;
 
 /// The protocol that the server announces and the only one it takes: ZEO 6
@@ -157,6 +159,8 @@ pub(crate) struct NamedStorage {
     /// True when the server closes a connection that stays silent, so
     /// that an open transaction cannot hold its locks forever.
     timeout: bool,
+    /// The resolution log of the server, if `--resolution-log` names one.
+    resolution_log: Option<Arc<ResolutionLog>>,
 }
 
 impl NamedStorage {
@@ -177,6 +181,7 @@ impl NamedStorage {
             read_only: false,
             shared_blob_dir: false,
             timeout: false,
+            resolution_log: None,
         }
     }
 
@@ -207,6 +212,12 @@ impl NamedStorage {
     /// true, as a ZEO server with a transaction timeout does.
     pub(crate) fn timeout(mut self, timeout: bool) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Write the lines of the resolution log to `log`.
+    pub(crate) fn resolution_log(mut self, log: Option<Arc<ResolutionLog>>) -> Self {
+        self.resolution_log = log;
         self
     }
 

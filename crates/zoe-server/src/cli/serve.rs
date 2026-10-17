@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
-use zoe_core::Compression;
+use zoe_core::{Compression, Mode};
 
 use super::Failure;
 
@@ -312,6 +312,58 @@ pub(super) struct ServeArgs {
     )]
     pack_gc: bool,
 
+    /// The mode of the structural merges (tier 1) of each class that
+    /// --structural-merge-class does not name (ADR 0042). on, the default,
+    /// merges BTree buckets, sets, BTrees of one bucket and Length at the
+    /// vote, or refuses them as BTrees does. shadow runs the merges and
+    /// writes their results to the resolution log, then lets the client
+    /// resolve the conflict. off does not run them.
+    #[arg(
+        long,
+        env = "ZOE_STRUCTURAL_MERGES",
+        value_name = "MODE",
+        default_value = "on",
+        value_parser = clap::builder::ValueParser::new(str::parse::<Mode>)
+    )]
+    structural_merges: Mode,
+
+    /// The mode of one class of tier 1, as CLASS=MODE, such as
+    /// BTrees.IOBTree.IOBucket=shadow. Repeat the option for more classes.
+    /// The twin takes pairs separated by commas, and the configuration file
+    /// a table [structural-merge-classes] of CLASS = MODE.
+    #[arg(
+        long,
+        env = "ZOE_STRUCTURAL_MERGE_CLASSES",
+        value_name = "CLASS=MODE",
+        value_delimiter = ',',
+        value_parser = class_mode
+    )]
+    structural_merge_class: Vec<(String, Mode)>,
+
+    /// Merge the posting dicts of ZCTextIndex entry by entry in the buckets
+    /// with integer keys, where ZODB's resolver refuses them (the
+    /// posting-dict rule of ADR 0042). Off by default.
+    #[arg(
+        long,
+        env = "ZOE_MERGE_POSTING_DICTS",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        action = clap::ArgAction::Set
+    )]
+    merge_posting_dicts: bool,
+
+    /// The resolution log: a file of JSON lines, one for each result of
+    /// tier 1, with the user and the description of both transactions and
+    /// the keys that it merged (ADR 0042). The server opens it in append
+    /// mode at its start, and never syncs it. Without it, the server writes
+    /// no such line.
+    #[arg(long, env = "ZOE_RESOLUTION_LOG", value_name = "FILE")]
+    resolution_log: Option<PathBuf>,
+
     /// Accept storeBlobShared: the server and its clients share the blob
     /// directory of each store, as with the option shared-blob-dir of a ZEO
     /// client. A client writes the blob file in the directory of its oid
@@ -442,6 +494,11 @@ fn named_storage(value: &str) -> Result<Storage, String> {
         }),
         _ => Err(format!("{value} is not NAME=PATH")),
     }
+}
+
+/// Parse the value of `--structural-merge-class`: `CLASS=MODE`.
+fn class_mode(value: &str) -> Result<(String, Mode), String> {
+    zoe_core::merge::class_mode(value)
 }
 
 /// Parse a time in whole seconds, as ZConfig's `time-interval` does: a
@@ -624,7 +681,15 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .idle_timeout(args.idle_timeout)
         .read_only(args.read_only)
         .pack_gc(args.pack_gc)
-        .shared_blob_dir(args.shared_blob_dir);
+        .shared_blob_dir(args.shared_blob_dir)
+        .structural_merges(zoe_core::StructuralMerges {
+            mode: args.structural_merges,
+            classes: args.structural_merge_class.iter().cloned().collect(),
+            posting_dicts: args.merge_posting_dicts,
+        });
+    if let Some(path) = &args.resolution_log {
+        options = options.resolution_log(path);
+    }
     if let Some(timeout) = args.lock_timeout {
         options = options.lock_timeout(timeout);
     }

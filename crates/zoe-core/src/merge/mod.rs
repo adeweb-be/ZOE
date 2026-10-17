@@ -31,6 +31,7 @@ mod btrees;
 mod posting;
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use zoe_pickle::Limits;
 use zoe_pickle::btrees::classify;
@@ -47,6 +48,44 @@ pub enum Mode {
     Shadow,
     /// Tier 1 runs, and its merge or its refusal is the outcome.
     On,
+}
+
+impl Mode {
+    /// Returns the name of the mode: `on`, `shadow` or `off`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Shadow => "shadow",
+            Mode::On => "on",
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    /// Reads `on`, `shadow` or `off`, in any case.
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(Mode::On),
+            "shadow" => Ok(Mode::Shadow),
+            "off" => Ok(Mode::Off),
+            _ => Err(format!("{text:?} is not on, shadow or off")),
+        }
+    }
+}
+
+/// Reads the mode of one class: `CLASS=MODE`, such as
+/// `BTrees.IOBTree.IOBucket=shadow`. The class is `module.name`.
+pub fn class_mode(text: &str) -> Result<(String, Mode), String> {
+    let (class, mode) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not CLASS=MODE"))?;
+    let class = class.trim();
+    if class.is_empty() || !class.contains('.') {
+        return Err(format!("{class:?} is not a class as module.name"));
+    }
+    Ok((class.to_owned(), mode.parse()?))
 }
 
 /// The settings of the structural merges (tier 1) of a store.
@@ -98,6 +137,15 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Returns the reason code of BTrees, or `None` for a reason of tier 1
+    /// that BTrees does not have.
+    pub fn code(self) -> Option<u8> {
+        match self {
+            Reason::BTrees(code) => Some(code),
+            _ => None,
+        }
+    }
+
     /// Returns the message of the reason, as `BTreesConflictError` gives it
     /// for a code of BTrees.
     pub fn message(self) -> &'static str {
@@ -245,6 +293,97 @@ pub enum Resolved {
     Refused(Reason),
     /// Tier 1 gave no answer. The text says why.
     Undecided(&'static str),
+}
+
+/// What a line of the resolution log gives beside a [`Resolution`].
+#[derive(Clone, Copy, Debug)]
+pub struct LogContext<'a> {
+    /// The time of the vote.
+    pub time: SystemTime,
+    /// The storage name, for a server.
+    pub storage: Option<&'a str>,
+    /// The user of the transaction that voted.
+    pub user: &'a [u8],
+    /// The description of the transaction that voted.
+    pub description: &'a [u8],
+    /// The user of the transaction that wrote the committed record, when
+    /// the store still has it.
+    pub committed_user: Option<&'a [u8]>,
+    /// The description of the transaction that wrote the committed record.
+    pub committed_description: Option<&'a [u8]>,
+}
+
+/// Returns the line of the resolution log of `resolution`: one JSON
+/// object, without the line feed (ADR 0042). A text that is not UTF-8 is
+/// written with U+FFFD in place of its bad bytes.
+pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
+    let time = context
+        .time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!("{{\"time\":{}.{:06}", time.as_secs(), time.subsec_micros());
+    let mut field = |name: &str, value: String| {
+        line.push_str(",\"");
+        line.push_str(name);
+        line.push_str("\":");
+        line.push_str(&value);
+    };
+    field(
+        "storage",
+        context.storage.map_or_else(|| "null".to_owned(), json),
+    );
+    field("oid", json(&format!("0x{:016x}", resolution.oid.0)));
+    field("class", json(&resolution.class));
+    field("tier", "1".to_owned());
+    field("mode", json(resolution.mode.as_str()));
+    let (outcome, code, reason) = match resolution.outcome {
+        Resolved::Merged => ("merged", None, None),
+        Resolved::Refused(reason) => ("refused", reason.code(), Some(reason.message())),
+        Resolved::Undecided(why) => ("undecided", None, Some(why)),
+    };
+    field("outcome", json(outcome));
+    field(
+        "code",
+        code.map_or_else(|| "null".to_owned(), |code| code.to_string()),
+    );
+    field("reason", reason.map_or_else(|| "null".to_owned(), json));
+    field("applied", resolution.applied.to_string());
+    let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
+    field("keys", format!("[{}]", keys.join(",")));
+    field("changed", resolution.changed.to_string());
+    field(
+        "committed",
+        json(&format!("0x{:016x}", resolution.committed.0)),
+    );
+    field("read", json(&format!("0x{:016x}", resolution.read.0)));
+    let text = |bytes: Option<&[u8]>| {
+        bytes.map_or_else(|| "null".to_owned(), |b| json(&String::from_utf8_lossy(b)))
+    };
+    field("user", text(Some(context.user)));
+    field("description", text(Some(context.description)));
+    field("committed_user", text(context.committed_user));
+    field("committed_description", text(context.committed_description));
+    line.push('}');
+    line
+}
+
+/// Returns `text` as a JSON string.
+fn json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl Resolution {

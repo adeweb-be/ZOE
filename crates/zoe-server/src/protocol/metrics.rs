@@ -16,6 +16,8 @@
 //! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that tier 1
 //!   merged in a vote that passed (`native`), and the oids that a second
 //!   vote passed after the client resolved them (`python`).
+//! - `zoe_structural_merges_total{mode, outcome}`: the results of tier 1
+//!   in the votes, merged, refused or undecided, in mode `on` or `shadow`.
 //! - `zoe_conflicts_raised_total`: the transactions that raised a
 //!   conflict: a vote that failed with a conflict, or a transaction that
 //!   ended between the two votes, so that the client raised
@@ -120,6 +122,29 @@ pub(crate) struct Metrics {
     pub(crate) conflicts_raised: AtomicU64,
     /// The oids in conflict that tier 1 merged in a vote that passed.
     pub(crate) conflicts_native: AtomicU64,
+    /// The results of tier 1, by mode (`on`, `shadow`) and outcome
+    /// (`merged`, `refused`, `undecided`).
+    pub(crate) structural_merges: [[AtomicU64; 3]; 2],
+}
+
+impl Metrics {
+    /// Count the results of tier 1 of one vote.
+    pub(crate) fn count_resolutions(&self, resolutions: &[zoe_core::Resolution]) {
+        use zoe_core::{Mode, Resolved};
+        for resolution in resolutions {
+            let mode = match resolution.mode {
+                Mode::On => 0,
+                Mode::Shadow => 1,
+                Mode::Off => continue,
+            };
+            let outcome = match resolution.outcome {
+                Resolved::Merged => 0,
+                Resolved::Refused(_) => 1,
+                Resolved::Undecided(_) => 2,
+            };
+            self.structural_merges[mode][outcome].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Default for Metrics {
@@ -133,6 +158,7 @@ impl Default for Metrics {
             commits: AtomicU64::new(0),
             conflicts_raised: AtomicU64::new(0),
             conflicts_native: AtomicU64::new(0),
+            structural_merges: Default::default(),
         }
     }
 }
@@ -243,6 +269,24 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         let native = get(&storage.metrics.conflicts_native);
         let _ = writeln!(out, "{name}{{{labels},path=\"native\"}} {native}");
         let _ = writeln!(out, "{name}{{{labels},path=\"python\"}} {python}");
+    }
+    let name = "zoe_structural_merges_total";
+    head(
+        &mut out,
+        name,
+        "counter",
+        "The number of results of the structural merges (tier 1) in the votes, by mode and outcome.",
+    );
+    for (storage, labels) in &storages {
+        for (m, mode) in ["on", "shadow"].into_iter().enumerate() {
+            for (o, outcome) in ["merged", "refused", "undecided"].into_iter().enumerate() {
+                let count = get(&storage.metrics.structural_merges[m][o]);
+                let _ = writeln!(
+                    out,
+                    "{name}{{{labels},mode=\"{mode}\",outcome=\"{outcome}\"}} {count}"
+                );
+            }
+        }
     }
     scalar(
         &mut out,

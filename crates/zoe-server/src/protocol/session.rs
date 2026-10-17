@@ -1643,6 +1643,7 @@ impl Transaction {
     /// finds no transaction.
     fn vote(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [id] = arity::<1>(args, "vote")?;
+        let storage = Arc::clone(&self.session.storage);
         let open = self.current(id)?;
         let listed = std::mem::take(&mut open.listed);
         let jobs = std::mem::take(&mut open.jobs);
@@ -1651,7 +1652,18 @@ impl Transaction {
                 .vote()
                 .map(|()| Voted::default())
                 .map_err(|error| Fault::of_vote(&error, txn)),
-            Ok(txn) => attach(txn, jobs).and_then(|()| vote_resolving(txn)),
+            Ok(txn) => {
+                let voted = attach(txn, jobs).and_then(|()| vote_resolving(txn));
+                // The vote that takes the locks runs tier 1: log and count
+                // its results, also when the vote failed.
+                storage.metrics.count_resolutions(txn.resolutions());
+                if let Some(log) = &storage.resolution_log
+                    && !txn.resolutions().is_empty()
+                {
+                    log.write(&txn.resolution_log_lines(SystemTime::now(), Some(&storage.name)));
+                }
+                voted
+            }
             Err(fault) => Err(fault.clone()),
         };
         match voted {

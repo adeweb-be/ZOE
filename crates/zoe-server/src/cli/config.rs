@@ -5,7 +5,9 @@
 //! `config` and `storage`. A key takes a string, an integer or a boolean,
 //! with the syntax of its option. Each `[storages.NAME]` table adds a store
 //! that the server serves under the storage name NAME. Its keys are `path`,
-//! which is necessary, `blob-dir`, `read-only` and `pack-gc`.
+//! which is necessary, `blob-dir`, `read-only` and `pack-gc`. The table
+//! `[structural-merge-classes]` gives the mode of classes of tier 1, as
+//! `"BTrees.IOBTree.IOBucket" = "shadow"`.
 //!
 //! An option on the command line or in its twin wins over the file. So the
 //! file gives only the options that neither of them gives. The stores of
@@ -23,9 +25,14 @@ use super::serve::Storage;
 /// The top-level key of the stores.
 const STORAGES: &str = "storages";
 
+/// The top-level table of the modes of the classes of tier 1, whose pairs
+/// become `--structural-merge-class` options.
+const MERGE_CLASSES: &str = "structural-merge-classes";
+
 /// The options of `zoe serve` that are not keys of the file. The
-/// `[storages.NAME]` tables take the place of `--storage`.
-const NOT_KEYS: [&str; 3] = ["config", "storage", "help"];
+/// `[storages.NAME]` tables take the place of `--storage`, and the table
+/// `[structural-merge-classes]` the place of `--structural-merge-class`.
+const NOT_KEYS: [&str; 4] = ["config", "storage", "structural_merge_class", "help"];
 
 /// What the configuration file adds to the command line.
 #[derive(Debug, Default, PartialEq)]
@@ -36,6 +43,27 @@ pub(super) struct Config {
     /// The stores of the `[storages.NAME]` tables, in the order of their
     /// names.
     pub(super) storages: Vec<Storage>,
+}
+
+/// Return the options of the table `[structural-merge-classes]`: one
+/// `--structural-merge-class=CLASS=MODE` for each key, in the order of the
+/// keys.
+fn merge_classes(value: &Value) -> Result<Vec<OsString>, String> {
+    let Value::Table(table) = value else {
+        return Err(format!("{MERGE_CLASSES} is a table of CLASS = MODE"));
+    };
+    table
+        .iter()
+        .map(|(class, mode)| match mode {
+            Value::String(mode) => {
+                let pair = format!("{class}={mode}");
+                zoe_core::merge::class_mode(&pair)
+                    .map(|_| format!("--structural-merge-class={pair}").into())
+                    .map_err(|error| format!("{MERGE_CLASSES}: {error}"))
+            }
+            _ => Err(format!("{MERGE_CLASSES}.{class} takes on, shadow or off")),
+        })
+        .collect()
 }
 
 /// Read the configuration file `path` of the command `serve`. `matches`
@@ -56,6 +84,17 @@ fn parse(text: &str, serve: &Command, matches: &ArgMatches) -> Result<Config, St
     for (key, value) in &table {
         if key == STORAGES {
             config.storages = storages(value)?;
+            continue;
+        }
+        if key == MERGE_CLASSES {
+            let given = matches.value_source("structural_merge_class");
+            let classes = merge_classes(value)?;
+            if !matches!(
+                given,
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ) {
+                config.args.extend(classes);
+            }
             continue;
         }
         let arg = serve
