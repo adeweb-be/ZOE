@@ -2,9 +2,11 @@
 # libFuzzer and runs them. This package is a workspace of its own, so the
 # builds and the lints of the repository do not see it.
 #
-# The seeds in corpus/ are the client streams of the wire traces in
-# docs/spikes/zeo-wire, each one up to 4 KiB: the protocol of the client,
-# then its messages, each one as a frame. corpus/generate.py writes them.
+# The seeds of frame and handshake in corpus/ are the client streams of the
+# wire traces in docs/spikes/zeo-wire, each one up to 4 KiB: the protocol of
+# the client, then its messages, each one as a frame. corpus/generate.py
+# writes them. The seeds of merge are conflicts of BTrees records that
+# corpus/generate_merge.py writes with ZODB.
 
 [package]
 name = "zoe-server-fuzz"
@@ -18,6 +20,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+zoe-core = { path = "../../zoe-core" }
+zoe-pickle = { path = "../../zoe-pickle" }
 zoe-server = { path = "..", features = ["fuzz"] }
 
 [workspace]
@@ -36,6 +40,14 @@ bench = false
 [[bin]]
 name = "handshake"
 path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+# Tier 1 of the conflict resolution, on three records.
+[[bin]]
+name = "merge"
+path = "fuzz_targets/merge.rs"
 test = false
 doc = false
 bench = false

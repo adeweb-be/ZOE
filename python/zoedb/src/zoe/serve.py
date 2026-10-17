@@ -4,7 +4,9 @@ The file is a ZConfig file with one `<zoe-server>` section, which
 `%import zoe` declares. The keys of the section, except `binary`, are the
 options of `zoe serve` without `--`, as in its TOML configuration file.
 Each `<storage NAME>` subsection is a `[storages.NAME]` table, with the
-keys `path`, `blob-dir`, `read-only` and `pack-gc`.
+keys `path`, `blob-dir`, `read-only` and `pack-gc`. The key
+`structural-merge-class`, once for each class, is the table
+`[structural-merge-classes]`.
 
 The module writes the settings as a TOML file into a file that has no
 name on disk, and replaces itself with `zoe serve --config` on that file.
@@ -62,7 +64,14 @@ KEYS = (
     "tls-key",
     "tls-client-ca",
     "tls-read-only-client-ca",
+    "structural-merges",
+    "structural-merge-class",
+    "posting-dicts",
+    "resolution-log",
 )
+
+# The keys that come once for each value. They go to tables of the file.
+MULTIKEYS = ("structural-merge-class",)
 
 # The keys whose value is a boolean.
 BOOLEANS = ("read-only", "pack-gc", "shared-blob-dir")
@@ -75,6 +84,7 @@ PATHS = (
     "tls-key",
     "tls-client-ca",
     "tls-read-only-client-ca",
+    "resolution-log",
 )
 
 SCHEMA = """
@@ -122,6 +132,8 @@ def settings(section):
     """
     values = {}
     for key in KEYS:
+        if key in MULTIKEYS:
+            continue
         text = getattr(section, key.replace("-", "_"))
         if not text:
             continue
@@ -137,6 +149,23 @@ def settings(section):
     return values
 
 
+def class_modes(section):
+    """Return the modes of the classes of the key `structural-merge-class`
+    of the section, as a dict of class to mode."""
+    from zoe.config import class_modes as read
+
+    modes = {}
+    for text in section.structural_merge_class or ():
+        if text:
+            try:
+                modes.update(read(text))
+            except ValueError as error:
+                raise UsageError(
+                    f"<zoe-server> structural-merge-class: {error}"
+                ) from None
+    return modes
+
+
 def toml(section):
     """Return the configuration file of `zoe serve` for the section."""
     lines = []
@@ -145,6 +174,12 @@ def toml(section):
             lines.append(f"{key} = {str(value).lower()}")
         else:
             lines.append(f"{key} = {toml_string(value)}")
+    modes = class_modes(section)
+    if modes:
+        lines.append("")
+        lines.append("[structural-merge-classes]")
+        for name, mode in modes.items():
+            lines.append(f"{toml_string(name)} = {toml_string(mode)}")
     # ZConfig refuses two subsections with the same name.
     for storage in section.storages:
         lines.append("")
@@ -168,6 +203,8 @@ def environment(section, environ):
     the section wins over the twins, as in the `<zoe>` section.
     """
     given = {twin(key) for key in settings(section)}
+    if class_modes(section):
+        given.add(twin("structural-merge-class"))
     return {name: value for name, value in environ.items() if name not in given}
 
 

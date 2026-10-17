@@ -10,6 +10,12 @@
 //! durable before it returns. `finish` and `abort` release the locks.
 //! Dropping a transaction aborts it.
 //!
+//! The vote that takes the locks runs tier 1 of the conflict resolution
+//! (`crate::merge`) on each stale written oid of a class of BTrees or
+//! `Length`: it stores the merged record over the committed one, or fails
+//! on a refusal, or leaves the conflict as it is. `resolutions` tells what
+//! tier 1 did.
+//!
 //! `vote_resolving` lets the caller resolve conflicts with the locks held.
 //! It returns the stale written oids with their committed records, and
 //! keeps the locks. The caller stores a resolved pickle of each oid and
@@ -61,6 +67,7 @@ use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, LockCancel, Mode, Refused};
+use crate::merge::{self, Merge, Outcome, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub use encoded::Encoded;
@@ -131,13 +138,23 @@ pub struct Txn<S: Deref<Target = Store>> {
     committed: Option<Tid>,
     /// The handle that ends the lock wait of a vote from another thread.
     lock_cancel: Option<LockCancel>,
+    /// What tier 1 did in the last vote that took the locks.
+    resolutions: Vec<Resolution>,
 }
 
 /// What the serial check of a vote found.
 enum Check {
     /// No serial fails the vote. Each stale written oid can be resolved:
-    /// the check gives it with its committed record.
-    Passed(Vec<(Oid, Record)>),
+    /// the check gives it with its committed record, or tier 1 merged it.
+    Passed {
+        /// The stale written oids that the caller resolves.
+        conflicts: Vec<(Oid, Record)>,
+        /// The records that tier 1 merged: the oid, the serial of the
+        /// committed record and the merged pickle.
+        merged: Vec<(Oid, Tid, Vec<u8>)>,
+        /// The transaction size with the merged pickles.
+        stored_bytes: u64,
+    },
     /// A stale serial fails the vote.
     Failed(Stale),
 }
@@ -175,6 +192,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             began,
             committed: None,
             lock_cancel: None,
+            resolutions: Vec::new(),
         }
     }
 
@@ -634,11 +652,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Err(ZoeError::Protocol("vote twice"));
         }
         self.conflict = None;
-        if !self.locked() {
+        // Only the vote that takes the locks runs tier 1. The vote after
+        // `vote_resolving` checks the serials again.
+        let native = !self.locked();
+        if native {
             self.lock()?;
         }
         self.resolving.clear();
-        self.check(false).map(drop)
+        self.check(false, native).map(drop)
     }
 
     /// Vote as `vote` does, but keep the locks when the vote finds stale
@@ -664,9 +685,70 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         self.conflict = None;
         self.lock()?;
-        let conflicts = self.check(true)?;
+        let conflicts = self.check(true, true)?;
         self.resolving = conflicts.iter().map(|&(oid, _)| oid).collect();
         Ok(conflicts)
+    }
+
+    /// Return the user of the transaction, as `tpc_begin` gave it.
+    pub fn user(&self) -> &[u8] {
+        &self.user
+    }
+
+    /// Return the description of the transaction, as `tpc_begin` gave it.
+    pub fn description(&self) -> &[u8] {
+        &self.description
+    }
+
+    /// Return what tier 1 did in the last vote that took the locks: one
+    /// entry for each stale written oid of a class of tier 1 whose mode is
+    /// not `Off`, in oid order. The vote that comes after `vote_resolving`
+    /// keeps the entries of `vote_resolving`.
+    pub fn resolutions(&self) -> &[Resolution] {
+        &self.resolutions
+    }
+
+    /// Return the lines of the resolution log (ADR 0042) of what tier 1 did
+    /// in the last vote that took the locks: one JSON object for each entry
+    /// of `resolutions`, at `time`, for the storage `storage` of a server.
+    /// The user and the description of the committed transaction come from
+    /// the history of the oid; when the store no longer has that record,
+    /// the line gives null for them.
+    pub fn resolution_log_lines(&self, time: SystemTime, storage: Option<&str>) -> Vec<String> {
+        self.resolutions
+            .iter()
+            .map(|resolution| {
+                let committed = self
+                    .store
+                    .history(resolution.oid, HISTORY_SEARCH)
+                    .ok()
+                    .and_then(|entries| {
+                        entries
+                            .into_iter()
+                            .find(|entry| entry.tid == resolution.committed)
+                    });
+                let context = merge::LogContext {
+                    time,
+                    storage,
+                    user: &self.user,
+                    description: &self.description,
+                    committed_user: committed.as_ref().map(|entry| &entry.user[..]),
+                    committed_description: committed.as_ref().map(|entry| &entry.description[..]),
+                };
+                merge::log_line(resolution, &context)
+            })
+            .collect()
+    }
+
+    /// Return the oids that tier 1 merged in the last vote that took the
+    /// locks and passed. Their staged records hold the merged records, over
+    /// the serial of the committed records.
+    pub fn natively_resolved(&self) -> Vec<Oid> {
+        self.resolutions
+            .iter()
+            .filter(|resolution| resolution.applied && resolution.outcome == Resolved::Merged)
+            .map(|resolution| resolution.oid)
+            .collect()
     }
 
     /// Take the locks of the vote, and keep them until `finish`, `abort` or
@@ -705,13 +787,35 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Check the serials with the locks held. Return the stale written oids
     /// that the caller can resolve, with their committed records. When
-    /// `resolve` is false, the caller can resolve none.
+    /// `resolve` is false, the caller can resolve none. When `native` is
+    /// true, tier 1 runs first on each stale written oid of its classes, and
+    /// the check stages the records that it merged.
     ///
-    /// A stale serial that the caller cannot resolve, or an error, fails
-    /// the check and releases the locks.
-    fn check(&mut self, resolve: bool) -> Result<Vec<(Oid, Record)>> {
-        let error = match self.check_serials(resolve) {
-            Ok(Check::Passed(conflicts)) => return Ok(conflicts),
+    /// A stale serial that the caller cannot resolve, a refusal of tier 1,
+    /// or an error, fails the check and releases the locks.
+    fn check(&mut self, resolve: bool, native: bool) -> Result<Vec<(Oid, Record)>> {
+        if native {
+            self.resolutions.clear();
+        }
+        let checked = self
+            .check_serials(resolve, native)
+            .and_then(|check| match check {
+                Check::Passed {
+                    conflicts,
+                    merged,
+                    stored_bytes,
+                } => {
+                    self.stage_merged(merged, stored_bytes)?;
+                    Ok(Check::Passed {
+                        conflicts,
+                        merged: Vec::new(),
+                        stored_bytes,
+                    })
+                }
+                failed => Ok(failed),
+            });
+        let error = match checked {
+            Ok(Check::Passed { conflicts, .. }) => return Ok(conflicts),
             Ok(Check::Failed(stale)) => {
                 self.conflict = Some((stale.current, stale.read));
                 let oid = stale.oid;
@@ -752,14 +856,40 @@ impl<S: Deref<Target = Store>> Txn<S> {
         requests.into_iter().collect()
     }
 
+    /// Stage the records that tier 1 merged over the serials of the
+    /// committed records, and mark their entries as applied.
+    fn stage_merged(&mut self, merged: Vec<(Oid, Tid, Vec<u8>)>, stored_bytes: u64) -> Result<()> {
+        if merged.is_empty() {
+            return Ok(());
+        }
+        let area = &self.store.backend.staging;
+        for (oid, serial, pickle) in &merged {
+            self.staged.put(area, *oid, *serial, pickle, false)?;
+        }
+        self.stored_bytes = stored_bytes;
+        for resolution in &mut self.resolutions {
+            if resolution.outcome == Resolved::Merged
+                && merged.iter().any(|(oid, _, _)| *oid == resolution.oid)
+            {
+                resolution.applied = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Compare the serial that the client read of each oid with its current
     /// serial. The written oids come first, then the read-current oids.
     ///
-    /// The first stale oid fails the check, unless `resolve` is true and
-    /// the oid is a written oid that the caller can resolve. The check
-    /// gives each such oid with its committed record.
-    fn check_serials(&self, resolve: bool) -> Result<Check> {
+    /// The first stale oid fails the check, unless tier 1 merges it, or
+    /// `resolve` is true and the oid is a written oid that the caller can
+    /// resolve. The check gives each such oid with its committed record.
+    /// When `native` is true, tier 1 runs on each stale written oid that
+    /// the caller could resolve, whether `resolve` is true or not, and its
+    /// entries go to `self.resolutions`.
+    fn check_serials(&mut self, resolve: bool, native: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
+        let mut merged = Vec::new();
+        let mut stored_bytes = self.stored_bytes;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
@@ -776,7 +906,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     read: staged.serial,
                     read_only: false,
                 };
-                if !resolve
+                if !(resolve || native)
                     || staged.restored
                     || staged.serial == Tid::ZERO
                     || staged.pickle_len() == 0
@@ -787,12 +917,40 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 // has an empty pickle and is never resolved. A record that
                 // is gone since the serials were read is a pack of it:
                 // the vote then fails as it does for a stale serial.
-                match self.store.backend.load_before(oid, Tid::MAX)? {
-                    Some(record) if record.tid == current && !record.data.is_empty() => {
-                        conflicts.push((oid, record));
-                    }
+                let record = match self.store.backend.load_before(oid, Tid::MAX)? {
+                    Some(record) if record.tid == current && !record.data.is_empty() => record,
                     _ => return Ok(Check::Failed(stale)),
+                };
+                if native && let Some((mode, merge)) = self.tier1(oid, staged.serial, &record)? {
+                    let mut resolution = Resolution::of(oid, mode, &merge, current, staged.serial);
+                    match (mode, merge.outcome) {
+                        (merge::Mode::On, Outcome::Merged(pickle)) => {
+                            match self.merged_size(oid, &pickle, stored_bytes) {
+                                Some(size) => {
+                                    stored_bytes = size;
+                                    merged.push((oid, current, pickle));
+                                    self.resolutions.push(resolution);
+                                    continue;
+                                }
+                                None => {
+                                    resolution.outcome =
+                                        Resolved::Undecided("a merged record over a size limit");
+                                }
+                            }
+                        }
+                        (merge::Mode::On, Outcome::Refused(_)) => {
+                            resolution.applied = true;
+                            self.resolutions.push(resolution);
+                            return Ok(Check::Failed(stale));
+                        }
+                        _ => {}
+                    }
+                    self.resolutions.push(resolution);
                 }
+                if !resolve {
+                    return Ok(Check::Failed(stale));
+                }
+                conflicts.push((oid, record));
             }
         }
         let read_current: Vec<_> = self.read_current.iter().collect();
@@ -810,7 +968,71 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 }
             }
         }
-        Ok(Check::Passed(conflicts))
+        Ok(Check::Passed {
+            conflicts,
+            merged,
+            stored_bytes,
+        })
+    }
+
+    /// Run tier 1 on the conflict of `oid`: the transaction read `read`,
+    /// and `committed` is the current record. Return `None` when the class
+    /// of the staged record is not a class of tier 1, or its mode is `Off`.
+    ///
+    /// The class comes from the class pickle of the staged record alone.
+    /// Only a class of tier 1 reads the record at `read`.
+    fn tier1(
+        &self,
+        oid: Oid,
+        read: Tid,
+        committed: &Record,
+    ) -> Result<Option<(merge::Mode, Merge)>> {
+        let rules = &self.store.structural_merges;
+        // A staged pickle that does not read back gives no answer: the
+        // conflict goes on, and the caller that reads the pickle again
+        // reports the error.
+        let Ok(Some((_, new))) = self.staged.get(oid) else {
+            return Ok(None);
+        };
+        let Some(class) = merge::tier1_class(&new) else {
+            return Ok(None);
+        };
+        let mode = rules.mode(&class);
+        if mode == merge::Mode::Off {
+            return Ok(None);
+        }
+        let Some(old) = self.store.backend.load_serial(oid, read)? else {
+            let merge = Merge {
+                class,
+                outcome: Outcome::Undecided("the record that the transaction read is gone"),
+                keys: Vec::new(),
+                changed: 0,
+                shadow: None,
+            };
+            return Ok(Some((mode, merge)));
+        };
+        let merge = merge::tier1(&old, &committed.data, &new, rules.posting_dicts)
+            .expect("a class of tier 1");
+        Ok(Some((mode, merge)))
+    }
+
+    /// Return the transaction size after a merged pickle of `oid` replaces
+    /// its staged pickle in a transaction of `stored_bytes`, or `None` when
+    /// the pickle breaks `max-record-size` or `max-transaction-size`.
+    fn merged_size(&self, oid: Oid, pickle: &[u8], stored_bytes: u64) -> Option<u64> {
+        if self.is_restore() {
+            return Some(stored_bytes);
+        }
+        let guardrails = &self.store.guardrails;
+        let size = pickle.len() as u64;
+        guardrails.check(SizeLimit::Record, oid, size).ok()?;
+        let staged = self
+            .staged
+            .record(oid)
+            .map_or(0, |staged| staged.pickle_len() as u64);
+        let total = stored_bytes.saturating_sub(staged).saturating_add(size);
+        guardrails.check(SizeLimit::Transaction, oid, total).ok()?;
+        Some(total)
     }
 
     /// Return the current serial of each oid of `oids`, in order, from one
@@ -954,6 +1176,11 @@ fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
 /// The number of oids whose current serials the vote reads in one backend
 /// read.
 const READ_CHUNK: usize = 256;
+
+/// The most records of the history of an oid that a line of the resolution
+/// log reads to find the committed record. Other commits can come after
+/// the vote, once it released its locks.
+const HISTORY_SEARCH: usize = 8;
 
 /// Check that a restore transaction can commit under `tid` when `last` is
 /// the last tid. A failed check is `Protocol`.

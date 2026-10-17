@@ -2376,6 +2376,8 @@ name = "zoe-server-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "zoe-core",
+ "zoe-pickle",
  "zoe-server",
 ]
 

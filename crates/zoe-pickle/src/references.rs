@@ -401,6 +401,7 @@ mod tests {
     /// `ZODB.serialize.referencesf` gives for them (ZODB 6.3, zodbpickle
     /// 4.5). It gives no oid for the other records.
     const CORPUS: &[(&str, &[u64])] = &[
+        ("postings-3", &[15]),
         ("iiset-2", &[67]),
         ("iiset-3", &[66]),
         ("iiset-4", &[65]),
@@ -460,7 +461,7 @@ mod tests {
             assert_eq!(oids(&std::fs::read(&path).unwrap()), expected, "{stem}");
             checked += 1;
         }
-        assert_eq!(checked, 80);
+        assert_eq!(checked, 95);
     }
 
     #[test]

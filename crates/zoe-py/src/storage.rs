@@ -42,12 +42,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use zoe_core::{BlobFile, Compression, Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Compression, Mode, Oid, Options, Store, Tid, Txn, ZoeError};
 
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
@@ -263,6 +263,49 @@ pub(crate) struct Storage {
     path: String,
     read_only: bool,
     published: Published,
+    /// The resolution log (ADR 0042), if `resolution_log` names one.
+    resolution_log: Option<Arc<ResolutionLog>>,
+}
+
+/// The resolution log of ADR 0042: a file of JSON lines, one for each
+/// result of tier 1 in a vote. It is opened in append mode, each vote
+/// writes its lines in one write, and it is never synced.
+struct ResolutionLog {
+    file: Mutex<File>,
+    /// True after a write failed: the storage warns at the first one.
+    failed: AtomicBool,
+}
+
+impl ResolutionLog {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(ResolutionLog {
+            file: Mutex::new(file),
+            failed: AtomicBool::new(false),
+        })
+    }
+
+    /// Writes the lines of what tier 1 did in the vote of `txn`. A failed
+    /// write never fails the vote. Returns the error of the first failed
+    /// write, for the log of the storage.
+    fn write(&self, txn: &SharedTxn) -> Option<String> {
+        if txn.resolutions().is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        for line in txn.resolution_log_lines(SystemTime::now(), None) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        match io::Write::write_all(&mut *file, text.as_bytes()) {
+            Err(error) if !self.failed.swap(true, Ordering::Relaxed) => Some(error.to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl Storage {
@@ -345,7 +388,12 @@ impl Storage {
     /// stores of the process, each only when its action is the default
     /// (see `signals`).
     #[new]
-    #[pyo3(signature = (path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true, compression = None))]
+    #[pyo3(signature = (
+        path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true,
+        compression = None, structural_merges = None, structural_merge_classes = None,
+        posting_dicts = None, resolution_log = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -354,8 +402,44 @@ impl Storage {
         blob_dir: Option<PathBuf>,
         pack_gc: bool,
         compression: Option<&str>,
+        structural_merges: Option<&str>,
+        structural_merge_classes: Option<HashMap<String, String>>,
+        posting_dicts: Option<&str>,
+        resolution_log: Option<PathBuf>,
     ) -> PyResult<Self> {
         let mut options = Options::default();
+        if let Some(text) = structural_merges {
+            options.structural_merges.mode = text
+                .parse::<Mode>()
+                .map_err(|e| PyValueError::new_err(format!("structural_merges: {e}")))?;
+        }
+        for (class, mode) in structural_merge_classes.unwrap_or_default() {
+            let (class, mode) = zoe_core::merge::class_mode(&format!("{class}={mode}"))
+                .map_err(|e| PyValueError::new_err(format!("structural_merge_classes: {e}")))?;
+            options.structural_merges.classes.insert(class, mode);
+        }
+        if let Some(text) = posting_dicts {
+            options.structural_merges.posting_dicts = text
+                .parse::<Mode>()
+                .map_err(|e| PyValueError::new_err(format!("posting_dicts: {e}")))?;
+        }
+        // In-process, the resolution log is the only place where shadow
+        // mode says what it found.
+        let merges = &options.structural_merges;
+        let shadow = merges.mode == Mode::Shadow
+            || merges.posting_dicts == Mode::Shadow
+            || merges.classes.values().any(|&mode| mode == Mode::Shadow);
+        if shadow && resolution_log.is_none() {
+            return Err(PyValueError::new_err(
+                "shadow mode needs resolution_log: without it, nothing tells what it found",
+            ));
+        }
+        let resolution_log = match resolution_log {
+            Some(path) => Some(Arc::new(
+                ResolutionLog::open(&path).map_err(|error| core(py, error.into()))?,
+            )),
+            None => None,
+        };
         if let Some(text) = compression {
             options.compression = text
                 .parse::<Compression>()
@@ -409,6 +493,7 @@ impl Storage {
             path: path.to_string_lossy().into_owned(),
             read_only,
             published: Published::new(last),
+            resolution_log,
         })
     }
 
@@ -960,6 +1045,28 @@ impl Storage {
             .map_err(|failure| failure.into_py(py))
     }
 
+    /// Return the oids that tier 1 of the core merged in the last vote of
+    /// `transaction` that took the locks and passed: the vote stored each
+    /// merged record over the committed serial. An empty list for a
+    /// transaction that this storage does not know, or that ended.
+    #[pyo3(name = "_natively_resolved")]
+    fn natively_resolved<'py>(
+        &self,
+        py: Python<'py>,
+        transaction: &Bound<'py, PyAny>,
+    ) -> Vec<Bound<'py, PyBytes>> {
+        let key = transaction.as_ptr() as usize;
+        // The guard drops at the end of this statement.
+        let entry = self.table().entries.get(&key).cloned();
+        let oids = match entry {
+            Some(entry) => py
+                .detach(|| entry.with(|txn| Ok(txn.natively_resolved())))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        oids.into_iter().map(|oid| p64(py, oid.0)).collect()
+    }
+
     /// Vote on `transaction` as `tpc_vote` does, but keep the locks when
     /// the vote finds conflicts that Python can resolve. An empty list
     /// means that the vote succeeded.
@@ -980,12 +1087,18 @@ impl Storage {
         untransform: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<ConflictRow<'py>>> {
         let entry = self.entry(py, transaction)?;
+        let log = self.resolution_log.clone();
+        let mut log_failure = None;
         let conflicts = py
             .detach(|| {
                 let read = entry.with(|txn| {
-                    let conflicts = txn
-                        .vote_resolving()
-                        .map_err(|error| vote_failure(txn, error))?;
+                    let voted = txn.vote_resolving();
+                    // The vote that takes the locks runs tier 1: log its
+                    // results, also when the vote failed.
+                    if let Some(log) = &log {
+                        log_failure = log.write(txn);
+                    }
+                    let conflicts = voted.map_err(|error| vote_failure(txn, error))?;
                     // A staged pickle in the spill file of the transaction
                     // is read from the file, and that read can fail.
                     Ok(conflicts
@@ -1014,8 +1127,11 @@ impl Storage {
                     .data
                     .and_then(|data| untransformed(untransform, &data));
                 failure.into_py(py)
-            })?
-            .map_err(|error| unreadable_pickle(py, error))?;
+            });
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        let conflicts = conflicts?.map_err(|error| unreadable_pickle(py, error))?;
         Ok(conflicts
             .into_iter()
             .map(|(oid, committed, read, data)| {
@@ -1251,6 +1367,20 @@ type TxnRow<'py> = (
     Bound<'py, PyBytes>,
     Vec<RecordRow<'py>>,
 );
+
+/// Log a failed write of the resolution log as a warning of the logger
+/// `zoe.storage`. Later failures are not logged.
+fn warn_log_failure(py: Python<'_>, error: &str) {
+    let message =
+        format!("a write of the resolution log failed; later failures are not logged: {error}");
+    let logged = py
+        .import("logging")
+        .and_then(|logging| logging.call_method1("getLogger", ("zoe.storage",)))
+        .and_then(|logger| logger.call_method1("warning", (message,)));
+    if let Err(error) = logged {
+        error.write_unraisable(py, None);
+    }
+}
 
 /// Return the `StorageError` for a staged pickle that the core cannot read
 /// back from the spill file. The error of the core is its cause, so its

@@ -53,8 +53,10 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     """A ZODB storage in the directory `path`, in this process.
 
     `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
-    pack_gc=True, compression=None)` opens the store in `path` and creates
-    the directory when it is missing.
+    pack_gc=True, compression=None, structural_merges=None,
+    structural_merge_classes=None, posting_dicts=None,
+    resolution_log=None)` opens the store in `path` and creates the
+    directory when it is missing.
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
     lock of an object. A longer wait raises `ConflictError`. `None` keeps the
     default of the store. A read-only storage refuses `tpc_begin`, `new_oid`,
@@ -68,6 +70,15 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     layout file of its blobs with `StorageError`: the option is missing or
     wrong, or the directory is not mounted. A `blob_dir` that is not a
     directory raises `OSError`, and the storage creates nothing.
+
+    `structural_merges` is the mode of the structural merges (tier 1) of
+    BTree buckets, sets and `Length`: `"on"` (`None` keeps it), `"shadow"`
+    or `"off"`. `structural_merge_classes` maps a class, as `module.name`,
+    to its own mode. `posting_dicts` is the mode of the posting-dict rule and
+    the first-key rule of ADR 0042, off by default. `resolution_log` is a
+    file that gets one JSON line for each result of the structural merges. A
+    shadow mode without `resolution_log` raises `ValueError`: nothing else
+    would tell what it found.
 
     `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
     copy, and copies a file from elsewhere. `loadBlob` returns the path of a
@@ -134,12 +145,15 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     def tpc_vote(self, transaction):
         """Vote on `transaction`, and resolve its conflicts.
 
-        The vote locks the objects of the transaction. Then, for each object
-        that another transaction changed, `tryToResolveConflict` runs the
-        `_p_resolveConflict` method of its class. The vote keeps the locks
-        while the method runs. It stores the resolved state over the
-        committed serial and votes again. Return the oids of the resolved
-        objects.
+        The vote locks the objects of the transaction. The core merges the
+        conflicts of BTree buckets, sets and `Length` in Rust (tier 1), and
+        a refusal of tier 1 raises `ConflictError`. Then, for each other
+        object that another transaction changed, `tryToResolveConflict`
+        runs the `_p_resolveConflict` method of its class. The vote keeps
+        the locks while the method runs. It stores the resolved state over
+        the committed serial and votes again. Return the oids of the
+        resolved objects: those that the core merged, then those that
+        Python resolved.
 
         An object that does not resolve raises `ConflictError`. The error
         names the class of the object. A read-current object is never
@@ -148,8 +162,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         vote aborts the transaction, and that releases the locks.
         """
         conflicts = self._vote_resolving(transaction, self._crs_untransform_record_data)
+        resolved = self._natively_resolved(transaction)
         if not conflicts:
-            return []
+            return resolved
         try:
             for oid, committed, read, committed_data, data in conflicts:
                 data = self._resolve(oid, committed, read, data, committed_data)
@@ -161,7 +176,7 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
             # failed vote, and a second abort does nothing.
             self.tpc_abort(transaction)
             raise
-        return [conflict[0] for conflict in conflicts]
+        return resolved + [conflict[0] for conflict in conflicts]
 
     def _resolve(self, oid, committed, read, data, committed_data):
         """Return the resolved pickle of `oid`, or raise `ConflictError`.
