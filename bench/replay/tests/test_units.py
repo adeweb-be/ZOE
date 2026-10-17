@@ -194,3 +194,15 @@ def test_the_command_refuses_a_run_without_probe_records(tmp_path, capsys):
     assert command.main(line) == 2
     assert "explain no transaction" in capsys.readouterr().err
     assert not (tmp_path / "result.json").exists()
+
+
+def test_the_next_transaction_of_a_request_starts_at_its_previous_commit(tmp_path):
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    probes = tmp_path / "instance0.jsonl"
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 2}
+    probes.write_text(json.dumps(request) + "\n")
+    starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
+    assert matched == {"matched": 2, "unmatched": 0, "requests": 1}
+    assert starts[first] == pytest.approx(t1, abs=1e-6)
+    assert starts[second] == pytest.approx(c1, abs=1e-6)

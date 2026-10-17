@@ -96,10 +96,11 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
     committed, that started before the time of the tid, and whose end comes
     first after it. The transaction starts at `t`, the start of the first
     attempt of the request: the replay does not retry, and the attempt
-    whose `ConflictError` reaches Zope is the first one. A tid that no
-    request explains starts at its commit: it reads its serials when it
-    commits, so it overlaps nothing. The transactions that commit before
-    the first request starts are the base.
+    whose `ConflictError` reaches Zope is the first one. A request that
+    commits several times begins each next transaction at its previous
+    commit. A tid that no request explains starts at its commit: it reads
+    its serials when it commits, so it overlaps nothing. The transactions
+    that commit before the first request starts are the base.
     """
     requests = []
     for path in probes:
@@ -135,6 +136,8 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
             continue
         found[2] -= 1
         starts[tid] = found[1]
+        # The next transaction of the request begins at this commit.
+        found[1] = commit
         matched += 1
     return starts, {
         "matched": matched,

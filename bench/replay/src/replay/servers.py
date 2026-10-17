@@ -3,6 +3,7 @@ with `ZEO.ClientStorage`, and `zoe serve` with `zoe.zeo.ClientStorage`, the
 native client."""
 
 import contextlib
+import hashlib
 import os
 import platform
 import signal
@@ -149,9 +150,10 @@ def server(stack: str, directory: Path, serve_args=()):
 
 def software(serve_args=()) -> dict:
     """Return what a result records of the software of its runs: the
-    commit of the repository, the `zoe` binary and its version, the
-    arguments of `zoe serve`, the package `zoe` that the native client
-    runs, Python and the machine."""
+    commit of the repository and whether its tree differs from it, the
+    `zoe` binary with its version and its sha256, the arguments of `zoe
+    serve`, the package `zoe` that the native client runs, Python and the
+    machine."""
     root = Path(__file__).resolve().parents[4]
 
     def output(command):
@@ -164,6 +166,11 @@ def software(serve_args=()) -> dict:
         return done.stdout.strip() or None
 
     binary = zoe_binary()
+    try:
+        digest = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+    except OSError:
+        digest = None
+    status = output(["git", "-C", str(root), "status", "--porcelain"])
     try:
         import zoe
 
@@ -178,8 +185,11 @@ def software(serve_args=()) -> dict:
         zoedb = None
     return {
         "commit": output(["git", "-C", str(root), "rev-parse", "HEAD"]),
+        # True when the tree holds changes that the commit does not.
+        "dirty": status is not None,
         "zoe": binary,
         "zoe_version": output([binary, "--version"]),
+        "zoe_sha256": digest,
         "zoe_serve_args": list(serve_args),
         "zoedb": zoedb,
         "zoe_package": package,

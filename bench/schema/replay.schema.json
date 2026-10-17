@@ -17,10 +17,12 @@
       "description": "The software of the runs.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["commit", "zoe", "zoe_version", "zoe_serve_args", "zoedb", "zoe_package", "python", "machine"],
+      "required": ["commit", "dirty", "zoe", "zoe_version", "zoe_sha256", "zoe_serve_args", "zoedb", "zoe_package", "python", "machine"],
       "properties": {
         "commit": { "description": "The commit of the repository, or null outside a checkout.", "type": ["string", "null"] },
+        "dirty": { "description": "True when the tree of the repository held changes that the commit does not.", "type": "boolean" },
         "zoe": { "description": "The path of the zoe binary that zoe serve runs.", "type": "string" },
+        "zoe_sha256": { "description": "The sha256 of the zoe binary, or null when it does not read.", "type": ["string", "null"] },
         "zoe_version": { "description": "The output of zoe --version, or null when it does not run.", "type": ["string", "null"] },
         "zoe_serve_args": { "description": "The arguments that zoe serve gets after its own.", "type": "array", "items": { "type": "string" } },
         "zoedb": { "description": "The version of the package zoedb that the replay imports, or null.", "type": ["string", "null"] },
@@ -51,7 +53,7 @@
         }
       }
     },
-    "speeds": { "description": "The speeds of the runs.", "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/speed" } },
+    "speeds": { "description": "The speeds of the runs.", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/speed" } },
     "runs": {
       "description": "One item per run, in the order of the runs: for each speed, for each repetition, one run of each stack.",
       "type": "array",
