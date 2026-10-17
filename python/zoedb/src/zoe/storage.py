@@ -357,6 +357,12 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         """Return True: the storage undoes transactions."""
         return True
 
+    def getTid(self, oid):
+        """Return the serial of the current record of `oid`. An object
+        that has no record, or whose current record is a deletion, raises
+        `POSKeyError`."""
+        return self.load(oid)[1]
+
     def undo(self, transaction_id, transaction):
         """Undo the transaction of the undo id `transaction_id` in
         `transaction`. Return `(None, oids)`: the oids of the undone

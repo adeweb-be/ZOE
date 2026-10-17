@@ -161,10 +161,11 @@ impl Fault {
 
     /// An undo that `reason` refuses, on `oid` when an object stops it. A
     /// stock client rebuilds it as a `MultipleUndoErrors` of one error,
-    /// which is an `UndoError`.
+    /// which is an `UndoError`. Each error is `(oid, reason)`, as in the
+    /// `MultipleUndoErrors` of FileStorage.
     fn undo(reason: &str, oid: Option<Oid>) -> Self {
         let oid = oid.map_or(Value::Nil, |oid| p64(oid.0));
-        let error = Value::Array(vec![Value::from(reason), oid]);
+        let error = Value::Array(vec![oid, Value::from(reason)]);
         Self {
             class: UNDO_ERRORS,
             args: Value::Map(vec![(Value::from("_errs"), Value::Array(vec![error]))]),
@@ -3409,7 +3410,7 @@ mod tests {
         let [error] = errors.as_array().unwrap().as_slice() else {
             panic!("one error: {fault:?}");
         };
-        assert_eq!(error.as_array().unwrap()[1], p64(7));
+        assert_eq!(error.as_array().unwrap()[0], p64(7));
         // An id that names no transaction fails the vote too.
         let fault = undo_in(&mut s, 5, Value::Binary(b"not an id".to_vec())).unwrap_err();
         assert_eq!(fault.class, "ZODB.POSException.MultipleUndoErrors");
