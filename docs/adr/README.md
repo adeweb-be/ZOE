@@ -50,3 +50,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0044](0044-the-lock-hand-off.md) | The lock hand-off: a merge at the vote takes the lock of a commit that is in a commit batch (accepted) |
 | [0045](0045-lock-intent.md) | Early write-intent locks: the lock before the read of a declared hot object (accepted) |
 | [0046](0046-the-merge-policy.md) | The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2 (accepted) |
+| [0047](0047-queued-indexing.md) | Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them (proposed) |
