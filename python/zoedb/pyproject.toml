@@ -26,7 +26,7 @@ classifiers = [
 # needs msgpack for it.
 plone = ["Products.CMFPlone>=6.1", "msgpack>=1"]
 # zoe:// URIs through zodburi, which needs ZEO.
-uri = ["zodburi>=3"]
+uri = ["zodb>=6.4"]
 
 # zodburi opens a zoe:// URI with this resolver. The uri extra installs
 # zodburi.
