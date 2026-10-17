@@ -1990,6 +1990,26 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_of_a_dict_state_are_interned_across_records() {
+        // An object of `m.M` whose `__dict__` is `{'micros': 1}`.
+        let state: &[u8] =
+            b"\x80\x03cm\nM\nq\x01)\x81q\x02}q\x03X\x06\x00\x00\x00microsq\x04K\x01sb.";
+        let mut heap = Heap::with_instances();
+        let (class, one) = load(&mut heap, state);
+        let (_, two) = load(&mut heap, state);
+        let key = |heap: &Heap, value: Value| {
+            let state = heap.instance(value).unwrap().state.unwrap();
+            heap.dict(state).unwrap()[0].0
+        };
+        assert_eq!(key(&heap, one), key(&heap, two));
+        // The pickler writes the key once, then a memo get, as CPython does
+        // for two loaded objects.
+        let pair = heap.new_tuple(vec![one, two]);
+        let bytes = dump(&heap, class, pair);
+        assert_eq!(bytes.windows(6).filter(|w| w == b"micros").count(), 1);
+    }
+
+    #[test]
     fn an_opaque_value_never_holds_itself() {
         // An object whose state names the object.
         let state: &[u8] = b"\x80\x03cm\nD\nq\x01)\x81q\x02}q\x03X\x01\x00\x00\x00sq\x04h\x02sb.";

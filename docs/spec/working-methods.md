@@ -148,8 +148,8 @@ First usable release: the server gate; the in-process storage is usable from the
 | Deterministic simulation testing | Should | phase 1 traits, phase 2 simulator | clock and I/O traits in `zoe-core` from the walking skeleton |
 | Compression, zstd now, deltas and dictionaries later | Should | phase 1 zstd; deltas after the bench | codec byte per record |
 | Blob content hashes, dedup later | Should | phase 1 hash; phase 9 dedup | BLAKE3 per blob record |
-| Append-only fields | Should | phase 4 | `workflow_history` first; append primitive in the protocol |
-| CRDT sets and registers | Should | phase 4 | shipped with append-only fields; counters are sequences |
+| Append-only fields | Should | phase 4 | `workflow_history` first; the tier 2 strategy `append` (ADR 0046); a stored primitive in the protocol only if B5 shows that rewriting the history costs too much |
+| CRDT sets and registers | Should | phase 4 | shipped with append-only fields as the tier 2 strategies `union` and `lww`; counters are sequences |
 | Ephemeral namespace with TTL | Should | phase 4 | sessions, CSRF keys, locks; `zoe.plone` session data manager and locking backend |
 | Registry as durable KV | Should | phase 4 | same primitive, durable flavour; `plone.app.registry` storage swap |
 | Incidental writes | Should | phase 4 report; async path after the outbox | writes-on-GET report first |
