@@ -65,6 +65,17 @@ Source = Annotated[
 ]
 
 
+# The cargo configuration of a build in CI: no debug information for the
+# dependencies.
+CARGO_CONFIG = """\
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+"""
+
+
 @object_type
 class Ci:
     """The CI functions. GitHub Actions workflows call them."""
@@ -101,11 +112,14 @@ class Ci:
             # The uv cache is a volume, so uv cannot hardlink from it.
             .with_env_variable("UV_LINK_MODE", "copy")
             # A hosted runner has little disk. A build in CI writes no
-            # incremental files and keeps only the line tables of its debug
-            # information. Backtraces keep their files and lines.
+            # incremental files. The crates of the workspace keep only the
+            # line tables of their debug information, and the dependencies
+            # keep none. Backtraces keep the files and lines of the
+            # workspace.
             .with_env_variable("CARGO_INCREMENTAL", "0")
             .with_env_variable("CARGO_PROFILE_DEV_DEBUG", "line-tables-only")
             .with_env_variable("CARGO_PROFILE_TEST_DEBUG", "line-tables-only")
+            .with_new_file("/root/.cargo/config.toml", CARGO_CONFIG)
             .with_directory("/src", source)
             .with_workdir("/src")
         )
