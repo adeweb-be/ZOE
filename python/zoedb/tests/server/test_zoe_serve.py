@@ -119,12 +119,12 @@ def test_the_structural_merges_go_to_the_file_and_to_their_table(tmp_path, monke
         "structural-merges shadow",
         "structural-merge-class BTrees.IOBTree.IOBucket on",
         "structural-merge-class BTrees.Length.Length off",
-        "merge-posting-dicts on",
+        "posting-dicts on",
         "resolution-log ~/merges.log",
     )
     assert tomllib.loads(serve.toml(found)) == {
         "structural-merges": "shadow",
-        "merge-posting-dicts": True,
+        "posting-dicts": "on",
         "resolution-log": str(tmp_path / "merges.log"),
         "structural-merge-classes": {
             "BTrees.IOBTree.IOBucket": "on",
@@ -133,7 +133,7 @@ def test_the_structural_merges_go_to_the_file_and_to_their_table(tmp_path, monke
     }
     environ = {
         "ZOE_STRUCTURAL_MERGE_CLASSES": "A.B=on",
-        "ZOE_MERGE_POSTING_DICTS": "false",
+        "ZOE_POSTING_DICTS": "off",
         "ZOE_LISTEN": "127.0.0.1:1",
     }
     assert serve.environment(found, environ) == {"ZOE_LISTEN": "127.0.0.1:1"}

@@ -340,21 +340,19 @@ pub(super) struct ServeArgs {
     )]
     structural_merge_class: Vec<(String, Mode)>,
 
-    /// Merge the posting dicts of ZCTextIndex entry by entry in the buckets
-    /// with integer keys, where ZODB's resolver refuses them (the
-    /// posting-dict rule of ADR 0042). Off by default.
+    /// The mode of the posting-dict rule of ADR 0042: on merges the posting
+    /// dicts of ZCTextIndex entry by entry in the buckets with integer keys,
+    /// where ZODB's resolver refuses them; shadow writes the merge of the
+    /// rule to the resolution log and refuses as ZODB's resolver does; off,
+    /// the default, does not run the rule.
     #[arg(
         long,
-        env = "ZOE_MERGE_POSTING_DICTS",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "true",
-        default_value = "false",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        action = clap::ArgAction::Set
+        env = "ZOE_POSTING_DICTS",
+        value_name = "MODE",
+        default_value = "off",
+        value_parser = clap::builder::ValueParser::new(str::parse::<Mode>)
     )]
-    merge_posting_dicts: bool,
+    posting_dicts: Mode,
 
     /// The resolution log: a file of JSON lines, one for each result of
     /// tier 1, with the user and the description of both transactions and
@@ -685,7 +683,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .structural_merges(zoe_core::StructuralMerges {
             mode: args.structural_merges,
             classes: args.structural_merge_class.iter().cloned().collect(),
-            posting_dicts: args.merge_posting_dicts,
+            posting_dicts: args.posting_dicts,
         });
     if let Some(path) = &args.resolution_log {
         options = options.resolution_log(path);
@@ -707,6 +705,17 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     }
     // The traces flush when `_traces` drops, after the stop of the server.
     let _traces = init_logs(args.log_format)?;
+    let shadow = args.structural_merges == Mode::Shadow
+        || args.posting_dicts == Mode::Shadow
+        || args
+            .structural_merge_class
+            .iter()
+            .any(|(_, mode)| *mode == Mode::Shadow);
+    if shadow && args.resolution_log.is_none() {
+        tracing::warn!(
+            "shadow mode without --resolution-log: only zoe_structural_merges_total of /metrics counts what it finds"
+        );
+    }
     if let Some(addr) = args.admin_listen {
         options = options.admin_listen(addr);
     }
@@ -948,7 +957,7 @@ mod tests {
         let args = serve(&[]).unwrap();
         assert_eq!(args.structural_merges, Mode::On);
         assert!(args.structural_merge_class.is_empty());
-        assert!(!args.merge_posting_dicts);
+        assert_eq!(args.posting_dicts, Mode::Off);
         assert_eq!(args.resolution_log, None);
         let args = serve(&[
             "--structural-merges",
@@ -957,7 +966,8 @@ mod tests {
             "BTrees.IOBTree.IOBucket=on",
             "--structural-merge-class",
             "BTrees.Length.Length=off,BTrees.OOBTree.OOBucket=shadow",
-            "--merge-posting-dicts",
+            "--posting-dicts",
+            "shadow",
             "--resolution-log",
             "merges.log",
         ])
@@ -971,12 +981,12 @@ mod tests {
                 ("BTrees.OOBTree.OOBucket".to_owned(), Mode::Shadow),
             ]
         );
-        assert!(args.merge_posting_dicts);
+        assert_eq!(args.posting_dicts, Mode::Shadow);
         assert_eq!(args.resolution_log, Some(PathBuf::from("merges.log")));
         for bad in [
             &["--structural-merges", "maybe"][..],
             &["--structural-merge-class", "IOBucket=on"],
-            &["--merge-posting-dicts=perhaps"],
+            &["--posting-dicts", "perhaps"],
         ] {
             assert!(serve(bad).is_err(), "{bad:?}");
         }

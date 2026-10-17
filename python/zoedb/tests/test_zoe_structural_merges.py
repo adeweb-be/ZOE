@@ -146,3 +146,118 @@ def test_a_bad_mode_raises_value_error(tmp_path):
         zoe.Storage(str(tmp_path / "one"), structural_merges="sometimes")
     with pytest.raises(ValueError, match="structural_merge_classes"):
         zoe.Storage(str(tmp_path / "two"), structural_merge_classes={"Length": "on"})
+
+
+# The shapes of production that the acceptance test of the merges does not
+# build: buckets of a tree of many buckets, whose state names the next
+# bucket, and buckets whose values are persistent references.
+
+
+def last_records(storage):
+    """Return the oids and the records of the last transaction of storage."""
+    records = []
+    for txn in storage.iterator():
+        records = sorted((record.oid, record.data) for record in txn)
+    return records
+
+
+def differential(tmp_path, name, make, first, second):
+    """Run the same race on FileStorage and on zoe.Storage. Return the
+    outcome and the records of the last commit of each."""
+    from ZODB.FileStorage import FileStorage
+
+    results = []
+    for storage in (
+        FileStorage(str(tmp_path / f"{name}.fs")),
+        zoe.Storage(str(tmp_path / f"{name}-zoe")),
+    ):
+        outcome, _ = race(storage, make, first, second)
+        # race closed the database, and so the storage: open it again.
+        if isinstance(storage, zoe.Storage):
+            storage = zoe.Storage(str(tmp_path / f"{name}-zoe"))
+        else:
+            storage = FileStorage(str(tmp_path / f"{name}.fs"), read_only=True)
+        try:
+            results.append((outcome, last_records(storage)))
+        finally:
+            storage.close()
+    return results
+
+
+def split_tree():
+    from BTrees.OOBTree import OOBTree
+
+    # An OOBucket holds 30 items: 200 keys make a tree of many buckets.
+    return OOBTree({f"k{i:03}": i for i in range(200)})
+
+
+def with_references():
+    from BTrees.OOBTree import OOBTree
+    from persistent.mapping import PersistentMapping
+
+    shared = PersistentMapping({"v": "s"})
+    return OOBTree({"a": PersistentMapping(), "b": shared, "c": shared, "d": 1})
+
+
+def keywords():
+    from BTrees.IOBTree import IOBucket
+
+    return IOBucket({1: ["x", "y"], 2: ["z"], 3: []})
+
+
+def mixed_sets():
+    from BTrees.IIBTree import IITreeSet
+    from BTrees.OOBTree import OOBTree
+
+    return OOBTree({"a": 1, "b": IITreeSet([1, 2]), "c": 3})
+
+
+def setting(key, value):
+    return lambda obj: obj.__setitem__(key, value)
+
+
+def making(key, factory):
+    return lambda obj: obj.__setitem__(key, factory())
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "first", "second", "merges"),
+    [
+        ("split-tree", split_tree, setting("k050", -1), setting("k051", -2), True),
+        (
+            "split-tree-same-key",
+            split_tree,
+            setting("k050", -1),
+            setting("k050", -2),
+            False,
+        ),
+        (
+            "references",
+            with_references,
+            making("e", lambda: __import__("persistent").mapping.PersistentMapping()),
+            setting("f", 2),
+            True,
+        ),
+        ("keywords", keywords, setting(4, ["a"]), setting(5, ["b", "c"]), True),
+        ("keywords-change", keywords, setting(1, ["x"]), setting(5, ["b"]), True),
+        (
+            "mixed-sets",
+            mixed_sets,
+            setting("d", 4),
+            making("e", lambda: __import__("BTrees").IIBTree.IITreeSet([7])),
+            True,
+        ),
+    ],
+)
+def test_merges_of_production_shapes_equal_the_merges_of_zodb(
+    tmp_path, calls, name, make, first, second, merges
+):
+    (theirs, their_records), (ours, our_records) = differential(
+        tmp_path, name, make, first, second
+    )
+    assert ours == theirs == ("merged" if merges else "conflict")
+    # The last commit of each store is the second change, or the first one
+    # when the second conflicts.
+    assert our_records == their_records
+    # FileStorage tried its conflict in Python once, and zoe.Storage never.
+    assert calls["calls"] == 1

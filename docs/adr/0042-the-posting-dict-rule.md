@@ -1,6 +1,6 @@
 # 0042. The posting-dict rule, and the settings of the structural merges
 
-Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes.
+Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes. On the pull request, the human then asked for the key of the rule as a mode, `posting-dicts`, for the reasons of the rule in the Context, and for a shadow mode that a store cannot run without its log in-process.
 
 ## Context
 
@@ -9,6 +9,10 @@ ZCTextIndex (in Products.ZCatalog) keeps the postings of a word, a dict of docum
 When two transactions index documents that share a rare word, both change the dict of that word in the same bucket. The bucket resolver of BTrees compares two values with `object_compare`, which calls `dict < dict`, and that raises `TypeError`. So ZODB's resolver refuses every bucket in which it must compare two dicts, also when only one side changed the dict. On B5 these refusals are most of the failed saves (finding items 3, 24 and 25 of `docs/findings/plone-end-to-end.md`): `IOBucket: Conflicting changes` is 172 of 212 failed client resolutions in `create-spread` and 279 of 285 in `edit` on `zoe-native` in the baseline of ZOE-203.
 
 Tier 1 (ZOE-203) merges buckets, sets, one-bucket BTrees and `Length` in Rust with the rules of BTrees, and gives the bytes that ZODB's resolver gives. Without more, it refuses these buckets as BTrees does. A rule that merges them is a merge where ZODB's resolver refuses, so its correctness rests on what ZCTextIndex does, not on BTrees.
+
+Why an entry merge is safe for ZCTextIndex. The entry of a document D in a posting is only ever written by a transaction that indexes, reindexes or unindexes D: `index_doc`, `_reindex_doc` and `unindex_doc` change the entry of D in the posting of each word of D, and they change `_docwords[D]` and `_docweight[D]` in the same transaction. Two transactions that both write the entry of D both change the key D of `_docwords`, and BTrees refuses two changes of one key (reason 1). So a merge of two postings never keeps an entry of D that disagrees with `_docwords[D]` and `_docweight[D]`: the conflict on D fails one of the two transactions anyway. A merge of postings only joins the entries of different documents.
+
+Why the rule refuses a merged dict of more than 10 entries, and does not convert it. ZCTextIndex converts a dict of 10 entries to an `IIBTree` before it adds the next one, so its dicts never hold more. A merge at the vote that gives 11 entries would have to convert too, and a tree is a new persistent object: it needs a new oid, which a merge at the vote cannot mint, and a record of its own in the commit.
 
 The card also asks for shadow mode and a resolution log, and for a setting of each class: off, shadow or on. These are new keys of `<zoe>` and of `zoe serve`: a public API.
 
@@ -33,10 +37,12 @@ The rule is off by default, because it merges where ZODB refuses: a class of ano
 
 ### How a store switches it on
 
-One boolean key, `merge-posting-dicts`, false by default:
+One key, `posting-dicts`, a mode with the words of `structural-merges`: `off`, the default, `shadow` or `on`.
 
-- In-process: the key `merge-posting-dicts` of `<zoe>`, its environment twin `ZOE_MERGE_POSTING_DICTS`, the query key of `zoe://`, and the argument `merge_posting_dicts` of `zoe.Storage`.
-- `zoe serve`: `--merge-posting-dicts`, `ZOE_MERGE_POSTING_DICTS`, the key `merge-posting-dicts` of the configuration file and of `<zoe-server>`. It applies to every store of the server.
+- In-process: the key `posting-dicts` of `<zoe>`, its environment twin `ZOE_POSTING_DICTS`, the query key of `zoe://`, and the argument `posting_dicts` of `zoe.Storage`.
+- `zoe serve`: `--posting-dicts`, `ZOE_POSTING_DICTS`, the key `posting-dicts` of the configuration file and of `<zoe-server>`. It applies to every store of the server.
+- `on` merges. `shadow` runs the rule and writes its result to the resolution log, in the field `shadow` of the line. When a dict took part in the merge, the vote then refuses with reason 1 of BTrees, as ZODB's resolver does, because BTrees cannot compare dicts. The other merges of tier 1 in the class stay live. So the rule, the one part of tier 1 that departs from ZODB, can run in shadow mode by itself.
+- The rule runs only where the mode of the class is `on` or `shadow`.
 
 A stock client and the native client need nothing: the server merges at the vote and replies with the bare oid, as ZEO 6 does for a conflict that its server resolved.
 
@@ -46,11 +52,11 @@ A Plone site sets the key in its `<zoe>` stanza or in the configuration of its s
 
 - `structural-merges` (`on`, `shadow` or `off`; `on` by default) is the mode of every class of tier 1. `on` stores the merge or fails the vote on a refusal. `shadow` runs tier 1, writes its result to the resolution log, and goes on as without it: the client resolves the conflict. `off` does not run tier 1.
 - `structural-merge-class CLASS MODE` sets the mode of one class, such as `structural-merge-class BTrees.IOBTree.IOBucket shadow`. In `<zoe>` it is a key that comes once for each class; its environment twin `ZOE_STRUCTURAL_MERGE_CLASSES` and `zoe serve --structural-merge-class CLASS=MODE` (repeated; `ZOE_STRUCTURAL_MERGE_CLASSES` as `CLASS=MODE,CLASS=MODE`; a table `[structural-merge-classes]` in the configuration file) take the pairs.
-- The posting-dict rule applies only where the mode of the class is `on` or `shadow`.
+- In-process there is no `/metrics`, so a shadow mode (of tier 1, of a class or of the posting rule) without `resolution-log` would tell nobody what it found: `zoe.Storage` refuses it at the open with `ValueError`. `zoe serve` counts the results in `zoe_structural_merges_total`, and logs a warning at its start for a shadow mode without `--resolution-log`.
 
 ### The resolution log
 
-Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) writes one line of JSON to the resolution log: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason (the code and the message of BTrees, or of the rule), whether the outcome was the outcome of the vote, the keys that the new transaction changed (at most 20, each cut at 80 characters, and their number), the committed and the read serial, and the user and the description of both transactions.
+Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) writes one line of JSON to the resolution log: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason (the code and the message of BTrees, or of the rule), the outcome of the posting-dict rule in shadow mode, whether the outcome was the outcome of the vote, the keys that the new transaction changed (at most 20, each cut at 80 characters, and their number), the committed and the read serial, and the user and the description of both transactions.
 
 - `resolution-log FILE`: in-process the key of `<zoe>` (`ZOE_RESOLUTION_LOG`, the query of `zoe://`, the argument `resolution_log` of `zoe.Storage`); for `zoe serve` the option `--resolution-log` (`ZOE_RESOLUTION_LOG`, the key `resolution-log` of the configuration file and of `<zoe-server>`). Without it, no line is written.
 - The file is opened in append mode and each line is written whole; it is never synced. It is not in the store, and pack never reads it.
@@ -68,7 +74,9 @@ Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) 
 
 - **Convert every posting to an `IIBTree`.** Step 1 of ZOE-203 measures this in a scratch fixture (`docs/spikes/posting-dicts.md`). It needs a change of ZCTextIndex or a migration of each site, and more objects per word.
 - **A merge of posting dicts without the limit of 10.** A dict of more than 10 entries would never become a tree, and the index would grow dicts without bound.
+- **Convert to a tree at the vote.** A merged dict of more than 10 entries would become an `IIBTree`, as ZCTextIndex does. The tree is a new persistent object: the vote would have to mint an oid and add a record that no client stored. The refusal is the conflict of today, and Zope retries.
 - **The rule on by default.** It merges where ZODB refuses, so a store opts in.
+- **A boolean key.** The rule could then run in shadow mode only with the shadow mode of its whole class, which drops the merges of BTrees in that class.
 - **The resolution log in the Python logging of Zope, or in the server log.** The server log has no user or description by rule; Zope's event log is not available to `zoe serve`. One file key for both modes is the simplest that holds.
 - **A switch that `zoe.plone` sends to the server.** It would be a protocol extension for a setting that the deployment already has.
 - **`zoe.plone` switches the rule on in-process at the open of the database**, through a method of `zoe.Storage`. It works only in-process, adds a public method, and makes the setting of a store change while it is open; the merge policy of ZOE-205 does it for both modes.

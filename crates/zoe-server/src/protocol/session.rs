@@ -448,6 +448,9 @@ struct Open {
     /// The number of conflicts that the last vote listed for the client to
     /// resolve. When it is not 0, the next vote is the second vote.
     listed: u64,
+    /// The number of oids that tier 1 merged in the first vote when that
+    /// vote listed conflicts too. The second vote that passes counts them.
+    native: u64,
     /// The blob file that the client uploads, from `storeBlobStart` to
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
@@ -1473,6 +1476,7 @@ impl Transaction {
                 id: id.clone(),
                 txn,
                 listed: 0,
+                native: 0,
                 upload: None,
                 jobs: Vec::new(),
             });
@@ -1646,6 +1650,7 @@ impl Transaction {
         let storage = Arc::clone(&self.session.storage);
         let open = self.current(id)?;
         let listed = std::mem::take(&mut open.listed);
+        let native = std::mem::take(&mut open.native);
         let jobs = std::mem::take(&mut open.jobs);
         let voted = match &mut open.txn {
             Ok(txn) if listed > 0 => txn
@@ -1667,14 +1672,23 @@ impl Transaction {
             Err(fault) => Err(fault.clone()),
         };
         match voted {
-            Ok(Voted { native, conflicts }) => {
+            Ok(Voted {
+                native: merged,
+                conflicts,
+            }) => {
                 open.listed = conflicts.len() as u64;
-                // A second vote that passes counts the conflicts that the
-                // client resolved.
-                Stats::add_n(&self.session.storage.stats.conflicts_resolved, listed);
-                let metrics = &self.session.storage.metrics;
-                Stats::add_n(&metrics.conflicts_native, native.len() as u64);
-                Ok(Value::Array(native.into_iter().chain(conflicts).collect()))
+                // A vote that passes counts the conflicts that the client
+                // resolved and the oids that tier 1 merged. A first vote
+                // that lists conflicts keeps its merged oids for the
+                // second vote.
+                if conflicts.is_empty() {
+                    Stats::add_n(&storage.stats.conflicts_resolved, listed);
+                    let merges = native + merged.len() as u64;
+                    Stats::add_n(&storage.metrics.conflicts_native, merges);
+                } else {
+                    open.native = merged.len() as u64;
+                }
+                Ok(Value::Array(merged.into_iter().chain(conflicts).collect()))
             }
             Err(fault) => {
                 self.open = None;

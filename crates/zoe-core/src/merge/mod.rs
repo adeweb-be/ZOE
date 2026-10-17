@@ -23,7 +23,9 @@
 //! A refusal is a case where ZODB's resolver refuses too.
 //!
 //! The posting-dict rule (ADR 0042) is a merge where ZODB's resolver
-//! refuses. It is off by default. See `posting.rs`.
+//! refuses. It is off by default. In shadow mode it computes its merge for
+//! the resolution log, and the conflict ends as in ZODB's resolver. See
+//! `posting.rs`.
 //!
 //! No Python runs here.
 
@@ -95,8 +97,9 @@ pub struct StructuralMerges {
     pub mode: Mode,
     /// The mode of a class of tier 1, by its `module.name`.
     pub classes: BTreeMap<String, Mode>,
-    /// The posting-dict rule of ADR 0042.
-    pub posting_dicts: bool,
+    /// The mode of the posting-dict rule of ADR 0042, inside the classes
+    /// where tier 1 runs.
+    pub posting_dicts: Mode,
 }
 
 impl Default for StructuralMerges {
@@ -105,7 +108,7 @@ impl Default for StructuralMerges {
         StructuralMerges {
             mode: Mode::On,
             classes: BTreeMap::new(),
-            posting_dicts: false,
+            posting_dicts: Mode::Off,
         }
     }
 }
@@ -198,6 +201,10 @@ pub struct Merge {
     /// The number of keys that the new record changed, inserted or
     /// deleted.
     pub changed: usize,
+    /// With the posting-dict rule in shadow mode, the outcome that the rule
+    /// gives when a dict took part in the merge. The outcome of the merge
+    /// is then the refusal of BTrees, as in ZODB's resolver.
+    pub shadow: Option<Outcome>,
 }
 
 /// The most keys that a [`Merge`] lists.
@@ -214,10 +221,10 @@ pub fn tier1_class(record: &[u8]) -> Option<String> {
 /// Merges the conflict of a record of a class of tier 1: `old` is the
 /// record that the transaction read, `committed` the record that another
 /// transaction committed after it, `new` the record of the transaction.
-/// `posting_dicts` turns the posting-dict rule on.
+/// `posting_dicts` is the mode of the posting-dict rule.
 ///
 /// Returns `None` when the class of `new` is not a class of tier 1.
-pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: bool) -> Option<Merge> {
+pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: Mode) -> Option<Merge> {
     let (module, name) = zoe_pickle::decode_class_name(new).ok()??;
     let class = classify(&module, &name)?;
     let mut merge = Merge {
@@ -225,6 +232,7 @@ pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: bool) -> O
         outcome: Outcome::Undecided(""),
         keys: Vec::new(),
         changed: 0,
+        shadow: None,
     };
     merge.outcome = match decode(old, committed, new) {
         Ok(trees) => btrees::merge(&trees, class, posting_dicts, &mut merge),
@@ -282,6 +290,10 @@ pub struct Resolution {
     pub committed: Tid,
     /// The serial that the transaction read.
     pub read: Tid,
+    /// With the posting-dict rule in shadow mode, what the rule gives when
+    /// a dict took part in the merge; `outcome` is then the refusal of
+    /// BTrees.
+    pub shadow: Option<Resolved>,
 }
 
 /// What tier 1 gave for a conflict, without the merged record.
@@ -336,17 +348,18 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     field("class", json(&resolution.class));
     field("tier", "1".to_owned());
     field("mode", json(resolution.mode.as_str()));
-    let (outcome, code, reason) = match resolution.outcome {
-        Resolved::Merged => ("merged", None, None),
-        Resolved::Refused(reason) => ("refused", reason.code(), Some(reason.message())),
-        Resolved::Undecided(why) => ("undecided", None, Some(why)),
-    };
-    field("outcome", json(outcome));
-    field(
-        "code",
-        code.map_or_else(|| "null".to_owned(), |code| code.to_string()),
+    let (outcome, code, reason) = resolution.outcome.json_parts();
+    field("outcome", outcome);
+    field("code", code);
+    field("reason", reason);
+    let shadow = resolution.shadow.map_or_else(
+        || "null".to_owned(),
+        |shadow| {
+            let (outcome, code, reason) = shadow.json_parts();
+            format!("{{\"outcome\":{outcome},\"code\":{code},\"reason\":{reason}}}")
+        },
     );
-    field("reason", reason.map_or_else(|| "null".to_owned(), json));
+    field("shadow", shadow);
     field("applied", resolution.applied.to_string());
     let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
     field("keys", format!("[{}]", keys.join(",")));
@@ -393,16 +406,38 @@ impl Resolution {
             oid,
             class: merge.class.clone(),
             mode,
-            outcome: match merge.outcome {
-                Outcome::Merged(_) => Resolved::Merged,
-                Outcome::Refused(reason) => Resolved::Refused(reason),
-                Outcome::Undecided(why) => Resolved::Undecided(why),
-            },
+            outcome: Resolved::of(&merge.outcome),
             applied: false,
             keys: merge.keys.clone(),
             changed: merge.changed,
             committed,
             read,
+            shadow: merge.shadow.as_ref().map(Resolved::of),
         }
+    }
+}
+
+impl Resolved {
+    fn of(outcome: &Outcome) -> Self {
+        match *outcome {
+            Outcome::Merged(_) => Resolved::Merged,
+            Outcome::Refused(reason) => Resolved::Refused(reason),
+            Outcome::Undecided(why) => Resolved::Undecided(why),
+        }
+    }
+
+    /// Returns the name, the code of BTrees and the reason of the outcome,
+    /// as JSON values.
+    fn json_parts(self) -> (String, String, String) {
+        let (outcome, code, reason) = match self {
+            Resolved::Merged => ("merged", None, None),
+            Resolved::Refused(reason) => ("refused", reason.code(), Some(reason.message())),
+            Resolved::Undecided(why) => ("undecided", None, Some(why)),
+        };
+        (
+            json(outcome),
+            code.map_or_else(|| "null".to_owned(), |code| code.to_string()),
+            reason.map_or_else(|| "null".to_owned(), json),
+        )
     }
 }

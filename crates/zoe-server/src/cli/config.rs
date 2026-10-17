@@ -304,14 +304,14 @@ mod tests {
 
     #[test]
     fn the_table_of_the_classes_gives_their_modes() {
-        let text = "structural-merges = \"shadow\"\nmerge-posting-dicts = true\n\n\
+        let text = "structural-merges = \"shadow\"\nposting-dicts = \"on\"\n\n\
                     [structural-merge-classes]\n\
                     \"BTrees.IOBTree.IOBucket\" = \"on\"\n\"BTrees.Length.Length\" = \"off\"\n";
         let config = parse_with(text, &[]).unwrap();
         assert_eq!(
             args(&config),
             [
-                "--merge-posting-dicts=true",
+                "--posting-dicts=on",
                 "--structural-merge-class=BTrees.IOBTree.IOBucket=on",
                 "--structural-merge-class=BTrees.Length.Length=off",
                 "--structural-merges=shadow",

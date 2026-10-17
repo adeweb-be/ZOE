@@ -54,7 +54,7 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
 
     `Storage(path, *, read_only=False, lock_timeout=None, blob_dir=None,
     pack_gc=True, compression=None, structural_merges=None,
-    structural_merge_classes=None, merge_posting_dicts=False,
+    structural_merge_classes=None, posting_dicts=None,
     resolution_log=None)` opens the store in `path` and creates the
     directory when it is missing.
     `lock_timeout` is the longest time, in seconds, that a vote waits for the
@@ -74,9 +74,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `structural_merges` is the mode of the structural merges (tier 1) of
     BTree buckets, sets and `Length`: `"on"` (`None` keeps it), `"shadow"`
     or `"off"`. `structural_merge_classes` maps a class, as `module.name`,
-    to its own mode. `merge_posting_dicts` turns on the posting-dict rule of
-    ADR 0042. `resolution_log` is a file that gets one JSON line for each
-    result of the structural merges.
+    to its own mode. `posting_dicts` is the mode of the posting-dict rule of
+    ADR 0042, off by default. `resolution_log` is a file that gets one JSON
+    line for each result of the structural merges. A shadow mode without
+    `resolution_log` raises `ValueError`: nothing else would tell what it
+    found.
 
     `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
     copy, and copies a file from elsewhere. `loadBlob` returns the path of a

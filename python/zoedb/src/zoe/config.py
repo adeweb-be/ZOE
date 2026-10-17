@@ -108,7 +108,7 @@ KEYS = {
     "compression": compression,
     "structural-merges": merge_mode,
     "structural-merge-class": class_modes,
-    "merge-posting-dicts": stock_datatypes["boolean"],
+    "posting-dicts": merge_mode,
     "resolution-log": stock_datatypes["string"],
 }
 
@@ -157,7 +157,7 @@ def open_storage(settings):
         compression=settings.get("compression"),
         structural_merges=settings.get("structural-merges"),
         structural_merge_classes=settings.get("structural-merge-class"),
-        merge_posting_dicts=settings.get("merge-posting-dicts", False),
+        posting_dicts=settings.get("posting-dicts"),
         resolution_log=os.path.expanduser(resolution_log) if resolution_log else None,
     )
 

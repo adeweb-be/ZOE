@@ -54,12 +54,12 @@ def rule(on):
 
     ADR 0042, a checkpoint of the card of the rule, names the key and how a
     store switches the rule on in both modes. The human approves a change
-    of this function with the ADR. Until then, the rule is the key
-    `merge-posting-dicts` of `<zoe>` and of `zoe serve`, through its
-    environment twin: `<zoe>` reads it in-process, and `zoe serve` reads it
-    as the twin of `--merge-posting-dicts`.
+    of this function with the ADR. The rule is the key `posting-dicts` of
+    `<zoe>` and of `zoe serve`, a mode, through its environment twin:
+    `<zoe>` reads it in-process, and `zoe serve` reads it as the twin of
+    `--posting-dicts`.
     """
-    return {"ZOE_MERGE_POSTING_DICTS": "true" if on else "false"}
+    return {"ZOE_POSTING_DICTS": "on" if on else "off"}
 
 
 @contextlib.contextmanager

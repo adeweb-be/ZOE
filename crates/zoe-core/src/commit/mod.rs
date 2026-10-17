@@ -988,7 +988,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
         committed: &Record,
     ) -> Result<Option<(merge::Mode, Merge)>> {
         let rules = &self.store.structural_merges;
-        let Some((_, new)) = self.staged.get(oid)? else {
+        // A staged pickle that does not read back gives no answer: the
+        // conflict goes on, and the caller that reads the pickle again
+        // reports the error.
+        let Ok(Some((_, new))) = self.staged.get(oid) else {
             return Ok(None);
         };
         let Some(class) = merge::tier1_class(&new) else {
@@ -1004,6 +1007,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 outcome: Outcome::Undecided("the record that the transaction read is gone"),
                 keys: Vec::new(),
                 changed: 0,
+                shadow: None,
             };
             return Ok(Some((mode, merge)));
         };

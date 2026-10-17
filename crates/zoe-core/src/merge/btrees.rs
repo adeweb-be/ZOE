@@ -6,6 +6,7 @@
 //! values of an object family; `Heap::compare` does it here, and a
 //! comparison that it cannot make stops the merge with no answer.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 
 use zoe_pickle::btrees::{
@@ -15,14 +16,14 @@ use zoe_pickle::btrees::{
 use zoe_pickle::python::{Heap, Object, Pickler, Undecided, Value};
 
 use super::posting;
-use super::{MAX_KEYS, Merge, Outcome, Reason, Trees};
+use super::{MAX_KEYS, Merge, Mode, Outcome, Reason, Trees};
 
 /// Merges the three records of a conflict of `class`, and notes in `merge`
 /// the keys that the new record changed.
 pub(super) fn merge(
     trees: &Trees,
     class: Class,
-    posting_dicts: bool,
+    posting_dicts: Mode,
     merge: &mut Merge,
 ) -> Outcome {
     let mut heap = Heap::new();
@@ -43,6 +44,7 @@ pub(super) fn merge(
     if heap.class(class_value).is_none() {
         return Outcome::Undecided("a class pickle of another format");
     }
+    let mut dicts = false;
     let state = match class {
         Class::Length => length(&states),
         Class::Family(shape, family) => {
@@ -50,7 +52,8 @@ pub(super) fn merge(
                 heap: &mut heap,
                 family,
                 mapping: shape.is_mapping(),
-                posting: posting_dicts && posting::applies(family),
+                posting: posting_dicts != Mode::Off && posting::applies(family),
+                dicts: Cell::new(false),
                 items: Vec::new(),
                 keys: Vec::new(),
                 changed: 0,
@@ -58,18 +61,27 @@ pub(super) fn merge(
             let state = merger.resolve(shape, &states);
             merge.keys = std::mem::take(&mut merger.keys);
             merge.changed = merger.changed;
+            dicts = merger.dicts.get();
             state
         }
     };
-    let state = match state {
-        Ok(state) => state,
-        Err(outcome) => return outcome,
+    let outcome = match state {
+        Ok(state) => {
+            let mut pickler = Pickler::new(&heap);
+            match pickler.dump(class_value).and_then(|()| pickler.dump(state)) {
+                Ok(()) => Outcome::Merged(pickler.into_bytes()),
+                Err(unsupported) => Outcome::Undecided(unsupported.0),
+            }
+        }
+        Err(outcome) => outcome,
     };
-    let mut pickler = Pickler::new(&heap);
-    match pickler.dump(class_value).and_then(|()| pickler.dump(state)) {
-        Ok(()) => Outcome::Merged(pickler.into_bytes()),
-        Err(unsupported) => Outcome::Undecided(unsupported.0),
+    // In shadow mode, the rule only tells what it would do. ZODB's
+    // resolver refuses each bucket where it must compare a dict.
+    if posting_dicts == Mode::Shadow && dicts {
+        merge.shadow = Some(outcome);
+        return refuse(1);
     }
+    outcome
 }
 
 /// `Length._p_resolveConflict(old, s1, s2)`: `s1 + s2 - old`.
@@ -144,8 +156,11 @@ struct Merger<'h> {
     heap: &'h mut Heap,
     family: Family,
     mapping: bool,
-    /// True when the posting-dict rule applies to this family.
+    /// True when the posting-dict rule applies to this family, on or in
+    /// shadow mode.
     posting: bool,
+    /// True when the rule compared or merged a posting dict.
+    dicts: Cell<bool>,
     /// The keys and the values of the merged bucket, in order.
     items: Vec<Value>,
     /// The keys that the new record changed, as text, at most `MAX_KEYS`.
@@ -184,8 +199,10 @@ impl Merger<'_> {
             .ok()
             .expect("three buckets");
         // The next buckets must be the same objects.
-        if old.next != committed.next || old.next != new.next {
-            return Err(refuse(0));
+        for other in [committed.next, new.next] {
+            if old.next != other {
+                return Err(self.next_differs(old.next, other));
+            }
         }
         self.bucket_merge(&old, &committed, &new)?;
         let items = std::mem::take(&mut self.items);
@@ -195,6 +212,22 @@ impl Merger<'_> {
         } else {
             state
         })
+    }
+
+    /// Returns the outcome of two next buckets that are not the same object.
+    /// ZODB's resolver makes one persistent reference of each persistent id,
+    /// with the class that `find_global` gives. Two spellings of one class,
+    /// such as an alias module, give one reference there and two here. So
+    /// two references to one oid and one database give no answer. Other
+    /// next buckets are a bucket split.
+    fn next_differs(&self, a: Option<Value>, b: Option<Value>) -> Outcome {
+        let reference = |value: Option<Value>| value.and_then(|value| self.heap.reference(value));
+        match (reference(a), reference(b)) {
+            (Some(a), Some(b)) if a.oid == b.oid && a.database == b.database => {
+                Outcome::Undecided("next buckets of one oid with two persistent ids")
+            }
+            _ => refuse(0),
+        }
     }
 
     /// Reads the state of a bucket as its `__setstate__` does. `None` is an
@@ -249,6 +282,7 @@ impl Merger<'_> {
                 if self.posting
                     && let Some(equal) = posting::equal(self.heap, a, b)
                 {
+                    self.dicts.set(true);
                     return equal;
                 }
                 Ok(self.heap.compare(a, b).map_err(undecided)? == Ordering::Equal)

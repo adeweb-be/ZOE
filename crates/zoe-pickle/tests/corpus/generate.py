@@ -21,9 +21,15 @@ from pathlib import Path
 
 import transaction
 import ZODB
-from BTrees.IIBTree import IITreeSet
+from BTrees.IFBTree import IFBucket
+from BTrees.IIBTree import IIBTree, IISet, IITreeSet
+from BTrees.IOBTree import IOBTree, IOBucket
+from BTrees.LLBTree import LLBucket
 from BTrees.Length import Length
-from BTrees.OOBTree import OOBTree, OOBucket
+from BTrees.OIBTree import OIBTree
+from BTrees.OOBTree import OOBTree, OOBucket, OOSet
+from BTrees.QQBTree import QQTreeSet
+from BTrees.UFBTree import UFBucket
 from persistent import Persistent
 from persistent.list import PersistentList
 from persistent.mapping import PersistentMapping
@@ -33,6 +39,8 @@ from ZODB.utils import get_pickle_metadata
 from zodbpickle import binary
 
 HERE = Path(__file__).resolve().parent
+# The oid of the root object of a store.
+ROOT_OID = b"\0" * 8
 
 # The construct name of a record that no pair names, by class.
 CLASS_CONSTRUCTS = {
@@ -230,16 +238,42 @@ def constructs():
     ]
 
 
-def main():
-    for old in HERE.glob("*.record"):
-        old.unlink()
+def tier1_constructs():
+    """Return (construct, persistent object) pairs of the states that tier 1
+    of the conflict resolution merges: a bucket and a set of each kind of
+    key, BTrees of one inline bucket, posting dicts of ZCTextIndex in the
+    buckets of `_wordinfo`, and a posting that became a tree. They go to a
+    store of their own, so the oids of the records of `constructs` do not
+    change."""
+    return [
+        ("bucket-family", IFBucket({-3: 0.5, 7: 2.25})),
+        ("bucket-family", LLBucket({-(2**62): 2**40, 5: -1})),
+        ("bucket-family", UFBucket({0: -0.0, 2**32 - 1: 1e10})),
+        ("bucket-family", OOBucket({"": "a", "a": "", "é": b"", "k": ("x", 1)})),
+        ("set-family", IISet([-1, 0, 2**31 - 1])),
+        ("set-family", OOSet(["b", "a", ""])),
+        ("set-family", OOSet([(1, "c"), (0, "d")])),
+        ("set-family", QQTreeSet([0, 2**64 - 1])),
+        ("btree-inline", OIBTree({"one": 1, "two": 2})),
+        ("btree-inline", IIBTree({1: 10, 2: 20})),
+        ("btree-inline", IOBTree()),
+        ("postings", IOBucket({10: {1: 3, 2: 1}, 20: {5: 1}, 30: {1: 0.5, 2: 1.25}})),
+        ("postings", IOBTree({10: {docid: 1 for docid in range(10)}, 20: {}})),
+        ("postings", IOBucket({10: IIBTree({docid: 2 for docid in range(11)})})),
+    ]
 
+
+def write(pairs, counts, skip_root):
+    """Commit pairs to a new FileStorage, and write the record of each one
+    to a file named after its construct. The other records (the root, the
+    buckets of the big trees, the targets of references) follow in storage
+    order and take a name from their class. With skip_root, the root stays
+    out."""
     with tempfile.TemporaryDirectory() as tmp:
         storage = FileStorage(os.path.join(tmp, "Data.fs"))
         db = ZODB.DB(storage)
         conn = db.open()
         root = conn.root()
-        pairs = constructs()
         for index, (_, obj) in enumerate(pairs):
             root[f"object-{index:02d}"] = obj
         transaction.commit()
@@ -248,19 +282,24 @@ def main():
         ]
         db.close()
 
-    # Write the named objects first, in the order of the pairs. The other
-    # records (the root, the buckets of the big trees, the targets of
-    # references) follow in storage order and take a name from their class.
     order = {obj._p_oid: index for index, (_, obj) in enumerate(pairs)}
     names = {obj._p_oid: construct for construct, obj in pairs}
     records.sort(key=lambda record: order.get(record[0], len(order)))
-    counts = Counter()
     for oid, data in records:
+        if skip_root and oid == ROOT_OID:
+            continue
         _, klass = get_pickle_metadata(data)
         construct = names.get(oid, CLASS_CONSTRUCTS.get(klass, klass.lower()))
         counts[construct] += 1
         (HERE / f"{construct}-{counts[construct]}.record").write_bytes(data)
 
+
+def main():
+    for old in HERE.glob("*.record"):
+        old.unlink()
+    counts = Counter()
+    write(constructs(), counts, skip_root=False)
+    write(tier1_constructs(), counts, skip_root=True)
     for construct, count in sorted(counts.items()):
         print(f"{construct}: {count}")
     print(f"total: {sum(counts.values())}")
