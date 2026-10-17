@@ -1,10 +1,16 @@
-<configure xmlns="http://namespaces.zope.org/zope">
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:zcml="http://namespaces.zope.org/zcml"
+    >
 
-  <!-- Opt in: the records of plone.registry live in the durable namespace
-       of the store. Include this file in the ZCML of the site. -->
-  <subscriber
-      for="zope.processlifetime.IProcessStarting"
-      handler=".registry.process_starting"
+  <!-- Opt in: each new registry keeps its records in the durable namespace
+       of the store. Include this file in the ZCML of the site. The backend
+       installs when the ZCML loads. An existing site moves its records with
+       zoe.plone.registry.use_namespace(site). -->
+  <include
+      package="z3c.zcmlhook"
+      file="meta.zcml"
       />
+  <zcml:customAction handler=".registry.install" />
 
 </configure>

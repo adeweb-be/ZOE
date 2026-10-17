@@ -16,11 +16,11 @@ import os
 __all__ = ["backends_from_environment"]
 
 
-def backends_from_environment(event=None):
+def backends_from_environment():
     """Install the backends that `ZOE_PLONE_BACKENDS` names, separated by
-    commas: `locking`, `registry`. The subscriber of `IProcessStarting`
-    calls it when Zope starts, so `<environment>` of `zope.conf` can set
-    it. An unknown name raises `ValueError`."""
+    commas: `locking`, `registry`. `configure.zcml` calls it when the ZCML
+    loads, after `<environment>` of `zope.conf` set the variable. An unknown
+    name raises `ValueError`."""
     for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
         name = name.strip()
         if name == "locking":

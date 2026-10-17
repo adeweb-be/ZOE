@@ -12,7 +12,8 @@ of the transaction. The extension goes to the server with `tpc_begin`, for
 a stock `ZEO.ClientStorage` too, and the transaction row of the store keeps
 it. `request_started` is the subscriber of `ZPublisher.pubevents.PubStart`:
 Zope begins the transaction of each attempt of a request just before the
-event, so the subscriber marks that transaction.
+event, so the subscriber marks that transaction. It marks only the
+transactions of GET and HEAD requests: the other methods write on purpose.
 
 A write of a KV namespace is no record, so it counts nothing.
 
@@ -27,6 +28,9 @@ __all__ = ["KEY", "mark", "request_started"]
 # request.
 KEY = "zoe.request_method"
 
+# The methods whose transactions the subscriber marks.
+READS = ("GET", "HEAD")
+
 
 def mark(txn, method):
     """Mark `txn` as the transaction of a request of `method`."""
@@ -35,7 +39,7 @@ def mark(txn, method):
 
 def request_started(event):
     """Mark the current transaction with the method of the request of
-    `event`, a `PubStart` of ZPublisher."""
-    method = getattr(event.request, "method", None)
-    if method:
+    `event`, a `PubStart` of ZPublisher, when it is GET or HEAD."""
+    method = str(getattr(event.request, "method", "") or "").upper()
+    if method in READS:
         mark(transaction.get(), method)

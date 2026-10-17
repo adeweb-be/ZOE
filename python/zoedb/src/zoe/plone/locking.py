@@ -19,19 +19,32 @@ object that provides `ITTWLockable` and whose storage has KV namespaces:
 
 Every other object, and an object whose storage has no namespace, keeps the
 stock behaviour. `uninstall()` puts the stock methods back. The locks that
-the namespace holds then stop counting; each one expires with its TTL.
+the namespace holds then stop counting; each one expires with its TTL. The
+backend does not carry locks over: the locks that an object kept itself
+before `install()` do not count while it is installed, and the locks of the
+namespace do not count after `uninstall()`. A lock lives for minutes, so
+this ends with the next edit.
 
-One row holds the locks of one object: a pickle of the WebDAV locks and of
-the types. A transaction decodes the row once. Its reads and its changes go
-to that copy, and a hook before its commit writes the copy back when it
-changed, also when a `LockItem` changed in place, as `refresh` does. The
-TTL of the row is the longest time that a lock of the row stays valid, at
-least one second. A row without a lock is deleted. An expired lock reads as
-absent, and its row goes with its TTL, so a read never writes.
+One row holds all the locks of one object: a pickle of the WebDAV locks and
+of the types. A transaction decodes the row once, and its reads and its
+changes go to that copy. Each change of a mapping stages the row in the
+namespace at once, so a savepoint covers it. A hook before the commit
+stages the rows again, for a `LockItem` that changed in place, as `refresh`
+does. A rollback to a savepoint drops the copies, and the next read decodes
+the row again. The TTL of the row is the longest time that a lock of the
+row stays valid, at least one second. A row without a lock is deleted.
 
-Two editors who open one form at the same moment can both take the lock:
-the later commit wins (ADR 0043). With the stock storage, one of them gets
-a `ConflictError` instead.
+A lock that is no longer valid reads as absent. With `killinvalids`,
+`wl_lockmapping` deletes such locks from the row, and calls
+`__no_valid_write_locks__` of the object when that leaves no lock, as OFS
+does. The row expires with its longest valid lock, so a read writes only
+in the second after a lock ends, or for an object with several locks.
+
+The row is the unit of a write: when two transactions change the locks of
+one object, the later commit wins for all the locks of the object (ADR
+0043). So two editors who open one form at the same moment can both take
+the lock. With the stock storage, one of them gets a `ConflictError`
+instead.
 
 The namespace keeps no history, so the locks do not follow the snapshot
 of a connection, and undo gives back no lock.
@@ -42,6 +55,11 @@ import pickle
 import time
 import weakref
 from collections.abc import MutableMapping
+
+import transaction.interfaces
+import zope.interface
+
+import zoe.kv
 
 __all__ = ["NAMESPACE", "install", "installed", "uninstall"]
 
@@ -55,8 +73,8 @@ MAX_TTL = 2**32 - 1
 # The stock methods while the backend is installed.
 _stock = {}
 
-# The row of each object that the current transaction of each connection
-# decoded: connection -> (transaction, {oid: _Row}).
+# The rows that the current transaction of each connection decoded:
+# connection -> _Rows.
 _rows = weakref.WeakKeyDictionary()
 
 
@@ -80,7 +98,13 @@ def install():
         row = _row_of(self)
         if row is None:
             return _stock["wl_lockmapping"](self, killinvalids, create)
-        return _Mapping(row, "locks")
+        locks = _Mapping(row, "locks")
+        if killinvalids and locks.remove_invalid() and not locks:
+            from Acquisition import aq_base
+
+            if hasattr(aq_base(self), "__no_valid_write_locks__"):
+                self.__no_valid_write_locks__()
+        return locks
 
     def _locks(self, create=True):
         row = _row_of(self.context)
@@ -110,34 +134,91 @@ def _row_of(obj):
     from Acquisition import aq_base
     from plone.locking.interfaces import ITTWLockable
 
-    import zoe.kv
-
     base = aq_base(obj)
     if not ITTWLockable.providedBy(base):
         return None
     jar = getattr(base, "_p_jar", None)
     oid = getattr(base, "_p_oid", None)
-    if jar is None or oid is None or not zoe.kv.supported(jar):
+    if jar is None or oid is None or not zoe.kv._supported(jar):
         return None
     txn = jar.transaction_manager.get()
-    found = _rows.get(jar)
-    if found is None or found[0] is not txn:
-        found = _rows[jar] = (txn, {})
-        txn.addBeforeCommitHook(_write_back, (jar, txn))
-    rows = found[1]
+    rows = _rows.get(jar)
+    if rows is None or rows.transaction is not txn:
+        rows = _rows[jar] = _Rows(jar, txn)
     row = rows.get(oid)
     if row is None:
         row = rows[oid] = _Row(zoe.kv.Namespace(jar, "ephemeral", NAMESPACE), oid)
     return row
 
 
-def _write_back(jar, txn):
-    """Write each row of `txn` on `jar` that changed, before the commit."""
-    found = _rows.get(jar)
-    if found is None or found[0] is not txn:
-        return
-    for row in found[1].values():
-        row.write()
+@zope.interface.implementer(transaction.interfaces.IDataManager)
+class _Rows(dict):
+    """The rows that one transaction of one connection decoded, by oid.
+
+    It joins the transaction as a data manager that writes nothing itself,
+    so that a savepoint covers the rows. Then it makes the writes of the
+    namespace join, when they are not there yet. So the savepoint of the
+    rows, which stages them, comes before the savepoint of the writes, which
+    keeps them.
+    """
+
+    def __init__(self, jar, txn):
+        super().__init__()
+        self.transaction_manager = jar.transaction_manager
+        self.transaction = txn
+        self._jar = jar
+        txn.join(self)
+        zoe.kv.Namespace(jar, "ephemeral", NAMESPACE)._staged(create=True)
+        txn.addBeforeCommitHook(self.write_back)
+
+    def write_back(self):
+        """Stage each row that changed: a `LockItem` can change in place."""
+        for row in self.values():
+            row.write()
+
+    def _end(self):
+        self.clear()
+        if _rows.get(self._jar) is self:
+            del _rows[self._jar]
+
+    # IDataManager
+
+    def abort(self, txn):
+        self._end()
+
+    def tpc_begin(self, txn):
+        pass
+
+    def commit(self, txn):
+        pass
+
+    def tpc_vote(self, txn):
+        pass
+
+    def tpc_finish(self, txn):
+        self._end()
+
+    def tpc_abort(self, txn):
+        self._end()
+
+    def sortKey(self):
+        return f"zoe.plone.locking:{id(self)}"
+
+    def savepoint(self):
+        self.write_back()
+        return _RowsSavepoint(self)
+
+
+@zope.interface.implementer(transaction.interfaces.IDataManagerSavepoint)
+class _RowsSavepoint:
+    """A savepoint of the rows: its rollback drops the decoded rows, so the
+    next read decodes them from the writes that the rollback gave back."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def rollback(self):
+        self._rows.clear()
 
 
 class _Row:
@@ -209,9 +290,11 @@ class _Mapping(MutableMapping):
 
     def __setitem__(self, key, value):
         self._items()[key] = value
+        self._row.write()
 
     def __delitem__(self, key):
         del self._items()[key]
+        self._row.write()
 
     def __iter__(self):
         return iter([key for key, value in self._items().items() if self._valid(value)])
@@ -221,9 +304,15 @@ class _Mapping(MutableMapping):
 
     def clear(self):
         self._items().clear()
+        self._row.write()
 
-
-def process_starting(event):
-    """Install the backend when Zope starts: the subscriber of
-    `locking.zcml`."""
-    install()
+    def remove_invalid(self):
+        """Delete the locks that are no longer valid. Tell if there were
+        some."""
+        items = self._items()
+        invalid = [key for key, value in items.items() if not self._valid(value)]
+        for key in invalid:
+            del items[key]
+        if invalid:
+            self._row.write()
+        return bool(invalid)

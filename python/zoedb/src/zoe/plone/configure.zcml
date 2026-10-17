@@ -1,4 +1,7 @@
-<configure xmlns="http://namespaces.zope.org/zope">
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:zcml="http://namespaces.zope.org/zcml"
+    >
 
   <!-- Plone loads this file through the plone.autoinclude entry point of
        zoedb. When Zope opened its database, the handler gives
@@ -8,16 +11,18 @@
       handler=".uidgenerator.database_opened"
       />
 
-  <!-- The backends that ZOE_PLONE_BACKENDS names, at the start of Zope:
-       locking, registry. Each one is opt-in. -->
-  <subscriber
-      for="zope.processlifetime.IProcessStarting"
-      handler=".backends_from_environment"
+  <!-- The backends that ZOE_PLONE_BACKENDS names: locking, registry. Each
+       one is opt-in. They install when the ZCML loads, so an instance, its
+       scripts and bin/instance run see the same backends. -->
+  <include
+      package="z3c.zcmlhook"
+      file="meta.zcml"
       />
+  <zcml:customAction handler=".backends_from_environment" />
 
-  <!-- The writes-on-GET report: each transaction of a request carries the
-       method of the request, and zoe serve counts the records of the
-       transactions of GET and HEAD requests by class. -->
+  <!-- The writes-on-GET report: each transaction of a GET or a HEAD request
+       carries the method of the request, and zoe serve counts the records
+       of these transactions by class. -->
   <subscriber
       for="ZPublisher.interfaces.IPubStart"
       handler=".report.request_started"
