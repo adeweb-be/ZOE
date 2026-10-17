@@ -523,6 +523,27 @@ fn the_first_key_rule_keeps_the_other_refusals_of_btrees() {
 }
 
 #[test]
+fn the_first_key_rule_leaves_an_inline_bucket_with_a_next_bucket_to_btrees() {
+    // `IIBTree`s whose inline bucket names the next bucket, the oid 9. Only
+    // a node inside a tree of many buckets has such a bucket, and the
+    // parent node holds its first key.
+    let old = b"\x80\x03cBTrees.IIBTree\nIIBTree\nq\x00.\x80\x03(K\x01K\x01K\x02K\x02tq\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x09q\x02cBTrees.IIBTree\nIIBucket\nq\x03\x86q\x04\
+        Q\x86q\x05\x85q\x06\x85q\x07.";
+    let committed = b"\x80\x03cBTrees.IIBTree\nIIBTree\nq\x00.\x80\x03K\x02K\x02\x86q\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x09q\x02cBTrees.IIBTree\nIIBucket\nq\x03\x86q\x04\
+        Q\x86q\x05\x85q\x06\x85q\x07.";
+    let new =
+        b"\x80\x03cBTrees.IIBTree\nIIBTree\nq\x00.\x80\x03(K\x01K\x01K\x02K\x02K\x03K\x03tq\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x09q\x02cBTrees.IIBTree\nIIBucket\nq\x03\x86q\x04\
+        Q\x86q\x05\x85q\x06\x85q\x07.";
+    assert_eq!(
+        first_key(Mode::On, old, committed, new),
+        (Resolved::Refused(Reason::BTrees(13)), None, None)
+    );
+}
+
+#[test]
 fn two_next_buckets_of_one_oid_with_two_persistent_ids_give_no_answer() {
     // `IIBucket`s whose next bucket is the oid 9, as ZODB's pickler writes
     // them. The new record names the class of the next bucket by another

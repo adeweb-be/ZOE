@@ -378,7 +378,7 @@ def test_the_first_key_rule_merges_a_delete_of_the_first_key(
         ),
     ],
 )
-def test_the_first_key_rule_merges_every_family(
+def test_the_first_key_rule_merges_a_tree_set_and_str_keys(
     tmp_path, calls, name, make, first, second, value
 ):
     storage = zoe.Storage(str(tmp_path / name), posting_dicts="on")
