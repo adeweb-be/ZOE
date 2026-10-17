@@ -152,11 +152,26 @@ fn to_data_fs(
     let report = zoe_convert::to_datafs(&store, data_fs, data_fs_blobs)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("the store {} into {}", path.display(), data_fs.display());
+    if report.durable_keys > 0 {
+        eprintln!("{}", left_out_warning(report.durable_keys));
+    }
     // A conversion that does not verify fails, also when the report does
     // not go out.
     let written = write_report(out, &title, &report);
     verified(&report)?;
     Ok(written?)
+}
+
+/// Return the warning of a conversion to a `Data.fs` that leaves out
+/// `keys` keys of the durable namespaces.
+fn left_out_warning(keys: u64) -> String {
+    format!(
+        "warning: the Data.fs leaves out {keys} keys of the durable KV namespaces: \
+         a Data.fs holds no namespace. A site that keeps its registry there reads \
+         no record from this copy. Move the records back into the object graph \
+         first (zoe.plone.registry.use_object_graph(site), then a commit), and \
+         convert again."
+    )
 }
 
 /// Return the failure of a conversion with the store in `path`. A
@@ -195,6 +210,7 @@ fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::R
             "  left out      {} keys of the durable namespaces: a Data.fs holds no namespace",
             report.durable_keys
         )?;
+        writeln!(out, "  {}", left_out_warning(report.durable_keys))?;
     }
     writeln!(out, "  problems      {}", report.problem_count())?;
     let width = report
@@ -220,5 +236,18 @@ fn verified(report: &Report) -> Result<(), Failure> {
         Err(Failure::Message(
             "the conversion does not verify: the report lists the problems".to_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::left_out_warning;
+
+    #[test]
+    fn the_warning_of_left_out_keys_names_the_way_back() {
+        let warning = left_out_warning(3);
+        assert!(warning.starts_with("warning: "), "{warning}");
+        assert!(warning.contains("leaves out 3 keys"), "{warning}");
+        assert!(warning.contains("use_object_graph"), "{warning}");
     }
 }
