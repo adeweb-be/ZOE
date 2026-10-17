@@ -22,10 +22,14 @@ The entry of a class has these keys, each optional:
   ``strict``, the default, ``lww``, ``max``, ``sum``, ``union`` or
   ``append``;
 - ``fields``: a dict of field names to their strategies;
-- ``coupled``: a list of groups of fields, each a list of field names.
+- ``coupled``: a list of groups of fields, each a list of field names;
+- ``blocked``: True for a class that never merges in tier 2, whatever its
+  other keys say; `zoe.plone` blocks a class whose invariant it cannot
+  read.
 
-`install` writes a policy in the transaction of a connection, and `read`
-gives it back as a dict.
+`validate` checks a policy and gives a copy of plain values, `install`
+writes a policy in the transaction of a connection, and `read` gives it
+back as a dict.
 """
 
 import copy
@@ -41,7 +45,7 @@ STRATEGIES = ("strict", "lww", "max", "sum", "union", "append")
 #: The keys of a policy that `install` takes, besides ``classes``.
 SWITCHES = ("structural_merges", "posting_dicts")
 #: The keys of the entry of a class.
-ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled")
+ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled", "blocked")
 
 
 class MergePolicy(persistent.Persistent):
@@ -56,70 +60,96 @@ class MergePolicy(persistent.Persistent):
         self.classes = {}
 
 
-def _mode(value, where):
-    if value not in MODES:
-        raise ValueError(f"{where}: {value!r} is not on, shadow or off")
+def _text(value, where):
+    """Return `value` when it is a str, not a subclass of str: the core
+    reads a plain str only."""
+    if type(value) is not str:
+        raise ValueError(f"{where}: {value!r} is not a str")
     return value
+
+
+def _canonical(value, allowed, where, words):
+    """Return the constant of `allowed` that equals `value`, so the policy
+    stores a plain str."""
+    if type(value) is not str or value not in allowed:
+        raise ValueError(f"{where}: {value!r} is not {words}")
+    return allowed[allowed.index(value)]
+
+
+def _mode(value, where):
+    return _canonical(value, MODES, where, "on, shadow or off")
 
 
 def _strategy(value, where):
-    if value not in STRATEGIES:
-        raise ValueError(f"{where}: {value!r} is not one of {', '.join(STRATEGIES)}")
-    return value
+    return _canonical(value, STRATEGIES, where, f"one of {', '.join(STRATEGIES)}")
 
 
 def validate(policy):
     """Return a copy of `policy` with plain values only, or raise
     `ValueError` when it breaks the rules of a policy. `policy` is a dict
     with the key ``classes`` and, optionally, ``structural_merges`` and
-    ``posting_dicts``. ``version`` is not part of it: `install` sets it."""
-    if not isinstance(policy, dict):
+    ``posting_dicts``. ``version`` is not part of it: `install` sets it.
+
+    Each text must be a plain `str`, and the copy holds the constants of
+    `MODES` and `STRATEGIES`, so the core reads every value."""
+    if type(policy) is not dict:
         raise ValueError("a policy is a dict")
     unknown = set(policy) - {"classes", *SWITCHES}
     if unknown:
-        raise ValueError(f"a policy has no key {sorted(unknown)[0]!r}")
+        raise ValueError(f"a policy has no key {sorted(map(str, unknown))[0]!r}")
     result = {}
     for switch in SWITCHES:
         if policy.get(switch) is not None:
             result[switch] = _mode(policy[switch], switch)
     classes = policy.get("classes", {})
-    if not isinstance(classes, dict):
+    if type(classes) is not dict:
         raise ValueError("classes is a dict of class names to entries")
     result["classes"] = {}
     for name, entry in classes.items():
-        if not isinstance(name, str) or "." not in name:
+        if type(name) is not str or "." not in name:
             raise ValueError(f"{name!r} is not a class as module.Class")
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             raise ValueError(f"{name}: an entry is a dict")
         unknown = set(entry) - set(ENTRY_KEYS)
         if unknown:
-            raise ValueError(f"{name}: an entry has no key {sorted(unknown)[0]!r}")
+            raise ValueError(
+                f"{name}: an entry has no key {sorted(map(str, unknown))[0]!r}"
+            )
         checked = {}
         for key in ("tier1", "tier2"):
             if entry.get(key) is not None:
                 checked[key] = _mode(entry[key], f"{name}: {key}")
         if entry.get("default") is not None:
             checked["default"] = _strategy(entry["default"], f"{name}: default")
-        fields = entry.get("fields") or {}
-        if not isinstance(fields, dict):
-            raise ValueError(f"{name}: fields is a dict of fields to strategies")
-        if fields:
-            checked["fields"] = {}
-            for field, strategy in fields.items():
-                if not isinstance(field, str):
-                    raise ValueError(f"{name}: the field {field!r} is not a str")
-                checked["fields"][field] = _strategy(strategy, f"{name}: {field}")
-        coupled = entry.get("coupled") or []
-        if coupled:
-            checked["coupled"] = []
+        if entry.get("blocked") is not None:
+            if type(entry["blocked"]) is not bool:
+                raise ValueError(f"{name}: blocked is True or False")
+            if entry["blocked"]:
+                checked["blocked"] = True
+        if "fields" in entry:
+            fields = entry["fields"]
+            if type(fields) is not dict:
+                raise ValueError(f"{name}: fields is a dict of fields to strategies")
+            if fields:
+                checked["fields"] = {
+                    _text(field, f"{name}: a field"): _strategy(
+                        strategy, f"{name}: {field}"
+                    )
+                    for field, strategy in fields.items()
+                }
+        if "coupled" in entry:
+            coupled = entry["coupled"]
+            if type(coupled) not in (list, tuple):
+                raise ValueError(f"{name}: coupled is a list of groups of fields")
+            groups = []
             for group in coupled:
-                if (
-                    isinstance(group, str)
-                    or not group
-                    or not all(isinstance(field, str) for field in group)
-                ):
+                if type(group) not in (list, tuple) or not group:
                     raise ValueError(f"{name}: a coupled group is a list of fields")
-                checked["coupled"].append(list(group))
+                groups.append(
+                    [_text(field, f"{name}: a coupled field") for field in group]
+                )
+            if groups:
+                checked["coupled"] = groups
         result["classes"][name] = checked
     return result
 

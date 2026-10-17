@@ -89,6 +89,9 @@ pub struct ClassPolicy {
     pub fields: BTreeMap<String, Strategy>,
     /// The groups of coupled fields.
     pub coupled: Vec<Vec<String>>,
+    /// True for a class that never merges in tier 2, whatever `tier2`
+    /// says: `zoe.plone` blocks a class whose invariant it cannot read.
+    pub blocked: bool,
 }
 
 impl ClassPolicy {
@@ -165,7 +168,10 @@ impl Policy {
             || self
                 .classes
                 .values()
-                .any(|entry| entry.tier1 == Some(Mode::Shadow) || entry.tier2 == Mode::Shadow)
+                .any(|entry| {
+                    entry.tier1 == Some(Mode::Shadow)
+                        || (entry.tier2 == Mode::Shadow && !entry.blocked)
+                })
     }
 }
 
@@ -231,12 +237,12 @@ impl Rules<'_> {
     }
 
     /// Returns the entry of the class `module.name` when tier 2 runs on it:
-    /// its mode is `On` or `Shadow`.
+    /// its mode is `On` or `Shadow`, and it is not blocked.
     pub fn tier2(&self, class: &str) -> Option<&ClassPolicy> {
         self.policy?
             .classes
             .get(class)
-            .filter(|entry| entry.tier2 != Mode::Off)
+            .filter(|entry| entry.tier2 != Mode::Off && !entry.blocked)
     }
 
     /// Returns the version of the policy.
@@ -368,6 +374,7 @@ fn class_policy(heap: &Heap, value: Value) -> std::result::Result<ClassPolicy, &
         default: Strategy::Strict,
         fields: BTreeMap::new(),
         coupled: Vec::new(),
+        blocked: false,
     };
     let strategy = |value: Value| {
         heap.str(value)
@@ -379,6 +386,10 @@ fn class_policy(heap: &Heap, value: Value) -> std::result::Result<ClassPolicy, &
             continue;
         }
         match key {
+            "blocked" => match value {
+                Value::Bool(blocked) => entry.blocked = blocked,
+                _ => return Err("a blocked that is not True or False"),
+            },
             "tier1" => entry.tier1 = Some(mode(heap, value)?),
             "tier2" => entry.tier2 = mode(heap, value)?,
             "default" => entry.default = strategy(value)?,
@@ -492,6 +503,36 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_class_never_merges_in_tier_2() {
+        let record = record(|heap| {
+            let entry = {
+                let items = vec![
+                    (text(heap, "tier2"), text(heap, "on")),
+                    (text(heap, "blocked"), Value::Bool(true)),
+                ];
+                heap.new_dict(items)
+            };
+            let classes = {
+                let name = text(heap, "m.Document");
+                heap.new_dict(vec![(name, entry)])
+            };
+            let items = vec![
+                (text(heap, "version"), Value::Int(1)),
+                (text(heap, "classes"), classes),
+            ];
+            heap.new_dict(items)
+        });
+        let policy = Policy::read(&record).unwrap();
+        assert!(policy.classes["m.Document"].blocked);
+        let config = StructuralMerges::default();
+        let rules = Rules {
+            config: &config,
+            policy: Some(&policy),
+        };
+        assert!(rules.tier2("m.Document").is_none());
+    }
+
+    #[test]
     fn a_policy_that_breaks_its_rules_does_not_read() {
         for (key, value) in [
             ("version", "x"),
@@ -537,6 +578,7 @@ mod tests {
                 default: Strategy::Strict,
                 fields: BTreeMap::new(),
                 coupled: Vec::new(),
+                blocked: false,
             },
         );
         assert_eq!(rules(&config, &policy), Mode::On);

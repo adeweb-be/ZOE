@@ -6,10 +6,12 @@ storage (and `zoe serve` for zoeclient), creates a Plone site and runs
 plone/history.py in the instance. The script imports the profile
 `zoe.plone:default`, whose import step derives the merge policy of the site
 from its Dexterity types and writes it into the store; gives the type
-Document the behaviour `zoe.plone.history` and runs the upgrade step; runs
-THREADS transitions of one Document from one snapshot, which commit in
-turn without a retry; then writes a policy with the Document class on and
-lets two connections change two fields of the Document from one snapshot.
+Document the behaviour `zoe.plone.history` and imports the profile again,
+which moves the histories; runs THREADS transitions of one Document from
+one snapshot, which commit in turn without a retry; then keeps overrides
+that switch the Document class on and lets two connections change two
+fields of the Document from one snapshot; and imports the profile
+`zoe.plone:uninstall`.
 Its last line of stdout is a JSON report.
 
 The scenarios: zoe (`zoe.Storage` in the instance) and zoeclient
@@ -56,10 +58,17 @@ def test_the_policy_and_the_history_of_zoe_plone(scenario):
     assert ["effective", "effective_date", "expiration_date", "expires"] in report[
         "document"
     ]["coupled"]
-    assert ["end", "open_end", "start"] in report["event"]["coupled"]
-    # The upgrade step moved the history of the Document from before the
-    # behaviour, and the new Document got its history when it was added.
-    assert report["moved"] == 1
+    # The invariant of the event behaviour couples every field of its
+    # interface.
+    assert any(
+        {"start", "end", "open_end"} <= set(group)
+        for group in report["event"]["coupled"]
+    )
+    # The change of the type derived the policy again; the import of the
+    # profile moved the history of the Document from before the behaviour,
+    # and the new Document got its history with its first status.
+    assert report["versions"][1] > report["versions"][0]
+    assert report["stock"] == "Persistence.mapping.PersistentMapping"
     assert report["before"] == HISTORY
     assert report["before_entries"] == 1
     assert report["after"] == HISTORY
@@ -70,3 +79,7 @@ def test_the_policy_and_the_history_of_zoe_plone(scenario):
     # Two changes of two fields of one Document both committed.
     assert report["fields"] == ["committed", "committed"]
     assert (report["title"], report["description"]) == ("After, edited", "two")
+    # The uninstall profile gives each history back as a PersistentMapping,
+    # and removes the behaviour.
+    assert report["uninstalled"] == ["Persistence.mapping.PersistentMapping"] * 2
+    assert report["behaviors"] is False

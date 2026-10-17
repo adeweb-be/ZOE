@@ -16,17 +16,24 @@ store merges them at the vote (tier 2). The record equals the record of the
 same transitions one after the other.
 
 The opt-in behaviour `zoe.plone.history` (`IAppendOnlyHistory`) gives an
-object of a type with the behaviour a `WorkflowHistory` when it is added.
-`upgrade` moves the stock histories of the objects that have the behaviour.
-A type without the behaviour keeps the stock history.
+object of a type with the behaviour a `WorkflowHistory` at its next status:
+the status adapter of `zoe.plone.status` calls `ensure` before it adds the
+status. An object that never gets a status gets no history. The import
+step of the profile `zoe.plone:default` moves the stock histories of the
+objects with the behaviour (`move_histories`), and the import step of the
+profile `zoe.plone:uninstall` gives each `WorkflowHistory` back as a
+`PersistentMapping` (`restore_histories`).
 
-Only `added` and `upgrade` import Plone.
+Only `move_histories`, `restore_histories` and the import steps import
+Plone.
 """
 
 import sys
+from collections.abc import MutableMapping
 
 import transaction
 from persistent import Persistent
+from persistent.mapping import PersistentMapping
 from zope.interface import Interface
 
 __all__ = [
@@ -34,16 +41,19 @@ __all__ = [
     "ENTRY",
     "IAppendOnlyHistory",
     "WorkflowHistory",
-    "added",
     "ensure",
+    "import_histories",
+    "move_histories",
     "policy",
-    "upgrade",
+    "restore",
+    "restore_histories",
+    "uninstall",
 ]
 
 #: The entry of `WorkflowHistory` in the merge policy.
 ENTRY = {"tier2": "on", "default": "append"}
 
-#: The number of objects that `upgrade` moves in one transaction.
+#: The number of objects that an import step changes in one transaction.
 BATCH = 100
 
 
@@ -52,7 +62,7 @@ class IAppendOnlyHistory(Interface):
     history of the object is a `WorkflowHistory`."""
 
 
-class WorkflowHistory(Persistent):
+class WorkflowHistory(Persistent, MutableMapping):
     """A mapping of workflow id to the tuple of its statuses.
 
     Its state is the mapping itself. `__setstate__` interns the keys, as
@@ -86,26 +96,18 @@ class WorkflowHistory(Persistent):
         del self._entries[key]
         self._p_changed = True
 
-    def __contains__(self, key):
-        return key in self._entries
-
     def __iter__(self):
         return iter(self._entries)
 
     def __len__(self):
         return len(self._entries)
 
-    def get(self, key, default=None):
-        return self._entries.get(key, default)
+    def __contains__(self, key):
+        return key in self._entries
 
-    def keys(self):
-        return self._entries.keys()
-
-    def values(self):
-        return self._entries.values()
-
-    def items(self):
-        return self._entries.items()
+    def copy(self):
+        """Return a new history with the same items."""
+        return type(self)(self._entries)
 
     def __repr__(self):
         return f"<{type(self).__name__} of {sorted(self._entries)}>"
@@ -117,55 +119,164 @@ def policy():
     return {"classes": {f"{__name__}.WorkflowHistory": dict(ENTRY)}}
 
 
+def _base(obj):
+    """Return `obj` without its acquisition wrapper."""
+    return getattr(obj, "aq_base", obj)
+
+
 def ensure(obj):
     """Give `obj` a `WorkflowHistory` with the items of its history. Return
     True when the history changed. An object without a history gets an
-    empty one."""
-    from Acquisition import aq_base
+    empty one.
 
-    base = aq_base(obj)
+    The move also marks the stock history as changed. So a transaction that
+    adds a status to the stock history from the same snapshot conflicts
+    with the move, whichever commits first, and its retry sees the moved
+    history: no status is lost."""
+    base = _base(obj)
     history = getattr(base, "workflow_history", None)
     if isinstance(history, WorkflowHistory):
         return False
+    if history is not None and getattr(history, "_p_jar", None) is not None:
+        history._p_changed = True
     base.workflow_history = WorkflowHistory(history.items() if history else ())
     return True
 
 
-def added(obj, event):
-    """The subscriber of an added object with the behaviour: the stock
-    history that the workflow tool wrote for its first status becomes a
-    `WorkflowHistory`, in the same transaction."""
-    ensure(obj)
+def _stock():
+    """Return the class of a stock history: the `PersistentMapping` of
+    Zope's `Persistence`, which Products.CMFCore uses, or that of
+    `persistent` outside Zope."""
+    try:
+        from Persistence import PersistentMapping as stock
+    except ImportError:
+        stock = PersistentMapping
+    return stock
 
 
-def upgrade(context):
-    """The upgrade step: move the stock history of each object of a type
-    with the behaviour to a `WorkflowHistory`, `BATCH` objects for each
-    transaction. Return the number of objects that changed."""
-    from plone.dexterity.interfaces import IDexterityFTI
+def restore(obj):
+    """Give `obj` its history back as a stock `PersistentMapping`. Return
+    True when the history changed. The move marks the `WorkflowHistory` as
+    changed, as `ensure` does."""
+    base = _base(obj)
+    history = getattr(base, "workflow_history", None)
+    if not isinstance(history, WorkflowHistory):
+        return False
+    if getattr(history, "_p_jar", None) is not None:
+        history._p_changed = True
+    base.workflow_history = _stock()(history.items())
+    return True
+
+
+def _each(site, query, change):
+    """Run `change` on each object that the catalog of `site` finds with
+    `query`, `BATCH` objects for each transaction. Return the number of
+    objects that changed."""
     from Products.CMFCore.utils import getToolByName
 
-    portal = getToolByName(context, "portal_url").getPortalObject()
-    types = getToolByName(portal, "portal_types")
-    names = [
-        fti.getId()
-        for fti in types.objectValues()
-        if IDexterityFTI.providedBy(fti)
-        and "zoe.plone.history" in getattr(fti, "behaviors", ())
-    ]
-    if not names:
-        return 0
-    catalog = getToolByName(portal, "portal_catalog")
-    moved = 0
+    catalog = getToolByName(site, "portal_catalog")
+    changed = 0
     pending = 0
-    for brain in catalog.unrestrictedSearchResults(portal_type=names):
-        obj = brain._unrestrictedGetObject()
-        if ensure(obj):
-            moved += 1
+    for brain in catalog.unrestrictedSearchResults(**query):
+        if change(brain._unrestrictedGetObject()):
+            changed += 1
             pending += 1
         if pending >= BATCH:
             transaction.commit()
             pending = 0
     if pending:
         transaction.commit()
-    return moved
+    return changed
+
+
+def history_types(site):
+    """Return the ids of the Dexterity types of `site` with the behaviour,
+    named by its name or by the identifier of its interface."""
+    from plone.behavior.registration import (
+        BehaviorRegistrationNotFound,
+        lookup_behavior_registration,
+    )
+    from plone.dexterity.interfaces import IDexterityFTI
+    from Products.CMFCore.utils import getToolByName
+
+    names = []
+    for fti in getToolByName(site, "portal_types").objectValues():
+        if not IDexterityFTI.providedBy(fti):
+            continue
+        for behavior in fti.behaviors:
+            try:
+                registration = lookup_behavior_registration(
+                    name=behavior, warn_about_fallback=False
+                )
+            except BehaviorRegistrationNotFound:
+                continue
+            if IAppendOnlyHistory in (registration.interface, registration.marker):
+                names.append(fti.getId())
+                break
+    return names
+
+
+def move_histories(site):
+    """Give each object of `site` with the behaviour a `WorkflowHistory`.
+    Return the number of objects that changed. A second run changes
+    nothing.
+
+    The objects come from the catalog by their type: the index
+    `object_provides` of an object that the catalog indexed before the
+    behaviour does not hold the marker yet."""
+    names = history_types(site)
+    if not names:
+        return 0
+
+    def change(obj):
+        return IAppendOnlyHistory.providedBy(obj) and ensure(obj)
+
+    return _each(site, {"portal_type": names}, change)
+
+
+def restore_histories(site):
+    """Give each object of `site` its history back as a
+    `PersistentMapping`. Return the number of objects that changed."""
+    return _each(site, {"path": "/".join(site.getPhysicalPath())}, restore)
+
+
+#: The file of the profile `zoe.plone:default` whose import moves the
+#: histories.
+MOVE = "zoe-plone-history.txt"
+#: The file of the profile `zoe.plone:uninstall` whose import gives them
+#: back.
+UNINSTALL = "zoe-plone-uninstall.txt"
+
+
+def import_histories(context):
+    """The import step of the profile `zoe.plone:default`: move the stock
+    histories of the objects with the behaviour. It runs at each import of
+    the profile, and changes only what is left to move."""
+    if context.readDataFile(MOVE) is None:
+        return
+    moved = move_histories(context.getSite())
+    context.getLogger("zoe.plone").info("moved %d workflow histories", moved)
+
+
+def uninstall(context):
+    """The import step of the profile `zoe.plone:uninstall`: remove the
+    behaviour from each Dexterity type, then give each `WorkflowHistory`
+    back as a `PersistentMapping`."""
+    if context.readDataFile(UNINSTALL) is None:
+        return
+    from plone.dexterity.interfaces import IDexterityFTI
+    from Products.CMFCore.utils import getToolByName
+
+    site = context.getSite()
+    names = set(history_types(site))
+    marker = IAppendOnlyHistory.__identifier__
+    for fti in getToolByName(site, "portal_types").objectValues():
+        if IDexterityFTI.providedBy(fti) and fti.getId() in names:
+            kept = tuple(
+                behavior
+                for behavior in fti.behaviors
+                if behavior not in ("zoe.plone.history", marker)
+            )
+            fti.manage_changeProperties(behaviors=kept)
+    restored = restore_histories(site)
+    context.getLogger("zoe.plone").info("restored %d workflow histories", restored)

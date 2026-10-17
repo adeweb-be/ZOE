@@ -12,31 +12,38 @@ As the admin user, the script:
 1. adds the Document `before`, whose history is the stock one;
 2. imports the profile `zoe.plone:default`, whose import step derives the
    merge policy of the site and writes it into the store;
-3. gives the type Document the behaviour `zoe.plone.history`, and runs the
-   upgrade step, which moves the history of `before`;
-4. adds the Document `after`, which gets a `WorkflowHistory` when it is
-   added;
+3. gives the type Document the behaviour `zoe.plone.history`, which
+   derives the policy again, and imports the profile again, whose import
+   step moves the history of `before`;
+4. adds the Document `after`, which gets a `WorkflowHistory` with its
+   first status, through the status adapter of the behaviour;
 5. runs THREADS threads, each with its own connection, that read `after`
    from one snapshot, add one status to its history through the workflow
    tool, and commit in turn, without a retry;
-6. writes a policy with the Document class on, and lets two connections
-   change the title and the description of `after` from one snapshot, each
-   with `notifyModified`, and commit in turn.
+6. keeps overrides that switch the Document class on, derives the policy
+   again, and lets two connections change the title and the description of
+   `after` from one snapshot, each with `notifyModified`, and commit in
+   turn;
+7. imports the profile `zoe.plone:uninstall`, which gives each history
+   back as a `PersistentMapping`.
 
 The last line of stdout is a JSON report:
 
     {"classes": <the classes of the derived policy>,
      "document": <the entry of the Document class>,
      "event": <the entry of the Event class>,
-     "moved": <the objects that the upgrade step moved>,
-     "before": <the class of the history of before>,
+     "versions": <the versions of the policy after steps 2 and 3>,
+     "stock": <the class of the history of before after step 2>,
+     "before": <the class of the history of before after step 3>,
      "before_entries": <the statuses of before>,
      "after": <the class of the history of after>,
      "committed": <the transitions that committed>,
      "conflicts": <the transitions that raised ConflictError>,
      "entries": <the statuses of after>,
      "fields": <the outcome of the two changes of fields>,
-     "title": ..., "description": ...}
+     "title": ..., "description": ...,
+     "uninstalled": <the classes of the two histories after step 7>,
+     "behaviors": <the behaviour is still on Document after step 7>}
 """
 
 import json
@@ -52,7 +59,7 @@ from DateTime import DateTime
 from Products.CMFCore.utils import getToolByName
 from Testing.makerequest import makerequest
 from ZODB.POSException import ConflictError
-from zoe.plone import history, merges
+from zoe.plone import merges
 from zope.component.hooks import setSite
 from zope.globalrequest import setRequest
 
@@ -112,12 +119,15 @@ setup = getToolByName(site, "portal_setup")
 setup.runAllImportStepsFromProfile("profile-zoe.plone:default")
 transaction.commit()
 derived = zoe.policy.read(site._p_jar)
+stock = class_of(site["before"])
 
-# 3. The behaviour, then the upgrade step.
+# 3. The behaviour derives the policy again, and the import of the profile
+# moves the history.
 fti = getToolByName(site, "portal_types")["Document"]
-fti.behaviors = (*fti.behaviors, "zoe.plone.history")
+fti.manage_changeProperties(behaviors=(*fti.behaviors, "zoe.plone.history"))
 transaction.commit()
-moved = history.upgrade(setup)
+versions = [derived["version"], zoe.policy.read(site._p_jar)["version"]]
+setup.runAllImportStepsFromProfile("profile-zoe.plone:default")
 transaction.commit()
 
 # 4. A new Document gets the history of the behaviour.
@@ -178,8 +188,9 @@ for _, connection in connections:
 
 # 6. Two changes of two fields of one Document.
 site = enter(aq_base(app), name)  # noqa: F821
-policy = merges.derive(site, {"classes": {DOCUMENT: {"tier2": "on"}}})
-zoe.policy.install(site._p_jar, policy)
+kept = merges.site_overrides(site, create=True)
+kept["history.py"] = {"classes": {DOCUMENT: {"tier2": "on"}}}
+merges.update_policy(site)
 transaction.commit()
 leave()
 pair = []
@@ -210,20 +221,38 @@ transaction.begin()
 site = enter(aq_base(app), name)  # noqa: F821
 before = site["before"]
 after = site["after"]
+report_after = {
+    "after": class_of(after),
+    "entries": len(aq_base(after).workflow_history[WORKFLOW]),
+    "title": after.title,
+    "description": after.description,
+}
+report_before = {
+    "before": class_of(before),
+    "before_entries": len(aq_base(before).workflow_history[WORKFLOW]),
+}
+
+# 7. The way back.
+setup = getToolByName(site, "portal_setup")
+setup.runAllImportStepsFromProfile("profile-zoe.plone:uninstall")
+transaction.commit()
+uninstalled = [class_of(site["before"]), class_of(site["after"])]
+behaviors = (
+    "zoe.plone.history" in getToolByName(site, "portal_types")["Document"].behaviors
+)
 report = {
     "classes": sorted(derived["classes"]),
     "document": derived["classes"].get(DOCUMENT),
     "event": derived["classes"].get(EVENT),
-    "moved": moved,
-    "before": class_of(before),
-    "before_entries": len(aq_base(before).workflow_history[WORKFLOW]),
-    "after": class_of(after),
+    "versions": versions,
+    "stock": stock,
+    **report_before,
     "committed": results.count("committed"),
     "conflicts": results.count("conflict"),
-    "entries": len(aq_base(after).workflow_history[WORKFLOW]),
     "fields": outcomes,
-    "title": after.title,
-    "description": after.description,
+    **report_after,
+    "uninstalled": uninstalled,
+    "behaviors": behaviors,
 }
 leave()
 print(json.dumps(report))
