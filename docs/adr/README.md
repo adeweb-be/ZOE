@@ -45,4 +45,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0039](0039-the-phase-3-gate-is-a-quick-head-to-head.md) | The phase 3 gate is a quick head-to-head: faster than ZEO in every cell; it supersedes ADR 0037 (accepted) |
 | [0040](0040-a-sync-on-macos-is-fsync.md) | A sync on macOS is fsync(2), as for FileStorage (accepted) |
 | [0041](0041-records-are-raw-by-default.md) | Records are raw by default; zstd is a setting (accepted) |
-| [0043](0043-kv-namespaces.md) | KV namespaces: an ephemeral namespace with a TTL, and a durable namespace (proposed) |
+| [0043](0043-kv-namespaces.md) | KV namespaces: an ephemeral namespace with a TTL, and a durable namespace (accepted) |

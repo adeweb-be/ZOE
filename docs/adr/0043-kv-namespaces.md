@@ -1,6 +1,6 @@
 # 0043. KV namespaces: an ephemeral namespace with a TTL, and a durable namespace
 
-Status: proposed. A checkpoint of ZOE-207: a change of the on-disk format (red zone), of the wire protocol and of the public Python API. The human approves it on the pull request. "Questions for the human" lists the choices that need approval.
+Status: accepted. The human approved it on the pull request of ZOE-207 (#420), with the answers of its draft to each question below. It changes the on-disk format (a red zone), the wire protocol and the public Python API.
 
 ## Context
 
@@ -129,9 +129,11 @@ Every durable write has a tid, so a backup with nothing new writes nothing and m
 - **Ephemeral-only commits without a sync and without a tid.** A session write would cost no sync, but a crash would lose the acknowledged writes after the last durable commit, and the store would need a second commit path. A deferred commit with a tid is not possible: after a crash, a ZEO client that saw the lost tid refuses the server (`ZEO/asyncio/client.py:598-605`).
 - **A sweep by a cursor over every row, without `kv_expiry`.** It saves a key space, but each step reads live rows, and an expired key goes only when the cursor reaches it.
 
-## Questions for the human
+## Answers of the human
 
-1. The durability of the ephemeral namespace: as durable as the records (this draft), or ephemeral-only commits without a sync, which a crash can lose.
+The human approved each choice of this draft:
+
+1. The ephemeral namespace is as durable as the records. Ephemeral-only commits have a sync.
 2. Three key spaces: `kv_ephemeral` (tag 7), `kv_durable` (tag 8), and `kv_expiry` (no tag); their names and their key layout.
 3. No history and no pack for both flavours. Reads give the last committed value, not the snapshot value, and undo gives back no key.
 4. Last writer wins, with no lock and no version check, also for the locks of edit forms.
@@ -140,7 +142,7 @@ Every durable write has a tid, so a backup with nothing new writes nothing and m
 7. The name `kv`, its five calls, the argument `flavour`, and the module `zoe.kv`.
 8. The sweep: a step of at most 1,000 keys, once a minute, with a sync, and no option.
 9. The limits: a name of at most 255 bytes, a key of at most 1,024 bytes, a TTL of at most 2^32 − 1 seconds, and values under `max-record-size`.
-10. No new format name: an older build opens a store with namespaces, leaves the durable rows out of its backups and runs no sweep. The other choice: the first durable write sets `ZOE format 3`.
+10. No new format name: an older build opens a store with namespaces, leaves the durable rows out of its backups and runs no sweep.
 11. The dump version 2, with a full copy of the durable rows in each dump.
 12. The CSRF keys stay in plone.keyring: they change only at a login, and the card names no backend for them.
 13. A copy through the ZODB iterator, and `zoe convert` to Data.fs, leave the durable rows out. A site moves its registry back into the object graph before such a copy.
