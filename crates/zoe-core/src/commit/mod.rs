@@ -163,6 +163,10 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The early write-intent locks that the transaction adopted before
     /// its vote, in ascending oid order. The vote counts them as its own.
     intents: Vec<Held>,
+    /// The lock wait of the vote that takes the locks: the acquisition, and
+    /// the waits for the durability of commits in flight. The vote gives
+    /// it to the observer at its end. `None` without an observer.
+    lock_waited: Option<Duration>,
 }
 
 /// What the serial check of a vote found.
@@ -225,6 +229,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             onto: BTreeMap::new(),
             lock_deadline: Duration::ZERO,
             intents: Vec::new(),
+            lock_waited: None,
         }
     }
 
@@ -713,7 +718,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.lock()?;
         }
         self.resolving.clear();
-        self.check(false, native).map(drop)
+        let checked = self.check(false, native);
+        if native {
+            self.observe_lock_wait();
+        }
+        checked.map(drop)
+    }
+
+    /// Give the lock wait of the vote that took the locks to the observer.
+    fn observe_lock_wait(&mut self) {
+        if let (Some(observer), Some(waited)) = (self.store.observer(), self.lock_waited.take()) {
+            observer.locks_acquired(waited);
+        }
     }
 
     /// Vote as `vote` does, but keep the locks when the vote finds stale
@@ -739,7 +755,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         self.conflict = None;
         self.lock()?;
-        let conflicts = self.check(true, true)?;
+        let checked = self.check(true, true);
+        self.observe_lock_wait();
+        let conflicts = checked?;
         self.resolving = conflicts.iter().map(|&(oid, _)| oid).collect();
         Ok(conflicts)
     }
@@ -876,11 +894,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 .locks
                 .acquire_cancellable(&requests, store.lock_timeout, &*store.clock, cancel)
         });
-        if let (Some(observer), Some(started)) = (store.observer(), started) {
-            observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
-        }
+        let waited = started.map(|started| store.clock.monotonic().saturating_sub(started));
         match acquired {
             Ok(mut locks) => {
+                // The vote adds its waits for commits in flight, and gives
+                // the sum to the observer at its end.
+                self.lock_waited = waited;
                 self.handed = locks.handoffs().into_iter().collect();
                 self.onto.clear();
                 self.lock_deadline = deadline.unwrap_or_else(|| locks.deadline());
@@ -891,6 +910,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 Ok(())
             }
             Err(Refused { error, released }) => {
+                if let (Some(observer), Some(waited)) = (store.observer(), waited) {
+                    observer.locks_acquired(waited);
+                }
                 let now = store.clock.now();
                 store.guardrails.locks_released(&released, now);
                 Err(error)
@@ -1042,7 +1064,20 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             self.resolutions.extend(resolution);
                             return Ok(Check::Failed(stale));
                         }
-                        Handed::Store => current = self.current_serial(oid)?,
+                        Handed::Store { waited } => {
+                            // The wait for the commit in flight counts in the
+                            // lock wait of the vote.
+                            if let Some(total) = &mut self.lock_waited {
+                                *total += waited;
+                            }
+                            current = self.current_serial(oid)?;
+                        }
+                        Handed::Late { waited } => {
+                            if let Some(total) = &mut self.lock_waited {
+                                *total += waited;
+                            }
+                            return Err(ZoeError::Conflict { oid });
+                        }
                     }
                 }
                 if current == staged.serial {
@@ -1107,6 +1142,19 @@ impl<S: Deref<Target = Store>> Txn<S> {
         for chunk in read_current.chunks(READ_CHUNK) {
             let serials = self.current_serials(chunk.iter().map(|&(&oid, _)| oid))?;
             for (&(&oid, &read), serial) in chunk.iter().zip(serials) {
+                // The last commit of an oid held with a hand-off can be in
+                // flight: the store does not hold it yet.
+                if let Some(handoff) = self.handed.get(&oid)
+                    && handoff.commit.ended().is_none()
+                    && handoff.commit.tid() != Some(read)
+                {
+                    return Ok(Check::Failed(Stale {
+                        oid,
+                        current: handoff.commit.tid(),
+                        read,
+                        read_only: true,
+                    }));
+                }
                 let current = serial.unwrap_or(Tid::ZERO);
                 if current != read {
                     return Ok(Check::Failed(Stale {
@@ -1134,7 +1182,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// When tier 1 does not decide, the call waits until the commit is
     /// durable or failed, at most until the lock deadline of the vote, and
     /// the check then goes on with the store. A wait past the deadline, or
-    /// a cancel, fails with `Conflict` on the oid.
+    /// a cancel, ends as `Handed::Late`: the vote fails with `Conflict` on
+    /// the oid. A transaction that read the commit in flight checks the oid
+    /// against the store, which holds that commit.
     fn check_handed(
         &self,
         oid: Oid,
@@ -1148,8 +1198,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return Ok(Handed::Passed);
         }
         let commit = &handoff.commit;
-        if commit.ended().is_some() {
-            return Ok(Handed::Store);
+        // The transaction read the commit in flight: its batch is visible,
+        // and the store holds it.
+        if commit.ended().is_some() || commit.tid() == Some(staged.serial) {
+            return Ok(Handed::Store {
+                waited: Duration::ZERO,
+            });
         }
         let stale = Stale {
             oid,
@@ -1197,20 +1251,26 @@ impl<S: Deref<Target = Store>> Txn<S> {
             }
         }
         let store: &Store = &self.store;
-        match commit.wait(
+        let started = store.observer().map(|_| store.clock.monotonic());
+        let outcome = commit.wait(
             oid,
             self.lock_deadline,
             &*store.clock,
             self.lock_cancel.as_ref(),
-        ) {
-            Waited::Durable | Waited::Failed => Ok(Handed::Store),
-            Waited::TimedOut | Waited::Cancelled => Err(ZoeError::Conflict { oid }),
+        );
+        let waited = started.map_or(Duration::ZERO, |started| {
+            store.clock.monotonic().saturating_sub(started)
+        });
+        match outcome {
+            Waited::Durable | Waited::Failed => Ok(Handed::Store { waited }),
+            Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
         }
     }
 
     /// Run tier 1 on the conflict of `oid`: the transaction read `read`,
-    /// and `committed` is the pickle of the current record. Return `None` when the class
-    /// of the staged record is not a class of tier 1, or its mode is `Off`.
+    /// and `committed` is the pickle of the current record. Return `None`
+    /// when the class of the staged record is not a class of tier 1, or its
+    /// mode is `Off`.
     ///
     /// The class comes from the class pickle of the staged record alone.
     /// Only a class of tier 1 reads the record at `read`.
@@ -1338,14 +1398,20 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let store: &Store = &self.store;
         let held = &mut self.locks;
         let mut handed = Vec::new();
-        let mut released = SystemTime::UNIX_EPOCH;
+        let empty = handoffs.is_empty();
+        // The member is in the queue while `queued` runs, so it calls no
+        // code that can panic but the lock manager: the time of the
+        // hand-offs comes before the finish joins the queue.
+        let released = if empty {
+            SystemTime::UNIX_EPOCH
+        } else {
+            store.clock.now()
+        };
         // The hand-offs come once the member is in the queue of group
         // commit, so the commit of a new owner comes after this one.
-        let empty = handoffs.is_empty();
         let queued = (!empty).then_some(|| {
             if let Some(held) = held.as_mut() {
                 handed = store.locks.hand_off(handoffs, held);
-                released = store.clock.now();
             }
         });
         let (member, finished) = store.group.finish(store, member, queued);
@@ -1498,9 +1564,13 @@ enum Handed {
         stale: Stale,
         resolution: Option<Resolution>,
     },
-    /// The commit in flight is durable or failed: the check goes on with
-    /// the store.
-    Store,
+    /// The commit in flight is durable or failed, or the transaction read
+    /// it: the check goes on with the store. `waited` is the wait for its
+    /// end.
+    Store { waited: Duration },
+    /// The wait for the end of the commit in flight passed the lock
+    /// deadline of the vote, or a cancel ended it: the vote fails.
+    Late { waited: Duration },
 }
 
 /// The number of oids whose current serials the vote reads in one backend

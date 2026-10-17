@@ -66,7 +66,8 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
     /// takes nothing. The call waits for a lock that another request holds,
     /// at most the lock timeout of the store. A longer wait, or a cancel,
     /// fails with `Conflict` on the oid that it waits for, and the call
-    /// keeps no lock that it took. A read-only store fails with `ReadOnly`.
+    /// keeps no lock that it took; so does a failed read of the serials. A
+    /// read-only store fails with `ReadOnly`.
     pub fn lock(&mut self, oids: &[Oid]) -> Result<Vec<Tid>> {
         self.store.writable()?;
         let Some(&first) = oids.first() else {
@@ -100,10 +101,18 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
         if let (Some(observer), Some(wait)) = (store.observer(), wait) {
             observer.intent_locks_acquired(locks.len(), wait);
         }
-        self.held.extend(locks);
         // The intent requests waited until the store held the last commit
-        // of each oid, so the store gives its serial.
-        let serials = store.backend.current_serials(&mut oids.iter().copied())?;
+        // of each oid, so the store gives its serial. A failed read keeps
+        // no lock of the call.
+        let serials = match store.backend.current_serials(&mut oids.iter().copied()) {
+            Ok(serials) => serials,
+            Err(error) => {
+                store.locks.release(&locks);
+                store.guardrails.locks_released(&locks, store.clock.now());
+                return Err(error);
+            }
+        };
+        self.held.extend(locks);
         Ok(serials
             .into_iter()
             .map(|serial| serial.unwrap_or(Tid::ZERO))

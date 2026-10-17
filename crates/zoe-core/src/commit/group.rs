@@ -122,6 +122,10 @@ impl GroupCommit {
         member: Member,
         queued: Option<F>,
     ) -> Outcome {
+        // The waiter comes from the store clock before the member joins the
+        // queue: a clock that panics then leaves no member in the queue
+        // whose transaction released its locks.
+        let waiter = store.clock.waiter();
         let mut queue = self.lock();
         let ticket = queue.next;
         queue.next += 1;
@@ -131,7 +135,6 @@ impl GroupCommit {
             queued();
             queue = self.lock();
         }
-        let mut waiter: Option<Arc<dyn Waiter>> = None;
         loop {
             if let Some(outcome) = queue.ended.remove(&ticket) {
                 return outcome;
@@ -152,14 +155,6 @@ impl GroupCommit {
                 queue = self.lock();
                 continue;
             }
-            // The waiter comes from the store clock, without the queue
-            // mutex. Then the finish looks at the queue again.
-            let Some(waiter) = waiter.clone() else {
-                drop(queue);
-                waiter = Some(store.clock.waiter());
-                queue = self.lock();
-                continue;
-            };
             queue.sleepers.push(Arc::clone(&waiter));
             drop(queue);
             // A wake before the wait is not lost.
@@ -1100,6 +1095,150 @@ mod tests {
                 Err(ZoeError::ReadConflict { oid: o }) if o == oid
             ));
         });
+        assert!(store.locks.is_empty());
+    }
+
+    /// An observer that holds the leader in `batch_synced` while `armed`:
+    /// its batch is visible, and its members have no outcome yet.
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        open: std::sync::atomic::AtomicBool,
+    }
+
+    impl Observer for Gate {
+        fn batch_synced(&self, _: usize) {
+            if self.armed.load(Ordering::SeqCst) {
+                self.held.store(true, Ordering::SeqCst);
+                while !self.open.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Hold the first commit visible, before its finish ends its hand-off,
+    /// and let a transaction that read it write `third` (`None`: a
+    /// deletion). Return the outcome of its vote and the oids that tier 1
+    /// merged.
+    fn after_a_visible_hand_off(third: Option<Vec<u8>>) -> Result<Vec<Oid>> {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let gate = Arc::new(Gate::default());
+        store.set_observer(gate.clone());
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.vote().map(|()| txn)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            gate.armed.store(true, Ordering::SeqCst);
+            let first = scope.spawn(move || first.finish());
+            // The second vote took the hand-off, and gives the lock back
+            // with it.
+            second.join().unwrap().unwrap().abort();
+            wait_until(|| gate.held.load(Ordering::SeqCst));
+            let (data, serial) = store.load(oid).unwrap();
+            assert_eq!(data, length(1));
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            match &third {
+                Some(data) => txn.store(oid, serial, data).unwrap(),
+                None => txn.delete(oid, serial).unwrap(),
+            }
+            let voted = txn.vote().map(|()| txn.natively_resolved());
+            gate.open.store(true, Ordering::SeqCst);
+            first.join().unwrap().unwrap();
+            voted
+        })
+    }
+
+    #[test]
+    fn a_deletion_that_read_a_commit_in_flight_passes() {
+        let voted = after_a_visible_hand_off(None);
+        assert!(voted.is_ok(), "{voted:?}");
+    }
+
+    #[test]
+    fn a_store_that_read_a_commit_in_flight_passes_without_a_merge() {
+        let voted = after_a_visible_hand_off(Some(length(5)));
+        assert_eq!(voted.unwrap(), Vec::<Oid>::new());
+    }
+
+    #[test]
+    fn a_read_current_check_of_an_oid_with_a_commit_in_flight_fails() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.check_current_serial(oid, read).unwrap();
+                txn.vote().map(drop)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            let voted = second.join().unwrap();
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+            // The first commit changed the oid after the read.
+            assert!(
+                matches!(voted, Err(ZoeError::ReadConflict { oid: o }) if o == oid),
+                "{voted:?}"
+            );
+        });
+        assert!(store.locks.is_empty());
+    }
+
+    /// A clock whose `waiter` panics once it is armed.
+    #[derive(Clone, Default)]
+    struct PanickingClock(Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::clock::Clock for PanickingClock {
+        fn now(&self) -> std::time::SystemTime {
+            std::time::SystemTime::now()
+        }
+
+        fn waiter(&self) -> Arc<dyn Waiter> {
+            assert!(!self.0.load(Ordering::SeqCst), "the clock fails");
+            crate::clock::SystemClock.waiter()
+        }
+    }
+
+    #[test]
+    fn a_clock_that_panics_in_a_finish_leaves_no_member_in_the_queue() {
+        let clock = PanickingClock::default();
+        let store = Store::open_full(
+            MemVfs::new(),
+            clock.clone(),
+            crate::store::Options::default(),
+        )
+        .unwrap();
+        let (first_oid, second_oid) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = voted(&store, first_oid, b"first");
+        let second = voted(&store, second_oid, b"second");
+        thread::scope(|scope| {
+            // The first finish leads a batch, and waits for the sequencer.
+            let sequencer = store.lock_sequencer();
+            let joined = store.group.joined();
+            let first = scope.spawn(move || first.finish());
+            wait_until(|| store.group.joined() == joined + 1);
+            clock.0.store(true, Ordering::SeqCst);
+            // The second finish panics before it joins the queue, and its
+            // transaction releases its locks.
+            assert!(scope.spawn(move || second.finish()).join().is_err());
+            assert_eq!(store.group.joined(), joined + 1);
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+        });
+        assert!(matches!(
+            store.load(second_oid),
+            Err(ZoeError::NotFound { .. })
+        ));
         assert!(store.locks.is_empty());
     }
 }

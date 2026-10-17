@@ -1,10 +1,10 @@
 //! The observer of a store: a hook for the metrics of a skin.
 //!
 //! The core calls the observer of a store after a sync of a commit batch,
-//! after the lock acquisition of each vote, and after a finish that handed
-//! off locks. The core keeps no metric
-//! and has no metrics dependency: the skin counts what it gets. Each
-//! method has a default that does nothing.
+//! at the end of each vote that takes locks, after a finish that handed off
+//! locks, and after each call that takes early write-intent locks. The core
+//! keeps no metric and has no metrics dependency: the skin counts what it
+//! gets. Each method has a default that does nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +24,9 @@ pub trait Observer: Send + Sync {
     }
 
     /// A vote spent `wait` to take its locks, measured on the monotonic
-    /// time of the store clock (`Clock::monotonic`). A vote that waited
-    /// past the lock timeout calls it too.
+    /// time of the store clock (`Clock::monotonic`), with its waits for the
+    /// durability of commits in flight (ADR 0044). A vote that waited past
+    /// the lock timeout calls it too.
     fn locks_acquired(&self, wait: Duration) {
         let _ = wait;
     }
