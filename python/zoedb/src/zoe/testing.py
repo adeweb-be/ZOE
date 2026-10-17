@@ -10,9 +10,9 @@ This module needs the test extra of ZODB.
 - `StorageTestCase` is the base class of the storage suites of ZODB.
 - `ZoeServer` runs the `zoe` binary as `zoe serve`, for the tests of the
   server. `ZoeServer.binary()` gives the path of the binary, from
-  `ZOE_BINARY` or the debug build of the repository. The kernel kills the
-  server when the thread that started it ends, so a test process that
-  dies leaves no server. Linux only.
+  `ZOE_BINARY` or the debug build of the repository. On Linux, the kernel
+  kills the server when the thread that started it ends, so a test process
+  that dies leaves no server.
 - `ZEO_LAYER` is a layer of zope.testrunner. Between its `setUp` and its
   `tearDown`, the test forker of ZEO starts `zoe serve` in place of a ZEO
   server. It needs ZEO.
@@ -164,11 +164,13 @@ class ZoeServer:
     string. An address that is set before the start is the `--listen` of
     the server.
 
-    The server never outlives the process that started it. The kernel
-    sends SIGKILL to the server when its parent ends (`PR_SET_PDEATHSIG`
-    of Linux). The signal follows the thread that started the server, not
-    the process: a server started from a thread ends when that thread
-    ends.
+    On Linux, the server never outlives the process that started it. The
+    kernel sends SIGKILL to the server when its parent ends
+    (`PR_SET_PDEATHSIG`). The signal follows the thread that started the
+    server, not the process: a server started from a thread ends when that
+    thread ends. Other platforms have no such signal. There, the server
+    runs until `kill`, `stop` or the end of the context manager, and a
+    test process that dies before them leaves the server.
     """
 
     def __init__(self, path=None, args=(), env=None, log=None):
@@ -293,7 +295,7 @@ _PR_SET_PDEATHSIG = 1
 
 
 def _die_with_parent():
-    """Return the function that `subprocess` runs in the child.
+    """Return the function that `subprocess` runs in the child, or None.
 
     The function asks the kernel to send SIGKILL to the child when its
     parent ends. Then it checks that the parent is still the process that
@@ -303,7 +305,12 @@ def _die_with_parent():
     The function runs between the fork and the exec, where other threads
     can hold locks. So this function looks up `prctl` before the fork, and
     the child does no other work.
+
+    Only Linux has `prctl` and the parent-death signal. On another
+    platform, return None: the child runs without a function.
     """
+    if sys.platform != "linux":
+        return None
     prctl = ctypes.CDLL(None, use_errno=True).prctl
     prctl.argtypes = (ctypes.c_int, ctypes.c_ulong)
     prctl.restype = ctypes.c_int
