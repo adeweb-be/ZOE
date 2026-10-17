@@ -6,7 +6,9 @@
 # wire traces in docs/spikes/zeo-wire, each one up to 4 KiB: the protocol of
 # the client, then its messages, each one as a frame. corpus/generate.py
 # writes them. The seeds of merge are conflicts of BTrees records that
-# corpus/generate_merge.py writes with ZODB.
+# corpus/generate_merge.py writes with ZODB, and the seeds of fields are
+# conflicts of persistent objects, a policy and a root that
+# corpus/generate_fields.py writes with ZODB.
 
 [package]
 name = "zoe-server-fuzz"
@@ -48,6 +50,15 @@ bench = false
 [[bin]]
 name = "merge"
 path = "fuzz_targets/merge.rs"
+test = false
+doc = false
+bench = false
+
+# Tier 2 of the conflict resolution, on three records, and the readers of
+# the merge policy and of the root.
+[[bin]]
+name = "fields"
+path = "fuzz_targets/fields.rs"
 test = false
 doc = false
 bench = false

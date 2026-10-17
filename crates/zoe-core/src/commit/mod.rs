@@ -12,9 +12,13 @@
 //!
 //! The vote that takes the locks runs tier 1 of the conflict resolution
 //! (`crate::merge`) on each stale written oid of a class of BTrees or
-//! `Length`: it stores the merged record over the committed one, or fails
-//! on a refusal, or leaves the conflict as it is. `resolutions` tells what
-//! tier 1 did.
+//! `Length`, and tier 2 on each stale written oid of a class that the
+//! merge policy marks mergeable: it stores the merged record over the
+//! committed one, or fails on a refusal, or leaves the conflict as it is.
+//! `resolutions` tells what the tiers did. The vote after
+//! `vote_resolving` compares each merge of shadow mode with the
+//! resolution that the caller stored, and `verifications` tells what it
+//! found.
 //!
 //! `vote_resolving` lets the caller resolve conflicts with the locks held.
 //! It returns the stale written oids with their committed records, and
@@ -68,7 +72,8 @@ use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
 use crate::lock::{Held, LockCancel, Mode, Refused};
-use crate::merge::{self, Merge, Outcome, Resolution, Resolved};
+use crate::merge::policy::{Policy, Rules};
+use crate::merge::{self, Merge, Outcome, Resolution, Resolved, Verification};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 pub use encoded::Encoded;
@@ -139,8 +144,8 @@ pub struct Txn<S: Deref<Target = Store>> {
     committed: Option<Tid>,
     /// The handle that ends the lock wait of a vote from another thread.
     lock_cancel: Option<LockCancel>,
-    /// What tier 1 did in the undos of the transaction, then in the last
-    /// vote that took the locks.
+    /// What tiers 1 and 2 did in the undos of the transaction, then in the
+    /// last vote that took the locks.
     resolutions: Vec<Resolution>,
     /// The number of entries of `resolutions` that the undos gave. They
     /// come first, and a vote keeps them.
@@ -148,6 +153,27 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The lowest tid that the transaction undoes. The finish checks it
     /// against the pack watermark under the commit sequencer.
     undone: Option<Tid>,
+    /// The merges of shadow mode of the last vote that took the locks: the
+    /// digest of each merged record, by oid. The vote after
+    /// `vote_resolving` compares them with the records of the caller.
+    shadows: BTreeMap<Oid, Shadowed>,
+    /// What the vote after `vote_resolving` found for each merge of
+    /// shadow mode that the caller resolved.
+    verifications: Vec<Verification>,
+}
+
+/// A merge of shadow mode, kept for its check against the resolution of
+/// the caller.
+struct Shadowed {
+    tier: u8,
+    class: String,
+    policy: Option<u64>,
+    /// The BLAKE3 digest of the merged record.
+    digest: blake3::Hash,
+    /// The serial of the committed record.
+    committed: Tid,
+    /// The serial that the transaction read.
+    read: Tid,
 }
 
 /// What the serial check of a vote found.
@@ -203,6 +229,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
             resolutions: Vec::new(),
             undo_resolutions: 0,
             undone: None,
+            shadows: BTreeMap::new(),
+            verifications: Vec::new(),
         }
     }
 
@@ -667,9 +695,38 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let native = !self.locked();
         if native {
             self.lock()?;
+        } else {
+            self.verify_shadows();
         }
         self.resolving.clear();
         self.check(false, native).map(drop)
+    }
+
+    /// Compare each merge of shadow mode of `vote_resolving` with the
+    /// record that the caller stored for its oid over the committed serial.
+    /// An oid that the caller did not resolve gives nothing.
+    fn verify_shadows(&mut self) {
+        self.verifications.clear();
+        for (oid, shadowed) in std::mem::take(&mut self.shadows) {
+            if !self.resolving.contains(&oid) {
+                continue;
+            }
+            let Ok(Some((serial, pickle))) = self.staged.get(oid) else {
+                continue;
+            };
+            if serial != shadowed.committed {
+                continue;
+            }
+            self.verifications.push(Verification {
+                oid,
+                tier: shadowed.tier,
+                class: shadowed.class,
+                policy: shadowed.policy,
+                same: blake3::hash(&pickle) == shadowed.digest,
+                committed: shadowed.committed,
+                read: shadowed.read,
+            });
+        }
     }
 
     /// Vote as `vote` does, but keep the locks when the vote finds stale
@@ -729,15 +786,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.resolutions
             .iter()
             .map(|resolution| {
-                let committed = self
-                    .store
-                    .history(resolution.oid, HISTORY_SEARCH)
-                    .ok()
-                    .and_then(|entries| {
-                        entries
-                            .into_iter()
-                            .find(|entry| entry.tid == resolution.committed)
-                    });
+                let committed = self.committed_entry(resolution.oid, resolution.committed);
                 let context = merge::LogContext {
                     time,
                     storage,
@@ -751,6 +800,33 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .collect()
     }
 
+    /// Return what the vote after `vote_resolving` found for each merge of
+    /// shadow mode that the caller resolved: whether the record of the
+    /// caller is the merged record (ADR 0046).
+    pub fn verifications(&self) -> &[Verification] {
+        &self.verifications
+    }
+
+    /// Return the lines of the resolution log of `verifications`, at
+    /// `time`, for the storage `storage` of a server.
+    pub fn verification_log_lines(&self, time: SystemTime, storage: Option<&str>) -> Vec<String> {
+        self.verifications
+            .iter()
+            .map(|verification| {
+                let committed = self.committed_entry(verification.oid, verification.committed);
+                let context = merge::LogContext {
+                    time,
+                    storage,
+                    user: &self.user,
+                    description: &self.description,
+                    committed_user: committed.as_ref().map(|entry| &entry.user[..]),
+                    committed_description: committed.as_ref().map(|entry| &entry.description[..]),
+                };
+                merge::verification_line(verification, &context)
+            })
+            .collect()
+    }
+
     /// Return the oids that tier 1 merged in the last vote that took the
     /// locks and passed. Their staged records hold the merged records, over
     /// the serial of the committed records.
@@ -760,6 +836,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .filter(|resolution| resolution.applied && resolution.outcome == Resolved::Merged)
             .map(|resolution| resolution.oid)
             .collect()
+    }
+
+    /// Return the history entry of `oid` at `tid`, when the store still has
+    /// it.
+    fn committed_entry(&self, oid: Oid, tid: Tid) -> Option<crate::read::HistoryEntry> {
+        self.store
+            .history(oid, HISTORY_SEARCH)
+            .ok()
+            .and_then(|entries| entries.into_iter().find(|entry| entry.tid == tid))
     }
 
     /// Take the locks of the vote, and keep them until `finish`, `abort` or
@@ -806,7 +891,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// or an error, fails the check and releases the locks.
     fn check(&mut self, resolve: bool, native: bool) -> Result<Vec<(Oid, Record)>> {
         if native {
+            // The entries of the undos come first, and they stay.
             self.resolutions.truncate(self.undo_resolutions);
+            self.shadows.clear();
+            self.verifications.clear();
         }
         let checked = self
             .check_serials(resolve, native)
@@ -901,6 +989,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let mut conflicts = Vec::new();
         let mut merged = Vec::new();
         let mut stored_bytes = self.stored_bytes;
+        // The first conflict reads the merge policy. A vote without a
+        // conflict reads nothing.
+        let mut policy: Option<Option<Arc<Policy>>> = None;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
@@ -932,8 +1023,35 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     Some(record) if record.tid == current && !record.data.is_empty() => record,
                     _ => return Ok(Check::Failed(stale)),
                 };
-                if native && let Some((mode, merge)) = self.tier1(oid, staged.serial, &record)? {
-                    let mut resolution = Resolution::of(oid, mode, &merge, current, staged.serial);
+                let resolved = if native {
+                    if policy.is_none() {
+                        policy = Some(self.store.merge_policy()?);
+                    }
+                    let rules = Rules {
+                        config: &self.store.structural_merges,
+                        policy: policy.as_ref().and_then(Option::as_deref),
+                    };
+                    self.native(oid, staged.serial, &record, &rules)?
+                        .map(|(mode, merge)| (mode, rules.version(), merge))
+                } else {
+                    None
+                };
+                if let Some((mode, version, merge)) = resolved {
+                    let mut resolution =
+                        Resolution::of(oid, mode, version, &merge, current, staged.serial);
+                    if let (merge::Mode::Shadow, Outcome::Merged(pickle)) = (mode, &merge.outcome) {
+                        self.shadows.insert(
+                            oid,
+                            Shadowed {
+                                tier: merge.tier,
+                                class: merge.class.clone(),
+                                policy: version,
+                                digest: blake3::hash(pickle),
+                                committed: current,
+                                read: staged.serial,
+                            },
+                        );
+                    }
                     match (mode, merge.outcome) {
                         (merge::Mode::On, Outcome::Merged(pickle)) => {
                             match self.merged_size(oid, &pickle, stored_bytes) {
@@ -986,45 +1104,43 @@ impl<S: Deref<Target = Store>> Txn<S> {
         })
     }
 
-    /// Run tier 1 on the conflict of `oid`: the transaction read `read`,
-    /// and `committed` is the current record. Return `None` when the class
-    /// of the staged record is not a class of tier 1, or its mode is `Off`.
+    /// Run tier 1 or tier 2 on the conflict of `oid`: the transaction read
+    /// `read`, and `committed` is the current record. Return `None` when the
+    /// class of the staged record is neither a class of tier 1 whose mode
+    /// is not `Off`, nor a class whose entry in the merge policy has tier 2
+    /// on or in shadow mode.
     ///
     /// The class comes from the class pickle of the staged record alone.
-    /// Only a class of tier 1 reads the record at `read`.
-    fn tier1(
+    /// Only a class of one of the tiers reads the record at `read`.
+    fn native(
         &self,
         oid: Oid,
         read: Tid,
         committed: &Record,
+        rules: &Rules<'_>,
     ) -> Result<Option<(merge::Mode, Merge)>> {
-        let rules = &self.store.structural_merges;
         // A staged pickle that does not read back gives no answer: the
         // conflict goes on, and the caller that reads the pickle again
         // reports the error.
         let Ok(Some((_, new))) = self.staged.get(oid) else {
             return Ok(None);
         };
-        let Some(class) = merge::tier1_class(&new) else {
+        let Some(tier) = Tier::of(&new, rules) else {
             return Ok(None);
         };
-        let mode = rules.mode(&class);
-        if mode == merge::Mode::Off {
-            return Ok(None);
-        }
         let Some(old) = self.store.backend.load_serial(oid, read)? else {
             let merge = Merge {
-                class,
+                tier: tier.tier,
+                class: tier.class,
                 outcome: Outcome::Undecided("the record that the transaction read is gone"),
                 keys: Vec::new(),
                 changed: 0,
                 shadow: None,
+                fields: Vec::new(),
             };
-            return Ok(Some((mode, merge)));
+            return Ok(Some((tier.mode, merge)));
         };
-        let merge = merge::tier1(&old, &committed.data, &new, rules.posting_dicts)
-            .expect("a class of tier 1");
-        Ok(Some((mode, merge)))
+        Ok(Some(tier.merge(&old, &committed.data, &new, rules)))
     }
 
     /// Return the transaction size after a merged pickle of `oid` replaces
@@ -1164,6 +1280,76 @@ impl<S: Deref<Target = Store>> Drop for Txn<S> {
             .guardrails
             .transaction_ended(self.began, now, ended);
     }
+}
+
+/// The tier that merges the records of a class, and its mode: tier 1 for
+/// a class of BTrees or `Length`, tier 2 for a class that the merge policy
+/// names.
+struct Tier<'r> {
+    tier: u8,
+    class: String,
+    mode: merge::Mode,
+    /// The entry of the merge policy of a class of tier 2.
+    entry: Option<&'r merge::policy::ClassPolicy>,
+}
+
+impl<'r> Tier<'r> {
+    /// Return the tier of the record `new`, from its class pickle alone, or
+    /// `None` when no tier merges its class or the mode of the tier is
+    /// `Off`.
+    fn of(new: &[u8], rules: &'r Rules<'_>) -> Option<Self> {
+        let tier = if let Some(class) = merge::tier1_class(new) {
+            let mode = rules.tier1_mode(&class);
+            Tier {
+                tier: 1,
+                class,
+                mode,
+                entry: None,
+            }
+        } else {
+            let class = merge::class_name(new)?;
+            let entry = rules.tier2(&class)?;
+            Tier {
+                tier: 2,
+                class,
+                mode: entry.tier2,
+                entry: Some(entry),
+            }
+        };
+        (tier.mode != merge::Mode::Off).then_some(tier)
+    }
+
+    /// Merge the three records of a conflict in this tier: `old` is the
+    /// base, `committed` the committed record and `new` the record that
+    /// goes over it.
+    fn merge(
+        &self,
+        old: &[u8],
+        committed: &[u8],
+        new: &[u8],
+        rules: &Rules<'_>,
+    ) -> (merge::Mode, Merge) {
+        let merge = match self.entry {
+            None => {
+                merge::tier1(old, committed, new, rules.posting_dicts()).expect("a class of tier 1")
+            }
+            Some(entry) => merge::tier2(old, committed, new, &self.class, entry),
+        };
+        (self.mode, merge)
+    }
+}
+
+/// Merge the three records of a conflict through the tiers: `old` is the
+/// base, `committed` the committed record and `new` the record that goes
+/// over it. Return `None` when no tier merges the class of `new`, or the
+/// mode of its tier is `Off`. The vote and the undo both merge with it.
+fn tiers(
+    old: &[u8],
+    committed: &[u8],
+    new: &[u8],
+    rules: &Rules<'_>,
+) -> Option<(merge::Mode, Merge)> {
+    Some(Tier::of(new, rules)?.merge(old, committed, new, rules))
 }
 
 /// Check that a transaction can write `oid`. `Oid(u64::MAX)` is refused

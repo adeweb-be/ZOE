@@ -1,4 +1,7 @@
-<configure xmlns="http://namespaces.zope.org/zope">
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:genericsetup="http://namespaces.zope.org/genericsetup"
+    xmlns:plone="http://namespaces.plone.org/plone">
 
   <!-- Plone loads this file through the plone.autoinclude entry point of
        zoedb. When Zope opened its database, the handler gives
@@ -7,5 +10,65 @@
       for="zope.processlifetime.IDatabaseOpenedWithRoot"
       handler=".uidgenerator.database_opened"
       />
+
+  <include package="plone.behavior" file="meta.zcml" />
+  <include package="Products.GenericSetup" file="meta.zcml" />
+
+  <!-- The opt-in behaviour of the append-only workflow history. Its status
+       adapter gives an object of a type with the behaviour a
+       WorkflowHistory at its next status. -->
+  <plone:behavior
+      name="zoe.plone.history"
+      title="Append-only workflow history"
+      description="Keeps the workflow history in a class whose transitions merge at the vote of the store, so that two transitions of one object do not conflict."
+      provides=".history.IAppendOnlyHistory"
+      />
+  <adapter factory=".status.AppendOnlyWorkflowStatus" />
+
+  <!-- A change of a Dexterity type derives the merge policy again, on a
+       site where a profile with overrides was imported. -->
+  <subscriber
+      for="plone.dexterity.interfaces.IDexterityFTI
+           zope.lifecycleevent.interfaces.IObjectModifiedEvent"
+      handler=".merges.fti_modified"
+      />
+
+  <!-- The profile writes the merge policy of the site into the store, and
+       moves the workflow histories of the objects with the behaviour. -->
+  <genericsetup:registerProfile
+      name="default"
+      title="ZOE"
+      directory="profiles/default"
+      description="Writes the merge policy of the site into the ZOE store, from its Dexterity types, and moves the workflow histories of the objects with the behaviour zoe.plone.history."
+      provides="Products.GenericSetup.interfaces.EXTENSION"
+      />
+  <genericsetup:registerProfile
+      name="uninstall"
+      title="ZOE (uninstall)"
+      directory="profiles/uninstall"
+      description="Removes the behaviour zoe.plone.history from the types and gives each workflow history back as a PersistentMapping."
+      provides="Products.GenericSetup.interfaces.EXTENSION"
+      />
+  <genericsetup:importStep
+      name="zoe.plone.merge_policy"
+      title="ZOE merge policy"
+      description="Derives the merge policy of the site and writes it into the store, when the profile holds zoe-merge-policy.json."
+      handler=".merges.import_merge_policy">
+    <depends name="typeinfo" />
+  </genericsetup:importStep>
+  <genericsetup:importStep
+      name="zoe.plone.history"
+      title="ZOE workflow histories"
+      description="Moves the workflow histories of the objects with the behaviour zoe.plone.history, when the profile holds zoe-plone-history.txt."
+      handler=".history.import_histories">
+    <depends name="typeinfo" />
+  </genericsetup:importStep>
+  <genericsetup:importStep
+      name="zoe.plone.uninstall"
+      title="ZOE uninstall"
+      description="Gives each workflow history back as a PersistentMapping, when the profile holds zoe-plone-uninstall.txt."
+      handler=".history.uninstall">
+    <depends name="typeinfo" />
+  </genericsetup:importStep>
 
 </configure>

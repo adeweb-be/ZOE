@@ -14,8 +14,9 @@
 //!   blob of T, a later transaction changed it, and the undo fails.
 //! - Else the undo is a three-way merge, as in ZODB: the state of T is the
 //!   base, the current state is the committed one, and the state before T
-//!   is the new one. Tier 1 merges a class of BTrees or `Length` in Rust.
-//!   A refusal of tier 1 fails the undo with `Undo`. When no tier gives an
+//!   is the new one. The tiers merge it as the vote merges a conflict:
+//!   tier 1 a class of BTrees or `Length`, tier 2 a class that the merge
+//!   policy names, in Rust. A refusal fails the undo with `Undo`. When no tier gives an
 //!   answer, the undo gives the oid to its caller as an [`UndoConflict`]:
 //!   the in-process storage resolves it in Python, and `zoe serve`, which
 //!   runs no Python, fails the undo.

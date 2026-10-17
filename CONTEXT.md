@@ -99,8 +99,20 @@ One of the three levels that try to resolve a conflict: structural merges, field
 _Avoid_: tier (alone; see Deployment tier)
 
 **Merge policy**:
-A versioned object in the store that says which classes merge field by field and with which strategy per field.
+A versioned object in the store, `root['zoe.merge_policy']`, that says which classes merge field by field and with which strategy per field, and which switches of the structural merges win over the keys of the store.
 _Avoid_: resolver config, merge rules
+
+**Strategy**:
+What tier 2 does with a field that both sides changed to different values: `strict`, `lww`, `max`, `sum`, `union` or `append`.
+_Avoid_: merge function, resolver
+
+**Coupled fields**:
+A group of fields of a class that tier 2 never merges apart: when both sides changed the group, they must agree on each of its fields.
+_Avoid_: linked fields, invariant fields
+
+**Verification**:
+The check of a merge of shadow mode against the resolution of the client: the second vote compares the record that the client stored with the merged record, and the resolution log says whether they are the same.
+_Avoid_: validation, proof
 
 **Shadow mode**:
 A mode where a conflict tier computes its merge and writes it to the resolution log, and the conflict then goes on as without that tier, to show what merging would have done.

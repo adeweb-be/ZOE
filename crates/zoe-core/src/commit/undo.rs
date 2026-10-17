@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use crate::backend::Record;
 use crate::error::{Result, ZoeError};
+use crate::merge::policy::Rules;
 use crate::merge::{self, Outcome, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 use crate::undo::{self, UndoConflict, Undone};
 
-use super::Txn;
+use super::{Txn, tiers};
 
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Stage the undo of the transaction `tid`: for each oid of `tid`, the
@@ -28,11 +29,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///   deletion when `tid` created the object. A blob gets the blob file
     ///   of the state before `tid` by a hard link, so no blob file is
     ///   copied or written again.
-    /// - Else tier 1 merges the three states, with the state of `tid` as
-    ///   the base, the current state as the committed one and the state
-    ///   before `tid` as the new one. The call stages the merged record
-    ///   over the serial of the current state. A refusal of tier 1 fails
-    ///   the call with `Undo`. When no tier gives an answer, the oid goes
+    /// - Else the tiers merge the three states, as the vote merges a
+    ///   conflict (`tiers`), with the state of `tid` as the base, the
+    ///   current state as the committed one and the state before `tid` as
+    ///   the new one: tier 1 for a class of BTrees or `Length`, tier 2 for
+    ///   a class that the merge policy names. The call stages the merged
+    ///   record over the serial of the current state. A refusal fails the
+    ///   call with `Undo`. When no tier gives an answer, the oid goes
     ///   into `conflicts`, and the call stages nothing for it: the caller
     ///   resolves it and stores the result over its serial, or fails.
     /// - An undo of the creation of an object, of a deletion, or of a blob,
@@ -195,14 +198,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(())
     }
 
-    /// Run tier 1 on the undo of `oid` in the transaction `tid`: `undone`
-    /// is the base, `current` the committed state at `serial`, and `before`
-    /// the new state. Stage the merged record over `serial` and return
-    /// true when tier 1 merges in mode `on`. Return false when it gives no
-    /// answer, and fail with `Undo` when it refuses.
+    /// Run the tiers on the undo of `oid` in the transaction `tid`, as the
+    /// vote runs them on a conflict: `undone` is the base, `current` the
+    /// committed state at `serial`, and `before` the new state. Tier 1
+    /// merges a class of BTrees or `Length`, and tier 2 a class that the
+    /// merge policy names. Stage the merged record over `serial` and return
+    /// true when a tier merges in mode `on`. Return false when it gives no
+    /// answer, or runs in mode `shadow`, and fail with `Undo` when it
+    /// refuses.
     ///
     /// The entry of the merge goes to `resolutions`, before the entries of
-    /// the vote.
+    /// the vote. The merge policy is read only for an undo that merges.
     fn merge_undo(
         &mut self,
         oid: Oid,
@@ -212,17 +218,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         current: &[u8],
         before: &[u8],
     ) -> Result<bool> {
-        let rules = &self.store.structural_merges;
-        let Some(class) = merge::tier1_class(before) else {
+        let policy = self.store.merge_policy()?;
+        let rules = Rules {
+            config: &self.store.structural_merges,
+            policy: policy.as_deref(),
+        };
+        let Some((mode, merged)) = tiers(undone, current, before, &rules) else {
             return Ok(false);
         };
-        let mode = rules.mode(&class);
-        if mode == merge::Mode::Off {
-            return Ok(false);
-        }
-        let merged =
-            merge::tier1(undone, current, before, rules.posting_dicts).expect("a class of tier 1");
-        let mut resolution = Resolution::of(oid, mode, &merged, serial, tid);
+        let mut resolution = Resolution::of(oid, mode, rules.version(), &merged, serial, tid);
         resolution.undo = true;
         let staged = match (mode, merged.outcome) {
             (merge::Mode::On, Outcome::Merged(pickle)) => match self.check_size(oid, &pickle) {

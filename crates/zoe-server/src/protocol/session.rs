@@ -1791,10 +1791,21 @@ impl Transaction {
         let jobs = std::mem::take(&mut open.jobs);
         let undos = std::mem::take(&mut open.undos);
         let voted = match &mut open.txn {
-            Ok(txn) if listed > 0 => txn
-                .vote()
-                .map(|()| Voted::default())
-                .map_err(|error| Fault::of_vote(&error, txn)),
+            Ok(txn) if listed > 0 => {
+                let voted = txn
+                    .vote()
+                    .map(|()| Voted::default())
+                    .map_err(|error| Fault::of_vote(&error, txn));
+                // The second vote compares the merges of shadow mode with
+                // the records of the client: log and count what it found.
+                storage.metrics.count_verifications(txn.verifications());
+                if let Some(log) = &storage.resolution_log
+                    && !txn.verifications().is_empty()
+                {
+                    log.write(&txn.verification_log_lines(SystemTime::now(), Some(&storage.name)));
+                }
+                voted
+            }
             Ok(txn) => {
                 let voted = undo(txn, &undos).and_then(|(undone, seen)| {
                     attach(txn, jobs)?;
@@ -3274,7 +3285,7 @@ mod tests {
         );
         let metrics = &s.storage.metrics;
         assert_eq!(get_counter(&metrics.conflicts_native), 1);
-        assert_eq!(get_counter(&metrics.structural_merges[0][0]), 1);
+        assert_eq!(get_counter(&metrics.structural_merges[0][0][0]), 1);
         // The client resolved nothing.
         let status = s.storage.status().to_value();
         assert_eq!(count(&status, "conflicts_resolved"), 0);
