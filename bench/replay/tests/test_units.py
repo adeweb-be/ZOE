@@ -1,0 +1,140 @@
+"""Unit tests of the replay: the items that a transaction applies to what it
+read, and the starts that the probe records give."""
+
+import json
+import time
+
+import pytest
+import transaction
+import ZODB
+from BTrees.IIBTree import IISet, IITreeSet
+from BTrees.IOBTree import IOBucket
+from BTrees.Length import Length
+from BTrees.OOBTree import OOBTree
+from persistent.mapping import PersistentMapping
+from ZODB.FileStorage import FileStorage
+from ZODB.TimeStamp import TimeStamp
+
+from replay import log, runner
+
+
+def test_a_bucket_takes_the_items_that_the_transaction_changed():
+    old = IOBucket({1: {7: 1}, 2: "a", 3: "c"}).__getstate__()
+    # Another transaction added 4 and changed 2 before this one committed.
+    read = IOBucket({1: {7: 1}, 2: "b", 3: "c", 4: "d"}).__getstate__()
+    # This one changed the dict of 1, deleted 3 and added 5.
+    own = IOBucket({1: {7: 1, 8: 2}, 2: "a", 5: "e"}).__getstate__()
+    state = runner.apply_items(IOBucket, old, read, own)
+    merged = IOBucket()
+    merged.__setstate__(state)
+    assert dict(merged.items()) == {1: {7: 1, 8: 2}, 2: "b", 4: "d", 5: "e"}
+
+
+def test_a_set_and_a_tree_of_one_bucket_take_the_items_too():
+    state = runner.apply_items(
+        IISet,
+        IISet([1, 2]).__getstate__(),
+        IISet([1, 2, 3]).__getstate__(),
+        IISet([2, 4]).__getstate__(),
+    )
+    merged = IISet()
+    merged.__setstate__(state)
+    assert list(merged) == [2, 3, 4]
+    state = runner.apply_items(
+        OOBTree,
+        OOBTree({"a": 1}).__getstate__(),
+        OOBTree({"a": 1, "b": 2}).__getstate__(),
+        OOBTree({"a": 1, "c": 3}).__getstate__(),
+    )
+    tree = OOBTree()
+    tree.__setstate__(state)
+    assert dict(tree.items()) == {"a": 1, "b": 2, "c": 3}
+    state = runner.apply_items(
+        IITreeSet,
+        None,
+        IITreeSet([5]).__getstate__(),
+        IITreeSet([6]).__getstate__(),
+    )
+    tree_set = IITreeSet()
+    tree_set.__setstate__(state)
+    assert list(tree_set) == [5, 6]
+
+
+def test_other_classes_and_trees_of_many_buckets_raise_value_error():
+    with pytest.raises(ValueError):
+        runner.apply_items(Length, 1, 2, 3)
+    with pytest.raises(ValueError):
+        runner.apply_items(PersistentMapping, {}, {}, {})
+    big = OOBTree({f"k{i:03}": i for i in range(200)})
+    db = ZODB.DB(None)
+    with db.transaction() as conn:
+        # The buckets of a tree of many buckets need oids for its state.
+        conn.root()["big"] = big
+        state = big.__getstate__()
+        with pytest.raises(ValueError):
+            runner.apply_items(OOBTree, state, state, state)
+    db.close()
+
+
+def tids(path, count):
+    """Commit `count` transactions to a new FileStorage at path. Return the
+    commit time of the creation of the root, then the tid and the commit
+    time of each transaction."""
+    db = ZODB.DB(FileStorage(str(path)))
+    manager = transaction.TransactionManager()
+    conn = db.open(manager)
+    for i in range(count):
+        # The commits are apart, so a start between two of them is clear.
+        time.sleep(0.05)
+        conn.root()["n"] = i
+        manager.commit()
+    db.close()
+    storage = FileStorage(str(path), read_only=True)
+    found = [txn.tid for txn in storage.iterator()]
+    storage.close()
+    times = [TimeStamp(tid).timeTime() for tid in found]
+    return times[0], list(zip(found[1:], times[1:], strict=True))
+
+
+def test_each_tid_starts_at_the_last_attempt_of_the_request_that_ends_first(tmp_path):
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
+    # The first request starts after the creation of the root, which stays
+    # in the base.
+    t1 = (root + c1) / 2
+    probes = tmp_path / "instance0.jsonl"
+    records = [
+        # The request of the first tid: one attempt, it ends just after it.
+        {"kind": "request", "t": t1, "seconds": c1 - t1 + 0.001, "finishes": 1},
+        # A request that commits nothing.
+        {"kind": "request", "t": t1, "seconds": 0.0001, "finishes": 0},
+        # The request of the second tid: two attempts.
+        {
+            "kind": "request",
+            "t": t1,
+            "seconds": c2 - t1 + 0.002,
+            "attempts": 2,
+            "finishes": 1,
+        },
+        {"kind": "snapshot", "t": c2},
+    ]
+    probes.write_text("".join(json.dumps(r) + "\n" for r in records))
+    starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
+    assert matched == {"matched": 2, "unmatched": 0, "requests": 2}
+    assert starts[first] == pytest.approx(t1, abs=1e-6)
+    # The last attempt takes half the time of the request, and ends with it.
+    end = c2 + 0.002
+    assert starts[second] == pytest.approx(end - (end - t1) / 2, abs=1e-6)
+    found = log.read_log(tmp_path / "Data.fs", starts)
+    assert [t.tid for t in found.transactions] == [first, second]
+    assert len(found.base) == 1
+
+
+def test_a_tid_that_no_request_explains_starts_at_its_commit(tmp_path):
+    root, [(_first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    probes = tmp_path / "instance0.jsonl"
+    request = {"kind": "request", "t": t1, "seconds": c1 - t1 + 0.0001, "finishes": 1}
+    probes.write_text(json.dumps(request) + "\n")
+    starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
+    assert matched == {"matched": 1, "unmatched": 1, "requests": 1}
+    assert starts[second] == pytest.approx(c2)

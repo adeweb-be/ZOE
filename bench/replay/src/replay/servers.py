@@ -14,6 +14,21 @@ from pathlib import Path
 
 # The longest time that a server takes to listen, in seconds.
 TIMEOUT = 30
+# The program of the ZEO server process. In the interpreter of a Plone
+# instance, eggs share namespace packages such as `zc`. pkg_resources
+# declares them when it loads, so the program loads it first when it can.
+RUNZEO = """\
+import runpy
+import warnings
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        import pkg_resources  # noqa: F401
+    except ImportError:
+        pass
+runpy.run_module("ZEO.runzeo", run_name="__main__", alter_sys=True)
+"""
 
 
 def child_environment() -> dict[str, str]:
@@ -51,13 +66,13 @@ def zeo_server(directory: Path) -> Iterator[tuple[str, int]]:
         server = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "ZEO.runzeo",
+                "-c",
+                RUNZEO,
                 "-a",
                 f"127.0.0.1:{port}",
                 "-f",
                 str(directory / "Data.fs"),
-            ],  # fmt: skip
+            ],
             stdout=out,
             stderr=subprocess.STDOUT,
             env=child_environment(),

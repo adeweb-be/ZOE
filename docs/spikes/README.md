@@ -11,6 +11,7 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 | [phase3-budget.md](phase3-budget.md) | What bounds each cell of the 3× gate of phase 3, and which cells can no card move? |
 | [performance-levers.md](performance-levers.md) | Where does the core spend its time on a load and a commit, which terms are waste, and what does each lever give? |
 | [write-log.md](write-log.md) | Does a write-ahead log with a background checkpoint buy enough of the commit rows to pay for its complexity, and what does it cost on the reads, at recovery and in the rest of the store? |
+| [log-replay.md](log-replay.md) | How does the replay rebuild the concurrency of a B5 run from its kept store and its probe records, and does it on one run? |
 | [pickle-round-trip.md](pickle-round-trip.md) | Can zoe-pickle decode a ZODB record into a tree and encode it back to the same bytes, and which constructs must stay opaque? |
 | [record-store.md](record-store.md) | Does redb or an append-only log with an in-memory index write fewer bytes and fewer fsyncs per commit, and which redb commit setting should the store use? |
 | [zeo-wire.md](zeo-wire.md) | What do a stock ZEO 6 server and an unmodified `ZEO.ClientStorage` send each other over msgpack, and where does the specification differ? |

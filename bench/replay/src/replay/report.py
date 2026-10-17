@@ -48,6 +48,9 @@ def lines(result: dict) -> list[str]:
         out.append(row)
     out.append("")
     out.append("conflicts per 1,000 transactions, over the runs that count")
+    out.append(
+        "(a vote that fails hides the conflicts that it resolved before its refusal)"
+    )
     for stack in STACKS:
         runs = [r for r in result["runs"] if r["stack"] == stack and r["counts"]]
         if not runs:

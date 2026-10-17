@@ -74,8 +74,10 @@ def rebase(record: Record, read: bytes | None) -> bytes:
     oid has no record before it, it is its own record. Else the
     `_p_resolveConflict` of the class applies the change, with the record
     before it as the old state, the state that it read as the committed
-    state and its own record as the new state. When that fails, it is its
-    own record.
+    state and its own record as the new state. When that refuses, and the
+    class is a bucket, a set or a BTree of one bucket of BTrees, the items
+    that the transaction added, changed or deleted go into the items that
+    it read (`apply_items`). When that fails too, it is its own record.
     """
     if record.previous is None or read is None or read == record.previous:
         return record.data
@@ -112,12 +114,62 @@ def _resolve(old: bytes, committed: bytes, new: bytes) -> bytes:
         other.load()
         return other.load()
 
-    resolved = resolve(state(old), state(committed), new_state)
+    states = state(old), state(committed), new_state
+    try:
+        resolved = resolve(*states)
+    except Exception:
+        resolved = apply_items(klass, *states)
     out = BytesIO()
     pickler = PersistentPickler(persistent_id, out, _protocol)
     pickler.dump(meta)
     pickler.dump(resolved)
     return out.getvalue()
+
+
+def apply_items(klass, old, read, own):
+    """Return the state `read` of a bucket, a set or a BTree of one bucket
+    of BTrees, with the items that `own` added, changed or deleted against
+    `old`. Raise `ValueError` for another class or another shape."""
+    name = klass.__name__
+    if not klass.__module__.startswith("BTrees.") or not name.endswith(
+        ("Bucket", "BTree", "Set")
+    ):
+        raise ValueError(f"no items to apply in {name}")
+    mapping = name.endswith(("Bucket", "BTree"))
+    tree = name.endswith(("BTree", "TreeSet"))
+
+    def unwrap(state):
+        """Return the flat items and the next bucket of a state."""
+        if state is None:
+            return (), None
+        if tree:
+            # A BTree of one bucket holds the state of the bucket inline.
+            if len(state) != 1 or len(state[0]) != 1:
+                raise ValueError("a BTree of more than one bucket")
+            state = state[0][0]
+        return state[0], state[1] if len(state) > 1 else None
+
+    def items(flat):
+        if mapping:
+            return dict(zip(flat[::2], flat[1::2], strict=True))
+        return dict.fromkeys(flat)
+
+    old_items, _ = unwrap(old)
+    read_flat, read_next = unwrap(read)
+    own_items, _ = unwrap(own)
+    before, merged, after = items(old_items), items(read_flat), items(own_items)
+    for key in before.keys() - after.keys():
+        merged.pop(key, None)
+    for key, value in after.items():
+        if key not in before or before[key] != value:
+            merged[key] = value
+    flat = []
+    for key in sorted(merged):
+        flat.append(key)
+        if mapping:
+            flat.append(merged[key])
+    state = (tuple(flat),) if read_next is None else (tuple(flat), read_next)
+    return ((state,),) if tree else state
 
 
 def copy_base(storage, base: list[Transaction]) -> None:
