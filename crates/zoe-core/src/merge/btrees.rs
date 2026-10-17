@@ -32,7 +32,13 @@ pub(super) fn merge(
     // as it does without the rule.
     if posting_dicts == Mode::Shadow && dicts {
         merge.shadow = Some(outcome);
-        return merge_once(trees, class, false, merge).0;
+        // The merge without the rule can stop at the first dict, so the
+        // keys of the line are those of the merge of the rule.
+        let (keys, changed) = (std::mem::take(&mut merge.keys), merge.changed);
+        let outcome = merge_once(trees, class, false, merge).0;
+        merge.keys = keys;
+        merge.changed = changed;
+        return outcome;
     }
     outcome
 }

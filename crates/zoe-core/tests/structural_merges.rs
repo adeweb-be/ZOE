@@ -290,6 +290,9 @@ fn the_posting_rule_in_shadow_mode_logs_its_merge_and_goes_on_without_it() {
     assert!(matches!(resolution.outcome, Resolved::Undecided(_)));
     assert!(!resolution.applied);
     assert_eq!(resolution.shadow, Some(Resolved::Merged));
+    // The line lists the keys of the merge of the rule.
+    assert_eq!(resolution.keys, ["10"]);
+    assert_eq!(resolution.changed, 1);
     let time = std::time::UNIX_EPOCH;
     let line = &txn.resolution_log_lines(time, None)[0];
     assert!(

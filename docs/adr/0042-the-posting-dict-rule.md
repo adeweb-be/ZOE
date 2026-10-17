@@ -56,7 +56,7 @@ A Plone site sets the key in its `<zoe>` stanza or in the configuration of its s
 
 ### The resolution log
 
-Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) writes one line of JSON to the resolution log: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason (the code and the message of BTrees, or of the rule), the outcome of the posting-dict rule in shadow mode, whether the outcome was the outcome of the vote, the keys that the new transaction changed (at most 20, each cut at 80 characters, and their number), the committed and the read serial, and the user and the description of both transactions.
+Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) writes one line of JSON to the resolution log: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason (the code and the message of BTrees, or of the rule), the outcome of the posting-dict rule in shadow mode, whether the outcome was the outcome of the vote, the keys that the new transaction changed (at most 20, each cut at 80 characters, and their number; with the rule in shadow mode, the keys of the merge of the rule), the committed and the read serial, and the user and the description of both transactions.
 
 - `resolution-log FILE`: in-process the key of `<zoe>` (`ZOE_RESOLUTION_LOG`, the query of `zoe://`, the argument `resolution_log` of `zoe.Storage`); for `zoe serve` the option `--resolution-log` (`ZOE_RESOLUTION_LOG`, the key `resolution-log` of the configuration file and of `<zoe-server>`). Without it, no line is written.
 - The file is opened in append mode and each line is written whole; it is never synced. It is not in the store, and pack never reads it.

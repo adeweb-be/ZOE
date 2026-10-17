@@ -196,7 +196,9 @@ pub struct Merge {
     /// The outcome.
     pub outcome: Outcome,
     /// The keys that the new record changed, inserted or deleted, as text,
-    /// in key order. At most [`MAX_KEYS`]; `changed` counts them all.
+    /// in key order. At most [`MAX_KEYS`]; `changed` counts them all. With
+    /// the posting-dict rule in shadow mode, they are the keys of the merge
+    /// of the rule.
     pub keys: Vec<String>,
     /// The number of keys that the new record changed, inserted or
     /// deleted.
