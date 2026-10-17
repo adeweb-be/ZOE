@@ -465,9 +465,10 @@ fn a_durable_key_survives_a_reopen_and_a_crash() {
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.kv_set(Flavour::Durable, "registry", b"later", b"x", None)
             .unwrap();
-        // The store reads the system clock, and a slow run (ThreadSanitizer)
-        // can check the crash images for more than a minute. A day is a
-        // TTL that no run outlasts, so the key never expires in this test.
+        // The store reads the system clock. A slow run, such as under
+        // ThreadSanitizer, can check the crash images for more than a
+        // minute. No run lasts a day, so the key does not expire in this
+        // test.
         txn.kv_set(Flavour::Ephemeral, "sessions", b"later", b"x", Some(DAY))
             .unwrap();
         txn.vote().unwrap();
