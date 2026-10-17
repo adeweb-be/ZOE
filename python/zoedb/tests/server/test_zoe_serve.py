@@ -229,13 +229,17 @@ def test_the_configuration_file_has_no_name_on_disk(tmp_path, monkeypatch, memor
     descriptor, path = serve.config_file(text)
     try:
         assert os.get_inheritable(descriptor)
+        if memory_file:
+            assert path == f"/proc/self/fd/{descriptor}"
+        else:
+            assert path == f"/dev/fd/{descriptor}"
+            assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
+            # On macOS an open of the path reads from this offset.
+            assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
         # zoe serve opens the path and reads the whole file.
         with open(path) as file:
             assert file.read() == text
         assert list(tmp_path.iterdir()) == []
-        if not hasattr(os, "memfd_create"):
-            assert path == f"/dev/fd/{descriptor}"
-            assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
     finally:
         os.close(descriptor)
 

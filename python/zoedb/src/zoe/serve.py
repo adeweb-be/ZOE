@@ -272,7 +272,13 @@ def main(argv=None):
         )
         return FAILURE
     # The file stays open in zoe serve, which reads it through `path`.
-    descriptor, path = config_file(text)
+    try:
+        descriptor, path = config_file(text)
+    except OSError as error:
+        print(
+            f"{parser.prog}: cannot write the configuration: {error}", file=sys.stderr
+        )
+        return FAILURE
     command = [binary, "serve", "--config", path]
     sys.stdout.flush()
     sys.stderr.flush()
