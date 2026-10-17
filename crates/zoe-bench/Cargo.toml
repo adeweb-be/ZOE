@@ -14,8 +14,9 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# The clients and the runtime of `load` and `saturate`.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+# The clients and the runtime of `load`, `saturate` and `hot`; `hot` reads
+# the metrics of the admin port over a socket.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util"] }
 zoe-client.workspace = true
 zoe-core.workspace = true
 
