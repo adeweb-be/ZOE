@@ -1,6 +1,6 @@
 # 0045. Early write-intent locks: the lock before the read of a declared hot object
 
-Status: proposed. A checkpoint of ZOE-204 (step 4): it adds the extension `lock_intent` to the wire protocol, the key `early-lock-classes` and a public Python API, and it changes the design of section 9 (lever 3) and section 5 ("Early write-intent locks"). The spike of step 1 (`docs/spikes/early-lock-hook.md`) left twelve questions without a proposal. The human asked Claude to settle them and to mark each answer as its own choice, for review: each answer below says so. Nothing of step 4 is built before the human approves this ADR.
+Status: accepted. A checkpoint of ZOE-204 (step 4): it adds the extension `lock_intent` to the wire protocol, the key `early-lock-classes` and a public Python API, and it changes the design of section 9 (lever 3) and section 5 ("Early write-intent locks"). The spike of step 1 (`docs/spikes/early-lock-hook.md`) left twelve questions without a proposal. Claude settled them, and the human approved this ADR as written, with the change of the helper `test_hot_objects.database()` of section 10. Each answer below says that it was Claude's choice.
 
 ## Context
 
@@ -18,7 +18,7 @@ The acceptance tests are `python/zoedb/tests/acceptance/test_hot_objects.py` and
 
 ### 1. The lock before the read (questions 1 and 2)
 
-*Claude's choice, for review.* The acceptance test counts every `ConflictError` that an attempt raises, not only the ones that the retries of Zope leave: the writers of `test_hot_objects.py` never retry. Only the lock before the read meets that reading; it meets the other one too.
+*Claude's choice, approved by the human.* The acceptance test counts every `ConflictError` that an attempt raises, not only the ones that the retries of Zope leave: the writers of `test_hot_objects.py` never retry. Only the lock before the read meets that reading; it meets the other one too.
 
 With early locks on, an object of a class that the configuration declares hot (section 2) takes its intent lock when its state loads, before the transaction sees any byte of it:
 
@@ -35,7 +35,7 @@ Fail fast, and fail fast with the lock kept for the retry, are not built: the fi
 
 ### 2. The hot classes (questions 2 and 9)
 
-*Claude's choice, for review.* The client takes intent locks only for the classes that the key `early-lock-classes` names, by `module.name`, the class that ZODB pickles (`type(obj)`). The key is a list in `<zoe>` and in `<zoeclient>`, empty by default. `early-locks on` with an empty list takes no intent lock.
+*Claude's choice, approved by the human.* The client takes intent locks only for the classes that the key `early-lock-classes` names, by `module.name`, the class that ZODB pickles (`type(obj)`). The key is a list in `<zoe>` and in `<zoeclient>`, empty by default. `early-locks on` with an empty list takes no intent lock.
 
 - A class of tier 1 in the list fails the open with `ValueError`: tier 1 and the lock hand-off serve it, and a lock before each read would only make its readers wait.
 - A subclass is not hot unless the list names it, as tier 1 does.
@@ -45,7 +45,7 @@ Fail fast, and fail fast with the lock kept for the retry, are not built: the fi
 
 ### 3. The owner of the intent locks (question 3)
 
-*Claude's choice, for review.* An intent owner holds the intent locks before `tpc_begin`. The session owns them on the server (option A1 of the spike), and the wire methods keep the form of the specification. On the client, the owner is the storage object by default, or the owner that a connection names.
+*Claude's choice, approved by the human.* An intent owner holds the intent locks before `tpc_begin`. The session owns them on the server (option A1 of the spike), and the wire methods keep the form of the specification. On the client, the owner is the storage object by default, or the owner that a connection names.
 
 - `lock_intent(oids)` takes the exclusive intent lock of each oid of `oids`, in oid order, and returns when the server holds them all for the session. `unlock_intent()` releases every intent lock of the session. Both are methods of the extension `lock_intent`: a connection that did not declare it in `register` gets `ValueError`, as for `sequences`.
 - `tpc_begin` of the session adopts the intent locks of the session: the vote of that transaction counts them as its own, and `tpc_finish`, `tpc_abort` and the end of the connection release them.
@@ -57,7 +57,7 @@ The intent locks are advisory: the vote still takes its locks and checks every s
 
 ### 4. The order of the locks (question 4)
 
-*Claude's choice, for review.* The rule of the specification stays: intent locks come in oid order.
+*Claude's choice, approved by the human.* The rule of the specification stays: intent locks come in oid order.
 
 - A `lock_intent` of an oid below an intent lock that the session holds fails with `LockOrder` at once, also when the lock is free, and takes nothing. The client gets `StorageTransactionError`, the exception of ZODB to which the specification maps `LockOrder`. The caller releases its set and asks again for the whole set in oid order.
 - Intent locks before the read come in the order of the loads. So `LockingConnection` turns a `LockOrder` into `ConflictError`, which ends the attempt, and keeps the hot oids of the attempt. The next attempt of the connection takes them all in one `lock_intent`, in oid order, at its first load of a hot object.
@@ -68,29 +68,29 @@ The lock hand-off (ADR 0044) goes only to the vote of a transaction, never to a 
 
 ### 5. Where a wait runs, and how long a hold lasts (questions 5 and 6)
 
-*Claude's choice, for review.*
+*Claude's choice, approved by the human.*
 
 - In `zoe serve`, a `lock_intent` runs on the thread of the transaction of the session, which starts at the first `lock_intent` of a transaction, as it starts at `tpc_begin` today. It never runs on the read pool, so its wait holds no thread that the loads of other connections share. A `LockCancel` ends its wait when the connection ends, as for a vote.
 - A session that holds intent locks without a `tpc_begin` for 60 s loses them: the server releases them and logs one WARN event with the oids and the label of the client. The bound is fixed, with no option. Because the locks are advisory, the drop changes no outcome but the chance of a conflict.
 
 ### 6. No batch (question 7)
 
-*Claude's choice, for review.* A lock before the read must be granted before the load returns, so there is no batch of 50 ms: `setstate` sends one `lock_intent` for the object that it loads, at once, and waits for it. The hot classes are few, so a transaction sends few calls. The retry after a `LockOrder` sends the hot oids of the failed attempt in one call.
+*Claude's choice, approved by the human.* A lock before the read must be granted before the load returns, so there is no batch of 50 ms: `setstate` sends one `lock_intent` for the object that it loads, at once, and waits for it. The hot classes are few, so a transaction sends few calls. The retry after a `LockOrder` sends the hot oids of the failed attempt in one call.
 
 ### 7. How `early-locks on` selects the connection class (question 8)
 
-*Claude's choice, for review.* A patch of the class (option D1 of the spike). When a storage with `early-locks on` and a non-empty `early-lock-classes` opens, `zoe.zodb` installs its methods on `ZODB.Connection.Connection` once per process: `setstate`, `newTransaction`, `tpc_begin`, `tpc_finish`, `tpc_abort` and `abort`. Each patched method checks `self._db.storage` first, and does exactly what ZODB does for a storage without early locks. So it works in `<zoe>`, in `<zoeclient>`, under Zope and under a plain `<zodb>`, and it leaves no stock connection in a pool. `zoe.zodb.LockingConnection` is the same methods as a subclass, for a program that makes its `DB` itself. The patch reads `_p_oid`, `_p_serial`, `type(obj)`, `_db.storage` and `_storage`, and no other internal of ZODB.
+*Claude's choice, approved by the human.* A patch of the class (option D1 of the spike). When a storage with `early-locks on` and a non-empty `early-lock-classes` opens, `zoe.zodb` installs its methods on `ZODB.Connection.Connection` once per process: `setstate`, `newTransaction`, `tpc_begin`, `tpc_finish`, `tpc_abort` and `abort`. Each patched method checks `self._db.storage` first, and does exactly what ZODB does for a storage without early locks. So it works in `<zoe>`, in `<zoeclient>`, under Zope and under a plain `<zodb>`, and it leaves no stock connection in a pool. `zoe.zodb.LockingConnection` is the same methods as a subclass, for a program that makes its `DB` itself. The patch reads `_p_oid`, `_p_serial`, `type(obj)`, `_db.storage` and `_storage`, and no other internal of ZODB.
 
 ### 8. `native false` and `readCurrent` (questions 10 and 11)
 
-*Claude's choice, for review.*
+*Claude's choice, approved by the human.*
 
 - `early-locks on` with `native false` in `<zoeclient>` fails the open with `ValueError`: `ZEO.ClientStorage` has one session and one commit lock for every thread of the process, so the intent locks of one thread would belong to all of them, and a deadlock would end only at `lock-timeout`.
 - `readCurrent` takes its shared lock at the vote, as now. A hot object is locked at its load already, and a shared intent lock of every node that a BTree passes would make the readers of a tree wait.
 
 ### 9. The versions of ZODB (question 12)
 
-*Claude's choice, for review.* The patch is tested on the versions of ZODB that the lock files of the repository install (6.2 to 6.4 today). The spike found `Connection.py` the same in these three versions. ZODB 6.0 and 6.1 stay supported targets, as for the rest of ZOE, without a test of their own until a lock file installs them.
+*Claude's choice, approved by the human.* The patch is tested on the versions of ZODB that the lock files of the repository install (6.2 to 6.4 today). The spike found `Connection.py` the same in these three versions. ZODB 6.0 and 6.1 stay supported targets, as for the rest of ZOE, without a test of their own until a lock file installs them.
 
 ### 10. The helpers of the acceptance tests
 
@@ -98,7 +98,7 @@ The planner left four helpers to this ADR. With the decisions above:
 
 - `test_early_locks.Client.lock` and `Client.release` stay as they are: `self.storage.lock_intent(list(oids))` and `self.storage.unlock_intent()`, with the default owner of the storage (section 3).
 - `test_early_locks.lock_order()` stays as it is: `StorageTransactionError` (section 4).
-- `test_hot_objects.database()` adds the hot class of the test with `early-locks on`. The hot object of the test is a `PersistentMapping`, which tier 1 does not merge. The change, for the approval of the human:
+- `test_hot_objects.database()` adds the hot class of the test with `early-locks on`. The hot object of the test is a `PersistentMapping`, which tier 1 does not merge. The human approved the change:
 
 ```python
     lines = section.strip().splitlines()
@@ -109,6 +109,8 @@ The planner left four helpers to this ADR. With the decisions above:
 ```
 
 The root of the database is a `PersistentMapping` too, so the writers of that test also lock the root at its load. The test of the hot `Length` passes `early-locks on` with no hot class of its own: `Length` is a class of tier 1, and the lock hand-off serves it.
+
+- The human also approved a second change of `test_hot_objects.py`: the test of the hot `Length` runs on Linux only, with a reason. On macOS a sync is `fsync(2)` (ADR 0040), which is faster than one round trip of a client, so the commits of the hot oid never wait in one batch, with or without the hand-off. Linux CI gives its evidence; the simulator gives the evidence of the mechanism (`crates/zoe-server/tests/simulated_hot_length.rs`).
 
 ### 11. What the build adds
 
