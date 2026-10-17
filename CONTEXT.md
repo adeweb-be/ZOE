@@ -86,6 +86,14 @@ _Avoid_: import, replay
 A lock that one transaction holds on one oid during a commit; exclusive for a write, shared for a read-current check.
 _Avoid_: row lock, commit lock
 
+**Lock hand-off**:
+The pass of a per-OID lock from a commit whose finish started to the vote at the head of the queue of the oid, with a copy of the staged record of the holder; the vote merges onto that record, and its commit comes after the commit of the holder.
+_Avoid_: lock transfer, lock steal
+
+**Commit in flight**:
+A commit whose finish started and that is not durable or failed yet; its staged records are final.
+_Avoid_: pending commit
+
 **Intent lock**:
 An exclusive per-OID lock that a client asks for when a transaction first changes an object, before the vote.
 _Avoid_: early lock, pessimistic lock
