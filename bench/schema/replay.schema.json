@@ -16,14 +16,14 @@
       "required": ["commit", "dirty", "zoe", "zoe_version", "zoe_sha256", "zoe_serve_args", "zoedb", "zoe_package", "python", "machine"],
       "properties": {
         "commit": { "description": "The commit of the repository, or null outside a checkout.", "type": ["string", "null"] },
-        "dirty": { "description": "True when the tree of the repository held changes that the commit does not; null when git does not tell.", "type": ["boolean", "null"] },
+        "dirty": { "description": "True when the tree of the repository held changes that the commit does not; null when git fails.", "type": ["boolean", "null"] },
         "zoe": { "description": "The path of the zoe binary that zoe serve runs.", "type": "string" },
         "zoe_sha256": { "description": "The sha256 of the zoe binary, or null when it does not read.", "type": ["string", "null"] },
         "zoe_version": { "description": "The output of zoe --version, or null when it does not run.", "type": ["string", "null"] },
         "zoe_serve_args": { "description": "The arguments that zoe serve gets after its own.", "type": "array", "items": { "type": "string" } },
         "zoedb": { "description": "The version of the package zoedb that the replay imports, or null.", "type": ["string", "null"] },
         "zoe_package": { "description": "The directory of the package zoe that the native client runs, or null.", "type": ["string", "null"] },
-        "zoe_extension_sha256": { "description": "The sha256 of the extension of the package zoe, or null.", "type": ["string", "null"] },
+        "zoe_extension_sha256": { "description": "The sha256 of the extension zoe._zoe that the interpreter loaded, or null.", "type": ["string", "null"] },
         "python": { "description": "The version of Python of the replay.", "type": "string" },
         "machine": { "description": "The system and the machine.", "type": "string" }
       }

@@ -399,8 +399,8 @@ def run(
     store under `workdir`. `serve_args` go to `zoe serve` after its own
     arguments. Return the result. It records the software before the
     first run, and again under `software_after` when it differs at the
-    end. Raise `ValueError` for a speed that is
-    not positive or that comes twice.
+    end. Raise `ValueError` for a speed that is not positive or that comes
+    twice.
     """
     if any(speed <= 0 for speed in speeds) or len(set(speeds)) != len(speeds):
         raise ValueError(f"the speeds must be positive and distinct: {speeds}")
@@ -421,7 +421,7 @@ def run(
         "speeds": list(speeds),
         "runs": runs,
     }
-    # A build or a change of the tree during the runs leaves a trace.
+    # Record the software again when it changed during the runs.
     after = servers.software(serve_args)
     if after != software:
         result["software_after"] = after

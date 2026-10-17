@@ -1,7 +1,10 @@
 """Unit tests of the replay: the items that a transaction applies to what it
 read, and the starts that the probe records give."""
 
+import hashlib
 import json
+import subprocess
+import sys
 import time
 
 import pytest
@@ -17,7 +20,7 @@ from ZODB.FileStorage import FileStorage
 from ZODB.TimeStamp import TimeStamp
 
 from replay import __main__ as command
-from replay import log, runner
+from replay import log, report, runner, servers
 from replay.gate import gate
 
 
@@ -206,3 +209,38 @@ def test_the_next_transaction_of_a_request_starts_at_its_previous_commit(tmp_pat
     assert matched == {"matched": 2, "unmatched": 0, "requests": 1}
     assert starts[first] == pytest.approx(t1, abs=1e-6)
     assert starts[second] == pytest.approx(c1, abs=1e-6)
+
+
+def test_the_software_is_unknown_when_git_and_zoe_fail(monkeypatch):
+    def fails(*args, **kwargs):
+        raise subprocess.CalledProcessError(128, args[0])
+
+    monkeypatch.setattr(servers.subprocess, "run", fails)
+    # An import of a module that sys.modules holds as None raises.
+    monkeypatch.setitem(sys.modules, "zoe", None)
+    monkeypatch.setitem(sys.modules, "zoe._zoe", None)
+    found = servers.software()
+    assert (found["commit"], found["dirty"], found["zoe_version"]) == (None, None, None)
+    assert (found["zoe_package"], found["zoe_extension_sha256"]) == (None, None)
+
+
+def test_the_extension_is_the_one_that_the_interpreter_loaded():
+    extension = pytest.importorskip("zoe._zoe")
+    digest = hashlib.sha256(open(extension.__file__, "rb").read()).hexdigest()
+    assert servers.software()["zoe_extension_sha256"] == digest
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_a_result_records_the_software_again_when_it_changed(
+    tmp_path, monkeypatch, changed
+):
+    before = servers.software()
+    after = dict(before, dirty=not before["dirty"]) if changed else dict(before)
+    reads = iter([before, after])
+    monkeypatch.setattr(servers, "software", lambda serve_args=(): next(reads))
+    result = runner.run(log.Log([], []), workdir=tmp_path, stacks=(), speeds=(1,))
+    assert result["software"] == before
+    assert result.get("software_after") == (after if changed else None)
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(result))
+    assert report.load(path) == result
