@@ -112,6 +112,33 @@ def test_pack_gc_false_goes_to_the_file_and_to_its_table(tmp_path):
     assert "pack-gc" not in config["storages"]["main"]
 
 
+def test_the_structural_merges_go_to_the_file_and_to_their_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    found = section(
+        tmp_path,
+        "structural-merges shadow",
+        "structural-merge-class BTrees.IOBTree.IOBucket on",
+        "structural-merge-class BTrees.Length.Length off",
+        "merge-posting-dicts on",
+        "resolution-log ~/merges.log",
+    )
+    assert tomllib.loads(serve.toml(found)) == {
+        "structural-merges": "shadow",
+        "merge-posting-dicts": True,
+        "resolution-log": str(tmp_path / "merges.log"),
+        "structural-merge-classes": {
+            "BTrees.IOBTree.IOBucket": "on",
+            "BTrees.Length.Length": "off",
+        },
+    }
+    environ = {
+        "ZOE_STRUCTURAL_MERGE_CLASSES": "A.B=on",
+        "ZOE_MERGE_POSTING_DICTS": "false",
+        "ZOE_LISTEN": "127.0.0.1:1",
+    }
+    assert serve.environment(found, environ) == {"ZOE_LISTEN": "127.0.0.1:1"}
+
+
 def test_an_empty_key_counts_as_not_set(tmp_path):
     found = section(tmp_path, "listen", "path /var/zoe")
     assert serve.settings(found) == {"path": "/var/zoe"}

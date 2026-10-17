@@ -63,9 +63,13 @@ KEYS = (
     "tls-client-ca",
     "tls-read-only-client-ca",
     "structural-merges",
+    "structural-merge-class",
     "merge-posting-dicts",
     "resolution-log",
 )
+
+# The keys that come once for each value. They go to tables of the file.
+MULTIKEYS = ("structural-merge-class",)
 
 # The keys whose value is a boolean.
 BOOLEANS = ("read-only", "pack-gc", "shared-blob-dir", "merge-posting-dicts")
@@ -126,6 +130,8 @@ def settings(section):
     """
     values = {}
     for key in KEYS:
+        if key in MULTIKEYS:
+            continue
         text = getattr(section, key.replace("-", "_"))
         if not text:
             continue

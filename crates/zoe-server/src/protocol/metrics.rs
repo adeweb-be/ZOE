@@ -363,7 +363,7 @@ mod tests {
         one.metrics.batch_synced(3);
         one.metrics.locks_acquired(Duration::from_millis(2));
         let text = render(&[one, exported("a\"b")]);
-        assert_eq!(text.matches("# TYPE ").count(), 11);
+        assert_eq!(text.matches("# TYPE ").count(), 12);
         assert!(
             text.contains("zoe_loads_total{storage=\"1\"} 1\n"),
             "{text}"
@@ -384,6 +384,14 @@ mod tests {
             text.contains("zoe_conflicts_resolved_total{storage=\"1\",path=\"native\"} 0\n"),
             "{text}"
         );
+        for mode in ["on", "shadow"] {
+            for outcome in ["merged", "refused", "undecided"] {
+                let line = format!(
+                    "zoe_structural_merges_total{{storage=\"1\",mode=\"{mode}\",outcome=\"{outcome}\"}} 0\n"
+                );
+                assert!(text.contains(&line), "{text}");
+            }
+        }
         assert!(
             text.contains("zoe_invalidation_queue_depth{storage=\"1\"} 0\n"),
             "{text}"
@@ -407,6 +415,7 @@ mod tests {
         assert!(help("zoe_fsync_batch_size").contains("in commits"));
         assert!(help("zoe_conflicts_resolved_total").contains("oids"));
         assert!(help("zoe_conflicts_raised_total").contains("transactions"));
+        assert!(help("zoe_structural_merges_total").contains("mode and outcome"));
         assert!(
             help("zoe_invalidation_queue_depth")
                 .contains("the deepest hub queue among the connections of the storage")

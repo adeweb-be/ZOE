@@ -303,6 +303,44 @@ mod tests {
     }
 
     #[test]
+    fn the_table_of_the_classes_gives_their_modes() {
+        let text = "structural-merges = \"shadow\"\nmerge-posting-dicts = true\n\n\
+                    [structural-merge-classes]\n\
+                    \"BTrees.IOBTree.IOBucket\" = \"on\"\n\"BTrees.Length.Length\" = \"off\"\n";
+        let config = parse_with(text, &[]).unwrap();
+        assert_eq!(
+            args(&config),
+            [
+                "--merge-posting-dicts=true",
+                "--structural-merge-class=BTrees.IOBTree.IOBucket=on",
+                "--structural-merge-class=BTrees.Length.Length=off",
+                "--structural-merges=shadow",
+            ]
+        );
+        // The command line wins over the table.
+        let line = ["--structural-merge-class", "BTrees.OOBTree.OOBucket=off"];
+        let config = parse_with(text, &line).unwrap();
+        assert!(!args(&config).iter().any(|arg| arg.contains("IOBucket")));
+        for (text, error) in [
+            (
+                "[structural-merge-classes]\n\"IOBucket\" = \"on\"\n",
+                "is not a class",
+            ),
+            (
+                "[structural-merge-classes]\n\"A.B\" = 1\n",
+                "takes on, shadow or off",
+            ),
+            (
+                "structural-merge-class = \"A.B=on\"\n",
+                "is not a key of the file",
+            ),
+        ] {
+            let found = parse_with(text, &[]).unwrap_err();
+            assert!(found.contains(error), "{text}: {found}");
+        }
+    }
+
+    #[test]
     fn a_bad_file_is_refused() {
         for (text, error) in [
             ("[storages.main\n", "TOML parse error"),

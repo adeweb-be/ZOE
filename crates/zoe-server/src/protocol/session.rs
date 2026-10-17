@@ -2018,7 +2018,7 @@ mod tests {
 
     use super::super::outbox::Inbox;
     use super::*;
-    use crate::protocol::Queues;
+    use crate::protocol::{Queues, ResolutionLog};
 
     /// A pickle of a `persistent.mapping.PersistentMapping` record, as ZODB
     /// writes it: the class pickle, then the state pickle.
@@ -2976,6 +2976,66 @@ mod tests {
         assert_eq!(count(&status, "conflicts_resolved"), 2);
         assert_eq!(count(&status, "aborts"), 1);
         commit(&mut s, 7, 1, tid, MAPPING).unwrap();
+    }
+
+    /// Returns the record of a `BTrees.Length.Length` of `value`, as ZODB
+    /// writes it.
+    fn length_record(value: u8) -> Vec<u8> {
+        [
+            &b"\x80\x03cBTrees.Length\nLength\nq\x00.\x80\x03K"[..],
+            &[value],
+            b".",
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn the_vote_gives_an_oid_that_tier_1_merged_as_a_bare_oid() {
+        let name = "native-merge";
+        let dir = std::env::temp_dir().join(format!("zoe-session-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let log_path = dir.join("resolutions.log");
+        let log = Arc::new(ResolutionLog::open(&log_path).unwrap());
+        let storage = NamedStorage::new("1", &dir, store, Queues::DEFAULT);
+        let mut s = Client::new(Arc::new(storage.resolution_log(Some(log))), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let read = commit(&mut s, 1, 1, 0, &length_record(10)).unwrap();
+        commit(&mut s, 2, 1, read, &length_record(12)).unwrap();
+        let reply = done(store_and_vote(&mut s, 3, &[(1, read)], &length_record(7)));
+        assert_eq!(reply, Value::Array(vec![p64(1)]));
+        let tid = finish(&mut s, Value::from(3));
+        let load = done(call(&mut s, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(
+            load,
+            Value::Array(vec![Value::Binary(length_record(9)), p64(tid), Value::Nil])
+        );
+        let metrics = &s.storage.metrics;
+        assert_eq!(get_counter(&metrics.conflicts_native), 1);
+        assert_eq!(get_counter(&metrics.structural_merges[0][0]), 1);
+        // The client resolved nothing.
+        let status = s.storage.status().to_value();
+        assert_eq!(count(&status, "conflicts_resolved"), 0);
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("\"storage\":\"1\""), "{text}");
+        assert!(
+            lines[0].contains("\"class\":\"BTrees.Length.Length\""),
+            "{text}"
+        );
+        assert!(lines[0].contains("\"outcome\":\"merged\""), "{text}");
+        assert!(lines[0].contains("\"user\":\"\""), "{text}");
+        assert!(lines[0].contains("\"committed_user\":\"user-2\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn get_counter(counter: &AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn registered(name: &str) -> Client {

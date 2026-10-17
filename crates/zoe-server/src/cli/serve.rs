@@ -944,6 +944,45 @@ mod tests {
     }
 
     #[test]
+    fn the_structural_merges_are_on_and_the_posting_rule_off_by_default() {
+        let args = serve(&[]).unwrap();
+        assert_eq!(args.structural_merges, Mode::On);
+        assert!(args.structural_merge_class.is_empty());
+        assert!(!args.merge_posting_dicts);
+        assert_eq!(args.resolution_log, None);
+        let args = serve(&[
+            "--structural-merges",
+            "shadow",
+            "--structural-merge-class",
+            "BTrees.IOBTree.IOBucket=on",
+            "--structural-merge-class",
+            "BTrees.Length.Length=off,BTrees.OOBTree.OOBucket=shadow",
+            "--merge-posting-dicts",
+            "--resolution-log",
+            "merges.log",
+        ])
+        .unwrap();
+        assert_eq!(args.structural_merges, Mode::Shadow);
+        assert_eq!(
+            args.structural_merge_class,
+            [
+                ("BTrees.IOBTree.IOBucket".to_owned(), Mode::On),
+                ("BTrees.Length.Length".to_owned(), Mode::Off),
+                ("BTrees.OOBTree.OOBucket".to_owned(), Mode::Shadow),
+            ]
+        );
+        assert!(args.merge_posting_dicts);
+        assert_eq!(args.resolution_log, Some(PathBuf::from("merges.log")));
+        for bad in [
+            &["--structural-merges", "maybe"][..],
+            &["--structural-merge-class", "IOBucket=on"],
+            &["--merge-posting-dicts=perhaps"],
+        ] {
+            assert!(serve(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn pack_gc_is_true_by_default_and_takes_a_boolean() {
         assert!(serve(&[]).unwrap().pack_gc);
         assert!(serve(&["--pack-gc"]).unwrap().pack_gc);
