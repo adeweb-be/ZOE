@@ -178,7 +178,8 @@
     <description>
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
-      the same values, wait-timeout and native, and an ssl section. It
+      the same values, wait-timeout, native, early-locks and
+      early-lock-classes, and an ssl section. It
       declares the ZOE extensions to the server, and works as a zeoclient
       against a stock ZEO server.
     </description>

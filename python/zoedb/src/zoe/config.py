@@ -6,7 +6,8 @@ as their storage. The `zoe` entry point of `zodburi.resolvers` names
 `resolve_uri`.
 
 `<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
-`<zeoclient>`, with the same values, `wait-timeout` and `native`, and an
+`<zeoclient>`, with the same values, `wait-timeout`, `native`,
+`early-locks` and `early-lock-classes`, and an
 `<ssl>` section with the keys of the `<ssl>` section of ZEO's
 `<clientstorage>`. It has no environment twins, as `<zeoclient>` has none.
 
@@ -229,7 +230,9 @@ class ZoeClient(BaseConfig):
     """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
 
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
-    `wait-timeout` as `wait_timeout` and `native` as `native`. It gives the
+    `wait-timeout` as `wait_timeout`, `native` as `native`, and
+    `early-locks` and `early-lock-classes` as `early_locks` and
+    `early_lock_classes`. It gives the
     `<ssl>` section as it is: the native client reads its files, and ZEO's
     client gets the context that ZEO's `<ssl>` section gives.
     """
