@@ -4,6 +4,7 @@ native client."""
 
 import contextlib
 import os
+import platform
 import signal
 import socket
 import subprocess
@@ -99,12 +100,13 @@ def zeo_server(directory: Path) -> Iterator[tuple[str, int]]:
 
 
 @contextlib.contextmanager
-def zoe_server(directory: Path) -> Iterator[tuple[str, int]]:
-    """Run `zoe serve` on a new store in directory. Yield its address."""
+def zoe_server(directory: Path, args=()) -> Iterator[tuple[str, int]]:
+    """Run `zoe serve` on a new store in directory, with `args` after its
+    own arguments. Yield its address."""
     out = directory / "zoe-serve.out"
     log = directory / "zoe-serve.log"
     command = [zoe_binary(), "serve", "--path", str(directory / "store"),
-               "--listen", "127.0.0.1:0"]  # fmt: skip
+               "--listen", "127.0.0.1:0", *args]  # fmt: skip
     with out.open("wb") as stdout, log.open("wb") as stderr:
         server = subprocess.Popen(
             command,
@@ -137,9 +139,53 @@ def zoe_server(directory: Path) -> Iterator[tuple[str, int]]:
             server.wait()
 
 
-def server(stack: str, directory: Path):
-    """Return the context manager of the server of `stack`."""
-    return zeo_server(directory) if stack == "zeo" else zoe_server(directory)
+def server(stack: str, directory: Path, serve_args=()):
+    """Return the context manager of the server of `stack`. `serve_args` go
+    to `zoe serve`."""
+    if stack == "zeo":
+        return zeo_server(directory)
+    return zoe_server(directory, serve_args)
+
+
+def software(serve_args=()) -> dict:
+    """Return what a result records of the software of its runs: the
+    commit of the repository, the `zoe` binary and its version, the
+    arguments of `zoe serve`, the package `zoe` that the native client
+    runs, Python and the machine."""
+    root = Path(__file__).resolve().parents[4]
+
+    def output(command):
+        try:
+            done = subprocess.run(
+                command, capture_output=True, text=True, timeout=TIMEOUT, check=True
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() or None
+
+    binary = zoe_binary()
+    try:
+        import zoe
+
+        package = str(Path(zoe.__file__).resolve().parent)
+    except ImportError:
+        package = None
+    try:
+        from importlib.metadata import version
+
+        zoedb = version("zoedb")
+    except Exception:
+        zoedb = None
+    return {
+        "commit": output(["git", "-C", str(root), "rev-parse", "HEAD"]),
+        "zoe": binary,
+        "zoe_version": output([binary, "--version"]),
+        "zoe_serve_args": list(serve_args),
+        "zoedb": zoedb,
+        "zoe_package": package,
+        "python": sys.version.split()[0],
+        "machine": f"{platform.system()} {platform.machine()}",
+    }
 
 
 def client(stack: str, address):

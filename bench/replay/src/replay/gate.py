@@ -22,7 +22,8 @@ class Gate:
     # ConflictErrors per 1,000 transactions over the runs of a stack that
     # count. None for a stack without a run that counts.
     rates: dict
-    # (stack, speed, repetition) of each run that does not count.
+    # (stack, speed, repetition) of each run that does not count: its check
+    # failed, or it replayed no transaction.
     excluded: list
     # (stack, speed) of each speed and stack without a run that counts.
     missing: list
@@ -39,7 +40,8 @@ def gate(result: dict) -> Gate:
     excluded = []
     for run in result["runs"]:
         stack = run["stack"]
-        if not run["counts"]:
+        # A run that replayed no transaction says nothing of the conflicts.
+        if not run["counts"] or not run["transactions"]:
             excluded.append((stack, run["speed"], run["repetition"]))
             continue
         if stack in errors:
@@ -54,7 +56,7 @@ def gate(result: dict) -> Gate:
     ]
     stacks = {stack for stack, _speed in counted}
     exact = {
-        stack: Fraction(1000 * errors[stack], max(1, transactions[stack]))
+        stack: Fraction(1000 * errors[stack], transactions[stack])
         if stack in stacks
         else None
         for stack in STACKS

@@ -94,11 +94,12 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
     `seconds` and its `finishes`. Each `tpc_finish` of the request ends one
     commit before the request ends. So a tid belongs to the request that
     committed, that started before the time of the tid, and whose end comes
-    first after it. A request of several attempts started its last attempt
-    after `t`: the start of the transaction is then the end of the request
-    minus the time of one attempt. A tid that no request explains starts at
-    its commit: it reads its serials when it commits, so it overlaps
-    nothing.
+    first after it. The transaction starts at `t`, the start of the first
+    attempt of the request: the replay does not retry, and the attempt
+    whose `ConflictError` reaches Zope is the first one. A tid that no
+    request explains starts at its commit: it reads its serials when it
+    commits, so it overlaps nothing. The transactions that commit before
+    the first request starts are the base.
     """
     requests = []
     for path in probes:
@@ -106,15 +107,14 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
             record = json.loads(line)
             if record.get("kind") == "request" and record.get("finishes"):
                 end = record["t"] + record["seconds"]
-                attempt = record["seconds"] / max(1, record.get("attempts") or 1)
-                requests.append([end, end - attempt, record["finishes"]])
+                requests.append([end, record["t"], record["finishes"]])
     requests.sort()
     storage = FileStorage(str(store), read_only=True)
     try:
         tids = [txn.tid for txn in storage.iterator()]
     finally:
         storage.close()
-    first = requests[0][1] if requests else None
+    first = min((request[1] for request in requests), default=None)
     starts: dict[bytes, float] = {}
     matched = unmatched = 0
     index = 0

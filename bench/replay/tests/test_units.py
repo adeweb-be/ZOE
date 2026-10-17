@@ -12,10 +12,13 @@ from BTrees.IOBTree import IOBucket
 from BTrees.Length import Length
 from BTrees.OOBTree import OOBTree
 from persistent.mapping import PersistentMapping
+from ZODB.ConflictResolution import PersistentReference
 from ZODB.FileStorage import FileStorage
 from ZODB.TimeStamp import TimeStamp
 
+from replay import __main__ as command
 from replay import log, runner
+from replay.gate import gate
 
 
 def test_a_bucket_takes_the_items_that_the_transaction_changed():
@@ -60,6 +63,21 @@ def test_a_set_and_a_tree_of_one_bucket_take_the_items_too():
     assert list(tree_set) == [5, 6]
 
 
+def test_a_value_that_does_not_compare_counts_as_changed():
+    # Two persistent references to two objects do not compare.
+    one = PersistentReference((b"\0" * 7 + b"\1", None))
+    two = PersistentReference((b"\0" * 7 + b"\2", None))
+    with pytest.raises(ValueError):
+        one == two  # noqa: B015
+    state = runner.apply_items(
+        IOBucket,
+        ((1, one),),
+        ((1, one, 2, 5),),
+        ((1, two),),
+    )
+    assert state == ((1, two, 2, 5),)
+
+
 def test_other_classes_and_trees_of_many_buckets_raise_value_error():
     with pytest.raises(ValueError):
         runner.apply_items(Length, 1, 2, 3)
@@ -96,7 +114,7 @@ def tids(path, count):
     return times[0], list(zip(found[1:], times[1:], strict=True))
 
 
-def test_each_tid_starts_at_the_last_attempt_of_the_request_that_ends_first(tmp_path):
+def test_each_tid_starts_at_the_request_that_ends_first_after_it(tmp_path):
     root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
     # The first request starts after the creation of the root, which stays
     # in the base.
@@ -121,9 +139,8 @@ def test_each_tid_starts_at_the_last_attempt_of_the_request_that_ends_first(tmp_
     starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
     assert matched == {"matched": 2, "unmatched": 0, "requests": 2}
     assert starts[first] == pytest.approx(t1, abs=1e-6)
-    # The last attempt takes half the time of the request, and ends with it.
-    end = c2 + 0.002
-    assert starts[second] == pytest.approx(end - (end - t1) / 2, abs=1e-6)
+    # A request of two attempts starts at its first one.
+    assert starts[second] == pytest.approx(t1, abs=1e-6)
     found = log.read_log(tmp_path / "Data.fs", starts)
     assert [t.tid for t in found.transactions] == [first, second]
     assert len(found.base) == 1
@@ -138,3 +155,42 @@ def test_a_tid_that_no_request_explains_starts_at_its_commit(tmp_path):
     starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
     assert matched == {"matched": 1, "unmatched": 1, "requests": 1}
     assert starts[second] == pytest.approx(c2)
+
+
+def test_a_run_that_replays_no_transaction_does_not_count():
+    run = {
+        "stack": "zeo",
+        "speed": 1,
+        "repetition": 1,
+        "transactions": 0,
+        "conflict_errors": 0,
+        "counts": True,
+    }
+    other = dict(run, stack="zoe-native")
+    found = gate({"speeds": [1], "runs": [run, other]})
+    assert found.excluded == [("zeo", 1, 1), ("zoe-native", 1, 1)]
+    assert found.missing == [("zeo", 1), ("zoe-native", 1)]
+    assert found.verdict == "fail"
+
+
+def test_speeds_must_be_positive_and_distinct(tmp_path):
+    empty = log.Log([], [])
+    for speeds in [(0,), (1, 1), (-4,)]:
+        with pytest.raises(ValueError):
+            runner.run(empty, workdir=tmp_path, speeds=speeds)
+
+
+def test_the_command_refuses_a_run_without_probe_records(tmp_path, capsys):
+    tids(tmp_path / "Data.fs", 1)
+    (tmp_path / "probe").mkdir()
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json")]
+    assert command.main(line) == 2
+    assert "no probe records" in capsys.readouterr().err
+    # Probe records of another time explain no transaction.
+    probe = {"kind": "request", "t": 0.0, "seconds": 1.0, "finishes": 1}
+    (tmp_path / "probe" / "instance0.jsonl").write_text(json.dumps(probe) + "\n")
+    assert command.main(line) == 2
+    assert "explain no transaction" in capsys.readouterr().err
+    assert not (tmp_path / "result.json").exists()
