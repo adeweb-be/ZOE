@@ -63,6 +63,11 @@ fn merge_fields(
     states: &[Value; 3],
     merge: &mut Merge,
 ) -> Result<Value, Outcome> {
+    // A client loads each state with `Persistent.__setstate__`, which
+    // interns its keys.
+    for &state in states {
+        heap.intern_keys(state);
+    }
     let mut all: Vec<Fields> = Vec::with_capacity(3);
     for &state in states {
         let fields = fields_of(heap, state)?;

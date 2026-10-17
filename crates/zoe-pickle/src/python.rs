@@ -202,6 +202,9 @@ pub struct Heap {
     /// True when the heap models the objects of other classes and the
     /// sets.
     instances: bool,
+    /// The interned strs, by text: the keys of the dict state of an object,
+    /// as BUILD and `Persistent.__setstate__` intern them in CPython.
+    interned: HashMap<String, ObjectId>,
 }
 
 impl Heap {
@@ -450,12 +453,44 @@ impl Heap {
     }
 
     /// Tells if `id` is a str or a bytes that the heap shares across its
-    /// records, as CPython does.
+    /// records, as CPython does: an empty one, one of one character below
+    /// U+0100, or an interned str.
     fn is_shared(&self, id: ObjectId) -> bool {
         self.empty_str == Some(id)
             || self.empty_bytes == Some(id)
             || self.chars.values().any(|&shared| shared == id)
             || self.bytes.values().any(|&shared| shared == id)
+            || self.interned.values().any(|&shared| shared == id)
+    }
+
+    /// Interns the str keys of the dict `dict`, as CPython interns the keys
+    /// of the state of an object: BUILD does it for an object without
+    /// `__setstate__`, and `Persistent.__setstate__` for a persistent
+    /// object. The first str of a text in the heap is the interned one; a
+    /// later key of that text becomes that str.
+    pub fn intern_keys(&mut self, dict: Value) {
+        let Some(Object::Dict(items)) = self.object(dict) else {
+            return;
+        };
+        let mut items = items.clone();
+        for (key, _) in &mut items {
+            let Value::Object(id) = *key else {
+                continue;
+            };
+            let Object::Str(text) = self.get(id) else {
+                continue;
+            };
+            match self.interned.get(text) {
+                Some(&interned) => *key = Value::Object(interned),
+                None => {
+                    self.interned.insert(text.clone(), id);
+                }
+            }
+        }
+        let Value::Object(id) = dict else {
+            return;
+        };
+        self.objects[id.0 as usize] = Object::Dict(items);
     }
 
     /// Returns a new tuple of `items`.
@@ -1256,6 +1291,13 @@ impl Loader<'_> {
                         }
                         _ => return Err(Unsupported("a BUILD of another form")),
                     }
+                    // `load_build` interns the keys of a dict state, also of
+                    // the dict of a `(dict, slots)` state.
+                    let dict = match self.heap.tuple(state) {
+                        Some(&[dict, _]) => dict,
+                        _ => state,
+                    };
+                    self.heap.intern_keys(dict);
                     continue;
                 }
                 _ => return Err(Unsupported("an opcode that the model does not model")),
