@@ -405,22 +405,14 @@ fn shadow_mode_merges_what_the_rule_off_merges() {
 
 #[test]
 fn the_first_key_rule_merges_a_delete_of_the_first_key_in_a_tree_of_one_bucket() {
-    // The committed transaction deletes the first key, then the new one
-    // deletes it while the other adds a key.
-    let cases: [[&[(i128, i128)]; 4]; 2] = [
-        [
-            &[(1, 1), (2, 2), (3, 3)],
-            &[(2, 2), (3, 3)],
-            &[(1, 1), (2, 2), (3, 3), (4, 4)],
-            &[(2, 2), (3, 3), (4, 4)],
-        ],
-        [
-            &[(1, 1), (2, 2), (3, 3)],
-            &[(1, 1), (2, 2), (3, 3), (4, 4)],
-            &[(2, 2), (3, 3)],
-            &[(2, 2), (3, 3), (4, 4)],
-        ],
-    ];
+    // The committed transaction deletes the first key, and the new one
+    // adds a key.
+    let cases: [[&[(i128, i128)]; 4]; 1] = [[
+        &[(1, 1), (2, 2), (3, 3)],
+        &[(2, 2), (3, 3)],
+        &[(1, 1), (2, 2), (3, 3), (4, 4)],
+        &[(2, 2), (3, 3), (4, 4)],
+    ]];
     for [base, committed, new, merged] in cases {
         for rule in [Mode::Off, Mode::Shadow, Mode::On] {
             let store = open(StructuralMerges {
@@ -473,11 +465,30 @@ fn the_first_key_rule_leaves_a_standalone_bucket_to_btrees() {
 }
 
 #[test]
+fn the_first_key_rule_refuses_a_delete_of_the_first_key_by_the_new_transaction() {
+    // In a node inside a tree, the new transaction can have moved the
+    // separator of the parent node in its own write of that node, and no
+    // check of the vote sees it.
+    let (base, committed, new) = (
+        ii_tree(&[(1, 1), (2, 2), (3, 3)]),
+        ii_tree(&[(1, 1), (2, 2), (3, 3), (4, 4)]),
+        ii_tree(&[(2, 2), (3, 3)]),
+    );
+    for rule in [Mode::Off, Mode::Shadow, Mode::On] {
+        assert_eq!(
+            first_key(rule, &base, &committed, &new),
+            (Resolved::Refused(Reason::BTrees(13)), None, None),
+            "{rule:?}"
+        );
+    }
+}
+
+#[test]
 fn the_first_key_rule_merges_a_tree_set_too() {
     let (base, committed, new) = (
         ii_tree_set(&[1, 2, 3]),
-        ii_tree_set(&[1, 2, 3, 4]),
         ii_tree_set(&[2, 3]),
+        ii_tree_set(&[1, 2, 3, 4]),
     );
     assert_eq!(
         first_key(Mode::On, &base, &committed, &new),

@@ -85,8 +85,8 @@ SEEDS = {
     ),
     "iitreeset-first-key-shadow": seed(
         IITreeSet([1, 2, 3]),
-        IITreeSet([1, 2, 3, 4]),
         IITreeSet([2, 3]),
+        IITreeSet([1, 2, 3, 4]),
         posting=SHADOW,
     ),
 }
