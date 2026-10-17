@@ -27,6 +27,12 @@
 //! bytes, a persistent id of an unknown shape, a container that holds
 //! itself. A caller then leaves the work to Python.
 //!
+//! A heap of [`Heap::with_instances`] also models the objects of other
+//! classes: an object that NEWOBJ or REDUCE makes, with the state that
+//! BUILD gives it, and a `set` or a `frozenset`. The merges of fields use
+//! such a heap. The merges of BTrees do not: for them, these objects stay
+//! constructs that the model refuses.
+//!
 //! No function here calls itself once per nesting level. The loader, the
 //! comparisons and the pickler use explicit stacks. The objects live in
 //! one vector and refer to each other by index, so a drop does not
@@ -88,6 +94,40 @@ pub enum Object {
     /// A persistent reference: the `PersistentReference` of ZODB's
     /// resolver.
     Reference(Reference),
+    /// An object of another class, that NEWOBJ or REDUCE makes. Only a
+    /// heap of [`Heap::with_instances`] holds one.
+    Instance(Instance),
+    /// A `set` or a `frozenset`: REDUCE of `builtins.set` or
+    /// `builtins.frozenset` with the list of its items. Only a heap of
+    /// [`Heap::with_instances`] holds one.
+    Set {
+        /// The class: `builtins.set` or `builtins.frozenset`.
+        class: Value,
+        /// The items, in the order of the pickle.
+        items: Vec<Value>,
+    },
+}
+
+/// An object of another class, as the unpickler makes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Instance {
+    /// The opcode that made the object: NEWOBJ or REDUCE.
+    pub made: Made,
+    /// The class of NEWOBJ, or the callable of REDUCE.
+    pub class: Value,
+    /// The tuple of the arguments.
+    pub args: Value,
+    /// The state that BUILD gives the object, if it comes.
+    pub state: Option<Value>,
+}
+
+/// The opcode that made an [`Instance`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Made {
+    /// NEWOBJ: `cls.__new__(cls, *args)`.
+    New,
+    /// REDUCE: `callable(*args)`.
+    Reduce,
 }
 
 /// A persistent reference, as ZODB's resolver reads it.
@@ -159,12 +199,24 @@ pub struct Heap {
     classes: HashMap<(String, String), ObjectId>,
     /// The persistent references, by their identity.
     references: HashMap<ReferenceKey, ObjectId>,
+    /// True when the heap models the objects of other classes and the
+    /// sets.
+    instances: bool,
 }
 
 impl Heap {
     /// Returns an empty heap.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns an empty heap that also models the objects of other classes
+    /// and the sets, as an [`Object::Instance`] and an [`Object::Set`].
+    pub fn with_instances() -> Self {
+        Heap {
+            instances: true,
+            ..Self::default()
+        }
     }
 
     /// Loads a record: its class pickle, then its state pickle, with one
@@ -230,6 +282,148 @@ impl Heap {
             Object::Class { module, name } => Some((module, name)),
             _ => None,
         }
+    }
+
+    /// Returns the text of `value` if it is a str.
+    pub fn str(&self, value: Value) -> Option<&str> {
+        match self.object(value)? {
+            Object::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns the object of `value` if it is an object of another class.
+    pub fn instance(&self, value: Value) -> Option<&Instance> {
+        match self.object(value)? {
+            Object::Instance(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    /// Returns a new list of `items`.
+    pub fn new_list(&mut self, items: Vec<Value>) -> Value {
+        Value::Object(self.push(Object::List(items)))
+    }
+
+    /// Returns a new set of `items` with the class `class`, which is
+    /// `builtins.set` or `builtins.frozenset`.
+    pub fn new_set(&mut self, class: Value, items: Vec<Value>) -> Value {
+        Value::Object(self.push(Object::Set { class, items }))
+    }
+
+    /// Tells if two values have the same structure: the same kind, the
+    /// same atoms and texts, the same items in the same order, the same
+    /// class and state for an object of another class, and the same oid,
+    /// database and weakness for a persistent reference. This is not the
+    /// `==` of Python: two dicts in another order differ here.
+    pub fn same(&self, a: Value, b: Value) -> bool {
+        let mut pairs = vec![(a, b)];
+        while let Some(pair) = pairs.pop() {
+            let same = match pair {
+                (Value::None, Value::None) => true,
+                (Value::Bool(x), Value::Bool(y)) => x == y,
+                (Value::Int(x), Value::Int(y)) => x == y,
+                (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+                (Value::Object(x), Value::Object(y)) if x == y => true,
+                (Value::Object(x), Value::Object(y)) => match (self.get(x), self.get(y)) {
+                    (Object::Str(p), Object::Str(q)) => p == q,
+                    (Object::Bytes(p), Object::Bytes(q)) => p == q,
+                    (Object::Tuple(p), Object::Tuple(q)) | (Object::List(p), Object::List(q)) => {
+                        pairs.extend(p.iter().copied().zip(q.iter().copied()));
+                        p.len() == q.len()
+                    }
+                    (Object::Dict(p), Object::Dict(q)) => {
+                        for (&(k1, v1), &(k2, v2)) in p.iter().zip(q) {
+                            pairs.push((k1, k2));
+                            pairs.push((v1, v2));
+                        }
+                        p.len() == q.len()
+                    }
+                    (
+                        Object::Class { module, name },
+                        Object::Class {
+                            module: other_module,
+                            name: other_name,
+                        },
+                    ) => module == other_module && name == other_name,
+                    (Object::Reference(p), Object::Reference(q)) => {
+                        p.oid == q.oid && p.database == q.database && p.weak == q.weak
+                    }
+                    (Object::Instance(p), Object::Instance(q)) => {
+                        pairs.push((p.class, q.class));
+                        pairs.push((p.args, q.args));
+                        match (p.state, q.state) {
+                            (Some(x), Some(y)) => {
+                                pairs.push((x, y));
+                                p.made == q.made
+                            }
+                            (None, None) => p.made == q.made,
+                            _ => false,
+                        }
+                    }
+                    (
+                        Object::Set { class, items },
+                        Object::Set {
+                            class: other_class,
+                            items: other_items,
+                        },
+                    ) => {
+                        pairs.push((*class, *other_class));
+                        pairs.extend(items.iter().copied().zip(other_items.iter().copied()));
+                        items.len() == other_items.len()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !same {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns the lists, the dicts, the sets and the objects of other
+    /// classes that `value` holds, `value` too, each once. A persistent
+    /// reference and a class are not followed: they are shared by design.
+    pub fn mutable_objects(&self, value: Value) -> Vec<ObjectId> {
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![value];
+        while let Some(value) = todo.pop() {
+            let Value::Object(id) = value else {
+                continue;
+            };
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                Object::Tuple(items) => todo.extend(items),
+                Object::List(items) => {
+                    found.push(id);
+                    todo.extend(items);
+                }
+                Object::Dict(items) => {
+                    found.push(id);
+                    for &(key, value) in items {
+                        todo.push(key);
+                        todo.push(value);
+                    }
+                }
+                Object::Instance(instance) => {
+                    found.push(id);
+                    todo.push(instance.args);
+                    todo.extend(instance.state);
+                }
+                Object::Set { items, .. } => {
+                    found.push(id);
+                    todo.extend(items);
+                }
+                Object::Str(_) | Object::Bytes(_) | Object::Class { .. } | Object::Reference(_) => {
+                }
+            }
+        }
+        found
     }
 
     /// Returns a new tuple of `items`.
@@ -516,12 +710,18 @@ impl Heap {
                     }
                 }
                 (Object::Dict(_), Object::Dict(_)) => return Err(Undecided::Unknown),
+                // A class of its own can define `==`.
+                (Object::Instance(_) | Object::Set { .. }, _)
+                | (_, Object::Instance(_) | Object::Set { .. }) => {
+                    return Err(Undecided::Unknown);
+                }
                 // Objects of two types, or two classes that are not the
                 // same object.
                 _ => false,
             },
             (Value::Object(x), _) | (_, Value::Object(x)) => match self.get(x) {
                 Object::Reference(_) => return Err(Undecided::Raises),
+                Object::Instance(_) | Object::Set { .. } => return Err(Undecided::Unknown),
                 _ => false,
             },
             // None, a bool, an int or a float against another of them.
@@ -607,6 +807,9 @@ enum Task<'a> {
     Remember(Vec<u32>),
     /// Make the persistent reference of the last value.
     Persistent,
+    /// Make a set of the last two values: the class and the tuple of the
+    /// arguments of REDUCE.
+    Set,
 }
 
 impl Loader<'_> {
@@ -642,6 +845,11 @@ impl Loader<'_> {
                 Task::Persistent => {
                     let data = values.pop().expect("a persistent id");
                     values.push(self.heap.reference_of(data)?);
+                }
+                Task::Set => {
+                    let args = values.pop().expect("the arguments of REDUCE");
+                    let class = values.pop().expect("the callable of REDUCE");
+                    values.push(self.heap.reduce(class, args)?);
                 }
             }
         }
@@ -715,6 +923,13 @@ impl Loader<'_> {
             }
             Node::ByteString(_) => return Err(Unsupported("a Python 2 str")),
             Node::Unicode(Unicode::Text(_)) => return Err(Unsupported("a protocol 0 unicode")),
+            Node::Reduce(reduce) if self.heap.instances => {
+                tasks.push(Task::Set);
+                tasks.push(Task::Enter(&reduce.args));
+                tasks.push(Task::Enter(&reduce.callable));
+                return Ok(());
+            }
+            Node::Opaque(opaque) if self.heap.instances => self.opaque(&opaque.bytes)?,
             Node::Reduce(_) => return Err(Unsupported("a REDUCE")),
             Node::Opaque(_) => return Err(Unsupported("an opaque node")),
         };
@@ -769,18 +984,34 @@ impl Loader<'_> {
     /// order, as `d[key] = value` gives them: a key that comes again keeps
     /// its place and takes the later value.
     fn dict_items(&self, flat: &[Value]) -> Result<Vec<(Value, Value)>, Unsupported> {
-        let mut items: Vec<(Value, Value)> = Vec::with_capacity(flat.len() / 2);
+        self.heap.set_items(Vec::new(), flat)
+    }
+}
+
+impl Heap {
+    /// Returns the items of a dict after `d[key] = value` of each pair of
+    /// `flat`, in order: a key that comes again keeps its place and takes
+    /// the later value.
+    fn set_items(
+        &self,
+        mut items: Vec<(Value, Value)>,
+        flat: &[Value],
+    ) -> Result<Vec<(Value, Value)>, Unsupported> {
+        let key_of = |key: Value| match key {
+            Value::Int(int) => Ok(DictKey::Int(int)),
+            Value::Object(id) => match self.get(id) {
+                Object::Str(text) => Ok(DictKey::Str(text.clone())),
+                Object::Bytes(bytes) => Ok(DictKey::Bytes(bytes.clone())),
+                _ => Err(Unsupported("a dict key of another type")),
+            },
+            _ => Err(Unsupported("a dict key of another type")),
+        };
         let mut places: HashMap<DictKey, usize> = HashMap::new();
+        for (place, &(key, _)) in items.iter().enumerate() {
+            places.insert(key_of(key)?, place);
+        }
         for &[key, value] in flat.as_chunks::<2>().0 {
-            let dict_key = match key {
-                Value::Int(int) => DictKey::Int(int),
-                Value::Object(id) => match self.heap.get(id) {
-                    Object::Str(text) => DictKey::Str(text.clone()),
-                    Object::Bytes(bytes) => DictKey::Bytes(bytes.clone()),
-                    _ => return Err(Unsupported("a dict key of another type")),
-                },
-                _ => return Err(Unsupported("a dict key of another type")),
-            };
+            let dict_key = key_of(key)?;
             match places.get(&dict_key) {
                 Some(&place) => items[place].1 = value,
                 None => {
@@ -791,6 +1022,280 @@ impl Loader<'_> {
         }
         Ok(items)
     }
+
+    /// Returns the object that REDUCE makes of `callable` and `args`: a set
+    /// for `builtins.set` and `builtins.frozenset`, else an object of
+    /// another class.
+    fn reduce(&mut self, callable: Value, args: Value) -> Result<Value, Unsupported> {
+        let Some((module, name)) = self.class(callable) else {
+            return Err(Unsupported("a REDUCE of a callable that is not a GLOBAL"));
+        };
+        let args_items = self
+            .tuple(args)
+            .ok_or(Unsupported("a REDUCE without a tuple of arguments"))?;
+        match (module, name) {
+            ("builtins", "set" | "frozenset") => {
+                let items = match args_items {
+                    [] => Vec::new(),
+                    [list] => match self.object(*list) {
+                        Some(Object::List(items)) => items.clone(),
+                        _ => return Err(Unsupported("a set of another form")),
+                    },
+                    _ => return Err(Unsupported("a set of another form")),
+                };
+                Ok(self.new_set(callable, items))
+            }
+            // The pickler of Python 3 writes such an object with NEWOBJ,
+            // so it does not pickle again to the same bytes.
+            ("copy_reg" | "copyreg", "_reconstructor") => {
+                Err(Unsupported("an object of copy_reg._reconstructor"))
+            }
+            _ => Ok(Value::Object(self.push(Object::Instance(Instance {
+                made: Made::Reduce,
+                class: callable,
+                args,
+                state: None,
+            })))),
+        }
+    }
+}
+
+/// One entry of the stack of [`Loader::opaque`].
+#[derive(Clone, Copy)]
+enum Slot {
+    Mark,
+    /// A value, and true when a memo get pushed it.
+    Value(Value, bool),
+}
+
+impl Loader<'_> {
+    /// Loads the bytes of an opaque node: whole opcodes that push one
+    /// value. The memo is the memo of the record. An object that NEWOBJ or
+    /// REDUCE makes, and the state of BUILD, become an [`Object::Instance`].
+    /// A list, a dict or an object takes its items or its state only right
+    /// after it is made, as the pickler writes them, so no value holds
+    /// itself.
+    fn opaque(&mut self, bytes: &[u8]) -> Result<Value, Unsupported> {
+        let other = Unsupported("an opaque construct of another form");
+        let mut stack: Vec<Slot> = Vec::new();
+        let mut pos = 0;
+        while let Some(&opcode) = bytes.get(pos) {
+            let rest = &bytes[pos + 1..];
+            let len = crate::opcode::argument_len(opcode, rest).ok_or(other)?;
+            let arg = &rest[..len];
+            pos += 1 + len;
+            let value = match opcode {
+                MARK => {
+                    stack.push(Slot::Mark);
+                    continue;
+                }
+                NONE => Value::None,
+                NEWTRUE => Value::Bool(true),
+                NEWFALSE => Value::Bool(false),
+                BININT1 => Value::Int(i128::from(arg[0])),
+                BININT2 => Value::Int(i128::from(u16::from_le_bytes([arg[0], arg[1]]))),
+                BININT => Value::Int(i128::from(i32::from_le_bytes(
+                    arg.try_into().map_err(|_| other)?,
+                ))),
+                LONG1 => Value::Int(long(&arg[1..])?),
+                LONG4 => Value::Int(long(&arg[4..])?),
+                BINFLOAT => Value::Float(f64::from_be_bytes(arg.try_into().map_err(|_| other)?)),
+                BINUNICODE => {
+                    let text = std::str::from_utf8(&arg[4..])
+                        .map_err(|_| Unsupported("a str that is not UTF-8"))?;
+                    self.heap.str_object(text)
+                }
+                SHORT_BINBYTES => self.heap.bytes_object(&arg[1..]),
+                BINBYTES => self.heap.bytes_object(&arg[4..]),
+                GLOBAL => {
+                    let text = std::str::from_utf8(arg).map_err(|_| other)?;
+                    let mut lines = text.split('\n');
+                    let (Some(module), Some(name)) = (lines.next(), lines.next()) else {
+                        return Err(other);
+                    };
+                    self.heap.new_class(module, name)
+                }
+                EMPTY_TUPLE => self.heap.new_tuple(Vec::new()),
+                TUPLE1 | TUPLE2 | TUPLE3 => {
+                    let n = usize::from(opcode - TUPLE1) + 1;
+                    let items = pop_values(&mut stack, n)?;
+                    self.heap.new_tuple(items)
+                }
+                TUPLE => {
+                    let items = pop_mark(&mut stack)?;
+                    self.heap.new_tuple(items)
+                }
+                EMPTY_LIST => Value::Object(self.heap.push(Object::List(Vec::new()))),
+                EMPTY_DICT => Value::Object(self.heap.push(Object::Dict(Vec::new()))),
+                APPEND | APPENDS => {
+                    let items = if opcode == APPEND {
+                        pop_values(&mut stack, 1)?
+                    } else {
+                        pop_mark(&mut stack)?
+                    };
+                    let id = fillable(&stack)?;
+                    match &mut self.heap.objects[id.0 as usize] {
+                        Object::List(list) => list.extend(items),
+                        _ => return Err(other),
+                    }
+                    continue;
+                }
+                SETITEM | SETITEMS => {
+                    let flat = if opcode == SETITEM {
+                        pop_values(&mut stack, 2)?
+                    } else {
+                        pop_mark(&mut stack)?
+                    };
+                    let id = fillable(&stack)?;
+                    let Object::Dict(items) = self.heap.get(id) else {
+                        return Err(other);
+                    };
+                    let items = self.heap.set_items(items.clone(), &flat)?;
+                    self.heap.objects[id.0 as usize] = Object::Dict(items);
+                    continue;
+                }
+                BINPUT | LONG_BINPUT => {
+                    let index = if opcode == BINPUT {
+                        u32::from(arg[0])
+                    } else {
+                        u32::from_le_bytes(arg.try_into().map_err(|_| other)?)
+                    };
+                    let Some(Slot::Value(value, _)) = stack.last() else {
+                        return Err(other);
+                    };
+                    self.memo.insert(index, *value);
+                    continue;
+                }
+                BINGET | LONG_BINGET => {
+                    let index = if opcode == BINGET {
+                        u32::from(arg[0])
+                    } else {
+                        u32::from_le_bytes(arg.try_into().map_err(|_| other)?)
+                    };
+                    let value = *self
+                        .memo
+                        .get(&index)
+                        .ok_or(Unsupported("a memo get without its put"))?;
+                    if let Value::Object(id) = value {
+                        let on_stack = stack.iter().any(
+                            |slot| matches!(slot, Slot::Value(Value::Object(x), _) if *x == id),
+                        );
+                        if (on_stack && self.heap.fillable(id)) || self.open.contains(&id) {
+                            return Err(Unsupported("a container that holds itself"));
+                        }
+                    }
+                    stack.push(Slot::Value(value, true));
+                    continue;
+                }
+                BINPERSID => {
+                    let [data] = pop_values(&mut stack, 1)?[..] else {
+                        return Err(other);
+                    };
+                    self.heap.reference_of(data)?
+                }
+                REDUCE => {
+                    let [callable, args] = pop_values(&mut stack, 2)?[..] else {
+                        return Err(other);
+                    };
+                    self.heap.reduce(callable, args)?
+                }
+                NEWOBJ => {
+                    let [class, args] = pop_values(&mut stack, 2)?[..] else {
+                        return Err(other);
+                    };
+                    if self.heap.class(class).is_none() || self.heap.tuple(args).is_none() {
+                        return Err(Unsupported("a NEWOBJ of another form"));
+                    }
+                    Value::Object(self.heap.push(Object::Instance(Instance {
+                        made: Made::New,
+                        class,
+                        args,
+                        state: None,
+                    })))
+                }
+                BUILD => {
+                    let [state] = pop_values(&mut stack, 1)?[..] else {
+                        return Err(other);
+                    };
+                    let id = fillable(&stack)?;
+                    match &mut self.heap.objects[id.0 as usize] {
+                        Object::Instance(instance) if instance.state.is_none() => {
+                            instance.state = Some(state);
+                        }
+                        _ => return Err(Unsupported("a BUILD of another form")),
+                    }
+                    continue;
+                }
+                _ => return Err(Unsupported("an opcode that the model does not model")),
+            };
+            stack.push(Slot::Value(value, false));
+        }
+        match stack[..] {
+            [Slot::Value(value, _)] => Ok(value),
+            _ => Err(other),
+        }
+    }
+}
+
+impl Heap {
+    /// Tells if the object of `id` can take items or a state: a list, a
+    /// dict or an object of another class.
+    fn fillable(&self, id: ObjectId) -> bool {
+        matches!(
+            self.get(id),
+            Object::List(_) | Object::Dict(_) | Object::Instance(_)
+        )
+    }
+}
+
+/// Returns the object on top of the stack of [`Loader::opaque`], to fill it.
+/// An object that a memo get pushed is complete and takes nothing more.
+fn fillable(stack: &[Slot]) -> Result<ObjectId, Unsupported> {
+    match stack.last() {
+        Some(Slot::Value(Value::Object(id), false)) => Ok(*id),
+        _ => Err(Unsupported("a fill of a value that is complete")),
+    }
+}
+
+/// Pops the last `n` values of the stack of [`Loader::opaque`], in order.
+fn pop_values(stack: &mut Vec<Slot>, n: usize) -> Result<Vec<Value>, Unsupported> {
+    let other = Unsupported("an opaque construct of another form");
+    let start = stack.len().checked_sub(n).ok_or(other)?;
+    stack
+        .drain(start..)
+        .map(|slot| match slot {
+            Slot::Value(value, _) => Ok(value),
+            Slot::Mark => Err(other),
+        })
+        .collect()
+}
+
+/// Pops the values above the last mark of the stack of [`Loader::opaque`],
+/// and the mark.
+fn pop_mark(stack: &mut Vec<Slot>) -> Result<Vec<Value>, Unsupported> {
+    let mark = stack
+        .iter()
+        .rposition(|slot| matches!(slot, Slot::Mark))
+        .ok_or(Unsupported("an opaque construct of another form"))?;
+    let values = pop_values(stack, stack.len() - mark - 1)?;
+    stack.pop();
+    Ok(values)
+}
+
+/// Returns the int of the two's complement bytes of LONG1 or LONG4,
+/// little-endian, if it fits 128 bits.
+fn long(bytes: &[u8]) -> Result<i128, Unsupported> {
+    if bytes.len() > 16 {
+        return Err(Unsupported("an int that does not fit 128 bits"));
+    }
+    let fill = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        0xff
+    } else {
+        0
+    };
+    let mut le = [fill; 16];
+    le[..bytes.len()].copy_from_slice(bytes);
+    Ok(i128::from_le_bytes(le))
 }
 
 /// Returns the value of an int node, if it fits 128 bits.
@@ -839,6 +1344,8 @@ const BATCH: usize = 1000;
 pub struct Pickler<'h> {
     heap: &'h Heap,
     memo: HashMap<ObjectId, u32>,
+    /// The next memo index.
+    next: u32,
     out: Vec<u8>,
 }
 
@@ -850,6 +1357,10 @@ enum Step {
     Byte(u8),
     /// Put an object in the memo, and write the put.
     Memoize(ObjectId),
+    /// Write the put of an object that the pickler makes for one save,
+    /// such as the list of the items of a set: it takes a memo index, and
+    /// nothing gets it.
+    MemoizeFresh,
 }
 
 impl<'h> Pickler<'h> {
@@ -858,6 +1369,7 @@ impl<'h> Pickler<'h> {
         Pickler {
             heap,
             memo: HashMap::new(),
+            next: 0,
             out: Vec::new(),
         }
     }
@@ -870,6 +1382,7 @@ impl<'h> Pickler<'h> {
             match step {
                 Step::Byte(byte) => self.out.push(byte),
                 Step::Memoize(id) => self.memoize(id),
+                Step::MemoizeFresh => self.memoize_fresh(),
                 Step::Save(value) => self.save(value, &mut steps)?,
             }
         }
@@ -968,6 +1481,34 @@ impl<'h> Pickler<'h> {
                 self.memoize(id);
                 steps.extend(dict_steps(items).into_iter().rev());
             }
+            Object::Instance(instance) => {
+                // `save_reduce`: the class or the callable, the arguments,
+                // NEWOBJ or REDUCE, the put of the object, then the state
+                // and BUILD.
+                if let Some(state) = instance.state {
+                    steps.push(Step::Byte(BUILD));
+                    steps.push(Step::Save(state));
+                }
+                steps.push(Step::Memoize(id));
+                steps.push(Step::Byte(match instance.made {
+                    Made::New => NEWOBJ,
+                    Made::Reduce => REDUCE,
+                }));
+                steps.push(Step::Save(instance.args));
+                steps.push(Step::Save(instance.class));
+            }
+            Object::Set { class, items } => {
+                // `set.__reduce__` gives `(type, (list(self),), None)`: a
+                // new list and a new tuple for each save.
+                steps.push(Step::Memoize(id));
+                steps.push(Step::Byte(REDUCE));
+                steps.push(Step::MemoizeFresh);
+                steps.push(Step::Byte(TUPLE1));
+                steps.extend(list_steps(items).into_iter().rev());
+                steps.push(Step::MemoizeFresh);
+                steps.push(Step::Byte(EMPTY_LIST));
+                steps.push(Step::Save(*class));
+            }
             Object::Reference(_) => unreachable!("a reference is saved above"),
         }
         Ok(())
@@ -1008,8 +1549,15 @@ impl<'h> Pickler<'h> {
     }
 
     fn memoize(&mut self, id: ObjectId) {
-        let index = u32::try_from(self.memo.len()).expect("fewer than 2^32 memo entries");
+        let index = self.next;
+        self.next = index.checked_add(1).expect("fewer than 2^32 memo entries");
         self.memo.insert(id, index);
+        self.memo_op(index, BINPUT, LONG_BINPUT);
+    }
+
+    fn memoize_fresh(&mut self) {
+        let index = self.next;
+        self.next = index.checked_add(1).expect("fewer than 2^32 memo entries");
         self.memo_op(index, BINPUT, LONG_BINPUT);
     }
 
@@ -1274,6 +1822,116 @@ mod tests {
             let tree = decode_record(&record).unwrap();
             assert_eq!(heap.load(&tree), Err(Unsupported(what)), "{state:?}");
         }
+    }
+
+    /// The record of a persistent object of `__main__.Doc` with a str, a
+    /// `DateTime`, a tuple and a set, as ZODB 6 writes it with Python 3.13.
+    const DOC: &[u8] = b"\x80\x03c__main__\nDoc\nq\x00.\x80\x03}q\x01(X\x05\x00\x00\x00titleq\x02\
+        X\x01\x00\x00\x00aq\x03X\x11\x00\x00\x00modification_dateq\x04cDateTime.DateTime\nDateTime\n\
+        q\x05)\x81q\x06\x8a\x07@\xf3L\xf6^G\x06\x89X\x03\x00\x00\x00UTCq\x07\x87q\x08b\
+        X\x07\x00\x00\x00subjectq\tX\x01\x00\x00\x00xq\nX\x01\x00\x00\x00yq\x0b\x86q\x0c\
+        X\x04\x00\x00\x00tagsq\rcbuiltins\nset\nq\x0e]q\x0f(K\x01K\x02e\x85q\x10Rq\x11u.";
+
+    #[test]
+    fn a_heap_with_instances_loads_objects_and_sets_and_pickles_them_again() {
+        let mut heap = Heap::with_instances();
+        let (class, state) = heap.load(&decode_record(DOC).unwrap()).unwrap();
+        assert_eq!(dump(&heap, class, state), DOC);
+        let fields = heap.dict(state).unwrap().to_vec();
+        let date = heap.instance(fields[1].1).unwrap();
+        assert_eq!(date.made, Made::New);
+        assert_eq!(
+            heap.class(date.class),
+            Some(("DateTime.DateTime", "DateTime"))
+        );
+        let micros = heap.tuple(date.state.unwrap()).unwrap()[0];
+        assert_eq!(micros, Value::Int(1_767_323_045_000_000));
+        let Some(Object::Set { items, .. }) = heap.object(fields[3].1) else {
+            panic!("a set");
+        };
+        assert_eq!(items, &[Value::Int(1), Value::Int(2)]);
+        // A heap without instances refuses the same record.
+        let mut strict = Heap::new();
+        assert!(strict.load(&decode_record(DOC).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_reduce_and_a_new_set_pickle_as_python_does() {
+        // `datetime.date(2026, 1, 2)` and `{3}`, in a tuple, with Python
+        // 3.13 and protocol 3.
+        let state: &[u8] =
+            b"\x80\x03cdatetime\ndate\nq\x01C\x04\x07\xea\x01\x02q\x02\x85q\x03Rq\x04\
+            cbuiltins\nset\nq\x05]q\x06K\x03a\x85q\x07Rq\x08\x86q\x09.";
+        let mut heap = Heap::with_instances();
+        let (class, value) = load(&mut heap, state);
+        assert_eq!(dump(&heap, class, value), [CLASS, state].concat());
+        let items = heap.tuple(value).unwrap().to_vec();
+        assert_eq!(heap.instance(items[0]).unwrap().made, Made::Reduce);
+        // A set that a merge makes takes a new list and a new tuple.
+        let Some(Object::Set { class: set, .. }) = heap.object(items[1]) else {
+            panic!("a set");
+        };
+        let made = heap.new_set(*set, vec![Value::Int(3)]);
+        let pair = heap.new_tuple(vec![items[0], made]);
+        assert_eq!(dump(&heap, class, pair), [CLASS, state].concat());
+    }
+
+    #[test]
+    fn same_compares_the_structure() {
+        let mut heap = Heap::with_instances();
+        let (_, one) = heap.load(&decode_record(DOC).unwrap()).unwrap();
+        let (_, two) = heap.load(&decode_record(DOC).unwrap()).unwrap();
+        assert_ne!(one, two);
+        assert!(heap.same(one, two));
+        assert!(!heap.same(Value::Int(1), Value::Bool(true)));
+        assert!(heap.same(Value::Float(f64::NAN), Value::Float(f64::NAN)));
+        let a = heap.new_dict(vec![
+            (Value::Int(1), Value::Int(1)),
+            (Value::Int(2), Value::Int(2)),
+        ]);
+        let b = heap.new_dict(vec![
+            (Value::Int(2), Value::Int(2)),
+            (Value::Int(1), Value::Int(1)),
+        ]);
+        assert!(!heap.same(a, b));
+        // Python cannot tell if two objects of another class are equal.
+        let fields = heap.dict(one).unwrap().to_vec();
+        let other = heap.dict(two).unwrap().to_vec();
+        assert_eq!(heap.eq(fields[1].1, other[1].1), Err(Undecided::Unknown));
+    }
+
+    #[test]
+    fn mutable_objects_lists_what_a_value_holds() {
+        let mut heap = Heap::with_instances();
+        let (_, state) = heap.load(&decode_record(DOC).unwrap()).unwrap();
+        let fields = heap.dict(state).unwrap().to_vec();
+        // The str and the tuple hold nothing mutable; the DateTime and the
+        // set are mutable objects.
+        assert!(heap.mutable_objects(fields[0].1).is_empty());
+        assert!(heap.mutable_objects(fields[2].1).is_empty());
+        assert_eq!(heap.mutable_objects(fields[1].1).len(), 1);
+        assert_eq!(heap.mutable_objects(state).len(), 3);
+    }
+
+    #[test]
+    fn an_opaque_value_never_holds_itself() {
+        // An object whose state names the object.
+        let state: &[u8] = b"\x80\x03cm\nD\nq\x01)\x81q\x02}q\x03X\x01\x00\x00\x00sq\x04h\x02sb.";
+        let mut heap = Heap::with_instances();
+        let record = [CLASS, state].concat();
+        assert_eq!(
+            heap.load(&decode_record(&record).unwrap()),
+            Err(Unsupported("a container that holds itself"))
+        );
+        // A REDUCE of `copyreg._reconstructor` pickles again with NEWOBJ.
+        let state: &[u8] =
+            b"\x80\x03ccopyreg\n_reconstructor\nq\x01cm\nD\nq\x02cbuiltins\nobject\n\
+            q\x03N\x87q\x04Rq\x05.";
+        let record = [CLASS, state].concat();
+        assert_eq!(
+            heap.load(&decode_record(&record).unwrap()),
+            Err(Unsupported("an object of copy_reg._reconstructor"))
+        );
     }
 
     #[test]
