@@ -2297,6 +2297,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "thiserror",
+ "xxhash-rust",
  "zoe-core",
  "zoe-pickle",
 ]
