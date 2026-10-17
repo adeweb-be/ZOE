@@ -3,7 +3,8 @@
 //! The check walks every record key of the store in key order. It reads
 //! each record, deletions too, and the blob record of each key, so each
 //! frame passes its checksum or gives a finding. It reads and hashes each
-//! blob file. It reads each transaction row and each sequence row. Of each
+//! blob file. It reads each transaction row, each sequence row and each row
+//! of the KV namespaces (`Store::verify_kv`). Of each
 //! oid, the newest record is the current record. A current record gives
 //! its class, from the class pickle alone, and its persistent references,
 //! from `zoe_pickle::persistent_ids`. No unpickler runs.
@@ -24,8 +25,8 @@ use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
 /// The number of record keys that one read of the walk takes.
 const KEY_CHUNK: usize = 1024;
 
-/// A frame that does not read: a record, a blob record, a transaction row
-/// or a sequence row.
+/// A frame that does not read: a record, a blob record, a transaction row,
+/// a sequence row or a row of a KV namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameProblem {
     /// The oid of the record or of the blob record. A transaction row and
@@ -34,7 +35,9 @@ pub struct FrameProblem {
     /// The tid of the frame, when the store gives it. A sequence row has
     /// none.
     pub tid: Option<Tid>,
-    /// What is wrong. For a sequence row, the text names the sequence.
+    /// What is wrong. For a sequence row, the text names the sequence. For
+    /// a row of a namespace, it names the flavour, the namespace and the
+    /// xxh3-64 hash of the key, never the key.
     pub error: String,
 }
 
@@ -88,6 +91,12 @@ pub struct Verification {
     pub transactions: u64,
     /// The sequence rows that read.
     pub sequences: u64,
+    /// The keys of the ephemeral namespaces, expired keys included.
+    pub ephemeral_keys: u64,
+    /// The keys of the durable namespaces, without the generation rows.
+    pub durable_keys: u64,
+    /// The expired ephemeral keys that wait for a sweep step.
+    pub expired_keys: u64,
     /// The record keys, deletions too.
     pub records: u64,
     /// The oids with a current record.
@@ -140,6 +149,7 @@ pub fn verify(store: &Store, known: Option<&BTreeSet<String>>) -> Verification {
     let mut report = Verification::default();
     rows(store, &mut report);
     sequences(store, &mut report);
+    namespaces(store, &mut report);
     let mut walk = Walk::default();
     records(store, &mut report, &mut walk);
     report.object_count = store.object_count();
@@ -204,6 +214,39 @@ fn sequences(store: &Store, report: &mut Verification) {
             oid: None,
             tid: None,
             error,
+        });
+    }
+}
+
+/// Read every row of the KV namespaces. Each problem is a finding in the
+/// checksums, as for a sequence row.
+fn namespaces(store: &Store, report: &mut Verification) {
+    let check = match store.verify_kv() {
+        Ok(check) => check,
+        Err(error) => {
+            report.checksums.push(frame_problem(None, error));
+            return;
+        }
+    };
+    report.ephemeral_keys = check.ephemeral_keys;
+    report.durable_keys = check.durable_keys;
+    report.expired_keys = check.expired_keys;
+    for finding in check.findings {
+        let namespace = finding
+            .namespace
+            .map_or_else(|| "a namespace".to_owned(), |name| format!("{name:?}"));
+        let key = finding
+            .key_hash
+            .map(|hash| format!(", the key of xxh3-64 {hash:#018x}"))
+            .unwrap_or_default();
+        report.checksums.push(FrameProblem {
+            oid: None,
+            tid: None,
+            error: format!(
+                "{} namespace {namespace}{key}: {}",
+                finding.flavour.name(),
+                finding.problem
+            ),
         });
     }
 }
@@ -570,6 +613,27 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rows_of_the_namespaces_are_read_and_counted() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let ttl = Some(std::time::Duration::from_secs(60));
+        txn.kv_set(zoe_core::Flavour::Ephemeral, "sessions", b"s", b"v", ttl)
+            .unwrap();
+        txn.kv_set(zoe_core::Flavour::Durable, "registry", b"a", b"1", None)
+            .unwrap();
+        txn.kv_set(zoe_core::Flavour::Durable, "registry", b"b", b"2", None)
+            .unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        let report = verify(&store, None);
+        assert_eq!(
+            (report.ephemeral_keys, report.durable_keys, report.expired_keys),
+            (1, 2, 0)
+        );
+        assert_eq!(report.problems(), 0, "{report:?}");
     }
 
     #[test]

@@ -237,6 +237,11 @@ fn to_json(report: &Verification) -> Value {
         "classes": report.classes,
         "unknown_classes": report.unknown_classes,
         "object_count": report.object_count,
+        "namespaces": {
+            "ephemeral_keys": report.ephemeral_keys,
+            "durable_keys": report.durable_keys,
+            "expired_keys": report.expired_keys,
+        },
         "count": report.count.map(|c| json!({"stored": c.stored, "counted": c.counted})),
     })
 }
@@ -257,6 +262,9 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "Verified the store {}", path.display())?;
     writeln!(out, "  transactions     {}", report.transactions)?;
     writeln!(out, "  sequences        {}", report.sequences)?;
+    writeln!(out, "  ephemeral keys   {}", report.ephemeral_keys)?;
+    writeln!(out, "  durable keys     {}", report.durable_keys)?;
+    writeln!(out, "  expired keys     {}", report.expired_keys)?;
     writeln!(out, "  records          {}", report.records)?;
     writeln!(out, "  objects          {}", report.objects)?;
     writeln!(out, "  blobs            {}", report.blobs)?;
