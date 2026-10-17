@@ -578,6 +578,33 @@ impl Backend for RedbBackend {
         }))
     }
 
+    fn txns_before(&self, before: Tid, limit: usize) -> Result<Vec<TxnMeta>> {
+        if before == Tid::ZERO || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (start, end) = (
+            format::txn_key(Tid::ZERO),
+            format::txn_key(Tid(before.0 - 1)),
+        );
+        let txn = self.db.begin_read().map_err(backend)?;
+        let txns = txn.open_table(TXNS).map_err(backend)?;
+        let mut rows = Vec::new();
+        // Each key is before the key before it.
+        let mut prior = Included(end);
+        for entry in txns
+            .range::<&[u8; 8]>(&start..=&end)
+            .map_err(backend)?
+            .rev()
+            .take(limit)
+        {
+            let (key, value) = entry.map_err(backend)?;
+            inside_txns(key.value(), (Included(start), prior))?;
+            prior = Excluded(*key.value());
+            rows.push(Self::txn_row(key.value(), value.value())?);
+        }
+        Ok(rows)
+    }
+
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>> {
         let txn = self.db.begin_read().map_err(backend)?;
         let records = txn.open_table(RECORDS).map_err(backend)?;

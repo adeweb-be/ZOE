@@ -3,8 +3,8 @@
 An unmodified `ZEO.ClientStorage` gets from `zoe serve`:
 
 - `get_info` at registration: `length`, `size`, `name`, `supportsUndo`
-  (false until phase 4), `supports_record_iternext` and `interfaces`, the
-  storage interfaces that the store provides;
+  (true), `supports_record_iternext` and `interfaces`, the storage
+  interfaces that the store provides, `IStorageUndoable` included;
 - `get_size_info`, `server_status` with the keys of ZEO's own server, the
   `ruok` status protocol, `ping` and `set_client_label`;
 - `history`, `loadSerial` and `record_iternext`, with the errors of ZODB.
@@ -83,8 +83,8 @@ def test_get_info_describes_the_store(storage):
     import ZODB.interfaces
 
     info = storage._info
-    assert info["supportsUndo"] is False
-    assert storage.supportsUndo() is False
+    assert info["supportsUndo"] is True
+    assert storage.supportsUndo() is True
     assert info["supports_record_iternext"] is True
     assert isinstance(info["name"], str)
     assert isinstance(info["length"], int)
@@ -95,12 +95,12 @@ def test_get_info_describes_the_store(storage):
         "IStorageIteration",
         "IStorageCurrentRecordIteration",
         "IStorageRestoreable",
+        "IStorageUndoable",
     ]:
         assert ("ZODB.interfaces", name) in interfaces, name
-    assert ("ZODB.interfaces", "IStorageUndoable") not in interfaces
     # ClientStorage takes the interfaces of the server as its own.
     assert ZODB.interfaces.IStorageIteration.providedBy(storage)
-    assert not ZODB.interfaces.IStorageUndoable.providedBy(storage)
+    assert ZODB.interfaces.IStorageUndoable.providedBy(storage)
 
 
 def test_size_info_and_length(storage):

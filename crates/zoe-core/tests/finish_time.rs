@@ -184,6 +184,10 @@ impl Vfs for TimedVfs {
         self.vfs.rename(from, to)
     }
 
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        self.vfs.hard_link(from, to)
+    }
+
     fn remove(&self, name: &str) -> io::Result<()> {
         self.vfs.remove(name)
     }

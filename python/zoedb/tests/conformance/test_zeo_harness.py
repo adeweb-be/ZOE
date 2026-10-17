@@ -39,13 +39,8 @@ MIXINS = {
     ("ZEO.tests.testZEO", "MiscZEOTests"),
 }
 
-UNDO = "the storage does not undo: supportsUndo() is false"
-
-# The tests of these mixins that need undo.
-SKIPS = {
-    "RevisionStorage.checkLoadBeforeUndo": UNDO,
-    "RevisionStorage.testLoadBeforeUndo": UNDO,
-}
+# The tests of these mixins that the harness does not run, and why.
+SKIPS = {}
 
 
 def defining_class(test):
@@ -88,7 +83,7 @@ def test_the_forker_of_zeo_starts_zoe_serve():
         storage = ClientStorage(addr, wait_timeout=30)
         try:
             # It is zoe serve: the store has the format of ZOE.
-            assert storage._info["supportsUndo"] is False
+            assert storage._info["supportsUndo"] is True
             oid = storage.new_oid()
             txn = TransactionMetaData()
             storage.tpc_begin(txn)

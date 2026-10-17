@@ -6,14 +6,13 @@ This is the gate "ZEO tests green" of phase 2 (F2, F9, F13, F22, F27, N2).
 a ZEO server (`test_zeo_harness.py` describes it).
 
 The run collects the test suites of ZEO unchanged, from the modules in
-`MODULES`, and runs every test. A test passes, or is skipped for undo
-(`supportsUndo()` is false until phase 3), or is in `OUT` with its
+`MODULES`, and runs every test. A test passes, or is in `OUT` with its
 reason, or skips itself, as ZEO's suites do on some platforms. `OUT`
 holds the tests that drive ZEO's own server objects in the test process,
 run `runzeo` or a ZEO 4 server, read the logs of ZEO's server, or run a
 Python storage inside the server, which a server without Python cannot do.
-It also holds the tests that call undo under a name without "undo". ZOE's
-own acceptance tests cover the behaviour of most of them, as `OUT` says.
+It also holds the undo tests that zoe serve cannot pass. ZOE's own
+acceptance tests cover the behaviour of most of them, as `OUT` says.
 
 Before the card of this gate moves to Ready, the planner checks `OUT`
 against a run of the harness. The builder never changes it: a test that
@@ -53,7 +52,18 @@ OUT_MODULES = {
     "ZEO.tests.testZEOOptions": "it tests the options of runzeo",
 }
 
-UNDO = "the storage does not undo: supportsUndo() is false"
+# The undo tests that zoe serve cannot pass, and why.
+SERVER_PYTHON = (
+    "it undoes a transaction whose object a later transaction changed again; "
+    "only the Python _p_resolveConflict of its test class PCounter can merge "
+    "that undo, and zoe serve runs no Python, so the undo fails with "
+    "UndoError; test_undo.py checks the undos that the merge tiers resolve"
+)
+DATA_TXN = (
+    "it checks that the record of an undo names the tid of the record that it "
+    "copies (data_txn); the store keeps every pickle whole and no back "
+    "pointer, so data_txn is None, and a back pointer is a format change"
+)
 
 # The tests of the collected modules that the run does not run, and why. A
 # name is the class that defines the test and its method, or the name of a
@@ -92,7 +102,12 @@ OUT = {
     "FileStorageLoadDelayedTests": (
         "it wraps the storage of the server in a Python storage"
     ),
-    "RecoveryStorage.testRestoreAcrossPack": "it calls undo, and " + UNDO,
+    "ConflictResolvingTransUndoStorage.testUndoConflictResolution": SERVER_PYTHON,
+    "TransactionalUndoStorage.testUndoMultipleConflictResolution": SERVER_PYTHON,
+    "TransactionalUndoStorage.testUndoMultipleConflictResolutionReversed": (
+        SERVER_PYTHON
+    ),
+    "TransactionalUndoStorage.testTransactionalUndoIterator": DATA_TXN,
 }
 
 
@@ -108,11 +123,6 @@ def name_of(test):
 
 def class_of(test):
     return type(test).__name__
-
-
-def is_undo(test):
-    name = name_of(test)
-    return "undo" in name.lower() or "Undo" in class_of(test)
 
 
 def walk(suite, layers=()):
@@ -140,9 +150,6 @@ def run(module_name):
         for test, layers in walk(suite_of(module_name), (zoe.testing.ZEO_LAYER,)):
             name = name_of(test)
             if name in OUT or class_of(test) in OUT:
-                continue
-            if is_undo(test):
-                result.addSkip(test, UNDO)
                 continue
             for layer in layers:
                 if layer not in started:

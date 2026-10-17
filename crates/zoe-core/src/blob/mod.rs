@@ -51,6 +51,7 @@ use crate::vfs::{DirLock, Vfs, WriteFile, parent};
 pub(crate) trait BlobDir: Send + Sync {
     fn exists(&self, name: &str) -> io::Result<bool>;
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()>;
     fn remove(&self, name: &str) -> io::Result<()>;
     fn sync_dir_at(&self, dir: &str) -> io::Result<()>;
     fn create_dir(&self, name: &str) -> io::Result<()>;
@@ -71,6 +72,10 @@ impl<V: Vfs> BlobDir for V {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         Vfs::rename(self, from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        Vfs::hard_link(self, from, to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -148,6 +153,10 @@ impl BlobDir for ReadOnlyDir {
     }
 
     fn rename(&self, from: &str, _to: &str) -> io::Result<()> {
+        Err(self.refused(from))
+    }
+
+    fn hard_link(&self, from: &str, _to: &str) -> io::Result<()> {
         Err(self.refused(from))
     }
 
@@ -272,6 +281,17 @@ impl BlobDir for Relocated {
             ));
         }
         dir.rename(&from, &to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        let (dir, from) = self.locate(from);
+        let (to_dir, to) = self.locate(to);
+        if !std::ptr::addr_eq(dir, to_dir) {
+            return Err(io::Error::other(
+                "a hard link between the store directory and the blob directory",
+            ));
+        }
+        dir.hard_link(&from, &to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -733,8 +753,70 @@ impl BlobStore {
                 hash: [0; 32],
                 size: 0,
             },
+            linked: false,
         };
         blob.record = self.hash(&temp)?;
+        Ok(blob)
+    }
+
+    /// Return a blob of the store `store` whose file is a hard link to the
+    /// committed blob file of `oid` at `tid`. `record` is the blob record of
+    /// that file. The link gets a new temporary name in `blobs/tmp/`, so
+    /// `place` renames it into its place as it does any other blob. No byte
+    /// is copied, and the committed file does not change. A missing file is
+    /// a corrupt blob.
+    ///
+    /// The committed file is durable, so the link needs no sync before the
+    /// intent file of the finish. A crash before the finish leaves the
+    /// temporary name, and the next open removes it, not the committed
+    /// file.
+    ///
+    /// When the filesystem cannot link (`cannot_link`), the call copies the
+    /// bytes into a new temporary file and syncs it. So it writes a new
+    /// file, and no blob file is written again.
+    pub(crate) fn link(
+        &self,
+        store: Weak<Opened>,
+        oid: Oid,
+        tid: Tid,
+        record: BlobRecord,
+    ) -> Result<PendingBlob> {
+        self.make_ready()?;
+        let committed = blob_name(oid, tid);
+        let temp = self.new_temp_name();
+        let linked = match self.dir.hard_link(&committed, &temp) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ZoeError::CorruptBlob { oid, tid });
+            }
+            Err(e) if cannot_link(&e) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if linked {
+            return Ok(PendingBlob {
+                store,
+                temp: Some(temp),
+                record,
+                linked,
+            });
+        }
+        let mut file = self.dir.create_file(&temp)?;
+        // The blob owns the new file from here, so an error removes it.
+        let blob = PendingBlob {
+            store,
+            temp: Some(temp),
+            record,
+            linked,
+        };
+        let mut source = match self.dir.read_file(&committed) {
+            Ok(source) => source,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ZoeError::CorruptBlob { oid, tid });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        io::copy(&mut source, &mut file)?;
+        file.sync()?;
         Ok(blob)
     }
 
@@ -802,7 +884,10 @@ impl BlobStore {
                 self.create_dir(&level)?;
             }
             let temp = blob.temp.as_deref().expect("a blob is placed once");
-            self.dir.set_read_only(temp)?;
+            // A link names a committed file, which is read-only already.
+            if !blob.linked {
+                self.dir.set_read_only(temp)?;
+            }
             self.dir.rename(temp, &blob_name(oid, tid))?;
             blob.temp = None;
             self.dir.sync_dir_at(&dir)?;
@@ -929,6 +1014,21 @@ impl BlobStore {
     }
 }
 
+/// Tell if `error`, of a hard link, says that the filesystem cannot link
+/// the file: the two names are on two devices, the filesystem refuses or
+/// does not have links, or the file has the most links that it can have.
+/// FAT and exFAT on macOS give `ENOTSUP`, which Rust does not map to
+/// `Unsupported`, so the code of the system counts too. On Linux
+/// `ENOTSUP` is `EOPNOTSUPP`.
+fn cannot_link(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::CrossesDevices
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::Unsupported
+    ) || matches!(error.raw_os_error(), Some(code) if code == libc::EMLINK || code == libc::ENOTSUP)
+}
+
 /// Tell if `file`, a name in `blobs/tmp/`, has the form of a temporary file
 /// of the core: digits, then `.tmp`.
 fn is_temp_name(file: &str) -> bool {
@@ -1028,6 +1128,7 @@ impl BlobFile {
                 hash: *self.hasher.finalize().as_bytes(),
                 size: self.size,
             },
+            linked: false,
         })
     }
 }
@@ -1075,6 +1176,8 @@ pub(crate) struct PendingBlob {
     /// The temporary file. It is `None` after `place` renamed it.
     temp: Option<String>,
     record: BlobRecord,
+    /// True when the file is a hard link of a committed blob file.
+    linked: bool,
 }
 
 impl PendingBlob {
