@@ -292,11 +292,21 @@ impl ResolutionLog {
     /// write never fails the vote. Returns the error of the first failed
     /// write, for the log of the storage.
     fn write(&self, txn: &SharedTxn) -> Option<String> {
-        if txn.resolutions().is_empty() {
+        self.write_lines(txn.resolution_log_lines(SystemTime::now(), None))
+    }
+
+    /// Writes the lines of the checks of the merges of shadow mode of the
+    /// vote after `_vote_resolving` (ADR 0046), as `write` does.
+    fn write_verifications(&self, txn: &SharedTxn) -> Option<String> {
+        self.write_lines(txn.verification_log_lines(SystemTime::now(), None))
+    }
+
+    fn write_lines(&self, lines: Vec<String>) -> Option<String> {
+        if lines.is_empty() {
             return None;
         }
         let mut text = String::new();
-        for line in txn.resolution_log_lines(SystemTime::now(), None) {
+        for line in lines {
             text.push_str(&line);
             text.push('\n');
         }
@@ -1042,8 +1052,26 @@ impl Storage {
     /// checks the serials again with the locks of `_vote_resolving`.
     fn tpc_vote(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<()> {
         let entry = self.entry(py, transaction)?;
-        py.detach(|| entry.with(|txn| txn.vote().map_err(|error| vote_failure(txn, error))))
-            .map_err(|failure| failure.into_py(py))
+        let log = self.resolution_log.clone();
+        let mut log_failure = None;
+        let voted = py
+            .detach(|| {
+                entry.with(|txn| {
+                    let voted = txn.vote();
+                    // The vote after `_vote_resolving` compares the merges
+                    // of shadow mode with the resolved records: log what it
+                    // found, also when the vote failed.
+                    if let Some(log) = &log {
+                        log_failure = log.write_verifications(txn);
+                    }
+                    voted.map_err(|error| vote_failure(txn, error))
+                })
+            })
+            .map_err(|failure| failure.into_py(py));
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        voted
     }
 
     /// Return the oids that tier 1 of the core merged in the last vote of

@@ -1653,10 +1653,21 @@ impl Transaction {
         let native = std::mem::take(&mut open.native);
         let jobs = std::mem::take(&mut open.jobs);
         let voted = match &mut open.txn {
-            Ok(txn) if listed > 0 => txn
-                .vote()
-                .map(|()| Voted::default())
-                .map_err(|error| Fault::of_vote(&error, txn)),
+            Ok(txn) if listed > 0 => {
+                let voted = txn
+                    .vote()
+                    .map(|()| Voted::default())
+                    .map_err(|error| Fault::of_vote(&error, txn));
+                // The second vote compares the merges of shadow mode with
+                // the records of the client: log and count what it found.
+                storage.metrics.count_verifications(txn.verifications());
+                if let Some(log) = &storage.resolution_log
+                    && !txn.verifications().is_empty()
+                {
+                    log.write(&txn.verification_log_lines(SystemTime::now(), Some(&storage.name)));
+                }
+                voted
+            }
             Ok(txn) => {
                 let voted = attach(txn, jobs).and_then(|()| vote_resolving(txn));
                 // The vote that takes the locks runs tier 1: log and count

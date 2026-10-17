@@ -1,0 +1,164 @@
+"""The merge policy of a store (ADR 0046).
+
+The policy is the persistent object ``root['zoe.merge_policy']`` of the
+database, of the class `MergePolicy`. It is a record like any other: it
+commits or aborts with its transaction, it has a history, and the store
+reads it again at the next vote with a conflict after a change. It holds
+plain values only, so the core reads it in Rust, in-process and in
+``zoe serve``:
+
+- ``version``: an int; each `install` adds 1;
+- ``structural_merges`` and ``posting_dicts``, optional: the mode of tier 1
+  and of the rules of ADR 0042, ``on``, ``shadow`` or ``off``; they win over
+  the keys of the same names of the store;
+- ``classes``: a dict of class names (``module.Class``) to their entries.
+
+The entry of a class has these keys, each optional:
+
+- ``tier1``: the mode of tier 1 for a class of BTrees or ``Length``;
+- ``tier2``: the mode of the merges of fields: ``on``, ``shadow`` or
+  ``off``, the default; a class without ``tier2`` never merges in tier 2;
+- ``default``: the strategy of a field that ``fields`` does not name:
+  ``strict``, the default, ``lww``, ``max``, ``sum``, ``union`` or
+  ``append``;
+- ``fields``: a dict of field names to their strategies;
+- ``coupled``: a list of groups of fields, each a list of field names.
+
+`install` writes a policy in the transaction of a connection, and `read`
+gives it back as a dict.
+"""
+
+import copy
+
+import persistent
+
+#: The name of the policy in the root of the database.
+NAME = "zoe.merge_policy"
+#: The modes of a switch.
+MODES = ("on", "shadow", "off")
+#: The strategies of a field.
+STRATEGIES = ("strict", "lww", "max", "sum", "union", "append")
+#: The keys of a policy that `install` takes, besides ``classes``.
+SWITCHES = ("structural_merges", "posting_dicts")
+#: The keys of the entry of a class.
+ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled")
+
+
+class MergePolicy(persistent.Persistent):
+    """The merge policy of a store. Write it with `install`.
+
+    Its attributes are ``version``, ``classes`` and, when the policy gives
+    them, ``structural_merges`` and ``posting_dicts``.
+    """
+
+    def __init__(self):
+        self.version = 0
+        self.classes = {}
+
+
+def _mode(value, where):
+    if value not in MODES:
+        raise ValueError(f"{where}: {value!r} is not on, shadow or off")
+    return value
+
+
+def _strategy(value, where):
+    if value not in STRATEGIES:
+        raise ValueError(f"{where}: {value!r} is not one of {', '.join(STRATEGIES)}")
+    return value
+
+
+def validate(policy):
+    """Return a copy of `policy` with plain values only, or raise
+    `ValueError` when it breaks the rules of a policy. `policy` is a dict
+    with the key ``classes`` and, optionally, ``structural_merges`` and
+    ``posting_dicts``. ``version`` is not part of it: `install` sets it."""
+    if not isinstance(policy, dict):
+        raise ValueError("a policy is a dict")
+    unknown = set(policy) - {"classes", *SWITCHES}
+    if unknown:
+        raise ValueError(f"a policy has no key {sorted(unknown)[0]!r}")
+    result = {}
+    for switch in SWITCHES:
+        if policy.get(switch) is not None:
+            result[switch] = _mode(policy[switch], switch)
+    classes = policy.get("classes", {})
+    if not isinstance(classes, dict):
+        raise ValueError("classes is a dict of class names to entries")
+    result["classes"] = {}
+    for name, entry in classes.items():
+        if not isinstance(name, str) or "." not in name:
+            raise ValueError(f"{name!r} is not a class as module.Class")
+        if not isinstance(entry, dict):
+            raise ValueError(f"{name}: an entry is a dict")
+        unknown = set(entry) - set(ENTRY_KEYS)
+        if unknown:
+            raise ValueError(f"{name}: an entry has no key {sorted(unknown)[0]!r}")
+        checked = {}
+        for key in ("tier1", "tier2"):
+            if entry.get(key) is not None:
+                checked[key] = _mode(entry[key], f"{name}: {key}")
+        if entry.get("default") is not None:
+            checked["default"] = _strategy(entry["default"], f"{name}: default")
+        fields = entry.get("fields") or {}
+        if not isinstance(fields, dict):
+            raise ValueError(f"{name}: fields is a dict of fields to strategies")
+        if fields:
+            checked["fields"] = {}
+            for field, strategy in fields.items():
+                if not isinstance(field, str):
+                    raise ValueError(f"{name}: the field {field!r} is not a str")
+                checked["fields"][field] = _strategy(strategy, f"{name}: {field}")
+        coupled = entry.get("coupled") or []
+        if coupled:
+            checked["coupled"] = []
+            for group in coupled:
+                if (
+                    isinstance(group, str)
+                    or not group
+                    or not all(isinstance(field, str) for field in group)
+                ):
+                    raise ValueError(f"{name}: a coupled group is a list of fields")
+                checked["coupled"].append(list(group))
+        result["classes"][name] = checked
+    return result
+
+
+def install(connection, policy):
+    """Write `policy` as the merge policy of the database of `connection`,
+    in its current transaction, and return its new version.
+
+    The first call creates the object and its name in the root. Each call
+    adds 1 to ``version``. The caller commits the transaction, so the
+    policy commits or aborts with it. A switch that `policy` does not give
+    leaves the key of the store in force."""
+    checked = validate(policy)
+    root = connection.root()
+    stored = root.get(NAME)
+    if stored is None:
+        stored = MergePolicy()
+        root[NAME] = stored
+    elif not isinstance(stored, MergePolicy):
+        raise ValueError(f"root[{NAME!r}] is not a MergePolicy")
+    stored.version += 1
+    stored.classes = checked["classes"]
+    for switch in SWITCHES:
+        if switch in checked:
+            setattr(stored, switch, checked[switch])
+        elif switch in stored.__dict__:
+            delattr(stored, switch)
+    return stored.version
+
+
+def read(connection):
+    """Return the merge policy of the database of `connection` as a dict,
+    with its ``version``, or ``None`` when the database has none."""
+    stored = connection.root().get(NAME)
+    if stored is None:
+        return None
+    policy = {"version": stored.version, "classes": copy.deepcopy(stored.classes)}
+    for switch in SWITCHES:
+        value = getattr(stored, switch, None)
+        if value is not None:
+            policy[switch] = value
+    return policy
