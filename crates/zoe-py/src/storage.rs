@@ -434,6 +434,7 @@ impl Storage {
                 "shadow mode needs resolution_log: without it, nothing tells what it found",
             ));
         }
+        options.structural_merges.resolution_log = resolution_log.is_some();
         let resolution_log = match resolution_log {
             Some(path) => Some(Arc::new(
                 ResolutionLog::open(&path).map_err(|error| core(py, error.into()))?,

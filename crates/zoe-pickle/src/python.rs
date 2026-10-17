@@ -300,9 +300,19 @@ impl Heap {
         }
     }
 
+    /// Returns a str of `text`, shared as CPython shares it.
+    pub fn new_str(&mut self, text: &str) -> Value {
+        self.str_object(text)
+    }
+
     /// Returns a new list of `items`.
     pub fn new_list(&mut self, items: Vec<Value>) -> Value {
         Value::Object(self.push(Object::List(items)))
+    }
+
+    /// Returns a new object of another class.
+    pub fn new_instance(&mut self, instance: Instance) -> Value {
+        Value::Object(self.push(Object::Instance(instance)))
     }
 
     /// Returns a new set of `items` with the class `class`, which is

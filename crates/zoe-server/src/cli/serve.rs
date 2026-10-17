@@ -707,6 +707,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
             mode: args.structural_merges,
             classes: args.structural_merge_class.iter().cloned().collect(),
             posting_dicts: args.posting_dicts,
+            resolution_log: args.resolution_log.is_some(),
         });
     if let Some(path) = &args.resolution_log {
         options = options.resolution_log(path);
