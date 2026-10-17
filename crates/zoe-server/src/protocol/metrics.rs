@@ -13,9 +13,11 @@
 //!   calls, and the `tpc_finish` calls that ended a transaction.
 //! - `zoe_fsync_batch_size`: the commits that one sync made durable.
 //! - `zoe_lock_wait_seconds`: the time of each vote to take its locks.
-//! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that a
-//!   second vote passed after the client resolved them (`python`). The
-//!   server resolves no conflict, so `native` stays 0.
+//! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that tier 1
+//!   merged in a vote that passed (`native`), and the oids that a second
+//!   vote passed after the client resolved them (`python`).
+//! - `zoe_structural_merges_total{mode, outcome}`: the results of tier 1
+//!   in the votes, merged, refused or undecided, in mode `on` or `shadow`.
 //! - `zoe_conflicts_raised_total`: the transactions that raised a
 //!   conflict: a vote that failed with a conflict, or a transaction that
 //!   ended between the two votes, so that the client raised
@@ -126,6 +128,11 @@ pub(crate) struct Metrics {
     /// The records that the transactions of GET and HEAD requests
     /// committed, by class.
     writes_on_get: Mutex<BTreeMap<String, u64>>,
+    /// The oids in conflict that tier 1 merged in a vote that passed.
+    pub(crate) conflicts_native: AtomicU64,
+    /// The results of tier 1, by mode (`on`, `shadow`) and outcome
+    /// (`merged`, `refused`, `undecided`).
+    pub(crate) structural_merges: [[AtomicU64; 3]; 2],
 }
 
 impl Metrics {
@@ -148,6 +155,24 @@ impl Metrics {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// Count the results of tier 1 of one vote.
+    pub(crate) fn count_resolutions(&self, resolutions: &[zoe_core::Resolution]) {
+        use zoe_core::{Mode, Resolved};
+        for resolution in resolutions {
+            let mode = match resolution.mode {
+                Mode::On => 0,
+                Mode::Shadow => 1,
+                Mode::Off => continue,
+            };
+            let outcome = match resolution.outcome {
+                Resolved::Merged => 0,
+                Resolved::Refused(_) => 1,
+                Resolved::Undecided(_) => 2,
+            };
+            self.structural_merges[mode][outcome].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Default for Metrics {
@@ -161,6 +186,8 @@ impl Default for Metrics {
             commits: AtomicU64::new(0),
             conflicts_raised: AtomicU64::new(0),
             writes_on_get: Mutex::new(BTreeMap::new()),
+            conflicts_native: AtomicU64::new(0),
+            structural_merges: Default::default(),
         }
     }
 }
@@ -268,8 +295,27 @@ pub(crate) fn render(storages: &[Exported]) -> String {
     );
     for (storage, labels) in &storages {
         let python = get(&storage.stats.conflicts_resolved);
-        let _ = writeln!(out, "{name}{{{labels},path=\"native\"}} 0");
+        let native = get(&storage.metrics.conflicts_native);
+        let _ = writeln!(out, "{name}{{{labels},path=\"native\"}} {native}");
         let _ = writeln!(out, "{name}{{{labels},path=\"python\"}} {python}");
+    }
+    let name = "zoe_structural_merges_total";
+    head(
+        &mut out,
+        name,
+        "counter",
+        "The number of results of the structural merges (tier 1) in the votes, by mode and outcome.",
+    );
+    for (storage, labels) in &storages {
+        for (m, mode) in ["on", "shadow"].into_iter().enumerate() {
+            for (o, outcome) in ["merged", "refused", "undecided"].into_iter().enumerate() {
+                let count = get(&storage.metrics.structural_merges[m][o]);
+                let _ = writeln!(
+                    out,
+                    "{name}{{{labels},mode=\"{mode}\",outcome=\"{outcome}\"}} {count}"
+                );
+            }
+        }
     }
     scalar(
         &mut out,
@@ -371,7 +417,7 @@ mod tests {
             ("BTrees.Length.Length", 1),
         ]));
         let text = render(&[one, exported("a\"b")]);
-        assert_eq!(text.matches("# TYPE ").count(), 12);
+        assert_eq!(text.matches("# TYPE ").count(), 13);
         assert!(
             text.contains(
                 "zoe_writes_on_get_total{storage=\"1\",class=\"persistent.mapping.PersistentMapping\"} 3\n"
@@ -404,6 +450,14 @@ mod tests {
             text.contains("zoe_conflicts_resolved_total{storage=\"1\",path=\"native\"} 0\n"),
             "{text}"
         );
+        for mode in ["on", "shadow"] {
+            for outcome in ["merged", "refused", "undecided"] {
+                let line = format!(
+                    "zoe_structural_merges_total{{storage=\"1\",mode=\"{mode}\",outcome=\"{outcome}\"}} 0\n"
+                );
+                assert!(text.contains(&line), "{text}");
+            }
+        }
         assert!(
             text.contains("zoe_invalidation_queue_depth{storage=\"1\"} 0\n"),
             "{text}"
@@ -428,6 +482,7 @@ mod tests {
         assert!(help("zoe_conflicts_resolved_total").contains("oids"));
         assert!(help("zoe_conflicts_raised_total").contains("transactions"));
         assert!(help("zoe_writes_on_get_total").contains("by class"));
+        assert!(help("zoe_structural_merges_total").contains("mode and outcome"));
         assert!(
             help("zoe_invalidation_queue_depth")
                 .contains("the deepest hub queue among the connections of the storage")

@@ -22,6 +22,9 @@ dev = [
     # The tests of trace_context make spans with the SDK of OpenTelemetry.
     # With its API installed, zoe.zeo declares trace_context.
     "opentelemetry-sdk",
+    # The test of the posting-dict rule indexes documents with the text
+    # index of Products.ZCatalog, Products.ZCTextIndex.
+    "Products.ZCatalog",
 ]
 
 [tool.uv]

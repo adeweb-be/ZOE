@@ -17,12 +17,19 @@
 //! those inside opaque nodes, for pack and the other tools that follow
 //! references. [`decode_class_name`] reads the class of a record from its
 //! class pickle alone.
+//!
+//! [`python`] models the objects that Python's unpickler builds from a
+//! record, with their identity, and pickles them again as zodbpickle does.
+//! [`btrees`] reads and builds the states of the classes of BTrees on that
+//! model, for the conflict resolution of the core.
 
+pub mod btrees;
 mod decode;
 mod encode;
 mod error;
 mod iterative;
 mod opcode;
+pub mod python;
 mod references;
 mod text;
 mod tree;

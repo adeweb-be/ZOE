@@ -15,6 +15,7 @@ mod format;
 mod guard;
 mod kv;
 mod lock;
+pub mod merge;
 mod pack;
 mod read;
 mod redb_backend;
@@ -41,6 +42,7 @@ pub use kv::{
     SWEEP_INTERVAL, SWEEP_LIMIT, Swept,
 };
 pub use lock::LockCancel;
+pub use merge::{Mode, Reason, Resolution, Resolved, StructuralMerges};
 pub use pack::{ClassTotals, PackReport};
 pub use read::{CurrentRecord, HistoryEntry, LoadedRecord, RecordInfo, Transactions, TxnInfo};
 pub use sequence::Sequence;

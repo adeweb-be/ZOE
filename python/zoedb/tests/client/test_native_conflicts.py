@@ -3,16 +3,19 @@
 `just test` runs it. Each test opens two DBs on two native clients,
 through `zoe.testing.native_client`, against one `zoe serve`.
 
-`zoe serve` resolves no conflict itself. When a vote meets a stale serial,
-its reply lists the conflict as a map: `oid`, `serials` (the committed
-serial and the serial that the client read) and `data` (the pickle that
-the client stored). The native client then resolves the conflict in the
-client, as the vote of `ZEO.ClientStorage` does: it calls
-`tryToResolveConflict(oid, committed, read, data)`, stores the result with
-`storea` at the committed serial and votes again. The vote returns the
-oids that the client resolved, so the DB loads their state again.
+`zoe serve` merges the conflicts of BTree buckets, sets and `Length` itself
+(tier 1), and its reply gives each merged oid as a bare oid. For another
+class, when a vote meets a stale serial, its reply lists the conflict as a
+map: `oid`, `serials` (the committed serial and the serial that the client
+read) and `data` (the pickle that the client stored). The native client
+then resolves the conflict in the client, as the vote of
+`ZEO.ClientStorage` does: it calls `tryToResolveConflict(oid, committed,
+read, data)`, stores the result with `storea` at the committed serial and
+votes again. The vote returns the oids that the server or the client
+resolved, so the DB loads their state again.
 
-- Two inserts of different keys into one `OOBTree` bucket both commit.
+- Two inserts of different keys into one `OOBTree` bucket both commit: the
+  server merges them.
 - Two increments of a `PCounter` of `ZODB.tests.ConflictResolution` both
   count.
 - A conflict that the class does not resolve raises `ConflictError` with
@@ -210,7 +213,7 @@ def test_inserts_of_two_clients_into_one_bucket_both_commit(dbs, connections):
     snapshot(conn_a, tm_a)["tree"]["key-a"] = 1
     conn_b.root()["tree"]["key-b"] = 2
     tm_a.commit()
-    # The vote of b lists the conflict, and client b resolves it.
+    # The server merges the bucket in the vote of b.
     tm_b.commit()
 
     def keys(conn, manager):

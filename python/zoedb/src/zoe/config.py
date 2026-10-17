@@ -72,6 +72,30 @@ def compression(value):
     raise ValueError(f"{value!r} is not none, zstd or zstd:LEVEL")
 
 
+def merge_mode(value):
+    """Return the mode of the structural merges: on, shadow or off."""
+    text = value.strip().lower()
+    if text in ("on", "shadow", "off"):
+        return text
+    raise ValueError(f"{value!r} is not on, shadow or off")
+
+
+def class_modes(value):
+    """Return the modes of classes of the structural merges, as a dict.
+
+    The value is one `CLASS MODE` or `CLASS=MODE`, or several of them
+    separated by commas, as the twin gives them. The class is
+    `module.name`.
+    """
+    modes = {}
+    for item in value.split(","):
+        match = re.fullmatch(r"\s*([\w.]+\.\w+)\s*(?:=|\s)\s*(\w+)\s*", item)
+        if not match:
+            raise ValueError(f"{item.strip()!r} is not CLASS MODE")
+        modes[match.group(1)] = merge_mode(match.group(2))
+    return modes
+
+
 # The keys and the converters of their values.
 KEYS = {
     "path": stock_datatypes["string"],
@@ -82,12 +106,25 @@ KEYS = {
     "read-only": stock_datatypes["boolean"],
     "pack-gc": stock_datatypes["boolean"],
     "compression": compression,
+    "structural-merges": merge_mode,
+    "structural-merge-class": class_modes,
+    "posting-dicts": merge_mode,
+    "resolution-log": stock_datatypes["string"],
 }
+
+# The keys that a section and a URI can give more than once. Their values
+# add up.
+MULTIKEYS = ("structural-merge-class",)
+
+
+# The twins whose name is not the name of their key: a key that comes
+# once for each value has a twin that takes them all.
+TWINS = {"structural-merge-class": "ZOE_STRUCTURAL_MERGE_CLASSES"}
 
 
 def twin(key):
     """Return the name of the environment twin of a key."""
-    return "ZOE_" + key.upper().replace("-", "_")
+    return TWINS.get(key) or "ZOE_" + key.upper().replace("-", "_")
 
 
 def convert(key, text, source):
@@ -110,6 +147,7 @@ def open_storage(settings):
     if not path:
         raise ValueError(f"<zoe> needs path, or the {twin('path')} variable")
     blob_dir = settings.get("blob-dir")
+    resolution_log = settings.get("resolution-log")
     return zoe.Storage(
         os.path.expanduser(path),
         read_only=settings.get("read-only", False),
@@ -117,6 +155,10 @@ def open_storage(settings):
         blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
         pack_gc=settings.get("pack-gc", True),
         compression=settings.get("compression"),
+        structural_merges=settings.get("structural-merges"),
+        structural_merge_classes=settings.get("structural-merge-class"),
+        posting_dicts=settings.get("posting-dicts"),
+        resolution_log=os.path.expanduser(resolution_log) if resolution_log else None,
     )
 
 
@@ -126,7 +168,18 @@ class ZoeStorage(BaseConfig):
     def open(self):
         settings = {}
         for key in KEYS:
-            text = getattr(self.config, key.replace("-", "_"))
+            given = getattr(self.config, key.replace("-", "_"))
+            if key in MULTIKEYS:
+                # A key that comes once for each value.
+                texts = [text for text in given or () if text]
+                if texts:
+                    modes = {}
+                    for text in texts:
+                        modes.update(convert(key, text, f"<zoe> {key} {text!r}"))
+                    settings[key] = modes
+                    continue
+                given = None
+            text = given
             source = f"<zoe> {key} {text!r}"
             if not text:
                 text = os.environ.get(twin(key), "")
@@ -141,8 +194,9 @@ def resolve_uri(uri):
 
     The URI is `zoe:///absolute/path?key=value&...`. The path of the URI is
     the path of the store. The query takes the keys of the section, except
-    path, each at most once. The other query keys go to zodburi, which takes
-    the keys of the database, such as `database_name`, and refuses the rest.
+    path, each at most once; `structural-merge-class` comes once for each
+    class. The other query keys go to zodburi, which takes the keys of the
+    database, such as `database_name`, and refuses the rest.
     """
     parts = urllib.parse.urlsplit(uri)
     path = urllib.parse.unquote(parts.path)
@@ -151,7 +205,10 @@ def resolve_uri(uri):
     settings = {"path": path}
     rest = {}
     for name, text in urllib.parse.parse_qsl(parts.query):
-        if name in KEYS and name != "path":
+        if name in MULTIKEYS:
+            value = convert(name, text, f"{name}={text!r}")
+            settings.setdefault(name, {}).update(value)
+        elif name in KEYS and name != "path":
             if name in settings:
                 raise ValueError(f"{uri!r} gives {name} more than once")
             settings[name] = convert(name, text, f"{name}={text!r}")

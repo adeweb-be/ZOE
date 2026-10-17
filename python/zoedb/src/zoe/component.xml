@@ -70,6 +70,43 @@
         change between opens.
       </description>
     </key>
+    <key name="structural-merges" datatype="string">
+      <description>
+        The mode of the structural merges (tier 1) of each class that
+        structural-merge-class does not name: on, the default, merges the
+        conflicts of BTree buckets, sets and Length in the vote, or refuses
+        them as BTrees does; shadow writes their result to the resolution
+        log and resolves the conflict in Python as before; off does not run
+        them. A shadow mode needs resolution-log.
+      </description>
+    </key>
+    <multikey name="structural-merge-class" datatype="string">
+      <description>
+        The mode of one class of the structural merges, as CLASS MODE, such
+        as BTrees.IOBTree.IOBucket shadow. The key comes once for each
+        class. The twin takes CLASS=MODE pairs separated by commas.
+      </description>
+    </multikey>
+    <key name="posting-dicts" datatype="string">
+      <description>
+        The mode of the posting-dict rule and the first-key rule of ADR
+        0042, two merges where ZODB's resolver refuses: on merges the
+        posting dicts of ZCTextIndex entry by entry in the buckets with
+        integer keys, and lets a delete of the first key by the committed
+        transaction through in a tree of one bucket; shadow writes the
+        merge of the rules to the resolution log, then ends the conflict as
+        off does; off, the default, does not run the rules. A shadow mode
+        needs resolution-log.
+      </description>
+    </key>
+    <key name="resolution-log" datatype="string">
+      <description>
+        A file of JSON lines, one for each result of the structural merges,
+        with the user and the description of both transactions and the keys
+        that it merged. The storage opens it in append mode and never syncs
+        it. Without it, the storage writes no such line.
+      </description>
+    </key>
   </sectiontype>
 
   <sectiontype name="ssl">
@@ -320,6 +357,33 @@
         If true, the server shares the blob directory of each store with
         its clients, and accepts storeBlobShared. The clients have the
         trust of the user of the server, as with ZEO. The default is false.
+      </description>
+    </key>
+    <key name="structural-merges" datatype="string">
+      <description>
+        The mode of the structural merges (tier 1) of each class that
+        structural-merge-class does not name: on, the default, shadow or
+        off.
+      </description>
+    </key>
+    <multikey name="structural-merge-class" datatype="string">
+      <description>
+        The mode of one class of the structural merges, as CLASS MODE, such
+        as BTrees.IOBTree.IOBucket shadow. The key comes once for each
+        class.
+      </description>
+    </multikey>
+    <key name="posting-dicts" datatype="string">
+      <description>
+        The mode of the posting-dict rule and the first-key rule of ADR
+        0042: on, shadow or off, the default. A shadow mode needs
+        resolution-log.
+      </description>
+    </key>
+    <key name="resolution-log" datatype="string">
+      <description>
+        A file of JSON lines, one for each result of the structural merges.
+        A leading ~ is the home directory.
       </description>
     </key>
     <key name="tls-cert" datatype="string">

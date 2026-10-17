@@ -34,6 +34,10 @@ KEYS = {
     "read-only",
     "pack-gc",
     "compression",
+    "structural-merges",
+    "structural-merge-class",
+    "posting-dicts",
+    "resolution-log",
 }
 # The ways to give a value to a key.
 SOURCES = ["stanza", "environment", "uri"]

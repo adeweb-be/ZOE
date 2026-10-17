@@ -15,6 +15,7 @@ use crate::error::{Result, ZoeError};
 use crate::format::Compression;
 use crate::guard::Guardrails;
 use crate::lock::LockManager;
+use crate::merge::StructuralMerges;
 use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
 use crate::sequence::{Sequence, Sequences};
@@ -161,6 +162,10 @@ pub struct Options {
     /// Such a pack reads no reference. The store does not record this
     /// option. This is `pack-gc` in the configuration.
     pub pack_gc: bool,
+    /// The structural merges (tier 1) of the conflict resolution: the
+    /// mode of their classes, and the rules of ADR 0042. The default is
+    /// tier 1 on for every class, and the rules off.
+    pub structural_merges: StructuralMerges,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
     #[doc(hidden)]
@@ -181,6 +186,7 @@ impl Default for Options {
             blob_dir: None,
             cache_size: None,
             pack_gc: true,
+            structural_merges: StructuralMerges::default(),
             _more: (),
         }
     }
@@ -238,6 +244,8 @@ pub struct Store {
     pub(crate) packing: PackState,
     /// The reserved values of the sequences that this store uses.
     pub(crate) sequences: Sequences,
+    /// The structural merges (tier 1) of the conflict resolution.
+    pub(crate) structural_merges: StructuralMerges,
 }
 
 impl Store {
@@ -517,6 +525,7 @@ impl Store {
             repaired: false,
             packing: PackState::default(),
             sequences: Sequences::default(),
+            structural_merges: options.structural_merges,
         })
     }
 

@@ -489,6 +489,9 @@ struct Open {
     /// The number of conflicts that the last vote listed for the client to
     /// resolve. When it is not 0, the next vote is the second vote.
     listed: u64,
+    /// The number of oids that tier 1 merged in the first vote when that
+    /// vote listed conflicts too. The second vote that passes counts them.
+    native: u64,
     /// The blob file that the client uploads, from `storeBlobStart` to
     /// `storeBlobEnd`. The end of the transaction drops it, and that
     /// removes its file.
@@ -1567,6 +1570,7 @@ impl Transaction {
                 id: id.clone(),
                 txn,
                 listed: 0,
+                native: 0,
                 upload: None,
                 jobs: Vec::new(),
                 of_get: args.get(3).is_some_and(of_get),
@@ -1755,12 +1759,15 @@ impl Transaction {
     /// vote passed.
     ///
     /// The first vote is `vote_resolving` of the core. It takes the locks
-    /// once, in oid order. A stale written oid that the client can resolve
-    /// does not fail it: the reply lists the oid, and the transaction keeps
-    /// its locks. The client resolves each conflict, stores the resolved
-    /// pickle over the committed serial and votes again. The second vote
-    /// takes no lock and checks every serial again. The server runs no
-    /// resolution code.
+    /// once, in oid order, and runs tier 1 on each stale oid of a class of
+    /// BTrees or `Length`: the reply gives each oid that tier 1 merged as a
+    /// bare oid, as a ZEO 6 server gives an oid that it resolved, and a
+    /// refusal of tier 1 fails the vote with `ConflictError`. Another stale
+    /// written oid that the client can resolve does not fail it: the reply
+    /// lists the oid, and the transaction keeps its locks. The client
+    /// resolves each conflict, stores the resolved pickle over the
+    /// committed serial and votes again. The second vote takes no lock and
+    /// checks every serial again. No Python runs on the server.
     ///
     /// Before it takes a lock, the first vote waits for each job of the
     /// compression pool of the transaction, and attaches its payload to
@@ -1772,24 +1779,48 @@ impl Transaction {
     /// finds no transaction.
     fn vote(&mut self, args: &[Value]) -> Result<Value, Fault> {
         let [id] = arity::<1>(args, "vote")?;
+        let storage = Arc::clone(&self.session.storage);
         let open = self.current(id)?;
         let listed = std::mem::take(&mut open.listed);
+        let native = std::mem::take(&mut open.native);
         let jobs = std::mem::take(&mut open.jobs);
         let voted = match &mut open.txn {
             Ok(txn) if listed > 0 => txn
                 .vote()
-                .map(|()| Vec::new())
+                .map(|()| Voted::default())
                 .map_err(|error| Fault::of_vote(&error, txn)),
-            Ok(txn) => attach(txn, jobs).and_then(|()| vote_resolving(txn)),
+            Ok(txn) => {
+                let voted = attach(txn, jobs).and_then(|()| vote_resolving(txn));
+                // The vote that takes the locks runs tier 1: log and count
+                // its results, also when the vote failed.
+                storage.metrics.count_resolutions(txn.resolutions());
+                if let Some(log) = &storage.resolution_log
+                    && !txn.resolutions().is_empty()
+                {
+                    log.write(&txn.resolution_log_lines(SystemTime::now(), Some(&storage.name)));
+                }
+                voted
+            }
             Err(fault) => Err(fault.clone()),
         };
         match voted {
-            Ok(conflicts) => {
+            Ok(Voted {
+                native: merged,
+                conflicts,
+            }) => {
                 open.listed = conflicts.len() as u64;
-                // A second vote that passes counts the conflicts that the
-                // client resolved.
-                Stats::add_n(&self.session.storage.stats.conflicts_resolved, listed);
-                Ok(Value::Array(conflicts))
+                // A vote that passes counts the conflicts that the client
+                // resolved and the oids that tier 1 merged. A first vote
+                // that lists conflicts keeps its merged oids for the
+                // second vote.
+                if conflicts.is_empty() {
+                    Stats::add_n(&storage.stats.conflicts_resolved, listed);
+                    let merges = native + merged.len() as u64;
+                    Stats::add_n(&storage.metrics.conflicts_native, merges);
+                } else {
+                    open.native = merged.len() as u64;
+                }
+                Ok(Value::Array(merged.into_iter().chain(conflicts).collect()))
             }
             Err(fault) => {
                 self.open = None;
@@ -1987,16 +2018,30 @@ fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
     Ok(())
 }
 
-/// Vote with `vote_resolving` of the core. Return each stale written oid
-/// that the client can resolve, as ZEO 6 lists a conflict in the reply of
-/// `vote`: `{oid, serials: [committed, read], data}`. `data` is the pickle
-/// that the transaction stored. The client loads the two other states
-/// with `loadSerial`.
-fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Vec<Value>, Fault> {
+/// The items of the reply of a vote.
+#[derive(Default)]
+struct Voted {
+    /// The oids that tier 1 merged, each as a bare oid.
+    native: Vec<Value>,
+    /// The conflicts that the client resolves.
+    conflicts: Vec<Value>,
+}
+
+/// Vote with `vote_resolving` of the core. Return each oid that tier 1
+/// merged, and each stale written oid that the client can resolve, as ZEO 6
+/// lists a conflict in the reply of `vote`: `{oid, serials: [committed,
+/// read], data}`. `data` is the pickle that the transaction stored. The
+/// client loads the two other states with `loadSerial`.
+fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Voted, Fault> {
     let conflicts = txn
         .vote_resolving()
         .map_err(|error| Fault::of_vote(&error, txn))?;
-    conflicts
+    let native = txn
+        .natively_resolved()
+        .into_iter()
+        .map(|oid| p64(oid.0))
+        .collect();
+    let conflicts = conflicts
         .into_iter()
         .map(|(oid, committed)| {
             // A staged pickle in the spill file is read from the file, and
@@ -2013,7 +2058,8 @@ fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Vec<Value>, Fault> {
                 (Value::from("data"), Value::Binary(data.into_owned())),
             ]))
         })
-        .collect()
+        .collect::<Result<Vec<_>, Fault>>()?;
+    Ok(Voted { native, conflicts })
 }
 
 /// Add 1 to the metric `counter`.
@@ -2177,7 +2223,7 @@ mod tests {
 
     use super::super::outbox::Inbox;
     use super::*;
-    use crate::protocol::Queues;
+    use crate::protocol::{Queues, ResolutionLog};
 
     /// A pickle of a `persistent.mapping.PersistentMapping` record, as ZODB
     /// writes it: the class pickle, then the state pickle.
@@ -3135,6 +3181,105 @@ mod tests {
         assert_eq!(count(&status, "conflicts_resolved"), 2);
         assert_eq!(count(&status, "aborts"), 1);
         commit(&mut s, 7, 1, tid, MAPPING).unwrap();
+    }
+
+    /// Returns the record of a `BTrees.Length.Length` of `value`, as ZODB
+    /// writes it.
+    fn length_record(value: u8) -> Vec<u8> {
+        [
+            &b"\x80\x03cBTrees.Length\nLength\nq\x00.\x80\x03K"[..],
+            &[value],
+            b".",
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn the_vote_gives_an_oid_that_tier_1_merged_as_a_bare_oid() {
+        let name = "native-merge";
+        let dir = std::env::temp_dir().join(format!("zoe-session-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let log_path = dir.join("resolutions.log");
+        let log = Arc::new(ResolutionLog::open(&log_path).unwrap());
+        let storage = NamedStorage::new("1", &dir, store, Queues::DEFAULT);
+        let mut s = Client::new(Arc::new(storage.resolution_log(Some(log))), outbox());
+        done(call(
+            &mut s,
+            "register",
+            vec![Value::from("1"), Value::Boolean(false)],
+        ));
+        let read = commit(&mut s, 1, 1, 0, &length_record(10)).unwrap();
+        commit(&mut s, 2, 1, read, &length_record(12)).unwrap();
+        let reply = done(store_and_vote(&mut s, 3, &[(1, read)], &length_record(7)));
+        assert_eq!(reply, Value::Array(vec![p64(1)]));
+        let tid = finish(&mut s, Value::from(3));
+        let load = done(call(&mut s, "loadBefore", vec![p64(1), p64(u64::MAX)]));
+        assert_eq!(
+            load,
+            Value::Array(vec![Value::Binary(length_record(9)), p64(tid), Value::Nil])
+        );
+        let metrics = &s.storage.metrics;
+        assert_eq!(get_counter(&metrics.conflicts_native), 1);
+        assert_eq!(get_counter(&metrics.structural_merges[0][0]), 1);
+        // The client resolved nothing.
+        let status = s.storage.status().to_value();
+        assert_eq!(count(&status, "conflicts_resolved"), 0);
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("\"storage\":\"1\""), "{text}");
+        assert!(
+            lines[0].contains("\"class\":\"BTrees.Length.Length\""),
+            "{text}"
+        );
+        assert!(lines[0].contains("\"outcome\":\"merged\""), "{text}");
+        assert!(lines[0].contains("\"user\":\"\""), "{text}");
+        assert!(lines[0].contains("\"committed_user\":\"user-2\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_of_tier_1_counts_at_the_vote_that_passes() {
+        let mut s = registered("native-two-votes");
+        let storage = Arc::clone(&s.storage);
+        let native = || get_counter(&storage.metrics.conflicts_native);
+        // The oid 1 is a Length, which tier 1 merges. The oid 2 is a
+        // mapping, which only the client resolves.
+        let length_read = commit(&mut s, 1, 1, 0, &length_record(10)).unwrap();
+        commit(&mut s, 2, 1, length_read, &length_record(12)).unwrap();
+        let mapping_read = commit(&mut s, 3, 2, 0, MAPPING).unwrap();
+        let mapping_later = commit(&mut s, 4, 2, mapping_read, MAPPING).unwrap();
+        for (id, abort) in [(5, true), (6, false)] {
+            begin(&mut s, id, None);
+            store(&mut s, id, 1, length_read, &length_record(7));
+            store(&mut s, id, 2, mapping_read, MAPPING);
+            let listed = done(call(&mut s, "vote", vec![Value::from(id)]));
+            let listed = listed.as_array().unwrap();
+            assert_eq!(listed.len(), 2, "{listed:?}");
+            assert_eq!(listed[0], p64(1));
+            // The first vote listed a conflict for the client, so nothing
+            // counts yet.
+            assert_eq!(native(), 0);
+            if abort {
+                done(call(&mut s, "tpc_abort", vec![Value::from(id)]));
+                assert_eq!(native(), 0);
+                continue;
+            }
+            store(&mut s, id, 2, mapping_later, b"resolved");
+            assert_eq!(
+                done(call(&mut s, "vote", vec![Value::from(id)])),
+                Value::Array(vec![])
+            );
+            finish(&mut s, Value::from(id));
+            assert_eq!(native(), 1);
+            let status = s.storage.status().to_value();
+            assert_eq!(count(&status, "conflicts_resolved"), 1);
+        }
+    }
+
+    fn get_counter(counter: &AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn registered(name: &str) -> Client {
