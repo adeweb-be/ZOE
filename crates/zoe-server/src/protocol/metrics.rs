@@ -86,6 +86,16 @@ impl Histogram {
             });
     }
 
+    /// Return the number of observations and their sum.
+    pub(crate) fn totals(&self) -> (u64, f64) {
+        let count = self
+            .counts
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .sum();
+        (count, f64::from_bits(self.sum.load(Ordering::Relaxed)))
+    }
+
     /// Add one observation of `duration`, in seconds.
     pub(crate) fn observe_duration(&self, duration: Duration) {
         self.observe(duration.as_secs_f64());

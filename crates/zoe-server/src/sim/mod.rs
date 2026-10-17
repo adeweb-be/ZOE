@@ -176,6 +176,11 @@ pub struct Report {
     /// head of their queues (ADR 0044), over every server process of the
     /// run.
     pub handoffs: u64,
+    /// The syncs of commit batches, over every server process of the run,
+    /// as `zoe_fsync_batch_size` counts them.
+    pub syncs: u64,
+    /// The commits that these syncs made durable.
+    pub synced_commits: u64,
 }
 
 /// A run of the server and its clients.
@@ -321,6 +326,9 @@ struct Driver {
     images: Rng,
     /// The lock hand-offs of the server processes that stopped.
     handoffs: u64,
+    /// The syncs of commit batches of the server processes that stopped,
+    /// and the commits that they made durable.
+    syncs: (u64, u64),
 }
 
 impl Driver {
@@ -371,6 +379,7 @@ impl Driver {
             crash_phases: Vec::new(),
             flush_pending: false,
             handoffs: 0,
+            syncs: (0, 0),
         }
     }
 
@@ -432,6 +441,7 @@ impl Driver {
         report.verify = verify;
         report.length_faults = length_faults;
         report.handoffs = self.handoffs;
+        (report.syncs, report.synced_commits) = self.syncs;
         report.crashes = self.crashes;
         report.crash_phases = std::mem::take(&mut self.crash_phases);
         report
@@ -763,8 +773,13 @@ impl Driver {
                 .as_ref()
                 .and_then(|storages| storages.get(STORAGE_NAME))
             {
-                let handoffs = &storage.exported().metrics.lock_handoffs;
-                self.handoffs += handoffs.load(std::sync::atomic::Ordering::Relaxed);
+                let metrics = storage.exported().metrics;
+                self.handoffs += metrics
+                    .lock_handoffs
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let (syncs, commits) = metrics.fsync_batch_size.totals();
+                self.syncs.0 += syncs;
+                self.syncs.1 += commits as u64;
             }
             state.server.up = false;
             state.server.storages = None;

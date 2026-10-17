@@ -16,9 +16,17 @@
 //! record before it plus 1, so no merge lost or repeated a change. Over the
 //! seeds, the finishes handed off locks.
 //!
+//! On a network whose round trip is shorter than a sync, the commits of
+//! the hot `Length` share the syncs: the mean of `zoe_fsync_batch_size`
+//! over 20 seeds is above 2. Without the hand-off, the same runs give about
+//! 1.15, because each commit of the hot oid waits for the sync of the one
+//! before it.
+//!
 //! `ZOE_SIM_SEEDS` sets the number of seeds (100 by default). `ZOE_SIM_SEED`
 //! runs one seed. A failing seed prints `ZOE_SIM_SEED=<seed>` and
 //! reproduces.
+
+use std::time::Duration;
 
 use zoe_server::sim::{Faults, Report, Simulation};
 
@@ -86,4 +94,28 @@ fn writers_of_a_hot_length_hand_the_lock_on() {
         check(seed, &report);
         assert!(report.handoffs > 0, "ZOE_SIM_SEED={seed}: no hand-off");
     }
+}
+
+#[test]
+fn writers_of_a_hot_length_share_the_syncs() {
+    let (mut syncs, mut commits) = (0, 0);
+    for seed in seeds().into_iter().take(20) {
+        let report = Simulation::new(seed)
+            .clients(16)
+            .commits(400)
+            .hot_length(true)
+            .slow_syncs(true)
+            .faults(Faults {
+                // A sync takes 100 µs to 2 ms; a round trip takes less.
+                delay: Some(Duration::from_micros(50)),
+                loss: 0.0,
+                ..Faults::default()
+            })
+            .run();
+        check(seed, &report);
+        syncs += report.syncs;
+        commits += report.synced_commits;
+    }
+    let mean = commits as f64 / syncs as f64;
+    assert!(mean > 2.0, "{commits} commits in {syncs} syncs");
 }

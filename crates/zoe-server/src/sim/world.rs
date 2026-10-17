@@ -331,6 +331,8 @@ impl State {
             lost_listener_finishes: self.pools.lost_listener_finishes,
             length_faults: Vec::new(),
             handoffs: 0,
+            syncs: 0,
+            synced_commits: 0,
         }
     }
 }
