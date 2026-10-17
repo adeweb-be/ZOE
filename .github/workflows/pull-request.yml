@@ -18,7 +18,9 @@ jobs:
     steps:
       - name: free disk
         # The image holds SDKs that CI does not use. Dagger needs the space.
+        # The space before and after shows if the step still frees any.
         run: |
+          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
