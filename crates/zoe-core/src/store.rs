@@ -1065,6 +1065,35 @@ mod tests {
         txn.finish()
     }
 
+    /// An observer that keeps the count of each `intent_locks_acquired`.
+    #[derive(Default)]
+    struct Intents(std::sync::Mutex<Vec<usize>>);
+
+    impl crate::Observer for Intents {
+        fn intent_locks_acquired(&self, locks: usize, _: std::time::Duration) {
+            self.0.lock().unwrap().push(locks);
+        }
+    }
+
+    #[test]
+    fn a_failed_read_of_the_serials_keeps_and_counts_no_intent_lock() {
+        let (store, faults) = faulty_store();
+        let observed = Arc::new(Intents::default());
+        assert!(store.set_observer(observed.clone()));
+        let oid = store.new_oid().unwrap();
+        let tid = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let mut intents = crate::IntentLocks::new(&store);
+        faults.load.store(true, Ordering::Relaxed);
+        assert!(matches!(intents.lock(&[oid]), Err(ZoeError::Backend(_))));
+        assert!(intents.is_empty());
+        assert!(store.lock_table_is_empty());
+        faults.load.store(false, Ordering::Relaxed);
+        assert_eq!(intents.lock(&[oid]).unwrap(), vec![tid]);
+        assert_eq!(*observed.0.lock().unwrap(), vec![0, 1]);
+        intents.release();
+        assert!(store.lock_table_is_empty());
+    }
+
     #[test]
     fn tids_increase_when_the_clock_stands_still() {
         let store = Store::open_in(MemVfs::new(), FrozenClock).unwrap();

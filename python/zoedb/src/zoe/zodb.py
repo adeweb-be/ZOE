@@ -31,7 +31,13 @@ come in oid order. A load of a hot object below a hot object that the
 transaction holds releases the locks of the transaction and takes them all
 again in oid order, with the new one: when every serial that the
 transaction read is unchanged, the load goes on; otherwise it raises
-`ConflictError`, which ends the attempt. `tpc_begin` gives the locks to the
+`ConflictError`, which ends the attempt. The transaction manager of the
+connection then keeps the hot oids of the attempt as a hint, and the first
+load of a hot object in its next transaction takes them all in oid order,
+in one request. The next transaction uses the hint or drops it at its end,
+so no lock and no hint outlives it. The hint is on the transaction manager,
+not on the connection, because a retry of Zope can run on another
+connection of the pool. `tpc_begin` gives the locks to the
 transaction of the storage, and its end releases them. The end of a
 transaction that did not commit through `tpc_begin` releases them too, with
 an implicit or an explicit transaction manager, and so does the close of
@@ -93,34 +99,47 @@ class _Intents:
         # request can keep a connection of a pool for the owner.
         self.asked = False
 
-    def lock(self, oid):
+    def lock(self, connection, oid):
         """Take the intent lock of oid, and return its serial."""
         serial = self.held.get(oid)
         if serial is not None:
             return serial
         self.asked = True
+        hint = None if self.held else _take_hint(connection, self.storage)
+        if hint:
+            # The attempt before ended on the order of its locks: take its
+            # hot oids with this one, in oid order.
+            return self._lock_all(sorted({*hint, oid}), oid)
         try:
             serials = self.storage.lock_intent([oid], self.owner)
         except StorageTransactionError:
             # An oid below a held one: take the whole set again in oid
             # order.
-            return self._relock(oid)
+            return self._relock(connection, oid)
         self.held[oid] = serials[0]
         return serials[0]
 
-    def _relock(self, oid):
+    def _lock_all(self, wanted, oid):
+        """Take the locks of `wanted`, in oid order, and return the serial
+        of oid."""
+        serials = self.storage.lock_intent(wanted, self.owner)
+        self.held.update(zip(wanted, serials, strict=True))
+        return self.held[oid]
+
+    def _relock(self, connection, oid):
         """Release the locks of the transaction, and take them again in oid
         order with `oid`. Raise `ConflictError` when another transaction
-        changed an object that the transaction read meanwhile."""
+        changed an object that the transaction read meanwhile, and keep the
+        hot oids as the hint of the next transaction."""
         read = dict(self.held)
         self.held.clear()
         self.storage.unlock_intent(self.owner)
         wanted = sorted({*read, oid})
-        serials = self.storage.lock_intent(wanted, self.owner)
-        self.held.update(zip(wanted, serials, strict=True))
+        granted = self._lock_all(wanted, oid)
         if any(self.held[held] != serial for held, serial in read.items()):
+            _keep_hint(connection, self.storage, wanted)
             raise ConflictError(oid=oid)
-        return self.held[oid]
+        return granted
 
     def end(self, connection):
         """End the locks of a transaction: release the ones that no
@@ -145,6 +164,64 @@ class _Intents:
                 "the release of the intent locks of a connection failed",
                 exc_info=True,
             )
+
+
+# The attribute of a transaction manager that holds its retry hints: for
+# each storage, by its id, the storage, the hot oids of the attempt that
+# ended on the order of its locks, and the transaction of that attempt. On
+# `transaction.manager`, a `threading.local`, the hints are those of the
+# thread.
+_HINTS = "_zoe_retry_hints"
+
+
+def _current(manager):
+    """Return the transaction of manager, or None when it has none."""
+    try:
+        return manager.get()
+    except Exception:
+        return None
+
+
+def _keep_hint(connection, storage, oids):
+    """Keep `oids` as the hint of the next transaction of the transaction
+    manager of connection, on storage."""
+    manager = connection.transaction_manager
+    failed = _current(manager)
+    if manager is None or failed is None:
+        return
+    hints = getattr(manager, _HINTS, None)
+    if hints is None:
+        hints = {}
+        try:
+            setattr(manager, _HINTS, hints)
+        except AttributeError:
+            return
+    hints[id(storage)] = (storage, frozenset(oids), failed)
+
+
+def _take_hint(connection, storage):
+    """Return the hint of the transaction manager of connection on storage,
+    and drop it, or None. The transaction that kept a hint never takes
+    it."""
+    manager = connection.transaction_manager
+    hints = getattr(manager, _HINTS, None) if manager is not None else None
+    entry = hints.get(id(storage)) if hints else None
+    if entry is None or entry[0] is not storage:
+        return None
+    if entry[2] is _current(manager):
+        return None
+    del hints[id(storage)]
+    return entry[1]
+
+
+def _drop_hint(connection, storage, completed):
+    """Drop the hint on storage at the end of a transaction that did not
+    keep it: that transaction had its chance to use it."""
+    manager = connection.transaction_manager
+    hints = getattr(manager, _HINTS, None) if manager is not None else None
+    entry = hints.get(id(storage)) if hints else None
+    if entry is not None and entry[2] is not completed:
+        del hints[id(storage)]
 
 
 def _hot_storage(connection):
@@ -199,7 +276,7 @@ class LockingConnection(Connection):
             return _replaced["setstate"](self, obj)
         oid = obj._p_oid
         intents = _intents(self, storage)
-        serial = intents.lock(oid)
+        serial = intents.lock(self, oid)
         savepoint = self._savepoint_storage
         if savepoint is not None and oid in savepoint.index:
             # A savepoint holds a change of the transaction: the stock load
@@ -231,6 +308,9 @@ class LockingConnection(Connection):
         intents = self.__dict__.get("_zoe_intents")
         if intents is not None:
             intents.end(self)
+        storage, classes = _hot_storage(self)
+        if classes:
+            _drop_hint(self, storage, transaction)
         return _replaced["afterCompletion"](self, transaction)
 
     def tpc_begin(self, transaction):

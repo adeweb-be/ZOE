@@ -98,20 +98,23 @@ impl<S: Deref<Target = Store>> IntentLocks<S> {
                 return Err(error);
             }
         };
-        if let (Some(observer), Some(wait)) = (store.observer(), wait) {
-            observer.intent_locks_acquired(locks.len(), wait);
-        }
         // The intent requests waited until the store held the last commit
         // of each oid, so the store gives its serial. A failed read keeps
-        // no lock of the call.
+        // no lock of the call, and counts none.
         let serials = match store.backend.current_serials(&mut oids.iter().copied()) {
             Ok(serials) => serials,
             Err(error) => {
                 store.locks.release(&locks);
                 store.guardrails.locks_released(&locks, store.clock.now());
+                if let (Some(observer), Some(wait)) = (store.observer(), wait) {
+                    observer.intent_locks_acquired(0, wait);
+                }
                 return Err(error);
             }
         };
+        if let (Some(observer), Some(wait)) = (store.observer(), wait) {
+            observer.intent_locks_acquired(locks.len(), wait);
+        }
         self.held.extend(locks);
         Ok(serials
             .into_iter()

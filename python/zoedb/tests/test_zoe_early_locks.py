@@ -3,6 +3,7 @@
 and the end of a transaction that read a hot object."""
 
 import threading
+import time
 
 import pytest
 import transaction
@@ -579,3 +580,144 @@ def test_an_owner_whose_first_lock_fails_gives_its_connection_back(
             assert done, "a commit waited for the connection of a failed owner"
         finally:
             db.close()
+
+
+def test_zope_writers_of_two_hot_objects_out_of_oid_order_never_give_up(tmp_path):
+    from ZODB.tests.MinPO import MinPO
+
+    s = zoe.Storage(
+        str(tmp_path / "store"),
+        early_locks=True,
+        early_lock_classes=["ZODB.tests.MinPO.MinPO"],
+        lock_timeout=30,
+    )
+    db = ZODB.DB(s, pool_size=8)
+    try:
+        with db.transaction() as conn:
+            conn.root()["a"] = MinPO(0)
+            conn.root()["b"] = MinPO(0)
+        with db.transaction() as conn:
+            assert conn.root()["a"]._p_oid < conn.root()["b"]._p_oid
+        committed = []
+        failed = []
+        start = threading.Barrier(8)
+
+        def writer():
+            start.wait()
+            for _ in range(25):
+                # Zope: one attempt and three retries, each on a connection
+                # of the pool, with the transaction manager of the thread.
+                for _attempt in range(4):
+                    conn = db.open()
+                    transaction.begin()
+                    try:
+                        root = conn.root()
+                        # The higher oid loads first.
+                        root["b"].value += 1
+                        time.sleep(0.0005)
+                        root["a"].value += 1
+                        transaction.commit()
+                        committed.append(1)
+                        break
+                    except ConflictError:
+                        transaction.abort()
+                    finally:
+                        conn.close()
+                else:
+                    failed.append(1)
+
+        writers = [threading.Thread(target=writer) for _ in range(8)]
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join(300)
+        assert not failed
+        with db.transaction() as conn:
+            assert conn.root()["a"].value == conn.root()["b"].value == 200
+        assert len(committed) == 200
+    finally:
+        db.close()
+
+
+def test_the_retry_hint_serves_the_next_transaction_of_the_manager_only(tmp_path):
+    s = storage(tmp_path)
+    db = ZODB.DB(s)
+    try:
+        with db.transaction() as conn:
+            conn.root()["a"] = PersistentMapping(n=0)
+            conn.root()["b"] = PersistentMapping(n=0)
+        lock_intent = s.lock_intent
+        requests = []
+        changed = []
+
+        def changing(oids, owner=None):
+            requests.append(list(oids))
+            # Another transaction commits b after the release of the set.
+            if len(oids) > 1 and not changed:
+                changed.append(1)
+                with db.transaction() as other:
+                    other.root()["b"]["n"] = 10
+            return lock_intent(oids, owner)
+
+        s.lock_intent = changing
+        manager = transaction.TransactionManager()
+        conn = db.open(transaction_manager=manager)
+        manager.begin()
+        root = conn.root()
+        root["b"]["n"] += 1
+        with pytest.raises(ConflictError):
+            root["a"]["n"] += 1
+        manager.abort()
+        conn.close()
+        # The other transaction sends its requests through the same
+        # wrapper: the set is the request of more than one oid.
+        oids = next(sorted(oids) for oids in requests if len(oids) > 1)
+        # The retry runs on a connection that the pool gives again: its
+        # first load of a hot object takes the whole set in one request.
+        conn = db.open(transaction_manager=manager)
+        manager.begin()
+        del requests[:]
+        root = conn.root()
+        root["b"]["n"] += 1
+        root["a"]["n"] += 1
+        assert sorted(requests[0]) == oids
+        manager.commit()
+        conn.close()
+        # The hint served once.
+        conn = db.open(transaction_manager=manager)
+        manager.begin()
+        del requests[:]
+        conn.root()["b"]["n"] += 1
+        assert len(requests[0]) == 1
+        manager.abort()
+        conn.close()
+        del s.lock_intent
+        with db.transaction() as conn:
+            assert (conn.root()["a"]["n"], conn.root()["b"]["n"]) == (1, 11)
+    finally:
+        db.close()
+
+
+def test_a_retry_hint_that_the_next_transaction_does_not_use_goes(tmp_path):
+    from zoe import zodb
+
+    s = storage(tmp_path)
+    db = ZODB.DB(s)
+    try:
+        hot_and_other(db)
+        manager = transaction.TransactionManager()
+        conn = db.open(transaction_manager=manager)
+        manager.begin()
+        oid = conn.root()["hot"]._p_oid
+        zodb._keep_hint(conn, s, [oid])
+        assert getattr(manager, zodb._HINTS)
+        manager.abort()
+        # The transaction that kept the hint ends: the hint stays.
+        assert getattr(manager, zodb._HINTS)
+        # The next transaction ends without a load of a hot object.
+        manager.begin()
+        manager.abort()
+        assert not getattr(manager, zodb._HINTS)
+        conn.close()
+    finally:
+        db.close()

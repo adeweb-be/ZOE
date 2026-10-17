@@ -1014,6 +1014,49 @@ mod tests {
         assert!(store.locks.is_empty());
     }
 
+    /// An observer that keeps the lock wait of each vote.
+    #[derive(Default)]
+    struct Waits(std::sync::Mutex<Vec<Duration>>);
+
+    impl Observer for Waits {
+        fn locks_acquired(&self, wait: Duration) {
+            self.0.lock().unwrap().push(wait);
+        }
+    }
+
+    #[test]
+    fn the_lock_wait_of_a_vote_counts_its_wait_for_a_durable_commit() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &io_dict(1, &[(1, 1)]));
+        let waits = Arc::new(Waits::default());
+        store.set_observer(waits.clone());
+        let mut first = writing(&store, oid, read, &io_dict(1, &[(1, 1), (2, 1)]));
+        first.vote().unwrap();
+        let held = Duration::from_millis(100);
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &io_dict(1, &[(1, 1), (3, 1)]));
+                txn.vote_resolving().unwrap();
+                txn.abort();
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            // The vote has the lock, and waits for the sync of the first
+            // commit, which the sequencer holds.
+            wait_until(|| store.locks.waiting(oid) == 0);
+            thread::sleep(held);
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+            second.join().unwrap();
+        });
+        let waits = waits.0.lock().unwrap();
+        // The first vote waited for nothing. The second one waited at least
+        // as long as the sync was held.
+        assert_eq!(waits.len(), 2, "{waits:?}");
+        assert!(waits[1] >= held, "{waits:?}");
+    }
+
     #[test]
     fn a_vote_that_fails_after_a_hand_off_passes_it_to_the_next_vote() {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
