@@ -32,11 +32,11 @@ mod _zoe {
     #[pymodule_export]
     use crate::cli::main;
     #[pymodule_export]
-    use crate::client::{NativeClient, NativeTransaction};
+    use crate::client::{NativeClient, NativeIntents, NativeTransaction};
     #[pymodule_export]
     use crate::sequence::Sequence;
     #[pymodule_export]
-    use crate::storage::{Storage, Transactions};
+    use crate::storage::{Intents, Storage, Transactions};
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

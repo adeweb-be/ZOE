@@ -16,6 +16,7 @@ use crate::format::Compression;
 use crate::guard::Guardrails;
 use crate::lock::LockManager;
 use crate::merge::StructuralMerges;
+use crate::merge::policy::{Policy, PolicyCache};
 use crate::pack::PackState;
 use crate::redb_backend::RedbBackend;
 use crate::sequence::{Sequence, Sequences};
@@ -246,6 +247,8 @@ pub struct Store {
     pub(crate) sequences: Sequences,
     /// The structural merges (tier 1) of the conflict resolution.
     pub(crate) structural_merges: StructuralMerges,
+    /// The merge policy that the store read last (ADR 0046).
+    policy: Mutex<PolicyCache>,
 }
 
 impl Store {
@@ -526,7 +529,20 @@ impl Store {
             packing: PackState::default(),
             sequences: Sequences::default(),
             structural_merges: options.structural_merges,
+            policy: Mutex::new(PolicyCache::default()),
         })
+    }
+
+    /// Return the merge policy of the store (ADR 0046): the object
+    /// `root['zoe.merge_policy']`. The store reads it again when the serial
+    /// of the root or of the policy changed since its last read. Only a vote
+    /// with a conflict calls this.
+    pub(crate) fn merge_policy(&self) -> Result<Option<Arc<Policy>>> {
+        let mut cache = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(&**self.backend, &self.structural_merges)
     }
 
     /// Fail with `ReadOnly` when the store is open for reads only.
@@ -1102,6 +1118,35 @@ mod tests {
         txn.store(oid, serial, data)?;
         txn.vote()?;
         txn.finish()
+    }
+
+    /// An observer that keeps the count of each `intent_locks_acquired`.
+    #[derive(Default)]
+    struct Intents(std::sync::Mutex<Vec<usize>>);
+
+    impl crate::Observer for Intents {
+        fn intent_locks_acquired(&self, locks: usize, _: std::time::Duration) {
+            self.0.lock().unwrap().push(locks);
+        }
+    }
+
+    #[test]
+    fn a_failed_read_of_the_serials_keeps_and_counts_no_intent_lock() {
+        let (store, faults) = faulty_store();
+        let observed = Arc::new(Intents::default());
+        assert!(store.set_observer(observed.clone()));
+        let oid = store.new_oid().unwrap();
+        let tid = commit(&store, oid, Tid::ZERO, b"a").unwrap();
+        let mut intents = crate::IntentLocks::new(&store);
+        faults.load.store(true, Ordering::Relaxed);
+        assert!(matches!(intents.lock(&[oid]), Err(ZoeError::Backend(_))));
+        assert!(intents.is_empty());
+        assert!(store.lock_table_is_empty());
+        faults.load.store(false, Ordering::Relaxed);
+        assert_eq!(intents.lock(&[oid]).unwrap(), vec![tid]);
+        assert_eq!(*observed.0.lock().unwrap(), vec![0, 1]);
+        intents.release();
+        assert!(store.lock_table_is_empty());
     }
 
     #[test]

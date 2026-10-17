@@ -86,8 +86,16 @@ _Avoid_: import, replay
 A lock that one transaction holds on one oid during a commit; exclusive for a write, shared for a read-current check.
 _Avoid_: row lock, commit lock
 
+**Lock hand-off**:
+The pass of a per-OID lock from a commit whose finish started to the vote at the head of the queue of the oid, with a copy of the staged record of the holder; the vote merges onto that record, and its commit comes after the commit of the holder.
+_Avoid_: lock transfer, lock steal
+
+**Commit in flight**:
+A commit whose finish started and that is not durable or failed yet; its staged records are final.
+_Avoid_: pending commit
+
 **Intent lock**:
-An exclusive per-OID lock that a client asks for when a transaction first changes an object, before the vote.
+An exclusive per-OID lock that a client asks for before the vote, when its transaction loads an object of a hot class, so a second writer waits before it reads (ADR 0045).
 _Avoid_: early lock, pessimistic lock
 
 **Conflict**:
@@ -99,8 +107,20 @@ One of the three levels that try to resolve a conflict: structural merges, field
 _Avoid_: tier (alone; see Deployment tier)
 
 **Merge policy**:
-A versioned object in the store that says which classes merge field by field and with which strategy per field.
+A versioned object in the store, `root['zoe.merge_policy']`, that says which classes merge field by field and with which strategy per field, and which switches of the structural merges win over the keys of the store.
 _Avoid_: resolver config, merge rules
+
+**Strategy**:
+What tier 2 does with a field that both sides changed to different values: `strict`, `lww`, `max`, `sum`, `union` or `append`.
+_Avoid_: merge function, resolver
+
+**Coupled fields**:
+A group of fields of a class that tier 2 never merges apart: when both sides changed the group, they must agree on each of its fields.
+_Avoid_: linked fields, invariant fields
+
+**Verification**:
+The check of a merge of shadow mode against the resolution of the client: the second vote compares the record that the client stored with the merged record, and the resolution log says whether they are the same.
+_Avoid_: validation, proof
 
 **Shadow mode**:
 A mode where a conflict tier computes its merge and writes it to the resolution log, and the conflict then goes on as without that tier, to show what merging would have done.

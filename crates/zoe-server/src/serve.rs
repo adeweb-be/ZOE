@@ -444,6 +444,7 @@ impl ServeOptions {
         options.blob_dir.clone_from(&storage.blob_dir);
         options.pack_gc = self.pack_gc && storage.pack_gc;
         options.structural_merges = self.structural_merges.clone();
+        options.structural_merges.resolution_log = self.resolution_log.is_some();
         options
     }
 

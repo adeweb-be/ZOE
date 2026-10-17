@@ -268,7 +268,8 @@ impl StorageBackend for SimFile {
             return self.inner.sync_data();
         };
         if world::thread_generation().is_some() {
-            match world::give_back(Why::Sync) {
+            let grows = matches!(cache.lock().last(), Some(Cached::SetLen(_)));
+            match world::give_back(Why::Sync { grows }) {
                 Resume::Go => {}
                 Resume::Defer => return Ok(()),
                 Resume::Killed => return Err(io::Error::other("the process was killed")),
@@ -325,6 +326,10 @@ impl Vfs for SimVfs {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         self.disk.rename(from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        self.disk.hard_link(from, to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {

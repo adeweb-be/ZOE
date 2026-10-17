@@ -43,8 +43,23 @@
     </key>
     <key name="early-locks" datatype="string">
       <description>
-        Early write-intent locks. The storage has none yet: off is the
-        only value, and the default.
+        If true, an object of a class of early-lock-classes takes its early
+        write-intent lock when its state loads (ADR 0045): a second writer
+        waits for the lock, then reads the commit of the first one, so its
+        vote has no conflict. The transaction sees such an object at a state
+        newer than its snapshot, and every reader of it waits for the lock.
+        The default is false: the locks come at the vote.
+      </description>
+    </key>
+    <key name="early-lock-classes" datatype="string">
+      <description>
+        The hot classes of early-locks, each as module.name, separated by
+        spaces or commas. A hot class must be a leaf record, whose state
+        refers to no other persistent object: a hot object read past the
+        snapshot can name a child that the snapshot does not hold, and the
+        load of that child can raise ReadConflictError. A class that the
+        structural merges (tier 1) merge raises an error: the lock hand-off
+        serves it. Without it, early-locks on takes no lock.
       </description>
     </key>
     <key name="read-only" datatype="string">
@@ -166,7 +181,8 @@
     <description>
       A client of a ZOE server: zoe.zeo.ClientStorage, a subclass of
       ZEO.ClientStorage. It takes every key of the zeoclient section, with
-      the same values, wait-timeout and native, and an ssl section. It
+      the same values, wait-timeout, native, early-locks and
+      early-lock-classes, and an ssl section. It
       declares the ZOE extensions to the server, and works as a zeoclient
       against a stock ZEO server.
     </description>
@@ -187,6 +203,22 @@
         is native, but a stock ZEO server that speaks only the pickle
         protocol Z5 at the open, with wait, gives the asyncio client of ZEO
         inside.
+      </description>
+    </key>
+    <key name="early-locks" datatype="boolean" default="off">
+      <description>
+        If true, an object of a class of early-lock-classes takes its early
+        write-intent lock on the server when its state loads (ADR 0045), as
+        in the zoe section. It needs the native client: with native false,
+        the open raises an error. A server that does not accept the
+        extension lock_intent, or that does not speak M5, gives no early
+        lock and one warning. The default is false.
+      </description>
+    </key>
+    <key name="early-lock-classes" datatype="string">
+      <description>
+        The hot classes of early-locks, each as module.name, separated by
+        spaces or commas, as in the zoe section.
       </description>
     </key>
   </sectiontype>

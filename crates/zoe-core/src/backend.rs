@@ -157,6 +157,23 @@ pub trait Backend: Send + Sync {
     /// Return at most `limit` versions of `oid`, newest first.
     fn history(&self, oid: Oid, limit: usize) -> Result<Vec<RecordMeta>>;
 
+    /// Return the rows of at most `limit` transactions with a tid lower
+    /// than `before`, newest first, from one snapshot. A row that does not
+    /// decode fails the call. The undo log reads the transactions with it.
+    ///
+    /// This default reads every row before `before` with `iter_txns`, so
+    /// its cost grows with the log. The redb backend reads back from
+    /// `before`, and its cost is the size of its result.
+    fn txns_before(&self, before: Tid, limit: usize) -> Result<Vec<TxnMeta>> {
+        if before == Tid::ZERO || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<TxnMeta> = self
+            .iter_txns(Tid::ZERO, Tid(before.0 - 1))
+            .collect::<Result<_>>()?;
+        Ok(rows.into_iter().rev().take(limit).collect())
+    }
+
     /// Return the newest version of `oid` with a tid lower than `tid`, and
     /// the serial of the oldest version of `oid` with a tid at or after
     /// `tid`. One snapshot gives both.

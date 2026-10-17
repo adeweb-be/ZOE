@@ -25,14 +25,21 @@
 //! `kv_get`, `kv_scan` and `kv_generation` read on the read pool, outside
 //! the transaction. `kv_set` and `kv_delete` stage a write in the open
 //! transaction of the connection, as `storea` stages a record.
+//!
+//! `undoa` queues an undo into the open transaction, and the first vote
+//! stages it before it takes a lock, as ZEO's server does. An undo that no
+//! tier of the core merges fails the vote with `UndoError`: no Python runs
+//! on the server.
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use rmpv::Value;
 use zoe_core::{
-    BlobFile, Compression, Finished, Flavour, LockCancel, Oid, Store, Tid, Txn, ZoeError,
+    BlobFile, Compression, Finished, Flavour, IntentLocks, LockCancel, Oid, Store, Tid, Txn,
+    TxnMeta, ZoeError, undo_id, undo_tid,
 };
 
 use super::blob::Download;
@@ -73,6 +80,17 @@ const READ_CONFLICT_ERROR: &str = "ZODB.POSException.ReadConflictError";
 /// The class of a transaction error of ZODB.
 const TRANSACTION_ERROR: &str = "ZODB.POSException.StorageTransactionError";
 
+/// The class of the undo errors of ZODB that a stock client rebuilds: a
+/// `MultipleUndoErrors` is an `UndoError`, and the factories of
+/// `ZEO.asyncio.client` know only it.
+const UNDO_ERRORS: &str = "ZODB.POSException.MultipleUndoErrors";
+
+/// The reason of an undo that a later transaction stops, as in FileStorage.
+const CHANGED_LATER: &str = "Some data were modified by a later transaction";
+
+/// The most transactions that one read of the undo log takes.
+const UNDO_LOG_CHUNK: usize = 256;
+
 /// The text of a conflict error of ZODB.
 const CONFLICT: &str = "database conflict error";
 
@@ -82,14 +100,15 @@ const READ_CONFLICT: &str = "database read conflict error";
 /// The interfaces that the store provides, as `(module, name)`, in the
 /// order of `providedBy(zoe.Storage(path)).__iro__`. A stock client takes
 /// the storage interfaces of this list as its own. The store provides
-/// `IExternalGC`, because `deleteObject` writes a deletion. It does not
-/// provide `IStorageUndoable`.
-const INTERFACES: [(&str, &str); 8] = [
+/// `IExternalGC`, because `deleteObject` writes a deletion, and
+/// `IStorageUndoable`.
+const INTERFACES: [(&str, &str); 9] = [
     ("ZODB.interfaces", "IBlobStorageRestoreable"),
     ("ZODB.interfaces", "IBlobStorage"),
     ("ZODB.interfaces", "IStorageRestoreable"),
     ("ZODB.interfaces", "IStorageCurrentRecordIteration"),
     ("ZODB.interfaces", "IStorageIteration"),
+    ("ZODB.interfaces", "IStorageUndoable"),
     ("ZODB.interfaces", "IExternalGC"),
     ("ZODB.interfaces", "IStorage"),
     ("zope.interface", "Interface"),
@@ -174,6 +193,19 @@ impl Fault {
 
     fn storage(text: impl Into<String>) -> Self {
         Self::new("ZODB.POSException.StorageError", text)
+    }
+
+    /// An undo that `reason` refuses, on `oid` when an object stops it. A
+    /// stock client rebuilds it as a `MultipleUndoErrors` of one error,
+    /// which is an `UndoError`. Each error is `(oid, reason)`, as in the
+    /// `MultipleUndoErrors` of FileStorage.
+    fn undo(reason: &str, oid: Option<Oid>) -> Self {
+        let oid = oid.map_or(Value::Nil, |oid| p64(oid.0));
+        let error = Value::Array(vec![oid, Value::from(reason)]);
+        Self {
+            class: UNDO_ERRORS,
+            args: Value::Map(vec![(Value::from("_errs"), Value::Array(vec![error]))]),
+        }
     }
 
     /// The error of a call that names no object `oid`: a `POSKeyError` of
@@ -299,6 +331,7 @@ impl Fault {
                 Self::conflict(READ_CONFLICT_ERROR, READ_CONFLICT, oid, None, None)
             }
             ZoeError::ReadOnly => Self::read_only(),
+            ZoeError::Undo { oid, reason } => Self::undo(reason, oid),
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } | ZoeError::WrongThread => {
                 Self::transaction(text)
             }
@@ -430,8 +463,11 @@ impl Reply {
 }
 
 /// The calls of the open transaction of a connection. One thread runs
-/// them in order, from `tpc_begin` to the end of the transaction.
-const TRANSACTION_CALLS: [&str; 14] = [
+/// them in order, from `tpc_begin`, or from the first `lock_intent` before
+/// it, to the end of the transaction.
+const TRANSACTION_CALLS: [&str; 17] = [
+    "lock_intent",
+    "unlock_intent",
     "tpc_begin",
     "storea",
     "restorea",
@@ -439,6 +475,7 @@ const TRANSACTION_CALLS: [&str; 14] = [
     "deleteObject",
     "kv_set",
     "kv_delete",
+    "undoa",
     "vote",
     "tpc_finish",
     "tpc_abort",
@@ -447,6 +484,10 @@ const TRANSACTION_CALLS: [&str; 14] = [
     "storeBlobEnd",
     "storeBlobShared",
 ];
+
+/// The longest time that a session holds intent locks without a
+/// `tpc_begin`, by default. Then the server releases them (ADR 0045).
+pub(crate) const INTENT_HOLD: Duration = Duration::from_secs(60);
 
 /// Tell if `method` is a call of the transaction of the connection.
 pub(crate) fn in_transaction(method: &str) -> bool {
@@ -503,6 +544,9 @@ struct Open {
     /// True for the transaction of a GET or a HEAD request: its commit
     /// counts its records by class in the writes-on-GET report.
     of_get: bool,
+    /// The undo ids that `undoa` queued, in order. The first vote stages
+    /// their undos.
+    undos: Vec<Value>,
 }
 
 impl Open {
@@ -560,6 +604,9 @@ pub(crate) struct Session {
 pub(crate) struct Transaction {
     session: Arc<Session>,
     open: Option<Open>,
+    /// The early write-intent locks of the session (ADR 0045), from its
+    /// first `lock_intent`. The next `tpc_begin` adopts them.
+    intents: Option<IntentLocks<Arc<Store>>>,
     /// The compression pool and the runtime of its jobs. Without them, the
     /// finish encodes each staged pickle.
     compress: Option<(Compressor, Arc<dyn Runtime>)>,
@@ -767,6 +814,8 @@ impl Session {
             "loadSerial" => self.load_serial(args),
             "getInvalidations" => self.get_invalidations(args),
             "history" => self.history(args),
+            "undoLog" => self.undo_log(args),
+            "undoInfo" => self.undo_info(args),
             "record_iternext" => self.record_iternext(args),
             "iterator_start" => self.iterator_start(args),
             "iterator_next" => self.iterator_next(args),
@@ -1030,7 +1079,7 @@ impl Session {
                 Value::from("name"),
                 Value::from(self.storage.path.display().to_string()),
             ),
-            (Value::from("supportsUndo"), Value::Boolean(false)),
+            (Value::from("supportsUndo"), Value::Boolean(true)),
             (
                 Value::from("supports_record_iternext"),
                 Value::Boolean(true),
@@ -1120,6 +1169,88 @@ impl Session {
                 })
                 .collect(),
         ))
+    }
+
+    /// Return the transactions that an undo can undo, newest first, from
+    /// the index `first` up to `last`, `last` excluded, as the maps of
+    /// FileStorage's `undoLog`. A negative `last` gives at most `-last`
+    /// transactions. The transactions at or before the last pack are not
+    /// in the log.
+    fn undo_log(&self, args: &[Value]) -> Result<Value, Fault> {
+        let (first, last) = match args {
+            [] => (0, -20),
+            [first] => (int_of(first)?, -20),
+            [first, last] => (int_of(first)?, int_of(last)?),
+            _ => return Err(Fault::type_error("undoLog takes 0 to 2 arguments")),
+        };
+        self.undo_entries(first, last, &[])
+    }
+
+    /// Return the transactions of `undoLog(first, last)` whose map holds
+    /// each key of the map `specification` with its value, as `undoInfo`
+    /// of ZODB does.
+    fn undo_info(&self, args: &[Value]) -> Result<Value, Fault> {
+        let (first, last, specification) = match args {
+            [] => (0, -20, None),
+            [first] => (int_of(first)?, -20, None),
+            [first, last] => (int_of(first)?, int_of(last)?, None),
+            [first, last, specification] => (int_of(first)?, int_of(last)?, Some(specification)),
+            _ => return Err(Fault::type_error("undoInfo takes 0 to 3 arguments")),
+        };
+        let specification = match specification {
+            None | Some(Value::Nil) => &[][..],
+            Some(Value::Map(items)) => &items[..],
+            Some(_) => return Err(Fault::type_error("the specification is not a dict")),
+        };
+        self.undo_entries(first, last, specification)
+    }
+
+    /// Return the maps of the undo log from the index `first` up to `last`,
+    /// with only the maps that hold each item of `specification`.
+    fn undo_entries(
+        &self,
+        first: i64,
+        last: i64,
+        specification: &[(Value, Value)],
+    ) -> Result<Value, Fault> {
+        let last = if last < 0 {
+            first.saturating_sub(last)
+        } else {
+            last
+        };
+        let first = usize::try_from(first).unwrap_or(0);
+        let last = usize::try_from(last).unwrap_or(0);
+        let mut found = Vec::new();
+        let mut index = 0;
+        let mut before = Tid::MAX;
+        'log: while index < last {
+            let rows = self.store.undo_log(before, UNDO_LOG_CHUNK)?;
+            let Some(oldest) = rows.last() else { break };
+            before = oldest.tid;
+            for row in &rows {
+                let entry = undo_entry(row);
+                let Value::Map(items) = &entry else {
+                    unreachable!("an entry of the undo log is a map")
+                };
+                // A key that the map does not hold matches None, as in
+                // ZODB: `desc.get(k, None) != v`.
+                let matches = specification.iter().all(|(key, value)| {
+                    let found = items.iter().find(|item| item.0 == *key);
+                    python_eq(found.map_or(&Value::Nil, |item| &item.1), value)
+                });
+                if !matches {
+                    continue;
+                }
+                if index >= first {
+                    found.push(entry);
+                }
+                index += 1;
+                if index >= last {
+                    break 'log;
+                }
+            }
+        }
+        Ok(Value::Array(found))
     }
 
     /// Return the current record of the first oid at or after the oid of
@@ -1432,6 +1563,7 @@ impl Transaction {
         Self {
             session,
             open: None,
+            intents: None,
             compress: None,
         }
     }
@@ -1442,9 +1574,48 @@ impl Transaction {
         self
     }
 
-    /// Tell if a transaction is open.
+    /// Tell if a transaction is open, or if the session holds intent
+    /// locks for its next transaction.
     pub(crate) fn is_open(&self) -> bool {
-        self.open.is_some()
+        self.open.is_some() || self.holds_intents()
+    }
+
+    /// Tell if the session holds intent locks.
+    fn holds_intents(&self) -> bool {
+        self.intents
+            .as_ref()
+            .is_some_and(|intents| !intents.is_empty())
+    }
+
+    /// Return the time that the session can still hold its intent locks
+    /// without a `tpc_begin`, or `None` when it holds none or a transaction
+    /// is open.
+    pub(crate) fn intent_hold_left(&self) -> Option<Duration> {
+        if self.open.is_some() {
+            return None;
+        }
+        let held_for = self.intents.as_ref()?.held_for()?;
+        Some(self.session.storage.intent_hold.saturating_sub(held_for))
+    }
+
+    /// Release the intent locks that the session held past the bound
+    /// without a `tpc_begin`, and log one WARN event. The locks are
+    /// advisory, so the drop changes no outcome but the chance of a
+    /// conflict.
+    pub(crate) fn drop_intents(&mut self) {
+        let Some(intents) = self.intents.as_mut() else {
+            return;
+        };
+        let oids = intents.oids();
+        intents.release();
+        if let Some(&first) = oids.first() {
+            tracing::warn!(
+                oids = oids.len(),
+                first = format!("0x{:016x}", first.0),
+                held_ms = self.session.storage.intent_hold.as_millis() as u64,
+                "released the intent locks that a client held without tpc_begin"
+            );
+        }
     }
 
     /// Run one call of the transaction, and count it in the status of the
@@ -1532,6 +1703,8 @@ impl Transaction {
             return Outcome::Failed(fault);
         }
         let result = match call.method.as_str() {
+            "lock_intent" => self.lock_intent(args),
+            "unlock_intent" => self.unlock_intent(args),
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
             "restorea" => self.restorea(args),
@@ -1539,6 +1712,7 @@ impl Transaction {
             "deleteObject" => self.delete_object(args),
             "kv_set" => self.kv_set(args),
             "kv_delete" => self.kv_delete(args),
+            "undoa" => self.undoa(args),
             "vote" => self.vote(args),
             "tpc_finish" => return self.tpc_finish(&*call),
             "tpc_abort" => self.tpc_abort(args),
@@ -1565,7 +1739,20 @@ impl Transaction {
             return Err(Fault::type_error("tpc_begin takes 4 to 6 arguments"));
         };
         if self.open.is_none() {
-            let txn = self.begin(args);
+            let mut txn = self.begin(args);
+            // The transaction adopts the intent locks of the session.
+            if let (Ok(begun), Some(intents)) = (&mut txn, self.intents.as_mut())
+                && let Err(error) = begun.adopt_intents(intents)
+            {
+                txn = Err(error.into());
+            }
+            // A transaction that does not begin adopts nothing: the intent
+            // locks of the session go.
+            if txn.is_err()
+                && let Some(intents) = self.intents.as_mut()
+            {
+                intents.release();
+            }
             self.open = Some(Open {
                 id: id.clone(),
                 txn,
@@ -1574,7 +1761,55 @@ impl Transaction {
                 upload: None,
                 jobs: Vec::new(),
                 of_get: args.get(3).is_some_and(of_get),
+                undos: Vec::new(),
             });
+        }
+        Ok(Value::Nil)
+    }
+
+    /// Take the early write-intent lock of each oid of `args`, a list of
+    /// oids in ascending order, for the next transaction of the session.
+    /// Return the current serial of each oid, in the same order, when the
+    /// session holds them all.
+    ///
+    /// An oid at or below an oid that the session holds fails with
+    /// `StorageTransactionError` (`LockOrder`), and the call takes nothing.
+    /// A wait past the lock timeout, or the end of the connection, fails
+    /// with `ConflictError`. A call in an open transaction, or of a client
+    /// that registered read-only, fails.
+    fn lock_intent(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oids] = arity::<1>(args, "lock_intent")?;
+        if self.session.read_only() {
+            return Err(Fault::read_only());
+        }
+        if self.open.is_some() {
+            return Err(Fault::transaction("lock_intent in an open transaction"));
+        }
+        let Value::Array(items) = oids else {
+            return Err(Fault::type_error("the oids of lock_intent are not a list"));
+        };
+        let oids = items
+            .iter()
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<Result<Vec<Oid>, Fault>>()?;
+        let session = &self.session;
+        let intents = self.intents.get_or_insert_with(|| {
+            let mut intents = IntentLocks::new(Arc::clone(&session.store));
+            intents.set_lock_cancel(session.lock_cancel.clone());
+            intents
+        });
+        let serials = intents.lock(&oids)?;
+        Ok(Value::Array(
+            serials.into_iter().map(|serial| p64(serial.0)).collect(),
+        ))
+    }
+
+    /// Release every intent lock of the session: the client ended its
+    /// transaction before `tpc_begin`.
+    fn unlock_intent(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        arity::<0>(args, "unlock_intent")?;
+        if let Some(intents) = self.intents.as_mut() {
+            intents.release();
         }
         Ok(Value::Nil)
     }
@@ -1754,6 +1989,15 @@ impl Transaction {
         Ok(Value::Nil)
     }
 
+    /// Queue the undo of the transaction of the undo id `trans_id` into the
+    /// open transaction `id`. `undoa` has no reply: the first vote stages
+    /// the undo, as ZEO's server does, and an error there fails the vote.
+    fn undoa(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [trans_id, id] = arity::<2>(args, "undoa")?;
+        self.current(id)?.undos.push(trans_id.clone());
+        Ok(Value::Nil)
+    }
+
     /// Vote, and return the conflicts that the client resolves, as ZEO 6
     /// does with client conflict resolution. An empty list means that the
     /// vote passed.
@@ -1769,8 +2013,11 @@ impl Transaction {
     /// committed serial and votes again. The second vote takes no lock and
     /// checks every serial again. No Python runs on the server.
     ///
-    /// Before it takes a lock, the first vote waits for each job of the
-    /// compression pool of the transaction, and attaches its payload to
+    /// Before it takes a lock, the first vote stages the undos that `undoa`
+    /// queued, in order. The reply gives each oid of an undone transaction
+    /// as a bare oid, as ZEO's server does. An undo that no tier merges
+    /// fails the vote with `UndoError`. Then the vote waits for each job of
+    /// the compression pool of the transaction, and attaches its payload to
     /// the staged record. A job that failed fails the vote with
     /// `StorageError`.
     ///
@@ -1784,13 +2031,33 @@ impl Transaction {
         let listed = std::mem::take(&mut open.listed);
         let native = std::mem::take(&mut open.native);
         let jobs = std::mem::take(&mut open.jobs);
+        let undos = std::mem::take(&mut open.undos);
         let voted = match &mut open.txn {
-            Ok(txn) if listed > 0 => txn
-                .vote()
-                .map(|()| Voted::default())
-                .map_err(|error| Fault::of_vote(&error, txn)),
+            Ok(txn) if listed > 0 => {
+                let voted = txn
+                    .vote()
+                    .map(|()| Voted::default())
+                    .map_err(|error| Fault::of_vote(&error, txn));
+                // The second vote compares the merges of shadow mode with
+                // the records of the client: log and count what it found.
+                storage.metrics.count_verifications(txn.verifications());
+                if let Some(log) = &storage.resolution_log
+                    && !txn.verifications().is_empty()
+                {
+                    log.write(&txn.verification_log_lines(SystemTime::now(), Some(&storage.name)));
+                }
+                voted
+            }
             Ok(txn) => {
-                let voted = attach(txn, jobs).and_then(|()| vote_resolving(txn));
+                let voted = undo(txn, &undos).and_then(|(undone, seen)| {
+                    attach(txn, jobs)?;
+                    let mut voted = vote_resolving(txn)?;
+                    voted
+                        .native
+                        .retain(|oid| u64_of(oid).map_or(true, |oid| !seen.contains(&Oid(oid))));
+                    voted.undone = undone.into_iter().map(|oid| p64(oid.0)).collect();
+                    Ok(voted)
+                });
                 // The vote that takes the locks runs tier 1: log and count
                 // its results, also when the vote failed.
                 storage.metrics.count_resolutions(txn.resolutions());
@@ -1805,6 +2072,7 @@ impl Transaction {
         };
         match voted {
             Ok(Voted {
+                undone,
                 native: merged,
                 conflicts,
             }) => {
@@ -1820,7 +2088,9 @@ impl Transaction {
                 } else {
                     open.native = merged.len() as u64;
                 }
-                Ok(Value::Array(merged.into_iter().chain(conflicts).collect()))
+                Ok(Value::Array(
+                    undone.into_iter().chain(merged).chain(conflicts).collect(),
+                ))
             }
             Err(fault) => {
                 self.open = None;
@@ -2021,10 +2291,101 @@ fn attach(txn: &mut Txn<Arc<Store>>, jobs: Vec<Job>) -> Result<(), Fault> {
 /// The items of the reply of a vote.
 #[derive(Default)]
 struct Voted {
+    /// The oids of the undone transactions, each as a bare oid.
+    undone: Vec<Value>,
     /// The oids that tier 1 merged, each as a bare oid.
     native: Vec<Value>,
     /// The conflicts that the client resolves.
     conflicts: Vec<Value>,
+}
+
+/// Stage in `txn` the undo of each undo id of `ids`, in order. Return the
+/// oids of the undone transactions, each once, in the order of the undos,
+/// and their set.
+///
+/// An undo id that names no transaction, and an undo that the core
+/// refuses, fail with `UndoError`. So does an undo that no tier of the
+/// core merges: the in-process storage resolves such an undo in Python,
+/// and no Python runs on the server.
+fn undo(txn: &mut Txn<Arc<Store>>, ids: &[Value]) -> Result<(Vec<Oid>, HashSet<Oid>), Fault> {
+    let mut oids = Vec::new();
+    let mut seen = HashSet::new();
+    for id in ids {
+        let tid = match id {
+            Value::Binary(id) => undo_tid(id),
+            Value::String(id) => undo_tid(id.as_bytes()),
+            _ => None,
+        }
+        .ok_or_else(|| Fault::undo("the undo id names no transaction", None))?;
+        let undone = txn.undo(tid)?;
+        if let Some(conflict) = undone.conflicts.first() {
+            return Err(Fault::undo(CHANGED_LATER, Some(conflict.oid)));
+        }
+        for oid in undone.oids {
+            if seen.insert(oid) {
+                oids.push(oid);
+            }
+        }
+    }
+    Ok((oids, seen))
+}
+
+/// Return the map of the undo log of the transaction row `row`: the keys
+/// `id`, `time`, `user_name` and `description` of FileStorage, then the
+/// keys of the extension, which replace a key of the same name, as in
+/// FileStorage. An extension that gives no msgpack map adds no key.
+fn undo_entry(row: &TxnMeta) -> Value {
+    let mut items = vec![
+        (Value::from("id"), Value::Binary(undo_id(row.tid))),
+        (Value::from("time"), Value::F64(clock::tid_time(row.tid))),
+        (Value::from("user_name"), Value::Binary(row.user.clone())),
+        (
+            Value::from("description"),
+            Value::Binary(row.description.clone()),
+        ),
+    ];
+    if let Ok(Value::Map(extension)) = extension::unpickle(&row.extension) {
+        for (key, value) in extension {
+            match items.iter_mut().find(|item| item.0 == key) {
+                Some(item) => item.1 = value,
+                None => items.push((key, value)),
+            }
+        }
+    }
+    Value::Map(items)
+}
+
+/// Tell if Python finds `a` and `b` equal, where the msgpack values allow
+/// it to tell: an int, a float and a bool compare by their numbers, as
+/// `1 == 1.0` and `True == 1` are true. Other values compare as msgpack
+/// values, so `b"x"` and `"x"` differ, as in Python.
+fn python_eq(a: &Value, b: &Value) -> bool {
+    fn number(value: &Value) -> Option<f64> {
+        match value {
+            Value::Integer(n) => n
+                .as_i64()
+                .map(|n| n as f64)
+                .or(n.as_u64().map(|n| n as f64)),
+            Value::F64(x) => Some(*x),
+            Value::F32(x) => Some(f64::from(*x)),
+            Value::Boolean(b) => Some(f64::from(u8::from(*b))),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        _ => match (number(a), number(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+    }
+}
+
+/// Return the int `value` of an argument.
+fn int_of(value: &Value) -> Result<i64, Fault> {
+    value
+        .as_i64()
+        .ok_or_else(|| Fault::type_error("an index of the undo log is not an int"))
 }
 
 /// Vote with `vote_resolving` of the core. Return each oid that tier 1
@@ -2059,7 +2420,11 @@ fn vote_resolving(txn: &mut Txn<Arc<Store>>) -> Result<Voted, Fault> {
             ]))
         })
         .collect::<Result<Vec<_>, Fault>>()?;
-    Ok(Voted { native, conflicts })
+    Ok(Voted {
+        undone: Vec::new(),
+        native,
+        conflicts,
+    })
 }
 
 /// Add 1 to the metric `counter`.
@@ -3221,7 +3586,7 @@ mod tests {
         );
         let metrics = &s.storage.metrics;
         assert_eq!(get_counter(&metrics.conflicts_native), 1);
-        assert_eq!(get_counter(&metrics.structural_merges[0][0]), 1);
+        assert_eq!(get_counter(&metrics.structural_merges[0][0][0]), 1);
         // The client resolved nothing.
         let status = s.storage.status().to_value();
         assert_eq!(count(&status, "conflicts_resolved"), 0);
@@ -3335,6 +3700,125 @@ mod tests {
         get(status, key).as_u64().unwrap()
     }
 
+    /// Undo the transaction of the undo id `undo_id` in the transaction
+    /// `id`. Return the reply of the vote, or its fault.
+    fn undo_in(s: &mut Client, id: i64, undo_id: Value) -> Result<Value, Fault> {
+        begin(s, id, None);
+        done(call(s, "undoa", vec![undo_id, Value::from(id)]));
+        match call(s, "vote", vec![Value::from(id)]) {
+            Outcome::Done(reply) => {
+                finish(s, Value::from(id));
+                Ok(reply)
+            }
+            outcome => Err(failed(outcome)),
+        }
+    }
+
+    #[test]
+    fn an_undo_stages_at_the_vote_and_the_reply_gives_its_oids() {
+        let mut s = registered("undo");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        let second = commit(&mut s, 2, 7, first, b"two").unwrap();
+        let log = done(call(
+            &mut s,
+            "undoLog",
+            vec![Value::from(0), Value::from(1)],
+        ));
+        let entry = &log.as_array().unwrap()[0];
+        assert_eq!(get(entry, "id"), &Value::Binary(undo_id(Tid(second))));
+        assert_eq!(get(entry, "user_name"), &Value::Binary(b"user-2".to_vec()));
+        let reply = undo_in(&mut s, 3, get(entry, "id").clone()).unwrap();
+        assert_eq!(reply, Value::Array(vec![p64(7)]));
+        let loaded = done(call(&mut s, "loadBefore", vec![p64(7), p64(u64::MAX >> 1)]));
+        assert_eq!(
+            loaded.as_array().unwrap()[0],
+            Value::Binary(b"one".to_vec())
+        );
+        // The undo is in the log, newest first.
+        let log = done(call(
+            &mut s,
+            "undoLog",
+            vec![Value::from(0), Value::from(-20)],
+        ));
+        assert_eq!(log.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_undo_that_no_tier_merges_fails_the_vote_with_an_undo_error() {
+        let mut s = registered("undo-error");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        let second = commit(&mut s, 2, 7, first, b"two").unwrap();
+        commit(&mut s, 3, 7, second, b"three").unwrap();
+        let fault = undo_in(&mut s, 4, Value::Binary(undo_id(Tid(second)))).unwrap_err();
+        assert_eq!(fault.class, "ZODB.POSException.MultipleUndoErrors");
+        let errors = item(&fault, "_errs");
+        let [error] = errors.as_array().unwrap().as_slice() else {
+            panic!("one error: {fault:?}");
+        };
+        assert_eq!(error.as_array().unwrap()[0], p64(7));
+        // An id that names no transaction fails the vote too.
+        let fault = undo_in(&mut s, 5, Value::Binary(b"not an id".to_vec())).unwrap_err();
+        assert_eq!(fault.class, "ZODB.POSException.MultipleUndoErrors");
+    }
+
+    #[test]
+    fn undo_info_keeps_the_entries_of_its_specification() {
+        let mut s = registered("undo-info");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        commit(&mut s, 2, 7, first, b"two").unwrap();
+        let specification = Value::Map(vec![(
+            Value::from("user_name"),
+            Value::Binary(b"user-1".to_vec()),
+        )]);
+        let args = vec![Value::from(0), Value::from(-20), specification];
+        let info = done(call(&mut s, "undoInfo", args));
+        let entries = info.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(get(&entries[0], "id"), &Value::Binary(undo_id(Tid(first))));
+        let all = done(call(&mut s, "undoInfo", vec![]));
+        assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn undo_info_matches_a_missing_key_with_none_and_numbers_as_python() {
+        let mut s = registered("undo-info-python");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        commit(&mut s, 2, 7, first, b"two").unwrap();
+        let info = |s: &mut Client, items: Vec<(Value, Value)>| {
+            let args = vec![Value::from(0), Value::from(-20), Value::Map(items)];
+            done(call(s, "undoInfo", args)).as_array().unwrap().len()
+        };
+        assert_eq!(info(&mut s, vec![(Value::from("missing"), Value::Nil)]), 2);
+        assert_eq!(
+            info(&mut s, vec![(Value::from("missing"), Value::from(1))]),
+            0
+        );
+        assert!(python_eq(&Value::from(1), &Value::F64(1.0)));
+        assert!(python_eq(&Value::Boolean(true), &Value::from(1)));
+        assert!(!python_eq(&Value::from("x"), &Value::Binary(b"x".to_vec())));
+        assert!(!python_eq(&Value::from(2), &Value::F64(2.5)));
+    }
+
+    #[test]
+    fn the_vote_of_an_undo_of_many_oids_gives_each_oid_once() {
+        const OIDS: u64 = 20_000;
+        let mut s = registered("undo-many");
+        begin(&mut s, 1, None);
+        for oid in 1..=OIDS {
+            store(&mut s, 1, oid, 0, b"one");
+        }
+        let tid = vote_and_finish(&mut s, 1).unwrap();
+        let started = Instant::now();
+        let reply = undo_in(&mut s, 2, Value::Binary(undo_id(Tid(tid)))).unwrap();
+        let oids = reply.as_array().unwrap();
+        assert_eq!(oids.len() as u64, OIDS);
+        let distinct: HashSet<u64> = oids.iter().map(|oid| u64_of(oid).unwrap()).collect();
+        assert_eq!(distinct.len() as u64, OIDS);
+        // The undo is linear in its oids: a list scan for each oid would
+        // take minutes in a debug build.
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    }
+
     #[test]
     fn get_info_describes_the_store() {
         let mut s = registered("get-info");
@@ -3357,7 +3841,7 @@ mod tests {
             s.storage.path.to_str(),
             "the name is the directory of the store"
         );
-        assert_eq!(get(&info, "supportsUndo"), &Value::Boolean(false));
+        assert_eq!(get(&info, "supportsUndo"), &Value::Boolean(true));
         assert_eq!(
             get(&info, "supports_record_iternext"),
             &Value::Boolean(true)
@@ -3373,7 +3857,7 @@ mod tests {
             .collect();
         assert_eq!(interfaces, INTERFACES);
         assert!(interfaces.contains(&("ZODB.interfaces", "IExternalGC")));
-        assert!(!interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
+        assert!(interfaces.contains(&("ZODB.interfaces", "IStorageUndoable")));
 
         let sizes = done(call(&mut s, "get_size_info", vec![]));
         assert_eq!(keys(&sizes), ["length", "size"]);
@@ -3437,6 +3921,105 @@ mod tests {
         ];
         done(call(&mut s, "register", args));
         s
+    }
+
+    /// Return a session on `storage`, registered with `declaration`.
+    fn declaring_on(storage: &Arc<NamedStorage>, declaration: &[&str]) -> Client {
+        let mut s = Client::new(Arc::clone(storage), outbox());
+        let names = declaration.iter().map(|name| Value::from(*name)).collect();
+        let args = vec![Value::from("1"), Value::Boolean(false), Value::Array(names)];
+        done(call(&mut s, "register", args));
+        s
+    }
+
+    fn lock_intent(s: &mut Client, oids: &[u64]) -> Outcome {
+        let oids = oids.iter().map(|&oid| p64(oid)).collect();
+        call(s, "lock_intent", vec![Value::Array(oids)])
+    }
+
+    #[test]
+    fn lock_intent_needs_the_declaration_and_gives_the_current_serials() {
+        let mut stock = registered("intent-stock");
+        let fault = failed(lock_intent(&mut stock, &[1]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let storage = storage("intent-serials", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        let serials = done(lock_intent(&mut s, &[1, 2]));
+        assert_eq!(serials, Value::Array(vec![p64(one), p64(0)]));
+        assert!(s.txn.is_open());
+        // A lower oid, or one that the session holds, fails and takes
+        // nothing.
+        for oids in [&[1][..], &[2], &[0]] {
+            let fault = failed(lock_intent(&mut s, oids));
+            assert_eq!(fault.class, TRANSACTION_ERROR, "{oids:?}");
+        }
+        assert_eq!(done(call(&mut s, "unlock_intent", vec![])), Value::Nil);
+        assert!(!s.txn.is_open());
+    }
+
+    #[test]
+    fn the_next_transaction_adopts_the_intent_locks_of_the_session() {
+        let storage = storage("intent-adopt", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let mut other = declaring_on(&storage, &["lock_intent"]);
+        let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        done(lock_intent(&mut s, &[1]));
+        // The vote of the session takes its own intent lock at once.
+        let voted = store_and_vote(&mut s, 2, &[(1, one)], MAPPING);
+        assert!(matches!(voted, Outcome::Done(_)), "{voted:?}");
+        // No lock_intent in an open transaction.
+        let fault = failed(lock_intent(&mut s, &[5]));
+        assert_eq!(fault.class, TRANSACTION_ERROR);
+        let two = finish(&mut s, Value::from(2));
+        // The end of the transaction released the lock: another session
+        // takes it at once, and reads the commit.
+        assert_eq!(
+            done(lock_intent(&mut other, &[1])),
+            Value::Array(vec![p64(two)])
+        );
+    }
+
+    #[test]
+    fn a_read_only_session_takes_no_intent_lock() {
+        let mut s = declaring("intent-read-only", true, &["lock_intent"]);
+        assert_eq!(failed(lock_intent(&mut s, &[1])), Fault::read_only());
+    }
+
+    #[test]
+    fn a_session_that_holds_intent_locks_past_the_bound_loses_them() {
+        let storage = storage("intent-bound", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let mut other = declaring_on(&storage, &["lock_intent"]);
+        done(lock_intent(&mut s, &[3]));
+        assert!(
+            s.txn
+                .intent_hold_left()
+                .is_some_and(|left| left <= INTENT_HOLD)
+        );
+        s.txn.drop_intents();
+        assert!(!s.txn.is_open());
+        assert_eq!(s.txn.intent_hold_left(), None);
+        done(lock_intent(&mut other, &[3]));
+    }
+
+    #[test]
+    fn a_begin_that_fails_releases_the_intent_locks_of_the_session() {
+        let storage = storage("intent-failed-begin", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        done(lock_intent(&mut s, &[3]));
+        // A status that the server does not support fails the begin.
+        let begin = vec![
+            Value::from(7),
+            Value::Nil,
+            Value::Nil,
+            Value::Map(vec![]),
+            Value::Nil,
+            Value::from("u"),
+        ];
+        done(call(&mut s, "tpc_begin", begin));
+        assert!(!s.txn.holds_intents());
+        assert!(storage.store.lock_table_is_empty());
     }
 
     #[test]

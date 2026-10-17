@@ -1572,3 +1572,67 @@ async fn the_info_of_the_pool_keeps_the_sizes_of_a_connection_that_left() {
     }
     assert_eq!(length(&pool), Some(1));
 }
+
+/// The options of a client that declares the extension `lock_intent`.
+fn locking() -> Options {
+    Options {
+        extensions: vec!["lock_intent".to_owned()],
+        ..Options::default()
+    }
+}
+
+/// Open a pool as `open` does, whose connections declare `lock_intent`.
+async fn open_locking(server: &Server, bound: usize) -> Pool {
+    let addr = server.addr();
+    let listener = Client::open(Arc::new(Tokio), addr, "1", &locking())
+        .await
+        .unwrap();
+    let connect: Connect = Arc::new(move || {
+        Box::pin(async move { Client::open(Arc::new(Tokio), addr, "1", &locking()).await })
+    });
+    Pool::new(Arc::new(Tokio), listener, connect, bound)
+}
+
+#[tokio::test]
+async fn an_owner_of_intent_locks_releases_them_before_its_connection_serves_again() {
+    let server = start("intent-release");
+    let pool = open_locking(&server, 1).await;
+    let other = Client::open(Arc::new(Tokio), server.addr(), "1", &locking())
+        .await
+        .unwrap();
+    let mut intents = pool.intents().await.unwrap();
+    assert!(!intents.holds());
+    intents.lock(&[Oid(5)]).await.unwrap();
+    assert!(intents.holds());
+    drop(intents);
+    // The one connection of the pool commits again, after the release.
+    let first = commit(&pool, Oid(6), Tid::ZERO, &record(b"a"))
+        .await
+        .unwrap();
+    assert!(first.tid() > Tid::ZERO);
+    let serials = tokio::time::timeout(TIMEOUT, other.lock_intent(&[Oid(5)]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(serials, vec![Tid::ZERO]);
+}
+
+#[tokio::test]
+async fn an_owner_whose_first_lock_times_out_holds_nothing() {
+    let options = ServeOptions::new(fresh_dir("intent-timeout").join("store"))
+        .lock_timeout(Duration::from_millis(100));
+    let server = Server::start(options).unwrap();
+    let pool = open_locking(&server, 1).await;
+    let other = Client::open(Arc::new(Tokio), server.addr(), "1", &locking())
+        .await
+        .unwrap();
+    other.lock_intent(&[Oid(5)]).await.unwrap();
+    let mut intents = pool.intents().await.unwrap();
+    let error = intents.lock(&[Oid(5)]).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Conflict { oid: Oid(5), .. }),
+        "{error:?}"
+    );
+    assert!(!intents.holds());
+    assert!(intents.is_connected());
+}

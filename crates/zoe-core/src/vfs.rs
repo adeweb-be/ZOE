@@ -44,6 +44,14 @@ pub trait Vfs: Send + Sync + 'static {
     /// Rename the file `from` to `to`, and replace `to` if it exists.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
 
+    /// Give the existing file `from` the second name `to`, a hard link.
+    /// Fail when `to` exists. The two names then give the same bytes, and
+    /// no byte is copied. The new name is durable after a sync of its
+    /// directory. Only a file that nothing writes again gets a link. A
+    /// filesystem that cannot link fails with its error, for example
+    /// `CrossesDevices`, `PermissionDenied` or `Unsupported`.
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()>;
+
     /// Remove the file `name`.
     fn remove(&self, name: &str) -> io::Result<()>;
 
@@ -112,6 +120,10 @@ impl<V: Vfs> Vfs for Arc<V> {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         (**self).rename(from, to)
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        (**self).hard_link(from, to)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -302,6 +314,10 @@ impl Vfs for OsVfs {
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         fs::rename(self.dir.join(from), self.dir.join(to))
+    }
+
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        fs::hard_link(self.dir.join(from), self.dir.join(to))
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -746,6 +762,10 @@ enum Op {
         from: String,
         to: String,
     },
+    Link {
+        from: String,
+        to: String,
+    },
     Remove {
         file: String,
     },
@@ -959,8 +979,8 @@ impl MemVfs {
     /// operation. At a crash point, the synced operations are on disk. A
     /// write or a length change is synced by a later sync of its file. A
     /// creation, a removal or the creation of a directory is synced by a
-    /// later sync of the directory that holds it. A rename is synced by a
-    /// later sync of the directory of its new name. The other operations
+    /// later sync of the directory that holds it. A rename or a hard link is
+    /// synced by a later sync of the directory of its new name. The other operations
     /// are pending. The images of a crash point are these:
     ///
     /// - With at most `MAX_SUBSET_PENDING` pending operations, one image
@@ -1048,6 +1068,29 @@ impl MemVfs {
         let bytes = state.files.remove(from).ok_or_else(|| not_found(from))?;
         state.files.insert(to.to_owned(), bytes);
         state.log.push(Op::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// The simulation keeps the bytes of each name apart, so a link copies
+    /// the bytes of `from`. Only a file that nothing writes again gets a
+    /// link, so the two names give the same bytes, as on a real disk.
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.alive()?;
+        state.check_parent(to)?;
+        if state.files.contains_key(to) || state.has_dir(to) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, to.to_owned()));
+        }
+        let bytes = state
+            .files
+            .get(from)
+            .ok_or_else(|| not_found(from))?
+            .clone();
+        state.files.insert(to.to_owned(), bytes);
+        state.log.push(Op::Link {
             from: from.to_owned(),
             to: to.to_owned(),
         });
@@ -1194,6 +1237,10 @@ impl Vfs for MemVfs {
         MemVfs::rename(self, from, to)
     }
 
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        MemVfs::hard_link(self, from, to)
+    }
+
     fn remove(&self, name: &str) -> io::Result<()> {
         MemVfs::remove(self, name)
     }
@@ -1296,7 +1343,7 @@ fn split_at_syncs(ops: &[Op]) -> (Vec<usize>, Vec<usize>) {
             }
             Op::Create { file } | Op::Remove { file } => dir_synced(file),
             Op::CreateDir { dir } => dir_synced(dir),
-            Op::Rename { to, .. } => dir_synced(to),
+            Op::Rename { to, .. } | Op::Link { to, .. } => dir_synced(to),
             Op::Sync { .. } | Op::SyncDir { .. } | Op::Mark { .. } => continue,
         };
         if is_synced {
@@ -1354,6 +1401,13 @@ fn apply(
             Op::Rename { from, to } => {
                 if has_dir(&dirs, to)
                     && let Some(bytes) = files.remove(from)
+                {
+                    files.insert(to.clone(), bytes);
+                }
+            }
+            Op::Link { from, to } => {
+                if has_dir(&dirs, to)
+                    && let Some(bytes) = files.get(from).cloned()
                 {
                     files.insert(to.clone(), bytes);
                 }

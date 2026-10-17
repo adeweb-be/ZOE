@@ -3,29 +3,40 @@
 The extension class `zoe._zoe.Storage` calls the core. This module adds the
 parts that need ZODB: the interface declarations, the history records, the
 records of the iterator, the copy from another storage, the conflict
-resolution, the committed blob files and the `WrongThread` exception.
+resolution, the undo log, the committed blob files and the `WrongThread`
+exception.
 """
 
+import base64
+import binascii
 import contextlib
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 import zope.interface
 from ZODB.BaseStorage import DataRecord, TransactionRecord
 from ZODB.blob import BlobFile, is_blob_record
 from ZODB.ConflictResolution import ConflictResolvingStorage
+from ZODB.Connection import TransactionMetaData
 from ZODB.interfaces import (
     IBlobStorageRestoreable,
     IExternalGC,
     IStorageCurrentRecordIteration,
     IStorageIteration,
+    IStorageUndoable,
 )
-from ZODB.POSException import ConflictError, POSKeyError, StorageTransactionError
+from ZODB.POSException import (
+    ConflictError,
+    POSKeyError,
+    StorageTransactionError,
+    UndoError,
+)
 from ZODB.TimeStamp import TimeStamp
 
-from zoe import _zoe
+from zoe import _zoe, zodb
 
 
 class WrongThread(StorageTransactionError):
@@ -38,15 +49,23 @@ class WrongThread(StorageTransactionError):
     """
 
 
+# The most transactions that one read of the undo log takes.
+_UNDO_LOG_CHUNK = 256
+
+# The reason of an undo that a later transaction stops, as in FileStorage.
+_CHANGED_LATER = "Some data were modified by a later transaction"
+
+
 # `IBlobStorageRestoreable` extends `IBlobStorage` and
-# `IStorageRestoreable`, and `IStorageCurrentRecordIteration` and
-# `IExternalGC` extend `IStorage`. `INTERFACES` of `zoe serve` lists these
-# interfaces in the order of `__iro__`. A change here needs the same change
-# there.
+# `IStorageRestoreable`, and `IStorageCurrentRecordIteration`,
+# `IStorageUndoable` and `IExternalGC` extend `IStorage`. `INTERFACES` of
+# `zoe serve` lists these interfaces in the order of `__iro__`. A change
+# here needs the same change there.
 @zope.interface.implementer(
     IBlobStorageRestoreable,
     IStorageCurrentRecordIteration,
     IStorageIteration,
+    IStorageUndoable,
     IExternalGC,
 )
 class Storage(_zoe.Storage, ConflictResolvingStorage):
@@ -110,6 +129,17 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
 
     `deleteObject` writes a deletion, so the class declares `IExternalGC`.
 
+    `undo` undoes a transaction in the transaction of the call: for each
+    object of the undone transaction, it stores the state before it. When a
+    later transaction changed an object, the undo is a three-way merge: the
+    core merges the classes of tier 1, and `_p_resolveConflict` of the class
+    resolves the others in Python, as in FileStorage. An undo that does not
+    merge raises `UndoError`, and so does an undo of a transaction at or
+    before the last pack. A blob undo gives the blob file of the state
+    before, by a hard link: no blob file is copied. `undoLog` and
+    `undoInfo` give the transactions after the last pack, newest first. An
+    undo id is the base64 text of the tid, as in FileStorage.
+
     `sequence(name).next()` returns the next value of the sequence `name` of
     the store: an `int`, unique and strictly increasing per store and per
     name. It is not part of a transaction, so an abort does not give the
@@ -124,11 +154,84 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
 
     `cleanup` closes the storage and removes the store directory and the
     blob directory, as `cleanup` of FileStorage removes its files.
+
+    `early_locks=True` turns on the early write-intent locks of ADR 0045 for
+    the classes of `early_lock_classes`, each as `module.name`, which must
+    be leaf records: `early_lock_classes` is then the frozenset of these hot
+    classes (None on a read-only storage), and the
+    storage puts the methods of `zoe.zodb.LockingConnection` on the
+    `Connection` of ZODB. A class of tier 1 in the list raises `ValueError`.
+    `lock_intent(oids, owner)` takes the intent lock of each oid, in
+    ascending order, and returns their current serials; `unlock_intent`
+    releases them. Without `owner`, the locks belong to the default owner of
+    the storage, and the next `tpc_begin` adopts them. A connection names an
+    owner of its own (`new_intent_owner`), and binds it to its thread for
+    its `tpc_begin` (`bind_intent_owner`).
     """
 
-    def __init__(self, path, *, blob_dir=None, **options):
+    def __new__(cls, path, *, early_locks=False, early_lock_classes=None, **options):
+        # A bad list of hot classes raises before the store opens.
+        zodb.hot_classes(early_locks, early_lock_classes)
+        return super().__new__(cls, path, **options)
+
+    def __init__(
+        self,
+        path,
+        *,
+        blob_dir=None,
+        early_locks=False,
+        early_lock_classes=None,
+        **options,
+    ):
         # The extension opens the store. Keep the blob directory for cleanup.
         self._blob_dir = None if blob_dir is None else os.path.abspath(blob_dir)
+        # A read-only storage writes nothing, so it takes no early lock.
+        classes = zodb.hot_classes(early_locks, early_lock_classes)
+        self.early_lock_classes = None if self.isReadOnly() else classes
+        self._default_intents = self._intents()
+        self._bound_intents = threading.local()
+        if self.early_lock_classes:
+            zodb.install()
+
+    def new_intent_owner(self):
+        """Return a new owner of early write-intent locks."""
+        return self._intents()
+
+    def lock_intent(self, oids, owner=None):
+        """Take the early write-intent lock of each oid of `oids`, in
+        ascending order, and return the current serial of each one.
+
+        An oid at or below an oid that the owner holds raises
+        `StorageTransactionError` and takes nothing. A wait past the lock
+        timeout raises `ConflictError`.
+        """
+        owner = self._default_intents if owner is None else owner
+        return self._lock_intent(owner, list(oids))
+
+    def unlock_intent(self, owner=None):
+        """Release every early write-intent lock of the owner."""
+        self._unlock_intent(self._default_intents if owner is None else owner)
+
+    def close(self):
+        """Release the intent locks of the default owner, which hold a share
+        of the store, then close the storage."""
+        default = self.__dict__.get("_default_intents")
+        if default is not None:
+            self._unlock_intent(default)
+        super().close()
+
+    def bind_intent_owner(self, owner):
+        """Make `owner` the owner of the intent locks that the next
+        `tpc_begin` of the calling thread adopts, or the default owner again
+        when `owner` is None."""
+        self._bound_intents.owner = owner
+
+    def tpc_begin(self, transaction, tid=None, status=None):
+        """Begin a two-phase commit of `transaction`, as the extension does.
+        The transaction adopts the early write-intent locks of the owner that
+        the calling thread bound, or of the default owner."""
+        owner = getattr(self._bound_intents, "owner", None) or self._default_intents
+        return super().tpc_begin(transaction, tid, status, owner)
 
     def cleanup(self):
         """Close the storage and remove the files of the store.
@@ -325,8 +428,114 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         super().registerDB(wrapper)
 
     def supportsUndo(self):
-        """Return False: the storage does not undo transactions."""
-        return False
+        """Return True: the storage undoes transactions."""
+        return True
+
+    def getTid(self, oid):
+        """Return the serial of the current record of `oid`. An object
+        that has no record, or whose current record is a deletion, raises
+        `POSKeyError`."""
+        return self.load(oid)[1]
+
+    def undo(self, transaction_id, transaction):
+        """Undo the transaction of the undo id `transaction_id` in
+        `transaction`. Return `(None, oids)`: the oids of the undone
+        transaction. The commit of `transaction` gives them their state
+        before the undone transaction.
+
+        When a later transaction changed an object, the undo merges: tier 1
+        of the core merges the classes of BTrees and `Length`, tier 2 the
+        classes that the merge policy names, and `tryToResolveConflict` the
+        others, with the state of the undone
+        transaction as the base, the current state as the committed one,
+        and the state before as the new one. An undo that no tier and no
+        `_p_resolveConflict` merges raises `UndoError`. An undo id that
+        names no transaction after the last pack raises `UndoError`.
+        """
+        tid = _undo_tid(transaction_id)
+        oids, conflicts = self._undo(tid, transaction)
+        for oid, serial, current, before in conflicts:
+            try:
+                data = self.tryToResolveConflict(oid, serial, tid, before, current)
+            except ConflictError:
+                raise UndoError(_CHANGED_LATER, oid) from None
+            self.store(oid, serial, data, "", transaction)
+        return None, oids
+
+    def undoLog(self, first=0, last=-20, filter=None):
+        """Return the transactions that an undo can undo, newest first,
+        from the index `first` up to `last`, `last` excluded. A negative
+        `last` gives at most `-last` transactions. `filter` keeps the
+        descriptions for which it returns true.
+
+        A description has the keys of FileStorage: `id`, `time`,
+        `user_name` and `description`, with the keys of the extension of the
+        transaction. The transactions at or before the last pack are not in
+        the log.
+        """
+        if last < 0:
+            last = first - last
+        found = []
+        index = 0
+        before = None
+        while index < last:
+            rows = self._undo_log(before, _UNDO_LOG_CHUNK)
+            if not rows:
+                break
+            for tid, user, description, extension in rows:
+                info = {
+                    "id": undo_id(tid),
+                    "time": TimeStamp(tid).timeTime(),
+                    "user_name": user,
+                    "description": description,
+                }
+                # An extension that does not unpickle adds no key.
+                try:
+                    info.update(TransactionMetaData(extension=extension).extension)
+                except Exception:
+                    pass
+                if filter is None or filter(info):
+                    if index >= first:
+                        found.append(info)
+                    index += 1
+                    if index >= last:
+                        break
+            before = rows[-1][0]
+        return found
+
+    def undoInfo(self, first=0, last=-20, specification=None):
+        """Return the transactions of `undoLog(first, last)` whose
+        description holds each key of `specification` with its value."""
+        if not specification:
+            return self.undoLog(first, last)
+        items = list(specification.items())
+
+        def matches(info):
+            return all(info.get(key) == value for key, value in items)
+
+        return self.undoLog(first, last, matches)
+
+
+def undo_id(tid):
+    """Return the undo id of the transaction `tid`: the base64 text of its
+    8 bytes, as FileStorage gives it."""
+    return base64.encodebytes(tid).rstrip()
+
+
+def _undo_tid(transaction_id):
+    """Return the tid of the undo id `transaction_id`: the text of
+    `undo_id`, or the 8 bytes of the tid. Another id raises `UndoError`."""
+    if isinstance(transaction_id, str):
+        transaction_id = transaction_id.encode("ascii", "replace")
+    if len(transaction_id) == 8:
+        return transaction_id
+    try:
+        tid = base64.b64decode(transaction_id.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        tid = b""
+    if len(tid) != 8:
+        raise UndoError("the undo id names no transaction")
+    return tid
 
 
 class _Transaction(TransactionRecord):

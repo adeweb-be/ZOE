@@ -162,6 +162,9 @@ pub(crate) struct NamedStorage {
     timeout: bool,
     /// The resolution log of the server, if `--resolution-log` names one.
     resolution_log: Option<Arc<ResolutionLog>>,
+    /// The longest time that a session holds intent locks without a
+    /// `tpc_begin` (ADR 0045).
+    pub(crate) intent_hold: std::time::Duration,
 }
 
 impl NamedStorage {
@@ -183,7 +186,16 @@ impl NamedStorage {
             shared_blob_dir: false,
             timeout: false,
             resolution_log: None,
+            intent_hold: session::INTENT_HOLD,
         }
+    }
+
+    /// Release the intent locks that a session holds `hold` without a
+    /// `tpc_begin`, in place of `INTENT_HOLD`.
+    #[cfg(test)]
+    pub(crate) fn with_intent_hold(mut self, hold: std::time::Duration) -> Self {
+        self.intent_hold = hold;
+        self
     }
 
     /// Start the status at `start`, in place of the time of `new`.
@@ -1768,5 +1780,182 @@ mod tests {
         assert_eq!(Storages::held(&storages), ["a", "b"]);
         drop(unregistered);
         assert!(Storages::held(&storages).is_empty());
+    }
+
+    /// Serve `storage` on a new TCP listener. Return the runtime, the
+    /// address and the task of the one connection that it serves.
+    fn serving_one(
+        storage: Arc<NamedStorage>,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> (
+        tokio::runtime::Runtime,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if let Some(dispatch) = dispatch {
+            builder.on_thread_start(move || {
+                std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+            });
+        }
+        let runtime = builder.build().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let storages = Arc::new(Storages::new(vec![storage], Queues::DEFAULT.client));
+        let served = runtime.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let connection = Connection {
+                peer: "test".to_owned(),
+                runtime: Arc::new(Tokio),
+                max_frame_size: crate::serve::DEFAULT_MAX_FRAME_SIZE.get(),
+                idle_timeout: None,
+                read_only: false,
+                socket: None,
+            };
+            serve_stream(reader, writer, connection, storages, never_stops()).await;
+        });
+        (runtime, addr, served)
+    }
+
+    /// Connect to `addr`, answer the protocol, register with the storage
+    /// "1" and declare the extension `lock_intent`, then send
+    /// `lock_intent` of `oid` with the id 2.
+    fn locking_intent(addr: std::net::SocketAddr, oid: u64) -> Client {
+        let mut client = Client::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(read_frame(&mut client), PROTOCOL);
+        write_frame(&mut client, PROTOCOL);
+        let declaration = Value::Array(vec![Value::from("lock_intent")]);
+        let register = vec![Value::from("1"), Value::Boolean(false), declaration];
+        send(&mut client, 1, "register", register);
+        read_frame(&mut client);
+        let oids = Value::Array(vec![session::p64(oid)]);
+        send(&mut client, 2, "lock_intent", vec![oids]);
+        client
+    }
+
+    /// The bytes of the log lines of a test.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_server_releases_intent_locks_held_past_the_bound_and_warns() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-intent-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let hold = Duration::from_millis(200);
+        let storage = NamedStorage::new("1", &dir, Arc::clone(&store), Queues::DEFAULT)
+            .with_intent_hold(hold);
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        // With one live dispatcher, tracing takes the interest of a callsite
+        // from the default of the thread that registers it first, which can
+        // be the thread of another test, without a subscriber. With two,
+        // it asks each dispatcher.
+        let _other = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let (runtime, addr, _served) = serving_one(Arc::new(storage), Some(dispatch));
+
+        let started = Instant::now();
+        let mut client = locking_intent(addr, 3);
+        let reply = read_frame(&mut client);
+        let reply = rmpv::decode::read_value(&mut reply.as_slice()).unwrap();
+        assert_eq!(reply.as_array().unwrap()[2], Value::from(".reply"));
+        assert!(!store.lock_table_is_empty());
+        // A callsite that another test registers while the subscriber
+        // registers can keep an interest of "never". The warning comes at
+        // the bound, after this rebuild.
+        tracing::callsite::rebuild_interest_cache();
+        // The connection stays open and sends nothing: the thread of the
+        // transaction releases the locks at the bound.
+        let deadline = started + Duration::from_secs(30);
+        while !store.lock_table_is_empty() {
+            assert!(Instant::now() < deadline, "the locks stay held");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.elapsed() >= hold);
+        // The warning comes after the release.
+        let line = loop {
+            let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("released the intent locks"))
+            {
+                break line.to_owned();
+            }
+            assert!(Instant::now() < deadline, "no warning in:\n{text}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(line.contains("\"level\":\"WARN\""), "{line}");
+        assert!(line.contains("\"first\":\"0x0000000000000003\""), "{line}");
+        // The session goes on: another lock_intent comes after the release.
+        let oids = Value::Array(vec![session::p64(3)]);
+        send(&mut client, 3, "lock_intent", vec![oids]);
+        read_frame(&mut client);
+        assert!(!store.lock_table_is_empty());
+        drop(client);
+        drop(runtime);
+    }
+
+    #[test]
+    fn the_end_of_a_connection_ends_its_lock_intent_that_waits() {
+        let dir =
+            std::env::temp_dir().join(format!("zoe-protocol-intent-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = zoe_core::Options {
+            lock_timeout: Duration::from_secs(120),
+            ..zoe_core::Options::default()
+        };
+        let store = Arc::new(Store::open_with(&dir, options).unwrap());
+        // Another owner holds the intent lock of oid 3 for the whole test.
+        let mut holder = zoe_core::IntentLocks::new(Arc::clone(&store));
+        holder.lock(&[zoe_core::Oid(3)]).unwrap();
+        let storage = Arc::new(NamedStorage::new(
+            "1",
+            &dir,
+            Arc::clone(&store),
+            Queues::DEFAULT,
+        ));
+        let (runtime, addr, served) = serving_one(storage, None);
+
+        let client = locking_intent(addr, 3);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!served.is_finished());
+        let started = Instant::now();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        // The connection ends before the lock timeout: its wait ends.
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(20), served).await })
+            .expect("the connection waits for the lock")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(20));
+        holder.release();
+        assert!(store.lock_table_is_empty());
+        drop(runtime);
     }
 }

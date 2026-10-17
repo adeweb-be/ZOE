@@ -103,12 +103,14 @@ def test_shadow_mode_logs_the_merge_and_lets_python_resolve(tmp_path, calls):
     )
     assert race(storage, lambda: Length(10), plus(1), plus(2)) == ("merged", 13)
     assert calls["calls"] == 1
-    (line,) = lines(log)
+    line, verified = lines(log)
     assert (line["mode"], line["outcome"], line["applied"]) == (
         "shadow",
         "merged",
         False,
     )
+    # The second vote checks the merge against the record of ZODB.
+    assert (verified["outcome"], verified["same"]) == ("verified", True)
 
 
 def test_a_class_off_runs_no_merge(tmp_path, calls):

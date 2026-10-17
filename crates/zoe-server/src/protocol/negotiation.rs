@@ -27,13 +27,19 @@ pub(crate) const TRACE_CONTEXT: &str = "trace_context";
 
 /// The extensions that the server serves. `sequences` adds
 /// `sequence_next(name)`, the next value of a sequence of the store (F29).
-/// `kv` adds the calls of the KV namespaces (F31, ADR 0043): three reads,
-/// and two writes in the transaction of the connection. `trace_context`
-/// adds the trace context of a call.
+/// `lock_intent` adds `lock_intent(oids)` and `unlock_intent()`, the early
+/// write-intent locks of the session (F7, ADR 0045). `kv` adds the calls
+/// of the KV namespaces (F31, ADR 0043): three reads, and two writes in
+/// the transaction of the connection. `trace_context` adds the trace
+/// context of a call.
 pub(crate) const SERVED: &[Extension] = &[
     Extension {
         name: "sequences",
         methods: &["sequence_next"],
+    },
+    Extension {
+        name: "lock_intent",
+        methods: &["lock_intent", "unlock_intent"],
     },
     Extension {
         name: "kv",

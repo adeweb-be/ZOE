@@ -102,12 +102,12 @@ tsan crate="zoe-core" filter="":
     echo "just tsan: ThreadSanitizer reported the race of the canary test, as expected."
 
 # Build the fuzz targets of zoe serve with libFuzzer, then run them one
-# after the other for `seconds` in all. `just fuzz` runs each of the three
-# targets for 20 seconds, and `just fuzz 600 frame` runs only `frame`, for
+# after the other for `seconds` in all. `just fuzz` runs each of the four
+# targets for 15 seconds, and `just fuzz 600 frame` runs only `frame`, for
 # 10 minutes. The targets and their seeds are in crates/zoe-server/fuzz. The
 # build, the inputs that libFuzzer finds and the crash files go to
 # target/fuzz.
-fuzz seconds="60" *targets="frame handshake merge":
+fuzz seconds="60" *targets="frame handshake merge fields":
     #!/usr/bin/env bash
     set -euo pipefail
     fuzz=crates/zoe-server/fuzz
@@ -251,10 +251,17 @@ crash runs="200" seed="" seeds="200":
 # on the locking backend of zoe.plone, with the tests of zoe.plone.
 # `just plone <scenario> creators THREADS ITEMS SEED` creates a Plone site,
 # sets the counter of portal_uidgenerator to SEED, and runs
-# plone/creators.py: THREADS threads that create ITEMS Documents each. Its last line of stdout is a JSON report. It runs on zoe,
-# zeoclient and zoeclient; for zeoclient and zoeclient, it starts `zoe
-# serve` on a new store, target/plone/<scenario>/var/creators, and stops it
-# at the end.
+# plone/creators.py: THREADS threads that create ITEMS Documents each. Its
+# last line of stdout is a JSON report. It runs on zoe, zeoclient and
+# zoeclient; for zeoclient and zoeclient, it starts `zoe serve` on a new
+# store, target/plone/<scenario>/var/creators, and stops it at the end.
+# `just plone <scenario> history THREADS` creates a Plone site and runs
+# plone/history.py: the profile of zoe.plone writes the merge policy, the
+# behaviour zoe.plone.history and its upgrade step, THREADS transitions of
+# one Document from one snapshot, and two changes of two fields of it. Its
+# last line of stdout is a JSON report. It runs on zoe and zoeclient; for
+# zoeclient, it starts `zoe serve` on a new store,
+# target/plone/zoeclient/var/history, and stops it at the end.
 # The build goes to target/plone. ZOE_PLONE_ADMIN gives the
 # admin user as user:password. Without it, the recipe makes a random
 # password once, in target/plone/admin. The instance listens on 127.0.0.1,
@@ -512,8 +519,37 @@ plone scenario="zoe" command="start" *args:
             # The last line of stdout is the JSON report of the script.
             "$instance" run plone/creators.py "$@"
             ;;
+        history)
+            # The history script runs in the instance with the storage of
+            # the scenario, after a new site: the merge policy of zoe.plone
+            # and its append-only workflow history. The instance must not
+            # run.
+            set -- {{ args }}
+            if [ "$#" -ne 1 ]; then
+                echo "just plone: use just plone {{ scenario }} history THREADS." >&2
+                exit 2
+            fi
+            case "{{ scenario }}" in
+                zoe)
+                    ;;
+                zoeclient)
+                    store="$target/zoeclient/var/history"
+                    rm -rf "$store"
+                    serve "$target/zoeclient/var/log/zoe-serve-history.log" \
+                        --path "$store" --listen 127.0.0.1:8100
+                    ;;
+                *)
+                    echo "just plone: the history check runs on zoe or zoeclient." >&2
+                    exit 2
+                    ;;
+            esac
+            "$instance" run plone/set_admin.py
+            "$instance" run plone/create_site.py "history-$RANDOM$RANDOM"
+            # The last line of stdout is the JSON report of the script.
+            "$instance" run plone/history.py "$@"
+            ;;
         *)
-            echo "just plone: unknown command {{ command }}. Use start, build, check, suites or creators." >&2
+            echo "just plone: unknown command {{ command }}. Use start, build, check, suites, creators or history." >&2
             exit 2
             ;;
     esac

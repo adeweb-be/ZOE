@@ -17,6 +17,7 @@
 //! `receiveBlobStop`, then the reply. The reader gives these calls to the
 //! download of their oid and serial.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
@@ -788,6 +789,58 @@ impl Client {
         self::tid(&reply, "kv_generation")
     }
 
+    /// Take the early write-intent lock of each oid of `oids`, in ascending
+    /// order, for the next transaction of this connection (ADR 0045).
+    /// Return the current serial of each oid, in the same order, when the
+    /// server holds them all. It needs the extension `lock_intent`: without
+    /// it, it fails with `Error::Unsupported` and sends nothing.
+    ///
+    /// An oid at or below an oid that the connection holds fails with the
+    /// `StorageTransactionError` of the server, and a wait past the lock
+    /// timeout with its `ConflictError`.
+    pub async fn lock_intent(&self, oids: &[Oid]) -> Result<Vec<Tid>, Error> {
+        self.check_extension(LOCK_INTENT)?;
+        let oids = oids.iter().map(|oid| bin8(oid.0)).collect();
+        let reply = self
+            .inner
+            .call("lock_intent", vec![Value::Array(oids)])
+            .await?;
+        let Some(serials) = reply.as_array() else {
+            return Err(bad("lock_intent", &reply));
+        };
+        serials
+            .iter()
+            .map(|serial| tid(serial, "lock_intent"))
+            .collect()
+    }
+
+    /// Release every intent lock of this connection, and wait for the
+    /// reply of the server.
+    pub async fn unlock_intent(&self) -> Result<(), Error> {
+        self.check_extension(LOCK_INTENT)?;
+        self.inner.call("unlock_intent", vec![]).await.map(drop)
+    }
+
+    /// Send `unlock_intent` and do not wait for its reply. The server
+    /// answers the calls of a connection in order, so a later call of the
+    /// connection comes after the release. `keep` drops only after the
+    /// frame is in the channel: a pool gives the connection back with it,
+    /// so the next transaction of the connection comes after the release.
+    pub fn unlock_intent_later(&self, keep: Box<dyn Any + Send>) {
+        self.inner.send_later("unlock_intent", vec![], keep);
+    }
+
+    /// Fail with `Error::Unsupported` when the server did not accept the
+    /// extension `name`.
+    fn check_extension(&self, name: &str) -> Result<(), Error> {
+        if self.extensions.iter().any(|accepted| accepted == name) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "the server did not accept the extension {name}"
+        )))
+    }
+
     /// Call `method` of the server with `args`, and return its reply, as
     /// `_call` of `ZEO.ClientStorage` does. An error reply fails with the
     /// error of the server.
@@ -1442,6 +1495,32 @@ impl Inner {
         TRACEPARENT.try_with(Clone::clone).ok().flatten()
     }
 
+    /// Send `method` with `args` as a call whose reply nothing waits for,
+    /// without a wait for room in the queue: a drop sends it. The reader
+    /// drops the reply, because no call waits for its id. `keep` drops only
+    /// after the frame is in the channel.
+    fn send_later(&self, method: &str, args: Vec<Value>, keep: Box<dyn Any + Send>) {
+        let id = {
+            let mut calls = lock(&self.calls);
+            if calls.closed {
+                return;
+            }
+            let id = calls.next_id;
+            calls.next_id += 1;
+            id
+        };
+        let Ok(frame) = protocol::call(id, method, args, None) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(frame)) = self.outgoing.try_send(frame) {
+            let outgoing = self.outgoing.clone();
+            self.runtime.spawn(Box::pin(async move {
+                let _ = outgoing.send(frame).await;
+                drop(keep);
+            }));
+        }
+    }
+
     /// Send `tpc_abort` for the transaction `txn`, and do not wait for its
     /// reply. The reader drops the reply, because no call waits for its id.
     /// `guard` is the commit lock of the transaction. It is released only
@@ -1707,6 +1786,8 @@ const SEQUENCES: &str = "sequences";
 
 /// The extension of the KV namespaces.
 const KV: &str = "kv";
+/// The extension of the early write-intent locks.
+const LOCK_INTENT: &str = "lock_intent";
 
 /// The extension that lets a call carry the trace context of the client.
 const TRACE_CONTEXT: &str = "trace_context";

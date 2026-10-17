@@ -71,8 +71,8 @@ use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
     Address, Cache, Connect, Copier, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open,
-    Options, Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn,
-    Verification, traced,
+    Options, Pool, PoolIntents, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio,
+    Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -903,12 +903,85 @@ impl NativeClient {
         Ok(PyBytes::new(py, &tid.0.to_be_bytes()))
     }
 
+    /// Return a new owner of early write-intent locks (ADR 0045). It
+    /// holds no lock and no connection.
+    fn intents(&self) -> NativeIntents {
+        NativeIntents {
+            pid: self.pid,
+            runtime: self.runtime,
+            intents: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take the early write-intent lock of each oid of `oids`, in ascending
+    /// order, for `owner`, and return the current serial of each oid. The
+    /// first lock of an owner leases a connection of the pool, which the
+    /// owner keeps until `unlock_intent` or the transaction that adopts
+    /// its locks. An oid at or below an oid that the owner holds raises
+    /// `StorageTransactionError`, and a wait past the lock timeout of the
+    /// server raises `ConflictError`.
+    fn lock_intent<'py>(
+        &self,
+        py: Python<'py>,
+        owner: &NativeIntents,
+        oids: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        self.check_process()?;
+        let oids = oids
+            .iter()
+            .map(|oid| <[u8; 8]>::try_from(oid.as_slice()).map(|b| Oid(u64::from_be_bytes(b))))
+            .collect::<Result<Vec<Oid>, _>>()
+            .map_err(|_| PyValueError::new_err("an oid is not 8 bytes"))?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let serials = py
+            .detach(|| {
+                runtime.block_on(traced(trace, async {
+                    let mut intents = owner.intents.lock().await;
+                    if intents.is_none() {
+                        *intents = Some(pool.intents().await?);
+                    }
+                    let held = intents.as_mut().expect("an owner");
+                    let locked = held.lock(&oids).await;
+                    // An owner that holds nothing, or whose connection is
+                    // lost, gives its connection back to the pool.
+                    if locked.is_err() && (!held.holds() || !held.is_connected()) {
+                        *intents = None;
+                    }
+                    locked
+                }))
+            })
+            .map_err(|e| client_error(py, e))?;
+        Ok(serials.into_iter().map(|tid| p64(py, tid.0)).collect())
+    }
+
+    /// Release every intent lock of `owner`, and give its connection back
+    /// to the pool. Without locks, do nothing.
+    fn unlock_intent(&self, py: Python<'_>, owner: &NativeIntents) -> PyResult<()> {
+        self.check_process()?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            runtime.block_on(async {
+                let intents = owner.intents.lock().await.take();
+                match intents {
+                    Some(intents) => intents.release().await,
+                    None => Ok(()),
+                }
+            })
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
     /// Begin a transaction on a free connection of the pool, and return
     /// it. `extension` is the dict of the transaction extension. With
     /// `tid`, the transaction commits under that tid, with the status
     /// `status`. When every connection is busy and the pool is at its
-    /// bound, wait for a free one.
-    #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned()))]
+    /// bound, wait for a free one. With `intents`, an owner that holds
+    /// early write-intent locks, the transaction begins on the connection
+    /// of the owner and adopts its locks.
+    #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned(), intents = None))]
+    #[allow(clippy::too_many_arguments)]
     fn begin(
         &self,
         py: Python<'_>,
@@ -917,6 +990,7 @@ impl NativeClient {
         extension: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
         status: String,
+        intents: Option<&NativeIntents>,
     ) -> PyResult<NativeTransaction> {
         let tid = tid.map(u64_of).transpose()?.map(Tid);
         let mut encoded = Vec::new();
@@ -928,8 +1002,23 @@ impl NativeClient {
         let (user, description) = (user.to_vec(), description.to_vec());
         let txn = py
             .detach(|| {
-                let begin = pool.begin_with(&user, &description, &encoded, tid, &status);
-                runtime.block_on(traced(trace, begin))
+                runtime.block_on(traced(trace, async {
+                    // An owner whose lock waits on another thread has no
+                    // locks to give yet: the transaction begins without them.
+                    let held = intents
+                        .and_then(|owner| owner.intents.try_lock().ok())
+                        .and_then(|mut held| held.take());
+                    match held {
+                        Some(held) => {
+                            held.begin_with(&user, &description, &encoded, tid, &status)
+                                .await
+                        }
+                        None => {
+                            pool.begin_with(&user, &description, &encoded, tid, &status)
+                                .await
+                        }
+                    }
+                }))
             })
             .map_err(|e| client_error(py, e))?;
         let slot = Arc::new(Mutex::new(Some(txn)));
@@ -1122,6 +1211,33 @@ impl Drop for NativeClient {
 /// The open transaction of a `Transaction`.
 type Slot = Mutex<Option<PoolTransaction>>;
 
+/// An owner of early write-intent locks of a `Client` (ADR 0045): the locks
+/// and the connection of the pool that holds them, from the first
+/// `lock_intent` to `unlock_intent` or the `begin` that adopts them. The
+/// drop releases the locks.
+#[pyclass(frozen, module = "zoe._zoe", name = "Intents")]
+pub(crate) struct NativeIntents {
+    /// The process that opened the client.
+    pid: u32,
+    runtime: &'static Runtime,
+    /// The locks, from the first `lock_intent`. An async mutex: a lock
+    /// waits on the server with it held.
+    intents: tokio::sync::Mutex<Option<PoolIntents>>,
+}
+
+impl Drop for NativeIntents {
+    fn drop(&mut self) {
+        let intents = self.intents.get_mut().take();
+        if self.pid != std::process::id() {
+            mem::forget(intents);
+            return;
+        }
+        // The drop of the locks can start a task of the runtime.
+        let _inside = self.runtime.enter();
+        drop(intents);
+    }
+}
+
 /// One transaction of a `Client`, on its own connection of the pool, from
 /// `begin` to `finish` and `done`, or to `abort`.
 #[pyclass(frozen, module = "zoe._zoe", name = "Transaction")]
@@ -1303,15 +1419,20 @@ impl NativeTransaction {
     }
 
     /// Undo the transaction `trans_id` in this transaction: `undoa`, sent to
-    /// the server, which answers as it does for `ZEO.ClientStorage`.
-    fn undo(&self, py: Python<'_>, trans_id: &[u8]) -> PyResult<()> {
+    /// the server, which answers as it does for `ZEO.ClientStorage`. The id
+    /// is bytes, as `undoLog` gives it, or a `str` of its text.
+    fn undo(&self, py: Python<'_>, trans_id: &Bound<'_, PyAny>) -> PyResult<()> {
         check_process(self.pid)?;
+        let trans_id: Vec<u8> = match trans_id.cast::<PyString>() {
+            Ok(text) => text.to_str()?.as_bytes().to_vec(),
+            Err(_) => trans_id.extract()?,
+        };
         let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
             let mut slot = lock(&self.txn);
             let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.undo(trans_id)))
+            runtime.block_on(traced(trace, txn.undo(&trans_id)))
         })
         .map_err(|e| client_error(py, e))
     }
@@ -2048,7 +2169,14 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
             errors::client_disconnected(py, "the connection to the server is lost".into())
         }
         Error::Io(error) => errors::client_disconnected(py, error.to_string()),
-        Error::Server { class, message, .. } => server_error(py, &class, message),
+        // A class of the factories of ZEO's client gets what its factory
+        // makes of the value, as from `ZEO.ClientStorage`: for example a
+        // `MultipleUndoErrors` with its `_errs`.
+        Error::Server {
+            class,
+            value,
+            message,
+        } => factory_error(py, &class, &value).unwrap_or_else(|| server_error(py, &class, message)),
         Error::Unsupported(text) => errors::unsupported_failure(py, text),
         Error::Invalid(text) => errors::transaction_failure(py, text),
         error => errors::storage_failure(py, error.to_string()),
@@ -2094,6 +2222,21 @@ fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
         Ok(PyErr::from_value(exception))
     })();
     made.unwrap_or_else(|_| server_error(py, &class, message))
+}
+
+/// Return the exception that the factory of `ZEO.asyncio.client` of the
+/// class `class` makes of the msgpack value `value`, or `None` when no
+/// factory has the class or the factory fails.
+fn factory_error(py: Python<'_>, class: &str, value: &Value) -> Option<PyErr> {
+    let made = (|| -> PyResult<Option<PyErr>> {
+        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
+        let Ok(factory) = factories.get_item(class) else {
+            return Ok(None);
+        };
+        let value = to_python(py, value, 0)?;
+        Ok(Some(PyErr::from_value(factory.call1((class, value))?)))
+    })();
+    made.ok().flatten()
 }
 
 /// Return the msgpack values of the args of a call: a list or a tuple.

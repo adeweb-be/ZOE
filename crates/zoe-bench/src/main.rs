@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use zoe_bench::conflicts::Ranking;
+use zoe_bench::hot::{self, HotSettings, Object};
 use zoe_bench::load::{self, LoadSettings, SaturateSettings, Workload};
 
 /// A load generator that speaks the ZEO protocol.
@@ -43,6 +44,38 @@ enum Command {
     /// loadBefore passes a ceiling, and report the loads per second of the
     /// last step under it.
     Saturate(SaturateArgs),
+    /// Run writers of one hot object, with vote-time locks or with early
+    /// write-intent locks, and report the conflicts and the commits of a
+    /// sync.
+    Hot(HotArgs),
+}
+
+#[derive(Debug, Args)]
+struct HotArgs {
+    #[command(flatten)]
+    target: Target,
+    /// The admin address of the server, for its /metrics: the syncs, the
+    /// lock hand-offs and the intent locks of the run.
+    #[arg(long, value_name = "HOST:PORT")]
+    admin: Option<String>,
+    /// The number of writers. Each writer has its own connection.
+    #[arg(long, default_value = "64", value_name = "N", value_parser = positive)]
+    writers: usize,
+    /// The increments of each writer.
+    #[arg(long, default_value = "20", value_name = "T", value_parser = positive)]
+    transactions: usize,
+    /// The object: length, which tier 1 merges, or mapping, which no tier
+    /// merges.
+    #[arg(long, default_value = "length", value_enum)]
+    object: Object,
+    /// Take the early write-intent lock of the object before each read.
+    #[arg(long)]
+    early_locks: bool,
+    /// The most attempts of one transaction. A transaction that meets a
+    /// conflict at each of them gives up, as a request of Zope does after
+    /// its retries.
+    #[arg(long, default_value = "4", value_name = "A", value_parser = positive)]
+    attempts: usize,
 }
 
 #[derive(Debug, Args)]
@@ -215,6 +248,27 @@ fn main() -> ExitCode {
             };
             run("load", load::load(addr, settings))
         }
+        Command::Hot(args) => {
+            let Some(addr) = address("hot", "--server", &args.target.server) else {
+                return ExitCode::from(2);
+            };
+            let admin = match &args.admin {
+                Some(admin) => match address("hot", "--admin", admin) {
+                    Some(admin) => Some(admin),
+                    None => return ExitCode::from(2),
+                },
+                None => None,
+            };
+            let settings = HotSettings {
+                storage: args.target.storage,
+                writers: args.writers,
+                transactions: args.transactions,
+                object: args.object,
+                early_locks: args.early_locks,
+                attempts: args.attempts,
+            };
+            run("hot", hot::hot(addr, admin, settings))
+        }
         Command::Saturate(args) => {
             let Some(addr) = prepare("saturate", &args.target, &args.workload) else {
                 return ExitCode::from(2);
@@ -241,14 +295,20 @@ fn prepare(command: &str, target: &Target, workload: &WorkloadArgs) -> Option<So
         eprintln!("zoe-bench {command}: --txn-size is larger than --objects");
         return None;
     }
-    match target.server.to_socket_addrs().map(|mut a| a.next()) {
+    address(command, "--server", &target.server)
+}
+
+/// Resolve the address `text` of the option `option`. Return `None` after
+/// a usage error.
+fn address(command: &str, option: &str, text: &str) -> Option<SocketAddr> {
+    match text.to_socket_addrs().map(|mut a| a.next()) {
         Ok(Some(addr)) => Some(addr),
         Ok(None) => {
-            eprintln!("zoe-bench {command}: --server gives no address");
+            eprintln!("zoe-bench {command}: {option} gives no address");
             None
         }
         Err(e) => {
-            eprintln!("zoe-bench {command}: --server: {e}");
+            eprintln!("zoe-bench {command}: {option}: {e}");
             None
         }
     }

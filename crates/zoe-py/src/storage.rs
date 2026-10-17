@@ -28,6 +28,12 @@
 //! `close` can release the locks while the resolution runs, because the
 //! resolution holds no mutex of the transaction.
 //!
+//! `_undo` stages the undo of a transaction through the core, which merges
+//! with tiers 1 and 2, and writes the lines of its merges to the resolution
+//! log when it ends. `zoe.storage.Storage.undo` resolves in Python the oids
+//! that no tier resolves. `_undo_log` reads the transactions that an undo can
+//! undo.
+//!
 //! The store and the table live in a `Shared` part, which the watcher of
 //! the signals also holds (see `signals`). The store closes once: in
 //! `close`, in the drop or in the watcher, whichever takes it first.
@@ -55,8 +61,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use zoe_core::{
-    BlobFile, Compression, Flavour, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT, Store, Tid,
-    Txn, ZoeError,
+    BlobFile, Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT,
+    Store, Tid, Txn, ZoeError,
 };
 
 use crate::errors::{self, Failure, p64, u64_of};
@@ -103,6 +109,21 @@ impl StoreRef {
     /// Give the share back when another share exists.
     pub(crate) fn try_close(self) -> Result<(), Self> {
         Arc::try_unwrap(self.0).map(drop).map_err(Self)
+    }
+}
+
+/// An owner of early write-intent locks of a `Storage` (ADR 0045). The
+/// drop releases its locks.
+#[pyclass(frozen, module = "zoe._zoe", name = "IntentLocks")]
+pub(crate) struct Intents {
+    /// The locks, from the first `lock_intent`, with their share of the
+    /// store.
+    intents: Mutex<Option<IntentLocks<StoreRef>>>,
+}
+
+impl Intents {
+    fn lock(&self) -> MutexGuard<'_, Option<IntentLocks<StoreRef>>> {
+        self.intents.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -387,15 +408,33 @@ impl ResolutionLog {
         })
     }
 
-    /// Writes the lines of what tier 1 did in the vote of `txn`. A failed
-    /// write never fails the vote. Returns the error of the first failed
-    /// write, for the log of the storage.
+    /// Writes the lines of what the tiers did in the vote of `txn`. The
+    /// entries of the undos come first, and `_undo` wrote them already, so
+    /// they are left out. A failed write never fails the vote. Returns the
+    /// error of the first failed write, for the log of the storage.
     fn write(&self, txn: &SharedTxn) -> Option<String> {
-        if txn.resolutions().is_empty() {
+        let vote = txn.undo_resolution_count()..txn.resolutions().len();
+        self.write_lines(txn.resolution_log_lines_of(vote, SystemTime::now(), None))
+    }
+
+    /// Writes the lines of the entries `range` of `txn`, that an undo gave,
+    /// as `write` does.
+    fn write_undo(&self, txn: &SharedTxn, range: std::ops::Range<usize>) -> Option<String> {
+        self.write_lines(txn.resolution_log_lines_of(range, SystemTime::now(), None))
+    }
+
+    /// Writes the lines of the checks of the merges of shadow mode of the
+    /// vote after `_vote_resolving` (ADR 0046), as `write` does.
+    fn write_verifications(&self, txn: &SharedTxn) -> Option<String> {
+        self.write_lines(txn.verification_log_lines(SystemTime::now(), None))
+    }
+
+    fn write_lines(&self, lines: Vec<String>) -> Option<String> {
+        if lines.is_empty() {
             return None;
         }
         let mut text = String::new();
-        for line in txn.resolution_log_lines(SystemTime::now(), None) {
+        for line in lines {
             text.push_str(&line);
             text.push('\n');
         }
@@ -585,6 +624,7 @@ impl Storage {
                 "shadow mode needs resolution_log: without it, nothing tells what it found",
             ));
         }
+        options.structural_merges.resolution_log = resolution_log.is_some();
         let resolution_log = match resolution_log {
             Some(path) => Some(Arc::new(
                 ResolutionLog::open(&path).map_err(|error| core(py, error.into()))?,
@@ -996,6 +1036,56 @@ impl Storage {
         )
     }
 
+    /// Return a new owner of early write-intent locks (ADR 0045). It holds
+    /// no lock and no share of the store.
+    #[pyo3(name = "_intents")]
+    fn intents(&self) -> Intents {
+        Intents {
+            intents: Mutex::new(None),
+        }
+    }
+
+    /// Take the early write-intent lock of each oid of `oids`, in ascending
+    /// order, for `owner`, and return the current serial of each oid, when
+    /// the store holds them all. An owner with locks keeps a share of the
+    /// store until `unlock_intent` or the `tpc_begin` that adopts them.
+    ///
+    /// An oid at or below an oid that `owner` holds raises
+    /// `StorageTransactionError` and takes nothing. A wait past the lock
+    /// timeout raises `ConflictError`. A read-only storage raises
+    /// `ReadOnlyError`.
+    #[pyo3(name = "_lock_intent")]
+    fn lock_intent<'py>(
+        &self,
+        py: Python<'py>,
+        owner: &Intents,
+        oids: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let oids = oids
+            .iter()
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<PyResult<Vec<Oid>>>()?;
+        let store = self.opened(py)?;
+        let serials = py
+            .detach(|| {
+                let mut intents = owner.lock();
+                let intents = intents.get_or_insert_with(|| IntentLocks::new(store));
+                intents.lock(&oids)
+            })
+            .map_err(|e| core(py, e))?;
+        Ok(serials.into_iter().map(|tid| p64(py, tid.0)).collect())
+    }
+
+    /// Release every intent lock of `owner`, and its share of the store.
+    /// Without locks, do nothing.
+    #[pyo3(name = "_unlock_intent")]
+    fn unlock_intent(&self, py: Python<'_>, owner: &Intents) {
+        py.detach(|| drop(owner.lock().take()));
+    }
+
     /// Begin a two-phase commit of `transaction`. The calling thread
     /// drives it.
     ///
@@ -1007,13 +1097,18 @@ impl Storage {
     /// functions give it: `" "` or `"p"`, as text or bytes. The store keeps
     /// no transaction status, so the status is not kept. Any other status
     /// raises `StorageTransactionError`.
-    #[pyo3(signature = (transaction, tid = None, status = None))]
+    ///
+    /// With `intents`, an owner of early write-intent locks of this
+    /// storage, the transaction adopts its locks: the vote counts them as
+    /// its own, and the end of the transaction releases them.
+    #[pyo3(signature = (transaction, tid = None, status = None, intents = None))]
     fn tpc_begin(
         &self,
         py: Python<'_>,
         transaction: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
         status: Option<&Bound<'_, PyAny>>,
+        intents: Option<&Intents>,
     ) -> PyResult<()> {
         if self.read_only {
             return Err(errors::read_only(py));
@@ -1032,9 +1127,20 @@ impl Storage {
         let extension = text(&transaction.getattr("extension_bytes")?)?;
         let store = self.opened(py)?;
         let txn = py
-            .detach(move || match tid {
-                None => Ok(Txn::begin(store, &user, &description, &extension)),
-                Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension),
+            .detach(move || {
+                let mut txn = match tid {
+                    None => Txn::begin(store, &user, &description, &extension),
+                    Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension)?,
+                };
+                // An owner whose lock waits on another thread has no locks
+                // to give yet: the transaction begins without them.
+                if let Some(owner) = intents
+                    && let Ok(mut held) = owner.intents.try_lock()
+                    && let Some(held) = held.as_mut()
+                {
+                    txn.adopt_intents(held)?;
+                }
+                Ok(txn)
             })
             .map_err(|e| core(py, e))?;
         let entry = Arc::new(Entry {
@@ -1140,6 +1246,95 @@ impl Storage {
         let serial = serial_of(oldserial)?;
         py.detach(|| entry.with(|txn| Ok(txn.delete(oid, serial)?)))
             .map_err(|failure| failure.into_py(py))
+    }
+
+    /// Stage the undo of the transaction `tid` in `transaction`: for each
+    /// oid of `tid`, the state before `tid`. Return the oids of `tid`, and
+    /// the conflicts that no tier of the core resolves. Each conflict is a
+    /// tuple: the oid, the serial of the current state, the current pickle
+    /// and the pickle of the state before `tid`. `zoe.storage.Storage.undo`
+    /// resolves them in Python and stores each result over its serial. The
+    /// lines of the merges of the undo go to the resolution log when the
+    /// call ends, also when it fails; the vote writes only its own.
+    ///
+    /// An undo that the core refuses raises `UndoError`: a transaction at
+    /// or before the last pack, or one that the store does not have, or a
+    /// later change that tier 1 refuses. A read-only storage refuses the
+    /// call.
+    #[pyo3(name = "_undo")]
+    fn undo<'py>(
+        &self,
+        py: Python<'py>,
+        tid: &Bound<'py, PyAny>,
+        transaction: &Bound<'py, PyAny>,
+    ) -> PyResult<(Vec<Bound<'py, PyBytes>>, Vec<UndoRow<'py>>)> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let entry = self.entry(py, transaction)?;
+        let tid = Tid(u64_of(tid)?);
+        let log = self.resolution_log.clone();
+        let mut log_failure = None;
+        let undone = py.detach(|| {
+            entry.with(|txn| {
+                let before = txn.undo_resolution_count();
+                let undone = txn.undo(tid);
+                // The merges of the undo go to the log when it ends, also
+                // when it fails: the vote writes only its own.
+                if let Some(log) = &log {
+                    log_failure = log.write_undo(txn, before..txn.undo_resolution_count());
+                }
+                Ok(undone?)
+            })
+        });
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        let undone = undone.map_err(|failure: Failure| failure.into_py(py))?;
+        let oids = undone.oids.iter().map(|oid| p64(py, oid.0)).collect();
+        let conflicts = undone
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                (
+                    p64(py, conflict.oid.0),
+                    p64(py, conflict.serial.0),
+                    PyBytes::new(py, &conflict.current),
+                    PyBytes::new(py, &conflict.before),
+                )
+            })
+            .collect();
+        Ok((oids, conflicts))
+    }
+
+    /// Return at most `limit` transactions before the tid `before` that an
+    /// undo can undo, newest first: the transactions after the last pack.
+    /// `None` starts at the last transaction. Each item is a tuple of the
+    /// tid, the user name, the description and the pickled extension.
+    /// `zoe.storage.Storage.undoLog` makes the dictionaries of ZODB.
+    #[pyo3(name = "_undo_log", signature = (before, limit))]
+    fn undo_log<'py>(
+        &self,
+        py: Python<'py>,
+        before: Option<&Bound<'py, PyAny>>,
+        limit: usize,
+    ) -> PyResult<Vec<UndoLogRow<'py>>> {
+        let before = before.map(u64_of).transpose()?.map_or(Tid::MAX, Tid);
+        let store = self.opened(py)?;
+        let rows = py
+            .detach(move || store.undo_log(before, limit))
+            .map_err(|e| core(py, e))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    p64(py, row.tid.0),
+                    PyBytes::new(py, &row.user),
+                    PyBytes::new(py, &row.description),
+                    PyBytes::new(py, &row.extension),
+                )
+            })
+            .collect())
     }
 
     /// Stage a new pickle of `oid` with the blob in the file `blobfilename`.
@@ -1315,8 +1510,26 @@ impl Storage {
     /// checks the serials again with the locks of `_vote_resolving`.
     fn tpc_vote(&self, py: Python<'_>, transaction: &Bound<'_, PyAny>) -> PyResult<()> {
         let entry = self.entry(py, transaction)?;
-        py.detach(|| entry.with(|txn| txn.vote().map_err(|error| vote_failure(txn, error))))
-            .map_err(|failure| failure.into_py(py))
+        let log = self.resolution_log.clone();
+        let mut log_failure = None;
+        let voted = py
+            .detach(|| {
+                entry.with(|txn| {
+                    let voted = txn.vote();
+                    // The vote after `_vote_resolving` compares the merges
+                    // of shadow mode with the resolved records: log what it
+                    // found, also when the vote failed.
+                    if let Some(log) = &log {
+                        log_failure = log.write_verifications(txn);
+                    }
+                    voted.map_err(|error| vote_failure(txn, error))
+                })
+            })
+            .map_err(|failure| failure.into_py(py));
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        voted
     }
 
     /// Return the oids that tier 1 of the core merged in the last vote of
@@ -1612,6 +1825,25 @@ type LoadedRow<'py> = (
 /// pickle of the transaction.
 type ConflictRow<'py> = (
     Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+);
+
+/// A conflict that `_undo` gives: the oid, the serial of the current
+/// state, the current pickle and the pickle of the state before the undone
+/// transaction.
+type UndoRow<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+);
+
+/// A transaction of `_undo_log`: the tid, the user name, the description
+/// and the pickled extension.
+type UndoLogRow<'py> = (
     Bound<'py, PyBytes>,
     Bound<'py, PyBytes>,
     Bound<'py, PyBytes>,
