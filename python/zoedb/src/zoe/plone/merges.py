@@ -39,8 +39,10 @@ The overrides are a JSON object with these keys, each optional:
 - ``classes``: entries by class name; an entry changes the keys that it
   gives, its ``fields`` add to the derived ones, and its ``coupled`` groups
   add to the derived groups; ``null`` removes the entry of a class. An
-  override does not unblock a blocked class: the class stays blocked, and
-  the import logs a warning.
+  override does not unblock a blocked class, through one profile or
+  several: it can neither remove it, nor switch it on, nor give it
+  ``"blocked": false``; the class stays blocked, and the import logs a
+  warning.
 
 Only `derive`, `site_overrides` (Acquisition), `update_policy`,
 `profile_of`, `fti_modified` (zope.component.hooks) and the import step
@@ -66,6 +68,7 @@ __all__ = [
     "fti_modified",
     "import_merge_policy",
     "invariant_fields",
+    "settle",
     "update_policy",
 ]
 
@@ -149,12 +152,14 @@ def _groups(*lists):
     return result
 
 
-def apply_overrides(policy, overrides, derived=frozenset()):
+def apply_overrides(policy, overrides, derived=frozenset(), blocked=frozenset()):
     """Return the policy `policy` with `overrides` applied (see the module
     docstring), and the names of the classes that the overrides remove.
     The key ``tier2`` of the overrides sets the mode of the classes of
-    `derived`. `policy` and `overrides` stay as they are. Raise
-    `ValueError` for overrides of another form."""
+    `derived`. A class of `blocked`, or one whose entry is blocked, stays
+    blocked: an override can neither remove it, nor switch it on, nor give
+    it ``"blocked": false``. `policy` and `overrides` stay as they are.
+    Raise `ValueError` for overrides of another form."""
     if type(overrides) is not dict:
         raise ValueError("the overrides are a JSON object")
     unknown = set(overrides) - {
@@ -183,27 +188,31 @@ def apply_overrides(policy, overrides, derived=frozenset()):
                 entry["tier2"] = mode
     removed = set()
     for name, entry in classes.items():
-        if entry is None:
+        if entry is not None and type(entry) is not dict:
+            raise ValueError(f"{name}: an override is a JSON object or null")
+        for key, kind in (("fields", dict), ("coupled", list)):
+            if entry is not None and key in entry and type(entry[key]) is not kind:
+                raise ValueError(f"{name}: {key} of an override is of another form")
+        merged = dict(result["classes"].get(name, {}))
+        if name in blocked or merged.get("blocked"):
+            # A blocked class stays blocked: the override loses its `tier2`
+            # and its `blocked`.
+            unblocks = entry is None or (
+                entry.get("tier2") not in (None, "off") or entry.get("blocked") is False
+            )
+            if unblocks:
+                logger.warning("%s stays blocked: an override cannot unblock it", name)
+            merged.update(blocked_entry())
+            entry = {
+                key: value
+                for key, value in (entry or {}).items()
+                if key not in ("tier2", "blocked")
+            }
+        elif entry is None:
             result["classes"].pop(name, None)
             removed.add(name)
             continue
-        if type(entry) is not dict:
-            raise ValueError(f"{name}: an override is a JSON object or null")
-        for key, kind in (("fields", dict), ("coupled", list)):
-            if key in entry and type(entry[key]) is not kind:
-                raise ValueError(f"{name}: {key} of an override is of another form")
-        merged = dict(result["classes"].get(name, {}))
         removed.discard(name)
-        if merged.get("blocked"):
-            if entry.get("tier2") not in (None, "off") or entry.get("blocked") is False:
-                logger.warning(
-                    "%s stays blocked: an override cannot switch it on", name
-                )
-            entry = {
-                key: value
-                for key, value in entry.items()
-                if key not in ("tier2", "blocked")
-            }
         fields = {**merged.get("fields", {}), **entry.get("fields", {})}
         coupled = _groups(merged.get("coupled"), entry.get("coupled"))
         merged.update(
@@ -257,6 +266,20 @@ def compose(stored, new):
             merged.update(blocked_entry())
         result["classes"][name] = merged
     return merge_policy.validate(result)
+
+
+def settle(stored, policy, removed):
+    """Return `policy` composed with the policy `stored` of the database,
+    without the classes of `removed`. A class that the database blocks,
+    for another site maybe, stays blocked: an override of this site
+    cannot remove it."""
+    composed = compose(stored, policy)
+    for name in removed:
+        if composed["classes"].get(name, {}).get("blocked"):
+            logger.warning("%s stays blocked: an override cannot unblock it", name)
+            continue
+        composed["classes"].pop(name, None)
+    return composed
 
 
 def derive(portal):
@@ -330,15 +353,18 @@ def update_policy(site):
     version."""
     derived = derive(site)
     names = set(derived["classes"])
+    # The classes that the derivation blocks stay blocked through the
+    # overrides of every profile.
+    blocked = {
+        name for name, entry in derived["classes"].items() if entry.get("blocked")
+    }
     policy = {"classes": {**derived["classes"], **history.policy()["classes"]}}
     removed = set()
     for overrides in (site_overrides(site) or {}).values():
-        policy, gone = apply_overrides(policy, overrides, names)
+        policy, gone = apply_overrides(policy, overrides, names, blocked)
         removed = (removed | gone) - set(policy["classes"])
     connection = site._p_jar
-    composed = compose(merge_policy.read(connection), policy)
-    for name in removed:
-        composed["classes"].pop(name, None)
+    composed = settle(merge_policy.read(connection), policy, removed)
     version = merge_policy.install(connection, composed)
     logger.info(
         "the merge policy of the database is version %d, with %d classes",

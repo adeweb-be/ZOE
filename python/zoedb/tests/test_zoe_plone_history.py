@@ -127,13 +127,20 @@ def test_a_move_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, firs
 
 
 @pytest.mark.parametrize("first", ["transition", "restore"])
-def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, first):
+@pytest.mark.parametrize(
+    "start",
+    [{"wf": (0,)}, {}, {"other": (0,)}],
+    ids=["same-workflow", "empty", "new-workflow"],
+)
+def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(
+    tmp_path, first, start
+):
     db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
     try:
         with db.transaction() as conn:
             policy.install(conn, history.policy())
             doc = Doc()
-            doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
+            doc.workflow_history = history.WorkflowHistory(start)
             conn.root()["doc"] = doc
         names = ("transition", "restore")
         managers = {name: transaction.TransactionManager() for name in names}
@@ -144,8 +151,8 @@ def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, f
         assert history.restore(conns["restore"].root()["doc"])
         second = "restore" if first == "transition" else "transition"
         managers[first].commit()
-        # Whichever commits second conflicts: an append against a delete
-        # of the history, which tier 2 refuses.
+        # Whichever commits second conflicts: the restore writes the old
+        # history with a state that tier 2 does not take.
         with pytest.raises(ConflictError):
             managers[second].commit()
         managers[second].abort()
@@ -161,9 +168,35 @@ def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(tmp_path, f
         with db.transaction() as conn:
             restored = conn.root()["doc"].workflow_history
             assert type(restored) is history._stock()
-            assert restored["wf"] == (0, 1)
+            assert dict(restored) == {**start, "wf": (*start.get("wf", ()), 1)}
     finally:
         db.close()
+
+
+def test_a_retired_history_holds_an_empty_workflow():
+    doc = Doc()
+    old = doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
+    assert history.restore(doc)
+    assert dict(old) == {history.RETIRED: ()}
+    assert all(statuses == () for statuses in old.values())
+    assert "WorkflowHistory" in repr(old)
+
+
+def test_move_leaves_an_object_without_a_history_as_it_is():
+    from zope.interface import alsoProvides
+
+    # An object of a type with the behaviour and without a workflow.
+    doc = Doc()
+    alsoProvides(doc, history.IAppendOnlyHistory)
+    assert not history.move(doc)
+    assert not hasattr(doc, "workflow_history")
+    # An object with the behaviour and a stock history moves; one without
+    # the behaviour stays.
+    doc.workflow_history = PersistentMapping({"wf": (0,)})
+    assert history.move(doc)
+    other = Doc()
+    other.workflow_history = PersistentMapping({"wf": (0,)})
+    assert not history.move(other)
 
 
 def test_restore_gives_a_persistent_mapping_back():
@@ -276,6 +309,45 @@ def test_an_override_does_not_unblock_a_class(caplog, override):
         DERIVED, {"classes": {"m.Odd": override}}, {"m.Odd"}
     )
     assert result["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
+    assert "stays blocked" in caplog.text
+
+
+def test_a_class_stays_blocked_across_the_sites_of_one_database(caplog):
+    # Site A blocks the class; site B removes it with a null override; site
+    # C switches it on. The class stays blocked in the database.
+    site_a = {"classes": {"m.Odd": {"tier2": "off", "blocked": True}}}
+    stored = merges.settle(None, site_a, set())
+    site_b, removed = merges.apply_overrides(
+        {"classes": {"m.Odd": {"tier2": "shadow"}}}, {"classes": {"m.Odd": None}}
+    )
+    assert removed == {"m.Odd"}
+    stored = merges.settle(stored, site_b, removed)
+    assert stored["classes"]["m.Odd"]["blocked"] is True
+    site_c = {"classes": {"m.Odd": {"tier2": "on"}}}
+    stored = merges.settle(stored, site_c, set())
+    assert stored["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
+    assert "cannot unblock it" in caplog.text
+    # A class that no site blocks goes when an override removes it.
+    stored = merges.settle(
+        {"classes": {"m.Page": {"tier2": "on"}}}, {"classes": {}}, {"m.Page"}
+    )
+    assert "m.Page" not in stored["classes"]
+
+
+def test_a_class_stays_blocked_through_two_profiles(caplog):
+    derived = merges.class_entries([("m.Odd", {"title"}, [(opaque, set())], {})])
+    policy_ = {"classes": dict(derived)}
+    blocked = {"m.Odd"}
+    for overrides in (
+        {"classes": {"m.Odd": None}},
+        {"classes": {"m.Odd": {"tier2": "on"}}},
+    ):
+        policy_, removed = merges.apply_overrides(
+            policy_, overrides, {"m.Odd"}, blocked
+        )
+        assert removed == set()
+    assert policy_["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
+    assert merges.compose(None, policy_)["classes"]["m.Odd"]["blocked"] is True
     assert "stays blocked" in caplog.text
 
 

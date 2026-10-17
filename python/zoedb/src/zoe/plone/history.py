@@ -20,8 +20,9 @@ object of a type with the behaviour a `WorkflowHistory` at its next status:
 the status adapter of `zoe.plone.status` calls `ensure` before it adds the
 status. An object that never gets a status gets no history. The import
 step of the profile `zoe.plone:default` moves the stock histories of the
-objects with the behaviour (`move_histories`), and the import step of the
-profile `zoe.plone:uninstall` gives each `WorkflowHistory` back as a
+objects with the behaviour (`move_histories`), and leaves an object
+without a history as it is; the import step of the profile
+`zoe.plone:uninstall` gives each `WorkflowHistory` back as a
 `PersistentMapping` (`restore_histories`).
 
 Only `move_histories`, `restore_histories` and the import steps import
@@ -43,6 +44,7 @@ __all__ = [
     "WorkflowHistory",
     "ensure",
     "import_histories",
+    "move",
     "move_histories",
     "policy",
     "restore",
@@ -110,7 +112,7 @@ class WorkflowHistory(Persistent, MutableMapping):
         return type(self)(self._entries)
 
     def __repr__(self):
-        return f"<{type(self).__name__} of {sorted(self._entries)}>"
+        return f"<{type(self).__name__} of {sorted(map(repr, self._entries))}>"
 
 
 def policy():
@@ -154,22 +156,32 @@ def _stock():
     return stock
 
 
+#: The key that `restore` leaves in a retired `WorkflowHistory`. It is not
+#: a str, so tier 2 does not take the state, and no workflow has it. Its
+#: value is an empty tuple of statuses, so a stale reader that loops over
+#: the values sees an empty workflow.
+RETIRED = 0
+
+
 def restore(obj):
     """Give `obj` its history back as a stock `PersistentMapping`. Return
     True when the history changed.
 
-    The move empties the `WorkflowHistory`: it deletes each of its
-    workflows. A transaction that adds a status to it from the same
-    snapshot is then a change against a delete, which tier 2 refuses, so
-    the two conflict whichever commits first, and the retry of the
-    transition sees the stock history: no status is lost."""
+    The move retires the `WorkflowHistory`: it writes it with the one item
+    `{RETIRED: ()}`, a state that tier 2 does not take. So a transaction
+    that writes the old history from the same snapshot, whatever it adds,
+    conflicts with the move whichever commits first: tier 2 gives no answer,
+    and the client raises `ConflictError`, as `WorkflowHistory` has no
+    `_p_resolveConflict`. Its retry sees the stock history, and no status
+    is lost."""
     base = _base(obj)
     history = getattr(base, "workflow_history", None)
     if not isinstance(history, WorkflowHistory):
         return False
     items = list(history.items())
-    for key in list(history):
-        del history[key]
+    history._entries.clear()
+    history._entries[RETIRED] = ()
+    history._p_changed = True
     base.workflow_history = _stock()(items)
     return True
 
@@ -223,9 +235,10 @@ def history_types(site):
 
 
 def move_histories(site):
-    """Give each object of `site` with the behaviour a `WorkflowHistory`.
-    Return the number of objects that changed. A second run changes
-    nothing.
+    """Give each object of `site` with the behaviour and a stock history a
+    `WorkflowHistory`. An object without a history gets none: its status
+    adapter gives it one at its first status. Return the number of objects
+    that changed. A second run changes nothing.
 
     The objects come from the catalog by their type: the index
     `object_provides` of an object that the catalog indexed before the
@@ -233,11 +246,16 @@ def move_histories(site):
     names = history_types(site)
     if not names:
         return 0
+    return _each(site, {"portal_type": names}, move)
 
-    def change(obj):
-        return IAppendOnlyHistory.providedBy(obj) and ensure(obj)
 
-    return _each(site, {"portal_type": names}, change)
+def move(obj):
+    """Give `obj` a `WorkflowHistory` when it has the behaviour and a stock
+    history. Return True when the history changed. An object without a
+    history, such as one of a type without a workflow, stays as it is."""
+    if getattr(_base(obj), "workflow_history", None) is None:
+        return False
+    return IAppendOnlyHistory.providedBy(obj) and ensure(obj)
 
 
 def restore_histories(site):
