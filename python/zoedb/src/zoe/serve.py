@@ -196,6 +196,20 @@ def find_binary(section, environ):
     return None
 
 
+def _write_all(descriptor, data):
+    """Write all of `data` to `descriptor`, or raise `OSError`.
+
+    A short write that ends at a line would give a valid file without its
+    last keys.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written == 0:
+            raise OSError("the configuration file of zoe serve took no byte")
+        view = view[written:]
+
+
 def config_file(text):
     """Write `text` into a file that has no name on disk.
 
@@ -206,9 +220,10 @@ def config_file(text):
     function removes the name of the file and the directory at once, and
     the path is in /dev/fd.
     """
+    data = text.encode()
     if hasattr(os, "memfd_create"):
         descriptor = os.memfd_create("zoe-serve.toml", 0)
-        os.write(descriptor, text.encode())
+        _write_all(descriptor, data)
         path = f"/proc/self/fd/{descriptor}"
     else:
         directory = tempfile.mkdtemp(prefix="zoe-serve-")
@@ -217,7 +232,7 @@ def config_file(text):
             os.unlink(name)
         finally:
             os.rmdir(directory)
-        os.write(descriptor, text.encode())
+        _write_all(descriptor, data)
         # On macOS, an open of /dev/fd/N shares the offset of the
         # descriptor. So zoe serve reads from that offset, and it must be 0.
         os.lseek(descriptor, 0, os.SEEK_SET)
