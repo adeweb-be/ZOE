@@ -55,7 +55,8 @@ fn write_report(
     writeln!(out, "  transactions  {}", report.transactions)?;
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
-    writeln!(out, "  sequences     {}", report.sequences)
+    writeln!(out, "  sequences     {}", report.sequences)?;
+    writeln!(out, "  durable rows  {}", report.durable_rows)
 }
 
 /// Return the time of `tid` in UTC, as `YYYY-MM-DD HH:MM:SS.mmm UTC`.
@@ -102,6 +103,7 @@ mod tests {
             records: 12,
             blobs: 2,
             sequences: 1,
+            durable_rows: 0,
             last_tid: Tid(0x10),
         };
         let mut out = Vec::new();

@@ -2451,6 +2451,7 @@ dependencies = [
  "blake3",
  "redb",
  "thiserror",
+ "xxhash-rust",
  "zoe-core",
  "zoe-pickle",
 ]

@@ -3,8 +3,11 @@
 //! A backup directory holds a chain of dump files. The first one is the
 //! full dump: every transaction of the store up to its last tid. Each later
 //! one is an incremental dump: the transactions after the last tid of the
-//! dump before it. A dump also holds the blob of each blob record and the
-//! end of each sequence. ADR 0030 gives the layout.
+//! dump before it. A dump also holds the blob of each blob record, the end
+//! of each sequence and, from version 2 on, every row of the durable KV
+//! namespaces with their generation rows (ADR 0043). ADR 0030 gives the
+//! layout. A restore reads versions 1 and 2, and writes the durable rows of
+//! the last dump of the chain.
 //!
 //! A backup reads the store through its transaction iterator. It writes a
 //! dump file once, under a temporary name, syncs it and renames it into
@@ -23,15 +26,22 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zoe_core::{BlobRecord, Oid, Store, Tid, TxnInfo, ZoeError};
+use zoe_core::{BlobRecord, DurableRow, Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::Error;
 use crate::datafs::Problems;
 use crate::filestorage::hex;
 
-/// The first 8 bytes of a dump file: the name of the format, then its
-/// version.
-const MAGIC: &[u8; 8] = b"ZOEDUMP\x01";
+/// The first 8 bytes of a dump file that a backup writes: the name of the
+/// format, then its version, 2.
+const MAGIC: &[u8; 8] = b"ZOEDUMP\x02";
+
+/// The first 8 bytes of a dump file of version 1, which has no durable
+/// rows. A restore reads it.
+const MAGIC_1: &[u8; 8] = b"ZOEDUMP\x01";
+
+/// The durable rows that one read of a backup takes.
+const ROW_CHUNK: usize = 1024;
 
 /// The suffix of the name of a dump file.
 const SUFFIX: &str = ".zoedump";
@@ -63,6 +73,8 @@ const CHUNK: usize = 1 << 16;
 
 /// The tag of the end of a sequence.
 const SEQUENCE: u8 = b'S';
+/// The tag of a durable row of a KV namespace, from version 2 on.
+const DURABLE: u8 = b'K';
 /// The tag of a transaction.
 const TRANSACTION: u8 = b'T';
 /// The tag of a record that holds a pickle.
@@ -96,6 +108,9 @@ pub struct Backup {
     pub blob_bytes: u64,
     /// The sequences of the dump.
     pub sequences: u64,
+    /// The durable rows of the KV namespaces of the dump, the generation
+    /// rows included.
+    pub durable_rows: u64,
 }
 
 /// What a restore read and wrote.
@@ -111,6 +126,9 @@ pub struct Restored {
     pub blobs: u64,
     /// The sequences.
     pub sequences: u64,
+    /// The durable rows of the KV namespaces of the last dump, the
+    /// generation rows included.
+    pub durable_rows: u64,
     /// The last tid of the last dump.
     pub last_tid: Tid,
 }
@@ -163,6 +181,7 @@ pub fn backup(store: &Store, dir: &Path) -> Result<Backup, Error> {
         blobs: 0,
         blob_bytes: 0,
         sequences: 0,
+        durable_rows: 0,
     };
     if !dumps.is_empty() {
         if last == after {
@@ -455,7 +474,7 @@ fn read_header(path: &Path) -> Result<(Tid, Tid), Error> {
 
 /// Check the magic of `header` and return its two tids.
 fn parse_header(path: &Path, header: &[u8; HEADER]) -> Result<(Tid, Tid), Error> {
-    if header[..8] != MAGIC[..] {
+    if header[..8] != MAGIC[..] && header[..8] != MAGIC_1[..] {
         return Err(damaged(path, "not a dump file of ZOE".to_owned()));
     }
     let tid = |at: usize| Tid(u64::from_be_bytes(header[at..at + 8].try_into().unwrap()));
@@ -529,6 +548,24 @@ fn write_dump(
         out.bytes(name.as_bytes())?;
         out.put(&end.to_be_bytes())?;
         report.sequences += 1;
+    }
+
+    // Every durable row, as the store holds it after its last tid. For an
+    // exact dump, no writer changes the store during the call.
+    let mut after_row: Option<Vec<u8>> = None;
+    loop {
+        let (rows, next) = store.kv_durable_rows(after_row.as_deref(), ROW_CHUNK)?;
+        for row in &rows {
+            out.put(&[DURABLE])?;
+            out.bytes(row.name.as_bytes())?;
+            out.bytes(&row.key)?;
+            out.bytes(&row.payload)?;
+            report.durable_rows += 1;
+        }
+        if rows.len() < ROW_CHUNK {
+            break;
+        }
+        after_row = next;
     }
 
     // `after` is below `last`, so the next tid exists.
@@ -651,6 +688,8 @@ fn store_error(error: io::Error) -> Error {
 enum Entry {
     /// The end of a sequence.
     Sequence { name: String, end: u64 },
+    /// A durable row of a KV namespace.
+    Durable(DurableRow),
     /// The header of a transaction. Its records follow.
     Transaction(Head),
     /// A record. When it has a blob, `DumpReader::blob` reads the bytes.
@@ -714,6 +753,8 @@ struct DumpReader {
     /// The tid of the last transaction read, or the last tid of the dump
     /// before.
     tid: Tid,
+    /// True for a dump of version 2, which can hold durable rows.
+    durable: bool,
     /// The blob of the last record, which the caller did not read yet.
     blob: Option<(Oid, BlobRecord)>,
 }
@@ -733,10 +774,12 @@ impl DumpReader {
             last: dump.last,
             state: State::Sequences,
             tid: dump.after,
+            durable: false,
             blob: None,
         };
         let mut header = [0; HEADER];
         reader.exact(&mut header, "the header")?;
+        reader.durable = header[..8] == MAGIC[..];
         if parse_header(path, &header)? != (dump.after, dump.last) {
             let reason = "the header names other tids than the file name";
             return Err(reader.damaged(reason.to_owned()));
@@ -766,6 +809,16 @@ impl DumpReader {
                     return Err(self.damaged(reason));
                 };
                 Ok(Entry::Sequence { name, end })
+            }
+            (DURABLE, State::Sequences) if self.durable => {
+                let name = self.field("the name of a namespace")?;
+                let key = self.field("a key of a namespace")?;
+                let payload = self.field("a value of a namespace")?;
+                let Ok(name) = String::from_utf8(name) else {
+                    let reason = format!("the name of the namespace at offset {at} is not UTF-8");
+                    return Err(self.damaged(reason));
+                };
+                Ok(Entry::Durable(DurableRow { name, key, payload }))
             }
             (TRANSACTION, State::Sequences | State::Transactions) => self.transaction(at),
             (END, State::Sequences | State::Transactions) => self.end(),
@@ -965,17 +1018,22 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
         records: 0,
         blobs: 0,
         sequences: 0,
+        durable_rows: 0,
         last_tid: Tid::ZERO,
     };
     let mut names = BTreeSet::new();
+    // The durable rows of the last dump: each dump holds every row.
+    let mut rows = Vec::new();
     for dump in dumps {
         let mut reader = DumpReader::open(dump)?;
+        rows.clear();
         loop {
             match reader.next()? {
                 Entry::Sequence { name, end } => {
                     store.sequence(&name).restore_end(end)?;
                     names.insert(name);
                 }
+                Entry::Durable(row) => rows.push(row),
                 Entry::Transaction(head) => restore_txn(&store, &mut reader, &head, &mut report)?,
                 Entry::Record { .. } => {
                     return Err(reader.damaged("a record outside a transaction".to_owned()));
@@ -987,6 +1045,9 @@ fn build(dumps: &[DumpFile], work: &Path) -> Result<Restored, Error> {
         report.last_tid = dump.last;
     }
     report.sequences = names.len() as u64;
+    // One backend write holds them all.
+    store.kv_restore_durable(&rows)?;
+    report.durable_rows = rows.len() as u64;
     Ok(report)
 }
 
@@ -1075,7 +1136,54 @@ fn compare(store: &Store, copy: &Store, last: Tid) -> Result<Vec<String>, Error>
             Err(error) => problems.push(format!("sequence {name:?}: {error}")),
         }
     }
+    // The durable rows of the store can change only with a commit, so the
+    // comparison holds when the store has no commit after the dumps.
+    if store.last_transaction() == last {
+        compare_durable(store, copy, &mut problems)?;
+    }
     Ok(problems.finish())
+}
+
+/// Compare the durable rows of `store` with those of `copy`. A difference
+/// names the namespace and the xxh3-64 hash of the key, never the key.
+fn compare_durable(store: &Store, copy: &Store, problems: &mut Problems) -> Result<(), Error> {
+    let all = |store: &Store| -> Result<Vec<DurableRow>, Error> {
+        let mut rows = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (chunk, next) = store.kv_durable_rows(after.as_deref(), ROW_CHUNK)?;
+            let full = chunk.len() == ROW_CHUNK;
+            rows.extend(chunk);
+            if !full {
+                return Ok(rows);
+            }
+            after = next;
+        }
+    };
+    let name = |row: &DurableRow| {
+        format!(
+            "durable row of namespace {:?}, the key of xxh3-64 {:#018x}",
+            row.name,
+            xxhash_rust::xxh3::xxh3_64(&row.key)
+        )
+    };
+    let ours = all(store)?;
+    let theirs = all(copy)?;
+    let mut ours = ours.into_iter().peekable();
+    for dumped in theirs {
+        while let Some(row) = ours.next_if(|row| (&row.name, &row.key) < (&dumped.name, &dumped.key)) {
+            problems.push(format!("{}: not in the dumps", name(&row)));
+        }
+        match ours.next_if(|row| (&row.name, &row.key) == (&dumped.name, &dumped.key)) {
+            Some(row) if row.payload == dumped.payload => {}
+            Some(row) => problems.push(format!("{}: another value in the dumps", name(&row))),
+            None => problems.push(format!("{}: the store lacks it", name(&dumped))),
+        }
+    }
+    for row in ours {
+        problems.push(format!("{}: not in the dumps", name(&row)));
+    }
+    Ok(())
 }
 
 /// Compare the current record of each oid at `last` in `store` and in
@@ -1469,6 +1577,125 @@ mod tests {
             .collect();
         files.sort();
         files
+    }
+
+    /// Commit `writes` of the namespaces in a normal transaction, each a
+    /// flavour, a name, a key and a value or `None` for a delete. Return
+    /// the tid.
+    fn commit_kv(store: &Store, writes: &[(zoe_core::Flavour, &str, &[u8], Option<&[u8]>)]) -> Tid {
+        use zoe_core::Flavour;
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        for &(flavour, name, key, value) in writes {
+            match value {
+                Some(value) => {
+                    let ttl = (flavour == Flavour::Ephemeral)
+                        .then(|| std::time::Duration::from_secs(3600));
+                    txn.kv_set(flavour, name, key, value, ttl).unwrap();
+                }
+                None => txn.kv_delete(flavour, name, key).unwrap(),
+            }
+        }
+        txn.vote().unwrap();
+        txn.finish().unwrap()
+    }
+
+    #[test]
+    fn a_dump_holds_every_durable_row_and_the_restore_writes_those_of_the_last_dump() {
+        use zoe_core::Flavour::{Durable, Ephemeral};
+        let dir = test_dir("backup-durable");
+        let (source, dumps, target) = (dir.join("store"), dir.join("dumps"), dir.join("target"));
+        let store = sample(&source);
+        let first = commit_kv(
+            &store,
+            &[
+                (Durable, "registry", b"a", Some(b"1")),
+                (Durable, "registry", b"b", Some(b"2")),
+                (Ephemeral, "sessions", b"s", Some(b"secret")),
+            ],
+        );
+        let full = backup(&store, &dumps).unwrap();
+        // Two keys and the generation row; the ephemeral row stays out.
+        assert_eq!(full.durable_rows, 3);
+        let second = commit_kv(
+            &store,
+            &[
+                (Durable, "registry", b"a", None),
+                (Durable, "registry", b"c", Some(b"3")),
+                (Durable, "other", b"x", Some(b"4")),
+            ],
+        );
+        let incremental = backup(&store, &dumps).unwrap();
+        assert_eq!(incremental.durable_rows, 5);
+        // A backup with nothing new writes nothing.
+        assert_eq!(backup(&store, &dumps).unwrap().dump, None);
+        assert!(check_dumps(&store, &dumps, &dir).unwrap().differences.is_empty());
+        drop(store);
+
+        let restored = restore(&dumps, &target).unwrap();
+        assert_eq!(restored.durable_rows, 5);
+        let copy = Store::open(&target).unwrap();
+        let get = |name, key: &[u8]| copy.kv_get(Durable, name, key).unwrap();
+        assert_eq!(get("registry", b"a"), None);
+        assert_eq!(get("registry", b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(get("registry", b"c").as_deref(), Some(&b"3"[..]));
+        assert_eq!(get("other", b"x").as_deref(), Some(&b"4"[..]));
+        assert_eq!(copy.kv_generation("registry").unwrap(), second);
+        assert!(first < second);
+        assert_eq!(copy.kv_get(Ephemeral, "sessions", b"s").unwrap(), None);
+        // The rows of the restored store verify: no generation after its
+        // last tid. The pickles of the sample are not real pickles.
+        let report = crate::verify(&copy, None);
+        assert!(report.checksums.is_empty(), "{report:?}");
+        assert_eq!(report.durable_keys, 3);
+        drop(copy);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_check_of_a_backup_finds_a_durable_row_that_differs() {
+        use zoe_core::Flavour::Durable;
+        let dir = test_dir("backup-durable-check");
+        let (source, dumps) = (dir.join("store"), dir.join("dumps"));
+        let store = sample(&source);
+        commit_kv(&store, &[(Durable, "registry", b"title", Some(b"site"))]);
+        backup(&store, &dumps).unwrap();
+        // A change of the row that no commit made: the dumps differ.
+        let mut write_row = |payload: &[u8]| {
+            let row = DurableRow {
+                name: "registry".to_owned(),
+                key: b"title".to_vec(),
+                payload: payload.to_vec(),
+            };
+            store.kv_restore_durable(&[row]).unwrap();
+        };
+        write_row(b"other");
+        let check = check_dumps(&store, &dumps, &dir).unwrap();
+        assert_eq!(check.differences.len(), 1, "{:?}", check.differences);
+        let text = &check.differences[0];
+        assert!(text.contains("\"registry\"") && text.contains("another value"), "{text}");
+        assert!(!text.contains("title"), "a difference names no key: {text}");
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_reads_a_dump_of_version_1() {
+        let dir = test_dir("backup-version-1");
+        let (source, dumps, target) = (dir.join("store"), dir.join("dumps"), dir.join("target"));
+        let store = sample(&source);
+        let full = backup(&store, &dumps).unwrap();
+        drop(store);
+        // A dump of version 1 has the same layout without durable rows.
+        let path = full.dump.unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[7] = 1;
+        let end = bytes.len() - HASH;
+        let hash = blake3::hash(&bytes[..end]);
+        bytes[end..].copy_from_slice(hash.as_bytes());
+        fs::write(&path, bytes).unwrap();
+        let restored = restore(&dumps, &target).unwrap();
+        assert_eq!((restored.transactions, restored.durable_rows), (2, 0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
