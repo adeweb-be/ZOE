@@ -26,14 +26,14 @@ pub(super) fn merge(
     posting_dicts: Mode,
     merge: &mut Merge,
 ) -> Outcome {
-    let (outcome, dicts) = merge_once(trees, class, posting_dicts != Mode::Off, merge);
-    // In shadow mode, the rule only tells what it would do. The vote then
-    // does what it does with the rule off, so a conflict with a dict goes on
-    // as it does without the rule.
-    if posting_dicts == Mode::Shadow && dicts {
+    let (outcome, ruled) = merge_once(trees, class, posting_dicts != Mode::Off, merge);
+    // In shadow mode, the rules only tell what they would do. The vote then
+    // does what it does with the rules off, so the conflict goes on as it
+    // does without them.
+    if posting_dicts == Mode::Shadow && ruled {
         merge.shadow = Some(outcome);
-        // The merge without the rule can stop at the first dict, so the
-        // keys of the line are those of the merge of the rule.
+        // The merge without the rules can stop early, so the keys of the
+        // line are those of the merge of the rules.
         let (keys, changed) = (std::mem::take(&mut merge.keys), merge.changed);
         let outcome = merge_once(trees, class, false, merge).0;
         merge.keys = keys;
@@ -43,9 +43,10 @@ pub(super) fn merge(
     outcome
 }
 
-/// Merges the three records once, with the posting-dict rule when
-/// `posting` is true. Also tells if the rule compared a dict.
-fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> (Outcome, bool) {
+/// Merges the three records once, with the rules of ADR 0042 when `rules`
+/// is true. Also tells if a rule compared a posting dict or let a
+/// delete of a first key through.
+fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (Outcome, bool) {
     let mut heap = Heap::new();
     // ZODB's resolver loads the new record, then the old one, then the
     // committed one. A persistent reference takes its persistent id from
@@ -67,7 +68,7 @@ fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> 
             false,
         );
     }
-    let mut dicts = false;
+    let mut ruled = false;
     let state = match class {
         Class::Length => length(&states),
         Class::Family(shape, family) => {
@@ -75,8 +76,10 @@ fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> 
                 heap: &mut heap,
                 family,
                 mapping: shape.is_mapping(),
-                posting: posting && posting::applies(family),
-                dicts: Cell::new(false),
+                rules,
+                posting: rules && posting::applies(family),
+                first_key: false,
+                ruled: Cell::new(false),
                 items: Vec::new(),
                 keys: Vec::new(),
                 changed: 0,
@@ -84,7 +87,7 @@ fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> 
             let state = merger.resolve(shape, &states);
             merge.keys = std::mem::take(&mut merger.keys);
             merge.changed = merger.changed;
-            dicts = merger.dicts.get();
+            ruled = merger.ruled.get();
             state
         }
     };
@@ -98,7 +101,7 @@ fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> 
         }
         Err(outcome) => outcome,
     };
-    (outcome, dicts)
+    (outcome, ruled)
 }
 
 /// `Length._p_resolveConflict(old, s1, s2)`: `s1 + s2 - old`.
@@ -173,11 +176,17 @@ struct Merger<'h> {
     heap: &'h mut Heap,
     family: Family,
     mapping: bool,
-    /// True when the posting-dict rule applies to this family, on or in
-    /// shadow mode.
+    /// True when the rules of ADR 0042 are on or in shadow mode.
+    rules: bool,
+    /// True when the posting-dict rule applies to this family.
     posting: bool,
-    /// True when the rule compared or merged a posting dict.
-    dicts: Cell<bool>,
+    /// True when the first-key rule applies: the rules are on or in shadow
+    /// mode, and the merge is of the one bucket that a tree holds inline,
+    /// with no next bucket.
+    first_key: bool,
+    /// True when a rule compared or merged a posting dict, or let a delete
+    /// of a first key through.
+    ruled: Cell<bool>,
     /// The keys and the values of the merged bucket, in order.
     items: Vec<Value>,
     /// The keys that the new record changed, as text, at most `MAX_KEYS`.
@@ -215,6 +224,10 @@ impl Merger<'_> {
         let [old, committed, new] = <[Bucket; 3]>::try_from(buckets)
             .ok()
             .expect("three buckets");
+        // A tree that holds its one bucket inline has no parent node to
+        // change. BTrees inlines only the bucket of a root, which has no
+        // next bucket.
+        self.first_key = self.rules && tree && old.next.is_none();
         // The next buckets must be the same objects.
         for other in [committed.next, new.next] {
             if old.next != other {
@@ -299,8 +312,8 @@ impl Merger<'_> {
                 if self.posting
                     && let Some(equal) = posting::equal(self.heap, a, b)
                 {
-                    self.dicts.set(true);
-                    return equal;
+                    self.ruled.set(true);
+                    return Ok(equal);
                 }
                 Ok(self.heap.compare(a, b).map_err(undecided)? == Ordering::Equal)
             }
@@ -343,6 +356,17 @@ impl Merger<'_> {
         if self.mapping && !matches!(self.values_equal(old.value(), new.value()), Ok(true)) {
             self.changed(new.key());
         }
+    }
+
+    /// Refuses the delete of the first item of a bucket: in a tree of many
+    /// buckets, it changes the parent node. The first-key rule lets it
+    /// through in the bucket that a tree holds inline.
+    fn delete_first_key(&self) -> Result<(), Outcome> {
+        if !self.first_key {
+            return Err(refuse(13));
+        }
+        self.ruled.set(true);
+        Ok(())
     }
 
     /// `bucket_merge(s1, s2, s3)` of `MergeTemplate.c`: `old`, `committed`
@@ -394,9 +418,7 @@ impl Merger<'_> {
                 } else if set || self.values_equal(i1.value(), i2.value())? {
                     // A delete in the new bucket.
                     if i3.position == 1 {
-                        // The delete of the first item changes the parent
-                        // node.
-                        return Err(refuse(13));
+                        self.delete_first_key()?;
                     }
                     self.changed(i1.key());
                     i1.next();
@@ -412,7 +434,7 @@ impl Merger<'_> {
                 } else if set || self.values_equal(i1.value(), i3.value())? {
                     // A delete in the committed bucket.
                     if i2.position == 1 {
-                        return Err(refuse(13));
+                        self.delete_first_key()?;
                     }
                     i1.next();
                     i3.next();

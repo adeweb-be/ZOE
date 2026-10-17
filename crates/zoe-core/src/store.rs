@@ -163,8 +163,8 @@ pub struct Options {
     /// option. This is `pack-gc` in the configuration.
     pub pack_gc: bool,
     /// The structural merges (tier 1) of the conflict resolution: the
-    /// mode of their classes, and the posting-dict rule. The default is
-    /// tier 1 on for every class, and the posting-dict rule off.
+    /// mode of their classes, and the rules of ADR 0042. The default is
+    /// tier 1 on for every class, and the rules off.
     pub structural_merges: StructuralMerges,
     /// Not an option. This field makes `..Options::default()` necessary
     /// when a caller sets every option.
