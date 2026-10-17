@@ -32,10 +32,14 @@ def _rate(count, transactions):
 
 def lines(result: dict) -> list[str]:
     """Return the lines of the report. The last one is the verdict."""
-    out = [
+    out = []
+    if "policy" in result:
+        classes = ", ".join(sorted(result["policy"].get("classes", {}))) or "none"
+        out += [f"zoe serve runs with a merge policy; its classes: {classes}", ""]
+    out.append(
         "stack       speed  rep  transactions  ConflictErrors  per 1k"
         "  acknowledged  seconds"
-    ]
+    )
     for run in result["runs"]:
         row = (
             f"{run['stack']:<11} {run['speed']:>4}x {run['repetition']:>4}"

@@ -263,3 +263,45 @@ def test_a_result_records_the_software_again_when_it_changed(
     path = tmp_path / "result.json"
     path.write_text(json.dumps(result))
     assert report.load(path) == result
+
+
+def test_a_result_holds_the_policy_of_the_runs(tmp_path):
+    policy = {"classes": {"m.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}
+    result = runner.run(
+        log.Log([], []), workdir=tmp_path, stacks=(), speeds=(1,), policy=policy
+    )
+    assert result["policy"] == policy
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(result))
+    assert report.load(path) == result
+    assert report.lines(result)[0] == (
+        "zoe serve runs with a merge policy; its classes: m.Registry"
+    )
+    # Without a policy, the result has none.
+    result = runner.run(log.Log([], []), workdir=tmp_path, stacks=(), speeds=(1,))
+    assert "policy" not in result
+
+
+def test_the_command_refuses_a_policy_that_is_not_valid(tmp_path, capsys):
+    bad = tmp_path / "policy.json"
+    bad.write_text(json.dumps({"classes": {"m.Registry": {"fields": {"data": "x"}}}}))
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--policy", str(bad)]
+    assert command.main(line) == 2
+    assert "is not a merge policy" in capsys.readouterr().err
+
+
+def test_a_run_of_zoe_serve_installs_the_policy_in_its_store(tmp_path):
+    import zoe.policy
+
+    policy = {"classes": {"m.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}
+    with servers.zoe_server(tmp_path) as address:
+        runner.install_policy(servers.client("zoe-native", address), policy)
+        db = ZODB.DB(servers.client("zoe-native", address))
+        try:
+            with db.transaction() as conn:
+                found = zoe.policy.read(conn)
+        finally:
+            db.close()
+    assert found == {"version": 1, **policy}
