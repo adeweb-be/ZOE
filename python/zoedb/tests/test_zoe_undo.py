@@ -76,3 +76,22 @@ def test_an_undo_that_python_cannot_merge_raises_undo_error(db):
     manager.abort()
     with db.transaction() as conn:
         assert conn.root()["c"]["v"] == 3
+
+
+def test_an_extension_that_does_not_unpickle_adds_no_key(tmp_path):
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.tests.MinPO import MinPO
+    from ZODB.tests.StorageTestBase import zodb_pickle
+
+    storage = zoe.Storage(str(tmp_path / "bad-extension"))
+    try:
+        txn = TransactionMetaData(b"user", b"odd", b"not a pickle")
+        storage.tpc_begin(txn)
+        storage.store(storage.new_oid(), b"\0" * 8, zodb_pickle(MinPO(1)), "", txn)
+        storage.tpc_vote(txn)
+        storage.tpc_finish(txn)
+        (entry,) = storage.undoLog(0, 5)
+        assert entry["description"] == b"odd"
+        assert sorted(entry) == ["description", "id", "time", "user_name"]
+    finally:
+        storage.close()

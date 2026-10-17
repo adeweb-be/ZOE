@@ -414,7 +414,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
                     "user_name": user,
                     "description": description,
                 }
-                info.update(TransactionMetaData(extension=extension).extension)
+                # An extension that does not unpickle adds no key.
+                try:
+                    info.update(TransactionMetaData(extension=extension).extension)
+                except Exception:
+                    pass
                 if filter is None or filter(info):
                     if index >= first:
                         found.append(info)

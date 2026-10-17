@@ -26,6 +26,7 @@
 //! tier of the core merges fails the vote with `UndoError`: no Python runs
 //! on the server.
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -1131,10 +1132,13 @@ impl Session {
                 let Value::Map(items) = &entry else {
                     unreachable!("an entry of the undo log is a map")
                 };
-                if !specification
-                    .iter()
-                    .all(|(key, value)| items.iter().any(|item| item.0 == *key && item.1 == *value))
-                {
+                // A key that the map does not hold matches None, as in
+                // ZODB: `desc.get(k, None) != v`.
+                let matches = specification.iter().all(|(key, value)| {
+                    let found = items.iter().find(|item| item.0 == *key);
+                    python_eq(found.map_or(&Value::Nil, |item| &item.1), value)
+                });
+                if !matches {
                     continue;
                 }
                 if index >= first {
@@ -1792,11 +1796,13 @@ impl Transaction {
                 .map(|()| Voted::default())
                 .map_err(|error| Fault::of_vote(&error, txn)),
             Ok(txn) => {
-                let voted = undo(txn, &undos).and_then(|undone| {
+                let voted = undo(txn, &undos).and_then(|(undone, seen)| {
                     attach(txn, jobs)?;
                     let mut voted = vote_resolving(txn)?;
-                    voted.native.retain(|oid| !undone.contains(oid));
-                    voted.undone = undone;
+                    voted
+                        .native
+                        .retain(|oid| u64_of(oid).map_or(true, |oid| !seen.contains(&Oid(oid))));
+                    voted.undone = undone.into_iter().map(|oid| p64(oid.0)).collect();
                     Ok(voted)
                 });
                 // The vote that takes the locks runs tier 1: log and count
@@ -2036,14 +2042,16 @@ struct Voted {
 }
 
 /// Stage in `txn` the undo of each undo id of `ids`, in order. Return the
-/// oids of the undone transactions, each once, as bare oids.
+/// oids of the undone transactions, each once, in the order of the undos,
+/// and their set.
 ///
 /// An undo id that names no transaction, and an undo that the core
 /// refuses, fail with `UndoError`. So does an undo that no tier of the
 /// core merges: the in-process storage resolves such an undo in Python,
 /// and no Python runs on the server.
-fn undo(txn: &mut Txn<Arc<Store>>, ids: &[Value]) -> Result<Vec<Value>, Fault> {
+fn undo(txn: &mut Txn<Arc<Store>>, ids: &[Value]) -> Result<(Vec<Oid>, HashSet<Oid>), Fault> {
     let mut oids = Vec::new();
+    let mut seen = HashSet::new();
     for id in ids {
         let tid = match id {
             Value::Binary(id) => undo_tid(id),
@@ -2056,13 +2064,12 @@ fn undo(txn: &mut Txn<Arc<Store>>, ids: &[Value]) -> Result<Vec<Value>, Fault> {
             return Err(Fault::undo(CHANGED_LATER, Some(conflict.oid)));
         }
         for oid in undone.oids {
-            let oid = p64(oid.0);
-            if !oids.contains(&oid) {
+            if seen.insert(oid) {
                 oids.push(oid);
             }
         }
     }
-    Ok(oids)
+    Ok((oids, seen))
 }
 
 /// Return the map of the undo log of the transaction row `row`: the keys
@@ -2088,6 +2095,32 @@ fn undo_entry(row: &TxnMeta) -> Value {
         }
     }
     Value::Map(items)
+}
+
+/// Tell if Python finds `a` and `b` equal, where the msgpack values allow
+/// it to tell: an int, a float and a bool compare by their numbers, as
+/// `1 == 1.0` and `True == 1` are true. Other values compare as msgpack
+/// values, so `b"x"` and `"x"` differ, as in Python.
+fn python_eq(a: &Value, b: &Value) -> bool {
+    fn number(value: &Value) -> Option<f64> {
+        match value {
+            Value::Integer(n) => n
+                .as_i64()
+                .map(|n| n as f64)
+                .or(n.as_u64().map(|n| n as f64)),
+            Value::F64(x) => Some(*x),
+            Value::F32(x) => Some(f64::from(*x)),
+            Value::Boolean(b) => Some(f64::from(u8::from(*b))),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        _ => match (number(a), number(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+    }
 }
 
 /// Return the int `value` of an argument.
@@ -3432,6 +3465,46 @@ mod tests {
         assert_eq!(get(&entries[0], "id"), &Value::Binary(undo_id(Tid(first))));
         let all = done(call(&mut s, "undoInfo", vec![]));
         assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn undo_info_matches_a_missing_key_with_none_and_numbers_as_python() {
+        let mut s = registered("undo-info-python");
+        let first = commit(&mut s, 1, 7, 0, b"one").unwrap();
+        commit(&mut s, 2, 7, first, b"two").unwrap();
+        let info = |s: &mut Client, items: Vec<(Value, Value)>| {
+            let args = vec![Value::from(0), Value::from(-20), Value::Map(items)];
+            done(call(s, "undoInfo", args)).as_array().unwrap().len()
+        };
+        assert_eq!(info(&mut s, vec![(Value::from("missing"), Value::Nil)]), 2);
+        assert_eq!(
+            info(&mut s, vec![(Value::from("missing"), Value::from(1))]),
+            0
+        );
+        assert!(python_eq(&Value::from(1), &Value::F64(1.0)));
+        assert!(python_eq(&Value::Boolean(true), &Value::from(1)));
+        assert!(!python_eq(&Value::from("x"), &Value::Binary(b"x".to_vec())));
+        assert!(!python_eq(&Value::from(2), &Value::F64(2.5)));
+    }
+
+    #[test]
+    fn the_vote_of_an_undo_of_many_oids_gives_each_oid_once() {
+        const OIDS: u64 = 20_000;
+        let mut s = registered("undo-many");
+        begin(&mut s, 1, None);
+        for oid in 1..=OIDS {
+            store(&mut s, 1, oid, 0, b"one");
+        }
+        let tid = vote_and_finish(&mut s, 1).unwrap();
+        let started = Instant::now();
+        let reply = undo_in(&mut s, 2, Value::Binary(undo_id(Tid(tid)))).unwrap();
+        let oids = reply.as_array().unwrap();
+        assert_eq!(oids.len() as u64, OIDS);
+        let distinct: HashSet<u64> = oids.iter().map(|oid| u64_of(oid).unwrap()).collect();
+        assert_eq!(distinct.len() as u64, OIDS);
+        // The undo is linear in its oids: a list scan for each oid would
+        // take minutes in a debug build.
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
     }
 
     #[test]

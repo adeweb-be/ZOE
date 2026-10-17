@@ -17,7 +17,7 @@ The tests run inside two layers. In `zoe.testing.ZEO_LAYER`, the test
 forker of ZEO starts `zoe serve` in place of a ZEO server. In
 `zoe.testing.NATIVE_LAYER`, `ZEO.ClientStorage.ClientStorage`, and what
 ZEO's tests open through it, is the native client. A test passes, or is
-is in `INSIDE` with its reason, or skips itself.
+in `INSIDE` with its reason, or skips itself.
 `INSIDE` holds the tests that read the inside of `ZEO.ClientStorage`,
 which the native client does not have.
 """
