@@ -6,8 +6,8 @@ in the environment of the Python tests:
     python/.venv-3.13/bin/python crates/zoe-server/fuzz/corpus/generate_merge.py
 
 A seed is a conflict of three records, as ZODB writes them: a flag byte
-(0 leaves the posting-dict rule off, 1 turns it on, 2 puts it in shadow
-mode), the lengths of the old and of the committed record, each as 2 bytes
+(0 leaves the rules of ADR 0042 off, 1 turns them on, 2 puts them in
+shadow mode), the lengths of the old and of the committed record, each as 2 bytes
 big-endian, then the old, the committed and the new record. All data is
 synthetic.
 """
@@ -16,7 +16,7 @@ import struct
 from io import BytesIO
 from pathlib import Path
 
-from BTrees.IIBTree import IIBucket, IISet
+from BTrees.IIBTree import IIBTree, IIBucket, IISet, IITreeSet
 from BTrees.IOBTree import IOBTree, IOBucket
 from BTrees.Length import Length
 from BTrees.OOBTree import OOBTree, OOBucket
@@ -34,7 +34,7 @@ def record(obj):
     return f.getvalue()
 
 
-# The flag byte of each mode of the posting-dict rule.
+# The flag byte of each mode of the rules of ADR 0042.
 OFF, ON, SHADOW = 0, 1, 2
 
 
@@ -74,6 +74,19 @@ SEEDS = {
         IOBucket({5: None, 10: {1: 3}}),
         IOBucket({5: None, 10: {1: 3, 2: 1}}),
         IOBucket({5: {7: 1}, 10: {1: 3, 3: 4}}),
+        posting=SHADOW,
+    ),
+    # A delete of the first key in the bucket of a tree of one bucket.
+    "iibtree-first-key": seed(
+        IIBTree({1: 1, 2: 2, 3: 3}),
+        IIBTree({2: 2, 3: 3}),
+        IIBTree({1: 1, 2: 2, 3: 3, 4: 4}),
+        posting=ON,
+    ),
+    "iitreeset-first-key-shadow": seed(
+        IITreeSet([1, 2, 3]),
+        IITreeSet([1, 2, 3, 4]),
+        IITreeSet([2, 3]),
         posting=SHADOW,
     ),
 }

@@ -43,8 +43,8 @@ pub(super) fn merge(
     outcome
 }
 
-/// Merges the three records once, with the rules of the text index when
-/// `rules` is true. Also tells if a rule compared a posting dict or let a
+/// Merges the three records once, with the rules of ADR 0042 when `rules`
+/// is true. Also tells if a rule compared a posting dict or let a
 /// delete of a first key through.
 fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (Outcome, bool) {
     let mut heap = Heap::new();
@@ -176,12 +176,13 @@ struct Merger<'h> {
     heap: &'h mut Heap,
     family: Family,
     mapping: bool,
-    /// True when the rules of the text index are on or in shadow mode.
+    /// True when the rules of ADR 0042 are on or in shadow mode.
     rules: bool,
     /// True when the posting-dict rule applies to this family.
     posting: bool,
-    /// True when the first-key rule applies: the rules are on and the merge
-    /// is of the one bucket that a tree holds inline.
+    /// True when the first-key rule applies: the rules are on or in shadow
+    /// mode, and the merge is of the one bucket that a tree holds inline,
+    /// with no next bucket.
     first_key: bool,
     /// True when a rule compared or merged a posting dict, or let a delete
     /// of a first key through.
@@ -224,8 +225,9 @@ impl Merger<'_> {
             .ok()
             .expect("three buckets");
         // A tree that holds its one bucket inline has no parent node to
-        // change.
-        self.first_key = self.rules && tree;
+        // change. BTrees inlines only the bucket of a root, which has no
+        // next bucket.
+        self.first_key = self.rules && tree && old.next.is_none();
         // The next buckets must be the same objects.
         for other in [committed.next, new.next] {
             if old.next != other {

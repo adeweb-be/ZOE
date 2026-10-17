@@ -37,6 +37,48 @@ fn ii_tree(items: &[(i128, i128)]) -> Vec<u8> {
     record(&heap, class, state)
 }
 
+/// Returns the record of an `IITreeSet` that holds one bucket of `keys`
+/// inline.
+fn ii_tree_set(keys: &[i128]) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class("BTrees.IIBTree", "IITreeSet");
+    let keys = keys.iter().map(|&k| Value::Int(k)).collect();
+    let bucket = new_bucket_state(&mut heap, keys, None);
+    let state = new_tree_state(&mut heap, bucket);
+    record(&heap, class, state)
+}
+
+/// Runs the vote of a conflict of `base`, `committed` and `new` with the
+/// rules of ADR 0042 in `rule`. Returns the outcome, the outcome of the
+/// rules in shadow mode, and the record of the oid after a vote that
+/// passed.
+fn first_key(
+    rule: Mode,
+    base: &[u8],
+    committed: &[u8],
+    new: &[u8],
+) -> (Resolved, Option<Resolved>, Option<Vec<u8>>) {
+    let store = open(StructuralMerges {
+        posting_dicts: rule,
+        ..StructuralMerges::default()
+    });
+    let (oid, read) = conflict(&store, base, committed);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, new).unwrap();
+    let voted = txn.vote_resolving();
+    let resolution = txn.resolutions()[0].clone();
+    let stored = match voted {
+        Ok(listed) => {
+            assert_eq!(listed, [], "{rule:?}");
+            txn.finish().unwrap();
+            Some(store.load(oid).unwrap().0)
+        }
+        Err(ZoeError::Conflict { .. }) => None,
+        Err(other) => panic!("{other}"),
+    };
+    (resolution.outcome, resolution.shadow, stored)
+}
+
 /// Returns the record of an `IOBucket` whose values are dicts of ints.
 fn io_postings(items: &[(i128, &[(i128, i128)])]) -> Vec<u8> {
     let mut heap = Heap::new();
@@ -427,6 +469,56 @@ fn the_first_key_rule_leaves_a_standalone_bucket_to_btrees() {
     assert_eq!(
         txn.resolutions()[0].outcome,
         Resolved::Refused(Reason::BTrees(13))
+    );
+}
+
+#[test]
+fn the_first_key_rule_merges_a_tree_set_too() {
+    let (base, committed, new) = (
+        ii_tree_set(&[1, 2, 3]),
+        ii_tree_set(&[1, 2, 3, 4]),
+        ii_tree_set(&[2, 3]),
+    );
+    assert_eq!(
+        first_key(Mode::On, &base, &committed, &new),
+        (Resolved::Merged, None, Some(ii_tree_set(&[2, 3, 4])))
+    );
+    assert_eq!(
+        first_key(Mode::Off, &base, &committed, &new),
+        (Resolved::Refused(Reason::BTrees(13)), None, None)
+    );
+}
+
+#[test]
+fn the_first_key_rule_keeps_the_other_refusals_of_btrees() {
+    // Both deletes leave the bucket empty: reason 10. In shadow mode the
+    // vote refuses as without the rule, and the line gives reason 10.
+    let (base, committed, new) = (
+        ii_tree(&[(1, 1), (2, 2)]),
+        ii_tree(&[(2, 2)]),
+        ii_tree(&[(1, 1)]),
+    );
+    assert_eq!(
+        first_key(Mode::On, &base, &committed, &new),
+        (Resolved::Refused(Reason::BTrees(10)), None, None)
+    );
+    assert_eq!(
+        first_key(Mode::Shadow, &base, &committed, &new),
+        (
+            Resolved::Refused(Reason::BTrees(13)),
+            Some(Resolved::Refused(Reason::BTrees(10))),
+            None
+        )
+    );
+    // A delete of the first key against a change of its value: reason 2.
+    let (base, committed, new) = (
+        ii_tree(&[(1, 1), (2, 2)]),
+        ii_tree(&[(1, 5), (2, 2)]),
+        ii_tree(&[(2, 2)]),
+    );
+    assert_eq!(
+        first_key(Mode::On, &base, &committed, &new),
+        (Resolved::Refused(Reason::BTrees(2)), None, None)
     );
 }
 

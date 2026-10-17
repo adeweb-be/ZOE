@@ -357,3 +357,122 @@ def test_the_first_key_rule_merges_a_delete_of_the_first_key(
     assert found == (outcome, value)
     # BTrees refuses reason 13 in Rust too, so the client never resolves.
     assert calls["calls"] == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "first", "second", "value"),
+    [
+        (
+            "tree-set",
+            lambda: __import__("BTrees").IIBTree.IITreeSet([1, 2, 3]),
+            lambda tree_set: tree_set.remove(1),
+            lambda tree_set: tree_set.add(4),
+            [2, 3, 4],
+        ),
+        (
+            "str-keys",
+            lambda: __import__("BTrees").OOBTree.OOBTree({"a": 1, "b": 2}),
+            deleting("a"),
+            setting("c", 3),
+            {"b": 2, "c": 3},
+        ),
+    ],
+)
+def test_the_first_key_rule_merges_every_family(
+    tmp_path, calls, name, make, first, second, value
+):
+    storage = zoe.Storage(str(tmp_path / name), posting_dicts="on")
+    db = ZODB.DB(storage)
+    try:
+        with db.transaction() as conn:
+            conn.root()["object"] = make()
+        managers = [transaction.TransactionManager() for _ in range(2)]
+        conns = [db.open(transaction_manager=tm) for tm in managers]
+        for tm in managers:
+            tm.begin()
+        first(conns[0].root()["object"])
+        second(conns[1].root()["object"])
+        for tm in managers:
+            tm.commit()
+        for conn in conns:
+            conn.close()
+        with db.transaction() as conn:
+            found = conn.root()["object"]
+            found = list(found) if isinstance(value, list) else dict(found.items())
+    finally:
+        db.close()
+    assert found == value
+    assert calls["calls"] == 0
+
+
+def test_a_reindex_that_drops_the_lowest_document_of_a_posting_tree_merges(
+    tmp_path, calls
+):
+    from Products.ZCTextIndex import WidCode
+    from Products.ZCTextIndex.Lexicon import CaseNormalizer, Lexicon, Splitter
+    from Products.ZCTextIndex.OkapiIndex import OkapiIndex
+
+    def index_of(documents):
+        lexicon = Lexicon(Splitter(), CaseNormalizer())
+        index = OkapiIndex(lexicon)
+        for docid, document in documents.items():
+            index.index_doc(docid, document)
+        return index, lexicon
+
+    def contents(index, lexicon):
+        word = lexicon.get_word
+        return {
+            "wordinfo": {
+                word(wid): dict(posting.items())
+                for wid, posting in index._wordinfo.items()
+            },
+            "docweight": dict(index._docweight.items()),
+            "docwords": {
+                docid: [word(wid) for wid in WidCode.decode(code)]
+                for docid, code in index._docwords.items()
+            },
+            "length": index.length(),
+            "document_count": index.document_count(),
+            "totaldoclen": index._totaldoclen(),
+        }
+
+    # Twelve documents hold the word "common": its postings are a tree of
+    # one bucket, whose first key is the document 1.
+    documents = {docid: "common alpha beta" for docid in range(1, 13)}
+    final = {**documents, 1: "alpha beta", 13: "common alpha beta"}
+    results = {}
+    for rule in ("off", "on"):
+        index, lexicon = index_of(documents)
+        storage = zoe.Storage(str(tmp_path / rule), posting_dicts=rule)
+        db = ZODB.DB(storage)
+        try:
+            with db.transaction() as conn:
+                conn.root()["lexicon"] = lexicon
+                conn.root()["index"] = index
+            managers = [transaction.TransactionManager() for _ in range(2)]
+            conns = [db.open(transaction_manager=tm) for tm in managers]
+            for tm in managers:
+                tm.begin()
+            # A reindex removes "common" from the document of the lowest
+            # id, while another transaction indexes a new document.
+            conns[0].root()["index"].index_doc(1, final[1])
+            conns[1].root()["index"].index_doc(13, final[13])
+            managers[0].commit()
+            try:
+                managers[1].commit()
+            except ConflictError:
+                managers[1].abort()
+                results[rule] = "conflict"
+            else:
+                results[rule] = "merged"
+            for conn in conns:
+                conn.close()
+            with db.transaction() as conn:
+                root = conn.root()
+                stored = contents(root["index"], root["lexicon"])
+        finally:
+            db.close()
+    assert results == {"off": "conflict", "on": "merged"}
+    assert stored == contents(*index_of(final))
+    # Tier 1 refuses with the rule off, so no client resolves.
+    assert calls["calls"] == 0
