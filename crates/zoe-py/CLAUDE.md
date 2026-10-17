@@ -15,7 +15,7 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `python/zoedb/src/zoe/serve.py`: `python -m zoe.serve`, which runs the `zoe` binary with the `<zoe-server>` section.
 - `src/cli.rs`: `zoe._zoe.main`, the `zoe` command of the console script.
 - `python/zoedb/src/zoe/__main__.py`: `zoe.__main__.main`, the entry point of the console script `zoe` and of `python -m zoe`.
-- `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage`, `IBlobStorage`, `IStorageIteration`, `IStorageCurrentRecordIteration`, `IStorageRestoreable`, `IBlobStorageRestoreable` and `IExternalGC`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `iterator`, `copyTransactionsFrom`, `pack`, `registerDB` and `supportsUndo`. It defines `WrongThread`.
+- `python/zoedb/src/zoe/storage.py`: `zoe.storage.Storage` subclasses `zoe._zoe.Storage` and ZODB's `ConflictResolvingStorage`, declares `IStorage`, `IBlobStorage`, `IStorageIteration`, `IStorageCurrentRecordIteration`, `IStorageRestoreable`, `IBlobStorageRestoreable`, `IStorageUndoable` and `IExternalGC`, and adds `tpc_vote` with the conflict resolution, `openCommittedBlobFile`, `history`, `iterator`, `copyTransactionsFrom`, `pack`, `registerDB`, `supportsUndo`, `getTid`, `undo`, `undoLog` and `undoInfo`. It defines `WrongThread`.
 
 ## Invariants
 
@@ -61,7 +61,8 @@ The Python extension module `zoe._zoe`, built by maturin into the `zoedb` wheel.
 - `_pack` runs the whole pack inside one `py.detach`, so the GIL is free from start to end. The pack takes no per-OID lock and does not wait for a publication. Other threads read and commit while it runs: a commit waits for at most one batch of the pack. A second pack waits for the first. A pack can run from any thread, also while a transaction of that thread is open.
 - A pack at a time before the last pack does nothing. A pack at a time after the last tid packs at the last tid.
 - A closed storage refuses `pack` with `StorageError`. A pack in progress keeps the store open after `close` until it ends, as any call in progress does.
-- `supportsUndo()` is false.
+- `supportsUndo()` is true. `undo(transaction_id, transaction)` calls `_undo`, which runs `Txn::undo` of the core, then resolves in Python each conflict that no tier of the core merges, with `tryToResolveConflict(oid, serial, undone, before, current)`, as FileStorage does, and stores the result over `serial`. A `ConflictError` there raises `UndoError`. It returns `(None, oids)`. A refusal of the core raises `UndoError`. An undo id is the base64 text of the tid, as in FileStorage, or the 8 bytes of the tid; another id raises `UndoError`.
+- `undoLog(first, last, filter)` reads `_undo_log` in parts of 256 rows, newest first, and gives the dictionaries of FileStorage: `id`, `time`, `user_name`, `description`, updated with the extension of the transaction. `filter` and the `specification` of `undoInfo` count before the indexes, as in ZODB.
 - The wheel never imports Plone. Only `zoe.plone`, through the `plone` extra, does.
 - The version of the wheel equals the version of the crates.
 - The wheel has one console script, `zoe`, on `zoe.__main__:main`. It runs `zoe._zoe.main(sys.argv)`, which runs `zoe_server::cli::main`, the code of the `zoe` binary, inside `py.detach`. The console script has no parser of its own. ADR 0028 records this.
