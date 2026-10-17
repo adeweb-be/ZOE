@@ -9,9 +9,9 @@ keys `path`, `blob-dir`, `read-only` and `pack-gc`.
 The module writes the settings as a TOML file into a file that has no
 name on disk, and replaces itself with `zoe serve --config` on that file.
 On Linux, the file is a memory file. On other platforms, it is a
-temporary file whose name the module removes. So no Python stays in the process of the server, a supervisor
-stops the server with SIGTERM, and no value of the section goes into the
-arguments of the process.
+temporary file whose name the module removes. So no Python stays in the
+process of the server, a supervisor stops the server with SIGTERM, and no
+value of the section goes into the arguments of the process.
 
 The wheel has no server. The binary is the `binary` key of the section,
 else `ZOE_BINARY`, else the `zoe` binary on the PATH. The search on the
