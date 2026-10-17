@@ -327,6 +327,10 @@ impl Vfs for SimVfs {
         self.disk.rename(from, to)
     }
 
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+        self.disk.hard_link(from, to)
+    }
+
     fn remove(&self, name: &str) -> io::Result<()> {
         self.disk.remove(name)
     }

@@ -47,17 +47,10 @@ pub trait Vfs: Send + Sync + 'static {
     /// Give the existing file `from` the second name `to`, a hard link.
     /// Fail when `to` exists. The two names then give the same bytes, and
     /// no byte is copied. The new name is durable after a sync of its
-    /// directory. Only a file that nothing writes again gets a link.
-    ///
-    /// This default fails with `Unsupported`, for a directory that cannot
-    /// link.
-    fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
-        let _ = (from, to);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the directory does not make hard links",
-        ))
-    }
+    /// directory. Only a file that nothing writes again gets a link. A
+    /// filesystem that cannot link fails with its error, for example
+    /// `CrossesDevices`, `PermissionDenied` or `Unsupported`.
+    fn hard_link(&self, from: &str, to: &str) -> io::Result<()>;
 
     /// Remove the file `name`.
     fn remove(&self, name: &str) -> io::Result<()>;

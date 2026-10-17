@@ -145,6 +145,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The number of entries of `resolutions` that the undos gave. They
     /// come first, and a vote keeps them.
     undo_resolutions: usize,
+    /// The lowest tid that the transaction undoes. The finish checks it
+    /// against the pack watermark under the commit sequencer.
+    undone: Option<Tid>,
 }
 
 /// What the serial check of a vote found.
@@ -199,6 +202,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             lock_cancel: None,
             resolutions: Vec::new(),
             undo_resolutions: 0,
+            undone: None,
         }
     }
 
@@ -1080,7 +1084,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// A restore transaction commits under its own tid. If that tid is not
     /// after the last tid, `finish` fails with `Protocol`. A normal
     /// transaction gets a tid after the last tid, below `Tid::MAX`. When no
-    /// such tid is left, `finish` fails with `Protocol`. The store does
+    /// such tid is left, `finish` fails with `Protocol`. A transaction that
+    /// undoes a transaction at or before the pack watermark fails with
+    /// `Undo`: a pack ran after the undo read its records. The store does
     /// not halt for these errors.
     ///
     /// An error other than `Protocol` and `Halted` leaves the outcome of
@@ -1110,6 +1116,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             user: std::mem::take(&mut self.user),
             description: std::mem::take(&mut self.description),
             extension: std::mem::take(&mut self.extension),
+            undone: self.undone,
         };
         let store: &Store = &self.store;
         let (member, finished) = store.group.finish(store, member);

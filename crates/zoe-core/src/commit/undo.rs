@@ -36,17 +36,26 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///   into `conflicts`, and the call stages nothing for it: the caller
     ///   resolves it and stores the result over its serial, or fails.
     /// - An undo of the creation of an object, of a deletion, or of a blob,
-    ///   that a later transaction changed fails with `Undo`.
+    ///   that a later transaction changed fails with `Undo`. A blob is
+    ///   changed when the current blob record is not the blob record of
+    ///   `tid`, also when the pickles are the same, as the pickles of the
+    ///   revisions of one blob are. So the undo never drops a later
+    ///   revision of a blob, where FileStorage gives the earlier blob back.
     ///
     /// A transaction at or before the last pack, one that the store does
     /// not have, or one whose state before is gone by a pack, fails the
-    /// call with `Undo`. A failed call can leave
-    /// the undo of the oids before the one that failed it staged, so the
-    /// caller then aborts the transaction.
+    /// call with `Undo`. The finish checks the pack watermark again, under
+    /// the commit sequencer: a pack after this call can remove what the
+    /// undo gives back. A failed call can leave the undo of the oids before
+    /// the one that failed it staged, so the caller then aborts the
+    /// transaction.
     ///
-    /// The call takes no lock. The vote locks the staged oids and checks
-    /// their serials as for `store`. The pickles count toward the size
-    /// limits, as for `store`. A restore transaction refuses the call with
+    /// The call holds every record of `tid` in memory at once, as the
+    /// transaction iterator does for one transaction. Tier 1 runs here
+    /// without the locks of the vote: the vote locks the staged oids and
+    /// checks their serials as for `store`, so a commit after the call is a
+    /// conflict of the vote. The pickles count toward the size limits, as
+    /// for `store`. A restore transaction refuses the call with
     /// `Protocol`, and so does a transaction after its vote. A call from
     /// another thread fails with `WrongThread`.
     pub fn undo(&mut self, tid: Tid) -> Result<Undone> {
@@ -57,6 +66,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         if self.locked() {
             return Err(ZoeError::Protocol("undo after vote"));
+        }
+        // No transaction has the tid 0, also in a store that was never
+        // packed.
+        if tid == Tid::ZERO {
+            return Err(refused(None, undo::NO_TRANSACTION));
         }
         if tid <= self.store.pack_watermark()? {
             return Err(refused(None, undo::PACKED));
@@ -73,6 +87,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 undone.conflicts.push(conflict);
             }
         }
+        self.undone = Some(self.undone.map_or(tid, |lowest| lowest.min(tid)));
         Ok(undone)
     }
 
@@ -80,15 +95,28 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// `undone`. Return the conflict when no tier resolves it.
     fn undo_oid(&mut self, oid: Oid, tid: Tid, undone: &[u8]) -> Result<Option<UndoConflict>> {
         let before = self.before(oid, tid)?;
-        let (serial, current) = match self.staged.get(oid)? {
-            Some((serial, pickle)) => (serial, pickle.into_owned()),
+        // The serial of the current state, its pickle and its blob record.
+        let (serial, current, blob) = match self.staged.get(oid)? {
+            Some((serial, pickle)) => {
+                let blob = self.blobs.get(&oid).map(|blob| *blob.record());
+                (serial, pickle.into_owned(), blob)
+            }
             None => match self.store.backend.load_before(oid, Tid::MAX)? {
-                Some(record) => (record.tid, record.data),
+                Some(record) => {
+                    let blob = self.store.backend.load_blob(oid, record.tid)?;
+                    (record.tid, record.data, blob)
+                }
                 // The transaction `tid` wrote the oid, so it has a record.
                 None => return Err(ZoeError::CorruptTxn { tid }),
             },
         };
         if current == undone {
+            // The revisions of a blob have the same pickle, so the blob
+            // records tell if a later transaction changed the blob.
+            let own = self.staged.record(oid).is_none() && serial == tid;
+            if !own && blob != self.store.backend.load_blob(oid, tid)? {
+                return Err(refused(Some(oid), undo::CHANGED_LATER));
+            }
             self.stage_before(oid, serial, before.as_ref())?;
             return Ok(None);
         }
@@ -195,6 +223,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let merged =
             merge::tier1(undone, current, before, rules.posting_dicts).expect("a class of tier 1");
         let mut resolution = Resolution::of(oid, mode, &merged, serial, tid);
+        resolution.undo = true;
         let staged = match (mode, merged.outcome) {
             (merge::Mode::On, Outcome::Merged(pickle)) => match self.check_size(oid, &pickle) {
                 Ok(stored_bytes) => {

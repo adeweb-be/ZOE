@@ -753,6 +753,7 @@ impl BlobStore {
                 hash: [0; 32],
                 size: 0,
             },
+            linked: false,
         };
         blob.record = self.hash(&temp)?;
         Ok(blob)
@@ -769,6 +770,10 @@ impl BlobStore {
     /// intent file of the finish. A crash before the finish leaves the
     /// temporary name, and the next open removes it, not the committed
     /// file.
+    ///
+    /// When the filesystem cannot link (`cannot_link`), the call copies the
+    /// bytes into a new temporary file and syncs it. So it writes a new
+    /// file, and no blob file is written again.
     pub(crate) fn link(
         &self,
         store: Weak<Opened>,
@@ -777,19 +782,42 @@ impl BlobStore {
         record: BlobRecord,
     ) -> Result<PendingBlob> {
         self.make_ready()?;
+        let committed = blob_name(oid, tid);
         let temp = self.new_temp_name();
-        match self.dir.hard_link(&blob_name(oid, tid), &temp) {
-            Ok(()) => {}
+        let linked = match self.dir.hard_link(&committed, &temp) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ZoeError::CorruptBlob { oid, tid });
+            }
+            Err(e) if cannot_link(&e) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if linked {
+            return Ok(PendingBlob {
+                store,
+                temp: Some(temp),
+                record,
+                linked,
+            });
+        }
+        let mut file = self.dir.create_file(&temp)?;
+        // The blob owns the new file from here, so an error removes it.
+        let blob = PendingBlob {
+            store,
+            temp: Some(temp),
+            record,
+            linked,
+        };
+        let mut source = match self.dir.read_file(&committed) {
+            Ok(source) => source,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(ZoeError::CorruptBlob { oid, tid });
             }
             Err(e) => return Err(e.into()),
-        }
-        Ok(PendingBlob {
-            store,
-            temp: Some(temp),
-            record,
-        })
+        };
+        io::copy(&mut source, &mut file)?;
+        file.sync()?;
+        Ok(blob)
     }
 
     /// Return the name of the file at `path` in `blobs/tmp/`. Return `None`
@@ -856,7 +884,10 @@ impl BlobStore {
                 self.create_dir(&level)?;
             }
             let temp = blob.temp.as_deref().expect("a blob is placed once");
-            self.dir.set_read_only(temp)?;
+            // A link names a committed file, which is read-only already.
+            if !blob.linked {
+                self.dir.set_read_only(temp)?;
+            }
             self.dir.rename(temp, &blob_name(oid, tid))?;
             blob.temp = None;
             self.dir.sync_dir_at(&dir)?;
@@ -983,6 +1014,18 @@ impl BlobStore {
     }
 }
 
+/// Tell if `error`, of a hard link, says that the filesystem cannot link
+/// the file: the two names are on two devices, the filesystem refuses or
+/// does not have links, or the file has the most links that it can have.
+fn cannot_link(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::CrossesDevices
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::Unsupported
+    ) || error.raw_os_error() == Some(libc::EMLINK)
+}
+
 /// Tell if `file`, a name in `blobs/tmp/`, has the form of a temporary file
 /// of the core: digits, then `.tmp`.
 fn is_temp_name(file: &str) -> bool {
@@ -1082,6 +1125,7 @@ impl BlobFile {
                 hash: *self.hasher.finalize().as_bytes(),
                 size: self.size,
             },
+            linked: false,
         })
     }
 }
@@ -1129,6 +1173,8 @@ pub(crate) struct PendingBlob {
     /// The temporary file. It is `None` after `place` renamed it.
     temp: Option<String>,
     record: BlobRecord,
+    /// True when the file is a hard link of a committed blob file.
+    linked: bool,
 }
 
 impl PendingBlob {

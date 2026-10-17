@@ -3,11 +3,12 @@
 //! The acceptance test `test_undo.py` compares the undo with FileStorage,
 //! in-process and through `zoe serve`. These tests check the core alone.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
-use zoe_core::vfs::MemVfs;
-use zoe_core::{Oid, Store, Tid, ZoeError, undo_id, undo_tid};
+use zoe_core::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
+use zoe_core::{Oid, Options, Store, SystemClock, Tid, ZoeError, undo_id, undo_tid};
 use zoe_pickle::python::{Heap, Pickler, Value};
 
 const PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
@@ -279,14 +280,6 @@ fn the_undo_log_is_newest_first_with_the_rows_of_the_transactions() {
     // The next part starts before the last row of the part before it.
     let rest = store.undo_log(tids[2], 10).unwrap();
     assert_eq!(rest.len(), 2);
-    let range: Vec<Tid> = store
-        .undo_log_range(1, -3)
-        .unwrap()
-        .into_iter()
-        .map(|row| row.tid)
-        .collect();
-    assert_eq!(range, [tids[3], tids[2], tids[1]]);
-    assert_eq!(store.undo_log_range(4, 100).unwrap().len(), 1);
     // An undo id is the base64 text of the tid.
     assert_eq!(undo_tid(&undo_id(tids[0])), Some(tids[0]));
 }
@@ -371,4 +364,228 @@ fn every_crash_image_of_a_blob_undo_is_whole_or_absent() {
         assert_eq!(read_blob(&store, oid, first), b"first blob", "{image:?}");
         assert_eq!(read_blob(&store, oid, second), b"second blob", "{image:?}");
     }
+}
+
+#[test]
+fn an_undo_of_the_tid_0_names_no_transaction() {
+    let store = store();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    assert!(matches!(
+        txn.undo(Tid::ZERO),
+        Err(ZoeError::Undo { oid: None, reason }) if reason.contains("no such transaction")
+    ));
+}
+
+#[test]
+fn the_line_of_the_resolution_log_of_an_undo_merge_says_undo() {
+    let store = store();
+    let oid = store.new_oid().unwrap();
+    let first = commit(&store, oid, Tid::ZERO, &length(10));
+    let undone = commit(&store, oid, first, &length(15));
+    commit(&store, oid, undone, &length(17));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.undo(undone).unwrap();
+    let [line] = &txn.resolution_log_lines(std::time::SystemTime::now(), None)[..] else {
+        panic!("one line");
+    };
+    assert!(line.contains("\"undo\":true"), "{line}");
+}
+
+fn global(p: &mut Vec<u8>, module: &str, name: &str) {
+    p.push(b'c');
+    p.extend_from_slice(module.as_bytes());
+    p.push(b'\n');
+    p.extend_from_slice(name.as_bytes());
+    p.push(b'\n');
+}
+
+/// Returns the record of a `PersistentMapping`. With `target`, its key `a`
+/// refers to that oid, so a pack keeps it.
+fn mapping(target: Option<Oid>) -> Vec<u8> {
+    let mut p = b"\x80\x03".to_vec();
+    global(&mut p, "persistent.mapping", "PersistentMapping");
+    p.extend_from_slice(b".\x80\x03}");
+    if let Some(oid) = target {
+        p.push(b'(');
+        p.push(b'X');
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.push(b'a');
+        p.extend_from_slice(b"C\x08");
+        p.extend_from_slice(&oid.0.to_be_bytes());
+        global(&mut p, "app.content", "Item");
+        p.push(0x86);
+        p.push(b'Q');
+        p.push(b'u');
+    }
+    p.push(b'.');
+    p
+}
+
+#[test]
+fn a_pack_between_the_undo_and_its_finish_fails_the_finish() {
+    let store = store();
+    let root = Oid(0);
+    let x = store.new_oid().unwrap();
+    let x = if x == root {
+        store.new_oid().unwrap()
+    } else {
+        x
+    };
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(root, Tid::ZERO, &mapping(Some(x))).unwrap();
+    txn.store(x, Tid::ZERO, &mapping(None)).unwrap();
+    txn.vote().unwrap();
+    let t1 = txn.finish().unwrap();
+    // The root lets go of x.
+    let t2 = commit(&store, root, t1, &mapping(None));
+    let mut undo = store.tpc_begin(b"", b"undo", b"").unwrap();
+    undo.undo(t2).unwrap();
+    // A pack at t2 removes x while the undo is open.
+    store.pack(t2).unwrap();
+    assert!(store.load(x).is_err());
+    undo.vote().unwrap();
+    assert!(matches!(
+        undo.finish(),
+        Err(ZoeError::Undo { oid: None, .. })
+    ));
+    // The store does not halt, and the root does not refer to x again.
+    assert_eq!(current(&store, root).unwrap(), mapping(None));
+    commit(&store, root, store.load(root).unwrap().1, &mapping(None));
+}
+
+#[test]
+fn an_undo_of_a_blob_that_a_later_transaction_changed_fails() {
+    let store = store();
+    let oid = store.new_oid().unwrap();
+    let first = commit_blob(&store, oid, Tid::ZERO, b"first blob");
+    let second = commit_blob(&store, oid, first, b"second blob");
+    let third = commit_blob(&store, oid, second, b"third blob");
+    // The three revisions have one pickle: only the blob tells them apart.
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    assert!(matches!(
+        txn.undo(second),
+        Err(ZoeError::Undo { oid: Some(found), .. }) if found == oid
+    ));
+    drop(txn);
+    assert_eq!(store.load(oid).unwrap().1, third);
+    // Two undos in one transaction, the newest first, undo both.
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    txn.undo(third).unwrap();
+    txn.undo(second).unwrap();
+    txn.vote().unwrap();
+    let tid = txn.finish().unwrap();
+    assert_eq!(read_blob(&store, oid, tid), b"first blob");
+}
+
+#[test]
+fn a_blob_undo_links_in_a_blob_directory_of_its_own() {
+    let base = std::env::temp_dir().join(format!("zoe-undo-reloc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let options = Options {
+        blob_dir: Some(base.join("shared-blobs")),
+        ..Options::default()
+    };
+    let store = Store::open_with(base.join("store"), options).unwrap();
+    let oid = store.new_oid().unwrap();
+    let first = commit_blob(&store, oid, Tid::ZERO, b"first blob");
+    let second = commit_blob(&store, oid, first, b"second blob");
+    let tid = undo(&store, second).unwrap();
+    assert_eq!(read_blob(&store, oid, tid), b"first blob");
+    let a = std::fs::metadata(store.blob_path(oid, first).unwrap()).unwrap();
+    let b = std::fs::metadata(store.blob_path(oid, tid).unwrap()).unwrap();
+    assert_eq!(a.ino(), b.ino());
+    let redo = undo(&store, tid).unwrap();
+    assert_eq!(read_blob(&store, oid, redo), b"second blob");
+    drop(store);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A directory that cannot make hard links, as a filesystem without them.
+struct NoLinks(MemVfs);
+
+impl Vfs for NoLinks {
+    type File = MemFile;
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.0.exists(name)
+    }
+
+    fn open(&self, name: &str) -> io::Result<MemFile> {
+        self.0.open(name)
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<MemFile> {
+        self.0.create_new(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.0.rename(from, to)
+    }
+
+    fn hard_link(&self, _from: &str, _to: &str) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::CrossesDevices))
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.0.remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        self.0.sync_dir()
+    }
+
+    fn sync_dir_at(&self, dir: &str) -> io::Result<()> {
+        self.0.sync_dir_at(dir)
+    }
+
+    fn create_dir(&self, name: &str) -> io::Result<()> {
+        self.0.create_dir(name)
+    }
+
+    fn list_files(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.0.list_files(dir)
+    }
+
+    fn list_entries(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.0.list_entries(dir)
+    }
+
+    fn create_file(&self, name: &str) -> io::Result<Box<dyn WriteFile>> {
+        self.0.create_file(name)
+    }
+
+    fn read_file(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
+        self.0.read_file(name)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.0.sync_file(name)
+    }
+
+    fn set_read_only(&self, name: &str) -> io::Result<()> {
+        self.0.set_read_only(name)
+    }
+
+    fn lock_dir(&self, name: &str) -> io::Result<DirLock> {
+        self.0.lock_dir(name)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.path(name)
+    }
+}
+
+#[test]
+fn a_blob_undo_copies_into_a_new_file_where_the_directory_cannot_link() {
+    let vfs = MemVfs::new();
+    let store = Store::open_in(NoLinks(vfs.clone()), SystemClock).unwrap();
+    let oid = store.new_oid().unwrap();
+    let first = commit_blob(&store, oid, Tid::ZERO, b"first blob");
+    let second = commit_blob(&store, oid, first, b"second blob");
+    let files = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
+    let tid = undo(&store, second).unwrap();
+    assert_eq!(read_blob(&store, oid, tid), b"first blob");
+    assert_eq!(read_blob(&store, oid, first), b"first blob");
+    let after = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
+    assert_eq!(after, files + 1);
 }

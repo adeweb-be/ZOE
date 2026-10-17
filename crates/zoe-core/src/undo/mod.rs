@@ -9,7 +9,9 @@
 //! - When the current state is the state of T, the undo stages the state
 //!   before T over the current serial. When T created the object, it
 //!   stages a deletion. A blob gets the blob file of the state before T,
-//!   by a hard link: no blob file is copied or written again.
+//!   by a hard link, or a copy in a new file where the filesystem cannot
+//!   link: no blob file is written again. When the current blob is not the
+//!   blob of T, a later transaction changed it, and the undo fails.
 //! - Else the undo is a three-way merge, as in ZODB: the state of T is the
 //!   base, the current state is the committed one, and the state before T
 //!   is the new one. Tier 1 merges a class of BTrees or `Length` in Rust.
@@ -23,8 +25,10 @@
 //! read it is a conflict of the vote, as for any store.
 //!
 //! Nothing is undoable at or before the last pack (`pack_watermark`). The
-//! undo log, `Store::undo_log`, gives the transactions after it, newest
-//! first. An undo id is the base64 text of the tid, as in FileStorage.
+//! finish checks it again under the commit sequencer, so a pack that runs
+//! between the undo and its finish fails the undo. The undo log,
+//! `Store::undo_log`, gives the transactions after it, newest first. An
+//! undo id is the base64 text of the tid, as in FileStorage.
 
 use crate::backend::TxnMeta;
 use crate::error::Result;
@@ -80,49 +84,18 @@ pub(crate) const CREATION_CHANGED: &str =
 /// gives the same text.
 pub(crate) const CHANGED_LATER: &str = "Some data were modified by a later transaction";
 
-/// The most transactions that one read of the undo log takes.
-const LOG_CHUNK: usize = 256;
-
 impl Store {
     /// Return the rows of at most `limit` transactions before `before`
     /// that an undo can undo, newest first: the transactions after the
     /// last pack. `Tid::MAX` starts at the last transaction.
     ///
-    /// Each call reads one snapshot. A caller that reads the log in parts
-    /// gives the tid of the last row of a part as `before` of the next.
+    /// The rows of one call come from one snapshot, and the watermark from
+    /// another read. A caller that reads the log in parts gives the tid of
+    /// the last row of a part as `before` of the next.
     pub fn undo_log(&self, before: Tid, limit: usize) -> Result<Vec<TxnMeta>> {
         let watermark = self.pack_watermark()?;
         let mut rows = self.backend.txns_before(before, limit)?;
         rows.retain(|row| row.tid > watermark);
-        Ok(rows)
-    }
-
-    /// Return the rows of the transactions of the undo log from index
-    /// `first` up to `last`, `last` excluded, newest first, as
-    /// `undoLog(first, last)` of ZODB gives them. A negative `last` counts
-    /// from `first`: `-n` is `first + n`.
-    pub fn undo_log_range(&self, first: i64, last: i64) -> Result<Vec<TxnMeta>> {
-        let last = if last < 0 {
-            first.saturating_sub(last)
-        } else {
-            last
-        };
-        let first = usize::try_from(first).unwrap_or(0);
-        let last = usize::try_from(last).unwrap_or(0);
-        let mut rows = Vec::new();
-        let mut before = Tid::MAX;
-        let mut index = 0;
-        while index < last {
-            let part = self.undo_log(before, LOG_CHUNK.min(last - index))?;
-            let Some(oldest) = part.last() else { break };
-            before = oldest.tid;
-            for row in part {
-                if index >= first {
-                    rows.push(row);
-                }
-                index += 1;
-            }
-        }
         Ok(rows)
     }
 }

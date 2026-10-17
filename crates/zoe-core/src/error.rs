@@ -92,6 +92,7 @@ pub enum ZoeError {
         /// Why the undo is refused.
         reason: &'static str,
     },
+
     /// A lock request is not in ascending oid order. The lock manager
     /// refuses it and takes no lock.
     #[error("lock request out of oid order: oid {oid:?}")]
