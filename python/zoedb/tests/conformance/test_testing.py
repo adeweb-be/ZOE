@@ -349,8 +349,10 @@ def test_a_server_that_does_not_listen_in_time_fails_the_start(
     with pytest.raises(RuntimeError, match="did not listen within 1 seconds"):
         layer.start_zeo_server(FILESTORAGE, zeo_config(), start_timeout=1)
     assert layer._servers == []
-    # The start killed the process and waited for it.
-    assert not os.path.exists(f"/proc/{pid_file.read_text().strip()}")
+    # The start killed the process and waited for it. Signal 0 checks that
+    # the process exists and sends nothing.
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
 
 
 def test_teardown_restores_the_forker_when_a_kill_fails(tmp_path, monkeypatch):
