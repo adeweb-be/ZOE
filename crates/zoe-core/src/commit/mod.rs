@@ -59,6 +59,7 @@
 
 mod encoded;
 mod group;
+mod intent;
 mod observer;
 mod staging;
 
@@ -81,6 +82,7 @@ use crate::types::{Oid, Tid};
 pub use encoded::Encoded;
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use intent::IntentLocks;
 pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
@@ -158,6 +160,9 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The end of the lock timeout of the last vote that took the locks, on
     /// the monotonic time of the store clock.
     lock_deadline: Duration,
+    /// The early write-intent locks that the transaction adopted before
+    /// its vote, in ascending oid order. The vote counts them as its own.
+    intents: Vec<Held>,
 }
 
 /// What the serial check of a vote found.
@@ -219,6 +224,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             handed: BTreeMap::new(),
             onto: BTreeMap::new(),
             lock_deadline: Duration::ZERO,
+            intents: Vec::new(),
         }
     }
 
@@ -262,6 +268,28 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let mut txn = Self::begin_restore(store, tid, user, description, extension)?;
         txn.deferred = true;
         Ok(txn)
+    }
+
+    /// Adopt the early write-intent locks of `intents` (ADR 0045): the vote
+    /// counts them as its own, and the end of the transaction releases
+    /// them. `intents` then holds no lock.
+    ///
+    /// The call must come before the vote, and `intents` must be an owner
+    /// of the store of the transaction. Otherwise it fails with `Protocol`
+    /// and changes nothing.
+    pub fn adopt_intents<T: Deref<Target = Store>>(
+        &mut self,
+        intents: &mut IntentLocks<T>,
+    ) -> Result<()> {
+        if self.locked() {
+            return Err(ZoeError::Protocol("adopt intent locks after the vote"));
+        }
+        if !std::ptr::eq(intents.store(), &*self.store) {
+            return Err(ZoeError::Protocol("intent locks of another store"));
+        }
+        self.intents.extend(intents.take());
+        self.intents.sort_by_key(|lock| lock.oid);
+        Ok(())
     }
 
     /// Let `cancel` end the lock wait of the votes of this transaction from
@@ -802,17 +830,52 @@ impl<S: Deref<Target = Store>> Txn<S> {
     fn lock(&mut self) -> Result<()> {
         self.store.writable()?;
         let store: &Store = &self.store;
-        let requests = self.lock_requests();
+        let mut requests = self.lock_requests();
         // A store without an observer does not read the clock. The wait is
         // measured on the monotonic time of the store clock, as the lock
         // timeout is, so a simulator gives it on simulated time.
         let started = store.observer().map(|_| store.clock.monotonic());
-        let acquired = store.locks.acquire_cancellable(
-            &requests,
-            store.lock_timeout,
-            &*store.clock,
-            self.lock_cancel.as_ref(),
-        );
+        let cancel = self.lock_cancel.as_ref();
+        let mut acquired = None;
+        // A vote that takes its locks without a wait waits for a commit in
+        // flight until the lock timeout after its start.
+        let mut deadline = None;
+        if !self.intents.is_empty()
+            && let Some(&(lowest, _)) = requests.first()
+        {
+            // The intent locks are above some oid that the vote needs. When
+            // every such oid is free, the vote takes them at once. Else it
+            // releases the intent locks above the lowest of them, so that it
+            // waits in oid order, and takes them again with the others. The
+            // serial check catches a commit that came in between.
+            let begun = store.clock.monotonic();
+            let tried =
+                store
+                    .locks
+                    .acquire_cancellable(&requests, Duration::ZERO, &*store.clock, cancel);
+            match tried {
+                Ok(locks) => {
+                    deadline = Some(begun.saturating_add(store.lock_timeout));
+                    acquired = Some(Ok(locks));
+                }
+                Err(Refused { released, .. }) => {
+                    store
+                        .guardrails
+                        .locks_released(&released, store.clock.now());
+                    let above = self.intents.partition_point(|lock| lock.oid < lowest);
+                    let given: Vec<Held> = self.intents.split_off(above);
+                    store.locks.release(&given);
+                    store.guardrails.locks_released(&given, store.clock.now());
+                    requests.extend(given.iter().map(|lock| (lock.oid, Mode::Exclusive)));
+                    requests.sort_by_key(|&(oid, _)| oid);
+                }
+            }
+        }
+        let acquired = acquired.unwrap_or_else(|| {
+            store
+                .locks
+                .acquire_cancellable(&requests, store.lock_timeout, &*store.clock, cancel)
+        });
         if let (Some(observer), Some(started)) = (store.observer(), started) {
             observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
         }
@@ -820,8 +883,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
             Ok(mut locks) => {
                 self.handed = locks.handoffs().into_iter().collect();
                 self.onto.clear();
-                self.lock_deadline = locks.deadline();
-                self.locks = Some(locks.keep());
+                self.lock_deadline = deadline.unwrap_or_else(|| locks.deadline());
+                let mut held = locks.keep();
+                held.append(&mut self.intents);
+                held.sort_by_key(|lock| lock.oid);
+                self.locks = Some(held);
                 Ok(())
             }
             Err(Refused { error, released }) => {
@@ -903,6 +969,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .map(|&oid| (oid, Mode::Shared))
             .collect();
         requests.extend(self.staged.iter().map(|(oid, _)| (oid, Mode::Exclusive)));
+        // An adopted intent lock is exclusive already.
+        for lock in &self.intents {
+            requests.remove(&lock.oid);
+        }
         requests.into_iter().collect()
     }
 
@@ -1360,7 +1430,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Release the locks, then log each lock held past `lock-warn`.
     fn release(&mut self) {
-        if let Some(held) = self.locks.take() {
+        let mut held = self.locks.take().unwrap_or_default();
+        held.append(&mut self.intents);
+        if !held.is_empty() {
             let now = self.store.clock.now();
             self.store.locks.release(&held);
             self.store.guardrails.locks_released(&held, now);

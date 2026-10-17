@@ -36,6 +36,13 @@ pub trait Observer: Send + Sync {
     fn locks_handed_off(&self, locks: usize) {
         let _ = locks;
     }
+
+    /// An intent owner took `locks` early write-intent locks in one call
+    /// (ADR 0045), after a wait of `wait` on the monotonic time of the store
+    /// clock. A call that failed calls it with 0 locks.
+    fn intent_locks_acquired(&self, locks: usize, wait: Duration) {
+        let _ = (locks, wait);
+    }
 }
 
 impl Store {

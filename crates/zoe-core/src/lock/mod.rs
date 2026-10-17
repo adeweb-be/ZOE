@@ -147,6 +147,11 @@ pub(crate) enum Mode {
     /// For an oid that the transaction writes. No other lock can hold the
     /// oid at the same time.
     Exclusive,
+    /// An early write-intent lock (ADR 0045): exclusive, taken before the
+    /// vote, before the transaction reads the oid. It never takes a
+    /// hand-off: it waits until the store holds the last commit of the oid,
+    /// as a shared request does.
+    Intent,
 }
 
 /// A request that waits in the queue of an oid.
@@ -201,13 +206,14 @@ impl std::fmt::Debug for Entry {
 
 impl Entry {
     /// Tell if the holders let a request in `mode` hold the lock with
-    /// them. While a hand-off is in the entry, a shared request waits: it
-    /// reads the oid from the store, and the store does not hold the last
-    /// commit of the oid yet.
+    /// them. While a hand-off is in the entry, a shared request and an
+    /// intent request wait: they read the oid from the store, and the store
+    /// does not hold the last commit of the oid yet.
     fn admits(&self, mode: Mode) -> bool {
         match mode {
             Mode::Exclusive => self.holders == 0,
-            Mode::Shared if self.holders == 0 => self.committing.is_none(),
+            Mode::Intent | Mode::Shared if self.holders == 0 => self.committing.is_none(),
+            Mode::Intent => false,
             Mode::Shared => !self.exclusive,
         }
     }
@@ -221,7 +227,7 @@ impl Entry {
 
     fn take(&mut self, mode: Mode) {
         self.holders += 1;
-        self.exclusive = mode == Mode::Exclusive;
+        self.exclusive = mode != Mode::Shared;
     }
 
     /// Grant the lock to the waiters at the head of the queue, in arrival
