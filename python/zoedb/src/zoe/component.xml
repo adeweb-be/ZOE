@@ -92,8 +92,9 @@
         The mode of the posting-dict rule of ADR 0042: on merges the
         posting dicts of ZCTextIndex entry by entry in the buckets with
         integer keys, where ZODB's resolver refuses them; shadow writes the
-        merge of the rule to the resolution log and refuses as ZODB's
-        resolver does; off, the default, does not run the rule.
+        merge of the rule to the resolution log, then ends the conflict as
+        off does; off, the default, does not run the rule. A shadow mode
+        needs resolution-log.
       </description>
     </key>
     <key name="resolution-log" datatype="string">
@@ -373,7 +374,7 @@
     <key name="posting-dicts" datatype="string">
       <description>
         The mode of the posting-dict rule of ADR 0042: on, shadow or off,
-        the default.
+        the default. A shadow mode needs resolution-log.
       </description>
     </key>
     <key name="resolution-log" datatype="string">

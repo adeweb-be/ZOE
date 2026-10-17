@@ -3048,6 +3048,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_merge_of_tier_1_counts_at_the_vote_that_passes() {
+        let mut s = registered("native-two-votes");
+        let storage = Arc::clone(&s.storage);
+        let native = || get_counter(&storage.metrics.conflicts_native);
+        // The oid 1 is a Length, which tier 1 merges. The oid 2 is a
+        // mapping, which only the client resolves.
+        let length_read = commit(&mut s, 1, 1, 0, &length_record(10)).unwrap();
+        commit(&mut s, 2, 1, length_read, &length_record(12)).unwrap();
+        let mapping_read = commit(&mut s, 3, 2, 0, MAPPING).unwrap();
+        let mapping_later = commit(&mut s, 4, 2, mapping_read, MAPPING).unwrap();
+        for (id, abort) in [(5, true), (6, false)] {
+            begin(&mut s, id, None);
+            store(&mut s, id, 1, length_read, &length_record(7));
+            store(&mut s, id, 2, mapping_read, MAPPING);
+            let listed = done(call(&mut s, "vote", vec![Value::from(id)]));
+            let listed = listed.as_array().unwrap();
+            assert_eq!(listed.len(), 2, "{listed:?}");
+            assert_eq!(listed[0], p64(1));
+            // The first vote listed a conflict for the client, so nothing
+            // counts yet.
+            assert_eq!(native(), 0);
+            if abort {
+                done(call(&mut s, "tpc_abort", vec![Value::from(id)]));
+                assert_eq!(native(), 0);
+                continue;
+            }
+            store(&mut s, id, 2, mapping_later, b"resolved");
+            assert_eq!(
+                done(call(&mut s, "vote", vec![Value::from(id)])),
+                Value::Array(vec![])
+            );
+            finish(&mut s, Value::from(id));
+            assert_eq!(native(), 1);
+            let status = s.storage.status().to_value();
+            assert_eq!(count(&status, "conflicts_resolved"), 1);
+        }
+    }
+
     fn get_counter(counter: &AtomicU64) -> u64 {
         counter.load(std::sync::atomic::Ordering::Relaxed)
     }

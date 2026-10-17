@@ -27,7 +27,7 @@ In a bucket, or a BTree that holds one bucket inline, of a family with integer k
 3. The rule refuses, with a conflict:
    - an entry that both sides changed to different values, or that one side changed and the other deleted;
    - a value that is not a posting dict on one side when both sides changed the key: a dict against the reference to the `IIBTree` of a converted posting;
-   - a merged dict of more than 10 entries: ZCTextIndex converts a dict only at exactly 10, so a dict of 11 would never become a tree;
+   - a merged dict of more than 10 entries: ZCTextIndex converts a dict only at exactly 10, so a dict of 11 would never become a tree. A dict of more than 10 entries on one side refuses before the merge of its entries, so the merge never builds one;
    - a merged dict of no entry: ZCTextIndex deletes the word instead.
 4. The rule never changes the number of words of an index. A word that both sides add stays a refusal (reason 4 or 6 of BTrees), and so does a word that one side deletes and the other changes (2 or 3): both change `length`. A score of an int against a float on the two sides gives no answer: the conflict goes on as without the rule.
 
@@ -41,7 +41,7 @@ One key, `posting-dicts`, a mode with the words of `structural-merges`: `off`, t
 
 - In-process: the key `posting-dicts` of `<zoe>`, its environment twin `ZOE_POSTING_DICTS`, the query key of `zoe://`, and the argument `posting_dicts` of `zoe.Storage`.
 - `zoe serve`: `--posting-dicts`, `ZOE_POSTING_DICTS`, the key `posting-dicts` of the configuration file and of `<zoe-server>`. It applies to every store of the server.
-- `on` merges. `shadow` runs the rule and writes its result to the resolution log, in the field `shadow` of the line. When a dict took part in the merge, the vote then refuses with reason 1 of BTrees, as ZODB's resolver does, because BTrees cannot compare dicts. The other merges of tier 1 in the class stay live. So the rule, the one part of tier 1 that departs from ZODB, can run in shadow mode by itself.
+- `on` merges. `shadow` runs the rule and writes its result to the resolution log, in the field `shadow` of the line. When the rule compared a dict, tier 1 then merges the record again without the rule, and that outcome ends the conflict, as with `off`: where BTrees must compare two dicts, tier 1 gives no answer, and the client's resolver refuses with its own reason, as today. The other merges of tier 1 in the class stay live. So the rule, the one part of tier 1 that departs from ZODB, can run in shadow mode by itself, and a store in shadow mode ends each conflict as a store with the rule off.
 - The rule runs only where the mode of the class is `on` or `shadow`.
 
 A stock client and the native client need nothing: the server merges at the vote and replies with the bare oid, as ZEO 6 does for a conflict that its server resolved.
@@ -52,7 +52,7 @@ A Plone site sets the key in its `<zoe>` stanza or in the configuration of its s
 
 - `structural-merges` (`on`, `shadow` or `off`; `on` by default) is the mode of every class of tier 1. `on` stores the merge or fails the vote on a refusal. `shadow` runs tier 1, writes its result to the resolution log, and goes on as without it: the client resolves the conflict. `off` does not run tier 1.
 - `structural-merge-class CLASS MODE` sets the mode of one class, such as `structural-merge-class BTrees.IOBTree.IOBucket shadow`. In `<zoe>` it is a key that comes once for each class; its environment twin `ZOE_STRUCTURAL_MERGE_CLASSES` and `zoe serve --structural-merge-class CLASS=MODE` (repeated; `ZOE_STRUCTURAL_MERGE_CLASSES` as `CLASS=MODE,CLASS=MODE`; a table `[structural-merge-classes]` in the configuration file) take the pairs.
-- In-process there is no `/metrics`, so a shadow mode (of tier 1, of a class or of the posting rule) without `resolution-log` would tell nobody what it found: `zoe.Storage` refuses it at the open with `ValueError`. `zoe serve` counts the results in `zoe_structural_merges_total`, and logs a warning at its start for a shadow mode without `--resolution-log`.
+- A shadow mode (of tier 1, of a class or of the posting rule) without `resolution-log` would tell nobody what it found: in-process there is no `/metrics`, and `zoe_structural_merges_total` of `zoe serve` counts the outcome of the vote, not the field `shadow`. So `zoe.Storage` refuses it at the open with `ValueError`, and `zoe serve` refuses it at its start with a usage error.
 
 ### The resolution log
 

@@ -480,8 +480,8 @@ impl Heap {
         }
     }
 
-    /// Compares two values that are not two tuples for `==`, or gives the
-    /// items of two tuples.
+    /// Compares two values for `==`, or gives the items of two tuples or of
+    /// two lists of one length.
     fn eq_leaf(&self, a: Value, b: Value) -> Result<Leaf<'_>, Undecided> {
         let answer = match (a, b) {
             (Value::Object(x), Value::Object(y)) if x == y => true,
@@ -530,7 +530,7 @@ impl Heap {
         Ok(Leaf::Answer(answer))
     }
 
-    /// Compares two values that are not two tuples for `<`.
+    /// Compares two values that are not two tuples or two lists for `<`.
     fn lt_leaf(&self, a: Value, b: Value) -> Result<bool, Undecided> {
         match (a, b) {
             (Value::Bool(_) | Value::Int(_), Value::Bool(_) | Value::Int(_)) => {
@@ -564,6 +564,7 @@ impl Heap {
 /// The answer of [`Heap::eq_leaf`].
 enum Leaf<'a> {
     Answer(bool),
+    /// The items of two tuples, or of two lists of one length.
     Tuples(&'a [Value], &'a [Value]),
 }
 

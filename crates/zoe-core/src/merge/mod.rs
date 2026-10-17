@@ -24,8 +24,8 @@
 //!
 //! The posting-dict rule (ADR 0042) is a merge where ZODB's resolver
 //! refuses. It is off by default. In shadow mode it computes its merge for
-//! the resolution log, and the conflict ends as in ZODB's resolver. See
-//! `posting.rs`.
+//! the resolution log, then the merge runs again without the rule, and
+//! that outcome ends the conflict. See `posting.rs`.
 //!
 //! No Python runs here.
 
@@ -202,8 +202,8 @@ pub struct Merge {
     /// deleted.
     pub changed: usize,
     /// With the posting-dict rule in shadow mode, the outcome that the rule
-    /// gives when a dict took part in the merge. The outcome of the merge
-    /// is then the refusal of BTrees, as in ZODB's resolver.
+    /// gives when it compared a dict. The outcome of the merge is then the
+    /// outcome without the rule.
     pub shadow: Option<Outcome>,
 }
 
@@ -291,8 +291,7 @@ pub struct Resolution {
     /// The serial that the transaction read.
     pub read: Tid,
     /// With the posting-dict rule in shadow mode, what the rule gives when
-    /// a dict took part in the merge; `outcome` is then the refusal of
-    /// BTrees.
+    /// it compared a dict; `outcome` is then the outcome without the rule.
     pub shadow: Option<Resolved>,
 }
 

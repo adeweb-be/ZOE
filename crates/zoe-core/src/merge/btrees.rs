@@ -26,6 +26,20 @@ pub(super) fn merge(
     posting_dicts: Mode,
     merge: &mut Merge,
 ) -> Outcome {
+    let (outcome, dicts) = merge_once(trees, class, posting_dicts != Mode::Off, merge);
+    // In shadow mode, the rule only tells what it would do. The vote then
+    // does what it does with the rule off, so a conflict with a dict goes on
+    // as it does without the rule.
+    if posting_dicts == Mode::Shadow && dicts {
+        merge.shadow = Some(outcome);
+        return merge_once(trees, class, false, merge).0;
+    }
+    outcome
+}
+
+/// Merges the three records once, with the posting-dict rule when
+/// `posting` is true. Also tells if the rule compared a dict.
+fn merge_once(trees: &Trees, class: Class, posting: bool, merge: &mut Merge) -> (Outcome, bool) {
     let mut heap = Heap::new();
     // ZODB's resolver loads the new record, then the old one, then the
     // committed one. A persistent reference takes its persistent id from
@@ -37,12 +51,15 @@ pub(super) fn merge(
     });
     let (class_value, states) = match loaded {
         Ok(loaded) => loaded,
-        Err(unsupported) => return Outcome::Undecided(unsupported.0),
+        Err(unsupported) => return (Outcome::Undecided(unsupported.0), false),
     };
     // ZODB writes the class of a bucket, a set and a Length as a GLOBAL
     // alone, and the resolver writes it again so.
     if heap.class(class_value).is_none() {
-        return Outcome::Undecided("a class pickle of another format");
+        return (
+            Outcome::Undecided("a class pickle of another format"),
+            false,
+        );
     }
     let mut dicts = false;
     let state = match class {
@@ -52,7 +69,7 @@ pub(super) fn merge(
                 heap: &mut heap,
                 family,
                 mapping: shape.is_mapping(),
-                posting: posting_dicts != Mode::Off && posting::applies(family),
+                posting: posting && posting::applies(family),
                 dicts: Cell::new(false),
                 items: Vec::new(),
                 keys: Vec::new(),
@@ -75,13 +92,7 @@ pub(super) fn merge(
         }
         Err(outcome) => outcome,
     };
-    // In shadow mode, the rule only tells what it would do. ZODB's
-    // resolver refuses each bucket where it must compare a dict.
-    if posting_dicts == Mode::Shadow && dicts {
-        merge.shadow = Some(outcome);
-        return refuse(1);
-    }
-    outcome
+    (outcome, dicts)
 }
 
 /// `Length._p_resolveConflict(old, s1, s2)`: `s1 + s2 - old`.

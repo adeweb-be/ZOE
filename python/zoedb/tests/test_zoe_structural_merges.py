@@ -141,6 +141,21 @@ def test_a_refusal_raises_conflict_error_without_python(tmp_path, calls):
     )
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"structural_merges": "shadow"},
+        {"structural_merge_classes": {"BTrees.Length.Length": "shadow"}},
+        {"posting_dicts": "shadow"},
+    ],
+)
+def test_a_shadow_mode_without_a_resolution_log_raises_value_error(tmp_path, options):
+    with pytest.raises(ValueError, match="resolution_log"):
+        zoe.Storage(str(tmp_path / "store"), **options)
+    log = tmp_path / "merges.log"
+    zoe.Storage(str(tmp_path / "store"), resolution_log=str(log), **options).close()
+
+
 def test_a_bad_mode_raises_value_error(tmp_path):
     with pytest.raises(ValueError, match="structural_merges"):
         zoe.Storage(str(tmp_path / "one"), structural_merges="sometimes")
@@ -161,15 +176,15 @@ def last_records(storage):
     return records
 
 
-def differential(tmp_path, name, make, first, second):
-    """Run the same race on FileStorage and on zoe.Storage. Return the
-    outcome and the records of the last commit of each."""
+def differential(tmp_path, name, make, first, second, **options):
+    """Run the same race on FileStorage and on zoe.Storage with `options`.
+    Return the outcome and the records of the last commit of each."""
     from ZODB.FileStorage import FileStorage
 
     results = []
     for storage in (
         FileStorage(str(tmp_path / f"{name}.fs")),
-        zoe.Storage(str(tmp_path / f"{name}-zoe")),
+        zoe.Storage(str(tmp_path / f"{name}-zoe"), **options),
     ):
         outcome, _ = race(storage, make, first, second)
         # race closed the database, and so the storage: open it again.
@@ -261,3 +276,60 @@ def test_merges_of_production_shapes_equal_the_merges_of_zodb(
     assert our_records == their_records
     # FileStorage tried its conflict in Python once, and zoe.Storage never.
     assert calls["calls"] == 1
+
+
+def postings():
+    from BTrees.IOBTree import IOBucket
+
+    return IOBucket({5: 1, 10: {1: 3}, 20: {1: 2}})
+
+
+def deleting(key):
+    return lambda obj: obj.__delitem__(key)
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "first", "second", "merges"),
+    [
+        # A dict meets None, then an int: BTrees compares them and merges.
+        (
+            "dict-and-none",
+            lambda: __import__("BTrees").IOBTree.IOBucket({1: None, 2: "a"}),
+            setting(1, {7: 1}),
+            setting(2, "b"),
+            True,
+        ),
+        (
+            "int-and-dict",
+            lambda: __import__("BTrees").IOBTree.IOBucket({1: 5, 2: "a"}),
+            setting(2, "b"),
+            setting(1, {7: 1}),
+            True,
+        ),
+        # Both sides change one posting: the rule would merge it.
+        (
+            "one-posting",
+            postings,
+            setting(10, {1: 3, 2: 1}),
+            setting(10, {1: 3, 3: 4}),
+            False,
+        ),
+        # A delete meets a dict that BTrees must compare.
+        ("delete-and-change", postings, setting(5, 2), deleting(10), False),
+    ],
+)
+def test_shadow_mode_of_the_posting_rule_ends_a_conflict_as_zodb_does(
+    tmp_path, name, make, first, second, merges
+):
+    log = tmp_path / f"{name}.log"
+    (theirs, their_records), (ours, our_records) = differential(
+        tmp_path,
+        name,
+        make,
+        first,
+        second,
+        posting_dicts="shadow",
+        resolution_log=str(log),
+    )
+    assert ours == theirs == ("merged" if merges else "conflict")
+    assert our_records == their_records

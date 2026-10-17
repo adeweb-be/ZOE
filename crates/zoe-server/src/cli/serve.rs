@@ -317,7 +317,8 @@ pub(super) struct ServeArgs {
     /// merges BTree buckets, sets, BTrees of one bucket and Length at the
     /// vote, or refuses them as BTrees does. shadow runs the merges and
     /// writes their results to the resolution log, then lets the client
-    /// resolve the conflict. off does not run them.
+    /// resolve the conflict. off does not run them. A shadow mode needs
+    /// --resolution-log.
     #[arg(
         long,
         env = "ZOE_STRUCTURAL_MERGES",
@@ -343,8 +344,9 @@ pub(super) struct ServeArgs {
     /// The mode of the posting-dict rule of ADR 0042: on merges the posting
     /// dicts of ZCTextIndex entry by entry in the buckets with integer keys,
     /// where ZODB's resolver refuses them; shadow writes the merge of the
-    /// rule to the resolution log and refuses as ZODB's resolver does; off,
-    /// the default, does not run the rule.
+    /// rule to the resolution log, then ends the conflict as off does; off,
+    /// the default, does not run the rule. A shadow mode needs
+    /// --resolution-log.
     #[arg(
         long,
         env = "ZOE_POSTING_DICTS",
@@ -580,9 +582,28 @@ pub(super) fn configure(
                 path.display()
             )));
         }
+        if shadow(serve) && serve.resolution_log.is_none() {
+            return Err(usage_error(
+                "a shadow mode needs --resolution-log: the log is where shadow mode writes what \
+                 it finds"
+                    .to_owned(),
+            ));
+        }
         serve.storages = storages(serve, config.storages).map_err(usage_error)?;
     }
     Ok(cli)
+}
+
+/// Tells if tier 1, a class of tier 1 or the posting-dict rule is in shadow
+/// mode.
+#[cfg(feature = "serve")]
+fn shadow(args: &ServeArgs) -> bool {
+    args.structural_merges == Mode::Shadow
+        || args.posting_dicts == Mode::Shadow
+        || args
+            .structural_merge_class
+            .iter()
+            .any(|(_, mode)| *mode == Mode::Shadow)
 }
 
 /// The command line has no configuration file in a build without server:
@@ -705,17 +726,6 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
     }
     // The traces flush when `_traces` drops, after the stop of the server.
     let _traces = init_logs(args.log_format)?;
-    let shadow = args.structural_merges == Mode::Shadow
-        || args.posting_dicts == Mode::Shadow
-        || args
-            .structural_merge_class
-            .iter()
-            .any(|(_, mode)| *mode == Mode::Shadow);
-    if shadow && args.resolution_log.is_none() {
-        tracing::warn!(
-            "shadow mode without --resolution-log: only zoe_structural_merges_total of /metrics counts what it finds"
-        );
-    }
     if let Some(addr) = args.admin_listen {
         options = options.admin_listen(addr);
     }
@@ -862,6 +872,25 @@ mod tests {
             text.contains("--tls-cert") && text.contains("--listen"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_shadow_mode_without_a_resolution_log_is_a_usage_error() {
+        let parse = |extra: &[&str]| {
+            let line = ["zoe", "serve", "--path", "store"].iter().chain(extra);
+            super::super::parse(line.map(Into::into).collect())
+        };
+        for shadow in [
+            &["--structural-merges", "shadow"][..],
+            &["--structural-merge-class", "BTrees.Length.Length=shadow"],
+            &["--posting-dicts", "shadow"],
+        ] {
+            let error = parse(shadow).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("--resolution-log"), "{error}");
+            let logged = [shadow, &["--resolution-log", "merges.log"]].concat();
+            assert!(parse(&logged).is_ok(), "{logged:?}");
+        }
     }
 
     #[test]
