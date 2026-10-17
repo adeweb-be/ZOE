@@ -45,17 +45,16 @@ import sys
 import threading
 
 import transaction
+import zoe.policy
 from AccessControl.SecurityManagement import newSecurityManager, noSecurityManager
 from Acquisition import aq_base
 from DateTime import DateTime
 from Products.CMFCore.utils import getToolByName
 from Testing.makerequest import makerequest
 from ZODB.POSException import ConflictError
+from zoe.plone import history, merges
 from zope.component.hooks import setSite
 from zope.globalrequest import setRequest
-
-import zoe.policy
-from zoe.plone import history, merges
 
 SITE_ID = "Plone"
 WORKFLOW = "simple_publication_workflow"
