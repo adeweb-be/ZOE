@@ -225,9 +225,8 @@ impl Merger<'_> {
             .ok()
             .expect("three buckets");
         // A root that holds its one bucket inline has no parent node to
-        // change. BTrees also writes a node inside a tree with its one
-        // bucket inline when that bucket has no oid when it pickles the
-        // node. The bucket of such a node has a next bucket, except in the
+        // change. BTrees also writes the one bucket of a node inside a tree
+        // inline, if the bucket has no oid at the pickle of the node. The bucket of such a node has a next bucket, except in the
         // node of the last bucket. A record cannot tell a root from that
         // last node, so the rule takes only a delete by the committed
         // transaction (ADR 0042).

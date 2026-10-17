@@ -345,10 +345,10 @@ pub(super) struct ServeArgs {
     /// 0042, two merges where ZODB's resolver refuses: on merges the
     /// posting dicts of ZCTextIndex entry by entry in the buckets with
     /// integer keys, and lets a delete of the first key by the committed
-    /// transaction through in a tree of one bucket; shadow writes the merge of the rules to the
-    /// resolution log, then ends the conflict as off does; off, the
-    /// default, does not run the rules. A shadow mode needs
-    /// --resolution-log.
+    /// transaction through in a tree of one bucket; shadow writes the
+    /// merge of the rules to the resolution log, then ends the conflict as
+    /// off does; off, the default, does not run the rules. A shadow mode
+    /// needs --resolution-log.
     #[arg(
         long,
         env = "ZOE_POSTING_DICTS",
