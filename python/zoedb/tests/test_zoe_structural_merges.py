@@ -476,3 +476,88 @@ def test_a_reindex_that_drops_the_lowest_document_of_a_posting_tree_merges(
     assert stored == contents(*index_of(final))
     # Tier 1 refuses with the rule off, so no client resolves.
     assert calls["calls"] == 0
+
+
+def a_node_with_one_bucket_inline(conn, manager):
+    """Build an IIBTree whose last inner node holds its one bucket inline,
+    with no next bucket. Return the tree and the first key of that node.
+
+    BTrees writes a node so when its one bucket has no oid yet. A commit
+    makes such a node when it splits the last node and then empties the
+    new node but for its new last bucket.
+    """
+    from BTrees.IIBTree import IIBTree
+
+    tree = conn.root()["tree"] = IIBTree()
+    manager.commit()
+    # Three inner nodes of buckets under the root.
+    count = 120 * 500 * 3
+    for start in range(0, count, 20000):
+        for key in range(start, min(count, start + 20000)):
+            tree[key * 10] = key
+        manager.commit()
+    last = (count - 1) * 10
+    node = tree.__getstate__()[0][-1]
+    for key in list(node.__getstate__()[0][0].keys()):
+        del tree[key]
+    for key in range(1, 200):
+        tree[last + 2 * key] = key
+    node = tree.__getstate__()[0][-1]
+    bucket = node.__getstate__()[0][-1]
+    keep = set(bucket.keys())
+    for key in list(tree.keys(node.minKey())):
+        if key not in keep:
+            del tree[key]
+    manager.commit()
+    # The record of the node holds its one bucket inline, with no next
+    # bucket.
+    import io
+
+    import zodbpickle.pickle
+
+    record, _ = conn._storage.load(node._p_oid)
+    unpickler = zodbpickle.pickle.Unpickler(io.BytesIO(record))
+    unpickler.persistent_load = lambda reference: reference
+    unpickler.load()
+    state = unpickler.load()
+    assert len(state) == 1 and len(state[0][0]) == 1
+    return tree, node.minKey()
+
+
+@pytest.mark.parametrize("deleter", ["committed", "new"])
+def test_a_first_key_delete_in_a_node_inside_a_tree_never_loses_a_key(
+    tmp_path, deleter
+):
+    path = str(tmp_path / "store")
+    db = ZODB.DB(zoe.Storage(path, posting_dicts="on"))
+    manager = transaction.TransactionManager()
+    _, first = a_node_with_one_bucket_inline(
+        db.open(transaction_manager=manager), manager
+    )
+    db.close()
+    # New caches: each connection loads the node from its inline record.
+    db = ZODB.DB(zoe.Storage(path, posting_dicts="on"))
+    try:
+        managers = [transaction.TransactionManager() for _ in range(2)]
+        trees = [db.open(transaction_manager=tm).root()["tree"] for tm in managers]
+        for tree in trees:
+            assert first in tree
+        deleting, adding = trees if deleter == "committed" else trees[::-1]
+        del deleting[first]
+        adding[first + 1] = 1
+        managers[0].commit()
+        # A delete by the committed transaction moved the separator of the
+        # parent node, which the new transaction read: a read conflict. A
+        # delete by the new transaction is a refusal of reason 13.
+        with pytest.raises(ConflictError):
+            managers[1].commit()
+        managers[1].abort()
+        with db.transaction() as check:
+            tree = check.root()["tree"]
+            # Only the committed transaction stays, and a lookup finds what
+            # it left. The order of the buckets of this tree disagrees with
+            # its nodes under ZODB alone, so the test reads by lookup.
+            assert (first in tree) == (deleter == "new")
+            assert (first + 1 in tree) == (deleter == "new")
+    finally:
+        db.close()
