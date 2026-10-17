@@ -1,0 +1,11 @@
+<configure xmlns="http://namespaces.zope.org/zope">
+
+  <!-- Opt in: the locks of plone.locking live in the ephemeral namespace of
+       the store, and the lock of an edit form writes no object. Include
+       this file in the ZCML of the site. -->
+  <subscriber
+      for="zope.processlifetime.IProcessStarting"
+      handler=".locking.process_starting"
+      />
+
+</configure>

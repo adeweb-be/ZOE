@@ -21,13 +21,24 @@ the objects of the transaction. When the connection began none, because it
 changed no object, the data manager begins a storage transaction of its
 own and drives its vote, its finish and its abort. An abort drops the
 writes.
+
+A `DemoStorage` whose chain of bases ends at a ZOE storage, as the test
+layers of plone.testing stack them, has namespaces too. Its writes go to an
+overlay in memory that belongs to the `DemoStorage`: they never reach the
+base, and they go with the `DemoStorage`. A read looks at the overlay of
+each `DemoStorage` of the chain, from the top, then at the base. The
+overlay keeps the expiry of each ephemeral key, and gives each durable
+namespace a generation of its own when a commit writes it.
 """
 
+import itertools
+import time
 import weakref
 
 import transaction.interfaces
 import zope.interface
 from ZODB.Connection import TransactionMetaData
+from ZODB.DemoStorage import DemoStorage
 from ZODB.POSException import Unsupported
 
 __all__ = ["Namespace"]
@@ -50,6 +61,31 @@ def _bound(bound):
     return None if bound is None else _key(bound)
 
 
+def _storage_of(connection):
+    """Return the namespaces of the storage of the database of
+    `connection`: the storage itself, or the overlay of a `DemoStorage`
+    over a ZOE storage. Another storage raises `Unsupported`."""
+    storage = connection.db().storage
+    if isinstance(storage, DemoStorage):
+        return _DemoNamespaces(storage)
+    if getattr(storage, "kv_set", None) is None:
+        raise Unsupported(
+            f"{type(storage).__name__} has no KV namespaces: use zoe.Storage"
+            " or zoe.zeo.ClientStorage"
+        )
+    return storage
+
+
+def supported(connection):
+    """Tell if the storage of the database of `connection` has KV
+    namespaces."""
+    try:
+        _storage_of(connection)
+    except Unsupported:
+        return False
+    return True
+
+
 class Namespace:
     """The namespace `name` of `flavour` of the store of `connection`."""
 
@@ -63,14 +99,8 @@ class Namespace:
             raise TypeError(
                 f"the name of a namespace is a str, not {type(name).__name__}"
             )
-        storage = connection.db().storage
-        if getattr(storage, "kv_set", None) is None:
-            raise Unsupported(
-                f"{type(storage).__name__} has no KV namespaces: use zoe.Storage"
-                " or zoe.zeo.ClientStorage"
-            )
         self._connection = connection
-        self._storage = storage
+        self._storage = _storage_of(connection)
         self.flavour = flavour
         self.name = name
 
@@ -137,6 +167,14 @@ class Namespace:
                 else:
                     pairs[key] = value
         return sorted(pairs.items())[:limit]
+
+    def writes(self):
+        """Return the writes of the current transaction in the namespace, as
+        a dict of key to value, `None` for a delete."""
+        writes = self._staged(create=False)
+        if writes is None:
+            return {}
+        return dict(writes.of(self.flavour, self.name))
 
     def generation(self):
         """Return the generation of the durable namespace: the 8 bytes of
@@ -210,6 +248,10 @@ class _Writes:
         pass
 
     def commit(self, txn):
+        if isinstance(self._storage, _DemoNamespaces):
+            # The overlay takes the writes at the finish.
+            self._storage.check(self._writes)
+            return
         # Each resource had its `tpc_begin` before this call. So the
         # connection began its storage transaction here when it is a
         # resource of `txn`.
@@ -233,6 +275,8 @@ class _Writes:
 
     def tpc_finish(self, txn):
         try:
+            if isinstance(self._storage, _DemoNamespaces):
+                self._storage.apply(self._writes)
             if self._meta is not None:
                 self._storage.tpc_finish(self._meta)
         finally:
@@ -266,3 +310,147 @@ class _Savepoint:
 
     def rollback(self):
         self._writes._writes = dict(self._state)
+
+
+# The overlay of each `DemoStorage`, while the `DemoStorage` lives.
+_overlays = weakref.WeakKeyDictionary()
+
+# The generations that the overlays give, above every tid of a store.
+_generations = itertools.count(2**63)
+
+# The longest TTL, in seconds, as the core takes it.
+_MAX_TTL = 2**32 - 1
+
+
+class _Overlay:
+    """The namespace writes that the commits on one `DemoStorage` made."""
+
+    def __init__(self):
+        # (flavour, name, key) -> (value or None for a delete, expiry or None)
+        self.rows = {}
+        # name -> the generation of a durable namespace
+        self.generations = {}
+
+    def find(self, flavour, name, key, now):
+        """Return `(True, value)` when the overlay holds `key`, `value`
+        None for a delete or an expired key, else `(False, None)`."""
+        row = self.rows.get((flavour, name, key))
+        if row is None:
+            return False, None
+        value, expiry = row
+        if expiry is not None and expiry <= now:
+            return True, None
+        return True, value
+
+
+class _DemoNamespaces:
+    """The namespaces of a `DemoStorage` whose chain of bases ends at a ZOE
+    storage. The writes go to the overlay of the `DemoStorage`."""
+
+    def __init__(self, demo):
+        chain = []
+        storage = demo
+        while isinstance(storage, DemoStorage):
+            chain.append(storage)
+            storage = storage.base
+        if getattr(storage, "kv_set", None) is None:
+            raise Unsupported(
+                f"the base of {type(demo).__name__} has no KV namespaces:"
+                " use zoe.Storage or zoe.zeo.ClientStorage"
+            )
+        self._demo = demo
+        # The `DemoStorage`s of the chain, the top first.
+        self._chain = chain
+        self._base = storage
+
+    def sortKey(self):
+        return self._demo.sortKey()
+
+    def _found(self, flavour, name, key, now):
+        for demo in self._chain:
+            overlay = _overlays.get(demo)
+            if overlay is not None:
+                found, value = overlay.find(flavour, name, key, now)
+                if found:
+                    return True, value
+        return False, None
+
+    def kv_get(self, flavour, name, key):
+        found, value = self._found(flavour, name, key, time.time())
+        if found:
+            return value
+        return self._base.kv_get(flavour, name, key)
+
+    def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
+        now = time.time()
+        rows = {}
+        for demo in self._chain:
+            overlay = _overlays.get(demo)
+            if overlay is None:
+                continue
+            for (f, n, key), _row in overlay.rows.items():
+                if (f, n) != (flavour, name) or key in rows:
+                    continue
+                if (start is not None and key < start) or (
+                    stop is not None and key >= stop
+                ):
+                    continue
+                rows[key] = overlay.find(f, n, key, now)[1]
+        # The base gives at most 1,000 pairs; the overlay can hide some.
+        wanted = min(1000, limit + len(rows))
+        scanned = self._base.kv_scan(flavour, name, start, stop, wanted)
+        last = scanned[-1][0] if len(scanned) == wanted else None
+        pairs = dict(scanned)
+        for key, value in rows.items():
+            if last is not None and key > last:
+                continue
+            if value is None:
+                pairs.pop(key, None)
+            else:
+                pairs[key] = value
+        return sorted(pairs.items())[:limit]
+
+    def kv_generation(self, name):
+        for demo in self._chain:
+            overlay = _overlays.get(demo)
+            if overlay is not None and name in overlay.generations:
+                return overlay.generations[name]
+        return self._base.kv_generation(name)
+
+    def check(self, writes):
+        """Raise the error that the core raises for a bad write of
+        `writes`."""
+        for (flavour, name, key), (value, ttl) in writes.items():
+            if not 1 <= len(name.encode("utf-8")) <= 255:
+                raise ValueError("the name of a namespace is empty or longer than 255 bytes")
+            if not 1 <= len(key) <= 1024:
+                raise ValueError("a key is empty or longer than 1,024 bytes")
+            if value is None:
+                continue
+            if flavour == "durable" and ttl is not None:
+                raise ValueError("a durable key takes no TTL")
+            if flavour == "ephemeral":
+                if ttl is None:
+                    raise ValueError("an ephemeral key needs a TTL")
+                if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                    raise TypeError("a TTL is an int or a float")
+                if not 0 < ttl <= _MAX_TTL:
+                    raise ValueError("a TTL is a number of seconds from 0 to 2^32 - 1")
+
+    def apply(self, writes):
+        """Put `writes`, the writes of a commit, in the overlay of the top
+        `DemoStorage`."""
+        if not writes:
+            return
+        overlay = _overlays.get(self._demo)
+        if overlay is None:
+            overlay = _overlays[self._demo] = _Overlay()
+        now = time.time()
+        durable = set()
+        for (flavour, name, key), (value, ttl) in writes.items():
+            expiry = now + ttl if flavour == "ephemeral" and value is not None else None
+            overlay.rows[(flavour, name, key)] = (value, expiry)
+            if flavour == "durable":
+                durable.add(name)
+        for name in durable:
+            overlay.generations[name] = next(_generations).to_bytes(8, "big")

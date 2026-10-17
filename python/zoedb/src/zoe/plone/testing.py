@@ -10,6 +10,9 @@ stack does not change, so the suites run unchanged.
 - `install(zeo="host:port")` uses a `ZEO.ClientStorage` of the `zoe serve`
   at that address.
 
+`ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
+on, separated by commas: `locking`, `registry`. `install` installs them.
+
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of
 `STARTUP`. zope.testrunner then sets up the layer before `STARTUP` and
@@ -17,6 +20,7 @@ tears it down after `STARTUP`. Only the `plone` extra and plone.testing
 make this module importable.
 """
 
+import os
 import shutil
 import tempfile
 
@@ -107,6 +111,8 @@ def install(zeo=None):
     as `host:port`, it is a ZEO client of the `zoe serve` at that address
     (`ZOE_SERVE`). Return the layer.
     """
+    for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
+        install_backend(name.strip())
     if zeo is None:
         layer = ZOE_STORAGE
     else:
@@ -116,3 +122,17 @@ def install(zeo=None):
     if layer not in startup.__bases__:
         startup.__bases__ = (layer, *startup.__bases__)
     return layer
+
+
+def install_backend(name):
+    """Install the backend `name` of `zoe.plone`: `locking` or `registry`."""
+    if name == "locking":
+        from zoe.plone import locking
+
+        locking.install()
+    elif name == "registry":
+        from zoe.plone import registry
+
+        registry.install()
+    else:
+        raise ValueError(f"no backend {name!r}: use locking or registry")

@@ -266,3 +266,74 @@ def test_a_namespace_checks_its_arguments(db):
         registry.set("k", "v")
     transaction.abort()
     conn.close()
+
+
+def test_a_demo_storage_over_a_zoe_storage_keeps_its_writes_in_an_overlay(tmp_path):
+    from ZODB.DemoStorage import DemoStorage
+
+    base = zoe.Storage(str(tmp_path / "store"))
+    commit(base, ("durable", "registry", b"kept", b"base", None))
+    generation = base.kv_generation("registry")
+    demo = DemoStorage(base=base, close_base_on_close=False)
+    db = ZODB.DB(demo)
+    try:
+        manager = transaction.TransactionManager()
+        conn = db.open(manager)
+        registry = zoe.kv.Namespace(conn, "durable", "registry")
+        sessions = zoe.kv.Namespace(conn, "ephemeral", "sessions")
+        # A read goes through to the base.
+        assert registry.get("kept") == b"base"
+        registry.set("new", b"demo")
+        registry.delete("kept")
+        sessions.set("s", b"v", ttl=0.2)
+        manager.commit()
+        assert registry.get("new") == b"demo"
+        assert registry.get("kept") is None
+        assert registry.scan() == [(b"new", b"demo")]
+        assert sessions.get("s") == b"v"
+        assert registry.generation() != generation
+        # The base never sees the writes of the overlay.
+        assert base.kv_get("durable", "registry", b"new") is None
+        assert base.kv_get("durable", "registry", b"kept") == b"base"
+        assert base.kv_generation("registry") == generation
+        # An aborted write stays out of the overlay too.
+        registry.set("aborted", b"x")
+        manager.abort()
+        assert registry.get("aborted") is None
+        time.sleep(0.3)
+        assert sessions.get("s") is None
+        # A DemoStorage on the DemoStorage reads both overlays.
+        top = ZODB.DB(DemoStorage(base=demo, close_base_on_close=False))
+        try:
+            with top.transaction() as other:
+                upper = zoe.kv.Namespace(other, "durable", "registry")
+                assert upper.get("new") == b"demo"
+                upper.set("top", b"t")
+            with top.transaction() as other:
+                assert zoe.kv.Namespace(other, "durable", "registry").get("top") == b"t"
+            assert registry.get("top") is None
+        finally:
+            top.close()
+        # A bad write fails the commit, as on the store.
+        sessions.set("bad", b"v")
+        with pytest.raises(ValueError):
+            manager.commit()
+        manager.abort()
+        conn.close()
+    finally:
+        db.close()
+        base.close()
+
+
+def test_a_demo_storage_over_another_storage_has_no_namespaces():
+    from ZODB.DemoStorage import DemoStorage
+
+    db = ZODB.DB(DemoStorage())
+    conn = db.open()
+    try:
+        assert not zoe.kv.supported(conn)
+        with pytest.raises(Unsupported):
+            zoe.kv.Namespace(conn, "durable", "registry")
+    finally:
+        conn.close()
+        db.close()

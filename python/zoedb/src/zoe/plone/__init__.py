@@ -4,4 +4,9 @@ Plone loads `configure.zcml` of this package through the plone.autoinclude
 entry point of zoedb. `uidgenerator` gives `portal_uidgenerator` its ids
 from a sequence of the store. `report` marks the transaction of each
 request with its method, for the writes-on-GET report of `zoe serve`.
+
+Two backends are opt-in, each with its own ZCML file: `locking.zcml` keeps
+the locks of plone.locking in the ephemeral namespace of the store
+(`locking`), and `registry.zcml` keeps the records of plone.registry in its
+durable namespace (`registry`).
 """

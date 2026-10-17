@@ -1,0 +1,10 @@
+<configure xmlns="http://namespaces.zope.org/zope">
+
+  <!-- Opt in: the records of plone.registry live in the durable namespace
+       of the store. Include this file in the ZCML of the site. -->
+  <subscriber
+      for="zope.processlifetime.IProcessStarting"
+      handler=".registry.process_starting"
+      />
+
+</configure>
