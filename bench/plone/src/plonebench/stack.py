@@ -484,8 +484,12 @@ class Stack:
     # The server.
 
     def start_server(self, timeout: float = 120.0) -> None:
-        if port_open(self.settings.server_port):
-            raise RuntimeError(f"port {self.settings.server_port} is in use")
+        # Each port of the run is free first: another run can hold any of them.
+        ports = [self.settings.server_port, self.settings.admin_port]
+        ports += [self.settings.base_port + i for i in range(self.settings.instances)]
+        for port in ports:
+            if port_open(port):
+                raise RuntimeError(f"port {port} is in use")
         log = open(self.run / "log" / "server.out", "w")
         self.logs.append(log)
         taskset = pin(self.settings.server_cpus)
