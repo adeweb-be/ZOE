@@ -10,8 +10,10 @@
 //! then loads the record of the serial that the grant returns, so it never
 //! holds a stale state.
 //!
-//! The report gives the commits, the `ConflictError`s, the commits per
-//! second and, from `GET /metrics` of the admin port of the server, the
+//! A transaction tries at most `attempts` times, as Zope tries a request:
+//! after the last conflict it gives up. The report gives the commits, the
+//! `ConflictError`s, the transactions that gave up, the commits per second
+//! and, from `GET /metrics` of the admin port of the server, the
 //! syncs and the commits that they made durable, the lock hand-offs and the
 //! intent locks of the run.
 
@@ -24,7 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zoe_client::{Client, Error as ClientError, Options, Tokio};
 use zoe_core::{Oid, Tid};
 
-use crate::load::{Error, MAX_ATTEMPTS};
+use crate::load::Error;
 use crate::machine::{Machine, Run};
 
 /// The version of the report.
@@ -104,6 +106,8 @@ pub struct HotSettings {
     pub object: Object,
     /// True when the writers take early write-intent locks.
     pub early_locks: bool,
+    /// The most attempts of one transaction.
+    pub attempts: usize,
 }
 
 /// The numbers of a `hot` run.
@@ -113,6 +117,8 @@ pub struct Hot {
     pub commits: u64,
     /// The votes that failed with a conflict.
     pub conflicts: u64,
+    /// The transactions that met a conflict at each of their attempts.
+    pub gave_up: u64,
     /// The value of the object at the end. It equals `commits`.
     pub value: u32,
     /// The time from the start of the writers to the end of the last one.
@@ -200,13 +206,14 @@ pub async fn hot(
             })
         })
         .collect();
-    let (mut commits, mut conflicts) = (0, 0);
+    let (mut commits, mut conflicts, mut gave_up) = (0, 0, 0);
     let mut failure = None;
     for task in tasks {
         match task.await.expect("a writer task panicked") {
-            Ok((c, k)) => {
-                commits += c;
-                conflicts += k;
+            Ok(tally) => {
+                commits += tally.commits;
+                conflicts += tally.conflicts;
+                gave_up += tally.gave_up;
             }
             Err(error) => failure = failure.or(Some(error)),
         }
@@ -231,6 +238,7 @@ pub async fn hot(
     let result = Hot {
         commits,
         conflicts,
+        gave_up,
         value,
         elapsed_seconds: elapsed,
         commits_per_second: commits as f64 / elapsed,
@@ -251,15 +259,22 @@ pub async fn hot(
     })
 }
 
-/// Run the increments of one writer. Return its commits and its conflicts.
-async fn write(client: &Client, oid: Oid, settings: &HotSettings) -> Result<(u64, u64), Error> {
-    let (mut commits, mut conflicts) = (0, 0);
+/// What one writer did.
+#[derive(Debug, Default)]
+struct Tally {
+    commits: u64,
+    conflicts: u64,
+    gave_up: u64,
+}
+
+/// Run the increments of one writer.
+async fn write(client: &Client, oid: Oid, settings: &HotSettings) -> Result<Tally, Error> {
+    let mut tally = Tally::default();
     for _ in 0..settings.transactions {
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            if attempts > MAX_ATTEMPTS {
-                return Err(Error::TooManyRetries);
+        for attempt in 1.. {
+            if attempt > settings.attempts {
+                tally.gave_up += 1;
+                break;
             }
             let (data, serial) = if settings.early_locks {
                 let serial = client.lock_intent(&[oid]).await?[0];
@@ -274,15 +289,15 @@ async fn write(client: &Client, oid: Oid, settings: &HotSettings) -> Result<(u64
             match txn.vote().await {
                 Ok(()) => {
                     txn.finish().await?;
-                    commits += 1;
+                    tally.commits += 1;
                     break;
                 }
-                Err(ClientError::Conflict { .. }) => conflicts += 1,
+                Err(ClientError::Conflict { .. }) => tally.conflicts += 1,
                 Err(error) => return Err(error.into()),
             }
         }
     }
-    Ok((commits, conflicts))
+    Ok(tally)
 }
 
 /// Read the counters of the report from `GET /metrics` of `admin`.

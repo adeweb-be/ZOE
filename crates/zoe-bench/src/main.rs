@@ -71,6 +71,11 @@ struct HotArgs {
     /// Take the early write-intent lock of the object before each read.
     #[arg(long)]
     early_locks: bool,
+    /// The most attempts of one transaction. A transaction that meets a
+    /// conflict at each of them gives up, as a request of Zope does after
+    /// its retries.
+    #[arg(long, default_value = "4", value_name = "A", value_parser = positive)]
+    attempts: usize,
 }
 
 #[derive(Debug, Args)]
@@ -260,6 +265,7 @@ fn main() -> ExitCode {
                 transactions: args.transactions,
                 object: args.object,
                 early_locks: args.early_locks,
+                attempts: args.attempts,
             };
             run("hot", hot::hot(addr, admin, settings))
         }

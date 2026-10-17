@@ -48,9 +48,13 @@ fn number(report: &serde_json::Value, key: &str) -> f64 {
 
 #[test]
 fn writers_of_an_object_that_cannot_merge_conflict_without_early_locks() {
-    let report = hot("mapping", &["--object", "mapping"]);
-    assert_eq!(number(&report, "commits"), 80.0);
-    assert_eq!(number(&report, "value"), 80.0);
+    let report = hot("mapping", &["--object", "mapping", "--attempts", "100"]);
+    assert_eq!(
+        number(&report, "commits") + number(&report, "gave_up"),
+        80.0
+    );
+    // No update is lost: the object holds each commit.
+    assert_eq!(number(&report, "value"), number(&report, "commits"));
     assert!(number(&report, "conflicts") > 0.0, "{report}");
     assert_eq!(number(&report, "intent_locks"), 0.0);
 }
@@ -59,6 +63,7 @@ fn writers_of_an_object_that_cannot_merge_conflict_without_early_locks() {
 fn writers_of_an_object_that_cannot_merge_wait_with_early_locks() {
     let report = hot("mapping-early", &["--object", "mapping", "--early-locks"]);
     assert_eq!(number(&report, "commits"), 80.0);
+    assert_eq!(number(&report, "gave_up"), 0.0);
     assert_eq!(number(&report, "value"), 80.0);
     assert_eq!(number(&report, "conflicts"), 0.0, "{report}");
     assert_eq!(number(&report, "intent_locks"), 80.0);
