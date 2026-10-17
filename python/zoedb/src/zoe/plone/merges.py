@@ -148,7 +148,10 @@ def apply_overrides(derived, overrides):
 def derive(portal, overrides=None):
     """Return the merge policy of the Dexterity types of `portal`, with
     `overrides` applied."""
-    from plone.behavior.registration import lookup_behavior_registration
+    from plone.behavior.registration import (
+        BehaviorRegistrationNotFound,
+        lookup_behavior_registration,
+    )
     from plone.dexterity.interfaces import IDexterityFTI
     from plone.dexterity.utils import iterSchemataForType
     from Products.CMFCore.utils import getToolByName
@@ -172,9 +175,14 @@ def derive(portal, overrides=None):
         # the `DCFieldProperty` of plone.app.dexterity does.
         stored = {}
         for behavior in fti.behaviors:
-            registration = lookup_behavior_registration(
-                name=behavior, warn_about_fallback=False
-            )
+            try:
+                registration = lookup_behavior_registration(
+                    name=behavior, warn_about_fallback=False
+                )
+            except BehaviorRegistrationNotFound:
+                # Plone skips a behaviour that is not registered, and so
+                # does the derivation.
+                continue
             factory = getattr(registration, "factory", None)
             for field in getFieldNames(registration.interface):
                 other = getattr(getattr(factory, field, None), "_get_name", None)
