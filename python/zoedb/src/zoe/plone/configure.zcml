@@ -8,6 +8,13 @@
       handler=".uidgenerator.database_opened"
       />
 
+  <!-- The backends that ZOE_PLONE_BACKENDS names, at the start of Zope:
+       locking, registry. Each one is opt-in. -->
+  <subscriber
+      for="zope.processlifetime.IProcessStarting"
+      handler=".backends_from_environment"
+      />
+
   <!-- The writes-on-GET report: each transaction of a request carries the
        method of the request, and zoe serve counts the records of the
        transactions of GET and HEAD requests by class. -->

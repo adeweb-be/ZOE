@@ -20,7 +20,6 @@ tears it down after `STARTUP`. Only the `plone` extra and plone.testing
 make this module importable.
 """
 
-import os
 import shutil
 import tempfile
 
@@ -111,8 +110,9 @@ def install(zeo=None):
     as `host:port`, it is a ZEO client of the `zoe serve` at that address
     (`ZOE_SERVE`). Return the layer.
     """
-    for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
-        install_backend(name.strip())
+    from zoe.plone import backends_from_environment
+
+    backends_from_environment()
     if zeo is None:
         layer = ZOE_STORAGE
     else:
@@ -122,17 +122,3 @@ def install(zeo=None):
     if layer not in startup.__bases__:
         startup.__bases__ = (layer, *startup.__bases__)
     return layer
-
-
-def install_backend(name):
-    """Install the backend `name` of `zoe.plone`: `locking` or `registry`."""
-    if name == "locking":
-        from zoe.plone import locking
-
-        locking.install()
-    elif name == "registry":
-        from zoe.plone import registry
-
-        registry.install()
-    else:
-        raise ValueError(f"no backend {name!r}: use locking or registry")

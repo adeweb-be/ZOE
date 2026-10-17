@@ -48,6 +48,9 @@ class StackConfig:
     description: str
     # What differs from the baseline `zeo`.
     differs: tuple[str, ...] = ()
+    # The backends of zoe.plone that the instances install, for
+    # ZOE_PLONE_BACKENDS in zope.conf; empty for none.
+    backends: str = ""
 
 
 STACKS = {
@@ -78,6 +81,29 @@ STACKS = {
             "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
             "conflicts: the client resolves through the vote (tier 3)",
         ),
+    ),
+    "zoe-native-kv": StackConfig(
+        name="zoe-native-kv",
+        scenario="zoeclient",
+        server="zoe",
+        section="zoeclient",
+        native=True,
+        description=(
+            "zoe-native with the backends of zoe.plone: the locks of "
+            "plone.locking and the records of plone.registry in the KV "
+            "namespaces of the store (ADR 0043)"
+        ),
+        differs=(
+            "server: zoe serve (redb store, raw records unless --zoe-compression, "
+            "per-oid locks, group commit)",
+            "client: native Rust client (msgpack M5), extensions sequences, kv "
+            "and trace_context declared",
+            "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
+            "zoe.plone: the locks of edit forms and the registry live in the KV "
+            "namespaces of the store, so a lock writes no object",
+            "conflicts: the client resolves through the vote (tier 3)",
+        ),
+        backends="locking,registry",
     ),
     "zoe-asyncio": StackConfig(
         name="zoe-asyncio",
@@ -263,6 +289,7 @@ def storage_section(
 def zope_conf(config: StackConfig, settings: Settings, home: Path, name: str) -> str:
     """Return the zope.conf of an instance, or of a script client."""
     head = "%import zoe\n" if config.section == "zoeclient" else ""
+    backends = f"\n    ZOE_PLONE_BACKENDS {config.backends}" if config.backends else ""
     instancehome = PLONE / config.scenario / "parts" / "instance"
     return f"""{head}%define INSTANCEHOME {instancehome}
 instancehome $INSTANCEHOME
@@ -273,7 +300,7 @@ security-policy-implementation C
 verbose-security off
 default-zpublisher-encoding utf-8
 <environment>
-    CHAMELEON_CACHE {home / "var" / "cache"}
+    CHAMELEON_CACHE {home / "var" / "cache"}{backends}
 </environment>
 <zodb_db main>
     cache-size {settings.zodb_cache_objects}
