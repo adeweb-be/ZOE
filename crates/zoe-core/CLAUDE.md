@@ -183,7 +183,7 @@ Every test of this crate also runs under ThreadSanitizer with `just tsan`, once 
 - An abort, a failed vote and a drop drop the staged namespace writes. An acknowledged namespace write is as durable as the records of its commit.
 - A read of a namespace gives the last committed value, not the value at a snapshot. It verifies the checksum before it reads the expiry, so a flipped bit is `CorruptKv`, never an expired, absent or other value. An expired key reads as absent. `CorruptKv` names the flavour, the namespace and the length of the key, never the key.
 - A sweep step (`Store::sweep`) takes the keys of `kv_expiry` with an expiry at or before now, at most its limit, in key order, and removes them in one backend write with a sync. In the same write it removes the row of each key when the row passes its checksum and its own expiry is at or before now. So a refreshed row stays, a damaged index key never removes a live key, and a row that fails its checksum stays. The core starts no thread for it: the skins run the steps.
-- Pack never reads or changes `kv_ephemeral`, `kv_durable` or `kv_expiry`.
+- Pack never reads or changes `kv_ephemeral`, `kv_durable` or `kv_expiry`. After its last batch of records, a pack at T removes each transaction row at or before T whose oid count is 0, the row of a commit that wrote no record (ADR 0043), at most a batch of rows in one backend write under the commit sequencer. A row with an oid count of 0 and keys in the transaction index stops the pack with `CorruptTxn`, and stays.
 - `Store::verify_kv` checks every namespace row for `zoe verify`. A finding names the namespace and the xxh3-64 hash of the key, never the key.
 
 ## Known limits
