@@ -27,11 +27,17 @@ pub(crate) const TRACE_CONTEXT: &str = "trace_context";
 
 /// The extensions that the server serves. `sequences` adds
 /// `sequence_next(name)`, the next value of a sequence of the store (F29).
-/// `trace_context` adds the trace context of a call.
+/// `kv` adds the calls of the KV namespaces (F31, ADR 0043): three reads,
+/// and two writes in the transaction of the connection. `trace_context`
+/// adds the trace context of a call.
 pub(crate) const SERVED: &[Extension] = &[
     Extension {
         name: "sequences",
         methods: &["sequence_next"],
+    },
+    Extension {
+        name: "kv",
+        methods: &["kv_get", "kv_scan", "kv_generation", "kv_set", "kv_delete"],
     },
     Extension {
         name: TRACE_CONTEXT,
@@ -142,6 +148,15 @@ mod tests {
         assert!(refused("first_call", Some(&["second"]), TEST_SERVED).is_some());
         assert!(refused("first_call", Some(&["first"]), TEST_SERVED).is_none());
         assert!(refused("second_other_call", Some(&["second"]), TEST_SERVED).is_none());
+    }
+
+    #[test]
+    fn the_calls_of_the_namespaces_need_the_declaration_of_kv() {
+        for method in ["kv_get", "kv_scan", "kv_generation", "kv_set", "kv_delete"] {
+            assert!(refused(method, None, SERVED).is_some());
+            assert!(refused(method, Some(&["sequences"]), SERVED).is_some());
+            assert!(refused(method, Some(&["kv"]), SERVED).is_none());
+        }
     }
 
     #[test]

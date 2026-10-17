@@ -625,6 +625,11 @@ impl Server {
         let storages = Storages::new(storages, options.queues.client)
             .with_pool(Pool::new(options.pool_threads()));
         let storages = Arc::new(storages);
+        // The expired keys of the ephemeral namespaces go once a minute.
+        runtime.spawn(protocol::sweep::run(
+            protocol::sweep::stores(&storages),
+            stopping.clone(),
+        ));
         let tasks = Arc::new(Tasks::default());
         // The accept loop counts as a task from now on, so a stop waits for
         // it.

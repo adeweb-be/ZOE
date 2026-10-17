@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use rmpv::Value;
 use tokio::sync::watch;
-use zoe_core::{Oid, Tid};
+use zoe_core::{Flavour, Oid, Tid};
 
 use crate::Error;
 use crate::cache::Cache;
@@ -837,6 +837,37 @@ impl Pool {
         self.shared.listener()?.sequence_next(name).await
     }
 
+    /// Return the value of a key of a namespace, as `Client::kv_get` does,
+    /// on the listener.
+    pub async fn kv_get(
+        &self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.shared.listener()?.kv_get(flavour, name, key).await
+    }
+
+    /// Return the pairs of a namespace, as `Client::kv_scan` does, on the
+    /// listener.
+    pub async fn kv_scan(
+        &self,
+        flavour: Flavour,
+        name: &str,
+        start: Option<&[u8]>,
+        stop: Option<&[u8]>,
+        limit: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        let listener = self.shared.listener()?;
+        listener.kv_scan(flavour, name, start, stop, limit).await
+    }
+
+    /// Return the generation of a durable namespace, as
+    /// `Client::kv_generation` does, on the listener.
+    pub async fn kv_generation(&self, name: &str) -> Result<Tid, Error> {
+        self.shared.listener()?.kv_generation(name).await
+    }
+
     /// Begin a transaction on a free connection, as `Client::begin_with`
     /// does. Open a connection when none is free and the pool has less than
     /// its bound. Else wait for a free one. After the close, or while the
@@ -1133,6 +1164,29 @@ impl PoolTransaction {
         self.txn().restore(oid, serial, data, prev_txn).await?;
         self.forget(oid);
         Ok(())
+    }
+
+    /// Stage a write of a namespace, as `Transaction::kv_set` does.
+    pub async fn kv_set(
+        &mut self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<f64>,
+    ) -> Result<(), Error> {
+        self.txn().kv_set(flavour, name, key, value, ttl).await
+    }
+
+    /// Stage a delete of a key of a namespace, as `Transaction::kv_delete`
+    /// does.
+    pub async fn kv_delete(
+        &mut self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+    ) -> Result<(), Error> {
+        self.txn().kv_delete(flavour, name, key).await
     }
 
     /// Undo the transaction `trans_id`, as `Transaction::undo` does. The

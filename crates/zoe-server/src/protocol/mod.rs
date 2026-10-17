@@ -33,6 +33,7 @@ mod pipeline;
 mod send_queue;
 mod session;
 mod status;
+pub(crate) mod sweep;
 
 /// The entry of the fuzz targets.
 #[cfg(any(test, feature = "fuzz"))]
