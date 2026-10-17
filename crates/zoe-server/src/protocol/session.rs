@@ -801,10 +801,14 @@ impl Session {
         let name = str_of(name)?;
         let start = optional_bin(start, "start")?;
         let stop = optional_bin(stop, "stop")?;
-        let limit = limit
-            .as_u64()
-            .ok_or_else(|| Fault::type_error("the limit of a scan is not an int of 0 or more"))?;
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        // A negative limit is a value error, as in `zoe.Storage`.
+        let limit = match limit {
+            Value::Integer(n) => match n.as_u64() {
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                None => return Err(Fault::value_error("the limit of a scan is less than 1")),
+            },
+            _ => return Err(Fault::type_error("the limit of a scan is not an int")),
+        };
         let pairs = self.store.kv_scan(flavour, name, start, stop, limit)?;
         Ok(Value::Array(
             pairs
@@ -3553,6 +3557,17 @@ mod tests {
                     Value::Nil,
                     Value::Nil,
                     Value::from(-1),
+                ],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_scan",
+                vec![
+                    Value::from("durable"),
+                    Value::from("r"),
+                    Value::Nil,
+                    Value::Nil,
+                    Value::from("1"),
                 ],
                 "builtins.TypeError",
             ),

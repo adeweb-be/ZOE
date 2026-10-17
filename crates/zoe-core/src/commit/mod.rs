@@ -424,16 +424,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Check a value of `size` bytes for the row `row` of `flavour` against
     /// `max-record-size` and `max-transaction-size`, as `check_size` does
-    /// for a pickle. A value that replaces a staged value of the same row
-    /// counts once. Return the new value of `stored_bytes`.
+    /// for a pickle. The key of the row counts toward the transaction size
+    /// with the value, and a write that replaces a staged write of the same
+    /// row counts once. Return the new value of `stored_bytes`.
     fn check_kv_size(&self, flavour: Flavour, row: &[u8], size: usize) -> Result<u64> {
         let guardrails = &self.store.guardrails;
-        let size = size as u64;
-        guardrails.check_kv(SizeLimit::Record, size)?;
+        guardrails.check_kv(SizeLimit::Record, size as u64)?;
+        let size = (row.len() + size) as u64;
         let staged = self
             .staged
             .kv_record(flavour, row)
-            .map_or(0, |staged| staged.value_len() as u64);
+            .map_or(0, |staged| (row.len() + staged.value_len()) as u64);
         let stored_bytes = self
             .stored_bytes
             .saturating_sub(staged)

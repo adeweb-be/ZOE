@@ -393,6 +393,32 @@ fn a_scan_gives_at_most_1000_pairs() {
 }
 
 #[test]
+fn a_scan_stops_after_the_pair_that_reaches_its_bytes() {
+    let (store, _, _) = open();
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    let value = vec![7; 300 * 1024];
+    for key in [&b"a"[..], b"b", b"c", b"d", b"e"] {
+        txn.kv_set(Flavour::Durable, "big", key, &value, None)
+            .unwrap();
+    }
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    // Four values of 300 KiB pass 1 MiB: the scan gives four, then one.
+    let first = store
+        .kv_scan(Flavour::Durable, "big", None, None, 1000)
+        .unwrap();
+    assert_eq!(first.len(), 4);
+    let mut after = first.last().unwrap().0.clone();
+    after.push(0);
+    let rest = store
+        .kv_scan(Flavour::Durable, "big", Some(&after), None, 1000)
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].0, b"e");
+    assert_eq!(zoe_core::SCAN_BYTES, 1 << 20);
+}
+
+#[test]
 fn a_durable_scan_leaves_out_the_generation_row() {
     let (store, _, _) = open();
     set_registry(&store, b"a", b"1");
@@ -576,7 +602,9 @@ fn bad_arguments_are_refused_and_stage_nothing() {
 fn a_value_counts_toward_the_size_limits() {
     let options = Options {
         max_record_size: Some(10),
-        max_transaction_size: Some(16),
+        // A row key is 1 + 8 + 1 bytes here, and it counts toward the size of
+        // the transaction with the value.
+        max_transaction_size: Some(36),
         ..Options::default()
     };
     let (store, _, _) = open_with(options);
@@ -599,8 +627,8 @@ fn a_value_counts_toward_the_size_limits() {
         matches!(
             refused,
             Err(ZoeError::KvTooLarge {
-                size: 17,
-                max: 16,
+                size: 37,
+                max: 36,
                 ..
             })
         ),
@@ -746,10 +774,16 @@ fn verify_counts_the_keys_and_finds_damaged_rows() {
         Some("other".to_owned()),
         "the namespace has keys and no generation row".to_owned()
     )));
-    // A finding names no key.
+    // A finding names no key, only the hash of the key.
     for finding in &check.findings {
         assert!(!finding.problem.contains("title"));
     }
+    let damaged = check
+        .findings
+        .iter()
+        .find(|f| f.problem == "the frame fails its checksum")
+        .unwrap();
+    assert_eq!(damaged.key_hash, Some(xxhash_rust::xxh3::xxh3_64(b"title")));
     assert!(
         testing::read_kv_frame(&store, Flavour::Durable, &orphan).is_ok(),
         "the orphan row stays"

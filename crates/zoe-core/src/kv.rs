@@ -30,6 +30,11 @@ use crate::types::Tid;
 /// The most pairs that one scan gives.
 pub const SCAN_LIMIT: usize = 1000;
 
+/// The bytes of keys and values after which a scan stops: the pair that
+/// reaches it is the last one. So a reply holds about this many bytes, and
+/// at least one pair.
+pub const SCAN_BYTES: usize = 1 << 20;
+
 /// The most keys of the index of the expiries that one sweep step takes.
 pub const SWEEP_LIMIT: usize = 1000;
 
@@ -268,8 +273,11 @@ impl Store {
     /// Return the keys and the values of the namespace `name` of
     /// `flavour`, in byte order of the keys, from `start` (included) to
     /// `stop` (excluded). `None` is an open end. The scan gives at most
-    /// `limit` pairs, and at most `SCAN_LIMIT`. It skips expired keys and
-    /// the generation row of a durable namespace.
+    /// `limit` pairs, and at most `SCAN_LIMIT`, and stops after the pair
+    /// that brings its keys and values to `SCAN_BYTES`. So a reply with
+    /// fewer pairs than the limit is not the end of the namespace: a caller
+    /// scans again from after its last key until a reply is empty. The scan
+    /// skips expired keys and the generation row of a durable namespace.
     ///
     /// A `limit` of 0 raises `InvalidKv`.
     pub fn kv_scan(
@@ -301,7 +309,9 @@ impl Store {
             None => namespace_end(name),
         };
         let mut pairs = Vec::new();
-        while pairs.len() < limit {
+        // The bytes of the keys and the values of `pairs`.
+        let mut size = 0;
+        'scan: while pairs.len() < limit {
             let rows = self
                 .backend
                 .kv_rows(flavour, slice(&from), slice(&end), SCAN_CHUNK)?;
@@ -316,9 +326,10 @@ impl Store {
                     continue;
                 }
                 let key = row[1 + name.len()..].to_vec();
+                size += key.len() + decoded.value.len();
                 pairs.push((key, decoded.value));
-                if pairs.len() == limit {
-                    break;
+                if pairs.len() == limit || size >= SCAN_BYTES {
+                    break 'scan;
                 }
             }
             if !full {
@@ -487,7 +498,12 @@ impl Store {
                     let finding = |namespace: Option<&str>, problem: &str| KvFinding {
                         flavour,
                         namespace: namespace.map(str::to_owned),
-                        key_hash: Some(xxh3_64(&row)),
+                        // The hash of the key, as a dump check names it; the
+                        // whole row when the row gives no key.
+                        key_hash: Some(
+                            format::split_kv_key(&row)
+                                .map_or_else(|| xxh3_64(&row), |(_, key)| xxh3_64(key)),
+                        ),
                         problem: problem.to_owned(),
                     };
                     let Some((name, key)) = format::split_kv_key(&row) else {

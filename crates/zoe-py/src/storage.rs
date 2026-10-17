@@ -267,10 +267,14 @@ impl Shared {
 
 /// The thread that runs the sweep steps of the ephemeral namespaces of a
 /// store, once a minute. It holds a weak reference to the store, so it
-/// never keeps the store open, and it runs no Python. The drop stops it.
+/// never keeps the store open between two steps, and it runs no Python.
+/// `stop` stops it and waits for its end, so a step that runs ends before
+/// the store closes. The drop only tells it to stop.
 struct Sweeper {
     /// True when the thread stops, and the signal that wakes it.
     stop: Arc<(Mutex<bool>, Condvar)>,
+    /// The thread, until `stop` waits for it.
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Sweeper {
@@ -280,19 +284,36 @@ impl Sweeper {
         let weak = Arc::downgrade(&store.0);
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&stop);
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("zoe-sweep".to_owned())
             .spawn(move || sweep(&weak, &signal))
             .ok()?;
-        Some(Self { stop })
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Tell the thread to stop.
+    fn signal(&self) {
+        let (stopped, changed) = &*self.stop;
+        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        changed.notify_all();
+    }
+
+    /// Stop the thread and wait for its end. Call it without the GIL: the
+    /// thread runs no Python, and a step that runs ends first.
+    fn stop(mut self) {
+        self.signal();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
 impl Drop for Sweeper {
     fn drop(&mut self) {
-        let (stopped, changed) = &*self.stop;
-        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        changed.notify_all();
+        self.signal();
     }
 }
 
@@ -419,14 +440,13 @@ impl Storage {
         py.detach(move || drop(store));
     }
 
-    /// Stop the thread of the sweep steps.
-    fn stop_sweeper(&self) {
-        let sweeper = self
-            .sweeper
+    /// Take the thread of the sweep steps out of the storage. The caller
+    /// stops it without the GIL.
+    fn take_sweeper(&self) -> Option<Sweeper> {
+        self.sweeper
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        drop(sweeper);
+            .take()
     }
 
     /// Stage a namespace write in `transaction` with `stage`, as `store`
@@ -1338,7 +1358,7 @@ impl Storage {
     /// The storage refuses every later call. A call that runs when `close`
     /// starts keeps the store open until it returns.
     fn close(&self, py: Python<'_>) {
-        self.stop_sweeper();
+        let sweeper = self.take_sweeper();
         let entries: Vec<Arc<Entry>> = {
             let mut table = self.table();
             table.closed = true;
@@ -1346,6 +1366,11 @@ impl Storage {
         };
         let store = self.shared.take_store();
         let entries = py.detach(move || {
+            // A sweep step that runs holds the store: it ends first, so the
+            // store closes before `close` returns.
+            if let Some(sweeper) = sweeper {
+                sweeper.stop();
+            }
             abort_all(&entries);
             drop(store);
             entries
@@ -1361,11 +1386,16 @@ impl Drop for Storage {
     /// was not closed. This also holds during the shutdown of the
     /// interpreter, on the thread that finalizes it.
     fn drop(&mut self) {
-        self.stop_sweeper();
+        let sweeper = self.take_sweeper();
         let store = self.shared.take_store();
         let entries: Vec<Arc<Entry>> = self.shared.table().drain();
         let txns: Vec<SharedTxn> = entries.iter().filter_map(|entry| entry.take()).collect();
-        let close = move || drop((txns, store));
+        let close = move || {
+            if let Some(sweeper) = sweeper {
+                sweeper.stop();
+            }
+            drop((txns, store));
+        };
         Python::try_attach(|py| py.detach(close));
         // The entries hold Python references. They drop here, so that the
         // watcher of the signals, which can hold the last share of

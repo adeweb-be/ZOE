@@ -16,9 +16,10 @@
 //! pickle for it. A later stage of the oid drops the payload with the
 //! record. The payload is not counted in `staging-memory`.
 //!
-//! The writes of the KV namespaces stage in the same buffer: their values
-//! count in `staging-memory`, and a value that does not fit goes to the
-//! spill file. A later write of the same key replaces the earlier one.
+//! The writes of the KV namespaces stage in the same buffer: the key of
+//! the row and the value count in `staging-memory`, and a value that does
+//! not fit goes to the spill file; the key stays in memory. A later write
+//! of the same key replaces the earlier one.
 //!
 //! A spill file is never part of the durable store. Nothing syncs it or
 //! `staging/`: the transaction reads the file in the same process, and a
@@ -296,9 +297,9 @@ impl Staging {
 
     /// Stage a write of the row `row` of `flavour`: `value`, or a delete for
     /// `None`, with the TTL `ttl_ms`. It replaces an earlier write of the
-    /// row. The value stays in memory if it fits in the limit of `area`,
-    /// else it goes to the spill file. If the call fails, the earlier
-    /// write stays.
+    /// row. The key of the row counts in memory. The value stays in memory
+    /// if it fits in the limit of `area` with the key, else it goes to the
+    /// spill file. If the call fails, the earlier write stays.
     pub(crate) fn put_kv(
         &mut self,
         area: &StagingArea,
@@ -312,10 +313,12 @@ impl Staging {
             Some(StagedKv {
                 value: Some(Pickle::Memory(bytes)),
                 ..
-            }) => bytes.len(),
-            _ => 0,
+            }) => key.1.len() + bytes.len(),
+            Some(_) => key.1.len(),
+            None => 0,
         };
-        let others = self.in_memory - replaced;
+        // The key of the row stays in memory whatever happens to the value.
+        let others = self.in_memory - replaced + key.1.len();
         let value = match value {
             None => {
                 self.in_memory = others;
@@ -539,27 +542,29 @@ mod tests {
 
     #[test]
     fn namespace_values_share_the_limit_and_the_spill_file() {
-        let (vfs, area) = area(8);
+        // A row key is 1 + 2 + 1 bytes here.
+        let row = |key: &[u8]| crate::format::kv_key(b"ns", key);
+        let (vfs, area) = area(12);
         let mut staging = Staging::default();
         staging.put(&area, Oid(1), Tid(1), b"aaaa", false).unwrap();
-        let row = |key: &[u8]| crate::format::kv_key(b"sessions", key);
         staging
             .put_kv(&area, Flavour::Ephemeral, row(b"a"), Some(b"vvvv"), 1000)
             .unwrap();
-        assert_eq!(staging.in_memory(), 8);
+        assert_eq!(staging.in_memory(), 12);
         assert!(!Vfs::exists(&vfs, STAGING_DIR).unwrap());
-        // The next value does not fit, so it goes to the spill file.
+        // The next value does not fit, so it goes to the spill file. Its key
+        // stays in memory.
         staging
             .put_kv(&area, Flavour::Durable, row(b"b"), Some(b"ww"), 0)
             .unwrap();
-        assert_eq!(staging.in_memory(), 8);
+        assert_eq!(staging.in_memory(), 16);
         assert_eq!(spill_files(&vfs), ["staging/0.spill"]);
         // A later write of a key replaces the earlier one, and a delete
-        // frees its memory.
+        // frees the memory of its value and keeps its key.
         staging
             .put_kv(&area, Flavour::Ephemeral, row(b"a"), None, 0)
             .unwrap();
-        assert_eq!(staging.in_memory(), 4);
+        assert_eq!(staging.in_memory(), 12);
         assert_eq!(staging.kv_len(), 2);
         let writes: Vec<_> = staging
             .kv_writes()

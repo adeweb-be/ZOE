@@ -37,8 +37,8 @@ pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
 pub use kv::{
-    DurableRow, Flavour, KvCheck, KvFinding, MAX_TTL_SECONDS, SCAN_LIMIT, SWEEP_INTERVAL,
-    SWEEP_LIMIT, Swept,
+    DurableRow, Flavour, KvCheck, KvFinding, MAX_TTL_SECONDS, SCAN_BYTES, SCAN_LIMIT,
+    SWEEP_INTERVAL, SWEEP_LIMIT, Swept,
 };
 pub use lock::LockCancel;
 pub use pack::{ClassTotals, PackReport};

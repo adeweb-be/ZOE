@@ -26,11 +26,13 @@
 //!    `pack_watermark`.
 //!
 //! 4. The empty rows: after the last batch of records, the pack removes
-//!    each transaction row at or before T whose oid count is 0, at most
-//!    `batch` rows in one backend write. These are the rows of the commits
-//!    that wrote no record, such as a commit of KV namespace writes only
-//!    (ADR 0043). A row with an oid count of 0 and keys in the transaction
-//!    index is `CorruptTxn`, and the pack stops before it removes it.
+//!    each transaction row before T whose oid count is 0, at most `batch`
+//!    rows in one backend write. These are the rows of the commits that
+//!    wrote no record, such as a commit of KV namespace writes only (ADR
+//!    0043). The row at T stays, so a pack at the last tid keeps the last
+//!    transaction, which a later backup and the clients name. A row with
+//!    an oid count of 0 and keys in the transaction index is `CorruptTxn`,
+//!    and the pack stops before it removes it.
 //!
 //! A finish during the pack writes records after T only, so the records
 //! that the mark reads do not change. Before each batch, under the commit
@@ -660,10 +662,10 @@ impl<'s> Pack<'s> {
         Ok(())
     }
 
-    /// Remove the transaction rows from `from` to T whose oid count is 0,
-    /// at most `batch` of them, in one backend write under the commit
-    /// sequencer. Return the tid from which the next call goes on, or
-    /// `None` when no such row is left.
+    /// Remove the transaction rows from `from` to the tid before T whose
+    /// oid count is 0, at most `batch` of them, in one backend write under
+    /// the commit sequencer. The row at T stays. Return the tid from which
+    /// the next call goes on, or `None` when no such row is left.
     ///
     /// Only this pack changes the rows at or before T, so a read outside
     /// the write gives the current rows. A row that does not read stops
@@ -672,9 +674,12 @@ impl<'s> Pack<'s> {
     /// damaged store.
     fn remove_empty_rows(&mut self, from: Tid, batch: usize) -> Result<Option<Tid>> {
         let backend = &self.store.backend;
+        let Some(before) = self.tid.0.checked_sub(1).map(Tid) else {
+            return Ok(None);
+        };
         let mut empty = Vec::new();
         let mut next = None;
-        for row in backend.iter_txns(from, self.tid) {
+        for row in backend.iter_txns(from, before) {
             let row = row?;
             if row.oid_count == 0 {
                 if !backend.indexed_tids(row.tid, row.tid, 1)?.is_empty() {
@@ -1046,6 +1051,29 @@ mod tests {
             Some(&b"v"[..])
         );
         assert_indexed(&store, "after the pack");
+    }
+
+    #[test]
+    fn a_pack_at_an_empty_last_commit_keeps_its_row() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(ROOT, record(&[]))]);
+        let mut empty = store.tpc_begin(b"", b"", b"").unwrap();
+        empty.vote().unwrap();
+        let earlier = empty.finish().unwrap();
+        let mut kv = store.tpc_begin(b"", b"", b"").unwrap();
+        kv.kv_set(crate::kv::Flavour::Durable, "registry", b"k", b"v", None)
+            .unwrap();
+        kv.vote().unwrap();
+        let last = kv.finish().unwrap();
+        store.pack(last).unwrap();
+        let rows: Vec<Tid> = store
+            .backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(|row| row.unwrap().tid)
+            .collect();
+        assert!(!rows.contains(&earlier), "{rows:?}");
+        assert_eq!(rows.last(), Some(&last));
+        assert_eq!(store.last_transaction(), last);
     }
 
     #[test]

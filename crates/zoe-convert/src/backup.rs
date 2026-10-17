@@ -1661,6 +1661,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A store in `dir` whose last commit writes a namespace only, then
+    /// packed at that commit, as `zoe pack --days 0` packs. The root holds a
+    /// real pickle, so the pack can read its references.
+    fn packed_with_an_empty_tail(dir: &Path) -> (Store, Tid) {
+        use zoe_core::Flavour::Durable;
+        let store = Store::open(dir).unwrap();
+        let root = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid::ZERO, root).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        let last = commit_kv(&store, &[(Durable, "registry", b"title", Some(b"site"))]);
+        store.pack(last).unwrap();
+        (store, last)
+    }
+
+    #[test]
+    fn a_backup_after_a_pack_at_an_empty_last_commit_continues() {
+        use zoe_core::Flavour::Durable;
+        let dir = test_dir("backup-pack-empty-tail");
+        let (source, dumps) = (dir.join("store"), dir.join("dumps"));
+        let store = Store::open(&source).unwrap();
+        let root = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid::ZERO, root).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        let last = commit_kv(&store, &[(Durable, "registry", b"a", Some(b"1"))]);
+        backup(&store, &dumps).unwrap();
+        // The pack at the last tid keeps the row of the last commit, which
+        // the dumps end at.
+        store.pack(last).unwrap();
+        commit_kv(&store, &[(Durable, "registry", b"b", Some(b"2"))]);
+        let next = backup(&store, &dumps).unwrap();
+        assert_eq!(next.after, last);
+        assert!(next.dump.is_some());
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_after_a_pack_at_an_empty_last_commit_has_the_same_last_tid() {
+        let dir = test_dir("restore-pack-empty-tail");
+        let (source, dumps, target) = (dir.join("store"), dir.join("dumps"), dir.join("target"));
+        let (store, last) = packed_with_an_empty_tail(&source);
+        backup(&store, &dumps).unwrap();
+        drop(store);
+        restore(&dumps, &target).unwrap();
+        let copy = Store::open(&target).unwrap();
+        assert_eq!(copy.last_transaction(), last);
+        assert_eq!(copy.kv_generation("registry").unwrap(), last);
+        let report = crate::verify(&copy, None);
+        assert_eq!(report.problems(), 0, "{report:?}");
+        drop(copy);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_check_of_a_backup_finds_a_durable_row_that_differs() {
         use zoe_core::Flavour::Durable;
