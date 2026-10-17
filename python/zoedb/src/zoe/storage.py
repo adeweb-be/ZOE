@@ -74,11 +74,11 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
     `structural_merges` is the mode of the structural merges (tier 1) of
     BTree buckets, sets and `Length`: `"on"` (`None` keeps it), `"shadow"`
     or `"off"`. `structural_merge_classes` maps a class, as `module.name`,
-    to its own mode. `posting_dicts` is the mode of the posting-dict rule of
-    ADR 0042, off by default. `resolution_log` is a file that gets one JSON
-    line for each result of the structural merges. A shadow mode without
-    `resolution_log` raises `ValueError`: nothing else would tell what it
-    found.
+    to its own mode. `posting_dicts` is the mode of the posting-dict rule and
+    the first-key rule of ADR 0042, off by default. `resolution_log` is a
+    file that gets one JSON line for each result of the structural merges. A
+    shadow mode without `resolution_log` raises `ValueError`: nothing else
+    would tell what it found.
 
     `storeBlob` takes a file of `temporaryDirectory()` by rename, never by
     copy, and copies a file from elsewhere. `loadBlob` returns the path of a

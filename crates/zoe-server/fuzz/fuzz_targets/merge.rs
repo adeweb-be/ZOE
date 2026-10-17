@@ -1,12 +1,12 @@
 //! Fuzz tier 1 of the conflict resolution: `zoe_core::merge::tier1`.
 //!
 //! An input is three records and a flag: a byte whose two low bits give
-//! the mode of the posting-dict rule (0 off, 1 on, else shadow), then the
+//! the mode of the rules of ADR 0042 (0 off, 1 on, else shadow), then the
 //! lengths of the old and of the committed record, each as 2
 //! bytes big-endian, then the old, the committed and the new record. A
 //! panic fails the run, and so does a merged record that does not decode,
 //! and an outcome in shadow mode that differs from the outcome with the
-//! rule off.
+//! rules off.
 
 #![no_main]
 

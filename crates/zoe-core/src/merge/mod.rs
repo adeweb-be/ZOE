@@ -113,7 +113,7 @@ pub struct StructuralMerges {
 }
 
 impl Default for StructuralMerges {
-    /// Tier 1 on for every class, and the posting-dict rule off.
+    /// Tier 1 on for every class, and the rules of ADR 0042 off.
     fn default() -> Self {
         StructuralMerges {
             mode: Mode::On,
@@ -250,7 +250,8 @@ pub fn tier1_class(record: &[u8]) -> Option<String> {
 /// Merges the conflict of a record of a class of tier 1: `old` is the
 /// record that the transaction read, `committed` the record that another
 /// transaction committed after it, `new` the record of the transaction.
-/// `posting_dicts` is the mode of the posting-dict rule.
+/// `posting_dicts` is the mode of the rules of ADR 0042: the posting-dict
+/// rule and the first-key rule.
 ///
 /// Returns `None` when the class of `new` is not a class of tier 1.
 pub fn tier1(old: &[u8], committed: &[u8], new: &[u8], posting_dicts: Mode) -> Option<Merge> {
