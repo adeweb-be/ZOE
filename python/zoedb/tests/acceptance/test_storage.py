@@ -523,10 +523,10 @@ def test_a_read_only_storage_refuses_tpc_begin(tmp_path):
             assert conn.root()["item"]["value"] == 1
 
 
-def test_undo_is_not_supported(tmp_path):
+def test_undo_is_supported(tmp_path):
     from ZODB.interfaces import IStorageUndoable
 
     with database(tmp_path / "store") as db:
-        assert db.storage.supportsUndo() is False
-        assert db.supportsUndo() is False
-        assert not IStorageUndoable.providedBy(db.storage)
+        assert db.storage.supportsUndo() is True
+        assert db.supportsUndo() is True
+        assert IStorageUndoable.providedBy(db.storage)

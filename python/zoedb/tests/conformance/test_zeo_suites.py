@@ -11,8 +11,8 @@ reason, or skips itself, as ZEO's suites do on some platforms. `OUT`
 holds the tests that drive ZEO's own server objects in the test process,
 run `runzeo` or a ZEO 4 server, read the logs of ZEO's server, or run a
 Python storage inside the server, which a server without Python cannot do.
-It also holds the tests that call undo under a name without "undo". ZOE's
-own acceptance tests cover the behaviour of most of them, as `OUT` says.
+It also holds the undo tests that zoe serve cannot pass. ZOE's own
+acceptance tests cover the behaviour of most of them, as `OUT` says.
 
 Before the card of this gate moves to Ready, the planner checks `OUT`
 against a run of the harness. The builder never changes it: a test that
@@ -54,9 +54,10 @@ OUT_MODULES = {
 
 # The undo tests that zoe serve cannot pass, and why.
 SERVER_PYTHON = (
-    "it undoes over a later change of a class that only the Python "
-    "_p_resolveConflict of the class merges; zoe serve runs no Python, so "
-    "such an undo fails with UndoError"
+    "it undoes a transaction whose object a later transaction changed again; "
+    "only the Python _p_resolveConflict of its test class PCounter can merge "
+    "that undo, and zoe serve runs no Python, so the undo fails with "
+    "UndoError; test_undo.py checks the undos that the merge tiers resolve"
 )
 DATA_TXN = (
     "it checks that the record of an undo names the tid of the record that it "
