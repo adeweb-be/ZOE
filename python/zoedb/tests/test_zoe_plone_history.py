@@ -130,7 +130,10 @@ def test_restore_gives_a_persistent_mapping_back():
     doc = Doc()
     doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
     assert history.restore(doc)
-    assert type(doc.workflow_history) is PersistentMapping
+    # The stock class: that of Zope's Persistence when it is there, as
+    # Products.CMFCore uses it.
+    assert type(doc.workflow_history) is history._stock()
+    assert isinstance(doc.workflow_history, PersistentMapping)
     assert dict(doc.workflow_history) == {"wf": (0,)}
     assert not history.restore(doc)
 
