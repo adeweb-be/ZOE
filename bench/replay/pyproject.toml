@@ -1,0 +1,61 @@
+# The log replay of the specification (B6): the transactions of a store that
+# a run of B5 kept, replayed against ZEO and against zoe serve, with the
+# conflicts that each stack raises and resolves. It is not a package that the
+# project ships, so it is not a member of the uv workspace in python/.
+#
+# The tests run in this environment, with plain classes of persistent and
+# BTrees. A replay of a Plone store runs in the interpreter of a Plone
+# instance, so that the resolver of ZODB has the classes of the site:
+# `just bench replay` puts src/ on its PYTHONPATH.
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "zoe-replay"
+version = "0.0.0"
+description = "Replays the transactions of a kept store against ZEO and zoe serve, and counts the conflicts."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ZODB>=6",
+    "ZEO>=6",
+    # zoe serve speaks only the msgpack protocol M5 of ZEO.
+    "msgpack>=1",
+    "jsonschema>=4",
+    # zoe.zeo.ClientStorage, the native client. uv builds its extension from
+    # python/zoedb with maturin.
+    "zoedb",
+    # Direct dependencies, so that the sources below select the forks.
+    "persistent",
+    "zodbpickle",
+    "BTrees",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+]
+
+[tool.uv.sources]
+# The source is editable, so the replay runs the Python code of the tree.
+zoedb = { path = "../../python/zoedb", editable = true }
+# The forks that the workspace in python/ uses.
+persistent = { git = "https://github.com/adeweb-be/persistent", rev = "57a8c54959112f49ef563267f0ed2cb96228c21a" }
+zodbpickle = { git = "https://github.com/adeweb-be/zodbpickle", rev = "84029ffb1d5e636b2fa20f44c65272832519263f" }
+BTrees = { git = "https://github.com/adeweb-be/BTrees", rev = "f7dfacc28befc038263390fa448df0b8e772f2f0" }
+
+[tool.uv.build-backend]
+module-name = "replay"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["replay"]

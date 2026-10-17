@@ -224,9 +224,13 @@ impl Merger<'_> {
         let [old, committed, new] = <[Bucket; 3]>::try_from(buckets)
             .ok()
             .expect("three buckets");
-        // A tree that holds its one bucket inline has no parent node to
-        // change. BTrees inlines only the bucket of a root, which has no
-        // next bucket.
+        // A root that holds its one bucket inline has no parent node to
+        // change. BTrees also writes a node inside a tree with its one
+        // bucket inline when that bucket has no oid when it pickles the
+        // node. The bucket of such a node has a next bucket, except in the
+        // node of the last bucket. A record cannot tell a root from that
+        // last node, so the rule takes only a delete by the committed
+        // transaction (ADR 0042).
         self.first_key = self.rules && tree && old.next.is_none();
         // The next buckets must be the same objects.
         for other in [committed.next, new.next] {
@@ -358,9 +362,12 @@ impl Merger<'_> {
         }
     }
 
-    /// Refuses the delete of the first item of a bucket: in a tree of many
-    /// buckets, it changes the parent node. The first-key rule lets it
-    /// through in the bucket that a tree holds inline.
+    /// Refuses the delete of the first item of a bucket by the committed
+    /// transaction: in a tree of many buckets, it can change the parent
+    /// node. The first-key rule lets it through in the bucket that a tree
+    /// holds inline, with no next bucket. The new transaction marked each
+    /// node on its path to the bucket as read-current, so a parent node
+    /// that the committed transaction changed fails the vote.
     fn delete_first_key(&self) -> Result<(), Outcome> {
         if !self.first_key {
             return Err(refuse(13));
@@ -418,7 +425,9 @@ impl Merger<'_> {
                 } else if set || self.values_equal(i1.value(), i2.value())? {
                     // A delete in the new bucket.
                     if i3.position == 1 {
-                        self.delete_first_key()?;
+                        // The new transaction can have moved the separator
+                        // of a parent node in its own write of that node.
+                        return Err(refuse(13));
                     }
                     self.changed(i1.key());
                     i1.next();

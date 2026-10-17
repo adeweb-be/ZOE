@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/replay.schema.json",
+  "title": "ZOE log replay result",
+  "description": "One run of the log replay, B6 of the specification: the timed transactions of a store that a run of B5 kept, replayed against ZEO 6 through ZEO.ClientStorage (zeo) and against zoe serve through the native client (zoe-native), in alternating runs, on one machine. Results are numbers about a synthetic site, never data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "software", "speeds", "runs"],
+  "$defs": {
+    "tid": { "description": "A tid as 16 hex digits.", "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "speed": { "description": "A multiple of the speed of the log.", "type": "number", "exclusiveMinimum": 0 },
+    "software": {
+      "description": "The software of the runs, read before the first run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty", "zoe", "zoe_version", "zoe_sha256", "zoe_serve_args", "zoedb", "zoe_package", "python", "machine"],
+      "properties": {
+        "commit": { "description": "The commit of the repository, or null outside a checkout.", "type": ["string", "null"] },
+        "dirty": { "description": "True when the tree of the repository held changes that the commit does not; null when git fails.", "type": ["boolean", "null"] },
+        "zoe": { "description": "The path of the zoe binary that zoe serve runs.", "type": "string" },
+        "zoe_sha256": { "description": "The sha256 of the zoe binary, or null when it does not read.", "type": ["string", "null"] },
+        "zoe_version": { "description": "The output of zoe --version, or null when it does not run.", "type": ["string", "null"] },
+        "zoe_serve_args": { "description": "The arguments that zoe serve gets after its own.", "type": "array", "items": { "type": "string" } },
+        "zoedb": { "description": "The version of the package zoedb that the replay imports, or null.", "type": ["string", "null"] },
+        "zoe_package": { "description": "The directory of the package zoe that the native client runs, or null.", "type": ["string", "null"] },
+        "zoe_extension_sha256": { "description": "The sha256 of the extension zoe._zoe that the interpreter loaded, or null.", "type": ["string", "null"] },
+        "python": { "description": "The version of Python of the replay.", "type": "string" },
+        "machine": { "description": "The system and the machine.", "type": "string" }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": { "const": 1 },
+    "started": { "description": "The start of the replay, in seconds since the epoch.", "type": "number" },
+    "software": { "$ref": "#/$defs/software" },
+    "software_after": { "description": "The software at the end of the runs, when it differs from the software before them: a build or a change of the tree during the runs.", "$ref": "#/$defs/software" },
+    "log": {
+      "description": "The log that the replay read.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store", "base", "timed", "starts"],
+      "properties": {
+        "store": { "description": "The path of the FileStorage of the log.", "type": "string" },
+        "base": { "description": "The transactions before the first timed one.", "type": "integer", "minimum": 0 },
+        "timed": { "description": "The timed transactions.", "type": "integer", "minimum": 0 },
+        "starts": {
+          "description": "How the starts of the transactions came from the probe records of the run.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["matched", "unmatched", "requests"],
+          "properties": {
+            "matched": { "description": "Transactions whose start is the start of a request that committed.", "type": "integer", "minimum": 0 },
+            "unmatched": { "description": "Transactions that no request explains. They start at their commit.", "type": "integer", "minimum": 0 },
+            "requests": { "description": "The requests of the probe records that committed.", "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "speeds": { "description": "The speeds of the runs.", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/speed" } },
+    "runs": {
+      "description": "One item per run, in the order of the runs: for each speed, for each repetition, one run of each stack.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stack", "speed", "repetition", "transactions", "order", "conflicts", "conflict_errors", "rebases", "read_load", "check", "counts", "seconds"],
+        "properties": {
+          "stack": { "enum": ["zeo", "zoe-native"] },
+          "speed": { "$ref": "#/$defs/speed" },
+          "repetition": { "type": "integer", "minimum": 1 },
+          "transactions": { "description": "The timed transactions that the run replayed.", "type": "integer", "minimum": 0 },
+          "order": { "description": "The tids of the log in the order in which the run ended their commits.", "type": "array", "items": { "$ref": "#/$defs/tid" } },
+          "conflicts": {
+            "description": "The oids in conflict at a vote, by class (module.name) and by what ended the conflict.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "propertyNames": { "enum": ["native", "python-client", "python-server", "refused"] },
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "conflict_errors": { "description": "The ConflictErrors that the commits raised: the ones that reach Zope.", "type": "integer", "minimum": 0 },
+          "rebases": {
+            "description": "How the transactions built the records that they stored, by class (module.name): own (the record of the log, because the transaction read the record before it), resolver (the resolver of the class applied the change), items (the items of the change went into the items that the transaction read) or record (the record of the log, because neither applied).",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "propertyNames": { "enum": ["own", "resolver", "items", "record"] },
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "read_load": {
+            "description": "The read load of the run, on a client of its own.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["loads", "error"],
+            "properties": {
+              "loads": { "description": "The loads that it made.", "type": "integer", "minimum": 0 },
+              "error": { "description": "The error that stopped it, or null.", "type": ["string", "null"] }
+            }
+          },
+          "check": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["acknowledged", "missing"],
+            "properties": {
+              "acknowledged": { "description": "The acknowledged transactions that the check got.", "type": "integer", "minimum": 0 },
+              "missing": { "description": "The tids of the acknowledged transactions of which a record does not load.", "type": "array", "items": { "$ref": "#/$defs/tid" } }
+            }
+          },
+          "counts": { "description": "True when the check found nothing missing and the run replayed at least one transaction. A run that does not count stays out of the gate.", "type": "boolean" },
+          "seconds": { "description": "From the first start of the schedule to the end of the last commit.", "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

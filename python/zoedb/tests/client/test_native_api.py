@@ -105,8 +105,8 @@ class AdminServer(ZoeServer):
                 stderr=stderr,
                 env=environ,
                 text=True,
-                # The kernel kills the server when this thread ends, as
-                # for ZoeServer.
+                # On Linux, the kernel kills the server when this thread
+                # ends, as for ZoeServer.
                 preexec_fn=zoe.testing._die_with_parent(),
             )
         finally:
