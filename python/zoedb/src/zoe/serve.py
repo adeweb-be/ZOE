@@ -64,7 +64,7 @@ KEYS = (
     "tls-read-only-client-ca",
     "structural-merges",
     "structural-merge-class",
-    "merge-posting-dicts",
+    "posting-dicts",
     "resolution-log",
 )
 
@@ -72,7 +72,7 @@ KEYS = (
 MULTIKEYS = ("structural-merge-class",)
 
 # The keys whose value is a boolean.
-BOOLEANS = ("read-only", "pack-gc", "shared-blob-dir", "merge-posting-dicts")
+BOOLEANS = ("read-only", "pack-gc", "shared-blob-dir")
 
 # The keys whose leading ~ is the home directory.
 PATHS = (

@@ -289,10 +289,11 @@ impl ResolutionLog {
     }
 
     /// Writes the lines of what tier 1 did in the vote of `txn`. A failed
-    /// write never fails the vote: the first one goes to stderr.
-    fn write(&self, txn: &SharedTxn) {
+    /// write never fails the vote. Returns the error of the first failed
+    /// write, for the log of the storage.
+    fn write(&self, txn: &SharedTxn) -> Option<String> {
         if txn.resolutions().is_empty() {
-            return;
+            return None;
         }
         let mut text = String::new();
         for line in txn.resolution_log_lines(SystemTime::now(), None) {
@@ -300,10 +301,9 @@ impl ResolutionLog {
             text.push('\n');
         }
         let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(error) = io::Write::write_all(&mut *file, text.as_bytes())
-            && !self.failed.swap(true, Ordering::Relaxed)
-        {
-            eprintln!("zoe: a write of the resolution log failed: {error}");
+        match io::Write::write_all(&mut *file, text.as_bytes()) {
+            Err(error) if !self.failed.swap(true, Ordering::Relaxed) => Some(error.to_string()),
+            _ => None,
         }
     }
 }
@@ -391,7 +391,7 @@ impl Storage {
     #[pyo3(signature = (
         path, *, read_only = false, lock_timeout = None, blob_dir = None, pack_gc = true,
         compression = None, structural_merges = None, structural_merge_classes = None,
-        merge_posting_dicts = false, resolution_log = None
+        posting_dicts = None, resolution_log = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -404,7 +404,7 @@ impl Storage {
         compression: Option<&str>,
         structural_merges: Option<&str>,
         structural_merge_classes: Option<HashMap<String, String>>,
-        merge_posting_dicts: bool,
+        posting_dicts: Option<&str>,
         resolution_log: Option<PathBuf>,
     ) -> PyResult<Self> {
         let mut options = Options::default();
@@ -418,7 +418,22 @@ impl Storage {
                 .map_err(|e| PyValueError::new_err(format!("structural_merge_classes: {e}")))?;
             options.structural_merges.classes.insert(class, mode);
         }
-        options.structural_merges.posting_dicts = merge_posting_dicts;
+        if let Some(text) = posting_dicts {
+            options.structural_merges.posting_dicts = text
+                .parse::<Mode>()
+                .map_err(|e| PyValueError::new_err(format!("posting_dicts: {e}")))?;
+        }
+        // In-process, the resolution log is the only place where shadow
+        // mode says what it found.
+        let merges = &options.structural_merges;
+        let shadow = merges.mode == Mode::Shadow
+            || merges.posting_dicts == Mode::Shadow
+            || merges.classes.values().any(|&mode| mode == Mode::Shadow);
+        if shadow && resolution_log.is_none() {
+            return Err(PyValueError::new_err(
+                "shadow mode needs resolution_log: without it, nothing tells what it found",
+            ));
+        }
         let resolution_log = match resolution_log {
             Some(path) => Some(Arc::new(
                 ResolutionLog::open(&path).map_err(|error| core(py, error.into()))?,
@@ -1073,6 +1088,7 @@ impl Storage {
     ) -> PyResult<Vec<ConflictRow<'py>>> {
         let entry = self.entry(py, transaction)?;
         let log = self.resolution_log.clone();
+        let mut log_failure = None;
         let conflicts = py
             .detach(|| {
                 let read = entry.with(|txn| {
@@ -1080,7 +1096,7 @@ impl Storage {
                     // The vote that takes the locks runs tier 1: log its
                     // results, also when the vote failed.
                     if let Some(log) = &log {
-                        log.write(txn);
+                        log_failure = log.write(txn);
                     }
                     let conflicts = voted.map_err(|error| vote_failure(txn, error))?;
                     // A staged pickle in the spill file of the transaction
@@ -1111,8 +1127,11 @@ impl Storage {
                     .data
                     .and_then(|data| untransformed(untransform, &data));
                 failure.into_py(py)
-            })?
-            .map_err(|error| unreadable_pickle(py, error))?;
+            });
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        let conflicts = conflicts?.map_err(|error| unreadable_pickle(py, error))?;
         Ok(conflicts
             .into_iter()
             .map(|(oid, committed, read, data)| {
@@ -1348,6 +1367,20 @@ type TxnRow<'py> = (
     Bound<'py, PyBytes>,
     Vec<RecordRow<'py>>,
 );
+
+/// Log a failed write of the resolution log as a warning of the logger
+/// `zoe.storage`. Later failures are not logged.
+fn warn_log_failure(py: Python<'_>, error: &str) {
+    let message =
+        format!("a write of the resolution log failed; later failures are not logged: {error}");
+    let logged = py
+        .import("logging")
+        .and_then(|logging| logging.call_method1("getLogger", ("zoe.storage",)))
+        .and_then(|logger| logger.call_method1("warning", (message,)));
+    if let Err(error) = logged {
+        error.write_unraisable(py, None);
+    }
+}
 
 /// Return the `StorageError` for a staged pickle that the core cannot read
 /// back from the spill file. The error of the core is its cause, so its

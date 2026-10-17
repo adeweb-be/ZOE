@@ -40,6 +40,36 @@ fn io_postings(items: &[(i128, &[(i128, i128)])]) -> Vec<u8> {
     record(&heap, class, state)
 }
 
+/// A value of an `IOBucket` of [`io_bucket`].
+#[derive(Clone, Copy)]
+enum Item {
+    None,
+    Int(i128),
+    Dict(&'static [(i128, i128)]),
+}
+
+/// Returns the record of an `IOBucket` of `items`.
+fn io_bucket(items: &[(i128, Item)]) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class("BTrees.IOBTree", "IOBucket");
+    let mut flat = Vec::new();
+    for &(key, item) in items {
+        flat.push(Value::Int(key));
+        flat.push(match item {
+            Item::None => Value::None,
+            Item::Int(value) => Value::Int(value),
+            Item::Dict(entries) => heap.new_dict(
+                entries
+                    .iter()
+                    .map(|&(k, v)| (Value::Int(k), Value::Int(v)))
+                    .collect(),
+            ),
+        });
+    }
+    let state = new_bucket_state(&mut heap, flat, None);
+    record(&heap, class, state)
+}
+
 /// Returns the record of a `BTrees.Length.Length` of `value`.
 fn length(value: i128) -> Vec<u8> {
     let mut heap = Heap::new();
@@ -211,7 +241,7 @@ fn the_posting_rule_merges_two_changes_of_one_dict() {
     let base: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1)]), (20, &[(1, 2)])];
     let committed: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (3, 4)]), (20, &[(1, 2)])];
     let new: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (4, 2)]), (20, &[(1, 2)])];
-    for rule in [false, true] {
+    for rule in [Mode::Off, Mode::On] {
         let store = open(StructuralMerges {
             posting_dicts: rule,
             ..StructuralMerges::default()
@@ -223,7 +253,7 @@ fn the_posting_rule_merges_two_changes_of_one_dict() {
         let [resolution] = txn.resolutions() else {
             panic!("{:?}", txn.resolutions());
         };
-        if !rule {
+        if rule == Mode::Off {
             // BTrees cannot compare two dicts: the client resolves.
             assert_eq!(conflicts.len(), 1);
             assert!(matches!(resolution.outcome, Resolved::Undecided(_)));
@@ -239,12 +269,128 @@ fn the_posting_rule_merges_two_changes_of_one_dict() {
 }
 
 #[test]
+fn the_posting_rule_in_shadow_mode_logs_its_merge_and_goes_on_without_it() {
+    let base: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1)]), (20, &[(1, 2)])];
+    let committed: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (3, 4)]), (20, &[(1, 2)])];
+    let new: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (4, 2)]), (20, &[(1, 2)])];
+    let store = open(StructuralMerges {
+        posting_dicts: Mode::Shadow,
+        ..StructuralMerges::default()
+    });
+    let (oid, read) = conflict(&store, &io_postings(base), &io_postings(committed));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &io_postings(new)).unwrap();
+    // Without the rule, BTrees cannot compare two dicts: the client
+    // resolves, as with the rule off.
+    assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(resolution.mode, Mode::On);
+    assert!(matches!(resolution.outcome, Resolved::Undecided(_)));
+    assert!(!resolution.applied);
+    assert_eq!(resolution.shadow, Some(Resolved::Merged));
+    // The line lists the keys of the merge of the rule.
+    assert_eq!(resolution.keys, ["10"]);
+    assert_eq!(resolution.changed, 1);
+    let time = std::time::UNIX_EPOCH;
+    let line = &txn.resolution_log_lines(time, None)[0];
+    assert!(
+        line.contains("\"shadow\":{\"outcome\":\"merged\",\"code\":null,\"reason\":null}"),
+        "{line}"
+    );
+    // A bucket of ints compares no dict, so the rule in shadow mode
+    // changes nothing there.
+    let (oid, read) = conflict(&store, &ii_bucket(&[(1, 1)]), &ii_bucket(&[(1, 1), (2, 2)]));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &ii_bucket(&[(1, 1), (3, 3)])).unwrap();
+    assert_eq!(txn.vote_resolving().unwrap(), []);
+    assert_eq!(txn.resolutions()[0].shadow, None);
+}
+
+#[test]
+fn shadow_mode_merges_what_the_rule_off_merges() {
+    // Buckets where a dict meets None or an int. BTrees and ZODB's
+    // resolver merge them.
+    let cases: [[&[(i128, Item)]; 4]; 2] = [
+        [
+            &[(1, Item::None), (2, Item::Int(5))],
+            &[(1, Item::Dict(&[(7, 1)])), (2, Item::Int(5))],
+            &[(1, Item::None), (2, Item::Int(6))],
+            &[(1, Item::Dict(&[(7, 1)])), (2, Item::Int(6))],
+        ],
+        [
+            &[(1, Item::Int(5)), (2, Item::Int(5))],
+            &[(1, Item::Int(5)), (2, Item::Int(6))],
+            &[(1, Item::Dict(&[(7, 1)])), (2, Item::Int(5))],
+            &[(1, Item::Dict(&[(7, 1)])), (2, Item::Int(6))],
+        ],
+    ];
+    for [base, committed, new, merged] in cases {
+        for rule in [Mode::Off, Mode::Shadow, Mode::On] {
+            let store = open(StructuralMerges {
+                posting_dicts: rule,
+                ..StructuralMerges::default()
+            });
+            let (oid, read) = conflict(&store, &io_bucket(base), &io_bucket(committed));
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, read, &io_bucket(new)).unwrap();
+            assert_eq!(txn.vote_resolving().unwrap(), [], "{rule:?}");
+            assert_eq!(txn.resolutions()[0].outcome, Resolved::Merged, "{rule:?}");
+            let tid = txn.finish().unwrap();
+            assert_eq!(
+                store.load(oid).unwrap(),
+                (io_bucket(merged), tid),
+                "{rule:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_next_buckets_of_one_oid_with_two_persistent_ids_give_no_answer() {
+    // `IIBucket`s whose next bucket is the oid 9, as ZODB's pickler writes
+    // them. The new record names the class of the next bucket by another
+    // module, so its persistent id differs.
+    let old = b"\x80\x03cBTrees.IIBTree\nIIBucket\nq\x00.\x80\x03K\x01K\x01\x86q\x01C\x08\
+        \x00\x00\x00\x00\x00\x00\x00\x09q\x02h\x00\x86q\x03Q\x86q\x04.";
+    let committed = b"\x80\x03cBTrees.IIBTree\nIIBucket\nq\x00.\x80\x03(K\x01K\x01K\x02K\x02tq\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x09q\x02h\x00\x86q\x03Q\x86q\x04.";
+    let alias = b"\x80\x03cBTrees.IIBTree\nIIBucket\nq\x00.\x80\x03(K\x01K\x01K\x03K\x03tq\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x09q\x02cBTrees._IIBTree\nIIBucket\nq\x03\x86q\x04\
+        Q\x86q\x05.";
+    let other = b"\x80\x03cBTrees.IIBTree\nIIBucket\nq\x00.\x80\x03(K\x01K\x01K\x03K\x03tq\x01\
+        C\x08\x00\x00\x00\x00\x00\x00\x00\x0aq\x02h\x00\x86q\x03Q\x86q\x04.";
+    let store = open(StructuralMerges::default());
+    let (oid, read) = conflict(&store, old, committed);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, alias).unwrap();
+    assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+    assert_eq!(
+        txn.resolutions()[0].outcome,
+        Resolved::Undecided("next buckets of one oid with two persistent ids")
+    );
+    // A next bucket of another oid is a bucket split, as in BTrees.
+    let (oid, read) = conflict(&store, old, committed);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, other).unwrap();
+    assert!(matches!(
+        txn.vote_resolving(),
+        Err(ZoeError::Conflict { .. })
+    ));
+    assert_eq!(
+        txn.resolutions()[0].outcome,
+        Resolved::Refused(Reason::BTrees(0))
+    );
+}
+
+#[test]
 fn the_posting_rule_refuses_a_dict_of_more_than_10_entries() {
     let nine: Vec<(i128, i128)> = (1..10).map(|doc| (doc, 1)).collect();
     let committed = [&nine[..], &[(20, 1)]].concat();
     let new = [&nine[..], &[(21, 1)]].concat();
     let store = open(StructuralMerges {
-        posting_dicts: true,
+        posting_dicts: Mode::On,
         ..StructuralMerges::default()
     });
     let (oid, read) = conflict(
@@ -285,7 +431,7 @@ fn a_line_of_the_resolution_log_names_both_transactions() {
     let expected = format!(
         "{{\"time\":1760000000.000001,\"storage\":\"main\",\"oid\":\"0x{:016x}\",\
          \"class\":\"BTrees.IIBTree.IIBucket\",\"tier\":1,\"mode\":\"on\",\
-         \"outcome\":\"merged\",\"code\":null,\"reason\":null,\"applied\":true,\
+         \"outcome\":\"merged\",\"code\":null,\"reason\":null,\"shadow\":null,\"applied\":true,\
          \"keys\":[\"3\"],\"changed\":1,\"committed\":\"0x{:016x}\",\"read\":\"0x{:016x}\",\
          \"user\":\"second\",\"description\":\"/doc/edit\",\"committed_user\":\"first\",\
          \"committed_description\":\"/doc/edit \\\"one\\\"\"}}",
@@ -304,4 +450,72 @@ fn modes_and_class_modes_parse() {
     );
     assert!(zoe_core::merge::class_mode("IOBucket=off").is_err());
     assert!(zoe_core::merge::class_mode("BTrees.IOBTree.IOBucket").is_err());
+}
+
+/// A small generator of the xorshift family, so that a failure repeats.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Changes one to four bytes of `record`, or cuts it.
+fn damaged(rng: &mut Rng, record: &[u8]) -> Vec<u8> {
+    let mut out = record.to_vec();
+    if rng.below(8) == 0 {
+        out.truncate(rng.below(out.len().max(1)));
+        return out;
+    }
+    for _ in 0..=rng.below(4) {
+        if !out.is_empty() {
+            let at = rng.below(out.len());
+            out[at] = rng.next() as u8;
+        }
+    }
+    out
+}
+
+#[test]
+fn damaged_records_never_panic_and_a_merge_always_decodes() {
+    let base: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1)]), (20, &[(1, 2)])];
+    let committed: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (3, 4)]), (20, &[(1, 2)])];
+    let new: &[(i128, &[(i128, i128)])] = &[(10, &[(1, 3), (2, 1), (4, 2)]), (20, &[(1, 2)])];
+    let triples = [
+        [
+            ii_bucket(&[(1, 1)]),
+            ii_bucket(&[(1, 1), (2, 2)]),
+            ii_bucket(&[(1, 1), (3, 3)]),
+        ],
+        [length(10), length(12), length(7)],
+        [io_postings(base), io_postings(committed), io_postings(new)],
+    ];
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut merged = 0;
+    for round in 0..20_000 {
+        let triple = &triples[round % triples.len()];
+        let mut records = triple.clone();
+        let which = rng.below(4);
+        if which < 3 {
+            records[which] = damaged(&mut rng, &triple[which]);
+        }
+        let posting = [Mode::Off, Mode::Shadow, Mode::On][rng.below(3)];
+        let Some(merge) = zoe_core::merge::tier1(&records[0], &records[1], &records[2], posting)
+        else {
+            continue;
+        };
+        if let zoe_core::merge::Outcome::Merged(record) = merge.outcome {
+            zoe_pickle::decode_record(&record).expect("a merged record decodes");
+            merged += 1;
+        }
+    }
+    assert!(merged > 1_000, "{merged}");
 }

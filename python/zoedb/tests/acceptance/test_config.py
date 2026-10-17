@@ -36,7 +36,7 @@ KEYS = {
     "compression",
     "structural-merges",
     "structural-merge-class",
-    "merge-posting-dicts",
+    "posting-dicts",
     "resolution-log",
 }
 # The ways to give a value to a key.

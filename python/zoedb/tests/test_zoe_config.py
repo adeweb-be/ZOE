@@ -283,7 +283,7 @@ def test_the_structural_merges_take_their_keys(tmp_path, monkeypatch):
         "structural-merges shadow",
         "structural-merge-class BTrees.IOBTree.IOBucket off",
         "structural-merge-class BTrees.Length.Length=on",
-        "merge-posting-dicts true",
+        "posting-dicts shadow",
         f"resolution-log {tmp_path / 'merges.log'}",
     )
     assert options["structural_merges"] == "shadow"
@@ -291,7 +291,7 @@ def test_the_structural_merges_take_their_keys(tmp_path, monkeypatch):
         "BTrees.IOBTree.IOBucket": "off",
         "BTrees.Length.Length": "on",
     }
-    assert options["merge_posting_dicts"] is True
+    assert options["posting_dicts"] == "shadow"
     assert options["resolution_log"] == str(tmp_path / "merges.log")
 
 
@@ -301,14 +301,14 @@ def test_the_structural_merges_take_their_twins(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "ZOE_STRUCTURAL_MERGE_CLASSES", "BTrees.IOBTree.IOBucket=on, A.B=shadow"
     )
-    monkeypatch.setenv("ZOE_MERGE_POSTING_DICTS", "true")
+    monkeypatch.setenv("ZOE_POSTING_DICTS", "ON")
     options = open_stanza(f"path {tmp_path}")
     assert options["structural_merges"] == "off"
     assert options["structural_merge_classes"] == {
         "BTrees.IOBTree.IOBucket": "on",
         "A.B": "shadow",
     }
-    assert options["merge_posting_dicts"] is True
+    assert options["posting_dicts"] == "on"
     # A key of the section wins over its twin.
     options = open_stanza(f"path {tmp_path}", "structural-merge-class C.D off")
     assert options["structural_merge_classes"] == {"C.D": "off"}
@@ -319,7 +319,7 @@ def test_the_structural_merges_take_their_twins(tmp_path, monkeypatch):
     options = open_stanza(f"path {tmp_path}")
     assert options["structural_merges"] is None
     assert options["structural_merge_classes"] is None
-    assert options["merge_posting_dicts"] is False
+    assert options["posting_dicts"] is None
     assert options["resolution_log"] is None
 
 
@@ -329,7 +329,7 @@ def test_the_structural_merges_take_their_twins(tmp_path, monkeypatch):
         "structural-merges maybe",
         "structural-merge-class IOBucket off",
         "structural-merge-class BTrees.IOBTree.IOBucket sometimes",
-        "merge-posting-dicts perhaps",
+        "posting-dicts perhaps",
     ],
 )
 def test_a_bad_merge_key_names_the_key(tmp_path, line):
@@ -342,7 +342,7 @@ def test_the_uri_takes_the_keys_of_the_structural_merges(tmp_path, monkeypatch):
     uri = (
         f"zoe://{tmp_path}?structural-merges=shadow"
         "&structural-merge-class=BTrees.IOBTree.IOBucket%3Doff"
-        "&structural-merge-class=A.B%20on&merge-posting-dicts=true"
+        "&structural-merge-class=A.B%20on&posting-dicts=on"
     )
     factory, rest = config.resolve_uri(uri)
     options = factory()
@@ -352,4 +352,4 @@ def test_the_uri_takes_the_keys_of_the_structural_merges(tmp_path, monkeypatch):
         "BTrees.IOBTree.IOBucket": "off",
         "A.B": "on",
     }
-    assert options["merge_posting_dicts"] is True
+    assert options["posting_dicts"] == "on"

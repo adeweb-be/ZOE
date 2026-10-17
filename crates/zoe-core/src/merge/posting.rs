@@ -16,7 +16,8 @@
 //! - a value that is not a dict on one side, such as the reference to the
 //!   tree of a posting that ZCTextIndex converted;
 //! - a merged dict of more than 10 entries, which ZCTextIndex would never
-//!   convert, or of no entry.
+//!   convert, or of no entry, and a dict of more than 10 entries on one
+//!   side, which ZCTextIndex never keeps.
 //!
 //! A posting dict maps int keys to int or float values. Another dict is
 //! not a posting dict, and the rule leaves it to BTrees.
@@ -108,12 +109,20 @@ pub(super) fn merge(
 /// Merges the entries of two posting dicts against the old one. The merged
 /// dict keeps the order of the committed dict, with the new entries of the
 /// new dict after them, as the new transaction would have changed the
-/// committed dict.
+/// committed dict. The work is linear in the entries.
 fn merge_entries(
     old: &[(Value, Value)],
     committed: &[(Value, Value)],
     new: &[(Value, Value)],
 ) -> Result<Vec<(i128, Value)>, Outcome> {
+    // ZCTextIndex never keeps a dict of more than 10 entries, and ZODB's
+    // resolver refuses every dict. So a larger dict is a refusal at once.
+    if [old, committed, new]
+        .iter()
+        .any(|dict| dict.len() > MAX_ENTRIES)
+    {
+        return Err(Outcome::Refused(Reason::PostingTooLarge));
+    }
     let map = |entries: &[(Value, Value)]| -> HashMap<i128, Value> {
         entries
             .iter()
@@ -125,6 +134,11 @@ fn merge_entries(
         .iter()
         .map(|&(key, value)| (key_of(key), value))
         .collect();
+    let places: HashMap<i128, usize> = merged
+        .iter()
+        .enumerate()
+        .map(|(place, &(key, _))| (key, place))
+        .collect();
     let changed = Outcome::Refused(Reason::PostingChanged);
     for &(key, value) in new {
         let key = key_of(key);
@@ -135,8 +149,7 @@ fn merge_entries(
                 }
                 match committed {
                     Some(&now) if score_equal(now, before)? => {
-                        let entry = merged.iter_mut().find(|(k, _)| *k == key);
-                        entry.expect("a committed entry").1 = value;
+                        merged[places[&key]].1 = value;
                     }
                     Some(&now) if score_equal(now, value)? => {}
                     _ => return Err(changed),
@@ -150,6 +163,7 @@ fn merge_entries(
             }
         }
     }
+    let mut deleted = std::collections::HashSet::new();
     for &(key, before) in old {
         let key = key_of(key);
         if new_map.contains_key(&key) {
@@ -160,9 +174,10 @@ fn merge_entries(
             if !score_equal(now, before)? {
                 return Err(changed);
             }
-            merged.retain(|&(k, _)| k != key);
+            deleted.insert(key);
         }
     }
+    merged.retain(|(key, _)| !deleted.contains(key));
     if merged.len() > MAX_ENTRIES {
         return Err(Outcome::Refused(Reason::PostingTooLarge));
     }

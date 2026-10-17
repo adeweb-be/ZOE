@@ -103,7 +103,7 @@ A versioned object in the store that says which classes merge field by field and
 _Avoid_: resolver config, merge rules
 
 **Shadow mode**:
-A mode where the conflict tiers compute a merge but the conflict is still raised, to show what merging would have done.
+A mode where a conflict tier computes its merge and writes it to the resolution log, and the conflict then goes on as without that tier, to show what merging would have done.
 _Avoid_: dry run (that word belongs to pack)
 
 **Invalidation**:

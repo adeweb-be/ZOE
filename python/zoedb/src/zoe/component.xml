@@ -77,7 +77,7 @@
         conflicts of BTree buckets, sets and Length in the vote, or refuses
         them as BTrees does; shadow writes their result to the resolution
         log and resolves the conflict in Python as before; off does not run
-        them.
+        them. A shadow mode needs resolution-log.
       </description>
     </key>
     <multikey name="structural-merge-class" datatype="string">
@@ -87,12 +87,14 @@
         class. The twin takes CLASS=MODE pairs separated by commas.
       </description>
     </multikey>
-    <key name="merge-posting-dicts" datatype="string">
+    <key name="posting-dicts" datatype="string">
       <description>
-        If true, the vote merges the posting dicts of ZCTextIndex entry by
-        entry in the buckets with integer keys, where ZODB's resolver
-        refuses them (the posting-dict rule of ADR 0042). The default is
-        false.
+        The mode of the posting-dict rule of ADR 0042: on merges the
+        posting dicts of ZCTextIndex entry by entry in the buckets with
+        integer keys, where ZODB's resolver refuses them; shadow writes the
+        merge of the rule to the resolution log, then ends the conflict as
+        off does; off, the default, does not run the rule. A shadow mode
+        needs resolution-log.
       </description>
     </key>
     <key name="resolution-log" datatype="string">
@@ -369,10 +371,10 @@
         class.
       </description>
     </multikey>
-    <key name="merge-posting-dicts" datatype="string">
+    <key name="posting-dicts" datatype="string">
       <description>
-        If true, the vote merges the posting dicts of ZCTextIndex (the
-        posting-dict rule of ADR 0042). The default is false.
+        The mode of the posting-dict rule of ADR 0042: on, shadow or off,
+        the default. A shadow mode needs resolution-log.
       </description>
     </key>
     <key name="resolution-log" datatype="string">

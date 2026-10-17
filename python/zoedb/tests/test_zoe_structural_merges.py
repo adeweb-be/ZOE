@@ -141,8 +141,195 @@ def test_a_refusal_raises_conflict_error_without_python(tmp_path, calls):
     )
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"structural_merges": "shadow"},
+        {"structural_merge_classes": {"BTrees.Length.Length": "shadow"}},
+        {"posting_dicts": "shadow"},
+    ],
+)
+def test_a_shadow_mode_without_a_resolution_log_raises_value_error(tmp_path, options):
+    with pytest.raises(ValueError, match="resolution_log"):
+        zoe.Storage(str(tmp_path / "store"), **options)
+    log = tmp_path / "merges.log"
+    zoe.Storage(str(tmp_path / "store"), resolution_log=str(log), **options).close()
+
+
 def test_a_bad_mode_raises_value_error(tmp_path):
     with pytest.raises(ValueError, match="structural_merges"):
         zoe.Storage(str(tmp_path / "one"), structural_merges="sometimes")
     with pytest.raises(ValueError, match="structural_merge_classes"):
         zoe.Storage(str(tmp_path / "two"), structural_merge_classes={"Length": "on"})
+
+
+# The shapes of production that the acceptance test of the merges does not
+# build: buckets of a tree of many buckets, whose state names the next
+# bucket, and buckets whose values are persistent references.
+
+
+def last_records(storage):
+    """Return the oids and the records of the last transaction of storage."""
+    records = []
+    for txn in storage.iterator():
+        records = sorted((record.oid, record.data) for record in txn)
+    return records
+
+
+def differential(tmp_path, name, make, first, second, **options):
+    """Run the same race on FileStorage and on zoe.Storage with `options`.
+    Return the outcome and the records of the last commit of each."""
+    from ZODB.FileStorage import FileStorage
+
+    results = []
+    for storage in (
+        FileStorage(str(tmp_path / f"{name}.fs")),
+        zoe.Storage(str(tmp_path / f"{name}-zoe"), **options),
+    ):
+        outcome, _ = race(storage, make, first, second)
+        # race closed the database, and so the storage: open it again.
+        if isinstance(storage, zoe.Storage):
+            storage = zoe.Storage(str(tmp_path / f"{name}-zoe"))
+        else:
+            storage = FileStorage(str(tmp_path / f"{name}.fs"), read_only=True)
+        try:
+            results.append((outcome, last_records(storage)))
+        finally:
+            storage.close()
+    return results
+
+
+def split_tree():
+    from BTrees.OOBTree import OOBTree
+
+    # An OOBucket holds 30 items: 200 keys make a tree of many buckets.
+    return OOBTree({f"k{i:03}": i for i in range(200)})
+
+
+def with_references():
+    from BTrees.OOBTree import OOBTree
+    from persistent.mapping import PersistentMapping
+
+    shared = PersistentMapping({"v": "s"})
+    return OOBTree({"a": PersistentMapping(), "b": shared, "c": shared, "d": 1})
+
+
+def keywords():
+    from BTrees.IOBTree import IOBucket
+
+    return IOBucket({1: ["x", "y"], 2: ["z"], 3: []})
+
+
+def mixed_sets():
+    from BTrees.IIBTree import IITreeSet
+    from BTrees.OOBTree import OOBTree
+
+    return OOBTree({"a": 1, "b": IITreeSet([1, 2]), "c": 3})
+
+
+def setting(key, value):
+    return lambda obj: obj.__setitem__(key, value)
+
+
+def making(key, factory):
+    return lambda obj: obj.__setitem__(key, factory())
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "first", "second", "merges"),
+    [
+        ("split-tree", split_tree, setting("k050", -1), setting("k051", -2), True),
+        (
+            "split-tree-same-key",
+            split_tree,
+            setting("k050", -1),
+            setting("k050", -2),
+            False,
+        ),
+        (
+            "references",
+            with_references,
+            making("e", lambda: __import__("persistent").mapping.PersistentMapping()),
+            setting("f", 2),
+            True,
+        ),
+        ("keywords", keywords, setting(4, ["a"]), setting(5, ["b", "c"]), True),
+        ("keywords-change", keywords, setting(1, ["x"]), setting(5, ["b"]), True),
+        (
+            "mixed-sets",
+            mixed_sets,
+            setting("d", 4),
+            making("e", lambda: __import__("BTrees").IIBTree.IITreeSet([7])),
+            True,
+        ),
+    ],
+)
+def test_merges_of_production_shapes_equal_the_merges_of_zodb(
+    tmp_path, calls, name, make, first, second, merges
+):
+    (theirs, their_records), (ours, our_records) = differential(
+        tmp_path, name, make, first, second
+    )
+    assert ours == theirs == ("merged" if merges else "conflict")
+    # The last commit of each store is the second change, or the first one
+    # when the second conflicts.
+    assert our_records == their_records
+    # FileStorage tried its conflict in Python once, and zoe.Storage never.
+    assert calls["calls"] == 1
+
+
+def postings():
+    from BTrees.IOBTree import IOBucket
+
+    return IOBucket({5: 1, 10: {1: 3}, 20: {1: 2}})
+
+
+def deleting(key):
+    return lambda obj: obj.__delitem__(key)
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "first", "second", "merges"),
+    [
+        # A dict meets None, then an int: BTrees compares them and merges.
+        (
+            "dict-and-none",
+            lambda: __import__("BTrees").IOBTree.IOBucket({1: None, 2: "a"}),
+            setting(1, {7: 1}),
+            setting(2, "b"),
+            True,
+        ),
+        (
+            "int-and-dict",
+            lambda: __import__("BTrees").IOBTree.IOBucket({1: 5, 2: "a"}),
+            setting(2, "b"),
+            setting(1, {7: 1}),
+            True,
+        ),
+        # Both sides change one posting: the rule would merge it.
+        (
+            "one-posting",
+            postings,
+            setting(10, {1: 3, 2: 1}),
+            setting(10, {1: 3, 3: 4}),
+            False,
+        ),
+        # A delete meets a dict that BTrees must compare.
+        ("delete-and-change", postings, setting(5, 2), deleting(10), False),
+    ],
+)
+def test_shadow_mode_of_the_posting_rule_ends_a_conflict_as_zodb_does(
+    tmp_path, name, make, first, second, merges
+):
+    log = tmp_path / f"{name}.log"
+    (theirs, their_records), (ours, our_records) = differential(
+        tmp_path,
+        name,
+        make,
+        first,
+        second,
+        posting_dicts="shadow",
+        resolution_log=str(log),
+    )
+    assert ours == theirs == ("merged" if merges else "conflict")
+    assert our_records == their_records

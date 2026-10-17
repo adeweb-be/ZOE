@@ -411,10 +411,12 @@ impl Heap {
     }
 
     /// Tells if `a == b`, as `PyObject_RichCompareBool(a, b, Py_EQ)`: an
-    /// object is equal to itself, and two tuples are equal item by item.
+    /// object is equal to itself, and two tuples or two lists are equal
+    /// item by item. Two lists of different lengths are not equal, without
+    /// a look at their items.
     pub fn eq(&self, a: Value, b: Value) -> Result<bool, Undecided> {
-        // Each frame is a pair of tuples and the index of their next pair
-        // of items.
+        // Each frame is a pair of tuples or of lists and the index of their
+        // next pair of items.
         let mut frames: Vec<(&[Value], &[Value], usize)> = Vec::new();
         let mut pair = (a, b);
         loop {
@@ -444,12 +446,12 @@ impl Heap {
         }
     }
 
-    /// Tells if `a < b`, as `PyObject_RichCompare(a, b, Py_LT)`. Two tuples
-    /// compare at their first pair of items that are not equal, or by
-    /// their length.
+    /// Tells if `a < b`, as `PyObject_RichCompare(a, b, Py_LT)`. Two tuples,
+    /// or two lists, compare at their first pair of items that are not
+    /// equal, or by their length.
     pub fn lt(&self, mut a: Value, mut b: Value) -> Result<bool, Undecided> {
         loop {
-            let (Some(x), Some(y)) = (self.tuple(a), self.tuple(b)) else {
+            let Some((x, y)) = self.sequences(a, b) else {
                 return self.lt_leaf(a, b);
             };
             let mut differ = None;
@@ -467,8 +469,19 @@ impl Heap {
         }
     }
 
-    /// Compares two values that are not two tuples for `==`, or gives the
-    /// items of two tuples.
+    /// Returns the items of `a` and `b` when both are tuples or both are
+    /// lists.
+    fn sequences(&self, a: Value, b: Value) -> Option<(&[Value], &[Value])> {
+        match (self.object(a)?, self.object(b)?) {
+            (Object::Tuple(x), Object::Tuple(y)) | (Object::List(x), Object::List(y)) => {
+                Some((x, y))
+            }
+            _ => None,
+        }
+    }
+
+    /// Compares two values for `==`, or gives the items of two tuples or of
+    /// two lists of one length.
     fn eq_leaf(&self, a: Value, b: Value) -> Result<Leaf<'_>, Undecided> {
         let answer = match (a, b) {
             (Value::Object(x), Value::Object(y)) if x == y => true,
@@ -495,9 +508,14 @@ impl Heap {
                 }
                 (Object::Str(x), Object::Str(y)) => x == y,
                 (Object::Bytes(x), Object::Bytes(y)) => x == y,
-                (Object::List(_), Object::List(_)) | (Object::Dict(_), Object::Dict(_)) => {
-                    return Err(Undecided::Unknown);
+                (Object::List(x), Object::List(y)) => {
+                    if x.len() != y.len() {
+                        false
+                    } else {
+                        return Ok(Leaf::Tuples(x, y));
+                    }
                 }
+                (Object::Dict(_), Object::Dict(_)) => return Err(Undecided::Unknown),
                 // Objects of two types, or two classes that are not the
                 // same object.
                 _ => false,
@@ -512,7 +530,7 @@ impl Heap {
         Ok(Leaf::Answer(answer))
     }
 
-    /// Compares two values that are not two tuples for `<`.
+    /// Compares two values that are not two tuples or two lists for `<`.
     fn lt_leaf(&self, a: Value, b: Value) -> Result<bool, Undecided> {
         match (a, b) {
             (Value::Bool(_) | Value::Int(_), Value::Bool(_) | Value::Int(_)) => {
@@ -546,6 +564,7 @@ impl Heap {
 /// The answer of [`Heap::eq_leaf`].
 enum Leaf<'a> {
     Answer(bool),
+    /// The items of two tuples, or of two lists of one length.
     Tuples(&'a [Value], &'a [Value]),
 }
 
@@ -1194,6 +1213,29 @@ mod tests {
         let mixed = heap.new_tuple(vec![Value::Int(1), a]);
         let other = heap.new_tuple(vec![Value::Int(2), Value::Int(3)]);
         assert_eq!(heap.compare(mixed, other), Ok(Ordering::Less));
+    }
+
+    #[test]
+    fn lists_compare_as_python_lists() {
+        let mut heap = Heap::new();
+        let list = |heap: &mut Heap, items: Vec<Value>| {
+            let id = heap.push(Object::List(items));
+            Value::Object(id)
+        };
+        let ab = list(&mut heap, vec![Value::Int(1), Value::Int(2)]);
+        let ac = list(&mut heap, vec![Value::Int(1), Value::Int(3)]);
+        let a = list(&mut heap, vec![Value::Int(1)]);
+        let tuple = heap.new_tuple(vec![Value::Int(1)]);
+        assert_eq!(heap.compare(ab, ac), Ok(Ordering::Less));
+        assert_eq!(heap.compare(a, ab), Ok(Ordering::Less));
+        let again = list(&mut heap, vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(heap.compare(ab, again), Ok(Ordering::Equal));
+        // A list and a tuple are never equal, and do not order.
+        assert_eq!(heap.eq(a, tuple), Ok(false));
+        assert_eq!(heap.compare(a, tuple), Err(Undecided::Unknown));
+        // Lists of different lengths are not equal, whatever their items.
+        let mixed = list(&mut heap, vec![Value::Int(1), Value::Float(1.0)]);
+        assert_eq!(heap.eq(a, mixed), Ok(false));
     }
 
     #[test]
