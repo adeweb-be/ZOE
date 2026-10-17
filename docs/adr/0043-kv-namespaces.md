@@ -4,7 +4,7 @@ Status: accepted. The human approved it on the pull request of ZOE-207 (#420), w
 
 ## Context
 
-F31 asks for KV namespaces. The ephemeral namespace has a TTL, no history and no pack, for sessions, CSRF keys and locks. The durable flavour is for `plone.app.registry`. ZOE-207 takes sessions, locks and the registry out of the object graph. Then their writes conflict with no content write, and an expired key goes without a pack. The data model has no key space for them, so the namespaces are a format change.
+F31 asks for KV namespaces. The ephemeral namespace has a TTL, no history and no pack, for sessions, CSRF keys and locks. The durable flavour is for `plone.app.registry`. ZOE-207 takes the locks of the edit forms out of the object graph; the registry (ZOE-217) and the sessions (ZOE-211) follow on cards of their own. Then their writes conflict with no content write, and an expired key goes without a pack. The data model has no key space for them, so the namespaces are a format change.
 
 What Plone 6.1.5 does today (paths in the eggs of `target/plone/eggs/cp313`):
 
@@ -111,7 +111,7 @@ Every durable write has a tid, so a backup with nothing new writes nothing and m
 
 ## Consequences
 
-- With the backends of `zoe.plone`, the GET of an edit form, or a session write, writes no object. It causes no `ConflictError` with a content write. plone.protect checks only the objects registered on the connections (`plone/protect/auto.py:215-237`), so it does not see a namespace write. The lock of an edit form needs no check: plone.locking marks it as a safe write. A backend whose writes need the check of plone.protect, as a registry does, must also mark an object as changed.
+- With the locking backend of `zoe.plone`, the GET of an edit form writes no object. It causes no `ConflictError` with a content write. plone.protect checks only the objects registered on the connections (`plone/protect/auto.py:215-237`), so it does not see a namespace write. The lock of an edit form needs no check: plone.locking marks it as a safe write. A backend whose writes need the check of plone.protect, as a registry does, must also mark an object as changed.
 - A namespace-only commit costs a tid, a transaction row and a share of a sync. A site that writes a session on each request syncs as often as it commits.
 - Two editors who open one edit form at the same moment can both take its lock, and the later write wins. With ZODB, one of them gets a `ConflictError` and a retry.
 - A copy through the ZODB iterator leaves the durable rows out. An application that keeps data in a durable namespace moves it back into the object graph before such a copy.

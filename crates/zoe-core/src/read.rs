@@ -1274,8 +1274,9 @@ mod tests {
     fn a_pack_between_two_slices_gives_no_error() {
         // The root at 100. Then, in turn, a transaction with no record and
         // a transaction of an object that nothing refers to. The pack
-        // removes each such object with its row, one in each batch, then
-        // each row with no record, one in each batch too. A row with no
+        // removes each such object with its row, but the row at T, one in
+        // each batch, then each row with no record before T, one in each
+        // batch too. A row with no
         // record has no index key, so an index read past it can name the
         // tid of a row that a later batch removes.
         let store = Store::open_vfs(MemVfs::new()).unwrap();

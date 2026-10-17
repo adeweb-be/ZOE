@@ -1621,7 +1621,8 @@ class _NativeClientStorage(ClientStorage):
         of a storage without namespaces for that time."""
         connected = self._native.is_connected()
         extensions = self._native.extensions()
-        # A list of the listener, or a listener before and after the read.
+        # Keep only an answer of a listener: a list that is not empty, or an
+        # empty list that the client read while it stayed connected.
         if extensions or (connected and self._native.is_connected()):
             self._kv_accepted = _KV in extensions
         return self._kv_accepted

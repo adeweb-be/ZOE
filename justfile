@@ -248,10 +248,10 @@ crash runs="200" seed="" seeds="200":
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
 # plone.testing. `just plone zoe backends` runs the suite of plone.locking
-# on the locking backend of zoe.plone, with the tests of zoe.plone. `just plone <scenario> creators THREADS ITEMS
-# SEED` creates a Plone site, sets the counter of portal_uidgenerator to
-# SEED, and runs plone/creators.py: THREADS threads that create ITEMS
-# Documents each. Its last line of stdout is a JSON report. It runs on zoe,
+# on the locking backend of zoe.plone, with the tests of zoe.plone.
+# `just plone <scenario> creators THREADS ITEMS SEED` creates a Plone site,
+# sets the counter of portal_uidgenerator to SEED, and runs
+# plone/creators.py: THREADS threads that create ITEMS Documents each. Its last line of stdout is a JSON report. It runs on zoe,
 # zeoclient and zoeclient; for zeoclient and zoeclient, it starts `zoe
 # serve` on a new store, target/plone/<scenario>/var/creators, and stops it
 # at the end.

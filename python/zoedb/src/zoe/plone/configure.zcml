@@ -11,8 +11,8 @@
       handler=".uidgenerator.database_opened"
       />
 
-  <!-- The backends that ZOE_PLONE_BACKENDS names: locking, registry. Each
-       one is opt-in. They install when the ZCML loads, so an instance, its
+  <!-- The backend that ZOE_PLONE_BACKENDS names: locking. It is
+       opt-in. They install when the ZCML loads, so an instance, its
        scripts and bin/instance run see the same backends. -->
   <include
       package="z3c.zcmlhook"
