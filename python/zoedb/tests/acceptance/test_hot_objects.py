@@ -16,8 +16,10 @@ Two mechanisms change that:
 The test checks:
 
 - 64 writers on one `Length` through `zoe serve`, with early locks on,
-  raise no `ConflictError`, the counter holds each increment, and the mean
-  of `zoe_fsync_batch_size` of `GET /metrics` over the run is above 1;
+  raise no `ConflictError`, and the counter holds each increment. The
+  simulator checks that their commits share the syncs
+  (`crates/zoe-server/tests/simulated_hot_length.rs`), with syncs slower
+  than a round trip of a client;
 - 64 writers on one object that cannot merge, a `PersistentMapping`, raise
   `ConflictError` with early locks off, the default, as today. With early
   locks on, they raise no `ConflictError`. In both cases the counter holds
@@ -35,10 +37,8 @@ client. `just test` runs it.
 import contextlib
 import os
 import subprocess
-import sys
 import threading
 import time
-import urllib.request
 
 import pytest
 
@@ -100,23 +100,17 @@ def through(server):
 
 
 class Server:
-    """A `zoe serve` process with an admin port, to read `/metrics`.
-
-    `zoe.testing.ZoeServer` keeps only the line `listening ADDRESS` of the
-    server. This class also keeps the line `admin ADDRESS` before it.
-    """
+    """A `zoe serve` process with the lock timeout of the test."""
 
     def __init__(self, path):
         self.path = path
         self.address = None
-        self.admin = None
         self._process = None
 
     def __enter__(self):
         command = [
             ZoeServer.binary(), "serve", "--path", str(self.path),
-            "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0",
-            "--lock-timeout", str(LOCK_TIMEOUT),
+            "--listen", "127.0.0.1:0", "--lock-timeout", str(LOCK_TIMEOUT),
         ]  # fmt: skip
         environ = {k: v for k, v in os.environ.items() if not k.startswith("ZOE_")}
         process = subprocess.Popen(
@@ -132,9 +126,7 @@ class Server:
         try:
             for line in process.stdout:
                 word, _, value = line.strip().partition(" ")
-                if word == "admin":
-                    self.admin = value
-                elif word == "listening":
+                if word == "listening":
                     host, port = value.rsplit(":", 1)
                     self.address = (host.strip("[]"), int(port))
                     self._process = process
@@ -151,21 +143,6 @@ class Server:
             process.kill()
             process.wait()
             process.stdout.close()
-
-    def batches(self):
-        """Return the sum and the count of `zoe_fsync_batch_size`."""
-        url = f"http://{self.admin}/metrics"
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as reply:
-            text = reply.read().decode()
-        found = {}
-        for part in ("sum", "count"):
-            prefix = f'zoe_fsync_batch_size_{part}{{storage="1"}} '
-            for line in text.splitlines():
-                if line.startswith(prefix):
-                    found[part] = float(line.split()[-1])
-            if part not in found:
-                raise AssertionError(f"/metrics has no {prefix.strip()}:\n{text}")
-        return found["sum"], found["count"]
 
 
 @contextlib.contextmanager
@@ -261,12 +238,10 @@ def increment_mapping(root):
     hot["n"] = hot["n"] + 1
 
 
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="fsync on macOS is faster than a client round trip, "
-    "so commits do not wait in batches",
-)
-def test_writers_on_a_hot_length_share_the_syncs(tmp_path):
+def test_writers_on_a_hot_length_raise_no_conflict_and_lose_nothing(tmp_path):
+    """The writers of a hot `Length` through `zoe serve` raise no
+    `ConflictError`, and the counter holds each increment. The simulator
+    checks that their commits share the syncs."""
     from BTrees.Length import Length
 
     with Server(tmp_path / "store") as server:
@@ -274,20 +249,13 @@ def test_writers_on_a_hot_length_share_the_syncs(tmp_path):
         try:
             with db.transaction() as conn:
                 conn.root()["length"] = Length(0)
-            before = server.batches()
             outcome = race(db, increment_length, LENGTH_ROUNDS)
-            after = server.batches()
             with db.transaction() as conn:
                 value = conn.root()["length"]()
         finally:
             db.close()
     assert outcome.conflicts == 0
     assert value == WRITERS * LENGTH_ROUNDS
-    commits = after[0] - before[0]
-    syncs = after[1] - before[1]
-    assert commits >= WRITERS * LENGTH_ROUNDS
-    assert syncs > 0
-    assert commits / syncs > 1, f"{commits} commits in {syncs} syncs"
 
 
 @pytest.mark.parametrize("mode", MODES)

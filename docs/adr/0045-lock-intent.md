@@ -116,7 +116,7 @@ The planner left four helpers to this ADR. With the decisions above:
 
 The root of the database is a `PersistentMapping` too, so the writers of that test also lock the root at its load. The test of the hot `Length` passes `early-locks on` with no hot class of its own: `Length` is a class of tier 1, and the lock hand-off serves it.
 
-- The human also approved a second change of `test_hot_objects.py`: the test of the hot `Length` runs on Linux only, with a reason. On macOS a sync is `fsync(2)` (ADR 0040), which is faster than one round trip of a client, so the commits of the hot oid never wait in one batch, with or without the hand-off. Linux CI gives its evidence; the simulator gives the evidence of the mechanism (`crates/zoe-server/tests/simulated_hot_length.rs`).
+- The human then replaced that change with a third one: the test of the hot `Length` checks 0 `ConflictError` and the exact counter on every platform, and the batch check leaves it for the simulator. The test is `test_writers_on_a_hot_length_raise_no_conflict_and_lose_nothing`. On macOS a sync is `fsync(2)` (ADR 0040), which is faster than one round trip of a client, so the commits of the hot oid never wait in one batch, with or without the hand-off. `writers_of_a_hot_length_share_the_syncs` of `crates/zoe-server/tests/simulated_hot_length.rs` asserts the batching, with syncs slower than a round trip: a mean above 2 commits for each sync.
 
 ### 11. What the build adds
 
