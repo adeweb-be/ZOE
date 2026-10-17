@@ -1017,13 +1017,16 @@ impl BlobStore {
 /// Tell if `error`, of a hard link, says that the filesystem cannot link
 /// the file: the two names are on two devices, the filesystem refuses or
 /// does not have links, or the file has the most links that it can have.
+/// FAT and exFAT on macOS give `ENOTSUP`, which Rust does not map to
+/// `Unsupported`, so the code of the system counts too. On Linux
+/// `ENOTSUP` is `EOPNOTSUPP`.
 fn cannot_link(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::CrossesDevices
             | io::ErrorKind::PermissionDenied
             | io::ErrorKind::Unsupported
-    ) || error.raw_os_error() == Some(libc::EMLINK)
+    ) || matches!(error.raw_os_error(), Some(code) if code == libc::EMLINK || code == libc::ENOTSUP)
 }
 
 /// Tell if `file`, a name in `blobs/tmp/`, has the form of a temporary file

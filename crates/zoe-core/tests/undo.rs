@@ -440,10 +440,10 @@ fn a_pack_between_the_undo_and_its_finish_fails_the_finish() {
     let t2 = commit(&store, root, t1, &mapping(None));
     let mut undo = store.tpc_begin(b"", b"undo", b"").unwrap();
     undo.undo(t2).unwrap();
-    // A pack at t2 removes x while the undo is open.
+    undo.vote().unwrap();
+    // A pack at t2 removes x after the vote.
     store.pack(t2).unwrap();
     assert!(store.load(x).is_err());
-    undo.vote().unwrap();
     assert!(matches!(
         undo.finish(),
         Err(ZoeError::Undo { oid: None, .. })
@@ -500,8 +500,9 @@ fn a_blob_undo_links_in_a_blob_directory_of_its_own() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-/// A directory that cannot make hard links, as a filesystem without them.
-struct NoLinks(MemVfs);
+/// A directory that cannot make hard links, as a filesystem without them:
+/// each link fails with the error that the function gives.
+struct NoLinks(MemVfs, fn() -> io::Error);
 
 impl Vfs for NoLinks {
     type File = MemFile;
@@ -523,7 +524,7 @@ impl Vfs for NoLinks {
     }
 
     fn hard_link(&self, _from: &str, _to: &str) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::CrossesDevices))
+        Err((self.1)())
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -577,15 +578,124 @@ impl Vfs for NoLinks {
 
 #[test]
 fn a_blob_undo_copies_into_a_new_file_where_the_directory_cannot_link() {
+    // Two devices, and the `ENOTSUP` of FAT and exFAT on macOS, which Rust
+    // does not map to `Unsupported`.
+    let errors: [fn() -> io::Error; 2] = [
+        || io::Error::from(io::ErrorKind::CrossesDevices),
+        || io::Error::from_raw_os_error(libc::ENOTSUP),
+    ];
+    for error in errors {
+        let vfs = MemVfs::new();
+        let store = Store::open_in(NoLinks(vfs.clone(), error), SystemClock).unwrap();
+        let oid = store.new_oid().unwrap();
+        let first = commit_blob(&store, oid, Tid::ZERO, b"first blob");
+        let second = commit_blob(&store, oid, first, b"second blob");
+        let files = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
+        let tid = undo(&store, second).unwrap();
+        assert_eq!(read_blob(&store, oid, tid), b"first blob");
+        assert_eq!(read_blob(&store, oid, first), b"first blob");
+        let after = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
+        assert_eq!(after, files + 1, "{:?}", error());
+    }
+}
+
+#[test]
+fn a_link_that_fails_for_another_reason_fails_the_undo() {
     let vfs = MemVfs::new();
-    let store = Store::open_in(NoLinks(vfs.clone()), SystemClock).unwrap();
+    let error: fn() -> io::Error = || io::Error::other("a disk error");
+    let store = Store::open_in(NoLinks(vfs, error), SystemClock).unwrap();
     let oid = store.new_oid().unwrap();
     let first = commit_blob(&store, oid, Tid::ZERO, b"first blob");
     let second = commit_blob(&store, oid, first, b"second blob");
-    let files = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
-    let tid = undo(&store, second).unwrap();
-    assert_eq!(read_blob(&store, oid, tid), b"first blob");
-    assert_eq!(read_blob(&store, oid, first), b"first blob");
-    let after = vfs.names().iter().filter(|n| n.ends_with(".blob")).count();
-    assert_eq!(after, files + 1);
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    assert!(matches!(txn.undo(second), Err(ZoeError::Io(_))));
+}
+
+#[test]
+fn a_pack_between_the_undo_and_its_vote_fails_the_vote() {
+    let store = store();
+    let root = Oid(0);
+    let x = store.new_oid().unwrap();
+    let x = if x == root {
+        store.new_oid().unwrap()
+    } else {
+        x
+    };
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(root, Tid::ZERO, &mapping(Some(x))).unwrap();
+    txn.store(x, Tid::ZERO, &mapping(None)).unwrap();
+    txn.vote().unwrap();
+    let t1 = txn.finish().unwrap();
+    let t2 = commit(&store, root, t1, &mapping(None));
+    let mut undo = store.tpc_begin(b"", b"undo", b"").unwrap();
+    undo.undo(t2).unwrap();
+    store.pack(t2).unwrap();
+    // The vote fails with its locks held, before the finish.
+    assert!(matches!(undo.vote(), Err(ZoeError::Undo { oid: None, .. })));
+    assert!(store.lock_table_is_empty());
+}
+
+/// Returns the oid that a record of `mapping` refers to.
+fn target_of(data: &[u8]) -> Option<Oid> {
+    let at = data.windows(2).position(|w| w == b"C\x08")?;
+    let bytes: [u8; 8] = data[at + 2..at + 10].try_into().ok()?;
+    Some(Oid(u64::from_be_bytes(bytes)))
+}
+
+#[test]
+fn an_undo_that_races_packs_never_names_a_corrupt_store() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let store = store();
+    let root = Oid(0);
+    let first = commit(&store, root, Tid::ZERO, &mapping(None));
+    let serial = Mutex::new(first);
+    let done = AtomicBool::new(false);
+    let errors = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                store.pack(store.last_transaction()).unwrap();
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..200 {
+                let x = store.new_oid().unwrap();
+                let s = *serial.lock().unwrap();
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.store(root, s, &mapping(Some(x))).unwrap();
+                txn.store(x, Tid::ZERO, &mapping(None)).unwrap();
+                txn.vote().unwrap();
+                let linked = txn.finish().unwrap();
+                let dropped = commit(&store, root, linked, &mapping(None));
+                *serial.lock().unwrap() = dropped;
+                let mut undo = store.tpc_begin(b"", b"undo", b"").unwrap();
+                let outcome = undo
+                    .undo(dropped)
+                    .and_then(|_| undo.vote())
+                    .and_then(|()| undo.finish());
+                match outcome {
+                    Ok(tid) => {
+                        *serial.lock().unwrap() = tid;
+                        // The object that the undo links again loads.
+                        let (data, _) = store.load(root).unwrap();
+                        assert_eq!(target_of(&data), Some(x));
+                        store.load(x).unwrap();
+                    }
+                    Err(error) => errors.lock().unwrap().push(error),
+                }
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+    });
+    for error in errors.into_inner().unwrap() {
+        assert!(
+            matches!(error, ZoeError::Undo { oid: None, reason } if reason.contains("pack")),
+            "an undo that races a pack gives {error:?}"
+        );
+    }
+    // The store does not halt.
+    let (data, s) = store.load(root).unwrap();
+    commit(&store, root, s, &data);
 }

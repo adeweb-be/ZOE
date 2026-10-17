@@ -897,7 +897,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.verifications.clear();
         }
         let checked = self
-            .check_serials(resolve, native)
+            .check_undone()
+            .and_then(|()| self.check_serials(resolve, native))
             .and_then(|check| match check {
                 Check::Passed {
                     conflicts,
@@ -929,6 +930,21 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.release();
         self.resolving.clear();
         Err(error)
+    }
+
+    /// Fail with `Undo` when the transaction undoes a transaction at or
+    /// before the pack watermark: a pack ran after the undo read it. The
+    /// vote checks this with its locks held, so the common case fails
+    /// before the finish. The finish checks it again under the commit
+    /// sequencer.
+    fn check_undone(&self) -> Result<()> {
+        match self.undone {
+            Some(undone) if undone <= self.store.pack_watermark()? => Err(ZoeError::Undo {
+                oid: None,
+                reason: crate::undo::PACKED,
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Return the serials of the stale oid that failed the last vote: the
@@ -1202,8 +1218,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// transaction gets a tid after the last tid, below `Tid::MAX`. When no
     /// such tid is left, `finish` fails with `Protocol`. A transaction that
     /// undoes a transaction at or before the pack watermark fails with
-    /// `Undo`: a pack ran after the undo read its records. The store does
-    /// not halt for these errors.
+    /// `Undo`: a pack ran after the undo read its records. A read of the
+    /// watermark for that check that fails gives its error. Each of these
+    /// errors fails only this commit, not the others of its batch, and the
+    /// store does not halt.
     ///
     /// An error other than `Protocol` and `Halted` leaves the outcome of
     /// the commit unknown until the store is reopened: the commit can be

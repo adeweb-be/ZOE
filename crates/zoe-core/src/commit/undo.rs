@@ -27,8 +27,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// - When the current state is the state of `tid`, the call stages the
     ///   state before `tid` over the serial of the current state, or a
     ///   deletion when `tid` created the object. A blob gets the blob file
-    ///   of the state before `tid` by a hard link, so no blob file is
-    ///   copied or written again.
+    ///   of the state before `tid` by a hard link, or a copy into a new
+    ///   file where the filesystem cannot link, so no blob file is written
+    ///   again.
     /// - Else the tiers merge the three states, as the vote merges a
     ///   conflict (`tiers`), with the state of `tid` as the base, the
     ///   current state as the committed one and the state before `tid` as
@@ -47,14 +48,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
     ///
     /// A transaction at or before the last pack, one that the store does
     /// not have, or one whose state before is gone by a pack, fails the
-    /// call with `Undo`. The finish checks the pack watermark again, under
-    /// the commit sequencer: a pack after this call can remove what the
-    /// undo gives back. A failed call can leave the undo of the oids before
+    /// call with `Undo`. A pack that runs during the call can remove the
+    /// records that it reads: a read that then fails gives `Undo` too. The
+    /// vote checks the pack watermark again after it takes the locks, and
+    /// the finish under the commit sequencer: a pack after this call can
+    /// remove what the undo gives back. A failed call can leave the undo of the oids before
     /// the one that failed it staged, so the caller then aborts the
     /// transaction.
     ///
     /// The call holds every record of `tid` in memory at once, as the
-    /// transaction iterator does for one transaction. Tier 1 runs here
+    /// transaction iterator does for one transaction. The tiers run here
     /// without the locks of the vote: the vote locks the staged oids and
     /// checks their serials as for `store`, so a commit after the call is a
     /// conflict of the vote. The pickles count toward the size limits, as
@@ -78,6 +81,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if tid <= self.store.pack_watermark()? {
             return Err(refused(None, undo::PACKED));
         }
+        // From here the transaction can hold a part of the undo, so its
+        // vote and its finish check the watermark.
+        self.undone = Some(self.undone.map_or(tid, |lowest| lowest.min(tid)));
+        self.undo_records(tid)
+            .map_err(|error| self.packed_since(tid, error))
+    }
+
+    /// Stage the undo of each record of the transaction `tid`.
+    fn undo_records(&mut self, tid: Tid) -> Result<Undone> {
         let records = match self.store.backend.txn_records(tid)? {
             Some((row, records)) if row.oid_count == records.len() as u64 => records,
             Some(_) => return Err(ZoeError::CorruptTxn { tid }),
@@ -90,8 +102,27 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 undone.conflicts.push(conflict);
             }
         }
-        self.undone = Some(self.undone.map_or(tid, |lowest| lowest.min(tid)));
         Ok(undone)
+    }
+
+    /// Return the error of an undo of `tid` whose reads failed with `error`.
+    /// A pack during the reads can remove the records of `tid`, or the
+    /// records before them. So when `tid` is now at or before the pack
+    /// watermark, a missing record, a transaction that the store no longer
+    /// has, and a record count that does not match give `Undo`, not a
+    /// corrupt store.
+    fn packed_since(&self, tid: Tid, error: ZoeError) -> ZoeError {
+        let pack_can_explain = match &error {
+            ZoeError::CorruptTxn { .. } => true,
+            ZoeError::Undo { reason, .. } => {
+                *reason == undo::NO_TRANSACTION || *reason == undo::BEFORE_PACKED
+            }
+            _ => false,
+        };
+        match self.store.pack_watermark() {
+            Ok(watermark) if pack_can_explain && tid <= watermark => refused(None, undo::PACKED),
+            _ => error,
+        }
     }
 
     /// Stage the undo of `oid`, whose record in the transaction `tid` is
