@@ -368,6 +368,9 @@ pub struct Resolution {
     /// the merged record and passed, or failed on the refusal. Always false
     /// in shadow mode.
     pub applied: bool,
+    /// True when the entry is the merge of an undo (`Txn::undo`): the
+    /// undone record is the base, and `read` is the undone tid.
+    pub undo: bool,
     /// The keys that the new record changed, inserted or deleted, as text.
     /// At most [`MAX_KEYS`].
     pub keys: Vec<String>,
@@ -474,6 +477,7 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     );
     field("shadow", shadow);
     field("applied", resolution.applied.to_string());
+    field("undo", resolution.undo.to_string());
     let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
     field("keys", format!("[{}]", keys.join(",")));
     field("changed", resolution.changed.to_string());
@@ -568,6 +572,7 @@ impl Resolution {
             policy,
             outcome: Resolved::of(&merge.outcome),
             applied: false,
+            undo: false,
             keys: merge.keys.clone(),
             changed: merge.changed,
             committed,

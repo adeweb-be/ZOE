@@ -19,20 +19,19 @@ The run collects the suites of ZODB unchanged and runs each test under
 
 - the storage suites: BasicStorage, MTStorage, Synchronization,
   ConflictResolution, PackableStorage, RevisionStorage, HistoryStorage,
-  IteratorStorage, PersistentStorage and ReadOnlyStorage;
+  IteratorStorage, PersistentStorage, ReadOnlyStorage and
+  TransactionalUndoStorage;
 - the blob suite of ZODB for a blob storage, with recovery and undo;
 - the test modules of ZODB in `FULL`, on the default storage.
 
-The run skips only the tests in `SKIPS`, each with its reason. The storage
-does not undo, so `supportsUndo()` is false and the undo tests are skipped.
-ZODB itself skips the tests in `OWN_SKIPS`.
+The run skips only the tests in `SKIPS`, each with its reason. ZODB itself
+skips the tests in `OWN_SKIPS`.
 
 These parts of ZODB do not apply to the storage, so the run does not
 collect them:
 
 - `PackableStorageWithOptionalGC`: it packs without garbage collection, and
   the pack of the store always collects garbage. `PackableStorage` runs.
-- `TransactionalUndoStorage`: it tests undo.
 - the modules that test one named storage, its file format or its tools:
   `testFileStorage`, `testfsIndex`, `testfsoids`, `test_fsdump`,
   `testRecover`, `testMappingStorage`, `testMVCCMappingStorage`,
@@ -54,6 +53,7 @@ import importlib
 import unittest
 
 import pytest
+from ZODB.tests.TransactionalUndoStorage import TransactionalUndoStorage
 
 import zoe
 import zoe.testing
@@ -73,6 +73,7 @@ STORAGE_SUITES = {
     "IteratorStorage": ["IteratorStorage", "ExtendedIteratorStorage"],
     "PersistentStorage": ["PersistentStorage"],
     "ReadOnlyStorage": ["ReadOnlyStorage"],
+    "TransactionalUndoStorage": ["TransactionalUndoStorage"],
 }
 
 # The test modules of ZODB that run on the default storage.
@@ -102,23 +103,19 @@ FULL = [
     "testpersistentclass",
 ]
 
-UNDO = "the storage does not undo: supportsUndo() is false"
-
 # The tests that the run skips, and the reason of each skip. A name is the
 # class that defines the test and the name of the test method.
 SKIPS = {
-    "ConflictResolvingTransUndoStorage.testUndoConflictResolution": UNDO,
-    "ConflictResolvingTransUndoStorage.testUndoUnresolvable": UNDO,
-    "PackableUndoStorage.testPackUndoLog": UNDO,
-    "PackableUndoStorage.testPackUnlinkedFromRoot": UNDO,
-    "RevisionStorage.testLoadBeforeUndo": UNDO,
-    "IteratorStorage.testUndoZombie": UNDO,
-    "ReadOnlyStorage.testWriteMethods": "the test calls undo, and " + UNDO,
-    "BlobUndoTests.testUndoWithoutPreviousVersion": UNDO,
-    "BlobUndoTests.testUndo": UNDO,
-    "BlobUndoTests.testUndoAfterConsumption": UNDO,
-    "BlobUndoTests.testRedo": UNDO,
-    "BlobUndoTests.testRedoOfCreation": UNDO,
+    "TransactionalUndoStorage.testTransactionalUndoIterator": (
+        "it checks that the record of an undo names the tid of the record that "
+        "it copies (data_txn); the store keeps every pickle whole and no back "
+        "pointer, so data_txn is None, and a back pointer is a format change"
+    ),
+    "PackableUndoStorage.testPackUndoLog": (
+        "it replaces time.time and packs at a time of its fake clock, and the "
+        "store takes its tids from its own clock: the pack time comes after "
+        "the last transaction"
+    ),
 }
 
 # ZODB skips these tests itself when the test case cannot open a second
@@ -145,6 +142,14 @@ OUT = {
         "of ZODB, and the store moves its blob files itself"
     ),
 }
+
+
+class UndoHelpers:
+    """The helper of `TransactionalUndoStorage` that
+    `ConflictResolvingTransUndoStorage` calls. The test classes of
+    FileStorage mix both in. It holds no test."""
+
+    _begin_undos_vote = TransactionalUndoStorage._begin_undos_vote
 
 
 def name_of(test):
@@ -285,7 +290,8 @@ def test_the_storage_suite_of_zodb_passes(module_name):
     suite = unittest.TestSuite()
     for class_name in STORAGE_SUITES[module_name]:
         tests = getattr(module, class_name)
-        case = type(f"Zoe{class_name}", (zoe.testing.StorageTestCase, tests), {})
+        bases = (zoe.testing.StorageTestCase, tests, UndoHelpers)
+        case = type(f"Zoe{class_name}", bases, {})
         names = loader.getTestCaseNames(case)
         # The run collects the tests of ZODB unchanged.
         assert set(names) == set(loader.getTestCaseNames(tests))

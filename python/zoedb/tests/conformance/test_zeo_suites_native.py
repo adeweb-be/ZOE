@@ -21,7 +21,7 @@ the native client. The run goes twice:
   do, and the servers of the forker speak M5. Which protocols the native
   client speaks is a question of the card of its walking skeleton.
 
-A test passes, or is skipped for undo (phase 4), or is in `OUT` or
+A test passes, or is in `OUT` or
 `OUT_MODULES` of this module with its reason, or skips itself. They hold
 the tests that read the inside of `ZEO.ClientStorage`, each with the ZOE
 test that covers its behaviour. Before the card of this gate moves to
@@ -42,7 +42,6 @@ import zoe.testing
 from zoe.testing import ZoeServer
 
 TIMEOUT = 30
-UNDO = "undo comes in phase 4"
 
 # The modules of test_zeo_suites.py that the run does not collect, and why.
 OUT_MODULES = {
@@ -226,9 +225,6 @@ def run(module_name, layers, out):
         for test, test_layers in suites.walk(suites.suite_of(module_name), layers):
             name = suites.name_of(test)
             if name in out or suites.class_of(test) in out:
-                continue
-            if suites.is_undo(test):
-                result.addSkip(test, UNDO)
                 continue
             for layer in test_layers:
                 if layer not in started:

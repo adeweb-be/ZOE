@@ -15,9 +15,8 @@ two classes of `ZEO.tests.testZEO` unchanged and runs their tests:
 The tests run inside two layers. In `zoe.testing.ZEO_LAYER`, the test
 forker of ZEO starts `zoe serve` in place of a ZEO server. In
 `zoe.testing.NATIVE_LAYER`, `ZEO.ClientStorage.ClientStorage`, and what
-ZEO's tests open through it, is the native client. A test passes, or is
-skipped for undo (`supportsUndo()` is false until phase 4), or is in `OUT`
-or `INSIDE` with its reason, or skips itself. `OUT` holds the tests that
+ZEO's tests open through it, is the native client. A test passes, or is in
+`OUT` or `INSIDE` with its reason, or skips itself. `OUT` holds the tests that
 `zoe serve` cannot pass, as in the run of ZEO's suites against
 `zoe serve` with a stock client. `INSIDE` holds the tests that read the
 inside of `ZEO.ClientStorage`, which the native client does not have.
@@ -27,8 +26,6 @@ import doctest
 import unittest
 
 import zoe.testing
-
-UNDO = "the storage does not undo: supportsUndo() is false"
 
 # The mixins that the run must cover, by module and class name.
 MIXINS = {
@@ -44,10 +41,27 @@ MIXINS = {
     ("ZODB.tests.RecoveryStorage", "RecoveryStorage"),
 }
 
+# The undo tests that zoe serve cannot pass, and why.
+SERVER_PYTHON = (
+    "it undoes over a later change of a class that only the Python "
+    "_p_resolveConflict of the class merges; zoe serve runs no Python, so "
+    "such an undo fails with UndoError"
+)
+DATA_TXN = (
+    "it checks that the record of an undo names the tid of the record that it "
+    "copies (data_txn); the store keeps every pickle whole and no back "
+    "pointer, so data_txn is None, and a back pointer is a format change"
+)
+
 # The tests that zoe serve cannot pass, and why. A name is the class that
 # defines the test and its method.
 OUT = {
-    "RecoveryStorage.testRestoreAcrossPack": "it calls undo, and " + UNDO,
+    "ConflictResolvingTransUndoStorage.testUndoConflictResolution": SERVER_PYTHON,
+    "TransactionalUndoStorage.testUndoMultipleConflictResolution": SERVER_PYTHON,
+    "TransactionalUndoStorage.testUndoMultipleConflictResolutionReversed": (
+        SERVER_PYTHON
+    ),
+    "TransactionalUndoStorage.testTransactionalUndoIterator": DATA_TXN,
 }
 
 SERVER_OBJECT = "it calls the asyncio client of ZEO.ClientStorage (_server)"
@@ -90,10 +104,6 @@ def name_of(test):
     return f"{defining_class(test).__name__}.{test._testMethodName}"
 
 
-def is_undo(test):
-    return "undo" in name_of(test).lower() or "Undo" in type(test).__name__
-
-
 def _tests_of(case):
     """Return the tests of case, with both prefixes of ZODB's mixins."""
     tests = []
@@ -134,9 +144,6 @@ def run(tests, layers):
             name = name_of(test)
             if name in OUT or name in INSIDE:
                 left_out += 1
-                continue
-            if is_undo(test):
-                result.addSkip(test, UNDO)
                 continue
             for layer in layers:
                 if hasattr(layer, "testSetUp"):

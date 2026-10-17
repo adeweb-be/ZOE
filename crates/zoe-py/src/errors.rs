@@ -42,6 +42,7 @@ exception!(
     "StorageTransactionError"
 );
 exception!(read_only_error, "ZODB.POSException", "ReadOnlyError");
+exception!(undo_error, "ZODB.POSException", "UndoError");
 exception!(unsupported, "ZODB.POSException", "Unsupported");
 exception!(wrong_thread, "zoe.storage", "WrongThread");
 exception!(
@@ -129,6 +130,11 @@ impl Failure {
             ZoeError::ReadConflict { oid } => {
                 conflict(py, read_conflict_error(py), oid, self.serials, None)
             }
+            ZoeError::Undo { oid, reason } => raise(
+                undo_error(py),
+                (reason, oid.map(|oid| p64(py, oid.0))),
+                None,
+            ),
             ZoeError::WrongThread => message(wrong_thread(py), &self.error),
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } => {
                 message(storage_transaction_error(py), &self.error)

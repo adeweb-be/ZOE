@@ -68,15 +68,16 @@ def kept_after_pack(server, storage="1"):
 
 
 def test_get_info_lists_iexternalgc(tmp_path):
-    from ZODB.interfaces import IExternalGC
+    from ZODB.interfaces import IExternalGC, IStorageUndoable
 
     with ZoeServer(str(tmp_path / "store")) as server:
         storage = client(server)
         try:
             interfaces = {tuple(item) for item in storage._info["interfaces"]}
             assert ("ZODB.interfaces", "IExternalGC") in interfaces
-            assert ("ZODB.interfaces", "IStorageUndoable") not in interfaces
+            assert ("ZODB.interfaces", "IStorageUndoable") in interfaces
             assert IExternalGC.providedBy(storage)
+            assert IStorageUndoable.providedBy(storage)
         finally:
             storage.close()
 

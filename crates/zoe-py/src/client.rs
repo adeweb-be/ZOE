@@ -1199,15 +1199,20 @@ impl NativeTransaction {
     }
 
     /// Undo the transaction `trans_id` in this transaction: `undoa`, sent to
-    /// the server, which answers as it does for `ZEO.ClientStorage`.
-    fn undo(&self, py: Python<'_>, trans_id: &[u8]) -> PyResult<()> {
+    /// the server, which answers as it does for `ZEO.ClientStorage`. The id
+    /// is bytes, as `undoLog` gives it, or a `str` of its text.
+    fn undo(&self, py: Python<'_>, trans_id: &Bound<'_, PyAny>) -> PyResult<()> {
         check_process(self.pid)?;
+        let trans_id: Vec<u8> = match trans_id.cast::<PyString>() {
+            Ok(text) => text.to_str()?.as_bytes().to_vec(),
+            Err(_) => trans_id.extract()?,
+        };
         let trace = traceparent(py, self.traceparent.as_ref())?;
         let runtime = self.runtime;
         py.detach(|| {
             let mut slot = lock(&self.txn);
             let txn = slot.as_mut().ok_or_else(not_open)?;
-            runtime.block_on(traced(trace, txn.undo(trans_id)))
+            runtime.block_on(traced(trace, txn.undo(&trans_id)))
         })
         .map_err(|e| client_error(py, e))
     }
@@ -1944,7 +1949,14 @@ fn client_error(py: Python<'_>, error: Error) -> PyErr {
             errors::client_disconnected(py, "the connection to the server is lost".into())
         }
         Error::Io(error) => errors::client_disconnected(py, error.to_string()),
-        Error::Server { class, message, .. } => server_error(py, &class, message),
+        // A class of the factories of ZEO's client gets what its factory
+        // makes of the value, as from `ZEO.ClientStorage`: for example a
+        // `MultipleUndoErrors` with its `_errs`.
+        Error::Server {
+            class,
+            value,
+            message,
+        } => factory_error(py, &class, &value).unwrap_or_else(|| server_error(py, &class, message)),
         Error::Unsupported(text) => errors::unsupported_failure(py, text),
         Error::Invalid(text) => errors::transaction_failure(py, text),
         error => errors::storage_failure(py, error.to_string()),
@@ -1990,6 +2002,21 @@ fn zeo_error(py: Python<'_>, name: &str, error: Error) -> PyErr {
         Ok(PyErr::from_value(exception))
     })();
     made.unwrap_or_else(|_| server_error(py, &class, message))
+}
+
+/// Return the exception that the factory of `ZEO.asyncio.client` of the
+/// class `class` makes of the msgpack value `value`, or `None` when no
+/// factory has the class or the factory fails.
+fn factory_error(py: Python<'_>, class: &str, value: &Value) -> Option<PyErr> {
+    let made = (|| -> PyResult<Option<PyErr>> {
+        let factories = py.import("ZEO.asyncio.client")?.getattr("exc_factories")?;
+        let Ok(factory) = factories.get_item(class) else {
+            return Ok(None);
+        };
+        let value = to_python(py, value, 0)?;
+        Ok(Some(PyErr::from_value(factory.call1((class, value))?)))
+    })();
+    made.ok().flatten()
 }
 
 /// Return the msgpack values of the args of a call: a list or a tuple.

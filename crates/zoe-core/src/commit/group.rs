@@ -41,6 +41,7 @@ use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
+use crate::undo;
 
 /// The part of a transaction that the leader of its batch writes.
 pub(super) struct Member {
@@ -54,6 +55,8 @@ pub(super) struct Member {
     pub(super) user: Vec<u8>,
     pub(super) description: Vec<u8>,
     pub(super) extension: Vec<u8>,
+    /// The lowest tid that the transaction undoes, when it undoes one.
+    pub(super) undone: Option<Tid>,
 }
 
 /// The outcome of one finish. The member goes back to its transaction. It
@@ -163,7 +166,10 @@ impl Drop for Lead<'_> {
 /// the outcome of each, in batch order.
 ///
 /// Each member gets its tid in batch order. A tid that fails its check
-/// fails only its member, with `Protocol`. The other members go in one
+/// fails only its member, with `Protocol`. An undo of a transaction at or
+/// before the pack watermark fails only its member, with `Undo`: a pack
+/// that came after the undo read its records can have removed what the
+/// undo gives back. The other members go in one
 /// backend write transaction. An error of that write fails each of them,
 /// and the store halts. The write commits without a sync when each of
 /// these members is a deferred restore.
@@ -182,10 +188,10 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
     let mut members: Vec<(Member, Result<Finished>)> = batch
         .into_iter()
         .map(|(_, member)| {
-            let tid = match member.tid {
+            let tid = check_undone(store, member.undone).and_then(|()| match member.tid {
                 Some(tid) => check_restore_tid(tid, last).map(|()| tid),
                 None => next_tid(now, last),
-            };
+            });
             let finished = tid.map(|tid| Finished {
                 tid,
                 previous: mem::replace(&mut last, tid),
@@ -249,6 +255,19 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
         .into_iter()
         .map(|(member, finished)| (Some(member), finished))
         .collect()
+}
+
+/// Check that `undone`, the lowest tid that a member undoes, is after the
+/// pack watermark. The caller holds the commit sequencer, so no pack batch
+/// commits between the check and the write of the member.
+pub(super) fn check_undone(store: &Store, undone: Option<Tid>) -> Result<()> {
+    match undone {
+        Some(undone) if undone <= store.pack_watermark()? => Err(ZoeError::Undo {
+            oid: None,
+            reason: undo::PACKED,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Place the blobs of the members that have a tid, then write these
@@ -416,6 +435,10 @@ mod tests {
 
         fn rename(&self, from: &str, to: &str) -> io::Result<()> {
             self.vfs.rename(from, to)
+        }
+
+        fn hard_link(&self, from: &str, to: &str) -> io::Result<()> {
+            self.vfs.hard_link(from, to)
         }
 
         fn remove(&self, name: &str) -> io::Result<()> {

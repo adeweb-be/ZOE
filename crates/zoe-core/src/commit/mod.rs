@@ -57,6 +57,7 @@ mod encoded;
 mod group;
 mod observer;
 mod staging;
+mod undo;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,8 +144,16 @@ pub struct Txn<S: Deref<Target = Store>> {
     committed: Option<Tid>,
     /// The handle that ends the lock wait of a vote from another thread.
     lock_cancel: Option<LockCancel>,
-    /// What tiers 1 and 2 did in the last vote that took the locks.
+    /// What tiers 1 and 2 did in the undos of the transaction, then in the
+    /// last vote that took the locks.
     resolutions: Vec<Resolution>,
+    /// The number of entries of `resolutions` that the undos gave. They
+    /// come first, and a vote keeps them.
+    undo_resolutions: usize,
+    /// The lowest tid that the transaction undoes. The vote checks it
+    /// against the pack watermark with its locks held, and the finish
+    /// again under the commit sequencer.
+    undone: Option<Tid>,
     /// The merges of shadow mode of the last vote that took the locks: the
     /// digest of each merged record, by oid. The vote after
     /// `vote_resolving` compares them with the records of the caller.
@@ -219,6 +228,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
             committed: None,
             lock_cancel: None,
             resolutions: Vec::new(),
+            undo_resolutions: 0,
+            undone: None,
             shadows: BTreeMap::new(),
             verifications: Vec::new(),
         }
@@ -757,22 +768,42 @@ impl<S: Deref<Target = Store>> Txn<S> {
         &self.description
     }
 
-    /// Return what tier 1 did in the last vote that took the locks: one
-    /// entry for each stale written oid of a class of tier 1 whose mode is
-    /// not `Off`, in oid order. The vote that comes after `vote_resolving`
-    /// keeps the entries of `vote_resolving`.
+    /// Return what tiers 1 and 2 did in the undos of the transaction, then
+    /// in the last vote that took the locks: one entry for each three-way
+    /// merge of an undo, and one for each stale written oid of the vote, of
+    /// a class of a tier whose mode is not `Off`, in oid order. The vote that comes
+    /// after `vote_resolving` keeps the entries of `vote_resolving`.
     pub fn resolutions(&self) -> &[Resolution] {
         &self.resolutions
     }
 
-    /// Return the lines of the resolution log (ADR 0042) of what tier 1 did
-    /// in the last vote that took the locks: one JSON object for each entry
-    /// of `resolutions`, at `time`, for the storage `storage` of a server.
+    /// Return the lines of the resolution log (ADR 0042) of what the tiers
+    /// did in the undos and in the last vote that took the locks: one JSON
+    /// object for each entry of `resolutions`, at `time`, for the storage `storage` of a server.
     /// The user and the description of the committed transaction come from
     /// the history of the oid; when the store no longer has that record,
     /// the line gives null for them.
     pub fn resolution_log_lines(&self, time: SystemTime, storage: Option<&str>) -> Vec<String> {
-        self.resolutions
+        self.resolution_log_lines_of(0..self.resolutions.len(), time, storage)
+    }
+
+    /// Return the number of entries of `resolutions` that the undos of the
+    /// transaction gave. They come first, before the entries of the vote.
+    pub fn undo_resolution_count(&self) -> usize {
+        self.undo_resolutions
+    }
+
+    /// Return the lines of the resolution log of the entries `range` of
+    /// `resolutions`, as `resolution_log_lines` does. A skin that writes
+    /// the lines of each undo when it ends, and those of the vote after it,
+    /// writes each line once.
+    pub fn resolution_log_lines_of(
+        &self,
+        range: std::ops::Range<usize>,
+        time: SystemTime,
+        storage: Option<&str>,
+    ) -> Vec<String> {
+        self.resolutions[range]
             .iter()
             .map(|resolution| {
                 let committed = self.committed_entry(resolution.oid, resolution.committed);
@@ -820,7 +851,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// locks and passed. Their staged records hold the merged records, over
     /// the serial of the committed records.
     pub fn natively_resolved(&self) -> Vec<Oid> {
-        self.resolutions
+        self.resolutions[self.undo_resolutions..]
             .iter()
             .filter(|resolution| resolution.applied && resolution.outcome == Resolved::Merged)
             .map(|resolution| resolution.oid)
@@ -880,12 +911,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// or an error, fails the check and releases the locks.
     fn check(&mut self, resolve: bool, native: bool) -> Result<Vec<(Oid, Record)>> {
         if native {
-            self.resolutions.clear();
+            // The entries of the undos come first, and they stay.
+            self.resolutions.truncate(self.undo_resolutions);
             self.shadows.clear();
             self.verifications.clear();
         }
         let checked = self
-            .check_serials(resolve, native)
+            .check_undone()
+            .and_then(|()| self.check_serials(resolve, native))
             .and_then(|check| match check {
                 Check::Passed {
                     conflicts,
@@ -917,6 +950,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.release();
         self.resolving.clear();
         Err(error)
+    }
+
+    /// Fail with `Undo` when the transaction undoes a transaction at or
+    /// before the pack watermark: a pack ran after the undo read it. The
+    /// vote checks this with its locks held, so the common case fails
+    /// before the finish. The finish checks it again under the commit
+    /// sequencer.
+    fn check_undone(&self) -> Result<()> {
+        group::check_undone(&self.store, self.undone)
     }
 
     /// Return the serials of the stale oid that failed the last vote: the
@@ -954,7 +996,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.staged.put(area, *oid, *serial, pickle, false)?;
         }
         self.stored_bytes = stored_bytes;
-        for resolution in &mut self.resolutions {
+        for resolution in &mut self.resolutions[self.undo_resolutions..] {
             if resolution.outcome == Resolved::Merged
                 && merged.iter().any(|(oid, _, _)| *oid == resolution.oid)
             {
@@ -1113,37 +1155,22 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let Ok(Some((_, new))) = self.staged.get(oid) else {
             return Ok(None);
         };
-        let (tier, class, mode, entry) = if let Some(class) = merge::tier1_class(&new) {
-            let mode = rules.tier1_mode(&class);
-            (1, class, mode, None)
-        } else if let Some(class) = merge::class_name(&new)
-            && let Some(entry) = rules.tier2(&class)
-        {
-            (2, class, entry.tier2, Some(entry))
-        } else {
+        let Some(tier) = Tier::of(&new, rules) else {
             return Ok(None);
         };
-        if mode == merge::Mode::Off {
-            return Ok(None);
-        }
         let Some(old) = self.store.backend.load_serial(oid, read)? else {
             let merge = Merge {
-                tier,
-                class,
+                tier: tier.tier,
+                class: tier.class,
                 outcome: Outcome::Undecided("the record that the transaction read is gone"),
                 keys: Vec::new(),
                 changed: 0,
                 shadow: None,
                 fields: Vec::new(),
             };
-            return Ok(Some((mode, merge)));
+            return Ok(Some((tier.mode, merge)));
         };
-        let merge = match entry {
-            None => merge::tier1(&old, &committed.data, &new, rules.posting_dicts())
-                .expect("a class of tier 1"),
-            Some(entry) => merge::tier2(&old, &committed.data, &new, &class, entry),
-        };
-        Ok(Some((mode, merge)))
+        Ok(Some(tier.merge(&old, &committed.data, &new, rules)))
     }
 
     /// Return the transaction size after a merged pickle of `oid` replaces
@@ -1203,8 +1230,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// A restore transaction commits under its own tid. If that tid is not
     /// after the last tid, `finish` fails with `Protocol`. A normal
     /// transaction gets a tid after the last tid, below `Tid::MAX`. When no
-    /// such tid is left, `finish` fails with `Protocol`. The store does
-    /// not halt for these errors.
+    /// such tid is left, `finish` fails with `Protocol`. A transaction that
+    /// undoes a transaction at or before the pack watermark fails with
+    /// `Undo`: a pack ran after the undo read its records. A read of the
+    /// watermark for that check that fails gives its error. Each of these
+    /// errors fails only this commit, not the others of its batch, and the
+    /// store does not halt.
     ///
     /// An error other than `Protocol` and `Halted` leaves the outcome of
     /// the commit unknown until the store is reopened: the commit can be
@@ -1233,6 +1264,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             user: std::mem::take(&mut self.user),
             description: std::mem::take(&mut self.description),
             extension: std::mem::take(&mut self.extension),
+            undone: self.undone,
         };
         let store: &Store = &self.store;
         let (member, finished) = store.group.finish(store, member);
@@ -1280,6 +1312,105 @@ impl<S: Deref<Target = Store>> Drop for Txn<S> {
             .guardrails
             .transaction_ended(self.began, now, ended);
     }
+}
+
+/// The tier that merges the records of a class, and its mode: tier 1 for
+/// a class of BTrees or `Length`, tier 2 for a class that the merge policy
+/// names.
+struct Tier<'r> {
+    tier: u8,
+    class: String,
+    mode: merge::Mode,
+    /// The entry of the merge policy of a class of tier 2.
+    entry: Option<&'r merge::policy::ClassPolicy>,
+}
+
+impl<'r> Tier<'r> {
+    /// Return the tier of the record `new`, from its class pickle alone, or
+    /// `None` when no tier merges its class or the mode of the tier is
+    /// `Off`.
+    fn of(new: &[u8], rules: &'r Rules<'_>) -> Option<Self> {
+        let tier = if let Some(class) = merge::tier1_class(new) {
+            let mode = rules.tier1_mode(&class);
+            Tier {
+                tier: 1,
+                class,
+                mode,
+                entry: None,
+            }
+        } else {
+            let class = merge::class_name(new)?;
+            let entry = rules.tier2(&class)?;
+            Tier {
+                tier: 2,
+                class,
+                mode: entry.tier2,
+                entry: Some(entry),
+            }
+        };
+        (tier.mode != merge::Mode::Off).then_some(tier)
+    }
+
+    /// Merge the three records of a conflict in this tier: `old` is the
+    /// base, `committed` the committed record and `new` the record that
+    /// goes over it.
+    fn merge(
+        &self,
+        old: &[u8],
+        committed: &[u8],
+        new: &[u8],
+        rules: &Rules<'_>,
+    ) -> (merge::Mode, Merge) {
+        let merge = match self.entry {
+            None => {
+                merge::tier1(old, committed, new, rules.posting_dicts()).expect("a class of tier 1")
+            }
+            Some(entry) => merge::tier2(old, committed, new, &self.class, entry),
+        };
+        (self.mode, merge)
+    }
+}
+
+/// Merge the three records of an undo through the tiers: `old` is the
+/// record of the undone transaction, `committed` the current record and
+/// `new` the record before the undone transaction. Return `None` when no
+/// tier merges the class of `new`, or the mode of its tier is `Off`.
+///
+/// The undo calls it. The vote picks its tier with the same `Tier::of`
+/// and merges with the same `Tier::merge`, apart, so that it reads the
+/// record that its transaction read only for a class of a tier.
+///
+/// In an undo, a field of strategy `lww` that both sides changed refuses,
+/// as `strict` does (ADR 0046): the undo would drop the later change
+/// without a word.
+fn undo_tiers(
+    old: &[u8],
+    committed: &[u8],
+    new: &[u8],
+    rules: &Rules<'_>,
+) -> Option<(merge::Mode, Merge)> {
+    let tier = Tier::of(new, rules)?;
+    let strict = tier.entry.map(without_lww);
+    let tier = Tier {
+        entry: strict.as_ref().or(tier.entry),
+        ..tier
+    };
+    Some(tier.merge(old, committed, new, rules))
+}
+
+/// Return `entry` with the strategy `strict` in place of each `lww`.
+fn without_lww(entry: &merge::policy::ClassPolicy) -> merge::policy::ClassPolicy {
+    use merge::policy::Strategy;
+    let strict = |strategy: Strategy| match strategy {
+        Strategy::Lww => Strategy::Strict,
+        other => other,
+    };
+    let mut entry = entry.clone();
+    entry.default = strict(entry.default);
+    for strategy in entry.fields.values_mut() {
+        *strategy = strict(*strategy);
+    }
+    entry
 }
 
 /// Check that a transaction can write `oid`. `Oid(u64::MAX)` is refused
