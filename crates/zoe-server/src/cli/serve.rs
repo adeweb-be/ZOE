@@ -341,11 +341,13 @@ pub(super) struct ServeArgs {
     )]
     structural_merge_class: Vec<(String, Mode)>,
 
-    /// The mode of the posting-dict rule of ADR 0042: on merges the posting
-    /// dicts of ZCTextIndex entry by entry in the buckets with integer keys,
-    /// where ZODB's resolver refuses them; shadow writes the merge of the
-    /// rule to the resolution log, then ends the conflict as off does; off,
-    /// the default, does not run the rule. A shadow mode needs
+    /// The mode of the posting-dict rule and the first-key rule of ADR
+    /// 0042, two merges where ZODB's resolver refuses: on merges the
+    /// posting dicts of ZCTextIndex entry by entry in the buckets with
+    /// integer keys, and lets a delete of the first key through in a tree
+    /// of one bucket; shadow writes the merge of the rules to the
+    /// resolution log, then ends the conflict as off does; off, the
+    /// default, does not run the rules. A shadow mode needs
     /// --resolution-log.
     #[arg(
         long,
@@ -594,7 +596,7 @@ pub(super) fn configure(
     Ok(cli)
 }
 
-/// Tells if tier 1, a class of tier 1 or the posting-dict rule is in shadow
+/// Tells if tier 1, a class of tier 1 or the rules of ADR 0042 are in shadow
 /// mode.
 #[cfg(feature = "serve")]
 fn shadow(args: &ServeArgs) -> bool {

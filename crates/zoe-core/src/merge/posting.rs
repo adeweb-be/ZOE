@@ -19,8 +19,9 @@
 //!   convert, or of no entry, and a dict of more than 10 entries on one
 //!   side, which ZCTextIndex never keeps.
 //!
-//! A posting dict maps int keys to int or float values. Another dict is
-//! not a posting dict, and the rule leaves it to BTrees.
+//! A posting dict maps int keys to int values, as the scores of the
+//! indexes of ZCTextIndex are ints. Another dict is not a posting dict, and
+//! the rule leaves it to BTrees.
 
 use std::collections::HashMap;
 
@@ -42,9 +43,9 @@ pub(super) fn applies(family: Family) -> bool {
 /// Returns the entries of `value` if it is a posting dict.
 fn entries(heap: &Heap, value: Value) -> Option<&[(Value, Value)]> {
     let items = heap.dict(value)?;
-    let posting = items.iter().all(|&(key, value)| {
-        matches!(key, Value::Int(_)) && matches!(value, Value::Int(_) | Value::Float(_))
-    });
+    let posting = items
+        .iter()
+        .all(|&(key, value)| matches!(key, Value::Int(_)) && matches!(value, Value::Int(_)));
     posting.then_some(items)
 }
 
@@ -52,28 +53,26 @@ fn entries(heap: &Heap, value: Value) -> Option<&[(Value, Value)]> {
 /// dict: two posting dicts are equal entry by entry, and a posting dict is
 /// never equal to another value. `None` when neither is a posting dict, or
 /// when the other is a dict that is not one.
-pub(super) fn equal(heap: &Heap, a: Value, b: Value) -> Option<Result<bool, Outcome>> {
+pub(super) fn equal(heap: &Heap, a: Value, b: Value) -> Option<bool> {
     match (entries(heap, a), entries(heap, b)) {
         (Some(a), Some(b)) => Some(same_entries(a, b)),
-        (Some(_), None) if heap.dict(b).is_none() => Some(Ok(false)),
-        (None, Some(_)) if heap.dict(a).is_none() => Some(Ok(false)),
+        (Some(_), None) if heap.dict(b).is_none() => Some(false),
+        (None, Some(_)) if heap.dict(a).is_none() => Some(false),
         _ => None,
     }
 }
 
 /// Tells if two posting dicts have the same entries, in any order.
-fn same_entries(a: &[(Value, Value)], b: &[(Value, Value)]) -> Result<bool, Outcome> {
+fn same_entries(a: &[(Value, Value)], b: &[(Value, Value)]) -> bool {
     if a.len() != b.len() {
-        return Ok(false);
+        return false;
     }
-    let b: HashMap<i128, Value> = b.iter().map(|&(key, value)| (key_of(key), value)).collect();
-    for &(key, value) in a {
-        match b.get(&key_of(key)) {
-            Some(&other) if score_equal(value, other)? => {}
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
+    let b: HashMap<i128, i128> = b
+        .iter()
+        .map(|&(key, value)| (int(key), int(value)))
+        .collect();
+    a.iter()
+        .all(|&(key, value)| b.get(&int(key)) == Some(&int(value)))
 }
 
 /// Merges two changes of the value of one key, against the old value.
@@ -98,10 +97,16 @@ pub(super) fn merge(
             Outcome::Refused(Reason::BTrees(1))
         });
     };
-    let merged = merge_entries(old, committed, new)?;
+    let ints = |entries: &[(Value, Value)]| -> Vec<(i128, i128)> {
+        entries
+            .iter()
+            .map(|&(key, value)| (int(key), int(value)))
+            .collect()
+    };
+    let merged = merge_entries(&ints(old), &ints(committed), &ints(new))?;
     let items = merged
         .into_iter()
-        .map(|(key, value)| (Value::Int(key), value))
+        .map(|(key, value)| (Value::Int(key), Value::Int(value)))
         .collect();
     Ok(heap.new_dict(items))
 }
@@ -111,10 +116,10 @@ pub(super) fn merge(
 /// new dict after them, as the new transaction would have changed the
 /// committed dict. The work is linear in the entries.
 fn merge_entries(
-    old: &[(Value, Value)],
-    committed: &[(Value, Value)],
-    new: &[(Value, Value)],
-) -> Result<Vec<(i128, Value)>, Outcome> {
+    old: &[(i128, i128)],
+    committed: &[(i128, i128)],
+    new: &[(i128, i128)],
+) -> Result<Vec<(i128, i128)>, Outcome> {
     // ZCTextIndex never keeps a dict of more than 10 entries, and ZODB's
     // resolver refuses every dict. So a larger dict is a refusal at once.
     if [old, committed, new]
@@ -123,17 +128,10 @@ fn merge_entries(
     {
         return Err(Outcome::Refused(Reason::PostingTooLarge));
     }
-    let map = |entries: &[(Value, Value)]| -> HashMap<i128, Value> {
-        entries
-            .iter()
-            .map(|&(key, value)| (key_of(key), value))
-            .collect()
-    };
+    let map =
+        |entries: &[(i128, i128)]| -> HashMap<i128, i128> { entries.iter().copied().collect() };
     let (old_map, committed_map, new_map) = (map(old), map(committed), map(new));
-    let mut merged: Vec<(i128, Value)> = committed
-        .iter()
-        .map(|&(key, value)| (key_of(key), value))
-        .collect();
+    let mut merged = committed.to_vec();
     let places: HashMap<i128, usize> = merged
         .iter()
         .enumerate()
@@ -141,23 +139,20 @@ fn merge_entries(
         .collect();
     let changed = Outcome::Refused(Reason::PostingChanged);
     for &(key, value) in new {
-        let key = key_of(key);
         match (old_map.get(&key), committed_map.get(&key)) {
             (Some(&before), committed) => {
-                if score_equal(before, value)? {
+                if before == value {
                     continue;
                 }
                 match committed {
-                    Some(&now) if score_equal(now, before)? => {
-                        merged[places[&key]].1 = value;
-                    }
-                    Some(&now) if score_equal(now, value)? => {}
+                    Some(&now) if now == before => merged[places[&key]].1 = value,
+                    Some(&now) if now == value => {}
                     _ => return Err(changed),
                 }
             }
             (None, None) => merged.push((key, value)),
             (None, Some(&now)) => {
-                if !score_equal(now, value)? {
+                if now != value {
                     return Err(changed);
                 }
             }
@@ -165,13 +160,12 @@ fn merge_entries(
     }
     let mut deleted = std::collections::HashSet::new();
     for &(key, before) in old {
-        let key = key_of(key);
         if new_map.contains_key(&key) {
             continue;
         }
         // The new transaction deleted the entry.
         if let Some(&now) = committed_map.get(&key) {
-            if !score_equal(now, before)? {
+            if now != before {
                 return Err(changed);
             }
             deleted.insert(key);
@@ -187,21 +181,11 @@ fn merge_entries(
     Ok(merged)
 }
 
-/// Returns the int of the key of a posting dict.
-fn key_of(key: Value) -> i128 {
-    match key {
-        Value::Int(key) => key,
-        _ => unreachable!("a posting dict has int keys"),
-    }
-}
-
-/// Tells if two scores are equal. An int and a float stop the merge with no
-/// answer: Python compares them, and the model does not.
-fn score_equal(a: Value, b: Value) -> Result<bool, Outcome> {
-    match (a, b) {
-        (Value::Int(a), Value::Int(b)) => Ok(a == b),
-        (Value::Float(a), Value::Float(b)) => Ok(a == b),
-        _ => Err(Outcome::Undecided("posting scores of an int and a float")),
+/// Returns the int of a key or a score of a posting dict.
+fn int(value: Value) -> i128 {
+    match value {
+        Value::Int(int) => int,
+        _ => unreachable!("a posting dict holds ints"),
     }
 }
 
@@ -209,32 +193,10 @@ fn score_equal(a: Value, b: Value) -> Result<bool, Outcome> {
 mod tests {
     use super::*;
 
-    fn entries(pairs: &[(i128, i128)]) -> Vec<(Value, Value)> {
-        pairs
-            .iter()
-            .map(|&(k, v)| (Value::Int(k), Value::Int(v)))
-            .collect()
-    }
-
-    fn merged(
-        old: &[(i128, i128)],
-        committed: &[(i128, i128)],
-        new: &[(i128, i128)],
-    ) -> Result<Vec<(i128, i128)>, Outcome> {
-        let result = merge_entries(&entries(old), &entries(committed), &entries(new))?;
-        Ok(result
-            .into_iter()
-            .map(|(k, v)| match v {
-                Value::Int(v) => (k, v),
-                other => panic!("{other:?}"),
-            })
-            .collect())
-    }
-
     #[test]
     fn two_new_documents_join_one_word() {
         assert_eq!(
-            merged(
+            merge_entries(
                 &[(1, 3), (2, 1)],
                 &[(1, 3), (2, 1), (3, 4)],
                 &[(1, 3), (2, 1), (4, 2)]
@@ -246,7 +208,7 @@ mod tests {
     #[test]
     fn a_change_a_delete_and_an_insert_merge() {
         assert_eq!(
-            merged(
+            merge_entries(
                 &[(1, 3), (2, 1), (5, 5)],
                 &[(1, 7), (2, 1), (5, 5)],
                 &[(1, 3), (5, 5), (4, 2)]
@@ -255,7 +217,7 @@ mod tests {
         );
         // The same change on both sides, and a delete on both sides.
         assert_eq!(
-            merged(&[(1, 3), (2, 1)], &[(1, 4)], &[(1, 4)]),
+            merge_entries(&[(1, 3), (2, 1)], &[(1, 4)], &[(1, 4)]),
             Ok(vec![(1, 4)])
         );
     }
@@ -263,39 +225,40 @@ mod tests {
     #[test]
     fn the_rule_refuses() {
         let changed = Err(Outcome::Refused(Reason::PostingChanged));
-        assert_eq!(merged(&[(1, 3)], &[(1, 5)], &[(1, 6)]), changed);
+        assert_eq!(merge_entries(&[(1, 3)], &[(1, 5)], &[(1, 6)]), changed);
         assert_eq!(
-            merged(&[(1, 3), (2, 1)], &[(2, 1)], &[(1, 6), (2, 1)]),
+            merge_entries(&[(1, 3), (2, 1)], &[(2, 1)], &[(1, 6), (2, 1)]),
             changed
         );
         assert_eq!(
-            merged(&[(1, 3), (2, 1)], &[(1, 6), (2, 1)], &[(2, 1)]),
+            merge_entries(&[(1, 3), (2, 1)], &[(1, 6), (2, 1)], &[(2, 1)]),
             changed
         );
         assert_eq!(
-            merged(&[(2, 1)], &[(2, 1), (1, 3)], &[(2, 1), (1, 4)]),
+            merge_entries(&[(2, 1)], &[(2, 1), (1, 3)], &[(2, 1), (1, 4)]),
             changed
         );
         let nine: Vec<(i128, i128)> = (1..10).map(|d| (d, 1)).collect();
         let committed = [&nine[..], &[(20, 1)]].concat();
         let new = [&nine[..], &[(21, 1)]].concat();
         assert_eq!(
-            merged(&nine, &committed, &new),
+            merge_entries(&nine, &committed, &new),
             Err(Outcome::Refused(Reason::PostingTooLarge))
         );
         assert_eq!(
-            merged(&[(1, 3), (2, 1)], &[(1, 3)], &[(2, 1)]),
+            merge_entries(&[(1, 3), (2, 1)], &[(1, 3)], &[(2, 1)]),
             Err(Outcome::Refused(Reason::PostingEmpty))
         );
     }
 
     #[test]
-    fn an_int_against_a_float_has_no_answer() {
-        let old = vec![(Value::Int(1), Value::Int(3))];
-        let new = vec![(Value::Int(1), Value::Float(3.0))];
-        assert!(matches!(
-            merge_entries(&old, &old, &new),
-            Err(Outcome::Undecided(_))
-        ));
+    fn a_dict_of_float_scores_is_not_a_posting_dict() {
+        let mut heap = Heap::new();
+        let floats = heap.new_dict(vec![(Value::Int(1), Value::Float(0.5))]);
+        let ints = heap.new_dict(vec![(Value::Int(1), Value::Int(3))]);
+        assert!(entries(&heap, floats).is_none());
+        assert!(entries(&heap, ints).is_some());
+        // Neither side is a posting dict, so BTrees compares them.
+        assert_eq!(equal(&heap, floats, floats), None);
     }
 }

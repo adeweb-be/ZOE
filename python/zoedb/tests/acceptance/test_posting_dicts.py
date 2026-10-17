@@ -14,7 +14,8 @@ that holds one bucket:
   calls `tryToResolveConflict` in the client for none of them;
 - each refusal case raises `ConflictError`: one entry changed differently
   on both sides; a delete of the word against a change of its dict; a
-  dict against an `IIBTree`; a merged dict of more than 10 entries.
+  dict against an `IIBTree`; a merged dict of more than 10 entries; dicts
+  of float scores, which are not posting dicts.
 
 With the rule off, a case gives the result of FileStorage with ZODB's
 resolver, as today.
@@ -170,7 +171,7 @@ class Case:
     merged: dict | None
 
 
-BASE = {10: {1: 3, 2: 1}, 20: {1: 2}, 30: {5: 1}, 40: {1: 0.5}}
+BASE = {10: {1: 3, 2: 1}, 20: {1: 2}, 30: {5: 1}, 40: {1: 1}}
 NINE = {50: {docid: 1 for docid in range(1, 10)}}
 EIGHT = {50: {docid: 1 for docid in range(1, 9)}}
 
@@ -195,13 +196,6 @@ MERGES = [
         {10: {1: 3}},
         {10: {1: 3, 2: 1, 4: 2}},
         {**BASE, 10: {1: 3, 4: 2}},
-    ),
-    Case(
-        "float scores",
-        BASE,
-        {40: {1: 0.5, 2: 0.25}},
-        {40: {1: 0.5, 3: 1.5}},
-        {**BASE, 40: {1: 0.5, 2: 0.25, 3: 1.5}},
     ),
     Case(
         "other words change too",
@@ -246,6 +240,13 @@ REFUSALS = [
         NINE,
         {50: {**NINE[50], 20: 1}},
         {50: {**NINE[50], 21: 1}},
+        None,
+    ),
+    Case(
+        "float scores",
+        {**BASE, 40: {1: 0.5}},
+        {40: {1: 0.5, 2: 0.25}},
+        {40: {1: 0.5, 3: 1.5}},
         None,
     ),
 ]
