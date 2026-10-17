@@ -247,8 +247,10 @@ crash runs="200" seed="" seeds="200":
 # that follow go to `bin/test`. `just plone zeoclient suites` runs them
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
-# plone.testing. `just plone <scenario> creators THREADS ITEMS SEED` creates
-# a Plone site, sets the counter of portal_uidgenerator to SEED, and runs
+# plone.testing. `just plone zoe backends` runs the suite of plone.locking
+# on the locking backend of zoe.plone, with the tests of zoe.plone.
+# `just plone <scenario> creators THREADS ITEMS SEED` creates a Plone site,
+# sets the counter of portal_uidgenerator to SEED, and runs
 # plone/creators.py: THREADS threads that create ITEMS Documents each. Its
 # last line of stdout is a JSON report. It runs on zoe, zeoclient and
 # zoeclient; for zeoclient and zoeclient, it starts `zoe serve` on a new
@@ -343,6 +345,13 @@ plone scenario="zoe" command="start" *args:
                 exit 2
                 ;;
         esac
+        parts=("buildout:parts+=test")
+    fi
+    if [ "{{ command }}" = backends ]; then
+        if [ "{{ scenario }}" != zoe ]; then
+            echo "just plone: the suites of the backends run on zoe." >&2
+            exit 2
+        fi
         parts=("buildout:parts+=test")
     fi
     # -N installs only what is missing. The user has an empty password, so
@@ -471,6 +480,15 @@ plone scenario="zoe" command="start" *args:
             set -- {{ args }}
             "$target/{{ scenario }}/bin/test" -s Products.CMFPlone \
                 -s plone.app.contenttypes -s plone.restapi "$@"
+            ;;
+        backends)
+            # The suite of plone.locking, unchanged, on the locking backend
+            # of zoe.plone, with the tests of zoe.plone: the layer of
+            # zoe.plone.testing installs the backends that
+            # ZOE_PLONE_BACKENDS names.
+            set -- {{ args }}
+            ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
+                -s plone.locking -s zoe.plone "$@"
             ;;
         creators)
             # The creators script runs in the instance with the storage of

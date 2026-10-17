@@ -16,7 +16,7 @@ from pathlib import Path
 
 from plonebench import analysis, ledger
 
-STACK_ORDER = ["zeo", "zoe-native", "zoe-asyncio", "zoe-stock"]
+STACK_ORDER = ["zeo", "zoe-native", "zoe-native-kv", "zoe-asyncio", "zoe-stock"]
 
 
 def load(runs: list[Path]) -> list[dict]:

@@ -32,13 +32,18 @@
 //!   conflict: a vote that failed with a conflict, or a transaction that
 //!   ended between the two votes, so that the client raised
 //!   `ConflictError`.
+//! - `zoe_writes_on_get_total{class}`: the records that the transactions
+//!   of GET and HEAD requests committed, by class (F32). `zoe.plone`
+//!   marks such a transaction with the key `zoe.request_method` of its
+//!   extension.
 //! - `zoe_clients_connected`: the connections that registered.
 //! - `zoe_invalidation_queue_depth`: the messages that wait in the deepest
 //!   hub queue among the connections of the storage.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::invalidation::Invalidations;
@@ -147,6 +152,9 @@ pub(crate) struct Metrics {
     pub(crate) intent_lock_wait: Histogram,
     /// The conflicts that reached the client as `ConflictError`.
     pub(crate) conflicts_raised: AtomicU64,
+    /// The records that the transactions of GET and HEAD requests
+    /// committed, by class.
+    writes_on_get: Mutex<BTreeMap<String, u64>>,
     /// The oids in conflict that tier 1 or tier 2 merged in a vote that
     /// passed.
     pub(crate) conflicts_native: AtomicU64,
@@ -159,6 +167,26 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
+    /// Add `classes`, the records of a commit of a GET or a HEAD request by
+    /// class, to the counts of the report.
+    pub(crate) fn add_writes_on_get(&self, classes: BTreeMap<String, u64>) {
+        let mut counts = self
+            .writes_on_get
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (class, n) in classes {
+            *counts.entry(class).or_default() += n;
+        }
+    }
+
+    /// Return the counts of the report.
+    fn writes_on_get(&self) -> BTreeMap<String, u64> {
+        self.writes_on_get
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Count the results of tiers 1 and 2 of one vote.
     pub(crate) fn count_resolutions(&self, resolutions: &[zoe_core::Resolution]) {
         use zoe_core::{Mode, Resolved};
@@ -201,6 +229,7 @@ impl Default for Metrics {
             intent_locks: AtomicU64::new(0),
             intent_lock_wait: Histogram::new(SECONDS),
             conflicts_raised: AtomicU64::new(0),
+            writes_on_get: Mutex::new(BTreeMap::new()),
             conflicts_native: AtomicU64::new(0),
             structural_merges: Default::default(),
             shadow_verifications: Default::default(),
@@ -390,6 +419,19 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         "The number of transactions that raised a conflict: a vote that failed with a conflict, or an end between the two votes.",
         &|s| get(&s.metrics.conflicts_raised),
     );
+    let name = "zoe_writes_on_get_total";
+    head(
+        &mut out,
+        name,
+        "counter",
+        "The number of records that the transactions of GET and HEAD requests committed, by class.",
+    );
+    for (storage, labels) in &storages {
+        for (class, n) in storage.metrics.writes_on_get() {
+            let class = escape(&class);
+            let _ = writeln!(out, "{name}{{{labels},class=\"{class}\"}} {n}");
+        }
+    }
     scalar(
         &mut out,
         "zoe_clients_connected",
@@ -457,9 +499,33 @@ mod tests {
         Stats::add(&one.stats.loads);
         one.metrics.batch_synced(3);
         one.metrics.locks_acquired(Duration::from_millis(2));
+        let classes = |items: &[(&str, u64)]| {
+            items
+                .iter()
+                .map(|&(class, n)| (class.to_owned(), n))
+                .collect::<BTreeMap<_, _>>()
+        };
+        one.metrics
+            .add_writes_on_get(classes(&[("persistent.mapping.PersistentMapping", 2)]));
+        one.metrics.add_writes_on_get(classes(&[
+            ("persistent.mapping.PersistentMapping", 1),
+            ("BTrees.Length.Length", 1),
+        ]));
         one.metrics.locks_handed_off(2);
         let text = render(&[one, exported("a\"b")]);
-        assert_eq!(text.matches("# TYPE ").count(), 16);
+        assert_eq!(text.matches("# TYPE ").count(), 17);
+        assert!(
+            text.contains(
+                "zoe_writes_on_get_total{storage=\"1\",class=\"persistent.mapping.PersistentMapping\"} 3\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "zoe_writes_on_get_total{storage=\"1\",class=\"BTrees.Length.Length\"} 1\n"
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("zoe_lock_handoffs_total{storage=\"1\"} 2\n"),
             "{text}"
@@ -525,6 +591,7 @@ mod tests {
         assert!(help("zoe_fsync_batch_size").contains("in commits"));
         assert!(help("zoe_conflicts_resolved_total").contains("oids"));
         assert!(help("zoe_conflicts_raised_total").contains("transactions"));
+        assert!(help("zoe_writes_on_get_total").contains("by class"));
         assert!(help("zoe_lock_handoffs_total").contains("locks"));
         assert!(help("zoe_intent_locks_total").contains("intent locks"));
         assert!(help("zoe_intent_lock_wait_seconds").ends_with("in seconds."));

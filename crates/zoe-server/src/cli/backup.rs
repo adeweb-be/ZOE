@@ -74,7 +74,8 @@ fn write_report(out: &mut dyn Write, path: &Path, to: &Path, report: &Backup) ->
     writeln!(out, "  records       {}", report.records)?;
     let (blobs, bytes) = (report.blobs, report.blob_bytes);
     writeln!(out, "  blobs         {blobs} ({bytes} bytes)")?;
-    writeln!(out, "  sequences     {}", report.sequences)
+    writeln!(out, "  sequences     {}", report.sequences)?;
+    writeln!(out, "  durable rows  {}", report.durable_rows)
 }
 
 #[cfg(test)]
@@ -93,6 +94,7 @@ mod tests {
             blobs: 1,
             blob_bytes: 10,
             sequences: 1,
+            durable_rows: 0,
         }
     }
 

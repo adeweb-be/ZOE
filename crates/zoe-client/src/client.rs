@@ -32,7 +32,7 @@ use std::time::Duration;
 use rmpv::Value;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
-use zoe_core::{Oid, Tid};
+use zoe_core::{Flavour, Oid, Tid};
 
 use crate::Error;
 use crate::endpoint::{Address, Endpoint};
@@ -712,6 +712,83 @@ impl Client {
         reply.as_u64().ok_or_else(|| bad("sequence_next", &reply))
     }
 
+    /// Fail with `Error::Unsupported` when the server did not accept the
+    /// extension `kv` of the namespaces.
+    fn check_kv(&self) -> Result<(), Error> {
+        if self.extensions.iter().any(|accepted| accepted == KV) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "the server did not accept the extension {KV}"
+        )))
+    }
+
+    /// Return the value of `key` in the namespace `name` of `flavour`, or
+    /// `None` when the key has no value or is expired. It needs the
+    /// extension `kv`: without it, it fails with `Error::Unsupported` and
+    /// sends nothing.
+    pub async fn kv_get(
+        &self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.check_kv()?;
+        let args = vec![flavour.name().into(), name.into(), key.into()];
+        match self.inner.call("kv_get", args).await? {
+            Value::Nil => Ok(None),
+            Value::Binary(value) => Ok(Some(value)),
+            other => Err(bad("kv_get", &other)),
+        }
+    }
+
+    /// Return at most `limit` pairs of the namespace `name` of `flavour`,
+    /// in the byte order of the keys, from `start` (included) to `stop`
+    /// (excluded). `None` is an open end. The server gives at most 1,000
+    /// pairs. It needs the extension `kv`, as `kv_get` does.
+    pub async fn kv_scan(
+        &self,
+        flavour: Flavour,
+        name: &str,
+        start: Option<&[u8]>,
+        stop: Option<&[u8]>,
+        limit: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        self.check_kv()?;
+        let bound = |bound: Option<&[u8]>| bound.map_or(Value::Nil, Value::from);
+        let args = vec![
+            flavour.name().into(),
+            name.into(),
+            bound(start),
+            bound(stop),
+            limit.into(),
+        ];
+        let reply = self.inner.call("kv_scan", args).await?;
+        let Value::Array(pairs) = reply else {
+            return Err(bad("kv_scan", &reply));
+        };
+        pairs
+            .into_iter()
+            .map(|pair| match pair {
+                Value::Array(items) => match <[Value; 2]>::try_from(items) {
+                    Ok([Value::Binary(key), Value::Binary(value)]) => Ok((key, value)),
+                    Ok(items) => Err(bad("kv_scan", &Value::Array(items.into()))),
+                    Err(items) => Err(bad("kv_scan", &Value::Array(items))),
+                },
+                other => Err(bad("kv_scan", &other)),
+            })
+            .collect()
+    }
+
+    /// Return the generation of the durable namespace `name`: the tid of
+    /// the last commit that wrote it, or `Tid(0)`. It needs the extension
+    /// `kv`, as `kv_get` does.
+    pub async fn kv_generation(&self, name: &str) -> Result<Tid, Error> {
+        self.check_kv()?;
+        let reply = self.inner.call("kv_generation", vec![name.into()]).await?;
+        self::tid(&reply, "kv_generation")
+    }
+
     /// Take the early write-intent lock of each oid of `oids`, in ascending
     /// order, for the next transaction of this connection (ADR 0045).
     /// Return the current serial of each oid, in the same order, when the
@@ -858,6 +935,7 @@ impl Client {
             open: true,
             ended: false,
             guard: Some(guard),
+            kv: self.check_kv().is_ok(),
         })
     }
 
@@ -942,6 +1020,8 @@ pub struct Transaction {
     ended: bool,
     /// The commit lock of the client. The drop gives it to `abort_later`.
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// True when the server accepted the extension `kv`.
+    kv: bool,
 }
 
 impl Transaction {
@@ -985,6 +1065,59 @@ impl Transaction {
                 vec![bin8(oid.0), bin8(serial.0), self.id.into()],
             )
             .await
+    }
+
+    /// Stage a write of `value` for `key` in the namespace `name` of
+    /// `flavour`: `kv_set`, without a reply. An ephemeral key needs `ttl`,
+    /// in seconds; a durable key takes none. The write commits with the
+    /// transaction. The server reports an error of the write at the vote.
+    /// It needs the extension `kv`: without it, it fails with
+    /// `Error::Unsupported` and sends nothing. After a failed vote, it fails
+    /// with `Error::Invalid` and sends nothing.
+    pub async fn kv_set(
+        &mut self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<f64>,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.check_kv()?;
+        let ttl = ttl.map_or(Value::Nil, Value::F64);
+        let args = vec![
+            flavour.name().into(),
+            name.into(),
+            key.into(),
+            value.into(),
+            ttl,
+        ];
+        self.inner.notify("kv_set", args).await
+    }
+
+    /// Stage a delete of `key` in the namespace `name` of `flavour`:
+    /// `kv_delete`, with the rules of `kv_set`.
+    pub async fn kv_delete(
+        &mut self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.check_kv()?;
+        let args = vec![flavour.name().into(), name.into(), key.into()];
+        self.inner.notify("kv_delete", args).await
+    }
+
+    /// Fail with `Error::Unsupported` when the server did not accept the
+    /// extension `kv`.
+    fn check_kv(&self) -> Result<(), Error> {
+        if self.kv {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "the server did not accept the extension {KV}"
+        )))
     }
 
     /// Copy a record of another storage into a transaction that began with
@@ -1651,6 +1784,8 @@ async fn beat(inner: Arc<Inner>, _alive: mpsc::Sender<()>) {
 /// The extension of the sequences.
 const SEQUENCES: &str = "sequences";
 
+/// The extension of the KV namespaces.
+const KV: &str = "kv";
 /// The extension of the early write-intent locks.
 const LOCK_INTENT: &str = "lock_intent";
 

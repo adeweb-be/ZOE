@@ -48,6 +48,9 @@ class StackConfig:
     description: str
     # What differs from the baseline `zeo`.
     differs: tuple[str, ...] = ()
+    # The backends of zoe.plone that the instances install, for
+    # ZOE_PLONE_BACKENDS in zope.conf; empty for none.
+    backends: str = ""
 
 
 STACKS = {
@@ -78,6 +81,28 @@ STACKS = {
             "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
             "conflicts: the client resolves through the vote (tier 3)",
         ),
+    ),
+    "zoe-native-kv": StackConfig(
+        name="zoe-native-kv",
+        scenario="zoeclient",
+        server="zoe",
+        section="zoeclient",
+        native=True,
+        description=(
+            "zoe-native with the locking backend of zoe.plone: the locks of "
+            "plone.locking in the ephemeral namespace of the store (ADR 0043)"
+        ),
+        differs=(
+            "server: zoe serve (redb store, raw records unless --zoe-compression, "
+            "per-oid locks, group commit)",
+            "client: native Rust client (msgpack M5), extensions sequences, kv "
+            "and trace_context declared",
+            "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
+            "zoe.plone: the locks of edit forms live in the ephemeral namespace "
+            "of the store, so a lock writes no object",
+            "conflicts: the client resolves through the vote (tier 3)",
+        ),
+        backends="locking",
     ),
     "zoe-asyncio": StackConfig(
         name="zoe-asyncio",
@@ -263,6 +288,7 @@ def storage_section(
 def zope_conf(config: StackConfig, settings: Settings, home: Path, name: str) -> str:
     """Return the zope.conf of an instance, or of a script client."""
     head = "%import zoe\n" if config.section == "zoeclient" else ""
+    backends = f"\n    ZOE_PLONE_BACKENDS {config.backends}" if config.backends else ""
     instancehome = PLONE / config.scenario / "parts" / "instance"
     return f"""{head}%define INSTANCEHOME {instancehome}
 instancehome $INSTANCEHOME
@@ -273,7 +299,7 @@ security-policy-implementation C
 verbose-security off
 default-zpublisher-encoding utf-8
 <environment>
-    CHAMELEON_CACHE {home / "var" / "cache"}
+    CHAMELEON_CACHE {home / "var" / "cache"}{backends}
 </environment>
 <zodb_db main>
     cache-size {settings.zodb_cache_objects}
@@ -457,8 +483,12 @@ class Stack:
     # The server.
 
     def start_server(self, timeout: float = 120.0) -> None:
-        if port_open(self.settings.server_port):
-            raise RuntimeError(f"port {self.settings.server_port} is in use")
+        # Each port of the run is free first: another run can hold any of them.
+        ports = [self.settings.server_port, self.settings.admin_port]
+        ports += [self.settings.base_port + i for i in range(self.settings.instances)]
+        for port in ports:
+            if port_open(port):
+                raise RuntimeError(f"port {port} is in use")
         log = open(self.run / "log" / "server.out", "w")
         self.logs.append(log)
         taskset = pin(self.settings.server_cpus)

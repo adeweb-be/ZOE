@@ -6,9 +6,11 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use crate::error::{Result, ZoeError};
 use crate::format::Codec;
+use crate::kv::{Flavour, Swept};
 use crate::types::{Oid, Tid};
 
 /// The bytes of a pickle or of a metadata field.
@@ -284,6 +286,24 @@ pub trait Backend: Send + Sync {
         ))
     }
 
+    /// Store `bytes` in the row `row` of the namespaces of `flavour`, or in
+    /// the index of the expiries for `None`, with no check, in a write
+    /// transaction of its own. `None` for `bytes` removes the row. Only
+    /// the test hook `testing` calls it. A backend without the hook gives
+    /// a `Backend` error.
+    #[cfg(feature = "testing")]
+    fn write_kv_stored(
+        &self,
+        flavour: Option<Flavour>,
+        row: &[u8],
+        bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let _ = (flavour, row, bytes);
+        Err(ZoeError::Backend(
+            "no test hook to write a namespace row".into(),
+        ))
+    }
+
     /// Remove the key `(tid, oid)` of the transaction index and keep the
     /// record. A test uses it to damage a store. Fail with `NotFound` when
     /// the key does not exist.
@@ -311,6 +331,31 @@ pub trait Backend: Send + Sync {
     /// that does not decode, such as a name that is not UTF-8, fails the
     /// whole call with an error, not a panic.
     fn sequence_names(&self) -> Result<Vec<String>>;
+
+    /// Return the stored bytes of the row `row` of the namespaces of
+    /// `flavour`, as stored: the caller checks the frame. A store without
+    /// the table of the flavour has no row.
+    fn kv_row(&self, flavour: Flavour, row: &[u8]) -> Result<Option<Bytes>>;
+
+    /// Return the rows of the namespaces of `flavour` from `from` to `to`,
+    /// in key order, at most `limit` of them, with their stored bytes. One
+    /// snapshot gives the list. A key outside the bounds, or a key that
+    /// does not come after the key before it, is `CorruptKv`. A store
+    /// without the table of the flavour has no row.
+    fn kv_rows(
+        &self,
+        flavour: Flavour,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>>;
+
+    /// Tell if the index of the expiries holds `key`.
+    fn kv_expiry_has(&self, key: &[u8]) -> Result<bool>;
+
+    /// Tell if the store has the table of the namespaces of `flavour`. The
+    /// first commit that writes a key of the flavour creates it.
+    fn has_kv(&self, flavour: Flavour) -> Result<bool>;
 }
 
 /// A version that a commit writes: the oid, the serial of the previous
@@ -332,9 +377,9 @@ pub enum Payload<'a> {
 pub type NewPayload<'a> = (Oid, Tid, Payload<'a>);
 
 /// One backend write transaction. It holds the records, their keys in
-/// the transaction index, the blob records, the transaction rows and the
-/// meta update of the commits of one commit batch, or the sequence row of
-/// one reservation.
+/// the transaction index, the blob records, the transaction rows, the
+/// namespace writes and the meta update of the commits of one commit
+/// batch, or the sequence row of one reservation, or one sweep step.
 pub trait WriteTxn {
     /// Stage the version of `oid` that `tid` writes, and its key
     /// `(tid, oid)` in the transaction index. `prev` is the serial of the
@@ -421,6 +466,27 @@ pub trait WriteTxn {
     /// that the store has not reserved.
     fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()>;
 
+    /// Stage the row `row` of the namespaces of `flavour` with `payload`, in
+    /// a frame of the key space of the flavour. Create the table of the
+    /// flavour when the store has none.
+    fn put_kv(&mut self, flavour: Flavour, row: &[u8], payload: &[u8]) -> Result<()>;
+
+    /// Stage the removal of the row `row` of the namespaces of `flavour`. A
+    /// row that does not exist stays absent.
+    fn remove_kv(&mut self, flavour: Flavour, row: &[u8]) -> Result<()>;
+
+    /// Stage `key` in the index of the expiries. Create the index when the
+    /// store has none.
+    fn put_kv_expiry(&mut self, key: &[u8]) -> Result<()>;
+
+    /// Stage one sweep step at the time `now`, in milliseconds since the
+    /// Unix epoch. Take the keys of the index of the expiries whose expiry
+    /// is at or before `now`, at most `limit`, in key order, and remove each
+    /// one. Remove the ephemeral row of each key when the row passes its
+    /// checksum and its own expiry is at or before `now`. Every other row
+    /// stays.
+    fn sweep_kv(&mut self, now: u64, limit: usize) -> Result<Swept>;
+
     /// Commit the staged writes. The writes are durable when this returns.
     fn commit(self: Box<Self>) -> Result<()>;
 
@@ -479,6 +545,22 @@ mod tests {
 
         fn put_sequence_end(&mut self, _: &str, _: u64) -> Result<()> {
             Ok(())
+        }
+
+        fn put_kv(&mut self, _: Flavour, _: &[u8], _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_kv(&mut self, _: Flavour, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn put_kv_expiry(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn sweep_kv(&mut self, _: u64, _: usize) -> Result<Swept> {
+            Ok(Swept::default())
         }
 
         fn commit(self: Box<Self>) -> Result<()> {
@@ -561,6 +643,28 @@ mod tests {
 
         fn sequence_names(&self) -> Result<Vec<String>> {
             Ok(Vec::new())
+        }
+
+        fn kv_row(&self, _: Flavour, _: &[u8]) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        fn kv_rows(
+            &self,
+            _: Flavour,
+            _: Bound<&[u8]>,
+            _: Bound<&[u8]>,
+            _: usize,
+        ) -> Result<Vec<(Bytes, Bytes)>> {
+            Ok(Vec::new())
+        }
+
+        fn kv_expiry_has(&self, _: &[u8]) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn has_kv(&self, _: Flavour) -> Result<bool> {
+            Ok(false)
         }
     }
 

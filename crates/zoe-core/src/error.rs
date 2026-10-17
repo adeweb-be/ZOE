@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::guard::SizeLimit;
+use crate::kv::Flavour;
 use crate::types::{Oid, Tid};
 
 /// The result type of the core.
@@ -58,6 +59,44 @@ pub enum ZoeError {
     CorruptSequence {
         /// The name of the sequence.
         name: String,
+    },
+
+    /// The checksum of a row of a KV namespace does not match its key and
+    /// its bytes, or its payload does not decode, or a scan of the rows gave
+    /// a key outside the scan or out of order. The error names the flavour,
+    /// the namespace and the length of the key, never the key: a key can be
+    /// a session id.
+    #[error("corrupt row of the {} namespace {name:?}: a key of {key_len} bytes", .flavour.name())]
+    CorruptKv {
+        /// The flavour of the namespace.
+        flavour: Flavour,
+        /// The name of the namespace, as the key of the row gives it. It is
+        /// empty when the key gives no name.
+        name: String,
+        /// The length of the key of the row.
+        key_len: usize,
+    },
+
+    /// A call of a KV namespace has a bad argument: an empty name or a name
+    /// longer than 255 bytes, an empty key or a key longer than 1,024
+    /// bytes, a TTL of 0 or longer than 2^32 - 1 seconds, a TTL for a
+    /// durable key or none for an ephemeral key, or a scan limit of 0. The
+    /// call changes nothing.
+    #[error("invalid namespace call: {0}")]
+    InvalidKv(&'static str),
+
+    /// A value of a namespace write is over `max-record-size`, or takes the
+    /// transaction past `max-transaction-size`. The transaction refuses the
+    /// call and stages nothing. The message holds no key and no value.
+    #[error("namespace write refused: {} of {size} bytes, over {} ({max} bytes)", .limit.subject(), .limit.key())]
+    KvTooLarge {
+        /// The limit that refused the call.
+        limit: SizeLimit,
+        /// The size that the call gives, in bytes: the value, or the sum of
+        /// the pickles and the values of the transaction.
+        size: u64,
+        /// The limit, in bytes.
+        max: u64,
     },
 
     /// Another transaction changed the object since the serial that this

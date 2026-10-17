@@ -10,6 +10,10 @@ stack does not change, so the suites run unchanged.
 - `install(zeo="host:port")` uses a `ZEO.ClientStorage` of the `zoe serve`
   at that address.
 
+`ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
+on, separated by commas: `locking` is the only one. `install` installs
+them.
+
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of
 `STARTUP`. zope.testrunner then sets up the layer before `STARTUP` and
@@ -107,6 +111,9 @@ def install(zeo=None):
     as `host:port`, it is a ZEO client of the `zoe serve` at that address
     (`ZOE_SERVE`). Return the layer.
     """
+    from zoe.plone import backends_from_environment
+
+    backends_from_environment()
     if zeo is None:
         layer = ZOE_STORAGE
     else:

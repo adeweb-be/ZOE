@@ -77,6 +77,7 @@ use zoe_client::{
 use zoe_core::{Oid, Tid};
 
 use crate::errors::{self, p64, u64_of};
+use crate::kv;
 
 /// The number of worker threads of the runtime of the native clients.
 const WORKERS: usize = 2;
@@ -840,6 +841,68 @@ impl NativeClient {
             .map_err(|e| client_error(py, e))
     }
 
+    /// Return the value of `key` in the namespace `name` of `flavour`, or
+    /// `None`. Raise `Unsupported` when the server did not accept `kv`.
+    fn kv_get<'py>(
+        &self,
+        py: Python<'py>,
+        flavour: &str,
+        name: String,
+        key: Vec<u8>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let flavour = kv::flavour(flavour)?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let value = py
+            .detach(move || runtime.block_on(traced(trace, pool.kv_get(flavour, &name, &key))))
+            .map_err(|e| client_error(py, e))?;
+        Ok(value.map(|value| PyBytes::new(py, &value)))
+    }
+
+    /// Return the pairs of the namespace `name` of `flavour`, as
+    /// `zoe.Storage.kv_scan` does. Raise `Unsupported` when the server did
+    /// not accept `kv`.
+    #[pyo3(signature = (flavour, name, start = None, stop = None, limit = 1000))]
+    fn kv_scan<'py>(
+        &self,
+        py: Python<'py>,
+        flavour: &str,
+        name: String,
+        start: Option<Vec<u8>>,
+        stop: Option<Vec<u8>>,
+        limit: i64,
+    ) -> PyResult<Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>> {
+        let flavour = kv::flavour(flavour)?;
+        let limit = u64::try_from(limit)
+            .map_err(|_| PyValueError::new_err("the limit of a scan is less than 1"))?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let pairs = py
+            .detach(move || {
+                let scan = pool.kv_scan(flavour, &name, start.as_deref(), stop.as_deref(), limit);
+                runtime.block_on(traced(trace, scan))
+            })
+            .map_err(|e| client_error(py, e))?;
+        Ok(pairs
+            .iter()
+            .map(|(key, value)| (PyBytes::new(py, key), PyBytes::new(py, value)))
+            .collect())
+    }
+
+    /// Return the generation of the durable namespace `name`, as 8 bytes.
+    /// Raise `Unsupported` when the server did not accept `kv`.
+    fn kv_generation<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let tid = py
+            .detach(move || runtime.block_on(traced(trace, pool.kv_generation(&name))))
+            .map_err(|e| client_error(py, e))?;
+        Ok(PyBytes::new(py, &tid.0.to_be_bytes()))
+    }
+
     /// Return a new owner of early write-intent locks (ADR 0045). It
     /// holds no lock and no connection.
     fn intents(&self) -> NativeIntents {
@@ -1266,6 +1329,47 @@ impl NativeTransaction {
             let txn = slot.as_mut().ok_or_else(not_open)?;
             let store = txn.store_blob_shared(oid, serial, data, filename);
             runtime.block_on(traced(trace, store))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Stage a write of `value` for `key` in the namespace `name` of
+    /// `flavour`. `ttl` is an int or a float of seconds, or `None`. The
+    /// server reports an error of the write at the vote. Raise
+    /// `Unsupported` when the server did not accept `kv`.
+    fn kv_set(
+        &self,
+        py: Python<'_>,
+        flavour: &str,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let flavour = kv::flavour(flavour)?;
+        let ttl = kv::ttl_seconds(ttl)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            runtime.block_on(traced(trace, txn.kv_set(flavour, name, key, value, ttl)))
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
+    /// Stage a delete of `key` in the namespace `name` of `flavour`, with
+    /// the rules of `kv_set`.
+    fn kv_delete(&self, py: Python<'_>, flavour: &str, name: &str, key: &[u8]) -> PyResult<()> {
+        let flavour = kv::flavour(flavour)?;
+        check_process(self.pid)?;
+        let trace = traceparent(py, self.traceparent.as_ref())?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            let mut slot = lock(&self.txn);
+            let txn = slot.as_mut().ok_or_else(not_open)?;
+            runtime.block_on(traced(trace, txn.kv_delete(flavour, name, key)))
         })
         .map_err(|e| client_error(py, e))
     }

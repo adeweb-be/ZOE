@@ -26,6 +26,7 @@ def parse_steps(text: str) -> list[tuple[int, float]]:
 
 
 def settings_of(args) -> stack.Settings:
+    defaults = stack.Settings()
     return stack.Settings(
         instances=args.instances,
         threads=args.threads,
@@ -38,6 +39,9 @@ def settings_of(args) -> stack.Settings:
         zeo_fsync=args.zeo_fsync,
         zoe_cache_size=args.zoe_cache_size,
         zoe_compression=args.zoe_compression,
+        base_port=defaults.base_port + args.port_offset,
+        server_port=defaults.server_port + args.port_offset,
+        admin_port=defaults.admin_port + args.port_offset,
     )
 
 
@@ -56,6 +60,13 @@ def add_settings(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--locust-cpus", default=defaults.locust_cpus)
     parser.add_argument(
         "--no-probe", action="store_true", help="run without the WSGI probe"
+    )
+    parser.add_argument(
+        "--port-offset",
+        type=int,
+        default=0,
+        help="add this number to every port of the run, so that two runs share "
+        "a machine",
     )
     parser.add_argument(
         "--zeo-fsync",

@@ -15,8 +15,11 @@ MODULES = [
     "zoe.zodb",
     "zoe.asyncio",
     "zoe.testing",
+    "zoe.kv",
     "zoe.plone",
     "zoe.plone.uidgenerator",
+    "zoe.plone.report",
+    "zoe.plone.locking",
 ]
 
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))

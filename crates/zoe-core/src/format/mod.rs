@@ -1,11 +1,12 @@
 //! The on-disk format: the frame and its checksum, the keys, and the
-//! values of the transaction rows, the sequence rows and the `meta` rows.
-//! `blob` gives the format of the blob store and of the blob records. This
-//! module is a red zone.
+//! values of the transaction rows, the sequence rows, the rows of the KV
+//! namespaces and the `meta` rows. `blob` gives the format of the blob
+//! store and of the blob records. This module is a red zone.
 //!
 //! Every record, every blob record, every transaction row, every sequence
-//! row and every intent file is a frame: a 32-byte header, the typed-field
-//! slots, then the payload. The header fields are little-endian:
+//! row, every row of a KV namespace and every intent file is a frame: a
+//! 32-byte header, the typed-field slots, then the payload. The header
+//! fields are little-endian:
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
@@ -26,7 +27,8 @@
 //! gives the tags. The key of a record and of a blob record is the 16
 //! bytes of `record_key`. The key of a transaction row and of an intent
 //! file is the 8 bytes of `txn_key`. The key of a sequence row is the
-//! UTF-8 bytes of the name of the sequence. So a frame that is read under
+//! UTF-8 bytes of the name of the sequence. The key of a row of a KV
+//! namespace is the bytes of `kv_key`. So a frame that is read under
 //! another key, or in another key space, fails the check.
 //!
 //! The payload holds the data in the form that the codec byte gives. The
@@ -46,6 +48,18 @@
 //! the oids of that transaction in ascending order. The index has no
 //! frame and no checksum of its own: the checksum of a record frame covers
 //! the oid and the tid of the record.
+//!
+//! The KV namespaces have three key spaces (ADR 0043). `kv_ephemeral` and
+//! `kv_durable` hold one row for each key of a namespace: its key is
+//! `kv_key`, the length of the name in one byte, the name, then the key.
+//! The payload of an ephemeral row is the expiry, a little-endian `u64` of
+//! milliseconds since the Unix epoch, then the value. The payload of a
+//! durable row is the value. The row of a durable namespace with the empty
+//! key is its generation row: its payload is the tid of the last commit
+//! that wrote the namespace, a little-endian `u64`. `kv_expiry` is the
+//! index of the expiries: its key is `kv_expiry_key`, the expiry
+//! big-endian, then the key of the ephemeral row. Its value is empty, so it
+//! has no frame and no tag, as the transaction index.
 
 pub mod blob;
 
@@ -84,7 +98,7 @@ pub const FORMAT_1_NAME: &[u8] = b"ZOE format 1";
 /// A tag never changes, and no key space takes the tag of another, also
 /// after one is removed. 0 is not a tag. The tag 6 is reserved for the
 /// key space `vectors` that the specification plans. A later frame kind
-/// takes the next free tag.
+/// takes the next free tag: 9.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum KeySpace {
@@ -98,6 +112,10 @@ pub enum KeySpace {
     Intents = 4,
     /// The sequence rows, in `sequences`.
     Sequences = 5,
+    /// The rows of the ephemeral KV namespaces, in `kv_ephemeral`.
+    KvEphemeral = 7,
+    /// The rows of the durable KV namespaces, in `kv_durable`.
+    KvDurable = 8,
 }
 
 impl KeySpace {
@@ -443,6 +461,91 @@ pub fn decode_sequence(payload: &[u8]) -> Result<u64, FrameError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// The most bytes of the name of a KV namespace. The key of a row holds
+/// the length of the name in one byte.
+pub const KV_MAX_NAME_LEN: usize = 255;
+
+/// The most bytes of a key of a KV namespace.
+pub const KV_MAX_KEY_LEN: usize = 1024;
+
+/// The length of the expiry at the start of the payload of an ephemeral
+/// row, and of the payload of a generation row.
+pub const KV_U64_LEN: usize = 8;
+
+/// Return the key of the row of `key` in the KV namespace `name`: the
+/// length of the name in one byte, the name, then the key. The empty key
+/// of a durable namespace is the key of its generation row.
+///
+/// The name is 1 to `KV_MAX_NAME_LEN` bytes. The caller checks it.
+pub fn kv_key(name: &[u8], key: &[u8]) -> Vec<u8> {
+    let len = u8::try_from(name.len()).expect("a namespace name fits in 255 bytes");
+    let mut row = Vec::with_capacity(1 + name.len() + key.len());
+    row.push(len);
+    row.extend_from_slice(name);
+    row.extend_from_slice(key);
+    row
+}
+
+/// Split the key of a row of a KV namespace into the name and the key.
+/// Return `None` when the length of the name is 0 or runs past the end of
+/// the row.
+pub fn split_kv_key(row: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&len, rest) = row.split_first()?;
+    let len = usize::from(len);
+    if len == 0 || rest.len() < len {
+        return None;
+    }
+    Some(rest.split_at(len))
+}
+
+/// Return the key of `row`, the key of an ephemeral row, in the index of
+/// the expiries: `expiry` big-endian, then `row`. So a scan of the index
+/// gives the rows in the order of their expiries.
+pub fn kv_expiry_key(expiry: u64, row: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(KV_U64_LEN + row.len());
+    key.extend_from_slice(&expiry.to_be_bytes());
+    key.extend_from_slice(row);
+    key
+}
+
+/// Split a key of the index of the expiries into the expiry and the key of
+/// the row. Return `None` when the key is shorter than the expiry.
+pub fn split_kv_expiry_key(key: &[u8]) -> Option<(u64, &[u8])> {
+    let (expiry, row) = key.split_at_checked(KV_U64_LEN)?;
+    Some((u64::from_be_bytes(expiry.try_into().unwrap()), row))
+}
+
+/// Encode the payload of an ephemeral row: `expiry` in milliseconds since
+/// the Unix epoch, little-endian, then `value`.
+pub fn encode_kv_ephemeral(expiry: u64, value: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(KV_U64_LEN + value.len());
+    payload.extend_from_slice(&expiry.to_le_bytes());
+    payload.extend_from_slice(value);
+    payload
+}
+
+/// Decode the payload of an ephemeral row. Return the expiry and the
+/// value. A payload shorter than the expiry is `Truncated`.
+pub fn decode_kv_ephemeral(payload: &[u8]) -> Result<(u64, &[u8]), FrameError> {
+    let (expiry, value) = payload
+        .split_at_checked(KV_U64_LEN)
+        .ok_or(FrameError::Truncated)?;
+    Ok((u64::from_le_bytes(expiry.try_into().unwrap()), value))
+}
+
+/// Encode the payload of the generation row of a durable namespace: `tid`,
+/// little-endian.
+pub fn encode_kv_generation(tid: Tid) -> [u8; KV_U64_LEN] {
+    tid.0.to_le_bytes()
+}
+
+/// Decode the payload of the generation row of a durable namespace. A
+/// payload of another length is `Truncated`.
+pub fn decode_kv_generation(payload: &[u8]) -> Result<Tid, FrameError> {
+    let bytes: [u8; KV_U64_LEN] = payload.try_into().map_err(|_| FrameError::Truncated)?;
+    Ok(Tid(u64::from_le_bytes(bytes)))
+}
+
 fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], FrameError> {
     if rest.len() < n {
         return Err(FrameError::Truncated);
@@ -534,18 +637,20 @@ mod tests {
     }
 
     /// Every key space of this build.
-    const SPACES: [KeySpace; 5] = [
+    const SPACES: [KeySpace; 7] = [
         KeySpace::Records,
         KeySpace::Blobs,
         KeySpace::Txns,
         KeySpace::Intents,
         KeySpace::Sequences,
+        KeySpace::KvEphemeral,
+        KeySpace::KvDurable,
     ];
 
     #[test]
     fn the_tags_of_the_key_spaces_never_change() {
         let tags = SPACES.map(KeySpace::tag);
-        assert_eq!(tags, [1, 2, 3, 4, 5]);
+        assert_eq!(tags, [1, 2, 3, 4, 5, 7, 8]);
     }
 
     #[test]
@@ -791,5 +896,98 @@ mod tests {
             assert_eq!(decode_sequence(payload), Err(FrameError::Truncated));
         }
         assert_eq!(decode_sequence(&encode_sequence(u64::MAX)), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn a_kv_key_holds_the_length_of_the_name_the_name_and_the_key() {
+        let row = kv_key(b"sessions", b"id");
+        assert_eq!(row, b"\x08sessionsid");
+        assert_eq!(split_kv_key(&row), Some((&b"sessions"[..], &b"id"[..])));
+        // The generation row of a durable namespace has the empty key.
+        assert_eq!(
+            split_kv_key(&kv_key(b"registry", b"")),
+            Some((&b"registry"[..], &b""[..]))
+        );
+        let longest = vec![b'n'; KV_MAX_NAME_LEN];
+        assert_eq!(kv_key(&longest, b"k")[0], 255);
+    }
+
+    #[test]
+    fn a_kv_key_whose_name_runs_past_the_row_does_not_split() {
+        for row in [&b""[..], b"\x00key", b"\x09sessions", b"\xffshort"] {
+            assert_eq!(split_kv_key(row), None, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn the_keys_of_one_namespace_sort_as_their_bytes() {
+        let a = kv_key(b"sessions", b"a");
+        let b = kv_key(b"sessions", b"ab");
+        let c = kv_key(b"sessions", b"b");
+        assert!(a < b && b < c);
+        // UTF-8 byte order is the code point order of a Python str.
+        let e = kv_key(b"sessions", "\u{e9}".as_bytes());
+        let z = kv_key(b"sessions", "\u{1f600}".as_bytes());
+        assert!(c < e && e < z);
+    }
+
+    #[test]
+    fn an_expiry_key_sorts_by_the_expiry_then_the_row() {
+        let row = kv_key(b"locks", b"doc");
+        let key = kv_expiry_key(0x0102, &row);
+        assert_eq!(&key[..8], &[0, 0, 0, 0, 0, 0, 1, 2]);
+        assert_eq!(split_kv_expiry_key(&key), Some((0x0102, &row[..])));
+        assert!(kv_expiry_key(1, &kv_key(b"z", b"z")) < kv_expiry_key(2, &kv_key(b"a", b"a")));
+        assert_eq!(split_kv_expiry_key(&[0; 7]), None);
+    }
+
+    #[test]
+    fn an_ephemeral_row_is_a_frame_with_the_expiry_then_the_value() {
+        let row = kv_key(b"sessions", b"id");
+        let payload = encode_kv_ephemeral(0x0102, b"value");
+        let frame = encode_frame(
+            KeySpace::KvEphemeral,
+            &row,
+            MAIN_BRANCH,
+            Tid::ZERO,
+            &payload,
+        );
+        assert_eq!(frame[2], CODEC_NONE);
+        assert_eq!(
+            &frame[HEADER_LEN..HEADER_LEN + 8],
+            &[2, 1, 0, 0, 0, 0, 0, 0]
+        );
+        let read = decode_frame(KeySpace::KvEphemeral, &row, &frame).unwrap();
+        assert_eq!(decode_kv_ephemeral(&read.data), Ok((0x0102, &b"value"[..])));
+        assert_eq!(decode_kv_ephemeral(&[0; 7]), Err(FrameError::Truncated));
+        assert_eq!(decode_kv_ephemeral(&[0; 8]), Ok((0, &b""[..])));
+    }
+
+    #[test]
+    fn a_generation_row_holds_a_tid_in_8_bytes() {
+        assert_eq!(encode_kv_generation(Tid(0x0102)), [2, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            decode_kv_generation(&encode_kv_generation(Tid(9))),
+            Ok(Tid(9))
+        );
+        for payload in [&[][..], &[1; 7], &[1; 9]] {
+            assert_eq!(decode_kv_generation(payload), Err(FrameError::Truncated));
+        }
+    }
+
+    #[test]
+    fn a_kv_row_verifies_only_under_its_key_and_in_its_flavour() {
+        let row = kv_key(b"registry", b"plone.title");
+        let frame = encode_frame(KeySpace::KvDurable, &row, MAIN_BRANCH, Tid::ZERO, b"v");
+        assert!(decode_frame(KeySpace::KvDurable, &row, &frame).is_ok());
+        let other = kv_key(b"registry", b"plone.titlf");
+        assert_eq!(
+            decode_frame(KeySpace::KvDurable, &other, &frame),
+            Err(FrameError::Checksum)
+        );
+        assert_eq!(
+            decode_frame(KeySpace::KvEphemeral, &row, &frame),
+            Err(FrameError::Checksum)
+        );
     }
 }

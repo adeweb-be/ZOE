@@ -99,6 +99,17 @@ impl Guardrails {
         }
     }
 
+    /// Check `size` of a value of a namespace write against `limit`, as
+    /// `check` does for a pickle. A refusal is `KvTooLarge`.
+    pub(crate) fn check_kv(&self, limit: SizeLimit, size: u64) -> Result<()> {
+        match self.check(limit, Oid(0), size) {
+            Err(ZoeError::TooLarge {
+                limit, size, max, ..
+            }) => Err(ZoeError::KvTooLarge { limit, size, max }),
+            other => other,
+        }
+    }
+
     /// Log the locks of `held` that were held longer than `lock-warn`,
     /// when the locks are released at `now`. Call it after the release, so
     /// that the log does not lengthen the hold.

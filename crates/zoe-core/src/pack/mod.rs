@@ -22,8 +22,18 @@
 //!    records to remove, at most `batch` of them, the oldest record of an
 //!    oid first. One backend write transaction removes them, their blob
 //!    records, and lowers the oid count of their transaction rows or
-//!    removes the rows that keep no record. The first batch also writes
-//!    `pack_watermark`.
+//!    removes the rows that keep no record. The row at T stays, with an
+//!    oid count of 0 when the pack removes all its records. The first
+//!    batch also writes `pack_watermark`.
+//!
+//! 4. The empty rows: after the last batch of records, the pack removes
+//!    each transaction row before T whose oid count is 0, at most `batch`
+//!    rows in one backend write. These are the rows of the commits that
+//!    wrote no record, such as a commit of KV namespace writes only (ADR
+//!    0043). The row at T stays, so a pack at the last tid keeps the last
+//!    transaction, which a later backup and the clients name. A row with
+//!    an oid count of 0 and keys in the transaction index is `CorruptTxn`,
+//!    and the pack stops before it removes it.
 //!
 //! A finish during the pack writes records after T only, so the records
 //! that the mark reads do not change. Before each batch, under the commit
@@ -264,6 +274,13 @@ impl Store {
             if stop() {
                 return Err(ZoeError::Closed);
             }
+        }
+        let mut from = Tid::ZERO;
+        while let Some(next) = pack.remove_empty_rows(from, batch.max(1))? {
+            if stop() {
+                return Err(ZoeError::Closed);
+            }
+            from = next;
         }
         Ok(pack.report)
     }
@@ -624,7 +641,9 @@ impl<'s> Pack<'s> {
                 }
             }
             for (row, left) in rows {
-                if left == 0 {
+                // The row at T stays: a later backup and the clients name
+                // the last tid of a pack at the last tid.
+                if left == 0 && row.tid != self.tid {
                     write.remove_txn(row.tid)?;
                 } else {
                     write.replace_txn(&TxnMeta {
@@ -644,6 +663,59 @@ impl<'s> Pack<'s> {
         }
         self.watermark = None;
         Ok(())
+    }
+
+    /// Remove the transaction rows from `from` to the tid before T whose
+    /// oid count is 0, at most `batch` of them, in one backend write under
+    /// the commit sequencer. The row at T stays. Return the tid from which
+    /// the next call goes on, or `None` when no such row is left.
+    ///
+    /// Only this pack changes the rows at or before T, so a read outside
+    /// the write gives the current rows. A row that does not read stops
+    /// the pack, and so does a row with an oid count of 0 that has keys in
+    /// the transaction index: the pack never removes the evidence of a
+    /// damaged store.
+    fn remove_empty_rows(&mut self, from: Tid, batch: usize) -> Result<Option<Tid>> {
+        let backend = &self.store.backend;
+        let Some(before) = self.tid.0.checked_sub(1).map(Tid) else {
+            return Ok(None);
+        };
+        let mut empty = Vec::new();
+        let mut next = None;
+        for row in backend.iter_txns(from, before) {
+            let row = row?;
+            if row.oid_count == 0 {
+                if !backend.indexed_tids(row.tid, row.tid, 1)?.is_empty() {
+                    return Err(ZoeError::CorruptTxn { tid: row.tid });
+                }
+                empty.push(row.tid);
+                if empty.len() == batch {
+                    next = row.tid.0.checked_add(1).map(Tid);
+                    break;
+                }
+            }
+        }
+        if empty.is_empty() {
+            return Ok(None);
+        }
+        let mut sequencer = self.store.lock_sequencer();
+        if sequencer.is_none() {
+            return Err(ZoeError::Halted);
+        }
+        let written = (|| {
+            let mut write = backend.begin_write()?;
+            for &tid in &empty {
+                write.remove_txn(tid)?;
+            }
+            write.commit()
+        })();
+        if let Err(error) = written {
+            // The outcome of the write is unknown, as for a batch of
+            // records.
+            *sequencer = None;
+            return Err(error);
+        }
+        Ok(next)
     }
 
     /// Add `removed` to the report.
@@ -941,6 +1013,115 @@ mod tests {
             .collect();
         assert_eq!(history, [(t2, 0)]);
         assert!(matches!(store.load(x), Err(ZoeError::NotFound { .. })));
+    }
+
+    #[test]
+    fn a_pack_removes_the_rows_at_or_before_its_tid_that_keep_no_record() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let root = commit(&store, &[(ROOT, record(&[]))]);
+        // Two commits without a record: an empty one and one of namespace
+        // writes only.
+        let mut empty = store.tpc_begin(b"", b"", b"").unwrap();
+        empty.vote().unwrap();
+        let first = empty.finish().unwrap();
+        let mut kv = store.tpc_begin(b"", b"", b"").unwrap();
+        kv.kv_set(crate::kv::Flavour::Durable, "registry", b"k", b"v", None)
+            .unwrap();
+        kv.vote().unwrap();
+        let second = kv.finish().unwrap();
+        let after = commit(&store, &[(ROOT, record(&[]))]);
+        let mut later = store.tpc_begin(b"", b"", b"").unwrap();
+        later.vote().unwrap();
+        let third = later.finish().unwrap();
+        // A pack at the last commit with a record removes the empty rows
+        // before it and keeps the one after it, in batches of one row. The
+        // first record of the root goes, and its row with it.
+        store.pack_in_batches(after, 1, || {}).unwrap();
+        let rows: Vec<Tid> = store
+            .backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(|row| row.unwrap().tid)
+            .collect();
+        assert_eq!(rows, [after, third]);
+        assert!(!rows.contains(&root));
+        assert!(!rows.contains(&first) && !rows.contains(&second));
+        // The namespace keeps its value: pack never reads it.
+        assert_eq!(
+            store
+                .kv_get(crate::kv::Flavour::Durable, "registry", b"k")
+                .unwrap()
+                .as_deref(),
+            Some(&b"v"[..])
+        );
+        assert_indexed(&store, "after the pack");
+    }
+
+    #[test]
+    fn a_pack_that_removes_every_record_of_its_tid_keeps_its_row() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(ROOT, record(&[]))]);
+        // Nothing refers to oid 1, so the pack removes its only record.
+        let last = commit(&store, &[(Oid(1), record(&[]))]);
+        store.pack(last).unwrap();
+        assert!(store.load(Oid(1)).is_err());
+        let rows: Vec<TxnMeta> = store
+            .backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(|row| row.unwrap())
+            .collect();
+        let at_last = rows.iter().find(|row| row.tid == last).unwrap();
+        assert_eq!(at_last.oid_count, 0);
+        assert_eq!(store.last_transaction(), last);
+        assert_indexed(&store, "after the pack");
+    }
+
+    #[test]
+    fn a_pack_at_an_empty_last_commit_keeps_its_row() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(ROOT, record(&[]))]);
+        let mut empty = store.tpc_begin(b"", b"", b"").unwrap();
+        empty.vote().unwrap();
+        let earlier = empty.finish().unwrap();
+        let mut kv = store.tpc_begin(b"", b"", b"").unwrap();
+        kv.kv_set(crate::kv::Flavour::Durable, "registry", b"k", b"v", None)
+            .unwrap();
+        kv.vote().unwrap();
+        let last = kv.finish().unwrap();
+        store.pack(last).unwrap();
+        let rows: Vec<Tid> = store
+            .backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(|row| row.unwrap().tid)
+            .collect();
+        assert!(!rows.contains(&earlier), "{rows:?}");
+        assert_eq!(rows.last(), Some(&last));
+        assert_eq!(store.last_transaction(), last);
+    }
+
+    #[test]
+    fn an_empty_row_with_index_keys_stops_the_pack_and_stays() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(ROOT, record(&[]))]);
+        let tid = commit(&store, &[(Oid(1), record(&[]))]);
+        // The root links the object, so the pack keeps its record.
+        let last = commit(&store, &[(ROOT, record(&[Oid(1)]))]);
+        // The row of `tid` says that it keeps no record, but its record and
+        // its index key stay.
+        let row = store.backend.iter_txns(tid, tid).next().unwrap().unwrap();
+        let mut write = store.backend.begin_write().unwrap();
+        write
+            .replace_txn(&TxnMeta {
+                oid_count: 0,
+                ..row
+            })
+            .unwrap();
+        write.commit().unwrap();
+        let packed = store.pack(last);
+        assert!(
+            matches!(packed, Err(ZoeError::CorruptTxn { tid: found }) if found == tid),
+            "{packed:?}"
+        );
+        assert!(store.backend.iter_txns(tid, tid).next().is_some());
     }
 
     #[test]

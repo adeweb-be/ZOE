@@ -21,6 +21,11 @@
 //! compression pool (`compress`): `storea` and `restorea` queue a job, and
 //! the first vote waits for the jobs before it takes a lock.
 //!
+//! The extension `kv` gives the KV namespaces of the store (ADR 0043).
+//! `kv_get`, `kv_scan` and `kv_generation` read on the read pool, outside
+//! the transaction. `kv_set` and `kv_delete` stage a write in the open
+//! transaction of the connection, as `storea` stages a record.
+//!
 //! `undoa` queues an undo into the open transaction, and the first vote
 //! stages it before it takes a lock, as ZEO's server does. An undo that no
 //! tier of the core merges fails the vote with `UndoError`: no Python runs
@@ -33,8 +38,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rmpv::Value;
 use zoe_core::{
-    BlobFile, Compression, Finished, IntentLocks, LockCancel, Oid, Store, Tid, Txn, TxnMeta,
-    ZoeError, undo_id, undo_tid,
+    BlobFile, Compression, Finished, Flavour, IntentLocks, LockCancel, Oid, Store, Tid, Txn,
+    TxnMeta, ZoeError, undo_id, undo_tid,
 };
 
 use super::blob::Download;
@@ -111,6 +116,36 @@ const INTERFACES: [(&str, &str); 9] = [
 
 /// The methods that ZEO counts in `stores`.
 const STORES: [&str; 3] = ["storea", "deleteObject", "restorea"];
+
+/// The key of the transaction extension that names the method of the
+/// request of the transaction. `zoe.plone` sets it.
+const REQUEST_METHOD: &str = "zoe.request_method";
+
+/// Tell if `extension`, the map of the extension of `tpc_begin`, marks the
+/// transaction of a GET or a HEAD request.
+fn of_get(extension: &Value) -> bool {
+    let Value::Map(items) = extension else {
+        return false;
+    };
+    items.iter().any(|(key, value)| {
+        key.as_str() == Some(REQUEST_METHOD)
+            && value
+                .as_str()
+                .is_some_and(|m| m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD"))
+    })
+}
+
+/// Return the records that `txn` staged, by class. A deletion and a
+/// pickle whose class does not decode have no class.
+fn classes_of(txn: &Txn<Arc<Store>>) -> std::collections::BTreeMap<String, u64> {
+    let mut classes = std::collections::BTreeMap::new();
+    for oid in txn.staged_oids() {
+        if let Some(class) = txn.staged_class_name(oid) {
+            *classes.entry(class).or_default() += 1;
+        }
+    }
+    classes
+}
 
 /// An exception for the client: its class and its arguments.
 #[derive(Debug, Clone, PartialEq)]
@@ -300,11 +335,13 @@ impl Fault {
             ZoeError::Protocol(_) | ZoeError::LockOrder { .. } | ZoeError::WrongThread => {
                 Self::transaction(text)
             }
+            ZoeError::InvalidKv(_) => Self::value_error(text),
             ZoeError::Halted
             | ZoeError::CorruptRecord { .. }
             | ZoeError::CorruptBlob { .. }
             | ZoeError::CorruptTxn { .. }
             | ZoeError::CorruptSequence { .. }
+            | ZoeError::CorruptKv { .. }
             | ZoeError::Backend(_) => Self::new("ZODB.POSException.StorageSystemError", text),
             _ => Self::new("ZODB.POSException.StorageError", text),
         }
@@ -428,7 +465,7 @@ impl Reply {
 /// The calls of the open transaction of a connection. One thread runs
 /// them in order, from `tpc_begin`, or from the first `lock_intent` before
 /// it, to the end of the transaction.
-const TRANSACTION_CALLS: [&str; 15] = [
+const TRANSACTION_CALLS: [&str; 17] = [
     "lock_intent",
     "unlock_intent",
     "tpc_begin",
@@ -436,6 +473,8 @@ const TRANSACTION_CALLS: [&str; 15] = [
     "restorea",
     "checkCurrentSerialInTransaction",
     "deleteObject",
+    "kv_set",
+    "kv_delete",
     "undoa",
     "vote",
     "tpc_finish",
@@ -502,6 +541,9 @@ struct Open {
     /// until the first vote. The end of the transaction drops them, and
     /// that cancels them.
     jobs: Vec<Job>,
+    /// True for the transaction of a GET or a HEAD request: its commit
+    /// counts its records by class in the writes-on-GET report.
+    of_get: bool,
     /// The undo ids that `undoa` queued, in order. The first vote stages
     /// their undos.
     undos: Vec<Value>,
@@ -783,9 +825,57 @@ impl Session {
             "pack" => self.pack(args),
             "sendBlob" => return self.send_blob(args, reply),
             "sequence_next" => self.sequence_next(args),
+            "kv_get" => self.kv_get(args),
+            "kv_scan" => self.kv_scan(args),
+            "kv_generation" => self.kv_generation(args),
             method => return Outcome::Close(format!("unknown method {method}")),
         };
         result.into()
+    }
+
+    /// Return the value of a key of a namespace, or nil: `kv_get(flavour,
+    /// name, key)`. The read gives the last committed value, and an expired
+    /// key reads as nil. It runs outside the transaction of the connection.
+    fn kv_get(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [flavour, name, key] = arity::<3>(args, "kv_get")?;
+        let (flavour, name, key) = (flavour_of(flavour)?, str_of(name)?, bin_of(key, "key")?);
+        let value = self.store.kv_get(flavour, name, key)?;
+        Ok(value.map_or(Value::Nil, Value::Binary))
+    }
+
+    /// Return the pairs of a namespace in the byte order of the keys:
+    /// `kv_scan(flavour, name, start, stop, limit)`. `start` is included and
+    /// `stop` excluded, and nil is an open end. The reply holds at most
+    /// `limit` pairs, and at most 1,000, as `[[key, value], ...]`.
+    fn kv_scan(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [flavour, name, start, stop, limit] = arity::<5>(args, "kv_scan")?;
+        let flavour = flavour_of(flavour)?;
+        let name = str_of(name)?;
+        let start = optional_bin(start, "start")?;
+        let stop = optional_bin(stop, "stop")?;
+        // A negative limit is a value error, as in `zoe.Storage`.
+        let limit = match limit {
+            Value::Integer(n) => match n.as_u64() {
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                None => return Err(Fault::value_error("the limit of a scan is less than 1")),
+            },
+            _ => return Err(Fault::type_error("the limit of a scan is not an int")),
+        };
+        let pairs = self.store.kv_scan(flavour, name, start, stop, limit)?;
+        Ok(Value::Array(
+            pairs
+                .into_iter()
+                .map(|(key, value)| Value::Array(vec![Value::Binary(key), Value::Binary(value)]))
+                .collect(),
+        ))
+    }
+
+    /// Return the generation of a durable namespace, the tid of the last
+    /// commit that wrote it, as 8 bytes: `kv_generation(name)`. A namespace
+    /// that no commit wrote has the zero tid.
+    fn kv_generation(&self, args: &[Value]) -> Result<Value, Fault> {
+        let [name] = arity::<1>(args, "kv_generation")?;
+        Ok(p64(self.store.kv_generation(str_of(name)?)?.0))
     }
 
     /// Return the next value of the sequence `name` of the store (F29),
@@ -1620,6 +1710,8 @@ impl Transaction {
             "restorea" => self.restorea(args),
             "checkCurrentSerialInTransaction" => self.check_current_serial(args),
             "deleteObject" => self.delete_object(args),
+            "kv_set" => self.kv_set(args),
+            "kv_delete" => self.kv_delete(args),
             "undoa" => self.undoa(args),
             "vote" => self.vote(args),
             "tpc_finish" => return self.tpc_finish(&*call),
@@ -1668,6 +1760,7 @@ impl Transaction {
                 native: 0,
                 upload: None,
                 jobs: Vec::new(),
+                of_get: args.get(3).is_some_and(of_get),
                 undos: Vec::new(),
             });
         }
@@ -1859,6 +1952,43 @@ impl Transaction {
         Ok(Value::Nil)
     }
 
+    /// Return the open transaction, for a call of the transaction that
+    /// names none. Without an open transaction, the call fails with
+    /// `StorageTransactionError`.
+    fn opened(&mut self, method: &str) -> Result<&mut Open, Fault> {
+        self.open
+            .as_mut()
+            .ok_or_else(|| Fault::transaction(format!("{method} outside a transaction")))
+    }
+
+    /// Stage a write of a namespace in the open transaction:
+    /// `kv_set(flavour, name, key, value, ttl)`. `ttl` is an int or a float
+    /// of seconds for `"ephemeral"`, and nil for `"durable"`. The call has
+    /// no reply: an error fails the vote, as an error of `storea` does.
+    fn kv_set(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [flavour, name, key, value, ttl] = arity::<5>(args, "kv_set")?;
+        self.opened("kv_set")?.stage(|txn| {
+            let flavour = flavour_of(flavour)?;
+            let (name, key) = (str_of(name)?, bin_of(key, "key")?);
+            let value = bin_of(value, "value")?;
+            let ttl = ttl_of(ttl)?;
+            Ok(txn.kv_set(flavour, name, key, value, ttl)?)
+        });
+        Ok(Value::Nil)
+    }
+
+    /// Stage a delete of a key of a namespace in the open transaction:
+    /// `kv_delete(flavour, name, key)`, with the rules of `kv_set`.
+    fn kv_delete(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [flavour, name, key] = arity::<3>(args, "kv_delete")?;
+        self.opened("kv_delete")?.stage(|txn| {
+            let flavour = flavour_of(flavour)?;
+            let (name, key) = (str_of(name)?, bin_of(key, "key")?);
+            Ok(txn.kv_delete(flavour, name, key)?)
+        });
+        Ok(Value::Nil)
+    }
+
     /// Queue the undo of the transaction of the undo id `trans_id` into the
     /// open transaction `id`. `undoa` has no reply: the first vote stages
     /// the undo, as ZEO's server does, and an error there fails the vote.
@@ -1995,8 +2125,13 @@ impl Transaction {
         let Ok(txn) = open.txn else {
             return Err(Fault::transaction("tpc_finish before vote"));
         };
+        let classes = open.of_get.then(|| classes_of(&txn));
         // The core returns only after the commit is durable.
-        Ok(Some(txn.finish_after()?))
+        let finished = txn.finish_after()?;
+        if let Some(classes) = classes {
+            self.session.storage.metrics.add_writes_on_get(classes);
+        }
+        Ok(Some(finished))
     }
 
     fn tpc_abort(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -2321,6 +2456,60 @@ fn arity_mut<'a, const N: usize>(
 fn arity<'a, const N: usize>(args: &'a [Value], method: &str) -> Result<&'a [Value; N], Fault> {
     args.try_into()
         .map_err(|_| Fault::type_error(format!("{method} takes {N} arguments")))
+}
+
+/// The flavour of a namespace: the str `"ephemeral"` or `"durable"`.
+fn flavour_of(value: &Value) -> Result<Flavour, Fault> {
+    let name = value
+        .as_str()
+        .ok_or_else(|| Fault::type_error("the flavour of a namespace is not a str"))?;
+    Flavour::from_name(name).ok_or_else(|| {
+        Fault::value_error("the flavour of a namespace is not \"ephemeral\" or \"durable\"")
+    })
+}
+
+/// The name of a namespace: a str.
+fn str_of(value: &Value) -> Result<&str, Fault> {
+    value
+        .as_str()
+        .ok_or_else(|| Fault::type_error("the name of a namespace is not a str"))
+}
+
+/// A key, a bound or a value of a namespace: bin. `what` names it.
+fn bin_of<'a>(value: &'a Value, what: &str) -> Result<&'a [u8], Fault> {
+    match value {
+        Value::Binary(bytes) => Ok(bytes),
+        _ => Err(Fault::type_error(format!("the {what} is not bytes"))),
+    }
+}
+
+/// A bound of a scan: bin, or nil for an open end.
+fn optional_bin<'a>(value: &'a Value, what: &str) -> Result<Option<&'a [u8]>, Fault> {
+    match value {
+        Value::Nil => Ok(None),
+        value => bin_of(value, what).map(Some),
+    }
+}
+
+/// The TTL of a write: an int or a float of seconds, or nil for none. A
+/// negative, not finite or too long TTL fails with `ValueError`. The core
+/// checks its bounds.
+fn ttl_of(value: &Value) -> Result<Option<Duration>, Fault> {
+    let refused = || Fault::value_error("a TTL is not a number of seconds from 0 to 2^32 - 1");
+    match value {
+        Value::Nil => Ok(None),
+        Value::Integer(n) => match n.as_u64() {
+            Some(seconds) => Ok(Some(Duration::from_secs(seconds))),
+            None => Err(refused()),
+        },
+        Value::F32(seconds) => Duration::try_from_secs_f32(*seconds)
+            .map(Some)
+            .map_err(|_| refused()),
+        Value::F64(seconds) => Duration::try_from_secs_f64(*seconds)
+            .map(Some)
+            .map_err(|_| refused()),
+        _ => Err(Fault::type_error("a TTL is not an int, a float or None")),
+    }
 }
 
 /// An oid or a tid as the protocol sends it: 8 bytes, big-endian.
@@ -3918,6 +4107,285 @@ mod tests {
             assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
             assert_eq!(s.store.sequence("intids").next().unwrap(), 1);
         }
+    }
+
+    fn bin(bytes: &[u8]) -> Value {
+        Value::Binary(bytes.to_vec())
+    }
+
+    /// Commit, in the transaction `id`, the namespace call `method` with
+    /// `args`. Return the tid.
+    fn commit_kv(s: &mut Client, id: i64, method: &str, args: Vec<Value>) -> u64 {
+        begin(s, id, None);
+        assert_eq!(done(call(s, method, args)), Value::Nil);
+        let voted = done(call(s, "vote", vec![Value::from(id)]));
+        assert_eq!(voted, Value::Array(vec![]));
+        finish(s, Value::from(id))
+    }
+
+    #[test]
+    fn kv_set_commits_with_the_transaction_and_kv_get_reads_it() {
+        let mut s = declaring("kv-set", false, &["kv"]);
+        let info = done(call(&mut s, "get_info", vec![]));
+        assert_eq!(
+            get(&info, "extensions"),
+            &Value::Array(vec![Value::from("kv")])
+        );
+        let get_title = || {
+            vec![
+                Value::from("durable"),
+                Value::from("registry"),
+                bin(b"title"),
+            ]
+        };
+        assert_eq!(done(call(&mut s, "kv_get", get_title())), Value::Nil);
+        let set = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+            bin(b"site"),
+            Value::Nil,
+        ];
+        let tid = commit_kv(&mut s, 7, "kv_set", set);
+        assert_eq!(done(call(&mut s, "kv_get", get_title())), bin(b"site"));
+        let generation = vec![Value::from("registry")];
+        assert_eq!(done(call(&mut s, "kv_generation", generation)), p64(tid));
+        let ephemeral = vec![
+            Value::from("ephemeral"),
+            Value::from("sessions"),
+            bin(b"s1"),
+            bin(b"data"),
+            Value::F64(60.5),
+        ];
+        commit_kv(&mut s, 8, "kv_set", ephemeral);
+        let scan = vec![
+            Value::from("ephemeral"),
+            Value::from("sessions"),
+            Value::Nil,
+            Value::Nil,
+            Value::from(1000),
+        ];
+        assert_eq!(
+            done(call(&mut s, "kv_scan", scan)),
+            Value::Array(vec![Value::Array(vec![bin(b"s1"), bin(b"data")])])
+        );
+        let delete = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+        ];
+        commit_kv(&mut s, 9, "kv_delete", delete);
+        assert_eq!(done(call(&mut s, "kv_get", get_title())), Value::Nil);
+    }
+
+    #[test]
+    fn an_aborted_kv_set_writes_nothing() {
+        let mut s = declaring("kv-abort", false, &["kv"]);
+        begin(&mut s, 7, None);
+        let set = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+            bin(b"site"),
+            Value::Nil,
+        ];
+        assert_eq!(done(call(&mut s, "kv_set", set)), Value::Nil);
+        done(call(&mut s, "tpc_abort", vec![Value::from(7)]));
+        let get = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+        ];
+        assert_eq!(done(call(&mut s, "kv_get", get)), Value::Nil);
+    }
+
+    #[test]
+    fn a_bad_kv_set_fails_the_vote() {
+        for (ttl, flavour, class) in [
+            (Value::Nil, "ephemeral", "builtins.ValueError"),
+            (Value::from(5), "durable", "builtins.ValueError"),
+            (Value::from(-1), "ephemeral", "builtins.ValueError"),
+            (Value::F64(f64::NAN), "ephemeral", "builtins.ValueError"),
+            (Value::from("5"), "ephemeral", "builtins.TypeError"),
+            (Value::from(5), "other", "builtins.ValueError"),
+        ] {
+            let mut s = declaring("kv-bad", false, &["kv"]);
+            begin(&mut s, 7, None);
+            let set = vec![
+                Value::from(flavour),
+                Value::from("sessions"),
+                bin(b"k"),
+                bin(b"v"),
+                ttl.clone(),
+            ];
+            assert_eq!(done(call(&mut s, "kv_set", set)), Value::Nil);
+            let fault = failed(call(&mut s, "vote", vec![Value::from(7)]));
+            assert_eq!(fault.class, class, "{flavour} {ttl:?}");
+        }
+    }
+
+    #[test]
+    fn kv_set_outside_a_transaction_fails() {
+        let mut s = declaring("kv-outside", false, &["kv"]);
+        let set = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"k"),
+            bin(b"v"),
+            Value::Nil,
+        ];
+        assert_eq!(failed(call(&mut s, "kv_set", set)).class, TRANSACTION_ERROR);
+    }
+
+    #[test]
+    fn a_bad_read_of_a_namespace_fails_and_the_connection_stays_open() {
+        let mut s = declaring("kv-bad-read", false, &["kv"]);
+        for (method, args, class) in [
+            (
+                "kv_get",
+                vec![Value::from("durable"), Value::from("r"), Value::from("k")],
+                "builtins.TypeError",
+            ),
+            (
+                "kv_get",
+                vec![Value::from("durable"), Value::from("r"), bin(b"")],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_get",
+                vec![Value::from("lasting"), Value::from("r"), bin(b"k")],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_get",
+                vec![Value::from(1), Value::from("r"), bin(b"k")],
+                "builtins.TypeError",
+            ),
+            (
+                "kv_get",
+                vec![Value::from("durable"), Value::from("r")],
+                "builtins.TypeError",
+            ),
+            (
+                "kv_scan",
+                vec![
+                    Value::from("durable"),
+                    Value::from("r"),
+                    Value::Nil,
+                    Value::Nil,
+                    Value::from(0),
+                ],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_scan",
+                vec![
+                    Value::from("durable"),
+                    Value::from("r"),
+                    Value::Nil,
+                    Value::Nil,
+                    Value::from(-1),
+                ],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_scan",
+                vec![
+                    Value::from("durable"),
+                    Value::from("r"),
+                    Value::Nil,
+                    Value::Nil,
+                    Value::from("1"),
+                ],
+                "builtins.TypeError",
+            ),
+            (
+                "kv_generation",
+                vec![Value::from("")],
+                "builtins.ValueError",
+            ),
+            (
+                "kv_generation",
+                vec![bin(b"registry")],
+                "builtins.TypeError",
+            ),
+        ] {
+            let fault = failed(call(&mut s, method, args.clone()));
+            assert_eq!(fault.class, class, "{method} {args:?}");
+            assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
+        }
+    }
+
+    #[test]
+    fn the_calls_of_the_namespaces_need_the_declaration_of_kv() {
+        let get = Call {
+            id: Value::from(1),
+            oneway: false,
+            method: "kv_get".into(),
+            args: vec![Value::from("durable"), Value::from("r"), bin(b"k")],
+            context: None,
+        };
+        let set = Call {
+            id: Value::from(1),
+            oneway: true,
+            method: "kv_set".into(),
+            args: vec![
+                Value::from("durable"),
+                Value::from("r"),
+                bin(b"k"),
+                bin(b"v"),
+                Value::Nil,
+            ],
+            context: None,
+        };
+        for mut s in [
+            registered("kv-stock"),
+            declaring("kv-other", false, &["sequences"]),
+        ] {
+            let mut reply = Reply::new(s.session.outbox.blocking_room());
+            assert_eq!(
+                failed(s.session.call(&get, &mut reply)).class,
+                "builtins.ValueError"
+            );
+            assert_eq!(
+                failed(s.txn.call(&mut set.clone())).class,
+                "builtins.ValueError"
+            );
+            assert_eq!(done(call(&mut s, "ping", vec![])), Value::Nil);
+        }
+    }
+
+    #[test]
+    fn a_read_only_connection_reads_the_namespaces_and_its_vote_fails() {
+        let mut s = declaring("kv-read-only", true, &["kv"]);
+        let get = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+        ];
+        assert_eq!(done(call(&mut s, "kv_get", get)), Value::Nil);
+        let set = vec![
+            Value::from("durable"),
+            Value::from("registry"),
+            bin(b"title"),
+            bin(b"site"),
+            Value::Nil,
+        ];
+        begin(&mut s, 8, None);
+        assert_eq!(done(call(&mut s, "kv_set", set)), Value::Nil);
+        let fault = failed(call(&mut s, "vote", vec![Value::from(8)]));
+        assert_eq!(fault, Fault::read_only());
+    }
+
+    #[test]
+    fn the_extension_of_a_get_or_a_head_marks_the_transaction() {
+        let ext = |method: Value| Value::Map(vec![(Value::from(REQUEST_METHOD), method)]);
+        assert!(of_get(&ext(Value::from("GET"))));
+        assert!(of_get(&ext(Value::from("head"))));
+        assert!(!of_get(&ext(Value::from("POST"))));
+        assert!(!of_get(&ext(Value::Binary(b"GET".to_vec()))));
+        assert!(!of_get(&Value::Map(vec![])));
+        assert!(!of_get(&Value::Nil));
     }
 
     #[test]

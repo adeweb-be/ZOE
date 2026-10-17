@@ -37,6 +37,13 @@
 //! The store and the table live in a `Shared` part, which the watcher of
 //! the signals also holds (see `signals`). The store closes once: in
 //! `close`, in the drop or in the watcher, whichever takes it first.
+//!
+//! The KV namespaces (ADR 0043): `kv_get`, `kv_scan` and `kv_generation`
+//! read them, and `kv_set` and `kv_delete` stage a write in a transaction,
+//! as `store` stages a pickle. A writable store that has the table of the
+//! ephemeral namespaces runs a sweep step once a minute, on a thread of
+//! the extension that runs no Python. The thread starts at the open of
+//! such a store, or at its first ephemeral write, and stops at the close.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -46,16 +53,20 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use zoe_core::{BlobFile, Compression, IntentLocks, Mode, Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{
+    BlobFile, Compression, Flavour, IntentLocks, Mode, Oid, Options, SWEEP_INTERVAL, SWEEP_LIMIT,
+    Store, Tid, Txn, ZoeError,
+};
 
 use crate::errors::{self, Failure, p64, u64_of};
+use crate::kv;
 use crate::publish::{Publication, Published};
 use crate::sequence::Sequence;
 use crate::signals;
@@ -275,6 +286,91 @@ impl Shared {
     }
 }
 
+/// The thread that runs the sweep steps of the ephemeral namespaces of a
+/// store, once a minute. It holds a weak reference to the store, so it
+/// never keeps the store open between two steps, and it runs no Python.
+/// `stop` stops it and waits for its end, so a step that runs ends before
+/// the store closes. The drop only tells it to stop.
+struct Sweeper {
+    /// True when the thread stops, and the signal that wakes it.
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    /// The thread, until `stop` waits for it.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Sweeper {
+    /// Start the thread of `store`. Return `None` when the system gives no
+    /// thread: the expired keys then stay until a later open.
+    fn start(store: &StoreRef) -> Option<Self> {
+        let weak = Arc::downgrade(&store.0);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("zoe-sweep".to_owned())
+            .spawn(move || sweep(&weak, &signal))
+            .ok()?;
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Tell the thread to stop.
+    fn signal(&self) {
+        let (stopped, changed) = &*self.stop;
+        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        changed.notify_all();
+    }
+
+    /// Stop the thread and wait for its end. Call it without the GIL: the
+    /// thread runs no Python, and a step that runs ends first.
+    fn stop(mut self) {
+        self.signal();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Sweeper {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+/// Run a sweep step of `store` once a minute, until `stop` or until the
+/// store closes. When a step takes `SWEEP_LIMIT` keys, the next step runs
+/// at once. A step that fails waits for the next minute: a read-only or a
+/// halted store runs no step.
+fn sweep(store: &Weak<Owned>, stop: &(Mutex<bool>, Condvar)) {
+    let (stopped, changed) = stop;
+    let is_stopped = || *stopped.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        {
+            let guard = stopped.lock().unwrap_or_else(PoisonError::into_inner);
+            let (guard, _) = changed
+                .wait_timeout_while(guard, SWEEP_INTERVAL, |stopped| !*stopped)
+                .unwrap_or_else(PoisonError::into_inner);
+            if *guard {
+                return;
+            }
+        }
+        loop {
+            let Some(owned) = store.upgrade() else {
+                return;
+            };
+            let full =
+                matches!(owned.store.sweep(SWEEP_LIMIT), Ok(swept) if swept.taken == SWEEP_LIMIT);
+            // A close during the step leaves the last share here, so the
+            // database closes on this thread.
+            drop(owned);
+            if !full || is_stopped() {
+                break;
+            }
+        }
+    }
+}
+
 /// The in-process storage. It implements ZODB's `IStorage`.
 #[pyclass(subclass, frozen, module = "zoe._zoe", name = "Storage")]
 pub(crate) struct Storage {
@@ -284,6 +380,9 @@ pub(crate) struct Storage {
     path: String,
     read_only: bool,
     published: Published,
+    /// The thread of the sweep steps, from the open of a store with
+    /// ephemeral namespaces or from the first ephemeral write.
+    sweeper: Mutex<Option<Sweeper>>,
     /// The resolution log (ADR 0042), if `resolution_log` names one.
     resolution_log: Option<Arc<ResolutionLog>>,
 }
@@ -397,6 +496,58 @@ impl Storage {
     fn remove(&self, transaction: &Bound<'_, PyAny>) -> Option<Arc<Entry>> {
         let key = transaction.as_ptr() as usize;
         self.table().entries.remove(&key)
+    }
+
+    /// Start the thread of the sweep steps, once. A read-only storage runs
+    /// none.
+    fn start_sweeper(&self, py: Python<'_>) {
+        if self.read_only {
+            return;
+        }
+        let mut sweeper = self.sweeper.lock().unwrap_or_else(PoisonError::into_inner);
+        if sweeper.is_some() {
+            return;
+        }
+        let store = self
+            .shared
+            .store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(store) = &store {
+            *sweeper = Sweeper::start(store);
+        }
+        drop(sweeper);
+        // The share drops without the GIL, as each share of a call does.
+        py.detach(move || drop(store));
+    }
+
+    /// Take the thread of the sweep steps out of the storage. The caller
+    /// stops it without the GIL.
+    fn take_sweeper(&self) -> Option<Sweeper> {
+        self.sweeper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Stage a namespace write in `transaction` with `stage`, as `store`
+    /// stages a pickle. A read-only storage refuses the call.
+    fn stage_kv(
+        &self,
+        py: Python<'_>,
+        transaction: &Bound<'_, PyAny>,
+        stage: impl Fn(&mut SharedTxn) -> Result<(), Failure> + Send + Sync,
+    ) -> PyResult<()> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let entry = self.entry(py, transaction)?;
+        let staged = match entry.try_with(&stage) {
+            Some(staged) => staged,
+            None => py.detach(|| entry.with(&stage)),
+        };
+        staged.map_err(|failure| failure.into_py(py))
     }
 
     /// Return the next value of the sequence `name`. A read-only storage
@@ -528,13 +679,20 @@ impl Storage {
             py.detach(move || drop(shared));
             return Err(error);
         }
-        Ok(Self {
+        let storage = Self {
             shared,
             path: path.to_string_lossy().into_owned(),
             read_only,
             published: Published::new(last),
+            sweeper: Mutex::new(None),
             resolution_log,
-        })
+        };
+        let store = storage.opened(py)?;
+        let ephemeral = py.detach(move || store.has_ephemeral_namespaces().unwrap_or(false));
+        if ephemeral {
+            storage.start_sweeper(py);
+        }
+        Ok(storage)
     }
 
     /// Return the name of the storage: the path of its directory.
@@ -760,6 +918,122 @@ impl Storage {
     fn sequence(slf: &Bound<'_, Self>, name: String) -> PyResult<Sequence> {
         slf.get().check_open(slf.py())?;
         Ok(Sequence::new(slf.clone().unbind(), name))
+    }
+
+    /// Return the value of `key` in the namespace `name` of `flavour`,
+    /// `"ephemeral"` or `"durable"`, as bytes, or `None` when the key has
+    /// no value or is expired.
+    ///
+    /// The read gives the last committed value, not the value at the
+    /// snapshot of a connection: the namespaces keep no history. A bad
+    /// name or key raises `ValueError`. A row that fails its checksum
+    /// raises `StorageSystemError`.
+    fn kv_get<'py>(
+        &self,
+        py: Python<'py>,
+        flavour: &str,
+        name: &str,
+        key: &[u8],
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let flavour = kv::flavour(flavour)?;
+        let store = self.opened(py)?;
+        let value = py
+            .detach(move || store.kv_get(flavour, name, key))
+            .map_err(|e| core(py, e))?;
+        Ok(value.map(|value| PyBytes::new(py, &value)))
+    }
+
+    /// Return the pairs `(key, value)` of the namespace `name` of
+    /// `flavour`, in the byte order of the keys, from `start` (included) to
+    /// `stop` (excluded). `None` is an open end. The list holds at most
+    /// `limit` pairs, and at most 1,000, without the expired keys. A
+    /// `limit` below 1 raises `ValueError`.
+    #[pyo3(signature = (flavour, name, start = None, stop = None, limit = 1000))]
+    fn kv_scan<'py>(
+        &self,
+        py: Python<'py>,
+        flavour: &str,
+        name: &str,
+        start: Option<&[u8]>,
+        stop: Option<&[u8]>,
+        limit: i64,
+    ) -> PyResult<Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>> {
+        let flavour = kv::flavour(flavour)?;
+        let limit = usize::try_from(limit)
+            .map_err(|_| PyValueError::new_err("the limit of a scan is less than 1"))?;
+        let store = self.opened(py)?;
+        let pairs = py
+            .detach(move || store.kv_scan(flavour, name, start, stop, limit))
+            .map_err(|e| core(py, e))?;
+        Ok(pairs
+            .iter()
+            .map(|(key, value)| (PyBytes::new(py, key), PyBytes::new(py, value)))
+            .collect())
+    }
+
+    /// Tell if the storage has KV namespaces: a `zoe.Storage` always has.
+    fn kv_supported(&self) -> bool {
+        true
+    }
+
+    /// Return the generation of the durable namespace `name`, as the 8
+    /// bytes of a tid: the tid of the last commit that wrote it, or 8 zero
+    /// bytes before the first one. A cache of the namespace stays valid
+    /// while its generation stays the same.
+    fn kv_generation<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let store = self.opened(py)?;
+        let tid = py
+            .detach(move || store.kv_generation(name))
+            .map_err(|e| core(py, e))?;
+        Ok(p64(py, tid.0))
+    }
+
+    /// Stage a write of `value` for `key` in the namespace `name` of
+    /// `flavour` in `transaction`, with the rules of `store`. An ephemeral
+    /// key needs `ttl`, an int or a float of seconds, more than 0 and at
+    /// most 2^32 - 1; a durable key takes `None`. The write commits with
+    /// the transaction, takes no lock, and the commit with the later tid
+    /// wins. A bad name, key or TTL raises `ValueError`. A read-only
+    /// storage refuses the call.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_set(
+        &self,
+        py: Python<'_>,
+        flavour: &str,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl: &Bound<'_, PyAny>,
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let flavour = kv::flavour(flavour)?;
+        let ttl = kv::ttl(ttl)?;
+        self.stage_kv(py, transaction, |txn| {
+            Ok(txn.kv_set(flavour, name, key, value, ttl)?)
+        })?;
+        if flavour == Flavour::Ephemeral {
+            self.start_sweeper(py);
+        }
+        Ok(())
+    }
+
+    /// Stage a delete of `key` in the namespace `name` of `flavour` in
+    /// `transaction`, with the rules of `kv_set`. A delete of a key that
+    /// has no value does nothing.
+    fn kv_delete(
+        &self,
+        py: Python<'_>,
+        flavour: &str,
+        name: &str,
+        key: &[u8],
+        transaction: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let flavour = kv::flavour(flavour)?;
+        self.stage_kv(
+            py,
+            transaction,
+            |txn| Ok(txn.kv_delete(flavour, name, key)?),
+        )
     }
 
     /// Return a new owner of early write-intent locks (ADR 0045). It holds
@@ -1418,6 +1692,7 @@ impl Storage {
     /// The storage refuses every later call. A call that runs when `close`
     /// starts keeps the store open until it returns.
     fn close(&self, py: Python<'_>) {
+        let sweeper = self.take_sweeper();
         let entries: Vec<Arc<Entry>> = {
             let mut table = self.table();
             table.closed = true;
@@ -1425,6 +1700,11 @@ impl Storage {
         };
         let store = self.shared.take_store();
         let entries = py.detach(move || {
+            // A sweep step that runs holds the store: it ends first, so the
+            // store closes before `close` returns.
+            if let Some(sweeper) = sweeper {
+                sweeper.stop();
+            }
             abort_all(&entries);
             drop(store);
             entries
@@ -1440,10 +1720,16 @@ impl Drop for Storage {
     /// was not closed. This also holds during the shutdown of the
     /// interpreter, on the thread that finalizes it.
     fn drop(&mut self) {
+        let sweeper = self.take_sweeper();
         let store = self.shared.take_store();
         let entries: Vec<Arc<Entry>> = self.shared.table().drain();
         let txns: Vec<SharedTxn> = entries.iter().filter_map(|entry| entry.take()).collect();
-        let close = move || drop((txns, store));
+        let close = move || {
+            if let Some(sweeper) = sweeper {
+                sweeper.stop();
+            }
+            drop((txns, store));
+        };
         Python::try_attach(|py| py.detach(close));
         // The entries hold Python references. They drop here, so that the
         // watcher of the signals, which can hold the last share of

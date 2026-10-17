@@ -1274,9 +1274,11 @@ mod tests {
     fn a_pack_between_two_slices_gives_no_error() {
         // The root at 100. Then, in turn, a transaction with no record and
         // a transaction of an object that nothing refers to. The pack
-        // removes each such object with its row, one in each batch. A row
-        // with no record has no index key, so an index read past it can
-        // name the tid of a row that the next batch removes.
+        // removes each such object with its row, but the row at T, one in
+        // each batch, then each row with no record before T, one in each
+        // batch too. A row with no
+        // record has no index key, so an index read past it can name the
+        // tid of a row that a later batch removes.
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         restore(&store, 100, &[(Oid(0), Some(LEAF.to_vec()))]);
         let mut written = vec![Tid(100)];
@@ -1304,19 +1306,19 @@ mod tests {
 
         assert_eq!(report.records, 8, "{report:?}");
         assert!(during >= 2, "{during} calls during the pack");
-        assert!(given.len() > during, "no call after the pack: {given:?}");
         let given: Vec<Tid> = given
             .iter()
             .map(|txn| txn.clone().unwrap_or_else(|e| panic!("{e} in {given:?}")))
             .collect();
         assert!(given.windows(2).all(|pair| pair[0] < pair[1]), "{given:?}");
         assert!(given.iter().all(|tid| written.contains(tid)), "{given:?}");
-        // The root and the transactions with no record survive the pack.
-        let survivors: Vec<Tid> = (0..=8).map(|n| Tid(100u64.max(200 * n))).collect();
-        assert_eq!(tids(&store, None, None), survivors);
-        for tid in &survivors {
-            assert!(given.contains(tid), "{tid:?} is missing from {given:?}");
-        }
+        // The root and the row at the tid of the pack survive: the pack
+        // removes the other rows that keep no record too (ADR 0043).
+        assert_eq!(tids(&store, None, None), [Tid(100), last]);
+        assert!(
+            given.contains(&Tid(100)),
+            "the root is missing from {given:?}"
+        );
     }
 
     fn is_corrupt<T: std::fmt::Debug>(result: Result<T>, tid: u64) {

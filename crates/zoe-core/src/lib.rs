@@ -13,6 +13,7 @@ mod commit;
 mod error;
 mod format;
 mod guard;
+mod kv;
 mod lock;
 pub mod merge;
 mod pack;
@@ -37,6 +38,10 @@ pub use commit::{Encoded, Finished, IntentLocks, Observer, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};
 pub use guard::SizeLimit;
+pub use kv::{
+    DurableRow, Flavour, KvCheck, KvFinding, MAX_TTL_SECONDS, SCAN_BYTES, SCAN_LIMIT,
+    SWEEP_INTERVAL, SWEEP_LIMIT, Swept,
+};
 pub use lock::LockCancel;
 pub use merge::{Mode, Reason, Resolution, Resolved, StructuralMerges};
 pub use pack::{ClassTotals, PackReport};

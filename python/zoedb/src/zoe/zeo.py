@@ -14,6 +14,12 @@ store and per name, not part of a transaction. It needs a server that
 accepted `sequences` on the connection. Without it, `next()` raises
 `ZODB.POSException.Unsupported`.
 
+`kv_get`, `kv_scan`, `kv_generation`, `kv_set` and `kv_delete` give the
+KV namespaces of the store, as `zoe.Storage` does (ADR 0043). They need a
+server that accepted `kv` on the connection: `kv_supported()` tells. Without
+it, each raises `ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a
+namespace to a connection of a database.
+
 When the package `opentelemetry` is installed, each connection also declares
 `trace_context`. When the server accepts it, each call that the client makes
 inside a span carries the W3C traceparent of that span: a fifth element of
@@ -47,8 +53,8 @@ a blob directory that it shares with the server (`shared_blob_dir`). It
 resolves in the client the conflicts that a vote lists, as
 `ZEO.ClientStorage` does. When it loses its server, it connects again in
 the background and verifies its cache, as ZEO does. It declares
-`sequences`, and `trace_context` when the package `opentelemetry` is
-installed, and sends the traceparent as the client of ZEO does. It has the
+`sequences` and `kv`, and `trace_context` when the package `opentelemetry`
+is installed. It sends the traceparent as the client of ZEO does. It has the
 rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
 `record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
 `deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
@@ -108,12 +114,26 @@ _zeo_logger = logging.getLogger("ZEO.ClientStorage")
 # The extension that lets a call carry the trace context of the client.
 _TRACE_CONTEXT = "trace_context"
 
+# The extension of the KV namespaces.
+_KV = "kv"
+
 # The extensions that each connection declares in `register`. Without
 # OpenTelemetry, the client has no trace context to send.
 _TRACES = () if _PROPAGATOR is None else (_TRACE_CONTEXT,)
 # The extension of the early write-intent locks (ADR 0045).
 _LOCK_INTENT = "lock_intent"
-EXTENSIONS = ("sequences", _LOCK_INTENT, *_TRACES)
+EXTENSIONS = ("sequences", _LOCK_INTENT, _KV, *_TRACES)
+
+# The flavours of the KV namespaces.
+_FLAVOURS = ("ephemeral", "durable")
+
+
+def _check_flavour(flavour):
+    """Raise `ValueError` when `flavour` is not a flavour of a namespace."""
+    if flavour not in _FLAVOURS:
+        raise ValueError(
+            f'the flavour of a namespace is "ephemeral" or "durable", not {flavour!r}'
+        )
 
 
 def _traceparent():
@@ -406,6 +426,55 @@ class ClientStorage(ZEOClientStorage):
         if "sequences" not in self._info.get("extensions", ()):
             raise Unsupported("the server does not serve the extension sequences")
         return self._call("sequence_next", name)
+
+    # The KV namespaces.
+
+    def kv_supported(self):
+        """Tell if the server accepted `kv` on the connection."""
+        return _KV in self._info.get("extensions", ())
+
+    def _check_kv(self, flavour=None):
+        if not self.kv_supported():
+            raise Unsupported("the server does not serve the extension kv")
+        if flavour is not None:
+            _check_flavour(flavour)
+
+    def kv_get(self, flavour, name, key):
+        """Return the value of `key` in the namespace `name` of `flavour`,
+        `"ephemeral"` or `"durable"`, as bytes, or None when the key has no
+        value or is expired. The read gives the last committed value."""
+        self._check_kv(flavour)
+        return self._call("kv_get", flavour, name, key)
+
+    def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
+        """Return the pairs `(key, value)` of the namespace `name` of
+        `flavour`, in the byte order of the keys, from `start` (included)
+        to `stop` (excluded), at most `limit` and at most 1,000."""
+        self._check_kv(flavour)
+        pairs = self._call("kv_scan", flavour, name, start, stop, limit)
+        return [(key, value) for key, value in pairs]
+
+    def kv_generation(self, name):
+        """Return the generation of the durable namespace `name`, the 8
+        bytes of the tid of the last commit that wrote it."""
+        self._check_kv()
+        return self._call("kv_generation", name)
+
+    def kv_set(self, flavour, name, key, value, ttl, transaction):
+        """Stage a write of `value` for `key` in the namespace `name` of
+        `flavour` in `transaction`, with the rules of `store`. An ephemeral
+        key needs `ttl`, in seconds; a durable key takes None. The server
+        reports an error of the write at the vote."""
+        self._check_kv(flavour)
+        self._check_trans(transaction, "kv_set")
+        self._async("kv_set", flavour, name, key, value, ttl)
+
+    def kv_delete(self, flavour, name, key, transaction):
+        """Stage a delete of `key` in the namespace `name` of `flavour` in
+        `transaction`, with the rules of `kv_set`."""
+        self._check_kv(flavour)
+        self._check_trans(transaction, "kv_delete")
+        self._async("kv_delete", flavour, name, key)
 
 
 # The size of the cache of ZEO when the caller gives none.
@@ -902,6 +971,8 @@ class _NativeClientStorage(ClientStorage):
         # deliveries sets it at each connection and clears it at the loss.
         self._operational = threading.Event()
         self._closed = False
+        # The answer of `kv_supported` from the last server.
+        self._kv_accepted = False
 
         from zoe import _zoe
 
@@ -1588,6 +1659,39 @@ class _NativeClientStorage(ClientStorage):
 
     def _sequence_next(self, name):
         return self._native.sequence_next(name)
+
+    # The KV namespaces.
+
+    def kv_supported(self):
+        """Tell if the server accepted `kv` on the connection. While the
+        client has no server, give the answer of the last server: the calls
+        then raise `ClientDisconnected`, and a caller does not take the path
+        of a storage without namespaces for that time."""
+        connected = self._native.is_connected()
+        extensions = self._native.extensions()
+        # Keep only an answer of a listener: a list that is not empty, or an
+        # empty list that the client read while it stayed connected.
+        if extensions or (connected and self._native.is_connected()):
+            self._kv_accepted = _KV in extensions
+        return self._kv_accepted
+
+    def kv_get(self, flavour, name, key):
+        return self._with_server(lambda: self._native.kv_get(flavour, name, key))
+
+    def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
+        return self._with_server(
+            lambda: self._native.kv_scan(flavour, name, start, stop, limit)
+        )
+
+    def kv_generation(self, name):
+        return self._with_server(lambda: self._native.kv_generation(name))
+
+    def kv_set(self, flavour, name, key, value, ttl, transaction):
+        native = self._check_trans(transaction, "kv_set")
+        native.kv_set(flavour, name, key, value, ttl)
+
+    def kv_delete(self, flavour, name, key, transaction):
+        self._check_trans(transaction, "kv_delete").kv_delete(flavour, name, key)
 
     # The early write-intent locks (ADR 0045).
 

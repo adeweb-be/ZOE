@@ -2,5 +2,28 @@
 
 Plone loads `configure.zcml` of this package through the plone.autoinclude
 entry point of zoedb. `uidgenerator` gives `portal_uidgenerator` its ids
-from a sequence of the store.
+from a sequence of the store. `report` marks the transaction of each
+request with its method, for the writes-on-GET report of `zoe serve`.
+
+The backend `locking` is opt-in, with its own ZCML file: `locking.zcml`
+keeps the locks of plone.locking in the ephemeral namespace of the store.
 """
+
+import os
+
+__all__ = ["backends_from_environment"]
+
+
+def backends_from_environment():
+    """Install the backends that `ZOE_PLONE_BACKENDS` names, separated by
+    commas: `locking` is the only one. `configure.zcml` calls it when the ZCML
+    loads, after `<environment>` of `zope.conf` set the variable. An unknown
+    name raises `ValueError`."""
+    for name in filter(None, os.environ.get("ZOE_PLONE_BACKENDS", "").split(",")):
+        name = name.strip()
+        if name == "locking":
+            from zoe.plone import locking
+
+            locking.install()
+        else:
+            raise ValueError(f"no backend {name!r} of zoe.plone: use locking")

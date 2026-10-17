@@ -37,15 +37,17 @@ So a dump would be four formats: the transaction records, the blob trees, the se
 
 | Part | Bytes |
 | --- | --- |
-| magic | `ZOEDUMP`, then the version `0x01`: 8 bytes |
+| magic | `ZOEDUMP`, then the version `0x02`: 8 bytes. A restore reads the versions `0x01` and `0x02`; a dump of version `0x01` has no durable rows |
 | header | `after`, 8 bytes; `last`, 8 bytes |
 | sequences | zero or more sequence entries |
+| durable rows | zero or more durable row entries, in key order: every row of the durable KV namespaces at `last`, generation rows included (ADR 0043) |
 | transactions | zero or more transaction entries, each followed by its records |
 | end | the tag `E` (`0x45`), then the BLAKE3 hash of every byte of the file before the hash, the tag `E` included: 32 bytes |
 
 | Entry | Tag | Fields after the tag |
 | --- | --- | --- |
 | sequence | `S` (`0x53`) | the name, as a byte string of UTF-8; the end, 8 bytes |
+| durable row | `K` (`0x4B`) | the name of the namespace, the key and the payload of the frame, each as a byte string. The key of a generation row is empty, and its payload is the tid of the last commit that wrote the namespace |
 | transaction | `T` (`0x54`) | the tid, 8 bytes; the user, the description and the extension, as byte strings; the number of its records, 8 bytes |
 | record | `R` (`0x52`) | the oid, 8 bytes; the pickle, as a byte string |
 | deletion | `D` (`0x44`) | the oid, 8 bytes |
