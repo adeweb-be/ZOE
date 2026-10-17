@@ -40,8 +40,9 @@
 //! When the finish of a holder starts, the holder can hand the lock of an
 //! oid that it writes to the exclusive request at the head of the queue of
 //! the oid (`handoff`, ADR 0044). The entry keeps the hand-off until the
-//! commit of the holder is durable or failed. Until then, only an exclusive
-//! request takes the lock, and the call that takes it gets the hand-off.
+//! store holds the last commit of the oid (`settle`). Until then, only an
+//! exclusive request takes the lock, and the call that takes it gets the
+//! hand-off.
 
 mod handoff;
 
@@ -53,7 +54,7 @@ use std::time::{Duration, SystemTime};
 use crate::clock::{Clock, Waiter};
 use crate::error::ZoeError;
 use crate::types::Oid;
-pub(crate) use handoff::{Handoff, Pending, Waited};
+pub(crate) use handoff::{Handoff, InFlight, Waited};
 
 /// A handle that ends the lock waits of votes from another thread.
 ///
@@ -181,7 +182,7 @@ struct Entry {
     /// True when the holder holds the lock in exclusive mode.
     exclusive: bool,
     /// The hand-off of the commit in flight that writes the last state of
-    /// the oid, until that commit is durable or failed.
+    /// the oid, until the store holds the last commit of the oid.
     committing: Option<Arc<Handoff>>,
     /// The requests that wait, in arrival order.
     queue: VecDeque<Queued>,
@@ -627,14 +628,21 @@ impl LockManager {
         handed
     }
 
-    /// End the hand-offs of `handed`, whose commit is durable or failed.
-    /// The entry of each oid drops the hand-off when it is still the one
-    /// of `handed`, and grants its lock to the waiters that it admits.
-    pub(crate) fn settle(&self, handed: &[(Held, Arc<Handoff>)]) {
+    /// End the hand-offs of `handed`: the store holds the last commit of
+    /// each oid, or the commit of the hand-off failed. The entry of each oid
+    /// drops the hand-off when it is still the one of `handed`, and grants
+    /// its lock to the waiters that it admits.
+    ///
+    /// Two finishes call it: the finish of the holder, when its commit is
+    /// durable or failed, and the finish of a new owner, when its own commit
+    /// is durable. That commit comes after the commit of the hand-off, so
+    /// the store holds the last commit of the oid, even when the finish of
+    /// the holder did not settle yet.
+    pub(crate) fn settle<'h>(&self, handed: impl IntoIterator<Item = (Oid, &'h Arc<Handoff>)>) {
         let mut woken = Woken::new();
         let mut table = self.table();
-        for (lock, handoff) in handed {
-            let Some(entry) = table.entries.get_mut(&lock.oid) else {
+        for (oid, handoff) in handed {
+            let Some(entry) = table.entries.get_mut(&oid) else {
                 continue;
             };
             if entry
@@ -646,7 +654,7 @@ impl LockManager {
                 entry.grant(&mut woken);
             }
             if entry.is_unused() {
-                table.entries.remove(&lock.oid);
+                table.entries.remove(&oid);
             }
         }
         drop(table);
@@ -1314,7 +1322,7 @@ mod tests {
     /// Return a hand-off of a new commit in flight.
     fn handoff() -> Arc<Handoff> {
         Arc::new(Handoff {
-            commit: Arc::new(Pending::new(b"", b"")),
+            commit: Arc::new(InFlight::new(b"", b"")),
             record: b"record".to_vec(),
         })
     }
@@ -1375,7 +1383,7 @@ mod tests {
             assert!(Arc::ptr_eq(&next.handoffs()[0].1, &first));
             drop(next);
             first.commit.end(true);
-            locks.settle(&handed);
+            locks.settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
             let free = locks
                 .acquire(&[(Oid(1), Shared)], Duration::ZERO, &SystemClock)
                 .unwrap();
@@ -1423,7 +1431,7 @@ mod tests {
             let (taken, handoffs) = next.join().unwrap();
             assert!(Arc::ptr_eq(&handoffs[0].1, &later));
             // The end of the first commit leaves the later hand-off.
-            locks.settle(&handed);
+            locks.settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
             locks.release(&taken);
             let refused = locks
                 .acquire(&[(Oid(1), Shared)], Duration::ZERO, &SystemClock)
@@ -1436,7 +1444,11 @@ mod tests {
                     .map_err(|refused| refused.error)
             });
             until_waiting(&locks, Oid(1), 1);
-            locks.settle(&later_handed);
+            locks.settle(
+                later_handed
+                    .iter()
+                    .map(|(lock, handoff)| (lock.oid, handoff)),
+            );
             let kept = reader.join().unwrap().unwrap();
             locks.release(&kept);
         });

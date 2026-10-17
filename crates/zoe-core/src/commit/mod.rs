@@ -74,7 +74,7 @@ use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
-use crate::lock::{Handoff, Held, LockCancel, Mode, Pending, Refused, Waited};
+use crate::lock::{Handoff, Held, InFlight, LockCancel, Mode, Refused, Waited};
 use crate::merge::{self, Merge, Outcome, Resolution, Resolved};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -154,7 +154,7 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The oids whose staged records tier 1 merged onto the record of a
     /// commit in flight, with that commit. The finish writes the tid of
     /// that commit as the previous serial of each.
-    onto: BTreeMap<Oid, Arc<Pending>>,
+    onto: BTreeMap<Oid, Arc<InFlight>>,
     /// The end of the lock timeout of the last vote that took the locks, on
     /// the monotonic time of the store clock.
     lock_deadline: Duration,
@@ -172,7 +172,7 @@ enum Check {
         merged: Vec<(Oid, Tid, Vec<u8>)>,
         /// The merged oids whose committed record is the record of a
         /// commit in flight, with that commit.
-        onto: Vec<(Oid, Arc<Pending>)>,
+        onto: Vec<(Oid, Arc<InFlight>)>,
         /// The transaction size with the merged pickles.
         stored_bytes: u64,
     },
@@ -1283,7 +1283,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
             commit.end(finished.is_ok());
         }
         if !handed.is_empty() {
-            store.locks.settle(&handed);
+            store
+                .locks
+                .settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
             let locks: Vec<Held> = handed.iter().map(|(lock, _)| *lock).collect();
             store.guardrails.locks_released(&locks, released);
             if let Some(observer) = store.observer() {
@@ -1298,6 +1300,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let finished = finished?;
         self.committed = Some(finished.tid);
+        // The commit is durable, and it comes after the commit of each
+        // hand-off that the vote got. So the store holds the last commit of
+        // these oids, also when their holder did not settle yet.
+        if !self.handed.is_empty() {
+            store
+                .locks
+                .settle(self.handed.iter().map(|(oid, handoff)| (*oid, handoff)));
+        }
         self.release();
         Ok(finished)
     }
@@ -1307,7 +1317,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// tier 1 merges in mode `on`, whose queue has an exclusive request at
     /// its head, with a copy of its staged pickle. A restore hands off
     /// nothing, because its finish can fail alone.
-    fn handoffs(&self) -> (Option<Arc<Pending>>, Handoffs) {
+    fn handoffs(&self) -> (Option<Arc<InFlight>>, Handoffs) {
         if self.is_restore() {
             return (None, Vec::new());
         }
@@ -1319,7 +1329,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             return (None, Vec::new());
         }
         let rules = &self.store.structural_merges;
-        let commit = Arc::new(Pending::new(&self.user, &self.description));
+        let commit = Arc::new(InFlight::new(&self.user, &self.description));
         let handoffs: Vec<_> = contended
             .into_iter()
             .filter_map(|oid| {

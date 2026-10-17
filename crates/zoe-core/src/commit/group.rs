@@ -28,7 +28,10 @@
 //! with `Protocol`.
 //!
 //! The queue mutex is held with no other lock. The leader takes the commit
-//! sequencer after it releases the queue mutex.
+//! sequencer after it releases the queue mutex. A finish that waits for the
+//! end of a batch waits on a waiter of the store clock, so a simulator runs
+//! other threads meanwhile. The leader wakes the waiters after it releases
+//! the queue mutex.
 //!
 //! The write of a batch and its sync run in a `tracing` span `fsync`, with
 //! the field `commits`, the number of members that have a tid. The span
@@ -38,15 +41,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use super::staging::Staging;
 use super::{Finished, Observer, check_restore_tid, next_tid};
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::blob::PendingBlob;
-use crate::clock::timestamp;
+use crate::clock::{Waiter, timestamp};
 use crate::error::{Result, ZoeError};
-use crate::lock::Pending;
+use crate::lock::InFlight;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -64,10 +68,10 @@ pub(super) struct Member {
     pub(super) extension: Vec<u8>,
     /// The commit in flight of this member, when it handed off a lock. The
     /// leader gives it its tid.
-    pub(super) commit: Option<Arc<Pending>>,
+    pub(super) commit: Option<Arc<InFlight>>,
     /// The oids whose records this member merged onto the record of a
     /// commit in flight, with that commit.
-    pub(super) onto: BTreeMap<Oid, Arc<Pending>>,
+    pub(super) onto: BTreeMap<Oid, Arc<InFlight>>,
 }
 
 /// The outcome of one finish. The member goes back to its transaction. It
@@ -86,14 +90,14 @@ struct Queue {
     leading: bool,
     /// The ticket of the next finish.
     next: u64,
+    /// The waiters of the finishes that wait for the end of a batch.
+    sleepers: Vec<Arc<dyn Waiter>>,
 }
 
 /// The commit batches of a store.
 #[derive(Default)]
 pub(crate) struct GroupCommit {
     queue: Mutex<Queue>,
-    /// Signals the end of a batch.
-    changed: Condvar,
     /// The observer of the store. A leader tells it the size of each
     /// batch that it made durable.
     pub(super) observer: OnceLock<Arc<dyn Observer>>,
@@ -127,6 +131,7 @@ impl GroupCommit {
             queued();
             queue = self.lock();
         }
+        let mut waiter: Option<Arc<dyn Waiter>> = None;
         loop {
             if let Some(outcome) = queue.ended.remove(&ticket) {
                 return outcome;
@@ -147,7 +152,19 @@ impl GroupCommit {
                 queue = self.lock();
                 continue;
             }
-            queue = self.changed.wait(queue).unwrap_or_else(|e| e.into_inner());
+            // The waiter comes from the store clock, without the queue
+            // mutex. Then the finish looks at the queue again.
+            let Some(waiter) = waiter.clone() else {
+                drop(queue);
+                waiter = Some(store.clock.waiter());
+                queue = self.lock();
+                continue;
+            };
+            queue.sleepers.push(Arc::clone(&waiter));
+            drop(queue);
+            // A wake before the wait is not lost.
+            waiter.wait(Duration::MAX);
+            queue = self.lock();
         }
     }
 
@@ -182,8 +199,11 @@ impl Drop for Lead<'_> {
             })),
         }
         queue.leading = false;
+        let sleepers = mem::take(&mut queue.sleepers);
         drop(queue);
-        self.group.changed.notify_all();
+        for sleeper in sleepers {
+            sleeper.wake();
+        }
     }
 }
 

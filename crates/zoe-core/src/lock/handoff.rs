@@ -9,11 +9,12 @@
 //! the finish of the holder, so its commit comes after the commit of the
 //! holder.
 //!
-//! The entry of the oid keeps the hand-off until the commit of the holder
-//! is durable or failed. Until then, only an exclusive request takes the
-//! lock of the oid, and it takes the hand-off with it. A shared request
-//! waits. So no request reads the oid from the store while the store does
-//! not hold the last commit of it.
+//! The entry of the oid keeps the hand-off until the store holds the last
+//! commit of the oid: the commit of the holder is durable or failed, or a
+//! later commit of a new owner is durable. Until then, only an exclusive
+//! request takes the lock of the oid, and it takes the hand-off with it. A
+//! shared request waits. So no request reads the oid from the store while
+//! the store does not hold the last commit of it.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use crate::types::{Oid, Tid};
 
 /// A commit whose finish started. Its batch gives it a tid, then it
 /// becomes durable or fails.
-pub(crate) struct Pending {
+pub(crate) struct InFlight {
     state: Mutex<State>,
     /// The user of the transaction, as `tpc_begin` gave it.
     pub(crate) user: Vec<u8>,
@@ -55,7 +56,7 @@ pub(crate) enum Waited {
     Cancelled,
 }
 
-impl Pending {
+impl InFlight {
     pub(crate) fn new(user: &[u8], description: &[u8]) -> Self {
         Self {
             state: Mutex::default(),
@@ -157,7 +158,7 @@ impl Pending {
 /// holder writes for the oid.
 pub(crate) struct Handoff {
     /// The commit of the holder.
-    pub(crate) commit: Arc<Pending>,
+    pub(crate) commit: Arc<InFlight>,
     /// A copy of the staged pickle of the holder. The new owner never reads
     /// the spill file of the holder, which goes away when the transaction
     /// of the holder ends.
@@ -173,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_wait_ends_at_the_end_of_the_commit() {
-        let commit = Arc::new(Pending::new(b"u", b"d"));
+        let commit = Arc::new(InFlight::new(b"u", b"d"));
         assert_eq!(commit.tid(), None);
         commit.assign(Tid(7));
         thread::scope(|scope| {
@@ -194,7 +195,7 @@ mod tests {
 
     #[test]
     fn a_wait_ends_at_its_deadline_or_at_a_cancel() {
-        let commit = Pending::new(b"", b"");
+        let commit = InFlight::new(b"", b"");
         let clock = ManualClock::new();
         // The deadline is past, so the wait ends at once.
         let deadline = clock.monotonic();
