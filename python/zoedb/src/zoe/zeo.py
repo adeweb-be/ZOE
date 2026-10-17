@@ -1045,7 +1045,7 @@ class _NativeClientStorage(ClientStorage):
         # The locks are advisory: without the extension, the client takes no
         # early lock, and says so once for the connection. A read-only
         # client writes nothing, so it takes no early lock.
-        classes = self._early_lock_classes
+        classes = self.__dict__.get("_early_lock_classes")
         if classes and _LOCK_INTENT not in self._info.get("extensions", ()):
             logger.warning(
                 "%s the server did not accept the extension lock_intent: "
