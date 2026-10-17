@@ -956,6 +956,8 @@ class _NativeClientStorage(ClientStorage):
         # deliveries sets it at each connection and clears it at the loss.
         self._operational = threading.Event()
         self._closed = False
+        # The answer of `kv_supported` from the last server.
+        self._kv_accepted = False
 
         from zoe import _zoe
 
@@ -1613,8 +1615,16 @@ class _NativeClientStorage(ClientStorage):
     # The KV namespaces.
 
     def kv_supported(self):
-        """Tell if the server accepted `kv` on the connection."""
-        return _KV in self._native.extensions()
+        """Tell if the server accepted `kv` on the connection. While the
+        client has no server, give the answer of the last server: the calls
+        then raise `ClientDisconnected`, and a caller does not take the path
+        of a storage without namespaces for that time."""
+        connected = self._native.is_connected()
+        extensions = self._native.extensions()
+        # A list of the listener, or a listener before and after the read.
+        if extensions or (connected and self._native.is_connected()):
+            self._kv_accepted = _KV in extensions
+        return self._kv_accepted
 
     def kv_get(self, flavour, name, key):
         return self._with_server(lambda: self._native.kv_get(flavour, name, key))

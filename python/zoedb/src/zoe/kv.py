@@ -209,14 +209,6 @@ class Namespace:
 
         return _merge(scan, staged, start, stop, limit)
 
-    def _writes(self):
-        """Return the writes of the current transaction in the namespace, as
-        a dict of key to value, `None` for a delete."""
-        writes = self._staged(create=False)
-        if writes is None:
-            return {}
-        return writes.of(self.flavour, self.name)
-
     def generation(self):
         """Return the generation of the durable namespace: the 8 bytes of
         the tid of the last commit that wrote it. A cache of the namespace
@@ -255,6 +247,14 @@ class _Writes:
         self._spaces = {}
         # The storage transaction that this data manager began, or None.
         self._meta = None
+        # The callables that stage writes before each savepoint.
+        self._flushes = []
+
+    def flush_before_savepoint(self, flush):
+        """Call `flush` before each savepoint, so that the savepoint keeps
+        the writes that it stages, whatever the order in which the data
+        managers joined the transaction."""
+        self._flushes.append(flush)
 
     def put(self, flavour, name, key, value, ttl):
         self._spaces.setdefault((flavour, name), {})[key] = (value, ttl)
@@ -282,6 +282,7 @@ class _Writes:
         ]
 
     def _end(self):
+        self._flushes.clear()
         if _managers.get(self._connection) is self:
             del _managers[self._connection]
 
@@ -348,6 +349,8 @@ class _Writes:
         return f"{self._storage.sortKey()}:zoe.kv:{id(self)}"
 
     def savepoint(self):
+        for flush in list(self._flushes):
+            flush()
         return _Savepoint(self, self._copy())
 
     def _copy(self):

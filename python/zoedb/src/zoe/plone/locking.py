@@ -28,11 +28,12 @@ this ends with the next edit.
 One row holds all the locks of one object: a pickle of the WebDAV locks and
 of the types. A transaction decodes the row once, and its reads and its
 changes go to that copy. Each change of a mapping stages the row in the
-namespace at once, so a savepoint covers it. A hook before the commit
-stages the rows again, for a `LockItem` that changed in place, as `refresh`
-does. A rollback to a savepoint drops the copies, and the next read decodes
-the row again. The TTL of the row is the longest time that a lock of the
-row stays valid, at least one second. A row without a lock is deleted.
+namespace at once, so a savepoint covers it. Each savepoint and a hook
+before the commit stage the rows again, for a `LockItem` that changed in
+place, as `refresh` does. A rollback to a savepoint drops the copies, and
+the next read decodes the row again. The TTL of the row is the longest
+time that a lock of the row stays valid, at least one second. A row
+without a lock is deleted.
 
 A lock that is no longer valid reads as absent. With `killinvalids`,
 `wl_lockmapping` deletes such locks from the row, and calls
@@ -156,10 +157,10 @@ class _Rows(dict):
     """The rows that one transaction of one connection decoded, by oid.
 
     It joins the transaction as a data manager that writes nothing itself,
-    so that a savepoint covers the rows. Then it makes the writes of the
-    namespace join, when they are not there yet. So the savepoint of the
-    rows, which stages them, comes before the savepoint of the writes, which
-    keeps them.
+    so that a rollback to a savepoint drops the rows. The writes of the
+    namespace stage the rows before each of their savepoints, so the
+    savepoint keeps a `LockItem` that changed in place, whatever the order
+    in which the two joined.
     """
 
     def __init__(self, jar, txn):
@@ -168,7 +169,8 @@ class _Rows(dict):
         self.transaction = txn
         self._jar = jar
         txn.join(self)
-        zoe.kv.Namespace(jar, "ephemeral", NAMESPACE)._staged(create=True)
+        writes = zoe.kv.Namespace(jar, "ephemeral", NAMESPACE)._staged(create=True)
+        writes.flush_before_savepoint(self.write_back)
         txn.addBeforeCommitHook(self.write_back)
 
     def write_back(self):

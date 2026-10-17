@@ -125,6 +125,23 @@ def test_a_namespace_on_a_database_of_the_client(server, native):
         db.close()
 
 
+@pytest.mark.parametrize("native", [True, False])
+def test_kv_supported_keeps_its_answer_while_the_server_is_away(server, native):
+    storage = zoe_client(server.address, native=native)
+    try:
+        assert storage.kv_supported()
+        server.kill()
+        deadline = time.monotonic() + 30
+        while storage.is_connected() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not storage.is_connected()
+        # The locking backend of zoe.plone never takes the stock path then.
+        assert storage.kv_supported()
+    finally:
+        storage.close()
+        server.start()
+
+
 def test_a_durable_key_survives_a_restart(server):
     storage = zoe_client(server.address)
     try:
