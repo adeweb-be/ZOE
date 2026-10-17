@@ -13,8 +13,7 @@ The harness runs the tests that these mixins define: `BasicStorage`, the
 race tests of ZODB (`RaceTests`, a base of `BasicStorage`),
 `SynchronizedStorage`, `MTStorage` and `RevisionStorage`. They run inside
 `NATIVE_LAYER` and `zoe.testing.ZEO_LAYER`, so the client is the native
-client and the server is `zoe serve`. The undo tests are skipped, as in
-`test_zeo_harness.py`.
+client and the server is `zoe serve`.
 
 The test case is ZEO's `FileStorageTests` with two changes:
 
@@ -45,13 +44,10 @@ MIXINS = {
     ("ZODB.tests.RevisionStorage", "RevisionStorage"),
 }
 
-UNDO = "the storage does not undo: supportsUndo() is false"
 RECONNECT = "it opens and closes many clients, a test of reconnects"
 
 # The tests of these mixins that the harness does not run, and why.
 SKIPS = {
-    "RevisionStorage.checkLoadBeforeUndo": UNDO,
-    "RevisionStorage.testLoadBeforeUndo": UNDO,
     "RaceTests.test_race_external_invalidate_vs_disconnect": RECONNECT,
 }
 

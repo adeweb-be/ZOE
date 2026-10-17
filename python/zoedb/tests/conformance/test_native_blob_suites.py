@@ -17,7 +17,7 @@ The tests run inside two layers. In `zoe.testing.ZEO_LAYER`, the test
 forker of ZEO starts `zoe serve` in place of a ZEO server. In
 `zoe.testing.NATIVE_LAYER`, `ZEO.ClientStorage.ClientStorage`, and what
 ZEO's tests open through it, is the native client. A test passes, or is
-skipped for undo, or is in `INSIDE` with its reason, or skips itself.
+is in `INSIDE` with its reason, or skips itself.
 `INSIDE` holds the tests that read the inside of `ZEO.ClientStorage`,
 which the native client does not have.
 """
@@ -26,8 +26,6 @@ import doctest
 import unittest
 
 import zoe.testing
-
-UNDO = "the storage does not undo: supportsUndo() is false"
 
 # The classes whose tests the run takes, and the classes that define them.
 CLASSES = {"BlobAdaptedFileStorageTests", "BlobWritableCacheTests"}
@@ -59,10 +57,6 @@ def name_of(test):
     if isinstance(test, doctest.DocTestCase):
         return test.id().rsplit("/", 1)[-1].rsplit(".", 1)[-1]
     return f"{defining_class(test).__name__}.{test._testMethodName}"
-
-
-def is_undo(test):
-    return "undo" in name_of(test).lower() or "Undo" in type(test).__name__
 
 
 def walk(suite, layers=()):
@@ -109,9 +103,6 @@ def run(tests):
             name = name_of(test)
             if name in INSIDE:
                 left_out += 1
-                continue
-            if is_undo(test):
-                result.addSkip(test, UNDO)
                 continue
             for layer in layers:
                 if layer not in started:

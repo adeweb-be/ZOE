@@ -12,9 +12,8 @@ in the test modules that bound the class at their import.
   the tests of ZODB's `ConflictResolvingStorage` against a server that
   leaves the resolution to the client.
 - In `FileStorageTests` of `ZEO.tests.testZEO`, the tests of
-  `ConflictResolvingStorage` run, and the tests of
-  `ConflictResolvingTransUndoStorage` are skipped for undo, as in
-  `test_zeo_harness.py`.
+  `ConflictResolvingStorage` and `ConflictResolvingTransUndoStorage` run,
+  but those in `SERVER_PYTHON`.
 
 No network thread of ZEO's own client starts during the run, so the tests
 exercise the native client.
@@ -25,7 +24,15 @@ import unittest
 
 import zoe.testing
 
-UNDO = "the storage does not undo: supportsUndo() is false"
+# The tests that need Python on the server, and why. The vote of zoe serve
+# merges an undo through the tiers of the core, and runs no Python.
+SERVER_PYTHON = {
+    "testUndoConflictResolution": (
+        "it undoes over a later change of a class that only the Python "
+        "_p_resolveConflict of the class merges; zoe serve runs no Python, so "
+        "such an undo fails with UndoError"
+    ),
+}
 
 CONFLICTS = ("ZODB.tests.ConflictResolution", "ConflictResolvingStorage")
 UNDO_CONFLICTS = ("ZODB.tests.ConflictResolution", "ConflictResolvingTransUndoStorage")
@@ -144,11 +151,15 @@ def test_conflict_resolution_mixins_of_zodb_pass(tmp_path, monkeypatch):
         if mixin_of(test) in (CONFLICTS, UNDO_CONFLICTS)
     ]
     assert {mixin_of(test) for test in tests} == {CONFLICTS, UNDO_CONFLICTS}
-    skips = {test: UNDO for test in tests if mixin_of(test) == UNDO_CONFLICTS}
+    skips = {
+        test: SERVER_PYTHON[test._testMethodName]
+        for test in tests
+        if mixin_of(test) == UNDO_CONFLICTS and test._testMethodName in SERVER_PYTHON
+    }
     with zeo_client_threads() as threads:
         result = run(tests, skips)
     assert_passed(result)
     assert threads == [], "ZEO's own client ran"
-    assert len(result.skipped) == len(skips) >= 2
+    assert len(result.skipped) == len(skips) == len(SERVER_PYTHON)
     assert result.testsRun == len(tests) - len(skips)
     assert result.testsRun >= 5

@@ -22,8 +22,6 @@ import unittest
 
 import zoe.testing
 
-UNDO = "the storage does not undo: supportsUndo() is false"
-
 RACE = "RaceTests.test_race_external_invalidate_vs_disconnect"
 
 
@@ -39,10 +37,6 @@ def name_of(test):
 
 def class_of(test):
     return type(test).__name__
-
-
-def is_undo(test):
-    return "undo" in name_of(test).lower() or "Undo" in class_of(test)
 
 
 def walk(suite, layers=()):
@@ -98,9 +92,6 @@ def run(tests):
     started, ran = [], []
     try:
         for test, layers in tests:
-            if is_undo(test):
-                result.addSkip(test, UNDO)
-                continue
             for layer in layers:
                 if layer not in started:
                     layer.setUp()
