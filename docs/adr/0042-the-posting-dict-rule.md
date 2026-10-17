@@ -1,6 +1,6 @@
 # 0042. The posting-dict rule, the first-key rule, and the settings of the structural merges
 
-Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes. On the pull request, the human then asked for the key of the rule as a mode, `posting-dicts`, for the reasons of the rule in the Context, for a shadow mode that a store cannot run without its log in-process, and for posting dicts of int scores only. The first-key rule came after the gate replay of ZOE-208 (#416): the human asked Claude to settle where it goes, and Claude put it here, under the same key; the human reviews it on the pull request.
+Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes. On the pull request, the human then asked for the key of the rule as a mode, `posting-dicts`, for the reasons of the rule in the Context, for a shadow mode that a store cannot run without its log in-process, and for posting dicts of int scores only. The first-key rule came after the gate replay of ZOE-208 (#416): the human asked Claude to settle where it goes, Claude put it here, and the human approved it here, under the same key.
 
 ## Context
 
