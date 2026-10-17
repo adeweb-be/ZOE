@@ -95,7 +95,7 @@ A commit whose finish started and that is not durable or failed yet; its staged 
 _Avoid_: pending commit
 
 **Intent lock**:
-An exclusive per-OID lock that a client asks for when a transaction first changes an object, before the vote.
+An exclusive per-OID lock that a client asks for before the vote, when its transaction loads an object of a hot class, so a second writer waits before it reads (ADR 0045).
 _Avoid_: early lock, pessimistic lock
 
 **Conflict**:
