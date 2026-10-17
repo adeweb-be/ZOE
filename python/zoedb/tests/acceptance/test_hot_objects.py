@@ -35,6 +35,7 @@ client. `just test` runs it.
 import contextlib
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -77,6 +78,8 @@ def database(section, early_locks):
     lines = section.strip().splitlines()
     if early_locks is not None:
         lines.insert(-1, f"  early-locks {early_locks}")
+    if early_locks == "on":
+        lines.insert(-1, "  early-lock-classes persistent.mapping.PersistentMapping")
     body = "\n".join(f"  {line}" for line in lines)
     text = f"%import zoe\n<zodb>\n  pool-size {WRITERS}\n{body}\n</zodb>\n"
     return ZODB.config.databaseFromString(text)
@@ -258,6 +261,11 @@ def increment_mapping(root):
     hot["n"] = hot["n"] + 1
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="fsync on macOS is faster than a client round trip, "
+    "so commits do not wait in batches",
+)
 def test_writers_on_a_hot_length_share_the_syncs(tmp_path):
     from BTrees.Length import Length
 
