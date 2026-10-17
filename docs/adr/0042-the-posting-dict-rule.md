@@ -1,6 +1,6 @@
 # 0042. The posting-dict rule, and the settings of the structural merges
 
-Status: proposed. A checkpoint of ZOE-203: the human approves it on the pull request before the rule and the keys are built.
+Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes.
 
 ## Context
 

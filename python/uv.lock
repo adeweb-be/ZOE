@@ -3863,6 +3863,7 @@ dependencies = [
 dev = [
     { name = "msgpack" },
     { name = "opentelemetry-sdk" },
+    { name = "products-zcatalog" },
     { name = "pytest" },
     { name = "zodb", extra = ["test"] },
     { name = "zodburi" },
@@ -3880,6 +3881,7 @@ requires-dist = [
 dev = [
     { name = "msgpack" },
     { name = "opentelemetry-sdk" },
+    { name = "products-zcatalog" },
     { name = "pytest", specifier = ">=9.1" },
     { name = "zodb", extras = ["test"] },
     { name = "zodburi", specifier = ">=3" },
