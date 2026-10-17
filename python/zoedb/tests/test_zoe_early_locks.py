@@ -149,7 +149,8 @@ def test_the_config_keys_give_the_hot_classes(tmp_path, monkeypatch):
         db.close()
     monkeypatch.setenv("ZOE_EARLY_LOCKS", "on")
     monkeypatch.setenv("ZOE_EARLY_LOCK_CLASSES", f"{HOT}, x.Y")
-    text = f"%import zoe\n<zodb>\n  <zoe>\n    path {tmp_path / 'other'}\n  </zoe>\n</zodb>\n"
+    other = tmp_path / "other"
+    text = f"%import zoe\n<zodb>\n  <zoe>\n    path {other}\n  </zoe>\n</zodb>\n"
     db = ZODB.config.databaseFromString(text)
     try:
         assert db.storage.early_lock_classes == {HOT, "x.Y"}
