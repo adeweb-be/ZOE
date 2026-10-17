@@ -11,7 +11,7 @@ Step 1 of the card: the log is the transactions of a store that a B5 run kept (`
 ## Method
 
 - `main` at `3b5164f`. One B5 run: `just bench plone run --stack zeo --scenario edit --steps 4:60,16:60 --keep-store`, on the small fixture. It kept `store/filestorage/Data.fs` and the probe records of both instances, `probe/instance0.jsonl` and `probe/instance1.jsonl`. Its verification passed.
-- `just bench replay RUN` read the log and replayed it on both stacks at 1×, 4× and 16×, one repetition, in the interpreter of the zoeclient Plone instance. A debug run replayed the first 300 transactions and compared, at each store, the serial that the transaction read with the serial on the server.
+- `just bench replay RUN` read the log and replayed it on both stacks at 1×, 4× and 16×, one repetition, in the interpreter of the zoeclient Plone instance, with `bench/replay` at `2ece33d` and a clean tree, as each result records. `zoe serve` was the release build of `main`; the native client was the package `zoe` of the zoeclient instance, built from `main`. A debug run replayed the first 300 transactions and compared, at each store, the serial that the transaction read with the serial on the server.
 - Machine: Apple M3 Pro, CPython 3.13, both servers with `fsync(2)`.
 
 ## The log
@@ -53,8 +53,8 @@ The acceptance test fixes the schedule: at the speed s, an event that the log pu
 | zoe-native | 1× | 1,720 | 164 | 95.3 | 1,556 | 188.0 |
 | zeo | 4× | 1,720 | 164 | 95.3 | 1,556 | 47.0 |
 | zoe-native | 4× | 1,720 | 164 | 95.3 | 1,556 | 47.0 |
-| zeo | 16× | 1,720 | 164 | 95.3 | 1,556 | 17.7 |
-| zoe-native | 16× | 1,720 | 164 | 95.3 | 1,556 | 15.0 |
+| zeo | 16× | 1,720 | 164 | 95.3 | 1,556 | 17.8 |
+| zoe-native | 16× | 1,720 | 164 | 95.3 | 1,556 | 15.1 |
 
 Every run counts: each record of each acknowledged transaction loads at its tid. Conflicts per 1,000 transactions, by class, all refused: `zeo`: `IOBucket` 87.8, `PersistentMapping` 3.5, `OOBucket` 2.9, `OOBTree` 1.2. `zoe-native`: `IOBucket` 74.4, `IIBTree` 7.0, `OOBucket` 6.4, `PersistentMapping` 3.5, `IITreeSet` 2.3, `IIBucket` 1.2, `OOBTree` 0.6. The two stacks refuse the same number of commits; the refused oid of a vote is not always the same one, so the classes differ.
 
@@ -66,7 +66,7 @@ The log holds the record of each transaction as the store committed it, so the r
 
 ## A preview of the gate
 
-The same log at 1×, `zoe-native` against `zoe serve` built from `card/ZOE-203` (f08a591) with `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`, one repetition, beside `zeo` of the baseline:
+The same log at 1×, `zoe-native` against `zoe serve` built in release from `card/ZOE-203` at `a5e210d` (sha256 `82ba8b38…`, which the result records) with `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`, one repetition, beside `zeo` of the baseline. The native client stays the one of `main`: ZOE-203 does not change it.
 
 | stack | `ConflictError`s | per 1,000 | acknowledged |
 | --- | ---: | ---: | ---: |
