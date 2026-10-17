@@ -861,6 +861,15 @@ impl Pool {
         })
     }
 
+    /// Lease a connection for the early write-intent locks of one owner,
+    /// as `begin_with` leases one for a transaction.
+    pub async fn intents(&self) -> Result<PoolIntents, Error> {
+        Ok(PoolIntents {
+            lease: Some(self.lease().await?),
+            held: false,
+        })
+    }
+
     /// Take a free connection, open one, or wait for one. A free
     /// connection that is lost closes and leaves the pool.
     async fn lease(&self) -> Result<Lease, Error> {
@@ -1074,6 +1083,80 @@ impl Drop for Opening {
             }
         }
         self.shared.bump();
+    }
+}
+
+/// The early write-intent locks of one owner (ADR 0045), on a connection
+/// of the pool that the owner leases from its first lock to the end of
+/// its transaction. `begin_with` begins the transaction that adopts the
+/// locks, on the same connection. The drop sends `unlock_intent` and gives
+/// the connection back, so the next transaction of the connection adopts
+/// none of them.
+pub struct PoolIntents {
+    lease: Option<Lease>,
+    /// True after a lock that the server granted.
+    held: bool,
+}
+
+impl PoolIntents {
+    fn client(&self) -> &Client {
+        self.lease.as_ref().expect("a lease").client()
+    }
+
+    /// Take the intent locks of `oids`, as `Client::lock_intent` does, and
+    /// return their current serials.
+    pub async fn lock(&mut self, oids: &[Oid]) -> Result<Vec<Tid>, Error> {
+        let serials = self.client().lock_intent(oids).await?;
+        self.held = true;
+        Ok(serials)
+    }
+
+    /// Release the locks, wait for the reply, and give the connection back.
+    pub async fn release(mut self) -> Result<(), Error> {
+        if std::mem::replace(&mut self.held, false) {
+            self.client().unlock_intent().await?;
+        }
+        Ok(())
+    }
+
+    /// Begin the transaction that adopts the locks, on the connection of
+    /// the locks, as `Pool::begin_with` does.
+    pub async fn begin_with(
+        mut self,
+        user: &[u8],
+        description: &[u8],
+        extension: &[u8],
+        tid: Option<Tid>,
+        status: &str,
+    ) -> Result<PoolTransaction, Error> {
+        let txn = self
+            .client()
+            .begin_with(user, description, extension, tid, status)
+            .await?;
+        self.held = false;
+        Ok(PoolTransaction {
+            txn: Some(txn),
+            lease: self.lease.take().expect("a lease"),
+            writes: Vec::new(),
+        })
+    }
+}
+
+impl Drop for PoolIntents {
+    fn drop(&mut self) {
+        if self.held
+            && let Some(lease) = &self.lease
+        {
+            lease.client().unlock_intent_later();
+        }
+    }
+}
+
+impl std::fmt::Debug for PoolIntents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolIntents")
+            .field("held", &self.held)
+            .finish_non_exhaustive()
     }
 }
 

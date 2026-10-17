@@ -23,10 +23,12 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rmpv::Value;
-use zoe_core::{BlobFile, Compression, Finished, LockCancel, Oid, Store, Tid, Txn, ZoeError};
+use zoe_core::{
+    BlobFile, Compression, Finished, IntentLocks, LockCancel, Oid, Store, Tid, Txn, ZoeError,
+};
 
 use super::blob::Download;
 use super::clock;
@@ -391,8 +393,11 @@ impl Reply {
 }
 
 /// The calls of the open transaction of a connection. One thread runs
-/// them in order, from `tpc_begin` to the end of the transaction.
-const TRANSACTION_CALLS: [&str; 12] = [
+/// them in order, from `tpc_begin`, or from the first `lock_intent` before
+/// it, to the end of the transaction.
+const TRANSACTION_CALLS: [&str; 14] = [
+    "lock_intent",
+    "unlock_intent",
     "tpc_begin",
     "storea",
     "restorea",
@@ -406,6 +411,10 @@ const TRANSACTION_CALLS: [&str; 12] = [
     "storeBlobEnd",
     "storeBlobShared",
 ];
+
+/// The longest time that a session holds intent locks without a
+/// `tpc_begin`. Then the server releases them (ADR 0045).
+pub(crate) const INTENT_HOLD: Duration = Duration::from_secs(60);
 
 /// Tell if `method` is a call of the transaction of the connection.
 pub(crate) fn in_transaction(method: &str) -> bool {
@@ -516,6 +525,9 @@ pub(crate) struct Session {
 pub(crate) struct Transaction {
     session: Arc<Session>,
     open: Option<Open>,
+    /// The early write-intent locks of the session (ADR 0045), from its
+    /// first `lock_intent`. The next `tpc_begin` adopts them.
+    intents: Option<IntentLocks<Arc<Store>>>,
     /// The compression pool and the runtime of its jobs. Without them, the
     /// finish encodes each staged pickle.
     compress: Option<(Compressor, Arc<dyn Runtime>)>,
@@ -1340,6 +1352,7 @@ impl Transaction {
         Self {
             session,
             open: None,
+            intents: None,
             compress: None,
         }
     }
@@ -1350,9 +1363,48 @@ impl Transaction {
         self
     }
 
-    /// Tell if a transaction is open.
+    /// Tell if a transaction is open, or if the session holds intent
+    /// locks for its next transaction.
     pub(crate) fn is_open(&self) -> bool {
-        self.open.is_some()
+        self.open.is_some() || self.holds_intents()
+    }
+
+    /// Tell if the session holds intent locks.
+    fn holds_intents(&self) -> bool {
+        self.intents
+            .as_ref()
+            .is_some_and(|intents| !intents.is_empty())
+    }
+
+    /// Return the time that the session can still hold its intent locks
+    /// without a `tpc_begin`, or `None` when it holds none or a transaction
+    /// is open.
+    pub(crate) fn intent_hold_left(&self) -> Option<Duration> {
+        if self.open.is_some() {
+            return None;
+        }
+        let held_for = self.intents.as_ref()?.held_for()?;
+        Some(INTENT_HOLD.saturating_sub(held_for))
+    }
+
+    /// Release the intent locks that the session held past the bound
+    /// without a `tpc_begin`, and log one WARN event. The locks are
+    /// advisory, so the drop changes no outcome but the chance of a
+    /// conflict.
+    pub(crate) fn drop_intents(&mut self) {
+        let Some(intents) = self.intents.as_mut() else {
+            return;
+        };
+        let oids = intents.oids();
+        intents.release();
+        if let Some(&first) = oids.first() {
+            tracing::warn!(
+                oids = oids.len(),
+                first = format!("0x{:016x}", first.0),
+                held_s = INTENT_HOLD.as_secs(),
+                "released the intent locks that a client held without tpc_begin"
+            );
+        }
     }
 
     /// Run one call of the transaction, and count it in the status of the
@@ -1440,6 +1492,8 @@ impl Transaction {
             return Outcome::Failed(fault);
         }
         let result = match call.method.as_str() {
+            "lock_intent" => self.lock_intent(args),
+            "unlock_intent" => self.unlock_intent(args),
             "tpc_begin" => self.tpc_begin(args),
             "storea" => self.storea(args),
             "restorea" => self.restorea(args),
@@ -1471,7 +1525,13 @@ impl Transaction {
             return Err(Fault::type_error("tpc_begin takes 4 to 6 arguments"));
         };
         if self.open.is_none() {
-            let txn = self.begin(args);
+            let mut txn = self.begin(args);
+            // The transaction adopts the intent locks of the session.
+            if let (Ok(begun), Some(intents)) = (&mut txn, self.intents.as_mut())
+                && let Err(error) = begun.adopt_intents(intents)
+            {
+                txn = Err(error.into());
+            }
             self.open = Some(Open {
                 id: id.clone(),
                 txn,
@@ -1480,6 +1540,53 @@ impl Transaction {
                 upload: None,
                 jobs: Vec::new(),
             });
+        }
+        Ok(Value::Nil)
+    }
+
+    /// Take the early write-intent lock of each oid of `args`, a list of
+    /// oids in ascending order, for the next transaction of the session.
+    /// Return the current serial of each oid, in the same order, when the
+    /// session holds them all.
+    ///
+    /// An oid at or below an oid that the session holds fails with
+    /// `StorageTransactionError` (`LockOrder`), and the call takes nothing.
+    /// A wait past the lock timeout, or the end of the connection, fails
+    /// with `ConflictError`. A call in an open transaction, or of a client
+    /// that registered read-only, fails.
+    fn lock_intent(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        let [oids] = arity::<1>(args, "lock_intent")?;
+        if self.session.read_only() {
+            return Err(Fault::read_only());
+        }
+        if self.open.is_some() {
+            return Err(Fault::transaction("lock_intent in an open transaction"));
+        }
+        let Value::Array(items) = oids else {
+            return Err(Fault::type_error("the oids of lock_intent are not a list"));
+        };
+        let oids = items
+            .iter()
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<Result<Vec<Oid>, Fault>>()?;
+        let session = &self.session;
+        let intents = self.intents.get_or_insert_with(|| {
+            let mut intents = IntentLocks::new(Arc::clone(&session.store));
+            intents.set_lock_cancel(session.lock_cancel.clone());
+            intents
+        });
+        let serials = intents.lock(&oids)?;
+        Ok(Value::Array(
+            serials.into_iter().map(|serial| p64(serial.0)).collect(),
+        ))
+    }
+
+    /// Release every intent lock of the session: the client ended its
+    /// transaction before `tpc_begin`.
+    fn unlock_intent(&mut self, args: &[Value]) -> Result<Value, Fault> {
+        arity::<0>(args, "unlock_intent")?;
+        if let Some(intents) = self.intents.as_mut() {
+            intents.release();
         }
         Ok(Value::Nil)
     }
@@ -3246,6 +3353,86 @@ mod tests {
         ];
         done(call(&mut s, "register", args));
         s
+    }
+
+    /// Return a session on `storage`, registered with `declaration`.
+    fn declaring_on(storage: &Arc<NamedStorage>, declaration: &[&str]) -> Client {
+        let mut s = Client::new(Arc::clone(storage), outbox());
+        let names = declaration.iter().map(|name| Value::from(*name)).collect();
+        let args = vec![Value::from("1"), Value::Boolean(false), Value::Array(names)];
+        done(call(&mut s, "register", args));
+        s
+    }
+
+    fn lock_intent(s: &mut Client, oids: &[u64]) -> Outcome {
+        let oids = oids.iter().map(|&oid| p64(oid)).collect();
+        call(s, "lock_intent", vec![Value::Array(oids)])
+    }
+
+    #[test]
+    fn lock_intent_needs_the_declaration_and_gives_the_current_serials() {
+        let mut stock = registered("intent-stock");
+        let fault = failed(lock_intent(&mut stock, &[1]));
+        assert_eq!(fault.class, "builtins.ValueError");
+        let storage = storage("intent-serials", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        let serials = done(lock_intent(&mut s, &[1, 2]));
+        assert_eq!(serials, Value::Array(vec![p64(one), p64(0)]));
+        assert!(s.txn.is_open());
+        // A lower oid, or one that the session holds, fails and takes
+        // nothing.
+        for oids in [&[1][..], &[2], &[0]] {
+            let fault = failed(lock_intent(&mut s, oids));
+            assert_eq!(fault.class, TRANSACTION_ERROR, "{oids:?}");
+        }
+        assert_eq!(done(call(&mut s, "unlock_intent", vec![])), Value::Nil);
+        assert!(!s.txn.is_open());
+    }
+
+    #[test]
+    fn the_next_transaction_adopts_the_intent_locks_of_the_session() {
+        let storage = storage("intent-adopt", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let mut other = declaring_on(&storage, &["lock_intent"]);
+        let one = commit(&mut s, 1, 1, 0, MAPPING).unwrap();
+        done(lock_intent(&mut s, &[1]));
+        // The vote of the session takes its own intent lock at once.
+        let voted = store_and_vote(&mut s, 2, &[(1, one)], MAPPING);
+        assert!(matches!(voted, Outcome::Done(_)), "{voted:?}");
+        // No lock_intent in an open transaction.
+        let fault = failed(lock_intent(&mut s, &[5]));
+        assert_eq!(fault.class, TRANSACTION_ERROR);
+        let two = finish(&mut s, Value::from(2));
+        // The end of the transaction released the lock: another session
+        // takes it at once, and reads the commit.
+        assert_eq!(
+            done(lock_intent(&mut other, &[1])),
+            Value::Array(vec![p64(two)])
+        );
+    }
+
+    #[test]
+    fn a_read_only_session_takes_no_intent_lock() {
+        let mut s = declaring("intent-read-only", true, &["lock_intent"]);
+        assert_eq!(failed(lock_intent(&mut s, &[1])), Fault::read_only());
+    }
+
+    #[test]
+    fn a_session_that_holds_intent_locks_past_the_bound_loses_them() {
+        let storage = storage("intent-bound", Queues::DEFAULT);
+        let mut s = declaring_on(&storage, &["lock_intent"]);
+        let mut other = declaring_on(&storage, &["lock_intent"]);
+        done(lock_intent(&mut s, &[3]));
+        assert!(
+            s.txn
+                .intent_hold_left()
+                .is_some_and(|left| left <= INTENT_HOLD)
+        );
+        s.txn.drop_intents();
+        assert!(!s.txn.is_open());
+        assert_eq!(s.txn.intent_hold_left(), None);
+        done(lock_intent(&mut other, &[3]));
     }
 
     #[test]
