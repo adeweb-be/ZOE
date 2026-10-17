@@ -258,6 +258,16 @@ impl Ticket {
     }
 }
 
+/// What the thread of a lane does next.
+enum Next {
+    /// Run this call.
+    Call(Box<(Call, Ticket)>),
+    /// The time of `Lane::next` passed with no call.
+    Late,
+    /// End the thread.
+    End,
+}
+
 /// The calls of the transaction of a connection that wait for its thread.
 struct Lane {
     state: Mutex<LaneState>,
@@ -308,23 +318,40 @@ impl Lane {
     }
 
     /// Return the next call. Wait for it while a transaction is open
-    /// (`open`). Return `None` when no call waits and no transaction is
-    /// open, or at the end: then the thread ends.
-    fn next(&self, open: bool) -> Option<(Call, Ticket)> {
+    /// (`open`). Return `End` when no call waits and no transaction is
+    /// open, or at the end: then the thread ends. With `within`, wait at
+    /// most that time on the clock of its runtime, and return `Late` when
+    /// no call came.
+    fn next(&self, open: bool, within: Option<(Duration, &dyn Runtime)>) -> Next {
         loop {
             {
                 let mut state = self.lock();
                 if let Some(next) = state.calls.pop_front() {
-                    return Some(next);
+                    return Next::Call(Box::new(next));
                 }
                 if !open || state.ended {
                     state.running = false;
-                    return None;
+                    return Next::End;
                 }
             }
             // A notice that comes after the check and before the wait is
             // kept, so the wait ends at once.
-            block_on(self.ready.notified());
+            let notified = self.ready.notified();
+            let Some((within, runtime)) = within else {
+                block_on(notified);
+                continue;
+            };
+            let mut notified = std::pin::pin!(notified);
+            let mut timer = runtime.sleep(within);
+            let woken = block_on(std::future::poll_fn(|cx| {
+                if notified.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(true);
+                }
+                timer.as_mut().poll(cx).map(|()| false)
+            }));
+            if !woken {
+                return Next::Late;
+            }
         }
     }
 
@@ -365,14 +392,30 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, comp
 
     let _guard = Guard(lane, ended);
     let (compressor, runtime) = compress;
-    let mut transaction = Transaction::new(Arc::clone(session)).compressing(compressor, runtime);
-    while let Some((
-        mut call,
-        Ticket {
-            slot: _slot, room, ..
-        },
-    )) = lane.next(transaction.is_open())
-    {
+    let mut transaction =
+        Transaction::new(Arc::clone(session)).compressing(compressor, Arc::clone(&runtime));
+    loop {
+        // Intent locks without a `tpc_begin` last at most a bound.
+        let within = transaction.intent_hold_left().map(|left| (left, &*runtime));
+        let (
+            mut call,
+            Ticket {
+                slot: _slot, room, ..
+            },
+        ) = match lane.next(transaction.is_open(), within) {
+            Next::Call(next) => *next,
+            Next::Late => {
+                if transaction
+                    .intent_hold_left()
+                    .is_some_and(|left| left.is_zero())
+                {
+                    let _entered = session.span(peer).entered();
+                    transaction.drop_intents();
+                }
+                continue;
+            }
+            Next::End => break,
+        };
         if ended.is_set() {
             lane.stop();
             break;

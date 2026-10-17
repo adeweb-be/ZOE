@@ -36,6 +36,15 @@
 //! Each wait for the lock of an oid runs in a `tracing` span `lock_wait`,
 //! with the field `oid`. The call opens and closes it without the mutex.
 //! The span ends at the grant, the timeout or the cancel.
+//!
+//! When the finish of a holder starts, the holder can hand the lock of an
+//! oid that it writes to the exclusive request at the head of the queue of
+//! the oid (`handoff`, ADR 0044). The entry keeps the hand-off until the
+//! store holds the last commit of the oid (`settle`). Until then, only an
+//! exclusive request takes the lock, and the call that takes it gets the
+//! hand-off.
+
+mod handoff;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +54,7 @@ use std::time::{Duration, SystemTime};
 use crate::clock::{Clock, Waiter};
 use crate::error::ZoeError;
 use crate::types::Oid;
+pub(crate) use handoff::{Handoff, InFlight, Waited};
 
 /// A handle that ends the lock waits of votes from another thread.
 ///
@@ -137,6 +147,11 @@ pub(crate) enum Mode {
     /// For an oid that the transaction writes. No other lock can hold the
     /// oid at the same time.
     Exclusive,
+    /// An early write-intent lock (ADR 0045): exclusive, taken before the
+    /// vote, before the transaction reads the oid. It never takes a
+    /// hand-off: it waits until the store holds the last commit of the oid,
+    /// as a shared request does.
+    Intent,
 }
 
 /// A request that waits in the queue of an oid.
@@ -165,26 +180,54 @@ fn wake_all(woken: Woken) {
 }
 
 /// The lock state of one oid.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Entry {
     /// The number of requests that hold the lock.
     holders: usize,
     /// True when the holder holds the lock in exclusive mode.
     exclusive: bool,
+    /// The hand-off of the commit in flight that writes the last state of
+    /// the oid, until the store holds the last commit of the oid.
+    committing: Option<Arc<Handoff>>,
     /// The requests that wait, in arrival order.
     queue: VecDeque<Queued>,
 }
 
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("holders", &self.holders)
+            .field("exclusive", &self.exclusive)
+            .field("committing", &self.committing.is_some())
+            .field("queue", &self.queue)
+            .finish()
+    }
+}
+
 impl Entry {
     /// Tell if the holders let a request in `mode` hold the lock with
-    /// them.
+    /// them. While a hand-off is in the entry, a shared request and an
+    /// intent request wait: they read the oid from the store, and the store
+    /// does not hold the last commit of the oid yet.
     fn admits(&self, mode: Mode) -> bool {
-        self.holders == 0 || (!self.exclusive && mode == Mode::Shared)
+        match mode {
+            Mode::Exclusive => self.holders == 0,
+            Mode::Intent | Mode::Shared if self.holders == 0 => self.committing.is_none(),
+            Mode::Intent => false,
+            Mode::Shared => !self.exclusive,
+        }
+    }
+
+    /// Return the hand-off that an exclusive request gets with the lock.
+    fn handoff(&self, mode: Mode) -> Option<Arc<Handoff>> {
+        (mode == Mode::Exclusive)
+            .then(|| self.committing.clone())
+            .flatten()
     }
 
     fn take(&mut self, mode: Mode) {
         self.holders += 1;
-        self.exclusive = mode == Mode::Exclusive;
+        self.exclusive = mode != Mode::Shared;
     }
 
     /// Grant the lock to the waiters at the head of the queue, in arrival
@@ -210,7 +253,7 @@ impl Entry {
     }
 
     fn is_unused(&self) -> bool {
-        self.holders == 0 && self.queue.is_empty()
+        self.holders == 0 && self.queue.is_empty() && self.committing.is_none()
     }
 }
 
@@ -273,10 +316,23 @@ pub(crate) struct Held {
 }
 
 /// The locks that one `acquire` call took. Dropping it releases them.
-#[derive(Debug)]
 pub(crate) struct Locks<'m> {
     manager: &'m LockManager,
     held: Vec<Held>,
+    /// The locks that came with a hand-off.
+    handoffs: Vec<(Oid, Arc<Handoff>)>,
+    /// The end of the lock timeout of the call, on the monotonic time of
+    /// its clock.
+    deadline: Duration,
+}
+
+impl std::fmt::Debug for Locks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Locks")
+            .field("held", &self.held)
+            .field("handoffs", &self.handoffs.len())
+            .finish()
+    }
 }
 
 impl Drop for Locks<'_> {
@@ -290,6 +346,17 @@ impl Locks<'_> {
     /// caller must give them to `LockManager::release` later.
     pub(crate) fn keep(mut self) -> Vec<Held> {
         std::mem::take(&mut self.held)
+    }
+
+    /// Take the locks that came with a hand-off, with their hand-offs.
+    pub(crate) fn handoffs(&mut self) -> Vec<(Oid, Arc<Handoff>)> {
+        std::mem::take(&mut self.handoffs)
+    }
+
+    /// Return the end of the lock timeout of the call, on the monotonic
+    /// time of its clock. A later wait of the vote ends there too.
+    pub(crate) fn deadline(&self) -> Duration {
+        self.deadline
     }
 }
 
@@ -384,6 +451,8 @@ impl LockManager {
         let mut locks = Locks {
             manager: self,
             held: Vec::with_capacity(requests.len()),
+            handoffs: Vec::new(),
+            deadline,
         };
         // The call waits for one oid at a time, so one waiter is
         // sufficient.
@@ -400,6 +469,9 @@ impl LockManager {
             let free = entry.queue.is_empty() && entry.admits(mode);
             if free {
                 entry.take(mode);
+                if let Some(handoff) = entry.handoff(mode) {
+                    locks.handoffs.push((oid, handoff));
+                }
             } else {
                 let Some(wake) = wake.clone() else {
                     // The waiter comes from the clock, without the mutex.
@@ -446,6 +518,13 @@ impl LockManager {
                     table = self.table();
                     // A grant removes the request from the queue.
                     if !table.waits(oid, &wake) {
+                        if let Some(handoff) = table
+                            .entries
+                            .get(&oid)
+                            .and_then(|entry| entry.handoff(mode))
+                        {
+                            locks.handoffs.push((oid, handoff));
+                        }
                         break;
                     }
                     // A request that is still in the queue at its deadline
@@ -491,6 +570,101 @@ impl LockManager {
             self.table().release(held, &mut woken);
             wake_all(woken);
         }
+    }
+
+    /// Return the oids of `oids` whose queue has an exclusive request at
+    /// its head. The caller holds the exclusive lock of each oid of `oids`.
+    pub(crate) fn contended(&self, oids: impl Iterator<Item = Oid>) -> Vec<Oid> {
+        let table = self.table();
+        oids.filter(|oid| {
+            table.entries.get(oid).is_some_and(|entry| {
+                entry
+                    .queue
+                    .front()
+                    .is_some_and(|head| head.mode == Mode::Exclusive)
+            })
+        })
+        .collect()
+    }
+
+    /// Hand the lock of each oid of `handoffs` to the exclusive request at
+    /// the head of its queue, with its hand-off. `held` holds the locks of
+    /// the holder, whose finish started. An oid whose head is no longer an
+    /// exclusive request stays with the holder.
+    ///
+    /// The call removes each lock that it hands off from `held`, and
+    /// returns these locks with their hand-offs. The entry of each one
+    /// keeps the hand-off until `settle`. The call grants under the mutex,
+    /// then wakes the new owners without it, as a release does.
+    pub(crate) fn hand_off(
+        &self,
+        handoffs: Vec<(Oid, Arc<Handoff>)>,
+        held: &mut Vec<Held>,
+    ) -> Vec<(Held, Arc<Handoff>)> {
+        let mut handed = Vec::new();
+        let mut woken = Woken::new();
+        let mut table = self.table();
+        for (oid, handoff) in handoffs {
+            let Some(entry) = table.entries.get_mut(&oid) else {
+                continue;
+            };
+            let exclusive_head = entry
+                .queue
+                .front()
+                .is_some_and(|head| head.mode == Mode::Exclusive);
+            let Some(index) = held.iter().position(|lock| lock.oid == oid) else {
+                continue;
+            };
+            if !(exclusive_head && entry.exclusive && entry.holders == 1) {
+                continue;
+            }
+            // The hold passes to the head of the queue: the count of the
+            // holders stays 1.
+            let Some(head) = entry.queue.pop_front() else {
+                continue;
+            };
+            entry.committing = Some(Arc::clone(&handoff));
+            woken.push(head.wake);
+            handed.push((held.swap_remove(index), handoff));
+        }
+        drop(table);
+        wake_all(woken);
+        // `held` stays in oid order for the release and the log.
+        held.sort_by_key(|lock| lock.oid);
+        handed
+    }
+
+    /// End the hand-offs of `handed`: the store holds the last commit of
+    /// each oid, or the commit of the hand-off failed. The entry of each oid
+    /// drops the hand-off when it is still the one of `handed`, and grants
+    /// its lock to the waiters that it admits.
+    ///
+    /// Two finishes call it: the finish of the holder, when its commit is
+    /// durable or failed, and the finish of a new owner, when its own commit
+    /// is durable. That commit comes after the commit of the hand-off, so
+    /// the store holds the last commit of the oid, even when the finish of
+    /// the holder did not settle yet.
+    pub(crate) fn settle<'h>(&self, handed: impl IntoIterator<Item = (Oid, &'h Arc<Handoff>)>) {
+        let mut woken = Woken::new();
+        let mut table = self.table();
+        for (oid, handoff) in handed {
+            let Some(entry) = table.entries.get_mut(&oid) else {
+                continue;
+            };
+            if entry
+                .committing
+                .as_ref()
+                .is_some_and(|committing| Arc::ptr_eq(committing, handoff))
+            {
+                entry.committing = None;
+                entry.grant(&mut woken);
+            }
+            if entry.is_unused() {
+                table.entries.remove(&oid);
+            }
+        }
+        drop(table);
+        wake_all(woken);
     }
 
     /// Tell if no request holds or waits for a lock.
@@ -1148,6 +1322,142 @@ mod tests {
             }
         });
         drop(holder);
+        assert!(locks.is_empty());
+    }
+
+    /// Return a hand-off of a new commit in flight.
+    fn handoff() -> Arc<Handoff> {
+        Arc::new(Handoff {
+            commit: Arc::new(InFlight::new(b"", b"")),
+            record: b"record".to_vec(),
+        })
+    }
+
+    #[test]
+    fn a_hand_off_passes_the_lock_to_the_exclusive_request_at_the_head() {
+        let locks = LockManager::default();
+        let mut held = locks
+            .acquire(
+                &[
+                    (Oid(1), Exclusive),
+                    (Oid(2), Exclusive),
+                    (Oid(3), Exclusive),
+                ],
+                Duration::ZERO,
+                &SystemClock,
+            )
+            .unwrap()
+            .keep();
+        let (first, second) = (handoff(), handoff());
+        thread::scope(|scope| {
+            let owner = scope.spawn(|| {
+                let mut taken = locks
+                    .acquire(&[(Oid(1), Exclusive)], LONG, &SystemClock)
+                    .unwrap();
+                let handoffs = taken.handoffs();
+                (taken.keep(), handoffs)
+            });
+            let reader = scope.spawn(|| {
+                locks
+                    .acquire(&[(Oid(2), Shared)], LONG, &SystemClock)
+                    .map(Locks::keep)
+                    .map_err(|refused| refused.error)
+            });
+            until_waiting(&locks, Oid(1), 1);
+            until_waiting(&locks, Oid(2), 1);
+            // Oid 2 has a shared request at its head, and oid 3 no request.
+            let oids = [Oid(1), Oid(2), Oid(3)].into_iter();
+            assert_eq!(locks.contended(oids), [Oid(1)]);
+            let offered = vec![(Oid(1), Arc::clone(&first)), (Oid(2), Arc::clone(&second))];
+            let handed = locks.hand_off(offered, &mut held);
+            assert_eq!(handed.len(), 1);
+            assert_eq!(handed[0].0.oid, Oid(1));
+            let oids: Vec<_> = held.iter().map(|lock| lock.oid).collect();
+            assert_eq!(oids, [Oid(2), Oid(3)]);
+            let (owned, handoffs) = owner.join().unwrap();
+            assert!(Arc::ptr_eq(&handoffs[0].1, &first));
+            locks.release(&owned);
+            // The commit is in flight: a shared request waits, and the next
+            // exclusive request takes the lock with the hand-off.
+            let refused = locks
+                .acquire(&[(Oid(1), Shared)], Duration::ZERO, &SystemClock)
+                .map_err(|refused| refused.error);
+            assert!(matches!(refused, Err(ZoeError::Conflict { oid: Oid(1) })));
+            let mut next = locks
+                .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
+                .unwrap();
+            assert!(Arc::ptr_eq(&next.handoffs()[0].1, &first));
+            drop(next);
+            first.commit.end(true);
+            locks.settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
+            let free = locks
+                .acquire(&[(Oid(1), Shared)], Duration::ZERO, &SystemClock)
+                .unwrap();
+            assert!(free.handoffs.is_empty());
+            drop(free);
+            locks.release(&held);
+            reader
+                .join()
+                .unwrap()
+                .map(|kept| locks.release(&kept))
+                .unwrap();
+        });
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn a_settle_grants_the_shared_waiters_and_leaves_a_later_hand_off() {
+        let locks = LockManager::default();
+        let mut held = locks
+            .acquire(&[(Oid(1), Exclusive)], Duration::ZERO, &SystemClock)
+            .unwrap()
+            .keep();
+        let (first, later) = (handoff(), handoff());
+        thread::scope(|scope| {
+            let owner = scope.spawn(|| {
+                locks
+                    .acquire(&[(Oid(1), Exclusive)], LONG, &SystemClock)
+                    .unwrap()
+                    .keep()
+            });
+            until_waiting(&locks, Oid(1), 1);
+            let handed = locks.hand_off(vec![(Oid(1), Arc::clone(&first))], &mut held);
+            let mut owned = owner.join().unwrap();
+            // The new owner hands the lock on before the first commit ends.
+            let next = scope.spawn(|| {
+                let mut taken = locks
+                    .acquire(&[(Oid(1), Exclusive)], LONG, &SystemClock)
+                    .unwrap();
+                let handoffs = taken.handoffs();
+                (taken.keep(), handoffs)
+            });
+            until_waiting(&locks, Oid(1), 1);
+            let later_handed = locks.hand_off(vec![(Oid(1), Arc::clone(&later))], &mut owned);
+            assert!(owned.is_empty());
+            let (taken, handoffs) = next.join().unwrap();
+            assert!(Arc::ptr_eq(&handoffs[0].1, &later));
+            // The end of the first commit leaves the later hand-off.
+            locks.settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
+            locks.release(&taken);
+            let refused = locks
+                .acquire(&[(Oid(1), Shared)], Duration::ZERO, &SystemClock)
+                .map_err(|refused| refused.error);
+            assert!(matches!(refused, Err(ZoeError::Conflict { oid: Oid(1) })));
+            let reader = scope.spawn(|| {
+                locks
+                    .acquire(&[(Oid(1), Shared)], LONG, &SystemClock)
+                    .map(Locks::keep)
+                    .map_err(|refused| refused.error)
+            });
+            until_waiting(&locks, Oid(1), 1);
+            locks.settle(
+                later_handed
+                    .iter()
+                    .map(|(lock, handoff)| (lock.oid, handoff)),
+            );
+            let kept = reader.join().unwrap().unwrap();
+            locks.release(&kept);
+        });
         assert!(locks.is_empty());
     }
 

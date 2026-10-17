@@ -20,8 +20,18 @@
 //! A batch with another member commits with a sync, which also makes every
 //! earlier deferred commit durable.
 //!
+//! A member can merge onto the record of a commit in flight that came to
+//! it with a lock hand-off (ADR 0044). That commit is in the same batch
+//! before the member, or in an earlier batch, so it has its tid when the
+//! leader writes the member. The member writes that tid as the previous
+//! serial of the record. A member whose commit in flight got no tid fails
+//! with `Protocol`.
+//!
 //! The queue mutex is held with no other lock. The leader takes the commit
-//! sequencer after it releases the queue mutex.
+//! sequencer after it releases the queue mutex. A finish that waits for the
+//! end of a batch waits on a waiter of the store clock, so a simulator runs
+//! other threads meanwhile. The leader wakes the waiters after it releases
+//! the queue mutex.
 //!
 //! The write of a batch and its sync run in a `tracing` span `fsync`, with
 //! the field `commits`, the number of members that have a tid. The span
@@ -31,14 +41,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use super::staging::Staging;
 use super::{Finished, Observer, check_restore_tid, next_tid};
 use crate::backend::{TxnMeta, TxnStatus};
 use crate::blob::PendingBlob;
-use crate::clock::timestamp;
+use crate::clock::{Waiter, timestamp};
 use crate::error::{Result, ZoeError};
+use crate::lock::InFlight;
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 use crate::undo;
@@ -55,6 +67,12 @@ pub(super) struct Member {
     pub(super) user: Vec<u8>,
     pub(super) description: Vec<u8>,
     pub(super) extension: Vec<u8>,
+    /// The commit in flight of this member, when it handed off a lock. The
+    /// leader gives it its tid.
+    pub(super) commit: Option<Arc<InFlight>>,
+    /// The oids whose records this member merged onto the record of a
+    /// commit in flight, with that commit.
+    pub(super) onto: BTreeMap<Oid, Arc<InFlight>>,
     /// The lowest tid that the transaction undoes, when it undoes one.
     pub(super) undone: Option<Tid>,
 }
@@ -75,14 +93,14 @@ struct Queue {
     leading: bool,
     /// The ticket of the next finish.
     next: u64,
+    /// The waiters of the finishes that wait for the end of a batch.
+    sleepers: Vec<Arc<dyn Waiter>>,
 }
 
 /// The commit batches of a store.
 #[derive(Default)]
 pub(crate) struct GroupCommit {
     queue: Mutex<Queue>,
-    /// Signals the end of a batch.
-    changed: Condvar,
     /// The observer of the store. A leader tells it the size of each
     /// batch that it made durable.
     pub(super) observer: OnceLock<Arc<dyn Observer>>,
@@ -97,11 +115,29 @@ impl GroupCommit {
 
     /// Commit `member` in a batch of `store`. Return the member and its
     /// outcome when its batch is durable or failed.
-    pub(super) fn finish(&self, store: &Store, member: Member) -> Outcome {
+    ///
+    /// `queued` runs once the member is in the queue, without the queue
+    /// mutex, before the finish waits. A finish that starts after it is
+    /// later in the commit order.
+    pub(super) fn finish<F: FnOnce()>(
+        &self,
+        store: &Store,
+        member: Member,
+        queued: Option<F>,
+    ) -> Outcome {
+        // The waiter comes from the store clock before the member joins the
+        // queue: a clock that panics then leaves no member in the queue
+        // whose transaction released its locks.
+        let waiter = store.clock.waiter();
         let mut queue = self.lock();
         let ticket = queue.next;
         queue.next += 1;
         queue.waiting.push((ticket, member));
+        if let Some(queued) = queued {
+            drop(queue);
+            queued();
+            queue = self.lock();
+        }
         loop {
             if let Some(outcome) = queue.ended.remove(&ticket) {
                 return outcome;
@@ -122,7 +158,11 @@ impl GroupCommit {
                 queue = self.lock();
                 continue;
             }
-            queue = self.changed.wait(queue).unwrap_or_else(|e| e.into_inner());
+            queue.sleepers.push(Arc::clone(&waiter));
+            drop(queue);
+            // A wake before the wait is not lost.
+            waiter.wait(Duration::MAX);
+            queue = self.lock();
         }
     }
 
@@ -157,8 +197,11 @@ impl Drop for Lead<'_> {
             })),
         }
         queue.leading = false;
+        let sleepers = mem::take(&mut queue.sleepers);
         drop(queue);
-        self.group.changed.notify_all();
+        for sleeper in sleepers {
+            sleeper.wake();
+        }
     }
 }
 
@@ -192,6 +235,22 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
                 Some(tid) => check_restore_tid(tid, last).map(|()| tid),
                 None => next_tid(now, last),
             });
+            // A member commits after each commit that it merged onto.
+            let tid = tid.and_then(|tid| {
+                if member.onto.values().all(|commit| commit.tid().is_some()) {
+                    Ok(tid)
+                } else {
+                    Err(ZoeError::Protocol(
+                        "a commit that this commit merged onto failed",
+                    ))
+                }
+            });
+            if let Some(commit) = &member.commit {
+                match &tid {
+                    Ok(tid) => commit.assign(*tid),
+                    Err(_) => commit.end(false),
+                }
+            }
             let finished = tid.map(|tid| Finished {
                 tid,
                 previous: mem::replace(&mut last, tid),
@@ -293,8 +352,20 @@ fn write(
         let Ok(finished) = finished else { continue };
         let tid = finished.tid;
         // An attached payload goes into its frame as it is. A spilled
-        // pickle without one is read back here, one at a time.
-        write.put_payloads(tid, &mut member.staged.payloads())?;
+        // pickle without one is read back here, one at a time. A record
+        // merged onto a commit in flight comes after the record of that
+        // commit.
+        let onto = &member.onto;
+        let mut payloads = member.staged.payloads().map(|record| {
+            record.map(|(oid, serial, payload)| {
+                let serial = onto
+                    .get(&oid)
+                    .and_then(|commit| commit.tid())
+                    .unwrap_or(serial);
+                (oid, serial, payload)
+            })
+        });
+        write.put_payloads(tid, &mut payloads)?;
         for (oid, _) in member.staged.iter() {
             if let Some(blob) = member.blobs.get(&oid) {
                 write.put_blob(oid, tid, blob.record())?;
@@ -355,8 +426,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use zoe_pickle::btrees::new_bucket_state;
+    use zoe_pickle::python::{Heap, Pickler, Value};
+
     use super::*;
     use crate::commit::Txn;
+    use crate::lock::LockCancel;
+    use crate::merge::{Resolution, Resolved};
     use crate::vfs::{DirLock, MemFile, MemVfs, Vfs, WriteFile};
 
     /// The database file of a store.
@@ -734,5 +810,501 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Return the record of a `BTrees.Length.Length` of `value`.
+    fn length(value: i128) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("BTrees.Length", "Length");
+        record(&heap, class, Value::Int(value))
+    }
+
+    /// Return the record of an `IIBucket` of `items`.
+    fn ii_bucket(items: &[(i128, i128)]) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("BTrees.IIBTree", "IIBucket");
+        let flat = items
+            .iter()
+            .flat_map(|&(k, v)| [Value::Int(k), Value::Int(v)])
+            .collect();
+        let state = new_bucket_state(&mut heap, flat, None);
+        record(&heap, class, state)
+    }
+
+    /// Return the record of an `IOBucket` that maps `key` to a dict of
+    /// `entries`. Tier 1 cannot compare two dicts without the posting-dict
+    /// rule, so it gives no answer on a change of the dict.
+    fn io_dict(key: i128, entries: &[(i128, i128)]) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("BTrees.IOBTree", "IOBucket");
+        let dict = entries
+            .iter()
+            .map(|&(k, v)| (Value::Int(k), Value::Int(v)))
+            .collect();
+        let flat = vec![Value::Int(key), heap.new_dict(dict)];
+        let state = new_bucket_state(&mut heap, flat, None);
+        record(&heap, class, state)
+    }
+
+    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
+        let mut pickler = Pickler::new(heap);
+        pickler.dump(class).unwrap();
+        pickler.dump(state).unwrap();
+        pickler.into_bytes()
+    }
+
+    /// Commit `data` as a new object. Return its oid and its serial.
+    fn created(store: &Store, data: &[u8]) -> (Oid, Tid) {
+        let oid = store.new_oid().unwrap();
+        let tid = voted(store, oid, data).finish().unwrap();
+        (oid, tid)
+    }
+
+    /// Begin a transaction that writes `data` for `oid`, read at `serial`.
+    fn writing<'s>(store: &'s Store, oid: Oid, serial: Tid, data: &[u8]) -> Txn<&'s Store> {
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(oid, serial, data).unwrap();
+        txn
+    }
+
+    /// Return the serial of the record before the current record of `oid`,
+    /// as the frame of the record gives it.
+    fn previous_serial(store: &Store, oid: Oid) -> Tid {
+        store
+            .backend
+            .load_before(oid, Tid::MAX)
+            .unwrap()
+            .unwrap()
+            .prev
+    }
+
+    #[test]
+    fn a_vote_merges_onto_a_commit_whose_batch_waits() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let batches = Arc::new(Batches::default());
+        store.set_observer(batches.clone());
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        let (first, second) = thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.vote().map(|()| txn)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            // The batch of the first finish waits for the commit sequencer,
+            // so the store does not hold the first commit.
+            let sequencer = store.lock_sequencer();
+            let joined = store.group.joined();
+            let first = scope.spawn(move || first.finish_after());
+            let second = second.join().unwrap().unwrap();
+            assert_eq!(second.natively_resolved(), [oid]);
+            assert!(!first.is_finished());
+            let second = scope.spawn(move || second.finish_after());
+            wait_until(|| store.group.joined() == joined + 2);
+            drop(sequencer);
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(second.previous, first.tid);
+        assert_eq!(store.load(oid).unwrap(), (length(2), second.tid));
+        assert_eq!(previous_serial(&store, oid), first.tid);
+        assert_eq!(*batches.0.lock().unwrap(), [1, 1]);
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_chain_of_merges_on_a_hot_length_shares_one_sync() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let batches = Arc::new(Batches::default());
+        store.set_observer(batches.clone());
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        let finished = thread::scope(|scope| {
+            let voters: Vec<_> = (1..=2)
+                .map(|n| {
+                    let store = &store;
+                    let voter = scope.spawn(move || {
+                        let mut txn = writing(store, oid, read, &length(1));
+                        txn.vote().unwrap();
+                        txn
+                    });
+                    wait_until(|| store.locks.waiting(oid) == n);
+                    voter
+                })
+                .collect();
+            let sequencer = store.lock_sequencer();
+            let joined = store.group.joined();
+            let mut finishes = vec![scope.spawn(move || first.finish_after())];
+            // Each finish hands the lock to the next vote.
+            for (n, voter) in (2..).zip(voters) {
+                let txn = voter.join().unwrap();
+                finishes.push(scope.spawn(move || txn.finish_after()));
+                wait_until(|| store.group.joined() == joined + n);
+            }
+            drop(sequencer);
+            finishes
+                .into_iter()
+                .map(|finish| finish.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(store.load(oid).unwrap(), (length(3), finished[2].tid));
+        assert_eq!(previous_serial(&store, oid), finished[1].tid);
+        assert_eq!(
+            store
+                .load_before(oid, finished[2].tid)
+                .unwrap()
+                .unwrap()
+                .data,
+            length(2)
+        );
+        // The first commit has a batch of its own. The two merges onto it
+        // share the next sync.
+        assert_eq!(*batches.0.lock().unwrap(), [1, 2]);
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_onto_a_commit_in_flight_fails_at_once() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &ii_bucket(&[(1, 1)]));
+        let mut first = writing(&store, oid, read, &ii_bucket(&[(1, 2)]));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &ii_bucket(&[(1, 3)]));
+                let voted = txn.vote();
+                (voted, txn.conflict_serials(), txn.resolutions().to_vec())
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            let (voted, serials, resolutions) = second.join().unwrap();
+            assert!(matches!(voted, Err(ZoeError::Conflict { oid: o }) if o == oid));
+            // The commit in flight has no tid yet.
+            assert_eq!(serials, None);
+            assert!(matches!(
+                resolutions[..],
+                [Resolution {
+                    outcome: Resolved::Refused(_),
+                    applied: true,
+                    ..
+                }]
+            ));
+            assert!(!first.is_finished());
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+        });
+        assert_eq!(store.load(oid).unwrap().0, ii_bucket(&[(1, 2)]));
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_conflict_that_tier_1_does_not_decide_waits_for_the_durable_commit() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &io_dict(1, &[(1, 1)]));
+        let mut first = writing(&store, oid, read, &io_dict(1, &[(1, 1), (2, 1)]));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &io_dict(1, &[(1, 1), (3, 1)]));
+                let conflicts = txn.vote_resolving().unwrap();
+                (txn, conflicts)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            // The vote has the lock, and waits for the first commit.
+            wait_until(|| store.locks.waiting(oid) == 0);
+            thread::sleep(Duration::from_millis(50));
+            assert!(!second.is_finished());
+            drop(sequencer);
+            let tid = first.join().unwrap().unwrap();
+            let (txn, conflicts) = second.join().unwrap();
+            let [(conflict, record)] = &conflicts[..] else {
+                panic!("{conflicts:?}");
+            };
+            // The caller gets the committed record, as without the
+            // hand-off.
+            assert_eq!(*conflict, oid);
+            assert_eq!(record.tid, tid);
+            assert_eq!(&record.data[..], &io_dict(1, &[(1, 1), (2, 1)])[..]);
+            txn.abort();
+        });
+        assert!(store.locks.is_empty());
+    }
+
+    /// An observer that keeps the lock wait of each vote.
+    #[derive(Default)]
+    struct Waits(std::sync::Mutex<Vec<Duration>>);
+
+    impl Observer for Waits {
+        fn locks_acquired(&self, wait: Duration) {
+            self.0.lock().unwrap().push(wait);
+        }
+    }
+
+    #[test]
+    fn the_lock_wait_of_a_vote_counts_its_wait_for_a_durable_commit() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &io_dict(1, &[(1, 1)]));
+        let waits = Arc::new(Waits::default());
+        store.set_observer(waits.clone());
+        let mut first = writing(&store, oid, read, &io_dict(1, &[(1, 1), (2, 1)]));
+        first.vote().unwrap();
+        let held = Duration::from_millis(100);
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &io_dict(1, &[(1, 1), (3, 1)]));
+                txn.vote_resolving().unwrap();
+                txn.abort();
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            // The vote has the lock, and waits for the sync of the first
+            // commit, which the sequencer holds.
+            wait_until(|| store.locks.waiting(oid) == 0);
+            thread::sleep(held);
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+            second.join().unwrap();
+        });
+        let waits = waits.0.lock().unwrap();
+        // The first vote waited for nothing. The second one waited at least
+        // as long as the sync was held.
+        assert_eq!(waits.len(), 2, "{waits:?}");
+        assert!(waits[1] >= held, "{waits:?}");
+    }
+
+    #[test]
+    fn a_vote_that_fails_after_a_hand_off_passes_it_to_the_next_vote() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let (other, other_read) = created(&store, &length(0));
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        // A transaction holds the other oid, so the second vote waits for
+        // it after the hand-off.
+        let mut blocker = writing(&store, other, other_read, &length(5));
+        blocker.vote().unwrap();
+        let cancel = LockCancel::new();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.store(other, other_read, &length(1)).unwrap();
+                txn.set_lock_cancel(cancel.clone());
+                txn.vote()
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let third = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.vote().map(|()| txn)
+            });
+            wait_until(|| store.locks.waiting(oid) == 2);
+            let sequencer = store.lock_sequencer();
+            let joined = store.group.joined();
+            let first = scope.spawn(move || first.finish_after());
+            wait_until(|| store.locks.waiting(other) == 1);
+            cancel.cancel();
+            assert!(second.join().unwrap().is_err());
+            // The third vote gets the lock with the same hand-off, and
+            // merges onto the first commit.
+            let third = third.join().unwrap().unwrap();
+            assert_eq!(third.natively_resolved(), [oid]);
+            let third = scope.spawn(move || third.finish_after());
+            wait_until(|| store.group.joined() == joined + 2);
+            drop(sequencer);
+            let first = first.join().unwrap().unwrap();
+            let third = third.join().unwrap().unwrap();
+            assert_eq!(previous_serial(&store, oid), first.tid);
+            assert_eq!(store.load(oid).unwrap(), (length(2), third.tid));
+        });
+        blocker.abort();
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_read_current_check_waits_while_a_hand_off_is_in_flight() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.vote().map(|()| txn)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            // The second vote merges, then aborts. The store still does not
+            // hold the first commit.
+            second.join().unwrap().unwrap().abort();
+            let reader = scope.spawn(|| {
+                let (other, _) = (store.new_oid().unwrap(), ());
+                let mut txn = writing(&store, other, Tid::ZERO, &length(7));
+                txn.check_current_serial(oid, read).unwrap();
+                txn.vote()
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            thread::sleep(Duration::from_millis(50));
+            assert!(!reader.is_finished());
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+            // The reader reads the serial of the first commit.
+            assert!(matches!(
+                reader.join().unwrap(),
+                Err(ZoeError::ReadConflict { oid: o }) if o == oid
+            ));
+        });
+        assert!(store.locks.is_empty());
+    }
+
+    /// An observer that holds the leader in `batch_synced` while `armed`:
+    /// its batch is visible, and its members have no outcome yet.
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        open: std::sync::atomic::AtomicBool,
+    }
+
+    impl Observer for Gate {
+        fn batch_synced(&self, _: usize) {
+            if self.armed.load(Ordering::SeqCst) {
+                self.held.store(true, Ordering::SeqCst);
+                while !self.open.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Hold the first commit visible, before its finish ends its hand-off,
+    /// and let a transaction that read it write `third` (`None`: a
+    /// deletion). Return the outcome of its vote and the oids that tier 1
+    /// merged.
+    fn after_a_visible_hand_off(third: Option<Vec<u8>>) -> Result<Vec<Oid>> {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let gate = Arc::new(Gate::default());
+        store.set_observer(gate.clone());
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.vote().map(|()| txn)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            gate.armed.store(true, Ordering::SeqCst);
+            let first = scope.spawn(move || first.finish());
+            // The second vote took the hand-off, and gives the lock back
+            // with it.
+            second.join().unwrap().unwrap().abort();
+            wait_until(|| gate.held.load(Ordering::SeqCst));
+            let (data, serial) = store.load(oid).unwrap();
+            assert_eq!(data, length(1));
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            match &third {
+                Some(data) => txn.store(oid, serial, data).unwrap(),
+                None => txn.delete(oid, serial).unwrap(),
+            }
+            let voted = txn.vote().map(|()| txn.natively_resolved());
+            gate.open.store(true, Ordering::SeqCst);
+            first.join().unwrap().unwrap();
+            voted
+        })
+    }
+
+    #[test]
+    fn a_deletion_that_read_a_commit_in_flight_passes() {
+        let voted = after_a_visible_hand_off(None);
+        assert!(voted.is_ok(), "{voted:?}");
+    }
+
+    #[test]
+    fn a_store_that_read_a_commit_in_flight_passes_without_a_merge() {
+        let voted = after_a_visible_hand_off(Some(length(5)));
+        assert_eq!(voted.unwrap(), Vec::<Oid>::new());
+    }
+
+    #[test]
+    fn a_read_current_check_of_an_oid_with_a_commit_in_flight_fails() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let (oid, read) = created(&store, &length(0));
+        let mut first = writing(&store, oid, read, &length(1));
+        first.vote().unwrap();
+        thread::scope(|scope| {
+            let second = scope.spawn(|| {
+                let mut txn = writing(&store, oid, read, &length(1));
+                txn.check_current_serial(oid, read).unwrap();
+                txn.vote().map(drop)
+            });
+            wait_until(|| store.locks.waiting(oid) == 1);
+            let sequencer = store.lock_sequencer();
+            let first = scope.spawn(move || first.finish());
+            let voted = second.join().unwrap();
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+            // The first commit changed the oid after the read.
+            assert!(
+                matches!(voted, Err(ZoeError::ReadConflict { oid: o }) if o == oid),
+                "{voted:?}"
+            );
+        });
+        assert!(store.locks.is_empty());
+    }
+
+    /// A clock whose `waiter` panics once it is armed.
+    #[derive(Clone, Default)]
+    struct PanickingClock(Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::clock::Clock for PanickingClock {
+        fn now(&self) -> std::time::SystemTime {
+            std::time::SystemTime::now()
+        }
+
+        fn waiter(&self) -> Arc<dyn Waiter> {
+            assert!(!self.0.load(Ordering::SeqCst), "the clock fails");
+            crate::clock::SystemClock.waiter()
+        }
+    }
+
+    #[test]
+    fn a_clock_that_panics_in_a_finish_leaves_no_member_in_the_queue() {
+        let clock = PanickingClock::default();
+        let store = Store::open_full(
+            MemVfs::new(),
+            clock.clone(),
+            crate::store::Options::default(),
+        )
+        .unwrap();
+        let (first_oid, second_oid) = (store.new_oid().unwrap(), store.new_oid().unwrap());
+        let first = voted(&store, first_oid, b"first");
+        let second = voted(&store, second_oid, b"second");
+        thread::scope(|scope| {
+            // The first finish leads a batch, and waits for the sequencer.
+            let sequencer = store.lock_sequencer();
+            let joined = store.group.joined();
+            let first = scope.spawn(move || first.finish());
+            wait_until(|| store.group.joined() == joined + 1);
+            clock.0.store(true, Ordering::SeqCst);
+            // The second finish panics before it joins the queue, and its
+            // transaction releases its locks.
+            assert!(scope.spawn(move || second.finish()).join().is_err());
+            assert_eq!(store.group.joined(), joined + 1);
+            drop(sequencer);
+            first.join().unwrap().unwrap();
+        });
+        assert!(matches!(
+            store.load(second_oid),
+            Err(ZoeError::NotFound { .. })
+        ));
+        assert!(store.locks.is_empty());
     }
 }

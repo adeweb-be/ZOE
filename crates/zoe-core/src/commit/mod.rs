@@ -20,6 +20,14 @@
 //! resolution that the caller stored, and `verifications` tells what it
 //! found.
 //!
+//! When the finish of a transaction starts, it hands the lock of each oid
+//! that it writes, of a class that tier 1 merges, to the exclusive vote at
+//! the head of the queue of the oid (ADR 0044). That vote merges onto the
+//! staged record of the holder. Its commit comes after the commit of the
+//! holder, in the same commit batch or a later one. When tier 1 does not
+//! decide the conflict, the vote waits until the commit of the holder is
+//! durable, within the lock timeout, and goes on as without the hand-off.
+//!
 //! `vote_resolving` lets the caller resolve conflicts with the locks held.
 //! It returns the stale written oids with their committed records, and
 //! keeps the locks. The caller stores a resolved pickle of each oid and
@@ -55,6 +63,7 @@
 
 mod encoded;
 mod group;
+mod intent;
 mod observer;
 mod staging;
 mod undo;
@@ -65,13 +74,13 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
 use crate::guard::{Ended, SizeLimit};
-use crate::lock::{Held, LockCancel, Mode, Refused};
+use crate::lock::{Handoff, Held, InFlight, LockCancel, Mode, Refused, Waited};
 use crate::merge::policy::{Policy, Rules};
 use crate::merge::{self, Merge, Outcome, Resolution, Resolved, Verification};
 use crate::store::Store;
@@ -79,6 +88,7 @@ use crate::types::{Oid, Tid};
 pub use encoded::Encoded;
 pub(crate) use group::GroupCommit;
 use group::Member;
+pub use intent::IntentLocks;
 pub use observer::Observer;
 use staging::Staging;
 pub(crate) use staging::StagingArea;
@@ -147,6 +157,23 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// What tiers 1 and 2 did in the undos of the transaction, then in the
     /// last vote that took the locks.
     resolutions: Vec<Resolution>,
+    /// The locks that the last vote that took the locks got with a
+    /// hand-off, with their hand-offs.
+    handed: BTreeMap<Oid, Arc<Handoff>>,
+    /// The oids whose staged records tier 1 merged onto the record of a
+    /// commit in flight, with that commit. The finish writes the tid of
+    /// that commit as the previous serial of each.
+    onto: BTreeMap<Oid, Arc<InFlight>>,
+    /// The end of the lock timeout of the last vote that took the locks, on
+    /// the monotonic time of the store clock.
+    lock_deadline: Duration,
+    /// The early write-intent locks that the transaction adopted before
+    /// its vote, in ascending oid order. The vote counts them as its own.
+    intents: Vec<Held>,
+    /// The lock wait of the vote that takes the locks: the acquisition, and
+    /// the waits for the durability of commits in flight. The vote gives
+    /// it to the observer at its end. `None` without an observer.
+    lock_waited: Option<Duration>,
     /// The number of entries of `resolutions` that the undos gave. They
     /// come first, and a vote keeps them.
     undo_resolutions: usize,
@@ -187,6 +214,9 @@ enum Check {
         /// The records that tier 1 merged: the oid, the serial of the
         /// committed record and the merged pickle.
         merged: Vec<(Oid, Tid, Vec<u8>)>,
+        /// The merged oids whose committed record is the record of a
+        /// commit in flight, with that commit.
+        onto: Vec<(Oid, Arc<InFlight>)>,
         /// The transaction size with the merged pickles.
         stored_bytes: u64,
     },
@@ -198,7 +228,9 @@ enum Check {
 /// read.
 struct Stale {
     oid: Oid,
-    current: Tid,
+    /// The current serial. It is `None` when the current record is the
+    /// record of a commit in flight that has no tid yet.
+    current: Option<Tid>,
     read: Tid,
     /// True when the transaction read the oid as current and does not
     /// write it.
@@ -228,6 +260,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
             committed: None,
             lock_cancel: None,
             resolutions: Vec::new(),
+            handed: BTreeMap::new(),
+            onto: BTreeMap::new(),
+            lock_deadline: Duration::ZERO,
+            intents: Vec::new(),
+            lock_waited: None,
             undo_resolutions: 0,
             undone: None,
             shadows: BTreeMap::new(),
@@ -275,6 +312,28 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let mut txn = Self::begin_restore(store, tid, user, description, extension)?;
         txn.deferred = true;
         Ok(txn)
+    }
+
+    /// Adopt the early write-intent locks of `intents` (ADR 0045): the vote
+    /// counts them as its own, and the end of the transaction releases
+    /// them. `intents` then holds no lock.
+    ///
+    /// The call must come before the vote, and `intents` must be an owner
+    /// of the store of the transaction. Otherwise it fails with `Protocol`
+    /// and changes nothing.
+    pub fn adopt_intents<T: Deref<Target = Store>>(
+        &mut self,
+        intents: &mut IntentLocks<T>,
+    ) -> Result<()> {
+        if self.locked() {
+            return Err(ZoeError::Protocol("adopt intent locks after the vote"));
+        }
+        if !std::ptr::eq(intents.store(), &*self.store) {
+            return Err(ZoeError::Protocol("intent locks of another store"));
+        }
+        self.intents.extend(intents.take());
+        self.intents.sort_by_key(|lock| lock.oid);
+        Ok(())
     }
 
     /// Let `cancel` end the lock wait of the votes of this transaction from
@@ -700,7 +759,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.verify_shadows();
         }
         self.resolving.clear();
-        self.check(false, native).map(drop)
+        let checked = self.check(false, native);
+        if native {
+            self.observe_lock_wait();
+        }
+        checked.map(drop)
+    }
+
+    /// Give the lock wait of the vote that took the locks to the observer.
+    fn observe_lock_wait(&mut self) {
+        if let (Some(observer), Some(waited)) = (self.store.observer(), self.lock_waited.take()) {
+            observer.locks_acquired(waited);
+        }
     }
 
     /// Compare each merge of shadow mode of `vote_resolving` with the
@@ -753,7 +823,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         self.conflict = None;
         self.lock()?;
-        let conflicts = self.check(true, true)?;
+        let checked = self.check(true, true);
+        self.observe_lock_wait();
+        let conflicts = checked?;
         self.resolving = conflicts.iter().map(|&(oid, _)| oid).collect();
         Ok(conflicts)
     }
@@ -806,6 +878,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.resolutions[range]
             .iter()
             .map(|resolution| {
+                // A conflict with a commit in flight names that commit. Its
+                // tid can be unknown at the vote: the line then gives 0.
+                if resolution.committed == Tid::ZERO
+                    && let Some(handoff) = self.handed.get(&resolution.oid)
+                {
+                    let commit = &handoff.commit;
+                    let mut resolution = resolution.clone();
+                    resolution.committed = commit.tid().unwrap_or(Tid::ZERO);
+                    let context = merge::LogContext {
+                        time,
+                        storage,
+                        user: &self.user,
+                        description: &self.description,
+                        committed_user: Some(&commit.user),
+                        committed_description: Some(&commit.description),
+                    };
+                    return merge::log_line(&resolution, &context);
+                }
                 let committed = self.committed_entry(resolution.oid, resolution.committed);
                 let context = merge::LogContext {
                     time,
@@ -874,26 +964,71 @@ impl<S: Deref<Target = Store>> Txn<S> {
     fn lock(&mut self) -> Result<()> {
         self.store.writable()?;
         let store: &Store = &self.store;
-        let requests = self.lock_requests();
+        let mut requests = self.lock_requests();
         // A store without an observer does not read the clock. The wait is
         // measured on the monotonic time of the store clock, as the lock
         // timeout is, so a simulator gives it on simulated time.
         let started = store.observer().map(|_| store.clock.monotonic());
-        let acquired = store.locks.acquire_cancellable(
-            &requests,
-            store.lock_timeout,
-            &*store.clock,
-            self.lock_cancel.as_ref(),
-        );
-        if let (Some(observer), Some(started)) = (store.observer(), started) {
-            observer.locks_acquired(store.clock.monotonic().saturating_sub(started));
+        let cancel = self.lock_cancel.as_ref();
+        let mut acquired = None;
+        // A vote that takes its locks without a wait waits for a commit in
+        // flight until the lock timeout after its start.
+        let mut deadline = None;
+        if !self.intents.is_empty()
+            && let Some(&(lowest, _)) = requests.first()
+        {
+            // The intent locks are above some oid that the vote needs. When
+            // every such oid is free, the vote takes them at once. Else it
+            // releases the intent locks above the lowest of them, so that it
+            // waits in oid order, and takes them again with the others. The
+            // serial check catches a commit that came in between.
+            let begun = store.clock.monotonic();
+            let tried =
+                store
+                    .locks
+                    .acquire_cancellable(&requests, Duration::ZERO, &*store.clock, cancel);
+            match tried {
+                Ok(locks) => {
+                    deadline = Some(begun.saturating_add(store.lock_timeout));
+                    acquired = Some(Ok(locks));
+                }
+                Err(Refused { released, .. }) => {
+                    store
+                        .guardrails
+                        .locks_released(&released, store.clock.now());
+                    let above = self.intents.partition_point(|lock| lock.oid < lowest);
+                    let given: Vec<Held> = self.intents.split_off(above);
+                    store.locks.release(&given);
+                    store.guardrails.locks_released(&given, store.clock.now());
+                    requests.extend(given.iter().map(|lock| (lock.oid, Mode::Exclusive)));
+                    requests.sort_by_key(|&(oid, _)| oid);
+                }
+            }
         }
+        let acquired = acquired.unwrap_or_else(|| {
+            store
+                .locks
+                .acquire_cancellable(&requests, store.lock_timeout, &*store.clock, cancel)
+        });
+        let waited = started.map(|started| store.clock.monotonic().saturating_sub(started));
         match acquired {
-            Ok(locks) => {
-                self.locks = Some(locks.keep());
+            Ok(mut locks) => {
+                // The vote adds its waits for commits in flight, and gives
+                // the sum to the observer at its end.
+                self.lock_waited = waited;
+                self.handed = locks.handoffs().into_iter().collect();
+                self.onto.clear();
+                self.lock_deadline = deadline.unwrap_or_else(|| locks.deadline());
+                let mut held = locks.keep();
+                held.append(&mut self.intents);
+                held.sort_by_key(|lock| lock.oid);
+                self.locks = Some(held);
                 Ok(())
             }
             Err(Refused { error, released }) => {
+                if let (Some(observer), Some(waited)) = (store.observer(), waited) {
+                    observer.locks_acquired(waited);
+                }
                 let now = store.clock.now();
                 store.guardrails.locks_released(&released, now);
                 Err(error)
@@ -923,12 +1058,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 Check::Passed {
                     conflicts,
                     merged,
+                    onto,
                     stored_bytes,
                 } => {
                     self.stage_merged(merged, stored_bytes)?;
+                    self.onto.extend(onto);
                     Ok(Check::Passed {
                         conflicts,
                         merged: Vec::new(),
+                        onto: Vec::new(),
                         stored_bytes,
                     })
                 }
@@ -937,7 +1075,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let error = match checked {
             Ok(Check::Passed { conflicts, .. }) => return Ok(conflicts),
             Ok(Check::Failed(stale)) => {
-                self.conflict = Some((stale.current, stale.read));
+                self.conflict = stale.current.map(|current| (current, stale.read));
                 let oid = stale.oid;
                 if stale.read_only {
                     ZoeError::ReadConflict { oid }
@@ -982,6 +1120,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
             .map(|&oid| (oid, Mode::Shared))
             .collect();
         requests.extend(self.staged.iter().map(|(oid, _)| (oid, Mode::Exclusive)));
+        // An adopted intent lock is exclusive already.
+        for lock in &self.intents {
+            requests.remove(&lock.oid);
+        }
         requests.into_iter().collect()
     }
 
@@ -1018,6 +1160,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     fn check_serials(&mut self, resolve: bool, native: bool) -> Result<Check> {
         let mut conflicts = Vec::new();
         let mut merged = Vec::new();
+        let mut onto = Vec::new();
         let mut stored_bytes = self.stored_bytes;
         // The first conflict reads the merge policy. A vote without a
         // conflict reads nothing.
@@ -1028,13 +1171,61 @@ impl<S: Deref<Target = Store>> Txn<S> {
         for chunk in staged.chunks(READ_CHUNK) {
             let serials = self.current_serials(chunk.iter().map(|(oid, _)| *oid))?;
             for (&(oid, staged), serial) in chunk.iter().zip(serials) {
-                let current = serial.unwrap_or(Tid::ZERO);
+                let mut current = serial.unwrap_or(Tid::ZERO);
+                // The store does not hold the commit in flight of a lock
+                // that came with a hand-off: its staged record is the
+                // committed record.
+                if let Some(handoff) = self.handed.get(&oid).cloned() {
+                    let checked = self.check_handed(
+                        oid,
+                        staged,
+                        &handoff,
+                        native,
+                        stored_bytes,
+                        &mut policy,
+                    )?;
+                    match checked {
+                        Handed::Passed => continue,
+                        Handed::Merged {
+                            pickle,
+                            size,
+                            resolution,
+                        } => {
+                            stored_bytes = size;
+                            // The serial is a placeholder: the finish writes
+                            // the tid of the commit in flight. Another vote
+                            // of the oid without the hand-off fails on it.
+                            merged.push((oid, Tid::ZERO, pickle));
+                            onto.push((oid, Arc::clone(&handoff.commit)));
+                            self.resolutions.push(resolution);
+                            continue;
+                        }
+                        Handed::Failed { stale, resolution } => {
+                            self.resolutions.extend(resolution);
+                            return Ok(Check::Failed(stale));
+                        }
+                        Handed::Store { waited } => {
+                            // The wait for the commit in flight counts in the
+                            // lock wait of the vote.
+                            if let Some(total) = &mut self.lock_waited {
+                                *total += waited;
+                            }
+                            current = self.current_serial(oid)?;
+                        }
+                        Handed::Late { waited } => {
+                            if let Some(total) = &mut self.lock_waited {
+                                *total += waited;
+                            }
+                            return Err(ZoeError::Conflict { oid });
+                        }
+                    }
+                }
                 if current == staged.serial {
                     continue;
                 }
                 let stale = Stale {
                     oid,
-                    current,
+                    current: Some(current),
                     read: staged.serial,
                     read_only: false,
                 };
@@ -1061,7 +1252,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         config: &self.store.structural_merges,
                         policy: policy.as_ref().and_then(Option::as_deref),
                     };
-                    self.native(oid, staged.serial, &record, &rules)?
+                    self.native(oid, staged.serial, &record.data, &rules)?
                         .map(|(mode, merge)| (mode, rules.version(), merge))
                 } else {
                     None
@@ -1116,11 +1307,24 @@ impl<S: Deref<Target = Store>> Txn<S> {
         for chunk in read_current.chunks(READ_CHUNK) {
             let serials = self.current_serials(chunk.iter().map(|&(&oid, _)| oid))?;
             for (&(&oid, &read), serial) in chunk.iter().zip(serials) {
+                // The last commit of an oid held with a hand-off can be in
+                // flight: the store does not hold it yet.
+                if let Some(handoff) = self.handed.get(&oid)
+                    && handoff.commit.ended().is_none()
+                    && handoff.commit.tid() != Some(read)
+                {
+                    return Ok(Check::Failed(Stale {
+                        oid,
+                        current: handoff.commit.tid(),
+                        read,
+                        read_only: true,
+                    }));
+                }
                 let current = serial.unwrap_or(Tid::ZERO);
                 if current != read {
                     return Ok(Check::Failed(Stale {
                         oid,
-                        current,
+                        current: Some(current),
                         read,
                         read_only: true,
                     }));
@@ -1130,12 +1334,119 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(Check::Passed {
             conflicts,
             merged,
+            onto,
             stored_bytes,
         })
     }
 
+    /// Check a written oid whose lock came with `handoff`.
+    ///
+    /// When the commit in flight of the hand-off is durable or failed, the
+    /// check goes on with the store. Otherwise its staged record is the
+    /// committed record: the tier of its class in mode `on` merges onto it,
+    /// or refuses. When no tier decides, the call waits until the commit is
+    /// durable or failed, at most until the lock deadline of the vote, and
+    /// the check then goes on with the store. A wait past the deadline, or
+    /// a cancel, ends as `Handed::Late`: the vote fails with `Conflict` on
+    /// the oid. A transaction that read the commit in flight checks the oid
+    /// against the store, which holds that commit.
+    fn check_handed(
+        &self,
+        oid: Oid,
+        staged: &staging::Staged,
+        handoff: &Handoff,
+        native: bool,
+        stored_bytes: u64,
+        policy: &mut Option<Option<Arc<Policy>>>,
+    ) -> Result<Handed> {
+        // The merge of the vote before, onto the same commit, stands.
+        if self.onto.contains_key(&oid) {
+            return Ok(Handed::Passed);
+        }
+        let commit = &handoff.commit;
+        // The transaction read the commit in flight: its batch is visible,
+        // and the store holds it.
+        if commit.ended().is_some() || commit.tid() == Some(staged.serial) {
+            return Ok(Handed::Store {
+                waited: Duration::ZERO,
+            });
+        }
+        let stale = Stale {
+            oid,
+            current: commit.tid(),
+            read: staged.serial,
+            read_only: false,
+        };
+        // The holder changed the oid, so the serial that the transaction
+        // read is stale. A restore, a new object or a deletion cannot be
+        // resolved.
+        if staged.restored
+            || staged.serial == Tid::ZERO
+            || staged.pickle_len() == 0
+            || handoff.record.is_empty()
+        {
+            return Ok(Handed::Failed {
+                stale,
+                resolution: None,
+            });
+        }
+        if native {
+            // The first conflict of the vote reads the merge policy.
+            if policy.is_none() {
+                *policy = Some(self.store.merge_policy()?);
+            }
+        }
+        let rules = Rules {
+            config: &self.store.structural_merges,
+            policy: policy.as_ref().and_then(Option::as_deref),
+        };
+        if native
+            && let Some((mode @ merge::Mode::On, merge)) =
+                self.native(oid, staged.serial, &handoff.record, &rules)?
+        {
+            let committed = commit.tid().unwrap_or(Tid::ZERO);
+            let mut resolution =
+                Resolution::of(oid, mode, rules.version(), &merge, committed, staged.serial);
+            match merge.outcome {
+                Outcome::Merged(pickle) => {
+                    if let Some(size) = self.merged_size(oid, &pickle, stored_bytes) {
+                        return Ok(Handed::Merged {
+                            pickle,
+                            size,
+                            resolution,
+                        });
+                    }
+                }
+                Outcome::Refused(_) => {
+                    resolution.applied = true;
+                    return Ok(Handed::Failed {
+                        stale,
+                        resolution: Some(resolution),
+                    });
+                }
+                Outcome::Undecided(_) => {}
+            }
+        }
+        let store: &Store = &self.store;
+        let started = store.observer().map(|_| store.clock.monotonic());
+        let outcome = commit.wait(
+            oid,
+            self.lock_deadline,
+            &*store.clock,
+            self.lock_cancel.as_ref(),
+        );
+        let waited = started.map_or(Duration::ZERO, |started| {
+            store.clock.monotonic().saturating_sub(started)
+        });
+        match outcome {
+            Waited::Durable | Waited::Failed => Ok(Handed::Store { waited }),
+            Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
+        }
+    }
+
     /// Run tier 1 or tier 2 on the conflict of `oid`: the transaction read
-    /// `read`, and `committed` is the current record. Return `None` when the
+    /// `read`, and `committed` is the pickle of the current record, or of
+    /// the commit in flight of a hand-off. Return `None` when the
     /// class of the staged record is neither a class of tier 1 whose mode
     /// is not `Off`, nor a class whose entry in the merge policy has tier 2
     /// on or in shadow mode.
@@ -1146,7 +1457,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         &self,
         oid: Oid,
         read: Tid,
-        committed: &Record,
+        committed: &[u8],
         rules: &Rules<'_>,
     ) -> Result<Option<(merge::Mode, Merge)>> {
         // A staged pickle that does not read back gives no answer: the
@@ -1170,7 +1481,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             };
             return Ok(Some((tier.mode, merge)));
         };
-        Ok(Some(tier.merge(&old, &committed.data, &new, rules)))
+        Ok(Some(tier.merge(&old, committed, &new, rules)))
     }
 
     /// Return the transaction size after a merged pickle of `oid` replaces
@@ -1256,6 +1567,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if !self.voted() {
             return Err(ZoeError::Protocol("finish before vote"));
         }
+        let (commit, handoffs) = self.handoffs();
         let member = Member {
             tid: self.tid,
             deferred: self.deferred,
@@ -1264,10 +1576,43 @@ impl<S: Deref<Target = Store>> Txn<S> {
             user: std::mem::take(&mut self.user),
             description: std::mem::take(&mut self.description),
             extension: std::mem::take(&mut self.extension),
+            commit: commit.clone(),
+            onto: std::mem::take(&mut self.onto),
             undone: self.undone,
         };
         let store: &Store = &self.store;
-        let (member, finished) = store.group.finish(store, member);
+        let held = &mut self.locks;
+        let mut handed = Vec::new();
+        let empty = handoffs.is_empty();
+        // The member is in the queue while `queued` runs, so it calls no
+        // code that can panic but the lock manager: the time of the
+        // hand-offs comes before the finish joins the queue.
+        let released = if empty {
+            SystemTime::UNIX_EPOCH
+        } else {
+            store.clock.now()
+        };
+        // The hand-offs come once the member is in the queue of group
+        // commit, so the commit of a new owner comes after this one.
+        let queued = (!empty).then_some(|| {
+            if let Some(held) = held.as_mut() {
+                handed = store.locks.hand_off(handoffs, held);
+            }
+        });
+        let (member, finished) = store.group.finish(store, member, queued);
+        if let Some(commit) = &commit {
+            commit.end(finished.is_ok());
+        }
+        if !handed.is_empty() {
+            store
+                .locks
+                .settle(handed.iter().map(|(lock, handoff)| (lock.oid, handoff)));
+            let locks: Vec<Held> = handed.iter().map(|(lock, _)| *lock).collect();
+            store.guardrails.locks_released(&locks, released);
+            if let Some(observer) = store.observer() {
+                observer.locks_handed_off(locks.len());
+            }
+        }
         // The transaction takes its staged records and its blobs back, so
         // `Drop` removes its spill file and its unplaced blob files.
         if let Some(member) = member {
@@ -1276,8 +1621,64 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         let finished = finished?;
         self.committed = Some(finished.tid);
+        // The commit is durable, and it comes after the commit of each
+        // hand-off that the vote got. So the store holds the last commit of
+        // these oids, also when their holder did not settle yet.
+        if !self.handed.is_empty() {
+            store
+                .locks
+                .settle(self.handed.iter().map(|(oid, handoff)| (*oid, handoff)));
+        }
         self.release();
         Ok(finished)
+    }
+
+    /// Return the commit in flight of a finish that starts and the
+    /// hand-offs that it can make: one for each written oid of a class that
+    /// tier 1 merges in mode `on`, whose queue has an exclusive request at
+    /// its head, with a copy of its staged pickle. The mode comes from the
+    /// configuration and the merge policy, as in the vote. A restore hands
+    /// off nothing, because its finish can fail alone, and nor does a
+    /// finish that cannot read the merge policy.
+    fn handoffs(&self) -> (Option<Arc<InFlight>>, Handoffs) {
+        if self.is_restore() {
+            return (None, Vec::new());
+        }
+        let contended = self
+            .store
+            .locks
+            .contended(self.staged.iter().map(|(oid, _)| oid));
+        if contended.is_empty() {
+            return (None, Vec::new());
+        }
+        let Ok(policy) = self.store.merge_policy() else {
+            return (None, Vec::new());
+        };
+        let rules = Rules {
+            config: &self.store.structural_merges,
+            policy: policy.as_deref(),
+        };
+        let commit = Arc::new(InFlight::new(&self.user, &self.description));
+        let handoffs: Vec<_> = contended
+            .into_iter()
+            .filter_map(|oid| {
+                let Ok(Some((_, pickle))) = self.staged.get(oid) else {
+                    return None;
+                };
+                let class = merge::tier1_class(&pickle)?;
+                (rules.tier1_mode(&class) == merge::Mode::On).then(|| {
+                    let handoff = Handoff {
+                        commit: Arc::clone(&commit),
+                        record: pickle.into_owned(),
+                    };
+                    (oid, Arc::new(handoff))
+                })
+            })
+            .collect();
+        if handoffs.is_empty() {
+            return (None, handoffs);
+        }
+        (Some(commit), handoffs)
     }
 
     /// Abort the transaction: drop the staged records, remove the spill
@@ -1288,7 +1689,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
 
     /// Release the locks, then log each lock held past `lock-warn`.
     fn release(&mut self) {
-        if let Some(held) = self.locks.take() {
+        let mut held = self.locks.take().unwrap_or_default();
+        held.append(&mut self.intents);
+        if !held.is_empty() {
             let now = self.store.clock.now();
             self.store.locks.release(&held);
             self.store.guardrails.locks_released(&held, now);
@@ -1432,6 +1835,34 @@ fn next_tid(now: Tid, last: Tid) -> Result<Tid> {
         Some(after) if after < Tid::MAX.0 => Ok(now.max(Tid(after)).min(Tid(Tid::MAX.0 - 1))),
         _ => Err(ZoeError::Protocol("no tid is left after the last tid")),
     }
+}
+
+/// The hand-offs that a finish can make: each oid with its hand-off.
+type Handoffs = Vec<(Oid, Arc<Handoff>)>;
+
+/// What the check of an oid that came with a hand-off found.
+enum Handed {
+    /// The oid passes.
+    Passed,
+    /// A tier merged onto the record of the commit in flight.
+    Merged {
+        pickle: Vec<u8>,
+        /// The transaction size with the merged pickle.
+        size: u64,
+        resolution: Resolution,
+    },
+    /// The conflict fails the vote.
+    Failed {
+        stale: Stale,
+        resolution: Option<Resolution>,
+    },
+    /// The commit in flight is durable or failed, or the transaction read
+    /// it: the check goes on with the store. `waited` is the wait for its
+    /// end.
+    Store { waited: Duration },
+    /// The wait for the end of the commit in flight passed the lock
+    /// deadline of the vote, or a cancel ended it: the vote fails.
+    Late { waited: Duration },
 }
 
 /// The number of oids whose current serials the vote reads in one backend

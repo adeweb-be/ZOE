@@ -51,6 +51,8 @@ def test_the_zoeclient_section_takes_every_key_of_zeoclient():
     assert keys(schema, "zoeclient") == keys(schema, "zeoclient") | {
         "wait-timeout",
         "native",
+        "early-locks",
+        "early-lock-classes",
     }
 
 

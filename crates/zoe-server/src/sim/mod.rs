@@ -167,6 +167,20 @@ pub struct Report {
     /// The finishes that had their reply when their pool lost its
     /// listener, and returned their tid after the stale mark.
     pub lost_listener_finishes: usize,
+    /// With `Simulation::hot_length`, each break of the history of the hot
+    /// `Length`, as text: a record whose value is not the value of the
+    /// record before it plus 1, or the first record not 1, or a record that
+    /// does not read as a `Length`.
+    pub length_faults: Vec<String>,
+    /// The locks that the finishes of the server handed to the vote at the
+    /// head of their queues (ADR 0044), over every server process of the
+    /// run.
+    pub handoffs: u64,
+    /// The syncs of commit batches, over every server process of the run,
+    /// as `zoe_fsync_batch_size` counts them.
+    pub syncs: u64,
+    /// The commits that these syncs made durable.
+    pub synced_commits: u64,
 }
 
 /// A run of the server and its clients.
@@ -181,6 +195,12 @@ pub struct Simulation {
     /// The size of the pool of each client, or `None` for clients of one
     /// connection.
     pool: Option<usize>,
+    /// The hot oid holds a `BTrees.Length.Length` that each transaction
+    /// that writes it increments.
+    hot_length: bool,
+    /// A sync of the database file takes simulated time, and other tasks
+    /// and threads run meanwhile.
+    slow_syncs: bool,
 }
 
 impl Simulation {
@@ -195,6 +215,8 @@ impl Simulation {
             blobs: false,
             faults: Faults::default(),
             pool: None,
+            hot_length: false,
+            slow_syncs: false,
         }
     }
 
@@ -243,6 +265,31 @@ impl Simulation {
         self
     }
 
+    /// With `true`, the hot oid of the clients holds a
+    /// `BTrees.Length.Length`. Each transaction that writes it reads its
+    /// value and stores the value plus 1, so concurrent writers conflict and
+    /// tier 1 merges them, with the lock hand-off. The check after the run
+    /// reads the history of the oid: each record holds the value of the
+    /// record before it plus 1 (`Report::length_faults`).
+    #[must_use]
+    pub fn hot_length(mut self, hot_length: bool) -> Self {
+        self.hot_length = hot_length;
+        self
+    }
+
+    /// With `true`, a sync of the database file takes 100 µs to 2 ms of
+    /// simulated time, as the seed chooses, and the driver runs other tasks
+    /// and threads meanwhile. So other votes and finishes run while a
+    /// commit batch syncs, as they do on a disk. A sync that follows a
+    /// change of the length of the file goes on at once: redb grows the
+    /// file under a lock of its own, which a read takes too. Without it,
+    /// the thread that syncs goes on at once.
+    #[must_use]
+    pub fn slow_syncs(mut self, slow_syncs: bool) -> Self {
+        self.slow_syncs = slow_syncs;
+        self
+    }
+
     /// Inject `faults`.
     #[must_use]
     pub fn faults(mut self, faults: Faults) -> Self {
@@ -277,6 +324,11 @@ struct Driver {
     flush_pending: bool,
     /// The numbers of the crash images, apart from the schedule.
     images: Rng,
+    /// The lock hand-offs of the server processes that stopped.
+    handoffs: u64,
+    /// The syncs of commit batches of the server processes that stopped,
+    /// and the commits that they made durable.
+    syncs: (u64, u64),
 }
 
 impl Driver {
@@ -326,6 +378,8 @@ impl Driver {
             crashes: 0,
             crash_phases: Vec::new(),
             flush_pending: false,
+            handoffs: 0,
+            syncs: (0, 0),
         }
     }
 
@@ -355,6 +409,7 @@ impl Driver {
                         rng: state.rng.fork(),
                         stall: self.plan.faults.stall_client_for.filter(|_| id == 0),
                         blobs: self.plan.blobs,
+                        hot_length: self.plan.hot_length,
                     }
                     .run(),
                 ),
@@ -374,7 +429,7 @@ impl Driver {
         // The end of the run is a crash too. Then the store opens from what
         // is durable, and every acknowledged commit must be there.
         self.stop("stops at the end of the run");
-        let (lost, verify, tids) = self.verify();
+        let (lost, verify, tids, length_faults) = self.verify();
         let mut state = self.shared.lock();
         let logs = std::mem::take(&mut state.pools.logs);
         let mut report = state.report();
@@ -384,6 +439,9 @@ impl Driver {
         report.own_deliveries = own;
         report.lost = lost;
         report.verify = verify;
+        report.length_faults = length_faults;
+        report.handoffs = self.handoffs;
+        (report.syncs, report.synced_commits) = self.syncs;
         report.crashes = self.crashes;
         report.crash_phases = std::mem::take(&mut self.crash_phases);
         report
@@ -518,6 +576,7 @@ impl Driver {
     fn runnable(&self, now: Duration, wait: Wait) -> bool {
         match wait {
             Wait::Ready => true,
+            Wait::Syncing { until, .. } => now >= until,
             Wait::Parked { waiter, deadline } => {
                 self.shared.permits.contains(waiter) || now >= deadline
             }
@@ -540,14 +599,49 @@ impl Driver {
     }
 
     /// Hand the baton to the thread `id` until it gives it back for
-    /// something else than a sync.
+    /// something else than a sync. With slow syncs, a sync gives the baton
+    /// back too: the thread goes on after the time of the sync.
     fn run_thread(&mut self, id: u64) {
-        let mut how = Resume::Go;
+        let mut how = {
+            let mut state = self.shared.lock();
+            match state.threads.get_mut(&id) {
+                Some(thread) => match std::mem::replace(&mut thread.wait, Wait::Ready) {
+                    Wait::Syncing { resume, .. } => resume,
+                    _ => Resume::Go,
+                },
+                None => Resume::Go,
+            }
+        };
         loop {
             match self.resume(id, how) {
-                Why::Sync => match self.on_sync() {
+                Why::Sync { grows } => match self.on_sync() {
+                    Some(next) if self.plan.slow_syncs && !grows => {
+                        let mut state = self.shared.lock();
+                        let time = state
+                            .rng
+                            .between(Duration::from_micros(100), Duration::from_millis(2));
+                        let until = state.now + time;
+                        if let Some(thread) = state.threads.get_mut(&id) {
+                            thread.wait = Wait::Syncing {
+                                until,
+                                resume: next,
+                            };
+                        }
+                        return;
+                    }
                     Some(next) => how = next,
                     None => {
+                        // The thread syncs at the crash, so the stop ends it
+                        // first.
+                        let mut state = self.shared.lock();
+                        let now = state.now;
+                        if let Some(thread) = state.threads.get_mut(&id) {
+                            thread.wait = Wait::Syncing {
+                                until: now,
+                                resume: Resume::Go,
+                            };
+                        }
+                        drop(state);
                         let finishing = phase::FINISHING;
                         self.crash(finishing, &format!("crashes in a sync, phase {finishing}"));
                         return;
@@ -589,7 +683,7 @@ impl Driver {
                     }
                 }
             }
-            Why::Sync => {}
+            Why::Sync { .. } => {}
             Why::Exited => {
                 state.threads.remove(&id);
                 drop(state);
@@ -673,6 +767,20 @@ impl Driver {
                 landed.0, landed.1, cached.0, cached.1
             ));
             let generation = state.server.generation;
+            if let Some(storage) = state
+                .server
+                .storages
+                .as_ref()
+                .and_then(|storages| storages.get(STORAGE_NAME))
+            {
+                let metrics = storage.exported().metrics;
+                self.handoffs += metrics
+                    .lock_handoffs
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let (syncs, commits) = metrics.fsync_batch_size.totals();
+                self.syncs.0 += syncs;
+                self.syncs.1 += commits as u64;
+            }
             state.server.up = false;
             state.server.storages = None;
             state.server.store = None;
@@ -699,12 +807,15 @@ impl Driver {
             .retain(|_, (owner, _)| *owner != Owner::Server(generation));
         let mut resumes = 0u32;
         loop {
+            // A thread that syncs ends first: it can lead a commit batch
+            // that other threads wait for.
             let next = self
                 .shared
                 .lock()
                 .threads
                 .iter()
-                .find(|(_, thread)| thread.generation == generation)
+                .filter(|(_, thread)| thread.generation == generation)
+                .min_by_key(|(_, thread)| !matches!(thread.wait, Wait::Syncing { .. }))
                 .map(|(id, _)| *id);
             let Some(id) = next else { break };
             resumes += 1;
@@ -721,8 +832,13 @@ impl Driver {
 
     /// Open the disk after the last stop. Return the number of the
     /// acknowledged commits that it does not hold whole, records and blobs,
-    /// the findings on the store, and the tids of the store.
-    fn verify(&mut self) -> (usize, Vec<String>, BTreeSet<u64>) {
+    /// the findings on the store, the tids of the store, and the breaks of
+    /// the history of the hot `Length`.
+    ///
+    /// With `Simulation::hot_length`, a commit of the hot oid holds the
+    /// record that tier 1 merged, not the record of the client: it counts
+    /// when the store holds a `Length` at its tid.
+    fn verify(&mut self) -> (usize, Vec<String>, BTreeSet<u64>, Vec<String>) {
         let acked = self.shared.lock().acked.clone();
         let clock = SimClock(Arc::clone(&self.shared));
         let vfs = SimVfs::new(self.disk.clone());
@@ -731,17 +847,22 @@ impl Driver {
             Err(error) => {
                 let finding = format!("the store does not open: {error}");
                 self.shared.lock().trace(&finding);
-                return (acked.len(), vec![finding], BTreeSet::new());
+                return (acked.len(), vec![finding], BTreeSet::new(), Vec::new());
             }
         };
         let lost = acked
             .iter()
             .filter(|commit| {
                 let tid = Tid(commit.tid);
+                let hot_length = self.plan.hot_length;
                 let records = commit.records.iter().all(|(oid, data)| {
-                    store
-                        .load_serial(Oid(*oid), tid)
-                        .is_ok_and(|stored| &stored == data)
+                    store.load_serial(Oid(*oid), tid).is_ok_and(|stored| {
+                        if hot_length && *oid == client::HOT {
+                            client::length_value(&stored).is_some()
+                        } else {
+                            &stored == data
+                        }
+                    })
                 });
                 let blobs = commit
                     .blobs
@@ -767,12 +888,17 @@ impl Driver {
             }
             Err(error) => findings.push(format!("the transactions do not read: {error}")),
         }
+        let length_faults = if self.plan.hot_length {
+            length_faults(&store)
+        } else {
+            Vec::new()
+        };
         let mut state = self.shared.lock();
         state.trace(format!("verify: {} acknowledged, {lost} lost", acked.len()));
-        for finding in &findings {
+        for finding in findings.iter().chain(&length_faults) {
             state.trace(format!("verify: {finding}"));
         }
-        (lost, findings, tids)
+        (lost, findings, tids, length_faults)
     }
 
     /// Move the clock to the next timer or lock deadline.
@@ -783,6 +909,7 @@ impl Driver {
             .values()
             .filter_map(|thread| match thread.wait {
                 Wait::Parked { deadline, .. } if deadline != Duration::MAX => Some(deadline),
+                Wait::Syncing { until, .. } => Some(until),
                 _ => None,
             })
             .min();
@@ -806,6 +933,46 @@ impl Driver {
         let start = state.trace.len().saturating_sub(40);
         state.trace[start..].join("\n")
     }
+}
+
+/// Return each break of the history of the hot `Length` of `store`. In tid
+/// order, the first record holds 1, and each later record holds the value
+/// of the record before it plus 1. Each commit of the oid increments it by
+/// 1, so a merge that loses or repeats a change breaks the history.
+fn length_faults(store: &Store) -> Vec<String> {
+    let oid = Oid(client::HOT);
+    let mut history = match store.history(oid, usize::MAX) {
+        Ok(history) => history,
+        Err(zoe_core::ZoeError::NotFound { .. }) => return Vec::new(),
+        Err(error) => {
+            return vec![format!(
+                "the history of the hot Length does not read: {error}"
+            )];
+        }
+    };
+    history.reverse();
+    let mut faults = Vec::new();
+    for (expected, entry) in (1..).zip(history) {
+        match store
+            .load_serial(oid, entry.tid)
+            .map(|data| client::length_value(&data))
+        {
+            Ok(Some(value)) if value == expected => {}
+            Ok(Some(value)) => faults.push(format!(
+                "the hot Length is {value} at tid {:016x}, not {expected}",
+                entry.tid.0
+            )),
+            Ok(None) => faults.push(format!(
+                "the record of the hot oid at tid {:016x} is not a Length",
+                entry.tid.0
+            )),
+            Err(error) => faults.push(format!(
+                "the record of the hot oid at tid {:016x} does not read: {error}",
+                entry.tid.0
+            )),
+        }
+    }
+    faults
 }
 
 /// Read the whole blob that `tid` wrote for `oid`, or `None` when it does

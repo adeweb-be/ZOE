@@ -1,9 +1,10 @@
 //! The observer of a store: a hook for the metrics of a skin.
 //!
-//! The core calls the observer of a store after a sync of a commit batch
-//! and after the lock acquisition of each vote. The core keeps no metric
-//! and has no metrics dependency: the skin counts what it gets. Each
-//! method has a default that does nothing.
+//! The core calls the observer of a store after a sync of a commit batch,
+//! at the end of each vote that takes locks, after a finish that handed off
+//! locks, and after each call that takes early write-intent locks. The core
+//! keeps no metric and has no metrics dependency: the skin counts what it
+//! gets. Each method has a default that does nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,10 +24,25 @@ pub trait Observer: Send + Sync {
     }
 
     /// A vote spent `wait` to take its locks, measured on the monotonic
-    /// time of the store clock (`Clock::monotonic`). A vote that waited
-    /// past the lock timeout calls it too.
+    /// time of the store clock (`Clock::monotonic`), with its waits for the
+    /// durability of commits in flight (ADR 0044). A vote that waited past
+    /// the lock timeout calls it too.
     fn locks_acquired(&self, wait: Duration) {
         let _ = wait;
+    }
+
+    /// The finish of a transaction handed `locks` locks to the votes at the
+    /// head of their queues (ADR 0044). The finish calls it after its
+    /// commit is durable or failed.
+    fn locks_handed_off(&self, locks: usize) {
+        let _ = locks;
+    }
+
+    /// An intent owner took `locks` early write-intent locks in one call
+    /// (ADR 0045), after a wait of `wait` on the monotonic time of the store
+    /// clock. A call that failed calls it with 0 locks.
+    fn intent_locks_acquired(&self, locks: usize, wait: Duration) {
+        let _ = (locks, wait);
     }
 }
 

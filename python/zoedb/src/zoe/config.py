@@ -6,7 +6,8 @@ as their storage. The `zoe` entry point of `zodburi.resolvers` names
 `resolve_uri`.
 
 `<zoeclient>` opens a `zoe.zeo.ClientStorage`. It takes every key of
-`<zeoclient>`, with the same values, `wait-timeout` and `native`, and an
+`<zeoclient>`, with the same values, `wait-timeout`, `native`,
+`early-locks` and `early-lock-classes`, and an
 `<ssl>` section with the keys of the `<ssl>` section of ZEO's
 `<clientstorage>`. It has no environment twins, as `<zeoclient>` has none.
 
@@ -40,13 +41,18 @@ def backend(value):
 
 
 def early_locks(value):
-    """Return False for a false boolean.
+    """Return the boolean of `early-locks`."""
+    return stock_datatypes["boolean"](value)
 
-    Refuse a true boolean: the storage has no early locks yet.
-    """
-    if stock_datatypes["boolean"](value):
-        raise ValueError("early-locks on: the storage has no early locks yet")
-    return False
+
+def class_names(value):
+    """Return the classes of `early-lock-classes`, as a tuple of
+    `module.name`. The value separates them with spaces or commas."""
+    names = tuple(name for name in re.split(r"[\s,]+", value.strip()) if name)
+    for name in names:
+        if not re.fullmatch(r"[\w.]+\.\w+", name):
+            raise ValueError(f"{name!r} is not module.name")
+    return names
 
 
 def lock_timeout(value):
@@ -103,6 +109,7 @@ KEYS = {
     "backend": backend,
     "lock-timeout": lock_timeout,
     "early-locks": early_locks,
+    "early-lock-classes": class_names,
     "read-only": stock_datatypes["boolean"],
     "pack-gc": stock_datatypes["boolean"],
     "compression": compression,
@@ -152,6 +159,8 @@ def open_storage(settings):
         os.path.expanduser(path),
         read_only=settings.get("read-only", False),
         lock_timeout=settings.get("lock-timeout"),
+        early_locks=settings.get("early-locks", False),
+        early_lock_classes=settings.get("early-lock-classes"),
         blob_dir=os.path.expanduser(blob_dir) if blob_dir else None,
         pack_gc=settings.get("pack-gc", True),
         compression=settings.get("compression"),
@@ -221,7 +230,9 @@ class ZoeClient(BaseConfig):
     """The `<zoeclient>` section. `open` opens its `zoe.zeo.ClientStorage`.
 
     It gives the keys of `<zeoclient>` as `ZODB.config.ZEOClient` gives them,
-    `wait-timeout` as `wait_timeout` and `native` as `native`. It gives the
+    `wait-timeout` as `wait_timeout`, `native` as `native`, and
+    `early-locks` and `early-lock-classes` as `early_locks` and
+    `early_lock_classes`. It gives the
     `<ssl>` section as it is: the native client reads its files, and ZEO's
     client gets the context that ZEO's `<ssl>` section gives.
     """
@@ -261,6 +272,8 @@ class ZoeClient(BaseConfig):
             realm=config.realm,
             wait_timeout=config.wait_timeout,
             native=native,
+            early_locks=config.early_locks,
+            early_lock_classes=class_names(config.early_lock_classes or ""),
             _ssl_section=config.ssl,
             **options,
         )

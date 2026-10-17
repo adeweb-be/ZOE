@@ -4,8 +4,9 @@
 //! Each metric has the label `storage`, the storage name. A duration is a
 //! histogram in seconds, and a counter ends in `_total`. The counters and
 //! the histograms of a storage are atomics that all its connections
-//! share. The core reports the size of each sync batch and each lock wait
-//! through its `Observer` trait. The gauges are read at each scrape.
+//! share. The core reports the size of each sync batch, each lock wait and
+//! the lock hand-offs through its `Observer` trait. The gauges are read at
+//! each scrape.
 //!
 //! - `zoe_loads_total`, `zoe_load_latency_seconds`: the `loadBefore` calls.
 //! - `zoe_commits_total`: the commits that `tpc_finish` made.
@@ -13,6 +14,11 @@
 //!   calls, and the `tpc_finish` calls that ended a transaction.
 //! - `zoe_fsync_batch_size`: the commits that one sync made durable.
 //! - `zoe_lock_wait_seconds`: the time of each vote to take its locks.
+//! - `zoe_lock_handoffs_total`: the locks that a finish handed to the vote
+//!   at the head of their queues (ADR 0044).
+//! - `zoe_intent_locks_total`, `zoe_intent_lock_wait_seconds`: the early
+//!   write-intent locks that the sessions took, and the time of each
+//!   `lock_intent` to take them (ADR 0045).
 //! - `zoe_conflicts_resolved_total{path}`: the oids in conflict that tier 1
 //!   or tier 2 merged in a vote that passed (`native`), and the oids that a
 //!   second vote passed after the client resolved them (`python`).
@@ -87,6 +93,17 @@ impl Histogram {
             });
     }
 
+    /// Return the number of observations and their sum.
+    #[cfg(feature = "sim")]
+    pub(crate) fn totals(&self) -> (u64, f64) {
+        let count = self
+            .counts
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .sum();
+        (count, f64::from_bits(self.sum.load(Ordering::Relaxed)))
+    }
+
     /// Add one observation of `duration`, in seconds.
     pub(crate) fn observe_duration(&self, duration: Duration) {
         self.observe(duration.as_secs_f64());
@@ -122,6 +139,12 @@ pub(crate) struct Metrics {
     pub(crate) lock_wait: Histogram,
     /// The commits that `tpc_finish` made.
     pub(crate) commits: AtomicU64,
+    /// The locks that a finish handed off.
+    pub(crate) lock_handoffs: AtomicU64,
+    /// The early write-intent locks that the sessions took.
+    pub(crate) intent_locks: AtomicU64,
+    /// The time of each `lock_intent` to take its locks.
+    pub(crate) intent_lock_wait: Histogram,
     /// The conflicts that reached the client as `ConflictError`.
     pub(crate) conflicts_raised: AtomicU64,
     /// The oids in conflict that tier 1 or tier 2 merged in a vote that
@@ -174,6 +197,9 @@ impl Default for Metrics {
             fsync_batch_size: Histogram::new(COMMITS),
             lock_wait: Histogram::new(SECONDS),
             commits: AtomicU64::new(0),
+            lock_handoffs: AtomicU64::new(0),
+            intent_locks: AtomicU64::new(0),
+            intent_lock_wait: Histogram::new(SECONDS),
             conflicts_raised: AtomicU64::new(0),
             conflicts_native: AtomicU64::new(0),
             structural_merges: Default::default(),
@@ -189,6 +215,16 @@ impl zoe_core::Observer for Metrics {
 
     fn locks_acquired(&self, wait: Duration) {
         self.lock_wait.observe_duration(wait);
+    }
+
+    fn locks_handed_off(&self, locks: usize) {
+        self.lock_handoffs
+            .fetch_add(locks as u64, Ordering::Relaxed);
+    }
+
+    fn intent_locks_acquired(&self, locks: usize, wait: Duration) {
+        self.intent_locks.fetch_add(locks as u64, Ordering::Relaxed);
+        self.intent_lock_wait.observe_duration(wait);
     }
 }
 
@@ -275,6 +311,26 @@ pub(crate) fn render(storages: &[Exported]) -> String {
         "zoe_lock_wait_seconds",
         "The time of each vote to take its locks, a wait past the lock timeout included, in seconds.",
         &|m| &m.lock_wait,
+    );
+    scalar(
+        &mut out,
+        "zoe_lock_handoffs_total",
+        "counter",
+        "The number of locks that a finish handed to the vote at the head of their queues.",
+        &|s| get(&s.metrics.lock_handoffs),
+    );
+    scalar(
+        &mut out,
+        "zoe_intent_locks_total",
+        "counter",
+        "The number of early write-intent locks that the sessions took.",
+        &|s| get(&s.metrics.intent_locks),
+    );
+    histogram(
+        &mut out,
+        "zoe_intent_lock_wait_seconds",
+        "The time of each lock_intent call to take its locks, a wait past the lock timeout included, in seconds.",
+        &|m| &m.intent_lock_wait,
     );
     let name = "zoe_conflicts_resolved_total";
     head(
@@ -401,8 +457,13 @@ mod tests {
         Stats::add(&one.stats.loads);
         one.metrics.batch_synced(3);
         one.metrics.locks_acquired(Duration::from_millis(2));
+        one.metrics.locks_handed_off(2);
         let text = render(&[one, exported("a\"b")]);
-        assert_eq!(text.matches("# TYPE ").count(), 13);
+        assert_eq!(text.matches("# TYPE ").count(), 16);
+        assert!(
+            text.contains("zoe_lock_handoffs_total{storage=\"1\"} 2\n"),
+            "{text}"
+        );
         assert!(
             text.contains("zoe_loads_total{storage=\"1\"} 1\n"),
             "{text}"
@@ -464,6 +525,9 @@ mod tests {
         assert!(help("zoe_fsync_batch_size").contains("in commits"));
         assert!(help("zoe_conflicts_resolved_total").contains("oids"));
         assert!(help("zoe_conflicts_raised_total").contains("transactions"));
+        assert!(help("zoe_lock_handoffs_total").contains("locks"));
+        assert!(help("zoe_intent_locks_total").contains("intent locks"));
+        assert!(help("zoe_intent_lock_wait_seconds").ends_with("in seconds."));
         assert!(help("zoe_structural_merges_total").contains("tier, mode and outcome"));
         assert!(
             help("zoe_invalidation_queue_depth")

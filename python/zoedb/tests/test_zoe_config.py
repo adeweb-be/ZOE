@@ -181,7 +181,8 @@ def test_an_empty_path_of_the_section_takes_its_twin(tmp_path, monkeypatch):
         "lock-timeout -5s",
         "read-only maybe",
         "backend fdb",
-        "early-locks on",
+        "early-locks maybe",
+        "early-lock-classes Length",
     ],
 )
 def test_a_bad_value_in_the_section_names_the_key(tmp_path, line):

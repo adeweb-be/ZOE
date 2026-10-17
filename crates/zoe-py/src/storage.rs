@@ -53,7 +53,7 @@ use std::time::{Duration, SystemTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use zoe_core::{BlobFile, Compression, Mode, Oid, Options, Store, Tid, Txn, ZoeError};
+use zoe_core::{BlobFile, Compression, IntentLocks, Mode, Oid, Options, Store, Tid, Txn, ZoeError};
 
 use crate::errors::{self, Failure, p64, u64_of};
 use crate::publish::{Publication, Published};
@@ -98,6 +98,21 @@ impl StoreRef {
     /// Give the share back when another share exists.
     pub(crate) fn try_close(self) -> Result<(), Self> {
         Arc::try_unwrap(self.0).map(drop).map_err(Self)
+    }
+}
+
+/// An owner of early write-intent locks of a `Storage` (ADR 0045). The
+/// drop releases its locks.
+#[pyclass(frozen, module = "zoe._zoe", name = "IntentLocks")]
+pub(crate) struct Intents {
+    /// The locks, from the first `lock_intent`, with their share of the
+    /// store.
+    intents: Mutex<Option<IntentLocks<StoreRef>>>,
+}
+
+impl Intents {
+    fn lock(&self) -> MutexGuard<'_, Option<IntentLocks<StoreRef>>> {
+        self.intents.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -747,6 +762,56 @@ impl Storage {
         Ok(Sequence::new(slf.clone().unbind(), name))
     }
 
+    /// Return a new owner of early write-intent locks (ADR 0045). It holds
+    /// no lock and no share of the store.
+    #[pyo3(name = "_intents")]
+    fn intents(&self) -> Intents {
+        Intents {
+            intents: Mutex::new(None),
+        }
+    }
+
+    /// Take the early write-intent lock of each oid of `oids`, in ascending
+    /// order, for `owner`, and return the current serial of each oid, when
+    /// the store holds them all. An owner with locks keeps a share of the
+    /// store until `unlock_intent` or the `tpc_begin` that adopts them.
+    ///
+    /// An oid at or below an oid that `owner` holds raises
+    /// `StorageTransactionError` and takes nothing. A wait past the lock
+    /// timeout raises `ConflictError`. A read-only storage raises
+    /// `ReadOnlyError`.
+    #[pyo3(name = "_lock_intent")]
+    fn lock_intent<'py>(
+        &self,
+        py: Python<'py>,
+        owner: &Intents,
+        oids: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        if self.read_only {
+            return Err(errors::read_only(py));
+        }
+        let oids = oids
+            .iter()
+            .map(|oid| u64_of(oid).map(Oid))
+            .collect::<PyResult<Vec<Oid>>>()?;
+        let store = self.opened(py)?;
+        let serials = py
+            .detach(|| {
+                let mut intents = owner.lock();
+                let intents = intents.get_or_insert_with(|| IntentLocks::new(store));
+                intents.lock(&oids)
+            })
+            .map_err(|e| core(py, e))?;
+        Ok(serials.into_iter().map(|tid| p64(py, tid.0)).collect())
+    }
+
+    /// Release every intent lock of `owner`, and its share of the store.
+    /// Without locks, do nothing.
+    #[pyo3(name = "_unlock_intent")]
+    fn unlock_intent(&self, py: Python<'_>, owner: &Intents) {
+        py.detach(|| drop(owner.lock().take()));
+    }
+
     /// Begin a two-phase commit of `transaction`. The calling thread
     /// drives it.
     ///
@@ -758,13 +823,18 @@ impl Storage {
     /// functions give it: `" "` or `"p"`, as text or bytes. The store keeps
     /// no transaction status, so the status is not kept. Any other status
     /// raises `StorageTransactionError`.
-    #[pyo3(signature = (transaction, tid = None, status = None))]
+    ///
+    /// With `intents`, an owner of early write-intent locks of this
+    /// storage, the transaction adopts its locks: the vote counts them as
+    /// its own, and the end of the transaction releases them.
+    #[pyo3(signature = (transaction, tid = None, status = None, intents = None))]
     fn tpc_begin(
         &self,
         py: Python<'_>,
         transaction: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
         status: Option<&Bound<'_, PyAny>>,
+        intents: Option<&Intents>,
     ) -> PyResult<()> {
         if self.read_only {
             return Err(errors::read_only(py));
@@ -783,9 +853,20 @@ impl Storage {
         let extension = text(&transaction.getattr("extension_bytes")?)?;
         let store = self.opened(py)?;
         let txn = py
-            .detach(move || match tid {
-                None => Ok(Txn::begin(store, &user, &description, &extension)),
-                Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension),
+            .detach(move || {
+                let mut txn = match tid {
+                    None => Txn::begin(store, &user, &description, &extension),
+                    Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension)?,
+                };
+                // An owner whose lock waits on another thread has no locks
+                // to give yet: the transaction begins without them.
+                if let Some(owner) = intents
+                    && let Ok(mut held) = owner.intents.try_lock()
+                    && let Some(held) = held.as_mut()
+                {
+                    txn.adopt_intents(held)?;
+                }
+                Ok(txn)
             })
             .map_err(|e| core(py, e))?;
         let entry = Arc::new(Entry {

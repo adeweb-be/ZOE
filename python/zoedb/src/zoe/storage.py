@@ -13,6 +13,7 @@ import contextlib
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 import zope.interface
@@ -35,7 +36,7 @@ from ZODB.POSException import (
 )
 from ZODB.TimeStamp import TimeStamp
 
-from zoe import _zoe
+from zoe import _zoe, zodb
 
 
 class WrongThread(StorageTransactionError):
@@ -153,11 +154,84 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
 
     `cleanup` closes the storage and removes the store directory and the
     blob directory, as `cleanup` of FileStorage removes its files.
+
+    `early_locks=True` turns on the early write-intent locks of ADR 0045 for
+    the classes of `early_lock_classes`, each as `module.name`, which must
+    be leaf records: `early_lock_classes` is then the frozenset of these hot
+    classes (None on a read-only storage), and the
+    storage puts the methods of `zoe.zodb.LockingConnection` on the
+    `Connection` of ZODB. A class of tier 1 in the list raises `ValueError`.
+    `lock_intent(oids, owner)` takes the intent lock of each oid, in
+    ascending order, and returns their current serials; `unlock_intent`
+    releases them. Without `owner`, the locks belong to the default owner of
+    the storage, and the next `tpc_begin` adopts them. A connection names an
+    owner of its own (`new_intent_owner`), and binds it to its thread for
+    its `tpc_begin` (`bind_intent_owner`).
     """
 
-    def __init__(self, path, *, blob_dir=None, **options):
+    def __new__(cls, path, *, early_locks=False, early_lock_classes=None, **options):
+        # A bad list of hot classes raises before the store opens.
+        zodb.hot_classes(early_locks, early_lock_classes)
+        return super().__new__(cls, path, **options)
+
+    def __init__(
+        self,
+        path,
+        *,
+        blob_dir=None,
+        early_locks=False,
+        early_lock_classes=None,
+        **options,
+    ):
         # The extension opens the store. Keep the blob directory for cleanup.
         self._blob_dir = None if blob_dir is None else os.path.abspath(blob_dir)
+        # A read-only storage writes nothing, so it takes no early lock.
+        classes = zodb.hot_classes(early_locks, early_lock_classes)
+        self.early_lock_classes = None if self.isReadOnly() else classes
+        self._default_intents = self._intents()
+        self._bound_intents = threading.local()
+        if self.early_lock_classes:
+            zodb.install()
+
+    def new_intent_owner(self):
+        """Return a new owner of early write-intent locks."""
+        return self._intents()
+
+    def lock_intent(self, oids, owner=None):
+        """Take the early write-intent lock of each oid of `oids`, in
+        ascending order, and return the current serial of each one.
+
+        An oid at or below an oid that the owner holds raises
+        `StorageTransactionError` and takes nothing. A wait past the lock
+        timeout raises `ConflictError`.
+        """
+        owner = self._default_intents if owner is None else owner
+        return self._lock_intent(owner, list(oids))
+
+    def unlock_intent(self, owner=None):
+        """Release every early write-intent lock of the owner."""
+        self._unlock_intent(self._default_intents if owner is None else owner)
+
+    def close(self):
+        """Release the intent locks of the default owner, which hold a share
+        of the store, then close the storage."""
+        default = self.__dict__.get("_default_intents")
+        if default is not None:
+            self._unlock_intent(default)
+        super().close()
+
+    def bind_intent_owner(self, owner):
+        """Make `owner` the owner of the intent locks that the next
+        `tpc_begin` of the calling thread adopts, or the default owner again
+        when `owner` is None."""
+        self._bound_intents.owner = owner
+
+    def tpc_begin(self, transaction, tid=None, status=None):
+        """Begin a two-phase commit of `transaction`, as the extension does.
+        The transaction adopts the early write-intent locks of the owner that
+        the calling thread bound, or of the default owner."""
+        owner = getattr(self._bound_intents, "owner", None) or self._default_intents
+        return super().tpc_begin(transaction, tid, status, owner)
 
     def cleanup(self):
         """Close the storage and remove the files of the store.

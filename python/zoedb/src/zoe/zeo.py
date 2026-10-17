@@ -110,7 +110,10 @@ _TRACE_CONTEXT = "trace_context"
 
 # The extensions that each connection declares in `register`. Without
 # OpenTelemetry, the client has no trace context to send.
-EXTENSIONS = ("sequences",) if _PROPAGATOR is None else ("sequences", _TRACE_CONTEXT)
+_TRACES = () if _PROPAGATOR is None else (_TRACE_CONTEXT,)
+# The extension of the early write-intent locks (ADR 0045).
+_LOCK_INTENT = "lock_intent"
+EXTENSIONS = ("sequences", _LOCK_INTENT, *_TRACES)
 
 
 def _traceparent():
@@ -359,10 +362,17 @@ class ClientStorage(ZEOClientStorage):
         self,
         *args,
         native=None,
+        early_locks=False,
+        early_lock_classes=None,
         _client_factory=_ClientThread,
         _ssl_section=None,
         **kw,
     ):
+        # The asyncio client of ZEO has one session and one commit lock for
+        # every thread of the process, so it takes no early locks.
+        if early_locks:
+            raise ValueError("early-locks on needs the native client: native true")
+        self.early_lock_classes = None
         # `_ssl_section` is the `<ssl>` section of `<zoeclient>`. ZEO's
         # client takes the context that it gives.
         if _ssl_section is not None:
@@ -815,11 +825,18 @@ class _NativeClientStorage(ClientStorage):
         password=None,
         realm=None,
         native=True,
+        early_locks=False,
+        early_lock_classes=None,
         _ssl_section=None,
     ):
         if not (native or native is None):
             raise ValueError("this class runs the native client: native is true")
+        from zoe import zodb
+
+        # A bad list of hot classes raises before the client connects.
+        self._early_lock_classes = zodb.hot_classes(early_locks, early_lock_classes)
         given = dict(locals())
+        given.pop("zodb")
         fall_back = self.__dict__.pop("_fall_back", False) and wait
         # Refuse a feature that is not built before any other step.
         for key, off in _NOT_BUILT.items():
@@ -916,6 +933,10 @@ class _NativeClientStorage(ClientStorage):
             return
         self._cache = _NativeCache(self._native, cache_size, cache_path)
         self._native_ready.set()
+        self._default_intents = self._native.intents()
+        self._bound_intents = threading.local()
+        if self._early_lock_classes:
+            zodb.install()
         try:
             if wait:
                 # The connect and the verification of a cache file share one
@@ -958,6 +979,15 @@ class _NativeClientStorage(ClientStorage):
             for key, value in given.items()
             if key not in ("self", "native", "_ssl_section", "__class__")
         }
+        # The client of ZEO takes no early locks. The locks are advisory, so
+        # the client goes on without them.
+        if args.pop("early_locks") and args.pop("early_lock_classes"):
+            logger.warning(
+                "%s the client of ZEO takes no early lock: early-locks on "
+                "needs a server that speaks M5",
+                self.__name__,
+            )
+        args.pop("early_lock_classes", None)
         self.__dict__.clear()
         self.__class__ = ClientStorage
         ClientStorage.__init__(
@@ -1012,6 +1042,26 @@ class _NativeClientStorage(ClientStorage):
         ]
         if declared:
             zope.interface.alsoProvides(self, *declared)
+        # The locks are advisory: without the extension, the client takes no
+        # early lock, and says so once for the connection. A read-only
+        # client writes nothing, so it takes no early lock.
+        classes = self.__dict__.get("_early_lock_classes")
+        if classes and _LOCK_INTENT not in self._info.get("extensions", ()):
+            logger.warning(
+                "%s the server did not accept the extension lock_intent: "
+                "early-locks on takes no early lock",
+                self.__name__,
+            )
+            classes = None
+        self._hot_classes = None if self._is_read_only else classes
+
+    @property
+    def early_lock_classes(self):
+        """The hot classes of early locks on the server of the last
+        connection, or None: without early locks, before the first
+        connection, on a read-only client, or when the server did not accept
+        the extension `lock_intent`."""
+        return self.__dict__.get("_hot_classes")
 
     def notify_disconnected(self):
         """The client lost its server: forget the iterators of the server,
@@ -1539,6 +1589,40 @@ class _NativeClientStorage(ClientStorage):
     def _sequence_next(self, name):
         return self._native.sequence_next(name)
 
+    # The early write-intent locks (ADR 0045).
+
+    def new_intent_owner(self):
+        """Return a new owner of early write-intent locks. Its first lock
+        leases a connection of the pool, which it keeps until `unlock_intent`
+        or the `tpc_begin` that adopts its locks."""
+        return self._native.intents()
+
+    def lock_intent(self, oids, owner=None):
+        """Take the early write-intent lock of each oid of `oids`, in
+        ascending order, and return the current serial of each one.
+
+        Without `owner`, the locks belong to the default owner of the client,
+        and the next `tpc_begin` adopts them. An oid at or below an oid that
+        the owner holds raises `StorageTransactionError` and takes nothing.
+        A wait past the lock timeout of the server raises `ConflictError`.
+        """
+        self._check_process()
+        if _LOCK_INTENT not in self._info.get("extensions", ()):
+            raise Unsupported("the server does not serve the extension lock_intent")
+        owner = self._default_intents if owner is None else owner
+        return self._with_server(lambda: self._native.lock_intent(owner, list(oids)))
+
+    def unlock_intent(self, owner=None):
+        """Release every early write-intent lock of the owner."""
+        self._check_process()
+        self._native.unlock_intent(self._default_intents if owner is None else owner)
+
+    def bind_intent_owner(self, owner):
+        """Make `owner` the owner of the intent locks that the next
+        `tpc_begin` of the calling thread adopts, or the default owner again
+        when `owner` is None."""
+        self._bound_intents.owner = owner
+
     # The two-phase commit.
 
     def _check_trans(self, trans, meth):
@@ -1569,12 +1653,16 @@ class _NativeClientStorage(ClientStorage):
         try:
             if isinstance(status, bytes):
                 status = status.decode("ascii")
+            # The transaction adopts the intent locks of the owner that the
+            # thread bound, or of the default owner.
+            owner = getattr(self._bound_intents, "owner", None) or self._default_intents
             native = self._native.begin(
                 _as_bytes(txn.user),
                 _as_bytes(txn.description),
                 txn.extension,
                 tid,
                 status,
+                owner,
             )
         except BaseException:
             with self._transactions_lock:
