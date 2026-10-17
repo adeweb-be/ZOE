@@ -169,7 +169,7 @@ just bench plone test                          # the tests of the harness
 | --- | --- | --- | --- |
 | `zeo` | ZEO 6 (`runzeo`, FileStorage, pickle protocol Z5) | `<zeoclient>`: `ZEO.ClientStorage` | the baseline; the ZEO server resolves conflicts with ZODB's resolver |
 | `zoe-native` | `zoe serve` | `<zoeclient>`: `zoe.zeo.ClientStorage`, native client; `zoedb[plone]` | the production combination: the native client, the `sequences` extension and `zoe.plone`, which gives `portal_uidgenerator` its ids from a store sequence |
-| `zoe-native-kv` | `zoe serve` | as `zoe-native`, with `ZOE_PLONE_BACKENDS locking,registry` in the `<environment>` of `zope.conf` | the KV namespaces of ADR 0043: the locks of the edit forms and the records of the registry live in the namespaces of the store, so a lock writes no object |
+| `zoe-native-kv` | `zoe serve` | as `zoe-native`, with `ZOE_PLONE_BACKENDS locking` in the `<environment>` of `zope.conf` | the KV namespaces of ADR 0043: the locks of the edit forms live in the ephemeral namespace of the store, so a lock writes no object |
 | `zoe-asyncio` | `zoe serve` | `<zoeclient>` with `native false`; `zoedb[plone]` | ZEO's asyncio client with the ZOE extensions: the sequence without the native client |
 | `zoe-stock` | `zoe serve` | `<zeoclient>`: stock `ZEO.ClientStorage` over M5, no zoedb | the server alone, with no client extension |
 

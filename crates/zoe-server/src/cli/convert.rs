@@ -167,10 +167,8 @@ fn to_data_fs(
 fn left_out_warning(keys: u64) -> String {
     format!(
         "warning: the Data.fs leaves out {keys} keys of the durable KV namespaces: \
-         a Data.fs holds no namespace. A site that keeps its registry there reads \
-         no record from this copy. Move the records back into the object graph \
-         first (zoe.plone.registry.use_object_graph(site), then a commit), and \
-         convert again."
+         a Data.fs holds no namespace. An application that keeps data there reads \
+         none of it from this copy."
     )
 }
 
@@ -244,10 +242,9 @@ mod tests {
     use super::left_out_warning;
 
     #[test]
-    fn the_warning_of_left_out_keys_names_the_way_back() {
+    fn the_warning_of_left_out_keys_counts_them() {
         let warning = left_out_warning(3);
         assert!(warning.starts_with("warning: "), "{warning}");
         assert!(warning.contains("leaves out 3 keys"), "{warning}");
-        assert!(warning.contains("use_object_graph"), "{warning}");
     }
 }

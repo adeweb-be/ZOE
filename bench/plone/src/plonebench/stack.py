@@ -89,9 +89,8 @@ STACKS = {
         section="zoeclient",
         native=True,
         description=(
-            "zoe-native with the backends of zoe.plone: the locks of "
-            "plone.locking and the records of plone.registry in the KV "
-            "namespaces of the store (ADR 0043)"
+            "zoe-native with the locking backend of zoe.plone: the locks of "
+            "plone.locking in the ephemeral namespace of the store (ADR 0043)"
         ),
         differs=(
             "server: zoe serve (redb store, raw records unless --zoe-compression, "
@@ -99,11 +98,11 @@ STACKS = {
             "client: native Rust client (msgpack M5), extensions sequences, kv "
             "and trace_context declared",
             "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
-            "zoe.plone: the locks of edit forms and the registry live in the KV "
-            "namespaces of the store, so a lock writes no object",
+            "zoe.plone: the locks of edit forms live in the ephemeral namespace "
+            "of the store, so a lock writes no object",
             "conflicts: the client resolves through the vote (tier 3)",
         ),
-        backends="locking,registry",
+        backends="locking",
     ),
     "zoe-asyncio": StackConfig(
         name="zoe-asyncio",

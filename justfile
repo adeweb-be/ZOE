@@ -247,9 +247,8 @@ crash runs="200" seed="" seeds="200":
 # that follow go to `bin/test`. `just plone zeoclient suites` runs them
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
-# plone.testing. `just plone zoe backends` runs the suites of plone.locking
-# and plone.app.registry on the locking and registry backends of zoe.plone,
-# with the tests of zoe.plone. `just plone <scenario> creators THREADS ITEMS
+# plone.testing. `just plone zoe backends` runs the suite of plone.locking
+# on the locking backend of zoe.plone, with the tests of zoe.plone. `just plone <scenario> creators THREADS ITEMS
 # SEED` creates a Plone site, sets the counter of portal_uidgenerator to
 # SEED, and runs plone/creators.py: THREADS threads that create ITEMS
 # Documents each. Its last line of stdout is a JSON report. It runs on zoe,
@@ -476,12 +475,13 @@ plone scenario="zoe" command="start" *args:
                 -s plone.app.contenttypes -s plone.restapi "$@"
             ;;
         backends)
-            # The suites of plone.locking and plone.app.registry, unchanged,
-            # on the backends of zoe.plone: the layer of zoe.plone.testing
-            # installs the backends that ZOE_PLONE_BACKENDS names.
+            # The suite of plone.locking, unchanged, on the locking backend
+            # of zoe.plone, with the tests of zoe.plone: the layer of
+            # zoe.plone.testing installs the backends that
+            # ZOE_PLONE_BACKENDS names.
             set -- {{ args }}
-            ZOE_PLONE_BACKENDS=locking,registry "$target/{{ scenario }}/bin/test" \
-                -s plone.locking -s plone.app.registry -s zoe.plone "$@"
+            ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
+                -s plone.locking -s zoe.plone "$@"
             ;;
         creators)
             # The creators script runs in the instance with the storage of
