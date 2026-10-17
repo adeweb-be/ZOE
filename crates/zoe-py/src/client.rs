@@ -71,8 +71,8 @@ use rmpv::Value;
 use tokio::runtime::Runtime;
 use zoe_client::{
     Address, Cache, Connect, Copier, Delivery, Dropping, Endpoint, Error, Event, FileCheck, Open,
-    Options, Pool, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio, Turn,
-    Verification, traced,
+    Options, Pool, PoolIntents, PoolTransaction, REFUSED_POLL, Reconnect, Tls, TlsOptions, Tokio,
+    Turn, Verification, traced,
 };
 use zoe_core::{Oid, Tid};
 
@@ -840,12 +840,78 @@ impl NativeClient {
             .map_err(|e| client_error(py, e))
     }
 
+    /// Return a new owner of early write-intent locks (ADR 0045). It
+    /// holds no lock and no connection.
+    fn intents(&self) -> NativeIntents {
+        NativeIntents {
+            pid: self.pid,
+            runtime: self.runtime,
+            intents: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take the early write-intent lock of each oid of `oids`, in ascending
+    /// order, for `owner`, and return the current serial of each oid. The
+    /// first lock of an owner leases a connection of the pool, which the
+    /// owner keeps until `unlock_intent` or the transaction that adopts
+    /// its locks. An oid at or below an oid that the owner holds raises
+    /// `StorageTransactionError`, and a wait past the lock timeout of the
+    /// server raises `ConflictError`.
+    fn lock_intent<'py>(
+        &self,
+        py: Python<'py>,
+        owner: &NativeIntents,
+        oids: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        self.check_process()?;
+        let oids = oids
+            .iter()
+            .map(|oid| <[u8; 8]>::try_from(oid.as_slice()).map(|b| Oid(u64::from_be_bytes(b))))
+            .collect::<Result<Vec<Oid>, _>>()
+            .map_err(|_| PyValueError::new_err("an oid is not 8 bytes"))?;
+        let pool = self.pool(py)?;
+        let trace = self.traceparent(py, &pool)?;
+        let runtime = self.runtime;
+        let serials = py
+            .detach(|| {
+                runtime.block_on(traced(trace, async {
+                    let mut intents = owner.intents.lock().await;
+                    if intents.is_none() {
+                        *intents = Some(pool.intents().await?);
+                    }
+                    intents.as_mut().expect("an owner").lock(&oids).await
+                }))
+            })
+            .map_err(|e| client_error(py, e))?;
+        Ok(serials.into_iter().map(|tid| p64(py, tid.0)).collect())
+    }
+
+    /// Release every intent lock of `owner`, and give its connection back
+    /// to the pool. Without locks, do nothing.
+    fn unlock_intent(&self, py: Python<'_>, owner: &NativeIntents) -> PyResult<()> {
+        self.check_process()?;
+        let runtime = self.runtime;
+        py.detach(|| {
+            runtime.block_on(async {
+                let intents = owner.intents.lock().await.take();
+                match intents {
+                    Some(intents) => intents.release().await,
+                    None => Ok(()),
+                }
+            })
+        })
+        .map_err(|e| client_error(py, e))
+    }
+
     /// Begin a transaction on a free connection of the pool, and return
     /// it. `extension` is the dict of the transaction extension. With
     /// `tid`, the transaction commits under that tid, with the status
     /// `status`. When every connection is busy and the pool is at its
-    /// bound, wait for a free one.
-    #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned()))]
+    /// bound, wait for a free one. With `intents`, an owner that holds
+    /// early write-intent locks, the transaction begins on the connection
+    /// of the owner and adopts its locks.
+    #[pyo3(signature = (user, description, extension, tid = None, status = " ".to_owned(), intents = None))]
+    #[allow(clippy::too_many_arguments)]
     fn begin(
         &self,
         py: Python<'_>,
@@ -854,6 +920,7 @@ impl NativeClient {
         extension: &Bound<'_, PyAny>,
         tid: Option<&Bound<'_, PyAny>>,
         status: String,
+        intents: Option<&NativeIntents>,
     ) -> PyResult<NativeTransaction> {
         let tid = tid.map(u64_of).transpose()?.map(Tid);
         let mut encoded = Vec::new();
@@ -865,8 +932,22 @@ impl NativeClient {
         let (user, description) = (user.to_vec(), description.to_vec());
         let txn = py
             .detach(|| {
-                let begin = pool.begin_with(&user, &description, &encoded, tid, &status);
-                runtime.block_on(traced(trace, begin))
+                runtime.block_on(traced(trace, async {
+                    let held = match intents {
+                        Some(owner) => owner.intents.lock().await.take(),
+                        None => None,
+                    };
+                    match held {
+                        Some(held) => {
+                            held.begin_with(&user, &description, &encoded, tid, &status)
+                                .await
+                        }
+                        None => {
+                            pool.begin_with(&user, &description, &encoded, tid, &status)
+                                .await
+                        }
+                    }
+                }))
             })
             .map_err(|e| client_error(py, e))?;
         let slot = Arc::new(Mutex::new(Some(txn)));
@@ -1058,6 +1139,33 @@ impl Drop for NativeClient {
 
 /// The open transaction of a `Transaction`.
 type Slot = Mutex<Option<PoolTransaction>>;
+
+/// An owner of early write-intent locks of a `Client` (ADR 0045): the locks
+/// and the connection of the pool that holds them, from the first
+/// `lock_intent` to `unlock_intent` or the `begin` that adopts them. The
+/// drop releases the locks.
+#[pyclass(frozen, module = "zoe._zoe", name = "Intents")]
+pub(crate) struct NativeIntents {
+    /// The process that opened the client.
+    pid: u32,
+    runtime: &'static Runtime,
+    /// The locks, from the first `lock_intent`. An async mutex: a lock
+    /// waits on the server with it held.
+    intents: tokio::sync::Mutex<Option<PoolIntents>>,
+}
+
+impl Drop for NativeIntents {
+    fn drop(&mut self) {
+        let intents = self.intents.get_mut().take();
+        if self.pid != std::process::id() {
+            mem::forget(intents);
+            return;
+        }
+        // The drop of the locks can start a task of the runtime.
+        let _inside = self.runtime.enter();
+        drop(intents);
+    }
+}
 
 /// One transaction of a `Client`, on its own connection of the pool, from
 /// `begin` to `finish` and `done`, or to `abort`.
