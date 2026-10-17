@@ -1,7 +1,8 @@
 //! The observer of a store: a hook for the metrics of a skin.
 //!
-//! The core calls the observer of a store after a sync of a commit batch
-//! and after the lock acquisition of each vote. The core keeps no metric
+//! The core calls the observer of a store after a sync of a commit batch,
+//! after the lock acquisition of each vote, and after a finish that handed
+//! off locks. The core keeps no metric
 //! and has no metrics dependency: the skin counts what it gets. Each
 //! method has a default that does nothing.
 
@@ -27,6 +28,13 @@ pub trait Observer: Send + Sync {
     /// past the lock timeout calls it too.
     fn locks_acquired(&self, wait: Duration) {
         let _ = wait;
+    }
+
+    /// The finish of a transaction handed `locks` locks to the votes at the
+    /// head of their queues (ADR 0044). The finish calls it after its
+    /// commit is durable or failed.
+    fn locks_handed_off(&self, locks: usize) {
+        let _ = locks;
     }
 }
 
