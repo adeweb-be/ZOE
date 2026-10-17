@@ -11,7 +11,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     # A hung step fails the job after this time.
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       # Nix fetches the github: inputs through the GitHub API with this token.
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
