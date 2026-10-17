@@ -11,7 +11,7 @@ Step 1 of the card: the log is the transactions of a store that a B5 run kept (`
 ## Method
 
 - `main` at `3b5164f`. One B5 run: `just bench plone run --stack zeo --scenario edit --steps 4:60,16:60 --keep-store`, on the small fixture. It kept `store/filestorage/Data.fs` and the probe records of both instances, `probe/instance0.jsonl` and `probe/instance1.jsonl`. Its verification passed.
-- `just bench replay RUN` read the log and replayed it on both stacks at 1×, 4× and 16×, one repetition, in the interpreter of the zoeclient Plone instance, with `bench/replay` at `2ece33d` and a clean tree, as each result records. `zoe serve` was the release build of `main`; the native client was the package `zoe` of the zoeclient instance, built from `main`. A debug run replayed the first 300 transactions and compared, at each store, the serial that the transaction read with the serial on the server.
+- `just bench replay RUN` read the log and replayed it on both stacks at 1×, 4× and 16×, one repetition, in the interpreter of the zoeclient Plone instance, with `bench/replay` at `2ece33d` and a clean tree, as each result records. `zoe serve` was the release build of `main`, whose sha256 each result records. The native client was the package `zoe` of the zoeclient instance; these results name it by its path only, because they came before the field `zoe_extension_sha256`. Its extension was built after `3b5164f`, and no commit of this card or of ZOE-203 changes the client. A debug run replayed the first 300 transactions and compared, at each store, the serial that the transaction read with the serial on the server.
 - Machine: Apple M3 Pro, CPython 3.13, both servers with `fsync(2)`.
 
 ## The log
@@ -66,7 +66,7 @@ The log holds the record of each transaction as the store committed it, so the r
 
 ## A preview of the gate
 
-The same log at 1×, `zoe-native` against `zoe serve` built in release from `card/ZOE-203` at `a5e210d` (sha256 `82ba8b38…`, which the result records) with `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`, one repetition, beside `zeo` of the baseline. The native client stays the one of `main`: ZOE-203 does not change it.
+The same log at 1×, `zoe-native` against `zoe serve` built in release from `card/ZOE-203` at `a5e210d` (sha256 `82ba8b38…`, which the result records) with `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`, one repetition, beside `zeo` of the baseline. The native client is the same package as in the baseline: ZOE-203 does not change the client.
 
 | stack | `ConflictError`s | per 1,000 | acknowledged |
 | --- | ---: | ---: | ---: |

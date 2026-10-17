@@ -397,11 +397,15 @@ def run(
     The runs alternate: for each speed, for each repetition, one run of each
     stack, in the order of `stacks`. Each run has a new server on a new
     store under `workdir`. `serve_args` go to `zoe serve` after its own
-    arguments. Return the result. Raise `ValueError` for a speed that is
+    arguments. Return the result. It records the software before the
+    first run, and again under `software_after` when it differs at the
+    end. Raise `ValueError` for a speed that is
     not positive or that comes twice.
     """
     if any(speed <= 0 for speed in speeds) or len(set(speeds)) != len(speeds):
         raise ValueError(f"the speeds must be positive and distinct: {speeds}")
+    # The software of the runs, read before the first one.
+    software = servers.software(serve_args)
     workdir = Path(workdir)
     runs = []
     for speed in speeds:
@@ -411,9 +415,14 @@ def run(
                 runs.append(
                     run_one(log, stack, speed, repetition, directory, check, serve_args)
                 )
-    return {
+    result = {
         "schema_version": 1,
-        "software": servers.software(serve_args),
+        "software": software,
         "speeds": list(speeds),
         "runs": runs,
     }
+    # A build or a change of the tree during the runs leaves a trace.
+    after = servers.software(serve_args)
+    if after != software:
+        result["software_after"] = after
+    return result

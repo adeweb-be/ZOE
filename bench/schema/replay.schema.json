@@ -8,29 +8,32 @@
   "required": ["schema_version", "software", "speeds", "runs"],
   "$defs": {
     "tid": { "description": "A tid as 16 hex digits.", "type": "string", "pattern": "^[0-9a-f]{16}$" },
-    "speed": { "description": "A multiple of the speed of the log.", "type": "number", "exclusiveMinimum": 0 }
-  },
-  "properties": {
-    "schema_version": { "const": 1 },
-    "started": { "description": "The start of the replay, in seconds since the epoch.", "type": "number" },
+    "speed": { "description": "A multiple of the speed of the log.", "type": "number", "exclusiveMinimum": 0 },
     "software": {
-      "description": "The software of the runs.",
+      "description": "The software of the runs, read before the first run.",
       "type": "object",
       "additionalProperties": false,
       "required": ["commit", "dirty", "zoe", "zoe_version", "zoe_sha256", "zoe_serve_args", "zoedb", "zoe_package", "python", "machine"],
       "properties": {
         "commit": { "description": "The commit of the repository, or null outside a checkout.", "type": ["string", "null"] },
-        "dirty": { "description": "True when the tree of the repository held changes that the commit does not.", "type": "boolean" },
+        "dirty": { "description": "True when the tree of the repository held changes that the commit does not; null when git does not tell.", "type": ["boolean", "null"] },
         "zoe": { "description": "The path of the zoe binary that zoe serve runs.", "type": "string" },
         "zoe_sha256": { "description": "The sha256 of the zoe binary, or null when it does not read.", "type": ["string", "null"] },
         "zoe_version": { "description": "The output of zoe --version, or null when it does not run.", "type": ["string", "null"] },
         "zoe_serve_args": { "description": "The arguments that zoe serve gets after its own.", "type": "array", "items": { "type": "string" } },
         "zoedb": { "description": "The version of the package zoedb that the replay imports, or null.", "type": ["string", "null"] },
         "zoe_package": { "description": "The directory of the package zoe that the native client runs, or null.", "type": ["string", "null"] },
+        "zoe_extension_sha256": { "description": "The sha256 of the extension of the package zoe, or null.", "type": ["string", "null"] },
         "python": { "description": "The version of Python of the replay.", "type": "string" },
         "machine": { "description": "The system and the machine.", "type": "string" }
       }
-    },
+    }
+  },
+  "properties": {
+    "schema_version": { "const": 1 },
+    "started": { "description": "The start of the replay, in seconds since the epoch.", "type": "number" },
+    "software": { "$ref": "#/$defs/software" },
+    "software_after": { "description": "The software at the end of the runs, when it differs from the software before them: a build or a change of the tree during the runs.", "$ref": "#/$defs/software" },
     "log": {
       "description": "The log that the replay read.",
       "type": "object",
