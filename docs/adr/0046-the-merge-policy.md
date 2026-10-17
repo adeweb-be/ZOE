@@ -1,6 +1,6 @@
 # 0046. The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2
 
-Status: proposed. The first checkpoint of ZOE-205: the human approves it on the pull request before tier 2 is built. "Questions for the human" lists the choices. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice; the answers below are Claude's choices, for review.
+Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human".
 
 ## Context
 
