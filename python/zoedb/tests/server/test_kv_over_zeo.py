@@ -56,6 +56,7 @@ def test_the_calls_of_the_namespaces(server, native):
     storage = zoe_client(server.address, native=native)
     try:
         assert "kv" in storage._info["extensions"]
+        assert storage.kv_supported()
         assert storage.kv_get("durable", "registry", b"title") is None
         assert storage.kv_generation("registry") == z64
         tid = commit(
@@ -169,6 +170,7 @@ def test_against_a_server_without_kv_the_calls_are_unsupported(tmp_path, native)
     storage = zoe_client(address, native=native)
     try:
         assert "extensions" not in storage._info
+        assert not storage.kv_supported()
         with pytest.raises(Unsupported):
             storage.kv_get("durable", "registry", b"title")
         meta = TransactionMetaData()

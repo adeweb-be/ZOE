@@ -37,6 +37,7 @@ def storage(tmp_path):
 
 
 def test_a_write_commits_with_its_transaction(storage):
+    assert storage.kv_supported() is True
     assert storage.kv_get("durable", "registry", b"title") is None
     assert storage.kv_generation("registry") == z64
     tid = commit(storage, ("durable", "registry", b"title", b"site", None))
@@ -144,6 +145,21 @@ def test_a_read_only_storage_reads_and_refuses_writes(tmp_path):
         storage.close()
 
 
+def test_a_storage_with_ephemeral_keys_closes_and_opens_again(tmp_path):
+    # Each open of a store with ephemeral keys starts a sweep thread, and
+    # each close waits for it, so the next open takes the lock of the store.
+    path = str(tmp_path / "store")
+    for _ in range(5):
+        storage = zoe.Storage(path)
+        commit(storage, ("ephemeral", "sessions", b"s", b"v", 60))
+        storage.close()
+    storage = zoe.Storage(path)
+    try:
+        assert storage.kv_get("ephemeral", "sessions", b"s") == b"v"
+    finally:
+        storage.close()
+
+
 def test_a_durable_key_survives_a_reopen(tmp_path):
     path = str(tmp_path / "store")
     storage = zoe.Storage(path)
@@ -242,6 +258,56 @@ def test_a_savepoint_rolls_back_the_writes(db):
     conn.close()
 
 
+def test_a_savepoint_rolled_back_to_no_write_commits_nothing(db):
+    manager = transaction.TransactionManager()
+    conn = db.open(manager)
+    registry = zoe.kv.Namespace(conn, "durable", "registry")
+    last = db.storage.lastTransaction()
+    savepoint = manager.savepoint()
+    registry.set("a", b"1")
+    savepoint.rollback()
+    # The data manager stays in the transaction with no write: it begins no
+    # storage transaction.
+    manager.commit()
+    assert db.storage.lastTransaction() == last
+    assert registry.get("a") is None
+    conn.close()
+
+
+def test_a_scan_fills_its_page_and_ends_only_at_an_empty_page(tmp_path):
+    from ZODB.DemoStorage import DemoStorage
+
+    base = zoe.Storage(str(tmp_path / "store"))
+    commit(base, *[("durable", "reg", b"k%04d" % i, b"v", None) for i in range(1500)])
+    demo = DemoStorage(base=base, close_base_on_close=False)
+    db = ZODB.DB(demo)
+    manager = transaction.TransactionManager()
+    conn = db.open(manager)
+    try:
+        registry = zoe.kv.Namespace(conn, "durable", "reg")
+        registry.delete(b"k0005")
+        # A staged delete hides a key, and the page still holds the limit.
+        page = registry.scan(limit=1000)
+        assert len(page) == 1000
+        assert (b"k0005", b"v") not in page
+        assert page[-1][0] == b"k1000"
+        manager.commit()
+        # Over the overlay, a reader that pages until an empty page sees
+        # every key but the deleted one.
+        storage = zoe.kv._storage_of(conn)
+        rows, start = {}, None
+        while pairs := storage.kv_scan("durable", "reg", start, None, 1000):
+            rows.update(pairs)
+            start = pairs[-1][0] + b"\x00"
+        assert len(rows) == 1499
+        assert b"k0005" not in rows
+        assert len(storage.kv_scan("durable", "reg", None, None, 1000)) == 1000
+    finally:
+        conn.close()
+        db.close()
+        base.close()
+
+
 def test_a_namespace_of_another_storage_is_unsupported():
     from ZODB.MappingStorage import MappingStorage
 
@@ -331,7 +397,7 @@ def test_a_demo_storage_over_another_storage_has_no_namespaces():
     db = ZODB.DB(DemoStorage())
     conn = db.open()
     try:
-        assert not zoe.kv.supported(conn)
+        assert not zoe.kv._supported(conn)
         with pytest.raises(Unsupported):
             zoe.kv.Namespace(conn, "durable", "registry")
     finally:

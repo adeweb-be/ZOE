@@ -846,6 +846,11 @@ impl Storage {
             .collect())
     }
 
+    /// Tell if the storage has KV namespaces: a `zoe.Storage` always has.
+    fn kv_supported(&self) -> bool {
+        true
+    }
+
     /// Return the generation of the durable namespace `name`, as the 8
     /// bytes of a tid: the tid of the last commit that wrote it, or 8 zero
     /// bytes before the first one. A cache of the namespace stays valid

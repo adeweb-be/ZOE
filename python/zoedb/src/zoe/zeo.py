@@ -16,9 +16,9 @@ accepted `sequences` on the connection. Without it, `next()` raises
 
 `kv_get`, `kv_scan`, `kv_generation`, `kv_set` and `kv_delete` give the
 KV namespaces of the store, as `zoe.Storage` does (ADR 0043). They need a
-server that accepted `kv` on the connection. Without it, each raises
-`ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a namespace to a
-connection of a database.
+server that accepted `kv` on the connection: `kv_supported()` tells. Without
+it, each raises `ZODB.POSException.Unsupported`. `zoe.kv.Namespace` gives a
+namespace to a connection of a database.
 
 When the package `opentelemetry` is installed, each connection also declares
 `trace_context`. When the server accepts it, each call that the client makes
@@ -53,8 +53,8 @@ a blob directory that it shares with the server (`shared_blob_dir`). It
 resolves in the client the conflicts that a vote lists, as
 `ZEO.ClientStorage` does. When it loses its server, it connects again in
 the background and verifies its cache, as ZEO does. It declares
-`sequences`, and `trace_context` when the package `opentelemetry` is
-installed, and `kv`, and sends the traceparent as the client of ZEO does. It has the
+`sequences` and `kv`, and `trace_context` when the package `opentelemetry`
+is installed. It sends the traceparent as the client of ZEO does. It has the
 rest of the storage API of `ZEO.ClientStorage`: the iterators, `history`,
 `record_iternext`, `pack`, `undoInfo` and `undoLog`, `server_status`,
 `deleteObject`, `restore`, `prefetch`, `sync` with `server_sync`,
@@ -421,8 +421,12 @@ class ClientStorage(ZEOClientStorage):
 
     # The KV namespaces.
 
+    def kv_supported(self):
+        """Tell if the server accepted `kv` on the connection."""
+        return _KV in self._info.get("extensions", ())
+
     def _check_kv(self, flavour=None):
-        if _KV not in self._info.get("extensions", ()):
+        if not self.kv_supported():
             raise Unsupported("the server does not serve the extension kv")
         if flavour is not None:
             _check_flavour(flavour)
@@ -1607,6 +1611,10 @@ class _NativeClientStorage(ClientStorage):
         return self._native.sequence_next(name)
 
     # The KV namespaces.
+
+    def kv_supported(self):
+        """Tell if the server accepted `kv` on the connection."""
+        return _KV in self._native.extensions()
 
     def kv_get(self, flavour, name, key):
         return self._with_server(lambda: self._native.kv_get(flavour, name, key))

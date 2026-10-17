@@ -2,8 +2,9 @@
 
 `Namespace(connection, flavour, name)` is the namespace `name` of
 `flavour`, `"ephemeral"` or `"durable"`, of the store of the database of
-`connection`. The store is a `zoe.Storage` or a `zoe.zeo.ClientStorage`;
-another storage raises `ZODB.POSException.Unsupported`.
+`connection`. The store is a `zoe.Storage`, or a `zoe.zeo.ClientStorage`
+whose server accepted the extension `kv`: `kv_supported()` of the storage
+tells. Another storage raises `ZODB.POSException.Unsupported`.
 
 A key is bytes, or a str, which the namespace writes as its UTF-8 bytes.
 UTF-8 byte order is the code point order of a str, so a scan of str keys
@@ -13,7 +14,8 @@ gives the order of an OOBTree. A value is bytes.
 transaction of the connection. `get` and `scan` see the writes of that
 transaction first, then the last committed values: the namespaces keep no
 history, so a read does not follow the snapshot of the connection. The
-data manager supports savepoints.
+data manager supports savepoints. A scan gives full pages: it reads the
+store again until it has `limit` pairs or reaches the end of the range.
 
 At the commit, the data manager stages its writes in the storage
 transaction that the connection began, so they commit in one write with
@@ -32,6 +34,7 @@ namespace a generation of its own when a commit writes it.
 """
 
 import itertools
+import threading
 import time
 import weakref
 
@@ -43,8 +46,12 @@ from ZODB.POSException import Unsupported
 
 __all__ = ["Namespace"]
 
-# The writes of the current transaction of each connection.
-_writes = weakref.WeakKeyDictionary()
+# The data manager of the writes of the current transaction of each
+# connection.
+_managers = weakref.WeakKeyDictionary()
+
+# The most pairs that one scan of the store gives.
+_SCAN_LIMIT = 1000
 
 
 def _key(key):
@@ -61,6 +68,12 @@ def _bound(bound):
     return None if bound is None else _key(bound)
 
 
+def _has_namespaces(storage):
+    """Tell if `storage` has KV namespaces: its `kv_supported()` says so."""
+    kv_supported = getattr(storage, "kv_supported", None)
+    return kv_supported is not None and bool(kv_supported())
+
+
 def _storage_of(connection):
     """Return the namespaces of the storage of the database of
     `connection`: the storage itself, or the overlay of a `DemoStorage`
@@ -68,15 +81,15 @@ def _storage_of(connection):
     storage = connection.db().storage
     if isinstance(storage, DemoStorage):
         return _DemoNamespaces(storage)
-    if getattr(storage, "kv_set", None) is None:
+    if not _has_namespaces(storage):
         raise Unsupported(
-            f"{type(storage).__name__} has no KV namespaces: use zoe.Storage"
-            " or zoe.zeo.ClientStorage"
+            f"{type(storage).__name__} has no KV namespaces: use zoe.Storage,"
+            " or zoe.zeo.ClientStorage with a server that accepts kv"
         )
     return storage
 
 
-def supported(connection):
+def _supported(connection):
     """Tell if the storage of the database of `connection` has KV
     namespaces."""
     try:
@@ -84,6 +97,45 @@ def supported(connection):
     except Unsupported:
         return False
     return True
+
+
+def _merge(scan, extra, start, stop, limit):
+    """Return at most `limit` pairs of the range from `start` to `stop`, in
+    key order: the pairs of the store with the pairs of `extra` over them.
+
+    `scan(start, count)` gives at most `count` pairs of the store from
+    `start` to `stop`. `extra` maps a key to a value, or to None for a key
+    that it hides. A page of `scan` holds every key of the store from its
+    start to its last key, so the merge applies each key of `extra` in the
+    page that covers it. A page can hold fewer pairs than `count`, so only
+    an empty page is the end.
+    """
+    extra = sorted(
+        (key, value)
+        for key, value in extra.items()
+        if (start is None or key >= start) and (stop is None or key < stop)
+    )
+    pairs = []
+    cursor = start
+    index = 0
+    while len(pairs) < limit:
+        count = min(_SCAN_LIMIT, limit - len(pairs) + len(extra) - index)
+        page = scan(cursor, count)
+        last = page[-1][0] if page else None
+        merged = dict(page)
+        while index < len(extra) and (last is None or extra[index][0] <= last):
+            key, value = extra[index]
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+            index += 1
+        pairs.extend(sorted(merged.items()))
+        if last is None:
+            break
+        # The first key after `last`.
+        cursor = last + b"\x00"
+    return pairs[:limit]
 
 
 class Namespace:
@@ -112,26 +164,31 @@ class Namespace:
         With `create`, make them and join the transaction when there are
         none. Else return None when there are none."""
         txn = self._connection.transaction_manager.get()
-        found = _writes.get(self._connection)
+        found = _managers.get(self._connection)
         if found is not None and found.transaction is txn:
             return found
         if not create:
             return None
         writes = _Writes(self._storage, self._connection, txn)
-        _writes[self._connection] = writes
+        _managers[self._connection] = writes
         txn.join(writes)
         return writes
+
+    def _find(self, key):
+        """Return `(True, value)` when the current transaction wrote `key`,
+        `value` None for a delete, else `(False, None)`. `key` is bytes."""
+        writes = self._staged(create=False)
+        if writes is None:
+            return False, None
+        return writes.find(self.flavour, self.name, key)
 
     def get(self, key, default=None):
         """Return the value of `key`, or `default` when it has none or is
         expired. A write of the current transaction comes first."""
         key = _key(key)
-        writes = self._staged(create=False)
-        if writes is not None:
-            found, value = writes.find(self.flavour, self.name, key)
-            if found:
-                return default if value is None else value
-        value = self._storage.kv_get(self.flavour, self.name, key)
+        found, value = self._find(key)
+        if not found:
+            value = self._storage.kv_get(self.flavour, self.name, key)
         return default if value is None else value
 
     def scan(self, start=None, stop=None, limit=1000):
@@ -143,38 +200,22 @@ class Namespace:
         start, stop = _bound(start), _bound(stop)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("the limit of a scan is an int of 1 or more")
-        limit = min(limit, 1000)
+        limit = min(limit, _SCAN_LIMIT)
         writes = self._staged(create=False)
-        staged = [] if writes is None else writes.of(self.flavour, self.name)
-        # A staged delete can hide a key of the scan, so the scan reads one
-        # more pair for each staged write, up to 1,000.
-        wanted = min(1000, limit + len(staged))
-        scanned = self._storage.kv_scan(self.flavour, self.name, start, stop, wanted)
-        pairs = dict(scanned)
-        # A full scan can leave out keys after its last one, so a staged key
-        # after that key would skip them.
-        last = scanned[-1][0] if len(scanned) == wanted else None
-        if staged:
-            for key, value in staged:
-                if (start is not None and key < start) or (
-                    stop is not None and key >= stop
-                ):
-                    continue
-                if last is not None and key > last:
-                    continue
-                if value is None:
-                    pairs.pop(key, None)
-                else:
-                    pairs[key] = value
-        return sorted(pairs.items())[:limit]
+        staged = {} if writes is None else writes.of(self.flavour, self.name)
 
-    def writes(self):
+        def scan(cursor, count):
+            return self._storage.kv_scan(self.flavour, self.name, cursor, stop, count)
+
+        return _merge(scan, staged, start, stop, limit)
+
+    def _writes(self):
         """Return the writes of the current transaction in the namespace, as
         a dict of key to value, `None` for a delete."""
         writes = self._staged(create=False)
         if writes is None:
             return {}
-        return dict(writes.of(self.flavour, self.name))
+        return writes.of(self.flavour, self.name)
 
     def generation(self):
         """Return the generation of the durable namespace: the 8 bytes of
@@ -210,47 +251,57 @@ class _Writes:
         self.transaction = txn
         self._storage = storage
         self._connection = connection
-        # (flavour, name, key) -> (value or None for a delete, ttl)
-        self._writes = {}
+        # (flavour, name) -> {key: (value or None for a delete, ttl)}
+        self._spaces = {}
         # The storage transaction that this data manager began, or None.
         self._meta = None
 
     def put(self, flavour, name, key, value, ttl):
-        self._writes[(flavour, name, key)] = (value, ttl)
+        self._spaces.setdefault((flavour, name), {})[key] = (value, ttl)
 
     def find(self, flavour, name, key):
         """Return `(True, value)` for a write of `key`, `value` None for a
         delete, else `(False, None)`."""
-        write = self._writes.get((flavour, name, key))
+        write = self._spaces.get((flavour, name), {}).get(key)
         if write is None:
             return False, None
         return True, write[0]
 
     def of(self, flavour, name):
-        """Return the key and the value of each write of the namespace."""
+        """Return the writes of the namespace, as a dict of key to value,
+        `None` for a delete."""
+        keys = self._spaces.get((flavour, name), {})
+        return {key: value for key, (value, _ttl) in keys.items()}
+
+    def items(self):
+        """Return each write as `((flavour, name, key), (value, ttl))`."""
         return [
-            (key, value)
-            for (f, n, key), (value, _ttl) in self._writes.items()
-            if f == flavour and n == name
+            ((flavour, name, key), write)
+            for (flavour, name), keys in self._spaces.items()
+            for key, write in keys.items()
         ]
 
     def _end(self):
-        if _writes.get(self._connection) is self:
-            del _writes[self._connection]
+        if _managers.get(self._connection) is self:
+            del _managers[self._connection]
 
     # IDataManager
 
     def abort(self, txn):
-        self._writes.clear()
+        self._spaces.clear()
         self._end()
 
     def tpc_begin(self, txn):
         pass
 
     def commit(self, txn):
+        writes = self.items()
+        if not writes:
+            # A rollback or a reader left no write: begin no transaction.
+            return
         if isinstance(self._storage, _DemoNamespaces):
             # The overlay takes the writes at the finish.
-            self._storage.check(self._writes)
+            self._storage.check(writes)
             return
         # Each resource had its `tpc_begin` before this call. So the
         # connection began its storage transaction here when it is a
@@ -263,7 +314,7 @@ class _Writes:
             meta = TransactionMetaData(txn.user, txn.description, txn.extension)
             self._storage.tpc_begin(meta)
             self._meta = meta
-        for (flavour, name, key), (value, ttl) in self._writes.items():
+        for (flavour, name, key), (value, ttl) in writes:
             if value is None:
                 self._storage.kv_delete(flavour, name, key, meta)
             else:
@@ -276,7 +327,7 @@ class _Writes:
     def tpc_finish(self, txn):
         try:
             if isinstance(self._storage, _DemoNamespaces):
-                self._storage.apply(self._writes)
+                self._storage.apply(self.items())
             if self._meta is not None:
                 self._storage.tpc_finish(self._meta)
         finally:
@@ -289,7 +340,7 @@ class _Writes:
                 self._storage.tpc_abort(self._meta)
         finally:
             self._meta = None
-            self._writes.clear()
+            self._spaces.clear()
             self._end()
 
     def sortKey(self):
@@ -297,7 +348,10 @@ class _Writes:
         return f"{self._storage.sortKey()}:zoe.kv:{id(self)}"
 
     def savepoint(self):
-        return _Savepoint(self, dict(self._writes))
+        return _Savepoint(self, self._copy())
+
+    def _copy(self):
+        return {space: dict(keys) for space, keys in self._spaces.items()}
 
 
 @zope.interface.implementer(transaction.interfaces.IDataManagerSavepoint)
@@ -309,11 +363,16 @@ class _Savepoint:
         self._state = state
 
     def rollback(self):
-        self._writes._writes = dict(self._state)
+        self._writes._spaces = {
+            space: dict(keys) for space, keys in self._state.items()
+        }
 
 
-# The overlay of each `DemoStorage`, while the `DemoStorage` lives.
+# The overlay of each `DemoStorage`, while the `DemoStorage` lives. The
+# lock guards the overlays and their rows: a read copies what it needs
+# under the lock.
 _overlays = weakref.WeakKeyDictionary()
+_overlays_lock = threading.Lock()
 
 # The generations that the overlays give, above every tid of a store.
 _generations = itertools.count(2**63)
@@ -353,7 +412,7 @@ class _DemoNamespaces:
         while isinstance(storage, DemoStorage):
             chain.append(storage)
             storage = storage.base
-        if getattr(storage, "kv_set", None) is None:
+        if not _has_namespaces(storage):
             raise Unsupported(
                 f"the base of {type(demo).__name__} has no KV namespaces:"
                 " use zoe.Storage or zoe.zeo.ClientStorage"
@@ -367,12 +426,13 @@ class _DemoNamespaces:
         return self._demo.sortKey()
 
     def _found(self, flavour, name, key, now):
-        for demo in self._chain:
-            overlay = _overlays.get(demo)
-            if overlay is not None:
-                found, value = overlay.find(flavour, name, key, now)
-                if found:
-                    return True, value
+        with _overlays_lock:
+            for demo in self._chain:
+                overlay = _overlays.get(demo)
+                if overlay is not None:
+                    found, value = overlay.find(flavour, name, key, now)
+                    if found:
+                        return True, value
         return False, None
 
     def kv_get(self, flavour, name, key):
@@ -381,46 +441,38 @@ class _DemoNamespaces:
             return value
         return self._base.kv_get(flavour, name, key)
 
+    def kv_supported(self):
+        return True
+
     def kv_scan(self, flavour, name, start=None, stop=None, limit=1000):
         now = time.time()
         rows = {}
-        for demo in self._chain:
-            overlay = _overlays.get(demo)
-            if overlay is None:
-                continue
-            for (f, n, key), _row in overlay.rows.items():
-                if (f, n) != (flavour, name) or key in rows:
+        with _overlays_lock:
+            for demo in self._chain:
+                overlay = _overlays.get(demo)
+                if overlay is None:
                     continue
-                if (start is not None and key < start) or (
-                    stop is not None and key >= stop
-                ):
-                    continue
-                rows[key] = overlay.find(f, n, key, now)[1]
-        # The base gives at most 1,000 pairs; the overlay can hide some.
-        wanted = min(1000, limit + len(rows))
-        scanned = self._base.kv_scan(flavour, name, start, stop, wanted)
-        last = scanned[-1][0] if len(scanned) == wanted else None
-        pairs = dict(scanned)
-        for key, value in rows.items():
-            if last is not None and key > last:
-                continue
-            if value is None:
-                pairs.pop(key, None)
-            else:
-                pairs[key] = value
-        return sorted(pairs.items())[:limit]
+                for (f, n, key), _row in overlay.rows.items():
+                    if (f, n) == (flavour, name) and key not in rows:
+                        rows[key] = overlay.find(f, n, key, now)[1]
+
+        def scan(cursor, count):
+            return self._base.kv_scan(flavour, name, cursor, stop, count)
+
+        return _merge(scan, rows, start, stop, min(limit, _SCAN_LIMIT))
 
     def kv_generation(self, name):
-        for demo in self._chain:
-            overlay = _overlays.get(demo)
-            if overlay is not None and name in overlay.generations:
-                return overlay.generations[name]
+        with _overlays_lock:
+            for demo in self._chain:
+                overlay = _overlays.get(demo)
+                if overlay is not None and name in overlay.generations:
+                    return overlay.generations[name]
         return self._base.kv_generation(name)
 
     def check(self, writes):
         """Raise the error that the core raises for a bad write of
-        `writes`."""
-        for (flavour, name, key), (value, ttl) in writes.items():
+        `writes`, a list of `((flavour, name, key), (value, ttl))`."""
+        for (flavour, name, key), (value, ttl) in writes:
             if not 1 <= len(name.encode("utf-8")) <= 255:
                 raise ValueError(
                     "the name of a namespace is empty or longer than 255 bytes"
@@ -444,15 +496,18 @@ class _DemoNamespaces:
         `DemoStorage`."""
         if not writes:
             return
-        overlay = _overlays.get(self._demo)
-        if overlay is None:
-            overlay = _overlays[self._demo] = _Overlay()
         now = time.time()
-        durable = set()
-        for (flavour, name, key), (value, ttl) in writes.items():
-            expiry = now + ttl if flavour == "ephemeral" and value is not None else None
-            overlay.rows[(flavour, name, key)] = (value, expiry)
-            if flavour == "durable":
-                durable.add(name)
-        for name in durable:
-            overlay.generations[name] = next(_generations).to_bytes(8, "big")
+        with _overlays_lock:
+            overlay = _overlays.get(self._demo)
+            if overlay is None:
+                overlay = _overlays[self._demo] = _Overlay()
+            durable = set()
+            for (flavour, name, key), (value, ttl) in writes:
+                expiry = (
+                    now + ttl if flavour == "ephemeral" and value is not None else None
+                )
+                overlay.rows[(flavour, name, key)] = (value, expiry)
+                if flavour == "durable":
+                    durable.add(name)
+            for name in durable:
+                overlay.generations[name] = next(_generations).to_bytes(8, "big")
