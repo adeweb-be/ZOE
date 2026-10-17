@@ -630,7 +630,11 @@ mod tests {
         txn.finish().unwrap();
         let report = verify(&store, None);
         assert_eq!(
-            (report.ephemeral_keys, report.durable_keys, report.expired_keys),
+            (
+                report.ephemeral_keys,
+                report.durable_keys,
+                report.expired_keys
+            ),
             (1, 2, 0)
         );
         assert_eq!(report.problems(), 0, "{report:?}");

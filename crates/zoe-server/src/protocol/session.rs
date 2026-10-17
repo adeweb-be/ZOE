@@ -98,6 +98,36 @@ const INTERFACES: [(&str, &str); 8] = [
 /// The methods that ZEO counts in `stores`.
 const STORES: [&str; 3] = ["storea", "deleteObject", "restorea"];
 
+/// The key of the transaction extension that names the method of the
+/// request of the transaction. `zoe.plone` sets it.
+const REQUEST_METHOD: &str = "zoe.request_method";
+
+/// Tell if `extension`, the map of the extension of `tpc_begin`, marks the
+/// transaction of a GET or a HEAD request.
+fn of_get(extension: &Value) -> bool {
+    let Value::Map(items) = extension else {
+        return false;
+    };
+    items.iter().any(|(key, value)| {
+        key.as_str() == Some(REQUEST_METHOD)
+            && value
+                .as_str()
+                .is_some_and(|m| m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD"))
+    })
+}
+
+/// Return the records that `txn` staged, by class. A deletion and a
+/// pickle whose class does not decode have no class.
+fn classes_of(txn: &Txn<Arc<Store>>) -> std::collections::BTreeMap<String, u64> {
+    let mut classes = std::collections::BTreeMap::new();
+    for oid in txn.staged_oids() {
+        if let Some(class) = txn.staged_class_name(oid) {
+            *classes.entry(class).or_default() += 1;
+        }
+    }
+    classes
+}
+
 /// An exception for the client: its class and its arguments.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Fault {
@@ -467,6 +497,9 @@ struct Open {
     /// until the first vote. The end of the transaction drops them, and
     /// that cancels them.
     jobs: Vec<Job>,
+    /// True for the transaction of a GET or a HEAD request: its commit
+    /// counts its records by class in the writes-on-GET report.
+    of_get: bool,
 }
 
 impl Open {
@@ -1532,6 +1565,7 @@ impl Transaction {
                 listed: 0,
                 upload: None,
                 jobs: Vec::new(),
+                of_get: args.get(3).is_some_and(of_get),
             });
         }
         Ok(Value::Nil)
@@ -1786,8 +1820,13 @@ impl Transaction {
         let Ok(txn) = open.txn else {
             return Err(Fault::transaction("tpc_finish before vote"));
         };
+        let classes = open.of_get.then(|| classes_of(&txn));
         // The core returns only after the commit is durable.
-        Ok(Some(txn.finish_after()?))
+        let finished = txn.finish_after()?;
+        if let Some(classes) = classes {
+            self.session.storage.metrics.add_writes_on_get(classes);
+        }
+        Ok(Some(finished))
     }
 
     fn tpc_abort(&mut self, args: &[Value]) -> Result<Value, Fault> {
@@ -3593,6 +3632,17 @@ mod tests {
         assert_eq!(done(call(&mut s, "kv_set", set)), Value::Nil);
         let fault = failed(call(&mut s, "vote", vec![Value::from(8)]));
         assert_eq!(fault, Fault::read_only());
+    }
+
+    #[test]
+    fn the_extension_of_a_get_or_a_head_marks_the_transaction() {
+        let ext = |method: Value| Value::Map(vec![(Value::from(REQUEST_METHOD), method)]);
+        assert!(of_get(&ext(Value::from("GET"))));
+        assert!(of_get(&ext(Value::from("head"))));
+        assert!(!of_get(&ext(Value::from("POST"))));
+        assert!(!of_get(&ext(Value::Binary(b"GET".to_vec()))));
+        assert!(!of_get(&Value::Map(vec![])));
+        assert!(!of_get(&Value::Nil));
     }
 
     #[test]

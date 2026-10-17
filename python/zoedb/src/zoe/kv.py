@@ -114,13 +114,23 @@ class Namespace:
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("the limit of a scan is an int of 1 or more")
         limit = min(limit, 1000)
-        pairs = dict(self._storage.kv_scan(self.flavour, self.name, start, stop, limit))
         writes = self._staged(create=False)
-        if writes is not None:
-            for key, value in writes.of(self.flavour, self.name):
+        staged = [] if writes is None else writes.of(self.flavour, self.name)
+        # A staged delete can hide a key of the scan, so the scan reads one
+        # more pair for each staged write, up to 1,000.
+        wanted = min(1000, limit + len(staged))
+        scanned = self._storage.kv_scan(self.flavour, self.name, start, stop, wanted)
+        pairs = dict(scanned)
+        # A full scan can leave out keys after its last one, so a staged key
+        # after that key would skip them.
+        last = scanned[-1][0] if len(scanned) == wanted else None
+        if staged:
+            for key, value in staged:
                 if (start is not None and key < start) or (
                     stop is not None and key >= stop
                 ):
+                    continue
+                if last is not None and key > last:
                     continue
                 if value is None:
                     pairs.pop(key, None)

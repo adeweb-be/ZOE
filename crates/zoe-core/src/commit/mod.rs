@@ -453,6 +453,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.staged.get(oid)
     }
 
+    /// Return each oid that the transaction staged, in ascending oid order.
+    /// This reads no pickle.
+    pub fn staged_oids(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.staged.iter().map(|(oid, _)| oid)
+    }
+
     /// Return the class of the pickle that the transaction staged for
     /// `oid`, as `module.name`. `zoe_pickle` reads it from the class
     /// pickle and never unpickles. This is the `class_name` of a ZODB
