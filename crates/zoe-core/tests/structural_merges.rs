@@ -555,6 +555,37 @@ fn the_first_key_rule_leaves_an_inline_bucket_with_a_next_bucket_to_btrees() {
 }
 
 #[test]
+fn a_stale_read_current_oid_fails_the_vote_after_a_merge_of_tier_1() {
+    // The first-key rule rests on this: a merge counts only when every
+    // read-current serial is still current.
+    let store = open(StructuralMerges {
+        posting_dicts: Mode::On,
+        ..StructuralMerges::default()
+    });
+    let (bucket, read) = conflict(&store, &ii_bucket(&[(1, 1)]), &ii_bucket(&[(1, 1), (2, 2)]));
+    let committed = store.load(bucket).unwrap();
+    let parent = store.new_oid().unwrap();
+    let seen = commit(&store, parent, Tid::ZERO, &length(1));
+    commit(&store, parent, seen, &length(2));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(bucket, read, &ii_bucket(&[(1, 1), (3, 3)]))
+        .unwrap();
+    txn.check_current_serial(parent, seen).unwrap();
+    assert!(matches!(txn.vote_resolving(), Err(ZoeError::ReadConflict { oid }) if oid == parent));
+    // Tier 1 merged the bucket, and the vote staged nothing of it.
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (resolution.outcome, resolution.applied),
+        (Resolved::Merged, false)
+    );
+    assert!(txn.natively_resolved().is_empty());
+    txn.abort();
+    assert_eq!(store.load(bucket).unwrap(), committed);
+}
+
+#[test]
 fn two_next_buckets_of_one_oid_with_two_persistent_ids_give_no_answer() {
     // `IIBucket`s whose next bucket is the oid 9, as ZODB's pickler writes
     // them. The new record names the class of the next bucket by another

@@ -10,7 +10,7 @@ import ZODB
 from BTrees.Length import Length
 from BTrees.OOBTree import OOBucket
 from ZODB.ConflictResolution import ConflictResolvingStorage
-from ZODB.POSException import ConflictError
+from ZODB.POSException import ConflictError, ReadConflictError
 
 import zoe
 
@@ -484,9 +484,10 @@ def a_node_with_one_bucket_inline(conn, manager):
     """Build an IIBTree whose last inner node holds its one bucket inline,
     with no next bucket. Return the tree and the first key of that node.
 
-    BTrees writes a node so when its one bucket has no oid yet. A commit
-    makes such a node when it splits the last node and then empties the
-    new node but for its new last bucket.
+    BTrees writes the one bucket of a node inline when the bucket has no
+    oid at the pickle of the node. A commit makes such a node when it
+    splits the last node and empties the new node but for its new last
+    bucket.
     """
     from BTrees.IIBTree import IIBTree
 
@@ -549,11 +550,17 @@ def test_a_first_key_delete_in_a_node_inside_a_tree_never_loses_a_key(
         adding[first + 1] = 1
         managers[0].commit()
         # A delete by the committed transaction moved the separator of the
-        # parent node, which the new transaction read: a read conflict. A
-        # delete by the new transaction is a refusal of reason 13.
-        with pytest.raises(ConflictError):
+        # root, which the new transaction read: a read conflict on the
+        # root. A delete by the new transaction is a refusal of reason 13
+        # on the node.
+        with pytest.raises(ConflictError) as raised:
             managers[1].commit()
         managers[1].abort()
+        if deleter == "committed":
+            assert type(raised.value) is ReadConflictError
+            assert raised.value.oid == adding._p_oid
+        else:
+            assert not isinstance(raised.value, ReadConflictError)
         with db.transaction() as check:
             tree = check.root()["tree"]
             # Only the committed transaction stays, and a lookup finds what
