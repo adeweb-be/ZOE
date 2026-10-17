@@ -22,10 +22,11 @@
 //! not model, it gives no answer, and the conflict goes on as without it.
 //! A refusal is a case where ZODB's resolver refuses too.
 //!
-//! The posting-dict rule (ADR 0042) is a merge where ZODB's resolver
-//! refuses. It is off by default. In shadow mode it computes its merge for
-//! the resolution log, then the merge runs again without the rule, and
-//! that outcome ends the conflict. See `posting.rs`.
+//! The posting-dict rule and the first-key rule (ADR 0042) are merges
+//! where ZODB's resolver refuses. One mode switches both, and it is off by
+//! default. In shadow mode the rules compute their merge for the
+//! resolution log, then the merge runs again without them, and that
+//! outcome ends the conflict. See `posting.rs` and `btrees.rs`.
 //!
 //! No Python runs here.
 
@@ -97,8 +98,8 @@ pub struct StructuralMerges {
     pub mode: Mode,
     /// The mode of a class of tier 1, by its `module.name`.
     pub classes: BTreeMap<String, Mode>,
-    /// The mode of the posting-dict rule of ADR 0042, inside the classes
-    /// where tier 1 runs.
+    /// The mode of the posting-dict rule and of the first-key rule of ADR
+    /// 0042, inside the classes where tier 1 runs.
     pub posting_dicts: Mode,
 }
 
@@ -197,15 +198,15 @@ pub struct Merge {
     pub outcome: Outcome,
     /// The keys that the new record changed, inserted or deleted, as text,
     /// in key order. At most [`MAX_KEYS`]; `changed` counts them all. With
-    /// the posting-dict rule in shadow mode, they are the keys of the merge
-    /// of the rule.
+    /// the rules of ADR 0042 in shadow mode, they are the keys of the merge
+    /// of the rules.
     pub keys: Vec<String>,
     /// The number of keys that the new record changed, inserted or
     /// deleted.
     pub changed: usize,
-    /// With the posting-dict rule in shadow mode, the outcome that the rule
-    /// gives when it compared a dict. The outcome of the merge is then the
-    /// outcome without the rule.
+    /// With the rules of ADR 0042 in shadow mode, the outcome that the
+    /// rules give when a rule compared a dict or let a first key go. The
+    /// outcome of the merge is then the outcome without the rules.
     pub shadow: Option<Outcome>,
 }
 
@@ -292,8 +293,9 @@ pub struct Resolution {
     pub committed: Tid,
     /// The serial that the transaction read.
     pub read: Tid,
-    /// With the posting-dict rule in shadow mode, what the rule gives when
-    /// it compared a dict; `outcome` is then the outcome without the rule.
+    /// With the rules of ADR 0042 in shadow mode, what the rules give when
+    /// a rule compared a dict or let a first key go; `outcome` is then the
+    /// outcome without the rules.
     pub shadow: Option<Resolved>,
 }
 

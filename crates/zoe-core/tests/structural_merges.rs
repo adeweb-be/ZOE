@@ -8,7 +8,7 @@ use zoe_core::vfs::MemVfs;
 use zoe_core::{
     Mode, Oid, Options, Reason, Resolved, Store, StructuralMerges, SystemClock, Tid, ZoeError,
 };
-use zoe_pickle::btrees::new_bucket_state;
+use zoe_pickle::btrees::{new_bucket_state, new_tree_state};
 use zoe_pickle::python::{Heap, Pickler, Value};
 
 /// Returns the record of an `IIBucket` of `items`.
@@ -20,6 +20,20 @@ fn ii_bucket(items: &[(i128, i128)]) -> Vec<u8> {
         .flat_map(|&(k, v)| [Value::Int(k), Value::Int(v)])
         .collect();
     let state = new_bucket_state(&mut heap, flat, None);
+    record(&heap, class, state)
+}
+
+/// Returns the record of an `IIBTree` that holds one bucket of `items`
+/// inline.
+fn ii_tree(items: &[(i128, i128)]) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class("BTrees.IIBTree", "IIBTree");
+    let flat = items
+        .iter()
+        .flat_map(|&(k, v)| [Value::Int(k), Value::Int(v)])
+        .collect();
+    let bucket = new_bucket_state(&mut heap, flat, None);
+    let state = new_tree_state(&mut heap, bucket);
     record(&heap, class, state)
 }
 
@@ -345,6 +359,75 @@ fn shadow_mode_merges_what_the_rule_off_merges() {
             );
         }
     }
+}
+
+#[test]
+fn the_first_key_rule_merges_a_delete_of_the_first_key_in_a_tree_of_one_bucket() {
+    // The committed transaction deletes the first key, then the new one
+    // deletes it while the other adds a key.
+    let cases: [[&[(i128, i128)]; 4]; 2] = [
+        [
+            &[(1, 1), (2, 2), (3, 3)],
+            &[(2, 2), (3, 3)],
+            &[(1, 1), (2, 2), (3, 3), (4, 4)],
+            &[(2, 2), (3, 3), (4, 4)],
+        ],
+        [
+            &[(1, 1), (2, 2), (3, 3)],
+            &[(1, 1), (2, 2), (3, 3), (4, 4)],
+            &[(2, 2), (3, 3)],
+            &[(2, 2), (3, 3), (4, 4)],
+        ],
+    ];
+    for [base, committed, new, merged] in cases {
+        for rule in [Mode::Off, Mode::Shadow, Mode::On] {
+            let store = open(StructuralMerges {
+                posting_dicts: rule,
+                ..StructuralMerges::default()
+            });
+            let (oid, read) = conflict(&store, &ii_tree(base), &ii_tree(committed));
+            let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+            txn.store(oid, read, &ii_tree(new)).unwrap();
+            let voted = txn.vote_resolving();
+            let resolution = &txn.resolutions()[0];
+            if rule == Mode::On {
+                assert_eq!(voted.unwrap(), [], "{rule:?}");
+                assert_eq!(resolution.outcome, Resolved::Merged);
+                assert_eq!(resolution.shadow, None);
+                let tid = txn.finish().unwrap();
+                assert_eq!(store.load(oid).unwrap(), (ii_tree(merged), tid));
+            } else {
+                // BTrees refuses the delete of the first key: "this will
+                // modify the parent node".
+                assert!(matches!(voted, Err(ZoeError::Conflict { .. })), "{rule:?}");
+                assert_eq!(resolution.outcome, Resolved::Refused(Reason::BTrees(13)));
+                let shadow = (rule == Mode::Shadow).then_some(Resolved::Merged);
+                assert_eq!(resolution.shadow, shadow, "{rule:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_first_key_rule_leaves_a_standalone_bucket_to_btrees() {
+    // A bucket can be the child of a tree of many buckets, whose parent
+    // node holds its first key.
+    let store = open(StructuralMerges {
+        posting_dicts: Mode::On,
+        ..StructuralMerges::default()
+    });
+    let (oid, read) = conflict(&store, &ii_bucket(&[(1, 1), (2, 2)]), &ii_bucket(&[(2, 2)]));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, &ii_bucket(&[(1, 1), (2, 2), (3, 3)]))
+        .unwrap();
+    assert!(matches!(
+        txn.vote_resolving(),
+        Err(ZoeError::Conflict { .. })
+    ));
+    assert_eq!(
+        txn.resolutions()[0].outcome,
+        Resolved::Refused(Reason::BTrees(13))
+    );
 }
 
 #[test]

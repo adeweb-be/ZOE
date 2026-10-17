@@ -333,3 +333,27 @@ def test_shadow_mode_of_the_posting_rule_ends_a_conflict_as_zodb_does(
     )
     assert ours == theirs == ("merged" if merges else "conflict")
     assert our_records == their_records
+
+
+def small_tree():
+    from BTrees.IIBTree import IIBTree
+
+    # A tree of three items holds its one bucket inline.
+    return IIBTree({1: 1, 2: 2, 3: 3})
+
+
+@pytest.mark.parametrize(
+    ("rule", "outcome", "value"),
+    [
+        ("off", "conflict", {2: 2, 3: 3}),
+        ("on", "merged", {2: 2, 3: 3, 4: 4}),
+    ],
+)
+def test_the_first_key_rule_merges_a_delete_of_the_first_key(
+    tmp_path, calls, rule, outcome, value
+):
+    storage = zoe.Storage(str(tmp_path / "store"), posting_dicts=rule)
+    found = race(storage, small_tree, deleting(1), setting(4, 4))
+    assert found == (outcome, value)
+    # BTrees refuses reason 13 in Rust too, so the client never resolves.
+    assert calls["calls"] == 0

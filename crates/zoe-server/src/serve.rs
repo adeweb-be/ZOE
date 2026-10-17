@@ -397,8 +397,8 @@ impl ServeOptions {
     }
 
     /// Run the structural merges (tier 1) of each store with `merges`: the
-    /// mode of their classes and the posting-dict rule (ADR 0042). Without
-    /// this call, tier 1 is on for every class and the rule is off.
+    /// mode of their classes and the rules of ADR 0042. Without this call,
+    /// tier 1 is on for every class and the rules are off.
     #[must_use]
     pub fn structural_merges(mut self, merges: StructuralMerges) -> Self {
         self.structural_merges = merges;
