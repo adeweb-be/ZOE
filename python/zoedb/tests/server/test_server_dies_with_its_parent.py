@@ -10,6 +10,10 @@ Each test runs a child Python process that starts a server and then
 waits. The test finds the server among the children of that process,
 checks that it runs while its parent runs, kills the parent with SIGKILL,
 and checks that the server ends.
+
+The kernel kills the server with the parent-death signal of Linux
+(`PR_SET_PDEATHSIG`), and the test finds the processes in `/proc`. Other
+platforms have neither, so the tests skip there.
 """
 
 import os
@@ -21,6 +25,11 @@ import textwrap
 import time
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux only: the parent-death signal and /proc",
+)
 
 TIMEOUT = 30
 
