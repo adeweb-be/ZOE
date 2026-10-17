@@ -16,8 +16,10 @@
 //!   base, the current state is the committed one, and the state before T
 //!   is the new one. The tiers merge it as the vote merges a conflict:
 //!   tier 1 a class of BTrees or `Length`, tier 2 a class that the merge
-//!   policy names, in Rust. A refusal fails the undo with `Undo`. When no tier gives an
-//!   answer, the undo gives the oid to its caller as an [`UndoConflict`]:
+//!   policy names, in Rust. A field of strategy `lww` that both sides
+//!   changed refuses in an undo. A refusal fails the undo with `Undo`.
+//!   When no tier gives an answer, the undo gives the oid to its caller as
+//!   an [`UndoConflict`]:
 //!   the in-process storage resolves it in Python, and `zoe serve`, which
 //!   runs no Python, fails the undo.
 //!
@@ -26,8 +28,9 @@
 //! read it is a conflict of the vote, as for any store.
 //!
 //! Nothing is undoable at or before the last pack (`pack_watermark`). The
-//! finish checks it again under the commit sequencer, so a pack that runs
-//! between the undo and its finish fails the undo. The undo log,
+//! vote checks it again with its locks held, and the finish under the
+//! commit sequencer, so a pack that runs between the undo and its finish
+//! fails the undo. The undo log,
 //! `Store::undo_log`, gives the transactions after it, newest first. An
 //! undo id is the base64 text of the tid, as in FileStorage.
 

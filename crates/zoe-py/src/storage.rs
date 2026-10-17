@@ -29,8 +29,9 @@
 //! resolution holds no mutex of the transaction.
 //!
 //! `_undo` stages the undo of a transaction through the core, which merges
-//! with tier 1. `zoe.storage.Storage.undo` resolves in Python the oids that
-//! no tier resolves. `_undo_log` reads the transactions that an undo can
+//! with tiers 1 and 2, and writes the lines of its merges to the resolution
+//! log when it ends. `zoe.storage.Storage.undo` resolves in Python the oids
+//! that no tier resolves. `_undo_log` reads the transactions that an undo can
 //! undo.
 //!
 //! The store and the table live in a `Shared` part, which the watcher of
@@ -293,11 +294,19 @@ impl ResolutionLog {
         })
     }
 
-    /// Writes the lines of what tier 1 did in the vote of `txn`. A failed
-    /// write never fails the vote. Returns the error of the first failed
-    /// write, for the log of the storage.
+    /// Writes the lines of what the tiers did in the vote of `txn`. The
+    /// entries of the undos come first, and `_undo` wrote them already, so
+    /// they are left out. A failed write never fails the vote. Returns the
+    /// error of the first failed write, for the log of the storage.
     fn write(&self, txn: &SharedTxn) -> Option<String> {
-        self.write_lines(txn.resolution_log_lines(SystemTime::now(), None))
+        let vote = txn.undo_resolution_count()..txn.resolutions().len();
+        self.write_lines(txn.resolution_log_lines_of(vote, SystemTime::now(), None))
+    }
+
+    /// Writes the lines of the entries `range` of `txn`, that an undo gave,
+    /// as `write` does.
+    fn write_undo(&self, txn: &SharedTxn, range: std::ops::Range<usize>) -> Option<String> {
+        self.write_lines(txn.resolution_log_lines_of(range, SystemTime::now(), None))
     }
 
     /// Writes the lines of the checks of the merges of shadow mode of the
@@ -889,7 +898,9 @@ impl Storage {
     /// the conflicts that no tier of the core resolves. Each conflict is a
     /// tuple: the oid, the serial of the current state, the current pickle
     /// and the pickle of the state before `tid`. `zoe.storage.Storage.undo`
-    /// resolves them in Python and stores each result over its serial.
+    /// resolves them in Python and stores each result over its serial. The
+    /// lines of the merges of the undo go to the resolution log when the
+    /// call ends, also when it fails; the vote writes only its own.
     ///
     /// An undo that the core refuses raises `UndoError`: a transaction at
     /// or before the last pack, or one that the store does not have, or a
@@ -907,9 +918,24 @@ impl Storage {
         }
         let entry = self.entry(py, transaction)?;
         let tid = Tid(u64_of(tid)?);
-        let undone = py
-            .detach(|| entry.with(|txn| Ok(txn.undo(tid)?)))
-            .map_err(|failure| failure.into_py(py))?;
+        let log = self.resolution_log.clone();
+        let mut log_failure = None;
+        let undone = py.detach(|| {
+            entry.with(|txn| {
+                let before = txn.undo_resolution_count();
+                let undone = txn.undo(tid);
+                // The merges of the undo go to the log when it ends, also
+                // when it fails: the vote writes only its own.
+                if let Some(log) = &log {
+                    log_failure = log.write_undo(txn, before..txn.undo_resolution_count());
+                }
+                Ok(undone?)
+            })
+        });
+        if let Some(error) = log_failure {
+            warn_log_failure(py, &error);
+        }
+        let undone = undone.map_err(|failure: Failure| failure.into_py(py))?;
         let oids = undone.oids.iter().map(|oid| p64(py, oid.0)).collect();
         let conflicts = undone
             .conflicts

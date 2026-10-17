@@ -820,3 +820,67 @@ fn an_undo_of_a_field_that_a_later_transaction_changed_again_fails() {
         Err(ZoeError::Undo { oid: Some(found), .. }) if found == oid
     ));
 }
+
+/// Returns the record of a `Length` of `value`.
+fn length(value: i128) -> Vec<u8> {
+    let mut heap = Heap::new();
+    let class = heap.new_class("BTrees.Length", "Length");
+    let mut pickler = Pickler::new(&heap);
+    pickler.dump(class).unwrap();
+    pickler.dump(Value::Int(value)).unwrap();
+    pickler.into_bytes()
+}
+
+#[test]
+fn the_policy_sets_the_mode_of_tier_1_of_an_undo() {
+    let store = open();
+    let policy_oid = new_oid(&store);
+    let entry: Entry = &[("tier1", Setting::Text("off"))];
+    let record = policy(1, &[("BTrees.Length.Length", entry)]);
+    commit(&store, policy_oid, Tid::ZERO, &record);
+    commit(&store, Oid(0), Tid::ZERO, &root(policy_oid));
+    let oid = new_oid(&store);
+    let first = commit(&store, oid, Tid::ZERO, &length(10));
+    let undone = commit(&store, oid, first, &length(15));
+    commit(&store, oid, undone, &length(17));
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    let staged = txn.undo(undone).unwrap();
+    // Tier 1 is off for the class: the caller gets the oid, and no entry.
+    assert_eq!(staged.conflicts.len(), 1);
+    assert_eq!(txn.resolutions(), []);
+}
+
+#[test]
+fn a_field_of_strategy_lww_that_both_sides_changed_refuses_in_an_undo() {
+    const LWW: Entry = &[
+        ("tier2", Setting::Text("on")),
+        ("fields", Setting::Fields(&[("title", "lww")])),
+    ];
+    let (store, _, _) = with_policy(LWW);
+    let oid = new_oid(&store);
+    let first = commit(&store, oid, Tid::ZERO, &doc(&base()));
+    let undone = commit(
+        &store,
+        oid,
+        first,
+        &doc(&changed(&[("title", V::Str("B"))])),
+    );
+    commit(
+        &store,
+        oid,
+        undone,
+        &doc(&changed(&[("title", V::Str("C"))])),
+    );
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    assert!(matches!(
+        txn.undo(undone),
+        Err(ZoeError::Undo { oid: Some(found), .. }) if found == oid
+    ));
+    let [entry] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(entry.outcome, Resolved::Refused(Reason::FieldChanged));
+    // In the vote, lww takes the new value.
+    let (outcome, _) = strategy("title", LWW, None, V::Str("B"), V::Str("C"));
+    assert_eq!(outcome, Resolved::Merged);
+}

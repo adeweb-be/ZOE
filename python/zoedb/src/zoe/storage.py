@@ -370,8 +370,9 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         before the undone transaction.
 
         When a later transaction changed an object, the undo merges: tier 1
-        of the core merges the classes of BTrees and `Length`, and
-        `tryToResolveConflict` the others, with the state of the undone
+        of the core merges the classes of BTrees and `Length`, tier 2 the
+        classes that the merge policy names, and `tryToResolveConflict` the
+        others, with the state of the undone
         transaction as the base, the current state as the committed one,
         and the state before as the new one. An undo that no tier and no
         `_p_resolveConflict` merges raises `UndoError`. An undo id that

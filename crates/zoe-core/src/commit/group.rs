@@ -260,7 +260,7 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
 /// Check that `undone`, the lowest tid that a member undoes, is after the
 /// pack watermark. The caller holds the commit sequencer, so no pack batch
 /// commits between the check and the write of the member.
-fn check_undone(store: &Store, undone: Option<Tid>) -> Result<()> {
+pub(super) fn check_undone(store: &Store, undone: Option<Tid>) -> Result<()> {
     match undone {
         Some(undone) if undone <= store.pack_watermark()? => Err(ZoeError::Undo {
             oid: None,

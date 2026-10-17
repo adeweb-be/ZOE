@@ -660,6 +660,8 @@ fn an_undo_that_races_packs_never_names_a_corrupt_store() {
             }
         });
         scope.spawn(|| {
+            // The packer stops also when an assertion of this thread fails.
+            let _done = SetOnDrop(&done);
             for _ in 0..200 {
                 let x = store.new_oid().unwrap();
                 let s = *serial.lock().unwrap();
@@ -686,7 +688,6 @@ fn an_undo_that_races_packs_never_names_a_corrupt_store() {
                     Err(error) => errors.lock().unwrap().push(error),
                 }
             }
-            done.store(true, Ordering::Relaxed);
         });
     });
     for error in errors.into_inner().unwrap() {
@@ -698,4 +699,117 @@ fn an_undo_that_races_packs_never_names_a_corrupt_store() {
     // The store does not halt.
     let (data, s) = store.load(root).unwrap();
     commit(&store, root, s, &data);
+}
+
+/// Sets its flag when it drops, so a loop that waits for the flag ends
+/// also when the thread that holds it panics.
+struct SetOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_blob_undo_that_races_packs_never_names_a_corrupt_blob() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let store = store();
+    let root = Oid(0);
+    let blob = store.new_oid().unwrap();
+    let blob = if blob == root {
+        store.new_oid().unwrap()
+    } else {
+        blob
+    };
+    commit(&store, root, Tid::ZERO, &mapping(Some(blob)));
+    let first = commit_blob(&store, blob, Tid::ZERO, b"revision 0");
+    let serial = Mutex::new(first);
+    let done = AtomicBool::new(false);
+    let errors = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                store.pack(store.last_transaction()).unwrap();
+            }
+        });
+        scope.spawn(|| {
+            let _done = SetOnDrop(&done);
+            // The bytes of the current blob.
+            let mut now = b"revision 0".to_vec();
+            for n in 1..=150u32 {
+                let s = *serial.lock().unwrap();
+                let revision = commit_blob(&store, blob, s, format!("revision {n}").as_bytes());
+                *serial.lock().unwrap() = revision;
+                // The undo gives the revision before back, whose blob file
+                // a pack at the last tid can remove meanwhile.
+                let mut undo = store.tpc_begin(b"", b"undo", b"").unwrap();
+                let outcome = undo
+                    .undo(revision)
+                    .and_then(|_| undo.vote())
+                    .and_then(|()| undo.finish());
+                match outcome {
+                    Ok(tid) => {
+                        *serial.lock().unwrap() = tid;
+                        assert_eq!(read_blob(&store, blob, tid), now);
+                    }
+                    Err(error) => {
+                        now = format!("revision {n}").into_bytes();
+                        errors.lock().unwrap().push(error);
+                    }
+                }
+            }
+        });
+    });
+    for error in errors.into_inner().unwrap() {
+        assert!(
+            matches!(error, ZoeError::Undo { oid: None, reason } if reason.contains("pack")),
+            "a blob undo that races a pack gives {error:?}"
+        );
+    }
+}
+
+#[test]
+fn an_undo_in_shadow_mode_logs_its_merge_and_leaves_the_oid_to_the_caller() {
+    use zoe_core::{Mode, Resolved, StructuralMerges};
+
+    let options = Options {
+        structural_merges: StructuralMerges {
+            mode: Mode::Shadow,
+            ..StructuralMerges::default()
+        },
+        ..Options::default()
+    };
+    let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+    let oid = store.new_oid().unwrap();
+    let first = commit(&store, oid, Tid::ZERO, &length(10));
+    let undone = commit(&store, oid, first, &length(15));
+    let last = commit(&store, oid, undone, &length(17));
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    let staged = txn.undo(undone).unwrap();
+    assert_eq!(
+        staged.conflicts.iter().map(|c| c.oid).collect::<Vec<_>>(),
+        [oid]
+    );
+    assert_eq!(txn.staged(oid).unwrap(), None);
+    let [entry] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (entry.mode, entry.outcome),
+        (Mode::Shadow, Resolved::Merged)
+    );
+    assert!(entry.undo && !entry.applied);
+    assert_eq!(txn.undo_resolution_count(), 1);
+    // The caller resolves the undo and stores its record over the serial.
+    txn.store(oid, last, &length(12)).unwrap();
+    assert_eq!(txn.vote_resolving().unwrap(), []);
+    // The check of shadow mode is for the merges of the vote.
+    assert_eq!(txn.verifications(), []);
+    assert!(txn.resolutions()[0].undo);
+    assert_eq!(txn.natively_resolved(), []);
+    txn.finish().unwrap();
+    assert_eq!(current(&store, oid).unwrap(), length(12));
 }

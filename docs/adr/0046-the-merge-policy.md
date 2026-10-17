@@ -70,7 +70,7 @@ Tier 2 runs at the vote, after tier 1, on a stale written oid whose class is not
 3. A field that only one side changed takes that change. A field that both sides changed to equal values takes it.
 4. A field that both sides changed to different values takes the strategy of its entry in `fields`, else `default`:
    - `strict`: refuses.
-   - `lww`: the value of the new record: the transaction that votes now is the last writer.
+   - `lww`: the value of the new record: the transaction that votes now is the last writer. In an undo (ZOE-206), `lww` refuses, as `strict` does: there the new record is the state before the undone transaction, so `lww` would drop the later change without a word, and an undo is a rare act of an administrator, for whom a refusal (`UndoError`) is the safe answer. `max`, `sum`, `union` and `append` merge an undo as they merge a vote. This is Claude's decision under the delegation of the human.
    - `max`: the greater of the two values, with the order of Python 3 (`Heap::lt`); values that it cannot order give no answer. For `modification_date`, two `DateTime`s order by their time.
    - `sum`: committed + new − old, for ints only.
    - `union`: for lists, tuples, sets and frozensets, on all three sides: the items of the old value that neither side removed, then the items that the committed side added, then the items that the new side added, each item once, in the kind of the new value. Two items are one when they have the same structure (their canonical ids, section 10), so items of every kind merge: dicts, sets, objects of other classes and persistent references too. A set keeps the order of the model.

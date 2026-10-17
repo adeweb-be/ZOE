@@ -12,7 +12,7 @@ use crate::store::Store;
 use crate::types::{Oid, Tid};
 use crate::undo::{self, UndoConflict, Undone};
 
-use super::{Txn, tiers};
+use super::{Txn, undo_tiers};
 
 impl<S: Deref<Target = Store>> Txn<S> {
     /// Stage the undo of the transaction `tid`: for each oid of `tid`, the
@@ -52,9 +52,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// records that it reads: a read that then fails gives `Undo` too. The
     /// vote checks the pack watermark again after it takes the locks, and
     /// the finish under the commit sequencer: a pack after this call can
-    /// remove what the undo gives back. A failed call can leave the undo of the oids before
-    /// the one that failed it staged, so the caller then aborts the
-    /// transaction.
+    /// remove what the undo gives back. A failed call can leave the undo of
+    /// the oids before the one that failed it staged, so the caller then
+    /// aborts the transaction.
     ///
     /// The call holds every record of `tid` in memory at once, as the
     /// transaction iterator does for one transaction. The tiers run here
@@ -114,6 +114,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     fn packed_since(&self, tid: Tid, error: ZoeError) -> ZoeError {
         let pack_can_explain = match &error {
             ZoeError::CorruptTxn { .. } => true,
+            // The blob file of a record before `tid`, which a pack removed.
+            ZoeError::CorruptBlob { tid: blob, .. } => *blob < tid,
             ZoeError::Undo { reason, .. } => {
                 *reason == undo::NO_TRANSACTION || *reason == undo::BEFORE_PACKED
             }
@@ -254,7 +256,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             config: &self.store.structural_merges,
             policy: policy.as_deref(),
         };
-        let Some((mode, merged)) = tiers(undone, current, before, &rules) else {
+        let Some((mode, merged)) = undo_tiers(undone, current, before, &rules) else {
             return Ok(false);
         };
         let mut resolution = Resolution::of(oid, mode, rules.version(), &merged, serial, tid);
