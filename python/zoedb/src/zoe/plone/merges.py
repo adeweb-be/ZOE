@@ -7,7 +7,9 @@ Dexterity type:
 - the class merges field by field (tier 2), in the mode `DEFAULT_MODE`;
 - the fields that an `@invariant` of the schema of a type, or of one of its
   behaviours, reads are one coupled group: when both sides change the
-  group, they must agree on each of its fields;
+  group, they must agree on each of its fields; a field that the factory
+  of its behaviour stores under another name (`effective` as
+  `effective_date`) takes both names;
 - a class with an invariant whose fields `derive` cannot find gets no
   entry, so it never merges in tier 2;
 - `modification_date` takes `max`: each save sets it, so two saves of one
@@ -82,19 +84,21 @@ def invariant_fields(invariant, names):
 
 def class_entries(typed, mode=DEFAULT_MODE):
     """Return the entry of each class of `typed`, an iterable of
-    `(class name, field names, invariants)`, one item for each type: the
-    names of the fields of the schemas of the type and the invariants of
-    those schemas. A class with an invariant whose fields are not found
+    `(class name, field names, invariants, stored names)`, one item for each
+    type: the names of the fields of the schemas of the type, the
+    invariants of those schemas, and the other name under which a field is
+    stored, by field. A class with an invariant whose fields are not found
     gets no entry."""
     groups = {}
     blocked = set()
-    for name, fields, invariants in typed:
+    for name, fields, invariants, stored in typed:
         groups.setdefault(name, [])
         for invariant in invariants:
             found = invariant_fields(invariant, set(fields))
             if not found:
                 blocked.add(name)
                 continue
+            found |= {stored[field] for field in found if field in stored}
             group = sorted(found)
             if group not in groups[name]:
                 groups[name].append(group)
@@ -144,6 +148,7 @@ def apply_overrides(derived, overrides):
 def derive(portal, overrides=None):
     """Return the merge policy of the Dexterity types of `portal`, with
     `overrides` applied."""
+    from plone.behavior.registration import lookup_behavior_registration
     from plone.dexterity.interfaces import IDexterityFTI
     from plone.dexterity.utils import iterSchemataForType
     from Products.CMFCore.utils import getToolByName
@@ -163,7 +168,19 @@ def derive(portal, overrides=None):
                 for invariant in iface.queryDirectTaggedValue("invariants", ()):
                     if invariant not in invariants:
                         invariants.append(invariant)
-        typed.append((fti.klass, fields, invariants))
+        # A factory of a behaviour can store a field under another name, as
+        # the `DCFieldProperty` of plone.app.dexterity does.
+        stored = {}
+        for behavior in fti.behaviors:
+            registration = lookup_behavior_registration(
+                name=behavior, warn_about_fallback=False
+            )
+            factory = getattr(registration, "factory", None)
+            for field in getFieldNames(registration.interface):
+                other = getattr(getattr(factory, field, None), "_get_name", None)
+                if isinstance(other, str) and other != field:
+                    stored[field] = other
+        typed.append((fti.klass, fields, invariants, stored))
     derived = {"classes": class_entries(typed, mode)}
     derived["classes"].update(history.policy()["classes"])
     return apply_overrides(derived, overrides)

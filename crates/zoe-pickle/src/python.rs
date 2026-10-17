@@ -396,14 +396,14 @@ impl Heap {
         true
     }
 
-    /// Returns the objects that the pickler memoizes and that `value` holds,
-    /// `value` too, each once: the strs, the bytes, the tuples but the empty
-    /// one, the lists, the dicts, the sets and the objects of other classes.
-    /// A str or a bytes that CPython shares in every record (the empty ones,
-    /// and those of one character below U+0100) is not listed: it is the
-    /// same object wherever it comes from. A persistent reference and a
-    /// class are not followed: they are shared by design.
-    pub fn memoized_objects(&self, value: Value) -> Vec<ObjectId> {
+    /// Returns the mutable objects that `value` holds, `value` too, each
+    /// once: the lists, the dicts, the sets and the objects of other
+    /// classes, but `DateTime.DateTime`, a value that no code changes in
+    /// place. Two fields that share one of them see each change of it; two
+    /// fields that share an immutable value (a str, a bytes, a tuple, a
+    /// frozenset, a `DateTime`) do not. A persistent reference and a class
+    /// are not followed: they are shared by design.
+    pub fn mutable_objects(&self, value: Value) -> Vec<ObjectId> {
         let mut found = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut todo = vec![value];
@@ -415,17 +415,7 @@ impl Heap {
                 continue;
             }
             match self.get(id) {
-                Object::Str(_) | Object::Bytes(_) => {
-                    if !self.is_shared(id) {
-                        found.push(id);
-                    }
-                }
-                Object::Tuple(items) => {
-                    if !items.is_empty() {
-                        found.push(id);
-                    }
-                    todo.extend(items);
-                }
+                Object::Tuple(items) => todo.extend(items),
                 Object::List(items) => {
                     found.push(id);
                     todo.extend(items);
@@ -438,29 +428,23 @@ impl Heap {
                     }
                 }
                 Object::Instance(instance) => {
-                    found.push(id);
+                    if self.class(instance.class) != Some(("DateTime.DateTime", "DateTime")) {
+                        found.push(id);
+                    }
                     todo.push(instance.args);
                     todo.extend(instance.state);
                 }
-                Object::Set { items, .. } => {
-                    found.push(id);
+                Object::Set { class, items } => {
+                    if self.class(*class) != Some(("builtins", "frozenset")) {
+                        found.push(id);
+                    }
                     todo.extend(items);
                 }
-                Object::Class { .. } | Object::Reference(_) => {}
+                Object::Str(_) | Object::Bytes(_) | Object::Class { .. } | Object::Reference(_) => {
+                }
             }
         }
         found
-    }
-
-    /// Tells if `id` is a str or a bytes that the heap shares across its
-    /// records, as CPython does: an empty one, one of one character below
-    /// U+0100, or an interned str.
-    fn is_shared(&self, id: ObjectId) -> bool {
-        self.empty_str == Some(id)
-            || self.empty_bytes == Some(id)
-            || self.chars.values().any(|&shared| shared == id)
-            || self.bytes.values().any(|&shared| shared == id)
-            || self.interned.values().any(|&shared| shared == id)
     }
 
     /// Interns the str keys of the dict `dict`, as CPython interns the keys
@@ -1975,18 +1959,18 @@ mod tests {
     }
 
     #[test]
-    fn memoized_objects_lists_what_a_value_holds() {
+    fn mutable_objects_lists_what_a_value_holds() {
         let mut heap = Heap::with_instances();
         let (_, state) = heap.load(&decode_record(DOC).unwrap()).unwrap();
         let fields = heap.dict(state).unwrap().to_vec();
-        // The str of one character is shared in every record.
-        assert!(heap.memoized_objects(fields[0].1).is_empty());
-        // The tuple of two shared strs.
-        assert_eq!(heap.memoized_objects(fields[2].1).len(), 1);
-        // The DateTime, its state and the str of its zone.
-        assert_eq!(heap.memoized_objects(fields[1].1).len(), 3);
-        // The set and its items, which are ints.
-        assert_eq!(heap.memoized_objects(fields[3].1).len(), 1);
+        // A str, a tuple of strs and a DateTime are immutable.
+        assert!(heap.mutable_objects(fields[0].1).is_empty());
+        assert!(heap.mutable_objects(fields[2].1).is_empty());
+        assert!(heap.mutable_objects(fields[1].1).is_empty());
+        // A set is mutable.
+        assert_eq!(heap.mutable_objects(fields[3].1).len(), 1);
+        // The state itself is a dict.
+        assert_eq!(heap.mutable_objects(state).len(), 2);
     }
 
     #[test]

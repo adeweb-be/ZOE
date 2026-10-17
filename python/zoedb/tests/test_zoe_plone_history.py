@@ -78,11 +78,11 @@ def test_an_invariant_couples_the_fields_that_it_reads():
 
 def test_the_entries_of_the_classes_of_the_types():
     typed = [
-        ("m.Page", {"title", "text"}, []),
-        ("m.Event", {"title", "start", "end"}, [start_before_end]),
+        ("m.Page", {"title", "text"}, [], {}),
+        ("m.Event", {"title", "start", "end"}, [start_before_end], {}),
         # A second type of the class takes the same group once.
-        ("m.Event", {"start", "end"}, [start_before_end]),
-        ("m.Odd", {"title"}, [opaque]),
+        ("m.Event", {"start", "end"}, [start_before_end], {}),
+        ("m.Odd", {"title"}, [opaque], {}),
     ]
     entries = merges.class_entries(typed)
     assert entries == {
@@ -99,6 +99,11 @@ def test_the_entries_of_the_classes_of_the_types():
         },
     }
     assert merges.class_entries(typed[:1], "on")["m.Page"]["tier2"] == "on"
+    # A field stored under another name takes both names in its group.
+    stored = [("m.Item", {"start", "end"}, [start_before_end], {"start": "start_date"})]
+    assert merges.class_entries(stored)["m.Item"]["coupled"] == [
+        ["end", "start", "start_date"]
+    ]
 
 
 def test_the_overrides_change_and_remove_entries():

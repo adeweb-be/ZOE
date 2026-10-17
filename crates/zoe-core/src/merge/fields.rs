@@ -180,13 +180,13 @@ fn fields_of(heap: &Heap, state: Value) -> Result<Fields, Outcome> {
     Ok(items.to_vec())
 }
 
-/// Gives no answer for a state where two fields hold one object that the
-/// pickler memoizes: a merge that takes the fields from two records would
-/// split it in two.
+/// Gives no answer for a state where two fields hold one mutable object: a
+/// merge that takes the fields from two records would split it in two, and
+/// a change of it through one field would not show through the other.
 fn check_shared(heap: &Heap, fields: &Fields) -> Result<(), Outcome> {
     let mut seen = HashSet::new();
     for &(_, value) in fields {
-        for id in heap.memoized_objects(value) {
+        for id in heap.mutable_objects(value) {
             if !seen.insert(id) {
                 return Err(Outcome::Undecided("an object that two fields share"));
             }
