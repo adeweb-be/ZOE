@@ -68,6 +68,7 @@ __all__ = [
     "fti_modified",
     "import_merge_policy",
     "invariant_fields",
+    "settle",
     "update_policy",
 ]
 
@@ -194,15 +195,13 @@ def apply_overrides(policy, overrides, derived=frozenset(), blocked=frozenset())
                 raise ValueError(f"{name}: {key} of an override is of another form")
         merged = dict(result["classes"].get(name, {}))
         if name in blocked or merged.get("blocked"):
-            # A blocked class stays blocked: the override keeps only its
-            # fields and its coupled groups.
+            # A blocked class stays blocked: the override loses its `tier2`
+            # and its `blocked`.
             unblocks = entry is None or (
                 entry.get("tier2") not in (None, "off") or entry.get("blocked") is False
             )
             if unblocks:
-                logger.warning(
-                    "%s stays blocked: an override cannot switch it on", name
-                )
+                logger.warning("%s stays blocked: an override cannot unblock it", name)
             merged.update(blocked_entry())
             entry = {
                 key: value
@@ -267,6 +266,20 @@ def compose(stored, new):
             merged.update(blocked_entry())
         result["classes"][name] = merged
     return merge_policy.validate(result)
+
+
+def settle(stored, policy, removed):
+    """Return `policy` composed with the policy `stored` of the database,
+    without the classes of `removed`. A class that the database blocks,
+    for another site maybe, stays blocked: an override of this site
+    cannot remove it."""
+    composed = compose(stored, policy)
+    for name in removed:
+        if composed["classes"].get(name, {}).get("blocked"):
+            logger.warning("%s stays blocked: an override cannot unblock it", name)
+            continue
+        composed["classes"].pop(name, None)
+    return composed
 
 
 def derive(portal):
@@ -351,9 +364,7 @@ def update_policy(site):
         policy, gone = apply_overrides(policy, overrides, names, blocked)
         removed = (removed | gone) - set(policy["classes"])
     connection = site._p_jar
-    composed = compose(merge_policy.read(connection), policy)
-    for name in removed:
-        composed["classes"].pop(name, None)
+    composed = settle(merge_policy.read(connection), policy, removed)
     version = merge_policy.install(connection, composed)
     logger.info(
         "the merge policy of the database is version %d, with %d classes",

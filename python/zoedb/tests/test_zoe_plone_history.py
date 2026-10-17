@@ -173,6 +173,32 @@ def test_a_restore_and_a_transition_from_one_snapshot_lose_no_status(
         db.close()
 
 
+def test_a_retired_history_holds_an_empty_workflow():
+    doc = Doc()
+    old = doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
+    assert history.restore(doc)
+    assert dict(old) == {history.RETIRED: ()}
+    assert all(statuses == () for statuses in old.values())
+    assert "WorkflowHistory" in repr(old)
+
+
+def test_move_leaves_an_object_without_a_history_as_it_is():
+    from zope.interface import alsoProvides
+
+    # An object of a type with the behaviour and without a workflow.
+    doc = Doc()
+    alsoProvides(doc, history.IAppendOnlyHistory)
+    assert not history.move(doc)
+    assert not hasattr(doc, "workflow_history")
+    # An object with the behaviour and a stock history moves; one without
+    # the behaviour stays.
+    doc.workflow_history = PersistentMapping({"wf": (0,)})
+    assert history.move(doc)
+    other = Doc()
+    other.workflow_history = PersistentMapping({"wf": (0,)})
+    assert not history.move(other)
+
+
 def test_restore_gives_a_persistent_mapping_back():
     doc = Doc()
     doc.workflow_history = history.WorkflowHistory({"wf": (0,)})
@@ -284,6 +310,28 @@ def test_an_override_does_not_unblock_a_class(caplog, override):
     )
     assert result["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
     assert "stays blocked" in caplog.text
+
+
+def test_a_class_stays_blocked_across_the_sites_of_one_database(caplog):
+    # Site A blocks the class; site B removes it with a null override; site
+    # C switches it on. The class stays blocked in the database.
+    site_a = {"classes": {"m.Odd": {"tier2": "off", "blocked": True}}}
+    stored = merges.settle(None, site_a, set())
+    site_b, removed = merges.apply_overrides(
+        {"classes": {"m.Odd": {"tier2": "shadow"}}}, {"classes": {"m.Odd": None}}
+    )
+    assert removed == {"m.Odd"}
+    stored = merges.settle(stored, site_b, removed)
+    assert stored["classes"]["m.Odd"]["blocked"] is True
+    site_c = {"classes": {"m.Odd": {"tier2": "on"}}}
+    stored = merges.settle(stored, site_c, set())
+    assert stored["classes"]["m.Odd"] == {"tier2": "off", "blocked": True}
+    assert "cannot unblock it" in caplog.text
+    # A class that no site blocks goes when an override removes it.
+    stored = merges.settle(
+        {"classes": {"m.Page": {"tier2": "on"}}}, {"classes": {}}, {"m.Page"}
+    )
+    assert "m.Page" not in stored["classes"]
 
 
 def test_a_class_stays_blocked_through_two_profiles(caplog):
