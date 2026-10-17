@@ -151,7 +151,7 @@ def server(stack: str, directory: Path, serve_args=()):
 def software(serve_args=()) -> dict:
     """Return what a result records of the software of its runs: the
     commit of the repository and whether its tree differs from it (None
-    when git does not tell), the `zoe` binary with its version and its
+    when git fails), the `zoe` binary with its version and its
     sha256, the arguments of `zoe serve`, the package `zoe` that the native
     client runs with the sha256 of its extension, Python and the machine."""
     root = Path(__file__).resolve().parents[4]
@@ -179,7 +179,9 @@ def software(serve_args=()) -> dict:
         package = Path(zoe.__file__).resolve().parent
     except ImportError:
         package = None
-    extensions = sorted(package.glob("_zoe*.so")) if package else []
+    # The extension that this interpreter loaded: a package can hold the
+    # extensions of other versions of Python next to it.
+    extension = getattr(sys.modules.get("zoe._zoe"), "__file__", None)
     try:
         from importlib.metadata import version
 
@@ -188,7 +190,8 @@ def software(serve_args=()) -> dict:
         zoedb = None
     return {
         "commit": output(["git", "-C", str(root), "rev-parse", "HEAD"]) or None,
-        # True when the tree holds changes that the commit does not.
+        # True when the tree holds changes that the commit does not, None
+        # when git fails.
         "dirty": None if status is None else bool(status),
         "zoe": binary,
         "zoe_version": output([binary, "--version"]) or None,
@@ -196,7 +199,7 @@ def software(serve_args=()) -> dict:
         "zoe_serve_args": list(serve_args),
         "zoedb": zoedb,
         "zoe_package": str(package) if package else None,
-        "zoe_extension_sha256": sha256(extensions[0]) if extensions else None,
+        "zoe_extension_sha256": sha256(extension) if extension else None,
         "python": sys.version.split()[0],
         "machine": f"{platform.system()} {platform.machine()}",
     }
