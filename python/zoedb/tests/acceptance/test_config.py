@@ -31,6 +31,7 @@ KEYS = {
     "backend",
     "lock-timeout",
     "early-locks",
+    "early-lock-classes",
     "read-only",
     "pack-gc",
     "compression",
@@ -347,19 +348,20 @@ def test_backend_takes_redb_and_refuses_others(tmp_path, monkeypatch, source):
 
 
 @pytest.mark.parametrize("source", SOURCES)
-def test_early_locks_opens_when_off_and_refuses_on(tmp_path, monkeypatch, source):
-    settings = {"early-locks": "off"}
-    with closing(
-        open_storage(source, tmp_path / "store", settings, monkeypatch)
-    ) as storage:
-        assert isinstance(storage, zoe.Storage)
-
-    # The storage has no early locks yet, so it refuses "on" and a value
-    # that is not a boolean.
-    for value in ("on", "maybe"):
+def test_early_locks_opens_when_off_and_on_and_refuses_a_bad_value(
+    tmp_path, monkeypatch, source
+):
+    for value in ("off", "on"):
         settings = {"early-locks": value}
-        with pytest.raises(ValueError):
-            open_storage(source, tmp_path / value, settings, monkeypatch).close()
+        with closing(
+            open_storage(source, tmp_path / value, settings, monkeypatch)
+        ) as storage:
+            assert isinstance(storage, zoe.Storage)
+
+    # A value that is not a boolean fails the open.
+    settings = {"early-locks": "maybe"}
+    with pytest.raises(ValueError):
+        open_storage(source, tmp_path / "maybe", settings, monkeypatch).close()
 
 
 @pytest.mark.parametrize("key", ["lock_timeout", "no-such-key"])
