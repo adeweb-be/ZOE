@@ -85,11 +85,11 @@ def test_the_client_declares_the_interfaces_of_the_server(storage):
         ZODB.interfaces.IStorageCurrentRecordIteration,
         ZODB.interfaces.IStorageRestoreable,
         ZODB.interfaces.IExternalGC,
+        ZODB.interfaces.IStorageUndoable,
     ):
         assert iface.providedBy(storage), iface
-    # The server does not undo.
-    assert not ZODB.interfaces.IStorageUndoable.providedBy(storage)
-    assert not storage.supportsUndo()
+    # The server undoes.
+    assert storage.supportsUndo()
 
 
 def test_an_error_of_the_server_raises_as_zeo_raises_it(storage):
