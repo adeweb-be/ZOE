@@ -12,6 +12,10 @@
 //! A client tells the driver when its commit reaches a phase where a
 //! planned crash can come: staged before the vote, locked after the vote,
 //! and acknowledged after the reply of `tpc_finish`.
+//!
+//! With a hot `Length`, the hot oid holds a `BTrees.Length.Length`. A
+//! transaction that writes it stores the value that it read plus 1, so the
+//! writers of the hot oid conflict, and tier 1 of the server merges them.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +31,13 @@ use crate::protocol::STORAGE_NAME;
 
 /// The oids that the clients share.
 const OIDS: u64 = 6;
+
+/// The hot oid: half of the transactions write it.
+pub(crate) const HOT: u64 = 1;
+
+/// The class pickle of a `BTrees.Length.Length` and the start of its state
+/// pickle, as the pickler of tier 1 writes them.
+const LENGTH: &[u8] = b"\x80\x03cBTrees.Length\nLength\nq\x00.\x80\x03";
 
 /// The oids of the blobs, after the other oids. An oid holds blobs or
 /// other records, never both, as in ZODB.
@@ -72,6 +83,8 @@ pub(crate) struct SimClient {
     pub(crate) stall: Option<Duration>,
     /// The client also commits blobs.
     pub(crate) blobs: bool,
+    /// The hot oid holds a `Length` that the client increments.
+    pub(crate) hot_length: bool,
 }
 
 impl SimClient {
@@ -173,10 +186,16 @@ impl SimClient {
     /// older than the newest commit of `oid` that a client saw
     /// acknowledged before the load.
     async fn serial(&self, client: &Client, oid: u64) -> Result<Tid, Outcome> {
+        self.load(client, oid).await.map(|(serial, _)| serial)
+    }
+
+    /// Load the current serial and the current record of `oid`, as
+    /// `serial` does. A new oid gives `Tid::ZERO` and no record.
+    async fn load(&self, client: &Client, oid: u64) -> Result<(Tid, Option<Vec<u8>>), Outcome> {
         let known = self.shared.lock().known.get(&oid).copied().unwrap_or(0);
-        let serial = match client.load(Oid(oid)).await {
-            Ok((_, serial)) => serial,
-            Err(Error::Server { class, .. }) if class.ends_with("POSKeyError") => Tid::ZERO,
+        let (serial, data) = match client.load(Oid(oid)).await {
+            Ok((data, serial)) => (serial, Some(data)),
+            Err(Error::Server { class, .. }) if class.ends_with("POSKeyError") => (Tid::ZERO, None),
             Err(Error::Disconnected) => return Err(Outcome::Lost { in_finish: false }),
             Err(_) => return Err(Outcome::Retry),
         };
@@ -188,7 +207,7 @@ impl SimClient {
                 self.id, serial.0
             ));
         }
-        Ok(serial)
+        Ok((serial, data))
     }
 
     /// Try one transaction: read the current serials of one or two oids,
@@ -197,7 +216,7 @@ impl SimClient {
         // Half of the transactions write oid 1, a hot object as a catalog
         // or a counter is.
         let first = if self.rng.chance(0.5) {
-            1
+            HOT
         } else {
             1 + self.rng.below(OIDS)
         };
@@ -211,10 +230,19 @@ impl SimClient {
         oids.sort_unstable();
         let mut records = Vec::new();
         for &oid in &oids {
-            let serial = match self.serial(client, oid).await {
-                Ok(serial) => serial,
+            let (serial, data) = match self.load(client, oid).await {
+                Ok(loaded) => loaded,
                 Err(outcome) => return outcome,
             };
+            if self.hot_length && oid == HOT {
+                let value = data.as_deref().map_or(Some(0), length_value);
+                let Some(value) = value else {
+                    self.trace("reads a hot oid that is not a Length");
+                    return Outcome::Retry;
+                };
+                records.push((oid, serial, length(value + 1)));
+                continue;
+            }
             let value = format!("c{} t{t} a{attempt} oid {oid}", self.id);
             records.push((oid, serial, record(value.as_bytes())));
         }
@@ -281,6 +309,35 @@ impl SimClient {
             Err(Error::Disconnected) => Outcome::Lost { in_finish: true },
             Err(_) => Outcome::Retry,
         }
+    }
+}
+
+/// A ZODB record of a `BTrees.Length.Length` of `value`, as the pickler of
+/// tier 1 writes it.
+pub(crate) fn length(value: u32) -> Vec<u8> {
+    let mut pickle = LENGTH.to_vec();
+    let le = value.to_le_bytes();
+    match value {
+        0..=0xff => pickle.extend([b'K', le[0]]),
+        0x100..=0xffff => pickle.extend([b'M', le[0], le[1]]),
+        _ => {
+            pickle.push(b'J');
+            pickle.extend(le);
+        }
+    }
+    pickle.push(b'.');
+    pickle
+}
+
+/// Return the value of a record of [`length`], or `None` for another
+/// record.
+pub(crate) fn length_value(pickle: &[u8]) -> Option<u32> {
+    let state = pickle.strip_prefix(LENGTH)?.strip_suffix(b".")?;
+    match *state {
+        [b'K', a] => Some(u32::from(a)),
+        [b'M', a, b] => Some(u32::from(u16::from_le_bytes([a, b]))),
+        [b'J', a, b, c, d] => u32::try_from(i32::from_le_bytes([a, b, c, d])).ok(),
+        _ => None,
     }
 }
 

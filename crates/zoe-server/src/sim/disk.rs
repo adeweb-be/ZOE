@@ -268,7 +268,8 @@ impl StorageBackend for SimFile {
             return self.inner.sync_data();
         };
         if world::thread_generation().is_some() {
-            match world::give_back(Why::Sync) {
+            let grows = matches!(cache.lock().last(), Some(Cached::SetLen(_)));
+            match world::give_back(Why::Sync { grows }) {
                 Resume::Go => {}
                 Resume::Defer => return Ok(()),
                 Resume::Killed => return Err(io::Error::other("the process was killed")),

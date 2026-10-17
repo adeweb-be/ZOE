@@ -40,8 +40,10 @@ pub(crate) enum Owner {
 pub(crate) enum Why {
     /// It waits on the waiter `waiter` until a wake or the deadline.
     Parked { waiter: u64, deadline: Duration },
-    /// It syncs the database file.
-    Sync,
+    /// It syncs the database file. `grows` is true when the sync follows a
+    /// change of the length of the file with no write between: redb grows
+    /// the file under a lock of its own, so other threads must not run.
+    Sync { grows: bool },
     /// It ended.
     Exited,
 }
@@ -74,6 +76,9 @@ pub(crate) enum Wait {
     Ready,
     /// It waits on a waiter until a wake or the deadline.
     Parked { waiter: u64, deadline: Duration },
+    /// It syncs the database file until `until`, and then goes on with
+    /// `resume`. Other tasks and threads run meanwhile.
+    Syncing { until: Duration, resume: Resume },
 }
 
 /// An event at a time of the simulated clock.
@@ -324,6 +329,8 @@ impl State {
             held: self.pools.held,
             waited_finishes: self.pools.waited,
             lost_listener_finishes: self.pools.lost_listener_finishes,
+            length_faults: Vec::new(),
+            handoffs: 0,
         }
     }
 }
