@@ -22,8 +22,9 @@
 //!    records to remove, at most `batch` of them, the oldest record of an
 //!    oid first. One backend write transaction removes them, their blob
 //!    records, and lowers the oid count of their transaction rows or
-//!    removes the rows that keep no record. The first batch also writes
-//!    `pack_watermark`.
+//!    removes the rows that keep no record. The row at T stays, with an
+//!    oid count of 0 when the pack removes all its records. The first
+//!    batch also writes `pack_watermark`.
 //!
 //! 4. The empty rows: after the last batch of records, the pack removes
 //!    each transaction row before T whose oid count is 0, at most `batch`
@@ -640,7 +641,9 @@ impl<'s> Pack<'s> {
                 }
             }
             for (row, left) in rows {
-                if left == 0 {
+                // The row at T stays: a later backup and the clients name
+                // the last tid of a pack at the last tid.
+                if left == 0 && row.tid != self.tid {
                     write.remove_txn(row.tid)?;
                 } else {
                     write.replace_txn(&TxnMeta {
@@ -1050,6 +1053,25 @@ mod tests {
                 .as_deref(),
             Some(&b"v"[..])
         );
+        assert_indexed(&store, "after the pack");
+    }
+
+    #[test]
+    fn a_pack_that_removes_every_record_of_its_tid_keeps_its_row() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        commit(&store, &[(ROOT, record(&[]))]);
+        // Nothing refers to oid 1, so the pack removes its only record.
+        let last = commit(&store, &[(Oid(1), record(&[]))]);
+        store.pack(last).unwrap();
+        assert!(store.load(Oid(1)).is_err());
+        let rows: Vec<TxnMeta> = store
+            .backend
+            .iter_txns(Tid::ZERO, Tid::MAX)
+            .map(|row| row.unwrap())
+            .collect();
+        let at_last = rows.iter().find(|row| row.tid == last).unwrap();
+        assert_eq!(at_last.oid_count, 0);
+        assert_eq!(store.last_transaction(), last);
         assert_indexed(&store, "after the pack");
     }
 

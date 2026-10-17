@@ -1311,9 +1311,9 @@ mod tests {
             .collect();
         assert!(given.windows(2).all(|pair| pair[0] < pair[1]), "{given:?}");
         assert!(given.iter().all(|tid| written.contains(tid)), "{given:?}");
-        // Only the root survives the pack: it removes the rows that keep
-        // no record too (ADR 0043).
-        assert_eq!(tids(&store, None, None), [Tid(100)]);
+        // The root and the row at the tid of the pack survive: the pack
+        // removes the other rows that keep no record too (ADR 0043).
+        assert_eq!(tids(&store, None, None), [Tid(100), last]);
         assert!(
             given.contains(&Tid(100)),
             "the root is missing from {given:?}"

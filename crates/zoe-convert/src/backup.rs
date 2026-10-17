@@ -1702,6 +1702,36 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_after_a_gc_pack_that_empties_the_last_commit_continues() {
+        use zoe_core::Flavour::Durable;
+        let dir = test_dir("backup-gc-pack-tail");
+        let (source, dumps) = (dir.join("store"), dir.join("dumps"));
+        let store = Store::open(&source).unwrap();
+        let mapping = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01.";
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid::ZERO, mapping).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        // The last commit writes only an object that nothing refers to.
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(1), Tid::ZERO, mapping).unwrap();
+        txn.vote().unwrap();
+        let last = txn.finish().unwrap();
+        backup(&store, &dumps).unwrap();
+        // The pack removes the only record of the last commit, and keeps
+        // its row, which the dumps end at.
+        store.pack(last).unwrap();
+        assert!(store.load(Oid(1)).is_err());
+        assert_eq!(store.last_transaction(), last);
+        commit_kv(&store, &[(Durable, "registry", b"b", Some(b"2"))]);
+        let next = backup(&store, &dumps).unwrap();
+        assert_eq!(next.after, last);
+        assert!(next.dump.is_some());
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_restore_after_a_pack_at_an_empty_last_commit_has_the_same_last_tid() {
         let dir = test_dir("restore-pack-empty-tail");
         let (source, dumps, target) = (dir.join("store"), dir.join("dumps"), dir.join("target"));
