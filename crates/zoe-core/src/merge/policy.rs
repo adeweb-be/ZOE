@@ -6,7 +6,7 @@
 //! ```text
 //! {"version": 3, "structural_merges": "on", "posting_dicts": "on",
 //!  "classes": {"module.Class": {"tier1": "shadow", "tier2": "on",
-//!              "default": "strict", "fields": {"field": "max"},
+//!              "default": "strict", "fields": {"field": "max", "data": "keys"},
 //!              "coupled": [["start", "end"]]}}}
 //! ```
 //!
@@ -48,6 +48,8 @@ pub enum Strategy {
     /// The committed items, then the items that the new side added after
     /// the old value.
     Append,
+    /// A dict, merged key by key.
+    Keys,
 }
 
 impl Strategy {
@@ -60,6 +62,7 @@ impl Strategy {
             Strategy::Sum => "sum",
             Strategy::Union => "union",
             Strategy::Append => "append",
+            Strategy::Keys => "keys",
         }
     }
 
@@ -71,6 +74,7 @@ impl Strategy {
             "sum" => Strategy::Sum,
             "union" => Strategy::Union,
             "append" => Strategy::Append,
+            "keys" => Strategy::Keys,
             _ => return None,
         })
     }
@@ -376,7 +380,7 @@ fn class_policy(heap: &Heap, value: Value) -> std::result::Result<ClassPolicy, &
     let strategy = |value: Value| {
         heap.str(value)
             .and_then(Strategy::parse)
-            .ok_or("a strategy that is not strict, lww, max, sum, union or append")
+            .ok_or("a strategy that is not strict, lww, max, sum, union, append or keys")
     };
     for (key, value) in str_dict(heap, value).ok_or("a class entry that is not a dict")? {
         if value == Value::None {
@@ -448,9 +452,11 @@ mod tests {
     fn a_policy_reads_with_its_classes_and_switches() {
         let record = record(|heap| {
             let fields = {
-                let key = text(heap, "modification_date");
-                let value = text(heap, "max");
-                heap.new_dict(vec![(key, value)])
+                let items = vec![
+                    (text(heap, "modification_date"), text(heap, "max")),
+                    (text(heap, "data"), text(heap, "keys")),
+                ];
+                heap.new_dict(items)
             };
             let group = {
                 let start = text(heap, "start");
@@ -484,6 +490,7 @@ mod tests {
         let entry = &policy.classes["m.Document"];
         assert_eq!(entry.tier2, Mode::On);
         assert_eq!(entry.strategy("modification_date"), Strategy::Max);
+        assert_eq!(entry.strategy("data"), Strategy::Keys);
         assert_eq!(entry.strategy("title"), Strategy::Strict);
         assert_eq!(entry.coupled, [["start", "end"]]);
         // The policy wins over the keys, and a switch that it does not give

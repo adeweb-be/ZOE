@@ -7,7 +7,9 @@
 //! test `test_field_merges.py`.
 
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Mode, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, ZoeError};
+use zoe_core::{
+    Mode, Oid, Options, Reason, Resolution, Resolved, Store, SystemClock, Tid, ZoeError,
+};
 use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
 
 /// A value of a field of a test record.
@@ -15,16 +17,20 @@ use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
 enum V {
     Int(i128),
     Str(&'static str),
+    Bytes(&'static [u8]),
     List(Vec<V>),
     Tuple(Vec<V>),
     /// A `DateTime.DateTime` of this many microseconds since the epoch.
     Date(i128),
+    /// A dict of these keys and values, in this order.
+    Dict(Vec<(V, V)>),
 }
 
 fn value(heap: &mut Heap, v: &V) -> Value {
     match v {
         V::Int(int) => Value::Int(*int),
         V::Str(text) => heap.new_str(text),
+        V::Bytes(bytes) => heap.new_bytes(bytes),
         V::List(items) => {
             let items = items.iter().map(|item| value(heap, item)).collect();
             heap.new_list(items)
@@ -44,6 +50,13 @@ fn value(heap: &mut Heap, v: &V) -> Value {
                 args,
                 state: Some(state),
             })
+        }
+        V::Dict(items) => {
+            let items = items
+                .iter()
+                .map(|(key, item)| (value(heap, key), value(heap, item)))
+                .collect();
+            heap.new_dict(items)
         }
     }
 }
@@ -883,4 +896,245 @@ fn a_field_of_strategy_lww_that_both_sides_changed_refuses_in_an_undo() {
     // In the vote, lww takes the new value.
     let (outcome, _) = strategy("title", LWW, None, V::Str("B"), V::Str("C"));
     assert_eq!(outcome, Resolved::Merged);
+}
+
+/// The entry of a class whose field `data` merges key by key.
+const KEYS: Entry = &[
+    ("tier2", Setting::Text("on")),
+    ("fields", Setting::Fields(&[("data", "keys")])),
+];
+
+/// Returns the record of a mapping whose dict holds `items`: an object
+/// whose state holds the field `data` alone, as a `PersistentMapping`.
+fn mapping(items: &[(V, V)]) -> Vec<u8> {
+    doc(&[("data", V::Dict(items.to_vec()))])
+}
+
+/// Runs a conflict of the records `base`, `committed` and `new` with the
+/// entry `entry`. Returns the resolution of tier 2, and the stored record
+/// when the vote merged.
+fn mapping_conflict(
+    entry: Entry,
+    base: &[u8],
+    committed: &[u8],
+    new: &[u8],
+) -> (Resolution, Option<Vec<u8>>) {
+    let (store, _, _) = with_policy(entry);
+    let (oid, read) = conflict(&store, base, committed);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, new).unwrap();
+    let voted = txn.vote_resolving();
+    let resolution = txn.resolutions()[0].clone();
+    if voted.is_ok_and(|conflicts| conflicts.is_empty()) {
+        let tid = txn.finish().unwrap();
+        let (data, serial) = store.load(oid).unwrap();
+        assert_eq!(serial, tid);
+        return (resolution, Some(data));
+    }
+    (resolution, None)
+}
+
+fn s(text: &'static str) -> V {
+    V::Str(text)
+}
+
+#[test]
+fn changes_of_different_keys_of_a_mapping_merge() {
+    let base = mapping(&[(s("key-a"), s("one")), (s("key-b"), s("two"))]);
+    let committed = mapping(&[
+        (s("key-a"), s("one")),
+        (s("key-b"), s("three")),
+        (s("key-c"), s("four")),
+    ]);
+    let new = mapping(&[(s("key-b"), s("two")), (s("key-e"), s("five"))]);
+    let (resolution, merged) = mapping_conflict(KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    // The committed keys in their order, then the key that only the new side
+    // added. The new side deleted key-a.
+    let expected = mapping(&[
+        (s("key-b"), s("three")),
+        (s("key-c"), s("four")),
+        (s("key-e"), s("five")),
+    ]);
+    assert_eq!(merged, Some(expected));
+    // The keys that the new record changed, in place of the field data.
+    assert_eq!(resolution.keys, ["\"key-a\"", "\"key-e\""]);
+    assert_eq!(resolution.changed, 2);
+}
+
+#[test]
+fn equal_changes_of_one_key_merge_and_a_reorder_of_the_new_side_does_not_show() {
+    let base = mapping(&[(s("key-a"), s("one")), (s("key-b"), s("two"))]);
+    let committed = mapping(&[(s("key-a"), s("six")), (s("key-b"), s("two"))]);
+    // The new side moves key-a to the end, with the value of the committed
+    // side.
+    let new = mapping(&[(s("key-b"), s("two")), (s("key-a"), s("six"))]);
+    let (resolution, merged) = mapping_conflict(KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    assert_eq!(merged, Some(committed));
+}
+
+#[test]
+fn two_changes_of_one_key_of_a_mapping_refuse() {
+    let base = mapping(&[(s("key-a"), s("one")), (s("key-b"), s("two"))]);
+    for (committed, new, reason) in [
+        (
+            mapping(&[(s("key-a"), s("six")), (s("key-b"), s("two"))]),
+            mapping(&[(s("key-a"), s("seven")), (s("key-b"), s("two"))]),
+            Reason::KeyChanged,
+        ),
+        (
+            mapping(&[(s("key-b"), s("two"))]),
+            mapping(&[(s("key-a"), s("seven")), (s("key-b"), s("two"))]),
+            Reason::KeyDeleted,
+        ),
+        (
+            mapping(&[(s("key-a"), s("six")), (s("key-b"), s("two"))]),
+            mapping(&[(s("key-b"), s("two"))]),
+            Reason::KeyDeleted,
+        ),
+        (
+            mapping(&[
+                (s("key-a"), s("one")),
+                (s("key-b"), s("two")),
+                (s("key-c"), s("x")),
+            ]),
+            mapping(&[
+                (s("key-a"), s("one")),
+                (s("key-b"), s("two")),
+                (s("key-c"), s("y")),
+            ]),
+            Reason::KeyChanged,
+        ),
+    ] {
+        let (resolution, merged) = mapping_conflict(KEYS, &base, &committed, &new);
+        assert_eq!(resolution.outcome, Resolved::Refused(reason));
+        assert_eq!(resolution.fields, ["data"]);
+        assert_eq!(merged, None);
+    }
+}
+
+#[test]
+fn the_keys_of_a_mapping_are_ints_strs_bytes_and_tuples_of_those() {
+    let tuple = |text, number| V::Tuple(vec![V::Str(text), V::Int(number)]);
+    let base = mapping(&[
+        (V::Int(7), s("one")),
+        (s("key-a"), s("two")),
+        (V::Bytes(b"key-b"), s("three")),
+        (tuple("key-c", 1), s("four")),
+    ]);
+    let committed = mapping(&[
+        (V::Int(7), s("five")),
+        (s("key-a"), s("two")),
+        (V::Bytes(b"key-b"), s("three")),
+        (tuple("key-c", 1), s("four")),
+    ]);
+    let new = mapping(&[
+        (V::Int(7), s("one")),
+        (s("key-a"), s("six")),
+        (V::Bytes(b"key-b"), s("seven")),
+        (tuple("key-c", 1), s("eight")),
+        (V::Int(-2), s("nine")),
+    ]);
+    let (resolution, merged) = mapping_conflict(KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    let expected = mapping(&[
+        (V::Int(7), s("five")),
+        (s("key-a"), s("six")),
+        (V::Bytes(b"key-b"), s("seven")),
+        (tuple("key-c", 1), s("eight")),
+        (V::Int(-2), s("nine")),
+    ]);
+    assert_eq!(merged, Some(expected));
+    // The order of the model: the ints, the strs, the bytes, the tuples.
+    assert_eq!(
+        resolution.keys,
+        ["-2", "\"key-a\"", "b'key-b'", "(\"key-c\", 1)"]
+    );
+}
+
+#[test]
+fn the_strategy_keys_gives_no_answer_for_values_that_are_not_dicts() {
+    let with = |data: V| doc(&[("data", data)]);
+    let (resolution, merged) = mapping_conflict(
+        KEYS,
+        &with(V::List(vec![V::Int(1)])),
+        &with(V::List(vec![V::Int(2)])),
+        &with(V::List(vec![V::Int(3)])),
+    );
+    assert_eq!(
+        resolution.outcome,
+        Resolved::Undecided("values that the strategy keys does not take")
+    );
+    assert_eq!(merged, None);
+    // A tuple of a tuple is not a key of the model.
+    let nested = V::Tuple(vec![V::Tuple(vec![s("key-a")])]);
+    let (resolution, _) = mapping_conflict(
+        KEYS,
+        &mapping(&[(nested.clone(), s("one"))]),
+        &mapping(&[(nested.clone(), s("two"))]),
+        &mapping(&[(nested, s("one")), (s("key-b"), s("three"))]),
+    );
+    assert_eq!(
+        resolution.outcome,
+        Resolved::Undecided("a dict key of another type")
+    );
+}
+
+#[test]
+fn two_keys_that_hold_one_list_give_no_answer() {
+    // The new state adds key-d, and holds one list under two keys.
+    let shared = built(|heap| {
+        let list = heap.new_list(vec![Value::Int(1)]);
+        let other = heap.new_list(vec![Value::Int(4)]);
+        let items = vec![
+            (heap.new_str("key-a"), list),
+            (heap.new_str("key-b"), list),
+            (heap.new_str("key-d"), other),
+        ];
+        vec![(heap.new_str("data"), heap.new_dict(items))]
+    });
+    let list = |n| V::List(vec![V::Int(n)]);
+    let base = mapping(&[(s("key-a"), list(1)), (s("key-b"), list(1))]);
+    let committed = mapping(&[
+        (s("key-a"), list(1)),
+        (s("key-b"), list(1)),
+        (s("key-c"), list(3)),
+    ]);
+    let new = mapping(&[
+        (s("key-a"), list(1)),
+        (s("key-b"), list(1)),
+        (s("key-d"), list(4)),
+    ]);
+    let (resolution, _) = mapping_conflict(KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    let (resolution, _) = mapping_conflict(KEYS, &base, &committed, &shared);
+    assert_eq!(
+        resolution.outcome,
+        Resolved::Undecided("an object that two keys of a mapping share")
+    );
+}
+
+#[test]
+fn an_undo_merges_a_mapping_key_by_key_and_refuses_a_key_changed_later() {
+    let (store, _, _) = with_policy(KEYS);
+    let oid = new_oid(&store);
+    let items = |a, b| mapping(&[(s("key-a"), s(a)), (s("key-b"), s(b))]);
+    let first = commit(&store, oid, Tid::ZERO, &items("one", "two"));
+    let undone = commit(&store, oid, first, &items("three", "two"));
+    let later = commit(&store, oid, undone, &items("three", "four"));
+    // No later transaction changed key-a: the undo gives it back.
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    assert_eq!(txn.undo(undone).unwrap().conflicts, []);
+    assert_eq!(txn.resolutions()[0].outcome, Resolved::Merged);
+    txn.vote().unwrap();
+    let tid = txn.finish().unwrap();
+    assert_eq!(store.load(oid).unwrap(), (items("one", "four"), tid));
+    // A later transaction changed key-b: the undo of `later` would drop it.
+    commit(&store, oid, tid, &items("one", "five"));
+    let mut txn = store.tpc_begin(b"", b"undo", b"").unwrap();
+    assert!(matches!(
+        txn.undo(later),
+        Err(ZoeError::Undo { oid: Some(found), .. }) if found == oid
+    ));
 }

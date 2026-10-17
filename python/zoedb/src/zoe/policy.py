@@ -19,13 +19,30 @@ The entry of a class has these keys, each optional:
 - ``tier2``: the mode of the merges of fields: ``on``, ``shadow`` or
   ``off``, the default; a class without ``tier2`` never merges in tier 2;
 - ``default``: the strategy of a field that ``fields`` does not name:
-  ``strict``, the default, ``lww``, ``max``, ``sum``, ``union`` or
-  ``append``;
+  ``strict``, the default, ``lww``, ``max``, ``sum``, ``union``,
+  ``append`` or ``keys``;
 - ``fields``: a dict of field names to their strategies;
 - ``coupled``: a list of groups of fields, each a list of field names;
 - ``blocked``: True for a class that never merges in tier 2, whatever its
   other keys say; `zoe.plone` blocks a class whose invariant it cannot
   read.
+
+The strategy ``keys`` merges a field whose value is a dict key by key: a
+key that one side changed, added or deleted takes that change, and two
+different changes of one key refuse. The state of a ``PersistentMapping``
+is ``{'data': {...}}``, so the entry of a mapping class gives the field
+``data`` the strategy ``keys``::
+
+    {"classes": {
+        "mysite.registry.Registry": {"tier2": "on", "fields": {"data": "keys"}},
+    }}
+
+An entry names one class, not its subclasses. Name a subclass of your own,
+for the mappings whose keys do not depend on each other. Do not name
+``persistent.mapping.PersistentMapping`` or
+``Persistence.mapping.PersistentMapping``: the root of each database, and
+many mappings of Zope and CMF whose keys depend on each other, such as the
+WebDAV locks of an object, are of those classes (ADR 0046, section 11).
 
 `validate` checks a policy and gives a copy of plain values, `install`
 writes a policy in the transaction of a connection, and `read` gives it
@@ -41,7 +58,7 @@ NAME = "zoe.merge_policy"
 #: The modes of a switch.
 MODES = ("on", "shadow", "off")
 #: The strategies of a field.
-STRATEGIES = ("strict", "lww", "max", "sum", "union", "append")
+STRATEGIES = ("strict", "lww", "max", "sum", "union", "append", "keys")
 #: The keys of a policy that `install` takes, besides ``classes``.
 SWITCHES = ("structural_merges", "posting_dicts")
 #: The keys of the entry of a class.
