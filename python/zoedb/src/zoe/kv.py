@@ -422,7 +422,9 @@ class _DemoNamespaces:
         `writes`."""
         for (flavour, name, key), (value, ttl) in writes.items():
             if not 1 <= len(name.encode("utf-8")) <= 255:
-                raise ValueError("the name of a namespace is empty or longer than 255 bytes")
+                raise ValueError(
+                    "the name of a namespace is empty or longer than 255 bytes"
+                )
             if not 1 <= len(key) <= 1024:
                 raise ValueError("a key is empty or longer than 1,024 bytes")
             if value is None:

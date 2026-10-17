@@ -35,7 +35,13 @@ import pickle
 import threading
 import weakref
 
-__all__ = ["NAMESPACE", "KVRecords", "install", "installed", "uninstall", "use_object_graph"]
+__all__ = [
+    "NAMESPACE",
+    "install",
+    "installed",
+    "uninstall",
+    "use_object_graph",
+]
 
 # The name of the namespace of the records.
 NAMESPACE = "zoe.plone.registry"

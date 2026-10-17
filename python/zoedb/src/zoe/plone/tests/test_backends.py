@@ -77,7 +77,9 @@ class TestRegistry(unittest.TestCase):
         self.registry = getUtility(IRegistry)
 
     def stored(self, name):
-        namespace = zoe.kv.Namespace(self.registry._p_jar, "durable", registry.NAMESPACE)
+        namespace = zoe.kv.Namespace(
+            self.registry._p_jar, "durable", registry.NAMESPACE
+        )
         encoded = namespace.get(registry.VALUE + name.encode())
         return None if encoded is None else pickle.loads(encoded)
 

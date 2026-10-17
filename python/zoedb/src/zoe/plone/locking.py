@@ -147,7 +147,9 @@ class _Row:
         self._namespace = namespace
         self._oid = oid
         stored = namespace.get(oid)
-        self.data = {"locks": {}, "types": {}} if stored is None else pickle.loads(stored)
+        self.data = (
+            {"locks": {}, "types": {}} if stored is None else pickle.loads(stored)
+        )
         # The encoding of the row as read, so a row that a transaction only
         # read is never written.
         self._stored = None if stored is None else pickle.dumps(self.data, 3)
