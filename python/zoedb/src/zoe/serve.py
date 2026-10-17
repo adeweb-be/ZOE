@@ -6,9 +6,10 @@ options of `zoe serve` without `--`, as in its TOML configuration file.
 Each `<storage NAME>` subsection is a `[storages.NAME]` table, with the
 keys `path`, `blob-dir`, `read-only` and `pack-gc`.
 
-The module writes the settings as a TOML file into a memory file, which
-has no path on disk, and replaces itself with `zoe serve --config` on
-that file. So no Python stays in the process of the server, a supervisor
+The module writes the settings as a TOML file into a file that has no
+name on disk, and replaces itself with `zoe serve --config` on that file.
+On Linux, the file is a memory file. On other platforms, it is a
+temporary file whose name the module removes. So no Python stays in the process of the server, a supervisor
 stops the server with SIGTERM, and no value of the section goes into the
 arguments of the process.
 
@@ -24,6 +25,7 @@ import argparse
 import io
 import os
 import sys
+import tempfile
 
 import ZConfig
 from ZConfig.datatypes import stock_datatypes
@@ -194,6 +196,36 @@ def find_binary(section, environ):
     return None
 
 
+def config_file(text):
+    """Write `text` into a file that has no name on disk.
+
+    Return the inheritable descriptor of the file, and the path through
+    which `zoe serve` opens it. On Linux, the file is a memory file, and
+    the path is in /proc. Other platforms have no memory file. There, the
+    file is a temporary file of mode 0600 in a private directory. The
+    function removes the name of the file and the directory at once, and
+    the path is in /dev/fd.
+    """
+    if hasattr(os, "memfd_create"):
+        descriptor = os.memfd_create("zoe-serve.toml", 0)
+        os.write(descriptor, text.encode())
+        path = f"/proc/self/fd/{descriptor}"
+    else:
+        directory = tempfile.mkdtemp(prefix="zoe-serve-")
+        try:
+            descriptor, name = tempfile.mkstemp(suffix=".toml", dir=directory)
+            os.unlink(name)
+        finally:
+            os.rmdir(directory)
+        os.write(descriptor, text.encode())
+        # On macOS, an open of /dev/fd/N shares the offset of the
+        # descriptor. So zoe serve reads from that offset, and it must be 0.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        path = f"/dev/fd/{descriptor}"
+    os.set_inheritable(descriptor, True)
+    return descriptor, path
+
+
 def main(argv=None):
     """Run `zoe serve` with the `<zoe-server>` section of the file of `-C`.
 
@@ -224,12 +256,9 @@ def main(argv=None):
             file=sys.stderr,
         )
         return FAILURE
-    # The memory file stays open in zoe serve, which reads it through its
-    # path in /proc.
-    descriptor = os.memfd_create("zoe-serve.toml", 0)
-    os.write(descriptor, text.encode())
-    os.set_inheritable(descriptor, True)
-    command = [binary, "serve", "--config", f"/proc/self/fd/{descriptor}"]
+    # The file stays open in zoe serve, which reads it through `path`.
+    descriptor, path = config_file(text)
+    command = [binary, "serve", "--config", path]
     sys.stdout.flush()
     sys.stderr.flush()
     try:
