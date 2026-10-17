@@ -9,6 +9,8 @@ fork.
 Each test runs a child interpreter, because the handlers stay in a process.
 A child reads the actions of its signals in `/proc/self/status`: a bit of
 `SigCgt` is a signal with a handler, a bit of `SigIgn` an ignored signal.
+It counts the watcher threads by their names in `/proc/self/task`. Only
+Linux has `/proc`, so the tests that read it skip on other platforms.
 """
 
 import os
@@ -30,6 +32,11 @@ import zoe
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 # The longest time that a child takes to start, to write a line or to end.
 TIMEOUT = 60
+# The mark of a test whose child reads /proc.
+READS_PROC = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux only: the child reads its signal actions and threads in /proc",
+)
 
 # The start of each child: the functions that talk to the test and read the
 # actions of the signals.
@@ -191,6 +198,7 @@ def create_store(path):
     assert child.wait() == 0, child.stderr()
 
 
+@READS_PROC
 def test_the_open_installs_a_handler_of_each_signal_whose_action_is_the_default(
     tmp_path,
 ):
@@ -213,6 +221,7 @@ def test_the_open_installs_a_handler_of_each_signal_whose_action_is_the_default(
     assert child.wait() == 0, child.stderr()
 
 
+@READS_PROC
 def test_one_watcher_thread_serves_every_storage(tmp_path):
     child = Child(
         """
@@ -234,6 +243,7 @@ def test_one_watcher_thread_serves_every_storage(tmp_path):
         assert_closed_cleanly(tmp_path / name)
 
 
+@READS_PROC
 def test_an_ignored_sighup_keeps_its_action_and_sigterm_still_closes(tmp_path):
     path = tmp_path / "store"
     child = Child(
@@ -260,6 +270,7 @@ def test_an_ignored_sighup_keeps_its_action_and_sigterm_still_closes(tmp_path):
     assert_closed_cleanly(path)
 
 
+@READS_PROC
 def test_a_later_open_installs_a_handler_that_an_earlier_open_did_not(tmp_path):
     first, second = tmp_path / "first", tmp_path / "second"
     child = Child(
@@ -288,6 +299,7 @@ def test_a_later_open_installs_a_handler_that_an_earlier_open_did_not(tmp_path):
     assert_closed_cleanly(second)
 
 
+@READS_PROC
 def test_the_extension_never_puts_its_handler_back(tmp_path):
     child = Child(
         """
@@ -308,6 +320,7 @@ def test_the_extension_never_puts_its_handler_back(tmp_path):
     assert child.wait() == 0, child.stderr()
 
 
+@READS_PROC
 def test_a_read_only_storage_installs_the_handlers_and_closes(tmp_path):
     path = tmp_path / "store"
     create_store(path)
@@ -500,6 +513,7 @@ def test_the_close_needs_no_gil(tmp_path):
 
 
 @pytest.mark.skipif(not FREE_THREADED, reason="a free-threaded build only")
+@READS_PROC
 def test_the_install_keeps_the_gil_off(tmp_path):
     # The child imports only the extension, so no module of ZODB turns the
     # GIL back on.
@@ -523,6 +537,7 @@ def test_the_install_keeps_the_gil_off(tmp_path):
     assert_closed_cleanly(path)
 
 
+@READS_PROC
 def test_the_child_of_a_fork_keeps_a_handler_of_the_application(tmp_path):
     path = tmp_path / "store"
     child = Child(
