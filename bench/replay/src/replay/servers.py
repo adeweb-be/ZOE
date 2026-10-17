@@ -175,13 +175,14 @@ def software(serve_args=()) -> dict:
     status = output(["git", "-C", str(root), "status", "--porcelain"])
     try:
         import zoe
+        import zoe._zoe
 
         package = Path(zoe.__file__).resolve().parent
+        # Hash the extension that this interpreter loaded. The package can
+        # also hold the extensions of other versions of Python.
+        extension = getattr(zoe._zoe, "__file__", None)
     except ImportError:
-        package = None
-    # The extension that this interpreter loaded: a package can hold the
-    # extensions of other versions of Python next to it.
-    extension = getattr(sys.modules.get("zoe._zoe"), "__file__", None)
+        package = extension = None
     try:
         from importlib.metadata import version
 

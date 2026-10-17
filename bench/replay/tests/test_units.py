@@ -6,6 +6,8 @@ import json
 import subprocess
 import sys
 import time
+import types
+from pathlib import Path
 
 import pytest
 import transaction
@@ -216,7 +218,7 @@ def test_the_software_is_unknown_when_git_and_zoe_fail(monkeypatch):
         raise subprocess.CalledProcessError(128, args[0])
 
     monkeypatch.setattr(servers.subprocess, "run", fails)
-    # An import of a module that sys.modules holds as None raises.
+    # Python raises ImportError when sys.modules holds None for a module.
     monkeypatch.setitem(sys.modules, "zoe", None)
     monkeypatch.setitem(sys.modules, "zoe._zoe", None)
     found = servers.software()
@@ -224,9 +226,26 @@ def test_the_software_is_unknown_when_git_and_zoe_fail(monkeypatch):
     assert (found["zoe_package"], found["zoe_extension_sha256"]) == (None, None)
 
 
-def test_the_extension_is_the_one_that_the_interpreter_loaded():
+def test_the_extension_is_the_one_that_the_interpreter_loaded(tmp_path, monkeypatch):
+    # A package with the extensions of two versions of Python. The one that
+    # the interpreter loaded does not sort first.
+    package = tmp_path / "zoe"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "_zoe.cpython-312-darwin.so").write_bytes(b"other")
+    loaded = package / "_zoe.cpython-313-darwin.so"
+    loaded.write_bytes(b"loaded")
+    extension = types.SimpleNamespace(__file__=str(loaded))
+    zoe = types.SimpleNamespace(__file__=str(package / "__init__.py"), _zoe=extension)
+    monkeypatch.setitem(sys.modules, "zoe", zoe)
+    monkeypatch.setitem(sys.modules, "zoe._zoe", extension)
+    found = servers.software()["zoe_extension_sha256"]
+    assert found == hashlib.sha256(b"loaded").hexdigest()
+
+
+def test_the_extension_of_the_install_is_hashed():
     extension = pytest.importorskip("zoe._zoe")
-    digest = hashlib.sha256(open(extension.__file__, "rb").read()).hexdigest()
+    digest = hashlib.sha256(Path(extension.__file__).read_bytes()).hexdigest()
     assert servers.software()["zoe_extension_sha256"] == digest
 
 
