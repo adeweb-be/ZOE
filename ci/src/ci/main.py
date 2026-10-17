@@ -100,6 +100,12 @@ class Ci:
             .with_mounted_cache("/root/.cache/uv", dag.cache_volume("zoe-uv"))
             # The uv cache is a volume, so uv cannot hardlink from it.
             .with_env_variable("UV_LINK_MODE", "copy")
+            # A hosted runner has little disk. A build in CI writes no
+            # incremental files and keeps only the line tables of its debug
+            # information. Backtraces keep their files and lines.
+            .with_env_variable("CARGO_INCREMENTAL", "0")
+            .with_env_variable("CARGO_PROFILE_DEV_DEBUG", "line-tables-only")
+            .with_env_variable("CARGO_PROFILE_TEST_DEBUG", "line-tables-only")
             .with_directory("/src", source)
             .with_workdir("/src")
         )
