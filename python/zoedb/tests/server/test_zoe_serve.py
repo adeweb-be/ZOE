@@ -243,7 +243,13 @@ def test_a_file_without_the_section_is_a_usage_error(tmp_path, capsys):
     assert "zoe-server" in capsys.readouterr().err
 
 
-def test_the_configuration_file_has_no_name_on_disk(tmp_path, monkeypatch):
+@pytest.mark.parametrize("memory_file", [True, False])
+def test_the_configuration_file_has_no_name_on_disk(tmp_path, monkeypatch, memory_file):
+    if memory_file and not hasattr(os, "memfd_create"):
+        pytest.skip("this platform has no memory file")
+    if not memory_file:
+        # The fallback of a platform without memfd_create runs on Linux too.
+        monkeypatch.delattr(os, "memfd_create", raising=False)
     # The temporary file of a platform without memfd_create goes here.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     text = 'listen = "127.0.0.1:0"\n'
