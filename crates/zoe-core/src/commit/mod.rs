@@ -39,6 +39,10 @@
 //! payload as it is, and encodes inline each record without one. The
 //! frames are the same either way.
 //!
+//! `kv_set` and `kv_delete` stage a write of a KV namespace in the same
+//! buffer. It takes no lock, and the vote checks nothing for it. The leader
+//! of the commit batch writes it with the records of the transaction.
+//!
 //! `store` and `store_blob` check the size limits of the store before
 //! they stage anything. A transaction logs its slow locks when it releases
 //! them, and logs itself when it ends, if it was slow.
@@ -54,12 +58,14 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::backend::Record;
 use crate::blob::{BlobFile, PendingBlob};
 use crate::error::{Result, ZoeError};
+use crate::format;
 use crate::guard::{Ended, SizeLimit};
+use crate::kv::{self, Flavour};
 use crate::lock::{Held, LockCancel, Mode, Refused};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
@@ -351,6 +357,89 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// refuses what its source took.
     fn is_restore(&self) -> bool {
         self.tid.is_some()
+    }
+
+    /// Stage a write of `value` for `key` in the namespace `name` of
+    /// `flavour`. An ephemeral key needs `ttl`, more than 0 and at most
+    /// `MAX_TTL_SECONDS`: the finish sets its expiry to the time of the
+    /// write of its commit batch plus `ttl`. A durable key takes no TTL.
+    ///
+    /// The write takes no lock, and the vote checks nothing for it: when
+    /// two transactions write one key, the commit with the later tid wins.
+    /// A later write of the same key in this transaction replaces this
+    /// one. An abort drops it.
+    ///
+    /// The value counts toward `max-record-size` and
+    /// `max-transaction-size` as a pickle does: a refusal is `KvTooLarge`.
+    /// A bad name, key or TTL is `InvalidKv`. A call from another thread is
+    /// `WrongThread`. A call after the vote, or in a restore transaction,
+    /// is `Protocol`. A refused call stages nothing.
+    pub fn kv_set(
+        &mut self,
+        flavour: Flavour,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        self.check_kv(name, key)?;
+        let ttl_ms = kv::ttl_millis(flavour, ttl)?;
+        let row = format::kv_key(name.as_bytes(), key);
+        let stored_bytes = self.check_kv_size(flavour, &row, value.len())?;
+        let area = &self.store.backend.staging;
+        self.staged
+            .put_kv(area, flavour, row, Some(value), ttl_ms)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
+    }
+
+    /// Stage a delete of `key` in the namespace `name` of `flavour`, with
+    /// the rules of `kv_set`. The finish removes the row. A delete of a key
+    /// that has no row does nothing.
+    pub fn kv_delete(&mut self, flavour: Flavour, name: &str, key: &[u8]) -> Result<()> {
+        self.check_kv(name, key)?;
+        let row = format::kv_key(name.as_bytes(), key);
+        let stored_bytes = self.check_kv_size(flavour, &row, 0)?;
+        let area = &self.store.backend.staging;
+        self.staged.put_kv(area, flavour, row, None, 0)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
+    }
+
+    /// Check that the transaction can stage a namespace write of `key` in
+    /// the namespace `name`. A refused call changes nothing.
+    fn check_kv(&self, name: &str, key: &[u8]) -> Result<()> {
+        self.check_thread()?;
+        if self.is_restore() {
+            return Err(ZoeError::Protocol(
+                "a namespace write in a restore transaction",
+            ));
+        }
+        if self.locked() {
+            return Err(ZoeError::Protocol("a namespace write after vote"));
+        }
+        kv::check_name(name)?;
+        kv::check_key(key)
+    }
+
+    /// Check a value of `size` bytes for the row `row` of `flavour` against
+    /// `max-record-size` and `max-transaction-size`, as `check_size` does
+    /// for a pickle. A value that replaces a staged value of the same row
+    /// counts once. Return the new value of `stored_bytes`.
+    fn check_kv_size(&self, flavour: Flavour, row: &[u8], size: usize) -> Result<u64> {
+        let guardrails = &self.store.guardrails;
+        let size = size as u64;
+        guardrails.check_kv(SizeLimit::Record, size)?;
+        let staged = self
+            .staged
+            .kv_record(flavour, row)
+            .map_or(0, |staged| staged.value_len() as u64);
+        let stored_bytes = self
+            .stored_bytes
+            .saturating_sub(staged)
+            .saturating_add(size);
+        guardrails.check_kv(SizeLimit::Transaction, stored_bytes)?;
+        Ok(stored_bytes)
     }
 
     /// Return the serial that the transaction read for `oid` and the pickle

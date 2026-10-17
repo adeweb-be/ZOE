@@ -829,6 +829,7 @@ mod tests {
     };
     use crate::format;
     use crate::format::Codec;
+    use crate::kv::{Flavour, Swept};
     use crate::vfs::LOCK;
 
     /// A clock that never moves.
@@ -905,6 +906,22 @@ mod tests {
 
         fn put_sequence_end(&mut self, name: &str, end: u64) -> Result<()> {
             self.0.put_sequence_end(name, end)
+        }
+
+        fn put_kv(&mut self, flavour: Flavour, row: &[u8], payload: &[u8]) -> Result<()> {
+            self.0.put_kv(flavour, row, payload)
+        }
+
+        fn remove_kv(&mut self, flavour: Flavour, row: &[u8]) -> Result<()> {
+            self.0.remove_kv(flavour, row)
+        }
+
+        fn put_kv_expiry(&mut self, key: &[u8]) -> Result<()> {
+            self.0.put_kv_expiry(key)
+        }
+
+        fn sweep_kv(&mut self, now: u64, limit: usize) -> Result<Swept> {
+            self.0.sweep_kv(now, limit)
         }
 
         fn commit(self: Box<Self>) -> Result<()> {
@@ -1027,6 +1044,28 @@ mod tests {
                 return Err(injected());
             }
             self.inner.sequence_names()
+        }
+
+        fn kv_row(&self, flavour: Flavour, row: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.kv_row(flavour, row)
+        }
+
+        fn kv_rows(
+            &self,
+            flavour: Flavour,
+            from: std::ops::Bound<&[u8]>,
+            to: std::ops::Bound<&[u8]>,
+            limit: usize,
+        ) -> Result<Vec<(Bytes, Bytes)>> {
+            self.inner.kv_rows(flavour, from, to, limit)
+        }
+
+        fn kv_expiry_has(&self, key: &[u8]) -> Result<bool> {
+            self.inner.kv_expiry_has(key)
+        }
+
+        fn has_kv(&self, flavour: Flavour) -> Result<bool> {
+            self.inner.has_kv(flavour)
         }
     }
 

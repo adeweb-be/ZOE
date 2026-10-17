@@ -23,22 +23,29 @@
 //! The queue mutex is held with no other lock. The leader takes the commit
 //! sequencer after it releases the queue mutex.
 //!
+//! The leader writes the namespace writes of each member after its records,
+//! in the same backend write. An ephemeral key expires at the time of that
+//! write plus its TTL. Each durable namespace that a member writes gets the
+//! tid of the member as its generation.
+//!
 //! The write of a batch and its sync run in a `tracing` span `fsync`, with
 //! the field `commits`, the number of members that have a tid. The span
 //! is a child of the span of the leader's finish. A batch of deferred
 //! restores commits without a sync, so it has no span `fsync`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::mem;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use super::staging::Staging;
 use super::{Finished, Observer, check_restore_tid, next_tid};
-use crate::backend::{TxnMeta, TxnStatus};
+use crate::backend::{TxnMeta, TxnStatus, WriteTxn};
 use crate::blob::PendingBlob;
 use crate::clock::timestamp;
 use crate::error::{Result, ZoeError};
+use crate::format;
+use crate::kv::{self, Flavour};
 use crate::store::Store;
 use crate::types::{Oid, Tid};
 
@@ -175,7 +182,10 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             .map(|(_, member)| (Some(member), Err(ZoeError::Halted)))
             .collect();
     };
-    let now = timestamp(store.clock.now());
+    let time = store.clock.now();
+    let now = timestamp(time);
+    // The expiries of the ephemeral writes of the batch count from here.
+    let now_ms = kv::millis(time);
     let mut last = start;
     // The number of commits that the sync of the batch made durable.
     let mut synced = 0;
@@ -206,7 +216,7 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
             let commits = members.iter().filter(|(_, f)| f.is_ok()).count();
             tracing::info_span!("fsync", commits)
         };
-        match span.in_scope(|| write(store, &mut members, deferred)) {
+        match span.in_scope(|| write(store, &mut members, deferred, now_ms)) {
             Ok(intents) => {
                 if deferred {
                     // A crash before the next durable commit loses this
@@ -253,11 +263,13 @@ fn write_batch(store: &Store, batch: Vec<(u64, Member)>) -> Vec<Outcome> {
 
 /// Place the blobs of the members that have a tid, then write these
 /// members in one backend write transaction and commit it, without a sync
-/// when `deferred` is true. Return the intent files of the blobs.
+/// when `deferred` is true. `now_ms` is the time of the write, in
+/// milliseconds since the Unix epoch. Return the intent files of the blobs.
 fn write(
     store: &Store,
     members: &mut [(Member, Result<Finished>)],
     deferred: bool,
+    now_ms: u64,
 ) -> Result<Vec<Option<String>>> {
     let mut intents = Vec::new();
     for (member, finished) in members.iter_mut() {
@@ -289,6 +301,7 @@ fn write(
             oid_count: member.staged.len() as u64,
             status: TxnStatus::Committed,
         })?;
+        write_kv(&mut *write, &member.staged, tid, now_ms)?;
     }
     if deferred {
         write.commit_deferred()?;
@@ -296,6 +309,40 @@ fn write(
         write.commit()?;
     }
     Ok(intents)
+}
+
+/// Write the namespace writes of `staged`, the staging of the member with
+/// the tid `tid`, at the time `now_ms`.
+///
+/// An ephemeral set writes its row with the expiry `now_ms` plus its TTL,
+/// and the key of that expiry in the index of the expiries. A delete
+/// removes the row: the index key of the row stays, and the sweep removes
+/// it. Each durable namespace that the member writes gets `tid` in its
+/// generation row.
+fn write_kv(write: &mut dyn WriteTxn, staged: &Staging, tid: Tid, now_ms: u64) -> Result<()> {
+    let mut durable = BTreeSet::new();
+    for entry in staged.kv_writes() {
+        let (flavour, row, value, ttl_ms) = entry?;
+        match (flavour, value) {
+            (_, None) => write.remove_kv(flavour, row)?,
+            (Flavour::Ephemeral, Some(value)) => {
+                let expiry = now_ms.saturating_add(ttl_ms);
+                write.put_kv(flavour, row, &format::encode_kv_ephemeral(expiry, &value))?;
+                write.put_kv_expiry(&format::kv_expiry_key(expiry, row))?;
+            }
+            (Flavour::Durable, Some(value)) => write.put_kv(flavour, row, &value)?,
+        }
+        if flavour == Flavour::Durable
+            && let Some((name, _)) = format::split_kv_key(row)
+        {
+            durable.insert(name);
+        }
+    }
+    for name in durable {
+        let generation = format::encode_kv_generation(tid);
+        write.put_kv(Flavour::Durable, &format::kv_key(name, b""), &generation)?;
+    }
+    Ok(())
 }
 
 /// Fail each member that has a tid with `error`. The last such member gets

@@ -1,7 +1,10 @@
 //! The redb backend.
 //!
-//! Six tables hold the key spaces of the data model: `records`,
-//! `txn_oids`, `blobs`, `txns`, `sequences` and `meta`. `format` says how keys and
+//! Six tables hold the key spaces of the object graph: `records`,
+//! `txn_oids`, `blobs`, `txns`, `sequences` and `meta`. Three more hold
+//! the KV namespaces: `kv_ephemeral`, `kv_durable` and `kv_expiry`. The
+//! first write of a flavour creates its tables, so a store that never
+//! writes a namespace has none of them. `format` says how keys and
 //! values are written. `txn_oids` is the transaction index: `put_record`
 //! writes the index key of each record in the write transaction of the
 //! record, and `remove_record` removes the key with the record.
@@ -17,7 +20,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,6 +34,7 @@ use crate::backend::{
 };
 use crate::error::{Result, ZoeError};
 use crate::format::{self, Compression, KeySpace};
+use crate::kv::{self, Flavour, Swept};
 use crate::types::{Oid, Tid};
 
 const RECORDS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("records");
@@ -39,6 +43,44 @@ const BLOBS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("blobs");
 const TXNS: TableDefinition<&[u8; 8], &[u8]> = TableDefinition::new("txns");
 const SEQUENCES: TableDefinition<&str, &[u8]> = TableDefinition::new("sequences");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const KV_EPHEMERAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv_ephemeral");
+const KV_DURABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv_durable");
+const KV_EXPIRY: TableDefinition<&[u8], ()> = TableDefinition::new("kv_expiry");
+
+/// Return the table of the rows of the namespaces of `flavour`.
+fn kv_table(flavour: Flavour) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
+    match flavour {
+        Flavour::Ephemeral => KV_EPHEMERAL,
+        Flavour::Durable => KV_DURABLE,
+    }
+}
+
+/// Tell if `key` is inside the bounds `from` and `to`.
+fn inside_kv(key: &[u8], from: Bound<&[u8]>, to: Bound<&[u8]>) -> bool {
+    let after = match from {
+        Included(from) => key >= from,
+        Excluded(from) => key > from,
+        Unbounded => true,
+    };
+    let before = match to {
+        Included(to) => key <= to,
+        Excluded(to) => key < to,
+        Unbounded => true,
+    };
+    after && before
+}
+
+/// Tell if no key can be inside the bounds `from` and `to`. redb panics on
+/// a range whose start is after its end.
+fn empty_kv_range(from: Bound<&[u8]>, to: Bound<&[u8]>) -> bool {
+    match (from, to) {
+        (Included(from), Included(to)) => from > to,
+        (Included(from) | Excluded(from), Excluded(to)) | (Excluded(from), Included(to)) => {
+            from >= to
+        }
+        _ => false,
+    }
+}
 
 const META_FORMAT: &str = "format";
 const META_LAST_TID: &str = "last_tid";
@@ -864,6 +906,38 @@ impl Backend for RedbBackend {
     }
 
     #[cfg(feature = "testing")]
+    fn write_kv_stored(
+        &self,
+        flavour: Option<Flavour>,
+        row: &[u8],
+        bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let Db::ReadWrite(db) = &self.db else {
+            return Err(ZoeError::ReadOnly);
+        };
+        let txn = db.begin_write().map_err(backend)?;
+        match flavour {
+            Some(flavour) => {
+                let mut table = txn.open_table(kv_table(flavour)).map_err(backend)?;
+                match bytes {
+                    Some(bytes) => table.insert(row, bytes).map(drop),
+                    None => table.remove(row).map(drop),
+                }
+                .map_err(backend)?;
+            }
+            None => {
+                let mut index = txn.open_table(KV_EXPIRY).map_err(backend)?;
+                match bytes {
+                    Some(_) => index.insert(row, ()).map(drop),
+                    None => index.remove(row).map(drop),
+                }
+                .map_err(backend)?;
+            }
+        }
+        txn.commit().map_err(backend)
+    }
+
+    #[cfg(feature = "testing")]
     fn write_meta_stored(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
         let Db::ReadWrite(db) = &self.db else {
             return Err(ZoeError::ReadOnly);
@@ -943,6 +1017,69 @@ impl Backend for RedbBackend {
                     "the key of a sequence row {at} does not decode"
                 ))))
             }
+        }
+    }
+
+    fn kv_row(&self, flavour: Flavour, row: &[u8]) -> Result<Option<Bytes>> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let table = match txn.open_table(kv_table(flavour)) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        Ok(table.get(row).map_err(backend)?.map(|v| v.value().to_vec()))
+    }
+
+    fn kv_rows(
+        &self,
+        flavour: Flavour,
+        from: Bound<&[u8]>,
+        to: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if limit == 0 || empty_kv_range(from, to) {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().map_err(backend)?;
+        let table = match txn.open_table(kv_table(flavour)) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(backend(e)),
+        };
+        let mut rows: Vec<(Bytes, Bytes)> = Vec::new();
+        for entry in table.range::<&[u8]>((from, to)).map_err(backend)? {
+            let (key, value) = entry.map_err(backend)?;
+            let key = key.value();
+            // redb checks one bound of a scan only, so a damaged branch
+            // page can give a key outside the scan or out of order.
+            let ordered = rows.last().is_none_or(|(last, _)| key > last.as_slice());
+            if !inside_kv(key, from, to) || !ordered {
+                return Err(kv::corrupt(flavour, key));
+            }
+            rows.push((key.to_vec(), value.value().to_vec()));
+            if rows.len() == limit {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    fn kv_expiry_has(&self, key: &[u8]) -> Result<bool> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        let index = match txn.open_table(KV_EXPIRY) {
+            Ok(index) => index,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        Ok(index.get(key).map_err(backend)?.is_some())
+    }
+
+    fn has_kv(&self, flavour: Flavour) -> Result<bool> {
+        let txn = self.db.begin_read().map_err(backend)?;
+        match txn.open_table(kv_table(flavour)) {
+            Ok(_) => Ok(true),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(backend(e)),
         }
     }
 }
@@ -1211,9 +1348,88 @@ impl WriteTxn for RedbWrite<'_> {
         Ok(())
     }
 
+    fn put_kv(&mut self, flavour: Flavour, row: &[u8], payload: &[u8]) -> Result<()> {
+        let frame = format::encode_frame(
+            flavour.space(),
+            row,
+            format::MAIN_BRANCH,
+            Tid::ZERO,
+            payload,
+        );
+        let mut table = self.txn.open_table(kv_table(flavour)).map_err(backend)?;
+        table.insert(row, frame.as_slice()).map_err(backend)?;
+        Ok(())
+    }
+
+    fn remove_kv(&mut self, flavour: Flavour, row: &[u8]) -> Result<()> {
+        let mut table = self.txn.open_table(kv_table(flavour)).map_err(backend)?;
+        table.remove(row).map_err(backend)?;
+        Ok(())
+    }
+
+    fn put_kv_expiry(&mut self, key: &[u8]) -> Result<()> {
+        let mut index = self.txn.open_table(KV_EXPIRY).map_err(backend)?;
+        index.insert(key, ()).map_err(backend)?;
+        Ok(())
+    }
+
+    fn sweep_kv(&mut self, now: u64, limit: usize) -> Result<Swept> {
+        let mut index = self.txn.open_table(KV_EXPIRY).map_err(backend)?;
+        // A key of the index starts with its expiry, big-endian. So the
+        // keys before the first key of `now + 1` have an expiry at or before
+        // `now`.
+        let end = now.checked_add(1).map(u64::to_be_bytes);
+        let to = match &end {
+            Some(end) => Excluded(&end[..]),
+            None => Unbounded,
+        };
+        let mut keys: Vec<Bytes> = Vec::new();
+        for entry in index.range::<&[u8]>((Unbounded, to)).map_err(backend)? {
+            let (key, _) = entry.map_err(backend)?;
+            let key = key.value();
+            let ordered = keys.last().is_none_or(|last| key > last.as_slice());
+            // A key that a damaged page gives outside the scan, or out of
+            // order, ends the step. The keys before it go.
+            if !inside_kv(key, Unbounded, to) || !ordered {
+                break;
+            }
+            keys.push(key.to_vec());
+            if keys.len() == limit {
+                break;
+            }
+        }
+        let mut rows = self.txn.open_table(KV_EPHEMERAL).map_err(backend)?;
+        let mut swept = Swept::default();
+        for key in &keys {
+            index.remove(key.as_slice()).map_err(backend)?;
+            swept.taken += 1;
+            let Some((_, row)) = format::split_kv_expiry_key(key) else {
+                continue;
+            };
+            let Some(bytes) = rows.get(row).map_err(backend)?.map(|v| v.value().to_vec()) else {
+                continue;
+            };
+            // A row that fails its checksum stays, as evidence. A row that a
+            // later write refreshed has a later expiry, and stays too.
+            let expired = format::decode_frame(KeySpace::KvEphemeral, row, &bytes)
+                .ok()
+                .and_then(|frame| {
+                    format::decode_kv_ephemeral(&frame.data)
+                        .ok()
+                        .map(|(e, _)| e)
+                })
+                .is_some_and(|expiry| expiry <= now);
+            if expired {
+                rows.remove(row).map_err(backend)?;
+                swept.removed += 1;
+            }
+        }
+        Ok(swept)
+    }
+
     fn commit(self: Box<Self>) -> Result<()> {
         // A write that changes no record writes no count: a sequence
-        // reservation and the barrier of `sync`.
+        // reservation, a sweep step and the barrier of `sync`.
         let object_count = if self.touched.is_empty() {
             None
         } else {

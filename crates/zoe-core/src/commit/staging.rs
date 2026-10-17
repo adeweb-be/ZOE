@@ -16,6 +16,10 @@
 //! pickle for it. A later stage of the oid drops the payload with the
 //! record. The payload is not counted in `staging-memory`.
 //!
+//! The writes of the KV namespaces stage in the same buffer: their values
+//! count in `staging-memory`, and a value that does not fit goes to the
+//! spill file. A later write of the same key replaces the earlier one.
+//!
 //! A spill file is never part of the durable store. Nothing syncs it or
 //! `staging/`: the transaction reads the file in the same process, and a
 //! crash ends the transaction. A transaction removes its spill file when it
@@ -35,6 +39,7 @@ use super::Encoded;
 use crate::backend::{NewPayload, Payload};
 use crate::error::{Result, ZoeError};
 use crate::format::Codec;
+use crate::kv::Flavour;
 use crate::types::{Oid, Tid};
 use crate::vfs::Vfs;
 
@@ -206,6 +211,31 @@ impl Staged {
     }
 }
 
+/// A write of a KV namespace waiting for the commit.
+pub(crate) struct StagedKv {
+    /// The value, or `None` for a delete.
+    value: Option<Pickle>,
+    /// The TTL of an ephemeral set, in milliseconds. It is 0 for a durable
+    /// write and for a delete.
+    pub(crate) ttl_ms: u64,
+}
+
+impl StagedKv {
+    /// Return the length of the value. A delete has 0. This reads no
+    /// value.
+    pub(crate) fn value_len(&self) -> usize {
+        match &self.value {
+            Some(Pickle::Memory(bytes)) => bytes.len(),
+            Some(Pickle::Spilled { len, .. }) => *len,
+            None => 0,
+        }
+    }
+}
+
+/// A namespace write that the finish writes: the flavour, the key of the
+/// row, the value or `None` for a delete, and the TTL in milliseconds.
+pub(crate) type KvWrite<'a> = (Flavour, &'a [u8], Option<Cow<'a, [u8]>>, u64);
+
 /// The staged records of one transaction.
 ///
 /// The buffer does not hold its staging area: each call that needs it
@@ -213,6 +243,8 @@ impl Staged {
 #[derive(Default)]
 pub(crate) struct Staging {
     records: BTreeMap<Oid, Staged>,
+    /// The namespace writes, by flavour and key of the row.
+    kv: BTreeMap<(Flavour, Vec<u8>), StagedKv>,
     /// The bytes of the pickles in memory.
     in_memory: usize,
     /// The spill file. It exists after the first pickle that does not fit
@@ -262,6 +294,72 @@ impl Staging {
         Ok(())
     }
 
+    /// Stage a write of the row `row` of `flavour`: `value`, or a delete for
+    /// `None`, with the TTL `ttl_ms`. It replaces an earlier write of the
+    /// row. The value stays in memory if it fits in the limit of `area`,
+    /// else it goes to the spill file. If the call fails, the earlier
+    /// write stays.
+    pub(crate) fn put_kv(
+        &mut self,
+        area: &StagingArea,
+        flavour: Flavour,
+        row: Vec<u8>,
+        value: Option<&[u8]>,
+        ttl_ms: u64,
+    ) -> Result<()> {
+        let key = (flavour, row);
+        let replaced = match self.kv.get(&key) {
+            Some(StagedKv {
+                value: Some(Pickle::Memory(bytes)),
+                ..
+            }) => bytes.len(),
+            _ => 0,
+        };
+        let others = self.in_memory - replaced;
+        let value = match value {
+            None => {
+                self.in_memory = others;
+                None
+            }
+            Some(data) if others.saturating_add(data.len()) <= area.memory => {
+                self.in_memory = others + data.len();
+                Some(Pickle::Memory(data.to_vec()))
+            }
+            Some(data) => {
+                let pickle = self.spill(area, data)?;
+                self.in_memory = others;
+                Some(pickle)
+            }
+        };
+        self.kv.insert(key, StagedKv { value, ttl_ms });
+        Ok(())
+    }
+
+    /// Return the staged write of the row `row` of `flavour`. This reads
+    /// no value.
+    pub(crate) fn kv_record(&self, flavour: Flavour, row: &[u8]) -> Option<&StagedKv> {
+        self.kv.get(&(flavour, row.to_vec()))
+    }
+
+    /// Return the number of staged namespace writes.
+    #[cfg(test)]
+    pub(crate) fn kv_len(&self) -> usize {
+        self.kv.len()
+    }
+
+    /// Return each staged namespace write, in the order of the flavour and
+    /// of the key of the row. A spilled value is read when the iterator
+    /// reaches it.
+    pub(crate) fn kv_writes(&self) -> impl Iterator<Item = Result<KvWrite<'_>>> + '_ {
+        self.kv.iter().map(|((flavour, row), staged)| {
+            let value = match &staged.value {
+                Some(pickle) => Some(self.read(pickle)?),
+                None => None,
+            };
+            Ok((*flavour, row.as_slice(), value, staged.ttl_ms))
+        })
+    }
+
     /// Write `data` to the spill file, and create the file in `area` first
     /// when the transaction has none.
     fn spill(&mut self, area: &StagingArea, data: &[u8]) -> Result<Pickle> {
@@ -303,7 +401,8 @@ impl Staging {
             .is_some_and(|staged| matches!(staged.pickle, Pickle::Memory(_)))
     }
 
-    /// Return the bytes of the pickles in memory.
+    /// Return the bytes of the pickles and of the namespace values in
+    /// memory.
     pub(crate) fn in_memory(&self) -> usize {
         self.in_memory
     }
@@ -368,8 +467,9 @@ impl Staging {
         })
     }
 
-    /// Return the bytes of `pickle`. A spilled pickle whose bytes do not
-    /// match its hash fails with `InvalidData`.
+    /// Return the bytes of `pickle`, a pickle or a namespace value. A
+    /// spilled one whose bytes do not match its hash fails with
+    /// `InvalidData`.
     fn read<'a>(&'a self, pickle: &'a Pickle) -> io::Result<Cow<'a, [u8]>> {
         let (offset, len, hash) = match pickle {
             Pickle::Memory(bytes) => return Ok(Cow::Borrowed(bytes)),
@@ -435,6 +535,55 @@ mod tests {
 
     fn pickle(staging: &Staging, oid: Oid) -> Vec<u8> {
         staging.get(oid).unwrap().unwrap().1.into_owned()
+    }
+
+    #[test]
+    fn namespace_values_share_the_limit_and_the_spill_file() {
+        let (vfs, area) = area(8);
+        let mut staging = Staging::default();
+        staging.put(&area, Oid(1), Tid(1), b"aaaa", false).unwrap();
+        let row = |key: &[u8]| crate::format::kv_key(b"sessions", key);
+        staging
+            .put_kv(&area, Flavour::Ephemeral, row(b"a"), Some(b"vvvv"), 1000)
+            .unwrap();
+        assert_eq!(staging.in_memory(), 8);
+        assert!(!Vfs::exists(&vfs, STAGING_DIR).unwrap());
+        // The next value does not fit, so it goes to the spill file.
+        staging
+            .put_kv(&area, Flavour::Durable, row(b"b"), Some(b"ww"), 0)
+            .unwrap();
+        assert_eq!(staging.in_memory(), 8);
+        assert_eq!(spill_files(&vfs), ["staging/0.spill"]);
+        // A later write of a key replaces the earlier one, and a delete
+        // frees its memory.
+        staging
+            .put_kv(&area, Flavour::Ephemeral, row(b"a"), None, 0)
+            .unwrap();
+        assert_eq!(staging.in_memory(), 4);
+        assert_eq!(staging.kv_len(), 2);
+        let writes: Vec<_> = staging
+            .kv_writes()
+            .map(|write| {
+                let (flavour, row, value, ttl) = write.unwrap();
+                (flavour, row.to_vec(), value.map(Cow::into_owned), ttl)
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                (Flavour::Ephemeral, row(b"a"), None, 0),
+                (Flavour::Durable, row(b"b"), Some(b"ww".to_vec()), 0),
+            ]
+        );
+        assert_eq!(
+            staging
+                .kv_record(Flavour::Durable, &row(b"b"))
+                .unwrap()
+                .value_len(),
+            2
+        );
+        staging.remove_spill(&area);
+        assert!(spill_files(&vfs).is_empty());
     }
 
     #[test]
