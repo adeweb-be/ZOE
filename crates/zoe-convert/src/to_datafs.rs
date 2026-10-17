@@ -74,16 +74,39 @@ const CHUNK: usize = 1 << 16;
 /// differences. Then the conversion keeps the old file and removes the file
 /// that it wrote. A blob that the store does not read is not written. This
 /// is not a difference: `Report.problems` names each such blob.
+///
+/// A `Data.fs` holds no KV namespace, so the conversion leaves the durable
+/// rows out, and `Report.durable_keys` counts their keys. It leaves the
+/// ephemeral rows out too, and counts none.
 pub fn to_datafs(source: &Store, data_fs: &Path, blob_dir: &Path) -> Result<Report, Error> {
     let _lock = lock(&sibling(data_fs, LOCK_SUFFIX)?)?;
     let temp = sibling(data_fs, TEMP_SUFFIX)?;
     // A crash can leave the temporary file.
     remove_if_exists(&temp)?;
-    let result = convert(source, data_fs, &temp, blob_dir);
+    let result = convert(source, data_fs, &temp, blob_dir).and_then(|mut report| {
+        report.durable_keys = durable_keys(source)?;
+        Ok(report)
+    });
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Return the keys of the durable namespaces of `source`, without the
+/// generation rows.
+fn durable_keys(source: &Store) -> Result<u64, Error> {
+    const CHUNK: usize = 1024;
+    let mut keys = 0;
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (rows, next) = source.kv_durable_rows(after.as_deref(), CHUNK)?;
+        keys += rows.iter().filter(|row| !row.key.is_empty()).count() as u64;
+        if rows.len() < CHUNK {
+            return Ok(keys);
+        }
+        after = next;
+    }
 }
 
 /// Do the conversion of `to_datafs` through the temporary file `temp`.
@@ -510,6 +533,30 @@ mod tests {
 
     /// The record of a blob.
     const BLOB: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+
+    #[test]
+    fn a_conversion_leaves_the_namespaces_out_and_counts_the_durable_keys() {
+        use zoe_core::Flavour::{Durable, Ephemeral};
+        let dir = test_dir("to-data-fs-namespaces");
+        let store = Store::open(dir.join("store")).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.store(Oid(0), Tid::ZERO, b"\x80\x03cm\nC\nq\x00.\x80\x03}.")
+            .unwrap();
+        txn.kv_set(Durable, "registry", b"a", b"1", None).unwrap();
+        txn.kv_set(Durable, "registry", b"b", b"2", None).unwrap();
+        let hour = Some(std::time::Duration::from_secs(3600));
+        txn.kv_set(Ephemeral, "sessions", b"s", b"v", hour).unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+        let report = to_datafs(&store, &dir.join("Data.fs"), &dir.join("blobs")).unwrap();
+        // Two keys; the generation row is no key, and an ephemeral key is
+        // not counted.
+        assert_eq!(report.durable_keys, 2);
+        assert_eq!(report.transactions, 1);
+        assert_eq!(report.problem_count(), 0, "{:?}", report.problems);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Commit `writes` and the blobs `blobs` in one transaction of `store`,
     /// with the description `description`.

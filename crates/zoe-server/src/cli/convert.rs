@@ -189,6 +189,13 @@ fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::R
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
     writeln!(out, "  last tid      {:#018x}", report.last_tid.0)?;
+    if report.durable_keys > 0 {
+        writeln!(
+            out,
+            "  left out      {} keys of the durable namespaces: a Data.fs holds no namespace",
+            report.durable_keys
+        )?;
+    }
     writeln!(out, "  problems      {}", report.problem_count())?;
     let width = report
         .counts()

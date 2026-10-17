@@ -1171,7 +1171,9 @@ fn compare_durable(store: &Store, copy: &Store, problems: &mut Problems) -> Resu
     let theirs = all(copy)?;
     let mut ours = ours.into_iter().peekable();
     for dumped in theirs {
-        while let Some(row) = ours.next_if(|row| (&row.name, &row.key) < (&dumped.name, &dumped.key)) {
+        while let Some(row) =
+            ours.next_if(|row| (&row.name, &row.key) < (&dumped.name, &dumped.key))
+        {
             problems.push(format!("{}: not in the dumps", name(&row)));
         }
         match ours.next_if(|row| (&row.name, &row.key) == (&dumped.name, &dumped.key)) {
@@ -1579,10 +1581,13 @@ mod tests {
         files
     }
 
-    /// Commit `writes` of the namespaces in a normal transaction, each a
-    /// flavour, a name, a key and a value or `None` for a delete. Return
+    /// A write of a namespace: a flavour, a name, a key and a value or
+    /// `None` for a delete.
+    type KvWrite<'a> = (zoe_core::Flavour, &'a str, &'a [u8], Option<&'a [u8]>);
+
+    /// Commit `writes` of the namespaces in a normal transaction. Return
     /// the tid.
-    fn commit_kv(store: &Store, writes: &[(zoe_core::Flavour, &str, &[u8], Option<&[u8]>)]) -> Tid {
+    fn commit_kv(store: &Store, writes: &[KvWrite<'_>]) -> Tid {
         use zoe_core::Flavour;
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         for &(flavour, name, key, value) in writes {
@@ -1628,7 +1633,12 @@ mod tests {
         assert_eq!(incremental.durable_rows, 5);
         // A backup with nothing new writes nothing.
         assert_eq!(backup(&store, &dumps).unwrap().dump, None);
-        assert!(check_dumps(&store, &dumps, &dir).unwrap().differences.is_empty());
+        assert!(
+            check_dumps(&store, &dumps, &dir)
+                .unwrap()
+                .differences
+                .is_empty()
+        );
         drop(store);
 
         let restored = restore(&dumps, &target).unwrap();
@@ -1660,7 +1670,7 @@ mod tests {
         commit_kv(&store, &[(Durable, "registry", b"title", Some(b"site"))]);
         backup(&store, &dumps).unwrap();
         // A change of the row that no commit made: the dumps differ.
-        let mut write_row = |payload: &[u8]| {
+        let write_row = |payload: &[u8]| {
             let row = DurableRow {
                 name: "registry".to_owned(),
                 key: b"title".to_vec(),
@@ -1672,7 +1682,10 @@ mod tests {
         let check = check_dumps(&store, &dumps, &dir).unwrap();
         assert_eq!(check.differences.len(), 1, "{:?}", check.differences);
         let text = &check.differences[0];
-        assert!(text.contains("\"registry\"") && text.contains("another value"), "{text}");
+        assert!(
+            text.contains("\"registry\"") && text.contains("another value"),
+            "{text}"
+        );
         assert!(!text.contains("title"), "a difference names no key: {text}");
         drop(store);
         let _ = fs::remove_dir_all(&dir);
