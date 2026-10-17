@@ -175,13 +175,13 @@ fn fields_of(heap: &Heap, state: Value) -> Result<Fields, Outcome> {
     Ok(items.to_vec())
 }
 
-/// Refuses a state where two fields hold one list, dict, set or object of
-/// another class: a merge that takes the fields from two records would
+/// Gives no answer for a state where two fields hold one object that the
+/// pickler memoizes: a merge that takes the fields from two records would
 /// split it in two.
 fn check_shared(heap: &Heap, fields: &Fields) -> Result<(), Outcome> {
     let mut seen = HashSet::new();
     for &(_, value) in fields {
-        for id in heap.mutable_objects(value) {
+        for id in heap.memoized_objects(value) {
             if !seen.insert(id) {
                 return Err(Outcome::Undecided("an object that two fields share"));
             }
@@ -273,41 +273,39 @@ fn make(heap: &mut Heap, kind: Kind, items: Vec<Value>) -> Value {
     }
 }
 
-/// A key of an item for `union`: two items are one when Python finds them
-/// equal. An int, a bool and a float of the same value are one.
+/// A key of an item for `union`: two items are one when they are equal
+/// for the model (`Heap::same`): the same kind and the same value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ItemKey {
     None,
+    Bool(bool),
     Int(i128),
     Float(u64),
     Str(String),
     Bytes(Vec<u8>),
     Tuple(Vec<ItemKey>),
+    List(Vec<ItemKey>),
 }
 
-/// Returns the key of an item, or `None` for an item that Python cannot
-/// hash or that the model cannot compare: a list, a dict, a set, an object
-/// of another class, a persistent reference, a NaN.
+/// Returns the key of an item, or `None` for an item that `union` does not
+/// take: a dict, a set, an object of another class, a persistent
+/// reference or a class.
 fn item_key(heap: &Heap, value: Value) -> Option<ItemKey> {
     Some(match value {
         Value::None => ItemKey::None,
-        Value::Bool(b) => ItemKey::Int(i128::from(b)),
+        Value::Bool(b) => ItemKey::Bool(b),
         Value::Int(int) => ItemKey::Int(int),
-        Value::Float(float) => {
-            if float.is_nan() {
-                return None;
-            }
-            if float.fract() == 0.0 && float.abs() < 1e38 {
-                // Python: `1.0 == 1` and both hash alike.
-                ItemKey::Int(float as i128)
-            } else {
-                ItemKey::Float(float.to_bits())
-            }
-        }
+        Value::Float(float) => ItemKey::Float(float.to_bits()),
         Value::Object(_) => match heap.object(value)? {
             Object::Str(text) => ItemKey::Str(text.clone()),
             Object::Bytes(bytes) => ItemKey::Bytes(bytes.clone()),
             Object::Tuple(items) => ItemKey::Tuple(
+                items
+                    .iter()
+                    .map(|&item| item_key(heap, item))
+                    .collect::<Option<_>>()?,
+            ),
+            Object::List(items) => ItemKey::List(
                 items
                     .iter()
                     .map(|&item| item_key(heap, item))
@@ -321,6 +319,7 @@ fn item_key(heap: &Heap, value: Value) -> Option<ItemKey> {
 /// The strategy `union`: the items of the old value that neither side
 /// removed, then the items that the committed side added, then the items
 /// that the new side added, each item once, in the kind of the new value.
+/// The three values are lists, tuples or sets.
 fn union(
     heap: &mut Heap,
     old: Option<Value>,
@@ -328,19 +327,17 @@ fn union(
     new: Value,
 ) -> Result<Value, Outcome> {
     let not_items = Outcome::Undecided("values that the strategy union does not take");
-    let (_, old_items) = match old {
-        Some(old) => items(heap, old).ok_or(not_items.clone())?,
-        None => (Kind::List, Vec::new()),
-    };
+    let (_, old_items) = old
+        .and_then(|old| items(heap, old))
+        .ok_or(not_items.clone())?;
     let (_, committed_items) = items(heap, committed).ok_or(not_items.clone())?;
     let (kind, new_items) = items(heap, new).ok_or(not_items.clone())?;
     let keys = |items: &[Value]| -> Option<Vec<ItemKey>> {
         items.iter().map(|&item| item_key(heap, item)).collect()
     };
-    let unhashable = Outcome::Undecided("items that the strategy union cannot compare");
-    let old_keys = keys(&old_items).ok_or(unhashable.clone())?;
-    let committed_keys = keys(&committed_items).ok_or(unhashable.clone())?;
-    let new_keys = keys(&new_items).ok_or(unhashable)?;
+    let old_keys = keys(&old_items).ok_or(not_items.clone())?;
+    let committed_keys = keys(&committed_items).ok_or(not_items.clone())?;
+    let new_keys = keys(&new_items).ok_or(not_items)?;
     let old_set: HashSet<&ItemKey> = old_keys.iter().collect();
     let committed_set: HashSet<&ItemKey> = committed_keys.iter().collect();
     let new_set: HashSet<&ItemKey> = new_keys.iter().collect();
@@ -361,9 +358,10 @@ fn union(
     Ok(make(heap, kind, result))
 }
 
-/// The strategy `append`: the old value is a prefix of both values; the
-/// result is the committed value, then the items that the new side added
-/// after the old value, in the kind of the new value.
+/// The strategy `append`: the three values are lists, or the three are
+/// tuples, and the old value is a prefix of both others; the result is the
+/// committed value, then the items that the new side added after the old
+/// value.
 fn append(
     heap: &mut Heap,
     old: Option<Value>,
@@ -375,11 +373,15 @@ fn append(
         Some((kind @ (Kind::List | Kind::Tuple), items)) => Some((kind, items)),
         _ => None,
     };
-    let (_, old_items) = old
+    let (old_kind, old_items) = old
         .and_then(|old| sequence(heap, old))
         .ok_or(not_append.clone())?;
-    let (_, committed_items) = sequence(heap, committed).ok_or(not_append.clone())?;
+    let (committed_kind, committed_items) = sequence(heap, committed).ok_or(not_append.clone())?;
     let (kind, new_items) = sequence(heap, new).ok_or(not_append.clone())?;
+    let tuple = |kind| matches!(kind, Kind::Tuple);
+    if tuple(old_kind) != tuple(kind) || tuple(committed_kind) != tuple(kind) {
+        return Err(not_append);
+    }
     let prefix = |items: &[Value]| {
         items.len() >= old_items.len()
             && old_items.iter().zip(items).all(|(&a, &b)| heap.same(a, b))
