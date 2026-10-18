@@ -360,7 +360,20 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     plan.refused = Some((oid, current, read));
                     return Ok(plan);
                 }
-                Split::Passed | Split::Undecided(_) => source.release_from(kept),
+                Split::Undecided(why) => {
+                    source.release_from(kept);
+                    // A lock of a bucket of the other side that is not
+                    // free gives an entry of rule 3 on the node. The vote
+                    // goes on as without the rule.
+                    if why == split::LOCKED
+                        && node_mode == Mode::On
+                        && let Some(&(read, current)) = serials.get(&oid)
+                    {
+                        plan.resolutions
+                            .push(undecided(oid, &class, 3, why, read, current, rules));
+                    }
+                }
+                Split::Passed => source.release_from(kept),
             }
         }
         source.shadow.set(false);
@@ -479,13 +492,15 @@ fn refusal(
     }
 }
 
-/// Returns the entry of the resolution log of a stale read-current node on
-/// which the vote fails in mode `on`, when rule 1 gives no answer for it:
-/// `why` is the reason of rule 1. The vote fails as without the rules, so
-/// the entry is not applied.
-pub(super) fn read_conflict(
+/// Returns the entry of the resolution log of a stale node for which
+/// `rule` gives no answer in mode `on`, with the reason `why`: a
+/// read-current node on which the vote fails (rule 1), or a node whose
+/// bucket of the other side is locked (rule 3). The vote goes on as
+/// without the rules, so the entry is not applied.
+pub(super) fn undecided(
     oid: Oid,
     class: &str,
+    rule: u8,
     why: &'static str,
     read: Tid,
     current: Tid,
@@ -506,7 +521,7 @@ pub(super) fn read_conflict(
         read,
         shadow: None,
         fields: Vec::new(),
-        split: Some(1),
+        split: Some(rule),
     }
 }
 
@@ -891,6 +906,82 @@ mod tests {
             assert_eq!(store.load(w).unwrap().0, bucket(&[70, 80], None));
         });
         assert_eq!(store.load(b1).unwrap().0, bucket(&[40, 45, 50], Some(y)));
+        assert!(store.locks.is_empty());
+    }
+
+    /// Returns the record of an `IIBTree` that holds one bucket of `keys`
+    /// inline, each key with the value 1.
+    fn inline(keys: &[i128]) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("BTrees.IIBTree", "IIBTree");
+        let items = keys.iter().flat_map(|&k| [Value::Int(k), Value::Int(1)]);
+        let bucket = new_bucket_state(&mut heap, items.collect(), None);
+        let inner = heap.new_tuple(vec![bucket]);
+        let state = heap.new_tuple(vec![inner]);
+        record(&heap, class, state)
+    }
+
+    #[test]
+    fn a_locked_bucket_of_an_inline_root_gives_a_line_of_rule_3_on_the_root() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let policy = new_oid(&store);
+        let (policy_record, root) = policy_and_root(policy, "on");
+        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        let n = new_oid(&store);
+        let read = commit(&store, &[(n, Tid::ZERO, inline(&[10, 20, 30]))]);
+        // S1 splits the inline bucket into y1 and y2.
+        let (y1, y2) = (new_oid(&store), new_oid(&store));
+        let s1 = commit(
+            &store,
+            &[
+                (n, read, node(y1, &[(30, y2)])),
+                (y1, Tid::ZERO, bucket(&[10, 20], Some(y2))),
+                (y2, Tid::ZERO, bucket(&[30, 40], None)),
+            ],
+        );
+        // Another transaction writes y1 without the root and holds its
+        // lock.
+        let mut other = store.tpc_begin(b"", b"", b"").unwrap();
+        other
+            .store(y1, s1, &bucket(&[10, 15, 20], Some(y2)))
+            .unwrap();
+        other.vote().unwrap();
+        // S2 read before S1 and splits the inline bucket too.
+        let (a, x) = (new_oid(&store), new_oid(&store));
+        let mut s2 = store.tpc_begin(b"", b"", b"").unwrap();
+        s2.set_server_writes(true);
+        for (oid, serial, data) in [
+            (n, read, node(a, &[(20, x)])),
+            (a, Tid::ZERO, bucket(&[10], Some(x))),
+            (x, Tid::ZERO, bucket(&[20, 25, 30], None)),
+        ] {
+            s2.store(oid, serial, &data).unwrap();
+        }
+        let voted = s2.vote();
+        assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == n));
+        // The root gets one entry of rule 3 that is not applied, and keeps
+        // the entry of tier 1 on which the vote fails.
+        let resolutions = s2.resolutions();
+        let rule_3: Vec<_> = resolutions
+            .iter()
+            .filter(|r| r.oid == n && r.split == Some(3))
+            .map(|r| (r.outcome, r.applied))
+            .collect();
+        assert_eq!(
+            rule_3,
+            [(Resolved::Undecided(crate::merge::split::LOCKED), false)],
+            "{resolutions:?}"
+        );
+        assert!(
+            resolutions
+                .iter()
+                .any(|r| r.oid == n && r.split.is_none() && r.applied),
+            "{resolutions:?}"
+        );
+        assert!(!s2.wrote_unstored());
+        other.finish().unwrap();
+        drop(s2);
         assert!(store.locks.is_empty());
     }
 }
