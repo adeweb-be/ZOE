@@ -29,8 +29,9 @@ process, with or without the option.
 - **A field changed in place** is staged again before the commit and
   before each savepoint. A rollback to a savepoint drops the decoded rows.
 - **The guard** of a stock registry in a store with namespaces calls
-  `readCurrent` on the registry when code reads its records. So a write
-  that began before a move conflicts. `configure.zcml` installs the guard
+  `readCurrent` on the roots of its trees when code reads its records, and
+  the move writes those roots. So a write that began before a move
+  conflicts, and a write of an attribute of the registry object does not. `configure.zcml` installs the guard
   whenever `zoe.plone` loads.
 
 `move_back(registry)` puts the records back into new `OOBTree`s and deletes
@@ -132,8 +133,8 @@ def _has_namespaces(jar):
 
 def install_guard():
     """Make each stock registry in a store with namespaces call
-    `readCurrent` on itself when code reads its records. A second call does
-    nothing."""
+    `readCurrent` on the roots of its trees when code reads its records. A
+    second call does nothing."""
     if _guard:
         return
     stock = Registry.__dict__["records"]
@@ -141,7 +142,7 @@ def install_guard():
     def records(self):
         found = stock.fget(self)
         if not isinstance(found, MovedRecords):
-            _read_current(self)
+            _read_current(self, found)
         return found
 
     _guard["records"] = stock
@@ -154,14 +155,40 @@ def uninstall_guard():
         Registry.records = _guard.pop("records")
 
 
-def _read_current(registry):
-    """Call `readCurrent` on `registry` when it is in a store with
-    namespaces. The caller has loaded it."""
+def _holds_its_bucket(tree):
+    """Tell if the loaded `tree` keeps its keys in its own state: an empty
+    tree, or a tree of one bucket. A write of a record then writes the
+    root itself."""
+    state = tree.__getstate__()
+    return state is None or len(state) == 1
+
+
+def _read_current(registry, records):
+    """Call `readCurrent` on the roots of `_fields` and `_values` of the
+    stock `records` of `registry`, when it is in a store with namespaces.
+    A move writes these roots, so a write that began before the move
+    conflicts. A write of an attribute of the registry object does not.
+
+    A root that keeps its own keys is written by each write of a record,
+    and a resolution of a conflict could then merge the write into the
+    trees that the move left. So for such a root, the guard calls
+    `readCurrent` on the registry object too, which the move writes."""
     jar = registry._p_jar
-    oid = registry._p_oid
-    if jar is None or oid is None or oid in jar._readCurrent:
+    if jar is None or registry._p_oid is None or not _has_namespaces(jar):
         return
-    if _has_namespaces(jar):
+    whole = False
+    for tree in (records._fields, records._values):
+        if tree._p_jar is not jar or tree._p_oid is None:
+            # A tree that is not stored yet.
+            whole = True
+            continue
+        # A ghost has no serial yet.
+        tree._p_activate()
+        if tree._p_oid not in jar._readCurrent:
+            jar.readCurrent(tree)
+        if _holds_its_bucket(tree):
+            whole = True
+    if whole and registry._p_oid not in jar._readCurrent:
         jar.readCurrent(registry)
 
 
@@ -654,6 +681,12 @@ def move(registry):
     namespace = zoe.kv.Namespace(jar, "durable", namespace_name(registry_id))
     for tree in (records._fields, records._values):
         _read_current_tree(jar, tree)
+        # The guard calls readCurrent on a root with children, so the move
+        # writes it. A root that keeps its own keys stays: the guard reads
+        # the registry object then, and the readCurrent of the move on the
+        # root finds a write of a record.
+        if tree._p_jar is jar and not _holds_its_bucket(tree):
+            tree._p_changed = True
 
     def seen(obj):
         if obj._p_jar is jar and obj._p_oid is not None:

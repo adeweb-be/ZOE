@@ -24,9 +24,9 @@
   <zcml:customAction handler=".backends_from_environment" />
 
   <!-- The guard of a stock registry, with or without the registry backend:
-       in a store with namespaces, a registry calls readCurrent on itself
-       when code reads its records. So a write that began before a move of
-       the registry conflicts (ADR 0050). -->
+       in a store with namespaces, a registry calls readCurrent on the
+       roots of its trees when code reads its records. A move writes these
+       roots, so a write that began before a move conflicts (ADR 0050). -->
   <zcml:customAction handler=".registry.install_guard" />
 
   <!-- Queued indexing, when its backend is installed: the thread of the

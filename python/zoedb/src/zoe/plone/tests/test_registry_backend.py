@@ -353,18 +353,95 @@ class TestRegistryBackend(unittest.TestCase):
                 app[PLONE_SITE_ID].portal_registry[TITLE], "Written before the move"
             )
 
-    def test_without_the_guard_a_write_that_races_a_move_is_lost(self):
+    def test_a_record_write_during_a_move_makes_the_move_conflict(self):
+        backend.move(self.registry)
+        with opened(self.db) as (app, manager):
+            app[PLONE_SITE_ID].portal_registry[TITLE] = "Written during the move"
+            manager.commit()
+        with self.assertRaises(ConflictError):
+            transaction.commit()
+        transaction.abort()
+        with opened(self.db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertNotIsInstance(aq_base(registry)._records, backend.MovedRecords)
+            self.assertEqual(registry[TITLE], "Written during the move")
+
+    def test_an_attribute_write_of_the_registry_does_not_conflict_with_a_reader(
+        self,
+    ):
+        records = self.registry.records
+        for tree in (records._fields, records._values):
+            self.assertFalse(backend._holds_its_bucket(tree))
+        with opened(self.db) as (app, manager):
+            site = app[PLONE_SITE_ID]
+            self.assertTrue(site.portal_registry[TITLE])
+            site.zoe_test_attribute = "Written by the reader"
+            with opened(self.db) as (other_app, other_manager):
+                # As the subscribers of the resources and of the theme do.
+                registry = aq_base(other_app[PLONE_SITE_ID].portal_registry)
+                registry.zoe_test_mtime = 1
+                other_manager.commit()
+            manager.commit()
+
+    def small_registry(self):
+        """Store a registry of one record, whose trees keep their keys in
+        their roots, at the Zope root. Return it."""
+        app = self.layer["app"]
+        app.zoe_small_registry = small = Registry()
+        small.records["zoe.small"] = Record(TextLine(title="Small"), "Stored")
+        transaction.commit()
+        self.assertTrue(backend._holds_its_bucket(small.records._fields))
+        return small
+
+    def test_a_write_that_races_a_move_of_a_small_registry_conflicts(self):
+        self.small_registry()
+        with opened(self.db) as (app, manager):
+            app.zoe_small_registry["zoe.small"] = "Written before the move"
+            backend.move(self.layer["app"].zoe_small_registry)
+            transaction.commit()
+            with self.assertRaises(ConflictError):
+                manager.commit()
+        with opened(self.db) as (app, _):
+            self.assertEqual(app.zoe_small_registry["zoe.small"], "Stored")
+
+    def test_a_write_during_a_move_of_a_small_registry_makes_the_move_conflict(
+        self,
+    ):
+        small = self.small_registry()
+        backend.move(small)
+        with opened(self.db) as (app, manager):
+            app.zoe_small_registry["zoe.small"] = "Written during the move"
+            manager.commit()
+        with self.assertRaises(ConflictError):
+            transaction.commit()
+        transaction.abort()
+        with opened(self.db) as (app, _):
+            self.assertEqual(
+                app.zoe_small_registry["zoe.small"], "Written during the move"
+            )
+
+    def test_the_guard_makes_a_field_change_that_races_a_move_conflict(self):
+        with opened(self.db) as (app, manager):
+            field = app[PLONE_SITE_ID].portal_registry.records[TITLE].field
+            field.title = "Changed before the move"
+            self.moved()
+            with self.assertRaises(ConflictError):
+                manager.commit()
+
+    def test_without_the_guard_a_field_change_that_races_a_move_is_lost(self):
+        # A write of a record reads the nodes of the tree current itself
+        # (BTrees), so it conflicts without the guard. A change of a field
+        # in place reads no node: only the guard makes it conflict.
         backend.uninstall_guard()
         self.addCleanup(backend.install_guard)
         with opened(self.db) as (app, manager):
-            writer = app[PLONE_SITE_ID].portal_registry
-            writer[TITLE] = "Written before the move"
+            field = app[PLONE_SITE_ID].portal_registry.records[TITLE].field
+            field.title = "Changed before the move"
             self.moved()
             manager.commit()
         with opened(self.db) as (app, _):
-            self.assertNotEqual(
-                app[PLONE_SITE_ID].portal_registry[TITLE], "Written before the move"
-            )
+            field = app[PLONE_SITE_ID].portal_registry.records[TITLE].field
+            self.assertNotEqual(field.title, "Changed before the move")
 
     # The move back, the copy and the reset.
 
