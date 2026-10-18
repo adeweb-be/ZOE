@@ -10,7 +10,8 @@ With a client that declares `server_writes` (`zoe.Storage` under a ZODB
 database, and the native mode of `zoe.zeo.ClientStorage`), S2 merges into
 A and Y, and T commits. A second Connection of the process of S2 that holds
 Y in its object cache sees the key of S2 after the commit. The finish gives
-the Connections every oid of the commit in one invalidation.
+the Connections every oid of the commit in one invalidation. A new
+Connection of another process finds every key, and `BTrees.check` passes.
 
 Without the declaration (a stock `ZEO.ClientStorage`, and the asyncio mode
 of `zoe.zeo.ClientStorage`), rule 3 gives no answer: S2 raises
@@ -24,6 +25,7 @@ import pytest
 import transaction
 import ZODB
 from BTrees.OOBTree import OOBTree
+from test_zoe_split_merges import other_process
 from ZODB.POSException import ConflictError, UndoError
 
 import zoe
@@ -45,7 +47,7 @@ class Opened:
     def __init__(self, mode, tmp_path):
         self.mode = mode
         self.server = None
-        store = tmp_path / "store"
+        store = self.store = tmp_path / "store"
         if mode == "in-process":
             self.db = ZODB.DB(zoe.Storage(str(store)))
             return
@@ -74,6 +76,19 @@ class Opened:
         self.db.close()
         if self.server is not None:
             self.server.__exit__(None, None, None)
+
+    def check_in_another_process(self, keys, tmp_path):
+        """Check the tree and each of `keys` in a new Connection of another
+        process. In-process, the store closes for that check, which opens
+        it read-only, and opens again after it."""
+        expected = {"tree": set(keys)}
+        if self.server is None:
+            self.db.close()
+            other_process(str(self.store), expected, tmp_path)
+            self.db = ZODB.DB(zoe.Storage(str(self.store)))
+            return
+        host, port = self.server.address
+        other_process(f"zeo:{host}:{port}", expected, tmp_path)
 
 
 @pytest.fixture
@@ -150,6 +165,7 @@ class Card:
     def close(self):
         for conn in self.conns.values():
             conn.close()
+        self.conns.clear()
 
 
 def run_card(db, last, reader=None):
@@ -181,7 +197,7 @@ def run_card(db, last, reader=None):
 
 
 @pytest.mark.parametrize("opened", DECLARING, indirect=True)
-def test_the_insert_into_the_bucket_of_the_other_side_commits(opened):
+def test_the_insert_into_the_bucket_of_the_other_side_commits(opened, tmp_path):
     db = opened.db
     last = full_tree(db)
     reader = {}
@@ -194,6 +210,7 @@ def test_the_insert_into_the_bucket_of_the_other_side_commits(opened):
             assert buckets(conn.root()["tree"]) == reader["buckets"]
     finally:
         card.close()
+    opened.check_in_another_process([*range(last + 1), *card.keys], tmp_path)
 
 
 @pytest.mark.parametrize("opened", STOCK, indirect=True)
