@@ -165,6 +165,15 @@ def test_a_cookie_that_does_not_parse_expires_with_its_path():
     assert indexing._cookie_path(None, Request()) == "/"
 
 
+def test_a_cookie_path_can_hold_a_dash():
+    # A site behind a virtual host: the path of the cookie is not the path
+    # of the request.
+    request = Request(PATH_INFO="/VirtualHostBase/http/host:80/plone/doc")
+    assert indexing._cookie_path("x-y-/my-site", request) == "/my-site"
+    assert indexing._cookie_path("x-y--/a-b/c-d", request) == "/a-b/c-d"
+    assert indexing._cookie_path("x-y-/a%20b-c", request) == "/a b-c"
+
+
 @pytest.mark.parametrize(
     "value, error",
     [
