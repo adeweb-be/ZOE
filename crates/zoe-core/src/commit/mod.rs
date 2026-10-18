@@ -1831,17 +1831,32 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// its staged pickle in a transaction of `stored_bytes`, or `None` when
     /// the pickle breaks `max-record-size` or `max-transaction-size`.
     fn merged_size(&self, oid: Oid, pickle: &[u8], stored_bytes: u64) -> Option<u64> {
+        self.merged_size_replacing(oid, pickle, stored_bytes, None)
+    }
+
+    /// Return the transaction size after `pickle` replaces a pickle of
+    /// `oid` of `replaced` bytes in a transaction of `stored_bytes`, as
+    /// `merged_size` does. `None` for `replaced` is the staged pickle of
+    /// `oid`; a merge that a later merge replaces gives its own length.
+    fn merged_size_replacing(
+        &self,
+        oid: Oid,
+        pickle: &[u8],
+        stored_bytes: u64,
+        replaced: Option<u64>,
+    ) -> Option<u64> {
         if self.is_restore() {
             return Some(stored_bytes);
         }
         let guardrails = &self.store.guardrails;
         let size = pickle.len() as u64;
         guardrails.check(SizeLimit::Record, oid, size).ok()?;
-        let staged = self
-            .staged
-            .record(oid)
-            .map_or(0, |staged| staged.pickle_len() as u64);
-        let total = stored_bytes.saturating_sub(staged).saturating_add(size);
+        let replaced = replaced.unwrap_or_else(|| {
+            self.staged
+                .record(oid)
+                .map_or(0, |staged| staged.pickle_len() as u64)
+        });
+        let total = stored_bytes.saturating_sub(replaced).saturating_add(size);
         guardrails.check(SizeLimit::Transaction, oid, total).ok()?;
         Some(total)
     }
@@ -3684,6 +3699,25 @@ mod tests {
         assert!(matches!(after, Err(ZoeError::Protocol(_))), "{after:?}");
         txn.finish().unwrap();
         assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), first));
+    }
+
+    #[test]
+    fn a_merge_that_replaces_a_merge_counts_the_length_of_the_first_merge() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let oid = Oid(1);
+        txn.store(oid, Tid::ZERO, b"0123456789").unwrap();
+        let staged = txn.stored_bytes;
+        assert_eq!(staged, 10);
+        // A first merge of 4 bytes replaces the staged pickle.
+        let first = txn.merged_size(oid, b"abcd", staged).unwrap();
+        assert_eq!(first, 4);
+        // A second merge of 6 bytes replaces the first one, not the
+        // staged pickle.
+        let second = txn
+            .merged_size_replacing(oid, b"abcdef", first, Some(4))
+            .unwrap();
+        assert_eq!(second, 6);
     }
 
     #[test]

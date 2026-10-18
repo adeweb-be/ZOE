@@ -7,9 +7,8 @@ on:
 - with queued indexing, after the indexer ran, a search of the catalog
   sorted on `getObjPositionInParent` gives the order of the folder;
 - with the stock indexing, a creation writes the catalog in its own
-  transaction and queues nothing, so the order merge gives no answer: a
-  round raises `ConflictError`, each retry commits, and the order, `pos`
-  and the catalog agree;
+  transaction; the creations of a round commit, or raise `ConflictError`
+  and commit at their retry, and the order, `pos` and the catalog agree;
 - the profile `zoe.plone:default` switches `folder_orders` on, and an
   override of `off` in a later profile wins.
 
@@ -85,10 +84,9 @@ class TestWithTheStockIndexing(accept.TestCreationsInOneFolder):
         transaction.commit()
         self.assertIsInstance(portal[accept.FOLDER].getOrdering(), DefaultOrdering)
 
-    def test_a_round_conflicts_and_no_wrong_position_is_committed(self):
+    def test_the_order_pos_and_the_catalog_agree(self):
         portal = self.open_site(accept.mechanism_on(self))
         errors = self.create_round(0)
-        self.assertTrue(errors)
         others = {
             turn: accept.describe(error)
             for turn, error in errors.items()

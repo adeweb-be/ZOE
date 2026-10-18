@@ -3,8 +3,7 @@
 //! The first conflict of a vote whose merge policy sets `folder_orders` to
 //! `on` or `shadow` makes a [`Plan`] for the stale order lists of the
 //! transaction, beside the plan of the split merge. The plan runs
-//! `merge::order::plan` on each of them, after the transaction queued its
-//! indexing (section 2, step 9 of ADR 0052).
+//! `merge::order::plan` on each of them.
 //!
 //! In mode `on`, the check of the written serials skips each order that the
 //! plan merges. After the check of every serial, the vote renumbers the ids
@@ -108,8 +107,6 @@ pub(super) fn line(
     }
 }
 
-/// The reason of a list whose transaction queued no indexing.
-const NO_QUEUE: &str = "a transaction that does not queue its indexing";
 /// The reason of a list in mode `shadow`.
 const SHADOW: &str = "an order in shadow mode";
 
@@ -159,10 +156,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// `rules`. The vote holds its locks.
     pub(super) fn order_plan(&self, rules: &Rules<'_>) -> Result<Plan> {
         let mut plan = Plan::default();
-        let mode = mode(rules);
-        if mode == Mode::Off {
+        // The plan finds the orders whenever the switch is not `off`, so
+        // tier 2 never merges one. It merges only where tier 1 of the
+        // positions runs too.
+        if rules.folder_orders() == Mode::Off {
             return Ok(plan);
         }
+        let mode = mode(rules);
         // The stored lists that the transaction read at a serial.
         let lists: Vec<(Oid, Tid)> = self
             .staged
@@ -176,7 +176,6 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if lists.is_empty() {
             return Ok(plan);
         }
-        let queues = self.staged.writes_durable_namespace(order::QUEUE);
         let source = TxnSource { txn: self };
         for chunk in lists.chunks(READ_CHUNK) {
             let current = self.current_serials(chunk.iter().map(|&(oid, _)| oid))?;
@@ -204,14 +203,18 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     Mode::Shadow => line(Resolved::Undecided(SHADOW), Some(outcome), ids),
                     _ => line(outcome, None, ids),
                 };
-                match order::plan(&source, oid)? {
+                let planned = order::plan(&source, oid)?;
+                if matches!(planned, Planned::NotOrder) {
+                    continue;
+                }
+                plan.known.insert(oid);
+                if mode == Mode::Off {
+                    continue;
+                }
+                match planned {
                     Planned::NotOrder => {}
                     Planned::Merge(merge) => {
-                        plan.known.insert(oid);
-                        if !queues {
-                            let entry = decided(Resolved::Undecided(NO_QUEUE), &merge.ids);
-                            plan.lines.insert(oid, entry);
-                        } else if mode == Mode::Shadow {
+                        if mode == Mode::Shadow {
                             let outcome = self.shadow_outcome(&merge)?;
                             plan.lines.insert(oid, decided(outcome, &merge.ids));
                         } else {
@@ -219,7 +222,6 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         }
                     }
                     Planned::Refused { reason, ids } => {
-                        plan.known.insert(oid);
                         let entry = decided(Resolved::Refused(reason), &ids);
                         if mode == Mode::On && plan.refused.is_none() {
                             let mut entry = entry;
@@ -230,7 +232,6 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         }
                     }
                     Planned::Undecided { why, ids } => {
-                        plan.known.insert(oid);
                         plan.lines
                             .insert(oid, decided(Resolved::Undecided(why), &ids));
                     }
@@ -362,7 +363,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
         };
         size = total;
         for Renumbered { oid, pickle, .. } in &renumbered {
-            let Some(total) = self.merged_size(*oid, pickle, size) else {
+            // A record that a merge gave counts with the length of that
+            // merge, not with the length of the staged pickle.
+            let replaced = merged
+                .iter()
+                .find(|(record, _, _)| record == oid)
+                .map(|(_, _, earlier)| earlier.len() as u64);
+            let Some(total) = self.merged_size_replacing(*oid, pickle, size, replaced) else {
                 return Ok(Err("a merged record over a size limit"));
             };
             size = total;

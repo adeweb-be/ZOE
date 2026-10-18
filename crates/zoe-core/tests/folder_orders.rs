@@ -8,16 +8,14 @@
 //! `persistent.list.PersistentList` of ids, and the positions, an
 //! `OIBTree` of id to index. A creation appends its id to the order,
 //! inserts it into the positions with the index `len(order) - 1`, sets
-//! `modification_date` of the folder, and queues its indexing. After each
+//! `modification_date` of the folder. After each
 //! commit, the test reads the store: the order holds each id once, and the
 //! positions are `{id: index}` of the order.
 
 use std::collections::BTreeMap;
 
 use zoe_core::vfs::MemVfs;
-use zoe_core::{
-    Flavour, Mode, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError,
-};
+use zoe_core::{Mode, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError};
 use zoe_pickle::btrees::{TreeState, bucket_state, new_bucket_state, tree_state};
 use zoe_pickle::python::{Heap, Object, Pickler, Value};
 
@@ -568,16 +566,10 @@ fn create_split(site: Site, snap: &Snap, ids: &[String], new: &[Oid], at: usize)
     writes
 }
 
-/// Begins a transaction of `writes`. With `queue`, it writes a key of the
-/// queue of queued indexing, as a creation of a site with queued indexing
-/// does. With `server_writes`, its client takes records that it did not
-/// store, as the native client and `zoe.Storage`.
-fn begin<'s>(
-    store: &'s Store,
-    writes: &[Write],
-    queue: bool,
-    server_writes: bool,
-) -> Txn<&'s Store> {
+/// Begins a transaction of `writes`. With `server_writes`, its client
+/// takes records that it did not store, as the native client and
+/// `zoe.Storage`.
+fn begin<'s>(store: &'s Store, writes: &[Write], server_writes: bool) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"user", b"create", b"").unwrap();
     txn.set_server_writes(server_writes);
     for write in writes {
@@ -586,29 +578,19 @@ fn begin<'s>(
             Write::ReadCurrent(oid, serial) => txn.check_current_serial(*oid, *serial).unwrap(),
         }
     }
-    if queue {
-        txn.kv_set(
-            Flavour::Durable,
-            "zoe.plone.indexing:00000000000000aa",
-            b"k",
-            b"index",
-            None,
-        )
-        .unwrap();
-    }
     txn
 }
 
-/// Commits `writes` with the queue and `server_writes`.
+/// Commits `writes` with `server_writes`.
 fn commit(store: &Store, writes: &[Write]) -> Tid {
-    let mut txn = begin(store, writes, true, true);
+    let mut txn = begin(store, writes, true);
     txn.vote().unwrap();
     txn.finish().unwrap()
 }
 
 /// Votes and commits `writes`; returns the oids that the vote resolved.
 fn merge(store: &Store, writes: &[Write]) -> Vec<Oid> {
-    let mut txn = begin(store, writes, true, true);
+    let mut txn = begin(store, writes, true);
     txn.vote().unwrap();
     let resolved = txn.natively_resolved();
     txn.finish().unwrap();
@@ -618,17 +600,16 @@ fn merge(store: &Store, writes: &[Write]) -> Vec<Oid> {
 /// Votes `writes`, which must fail with a conflict on `oid`; returns the
 /// entries of the vote.
 fn conflict(store: &Store, writes: &[Write], oid: Oid) -> Vec<zoe_core::Resolution> {
-    conflict_with(store, writes, oid, true, true)
+    conflict_with(store, writes, oid, true)
 }
 
 fn conflict_with(
     store: &Store,
     writes: &[Write],
     oid: Oid,
-    queue: bool,
     server_writes: bool,
 ) -> Vec<zoe_core::Resolution> {
-    let mut txn = begin(store, writes, queue, server_writes);
+    let mut txn = begin(store, writes, server_writes);
     match txn.vote() {
         Err(ZoeError::Conflict { oid: failed }) => {
             assert_eq!(failed, oid, "the oid of the conflict")
@@ -703,12 +684,7 @@ fn an_id_in_a_bucket_that_the_other_side_did_not_write_is_staged_again() {
     commit(&store, &create(site, &old, &[id(10)]));
     // An id that sorts into the first bucket, which the other side did
     // not write: that record of the transaction is not stale.
-    let mut txn = begin(
-        &store,
-        &create(site, &old, &["a-first".to_owned()]),
-        true,
-        true,
-    );
+    let mut txn = begin(&store, &create(site, &old, &["a-first".to_owned()]), true);
     txn.vote().unwrap();
     assert!(txn.natively_resolved().contains(&first));
     let entry = txn
@@ -760,7 +736,7 @@ fn a_split_of_one_bucket_by_both_sides_without_server_writes_conflicts() {
     let Pos::Node(buckets) = &old.pos else {
         panic!("a node")
     };
-    let mut txn = begin(&store, &writes, true, false);
+    let mut txn = begin(&store, &writes, false);
     assert!(txn.vote().is_err());
     drop(txn);
     let _ = buckets;
@@ -901,7 +877,7 @@ fn both_sides_adding_one_id_refuse() {
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
     commit(&store, &create(site, &old, &[id(3)]));
-    let mut txn = begin(&store, &create(site, &old, &[id(3)]), true, true);
+    let mut txn = begin(&store, &create(site, &old, &[id(3)]), true);
     let voted = txn.vote();
     assert!(voted.is_err());
     let entries = txn.resolutions().to_vec();
@@ -1059,26 +1035,6 @@ fn a_transaction_that_appended_nothing_gives_no_answer() {
 }
 
 #[test]
-fn without_the_queue_of_queued_indexing_the_merge_gives_no_answer() {
-    let store = open(ON);
-    let site = site(&store, &ids(0..3), None);
-    let old = snap(&store, site);
-    commit(&store, &create(site, &old, &[id(3)]));
-    let entries = conflict_with(
-        &store,
-        &create(site, &old, &[id(4)]),
-        site.order,
-        false,
-        true,
-    );
-    assert_eq!(
-        list_entry(&entries, site).unwrap().outcome,
-        Resolved::Undecided("a transaction that does not queue its indexing")
-    );
-    assert_eq!(assert_agrees(&store, site), ids(0..4));
-}
-
-#[test]
 fn with_tier_1_of_the_buckets_off_the_merge_does_not_run() {
     let store = open(Settings {
         bucket_tier1: Some("off"),
@@ -1131,26 +1087,59 @@ fn in_shadow_mode_the_vote_conflicts_and_the_line_tells_the_outcome() {
 
 // Tier 2 and an order.
 
+/// The writes of a creation of `new` whose transaction also changes the
+/// position of the first id: the order is a plain append, but the
+/// positions break the equation, so the order merge gives no answer.
+fn create_with_another_change(site: Site, snap: &Snap, new: &str) -> Vec<Write> {
+    let mut order = snap.order.clone();
+    order.push(new.to_owned());
+    let mut items = positions(&order);
+    items[0].1 = 99;
+    vec![
+        Write::Store(
+            site.folder,
+            snap.folder,
+            folder(site.annotations, snap.date + 1),
+        ),
+        Write::Store(site.order, snap.order_serial, list(&order)),
+        Write::Store(site.pos, snap.pos_serial, pos_inline(&items)),
+    ]
+}
+
 #[test]
 fn tier_2_never_merges_an_order() {
-    for folder_orders in ["on", "shadow"] {
-        let store = open(Settings {
-            folder_orders: Some(folder_orders),
+    let cases = [
+        Settings {
             list_tier2: Some("on"),
             ..ON
-        });
+        },
+        Settings {
+            folder_orders: Some("shadow"),
+            list_tier2: Some("on"),
+            ..ON
+        },
+        // With tier 1 of the buckets off the merge does not run, and the
+        // vote still knows the order.
+        Settings {
+            bucket_tier1: Some("off"),
+            list_tier2: Some("on"),
+            ..ON
+        },
+    ];
+    for settings in cases {
+        let store = open(settings);
         let site = site(&store, &ids(0..3), None);
         let old = snap(&store, site);
         commit(&store, &create(site, &old, &[id(3)]));
-        // No queue: the merge gives no answer, and tier 2 must not merge
-        // the order without the positions.
-        let entries = conflict_with(
+        // Tier 2 would append to the order without the positions.
+        let mut txn = begin(
             &store,
-            &create(site, &old, &[id(4)]),
-            site.order,
-            false,
+            &create_with_another_change(site, &old, &id(4)),
             true,
         );
+        assert!(txn.vote().is_err(), "the vote passed");
+        let entries = txn.resolutions().to_vec();
+        drop(txn);
         assert!(
             entries
                 .iter()
@@ -1212,7 +1201,7 @@ fn an_undo_of_a_merged_creation_gives_back_the_order_and_the_positions_before_it
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
     commit(&store, &create(site, &old, &[id(3)]));
-    let mut txn = begin(&store, &create(site, &old, &[id(4)]), true, true);
+    let mut txn = begin(&store, &create(site, &old, &[id(4)]), true);
     txn.vote().unwrap();
     let merged = txn.finish().unwrap();
     assert_eq!(assert_agrees(&store, site), ids(0..5));
@@ -1297,7 +1286,7 @@ fn a_resolving_vote_merges_the_order() {
     let site = site(&store, &ids(0..3), None);
     let old = snap(&store, site);
     commit(&store, &create(site, &old, &[id(3)]));
-    let mut txn = begin(&store, &create(site, &old, &[id(4)]), true, true);
+    let mut txn = begin(&store, &create(site, &old, &[id(4)]), true);
     // The merge leaves no conflict to the caller, so the resolving vote is
     // the vote.
     let conflicts = txn.vote_resolving().unwrap();
@@ -1367,4 +1356,142 @@ fn the_merged_records_name_no_other_change() {
         assert_eq!(now.get(id), Some(index));
     }
     assert_eq!(now.get(&id(4)), Some(&4));
+}
+
+// More changes that give no answer.
+
+/// The writes of a transaction that writes `order` and its positions, as
+/// a sort, a rename or a delete of plone.folder does.
+fn rewrite(site: Site, snap: &Snap, order: &[String]) -> Vec<Write> {
+    vec![
+        Write::Store(
+            site.folder,
+            snap.folder,
+            folder(site.annotations, snap.date + 1),
+        ),
+        Write::Store(site.order, snap.order_serial, list(order)),
+        Write::Store(site.pos, snap.pos_serial, pos_inline(&positions(order))),
+    ]
+}
+
+#[test]
+fn a_sort_on_either_side_gives_no_answer() {
+    for sort_first in [true, false] {
+        let store = open(ON);
+        let site = site(&store, &ids(0..3), None);
+        let old = snap(&store, site);
+        let mut sorted = old.order.clone();
+        sorted.reverse();
+        let (theirs, ours) = if sort_first {
+            (rewrite(site, &old, &sorted), create(site, &old, &[id(3)]))
+        } else {
+            (create(site, &old, &[id(3)]), rewrite(site, &old, &sorted))
+        };
+        commit(&store, &theirs);
+        let entries = conflict(&store, &ours, site.order);
+        let entry = list_entry(&entries, site).expect("a line of the order");
+        assert_eq!(
+            entry.outcome,
+            Resolved::Undecided("an order that is not appends on both sides")
+        );
+    }
+}
+
+#[test]
+fn a_rename_of_an_existing_item_gives_no_answer() {
+    let store = open(ON);
+    let site = site(&store, &ids(0..3), None);
+    let old = snap(&store, site);
+    commit(&store, &create(site, &old, &[id(3)]));
+    let mut renamed = old.order.clone();
+    renamed[1] = "renamed".to_owned();
+    let entries = conflict(&store, &rewrite(site, &old, &renamed), site.order);
+    assert_eq!(
+        list_entry(&entries, site).unwrap().outcome,
+        Resolved::Undecided("an order that is not appends on both sides")
+    );
+}
+
+#[test]
+fn a_delete_by_the_transaction_gives_no_answer() {
+    let store = open(ON);
+    let site = site(&store, &ids(0..3), None);
+    let old = snap(&store, site);
+    commit(&store, &create(site, &old, &[id(3)]));
+    let entries = conflict(&store, &rewrite(site, &old, &ids(1..3)), site.order);
+    assert_eq!(
+        list_entry(&entries, site).unwrap().outcome,
+        Resolved::Undecided("an order that is not appends on both sides")
+    );
+}
+
+/// Returns the record of an order of `ids` of the class `m.OtherList`.
+fn other_list(ids: &[String]) -> Vec<u8> {
+    let mut heap = Heap::with_instances();
+    let values: Vec<Value> = ids.iter().map(|id| heap.new_str(id)).collect();
+    list_of("m", "OtherList", &values, &mut heap)
+}
+
+#[test]
+fn an_order_of_another_class_as_the_old_record_gives_no_answer() {
+    let store = open(ON);
+    let site = site(&store, &ids(0..3), None);
+    // The record that both sides read is of another class.
+    let (_, serial) = store.load(site.order).unwrap();
+    let mut txn = begin(
+        &store,
+        &[Write::Store(site.order, serial, other_list(&ids(0..3)))],
+        true,
+    );
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    let old = snap(&store, site);
+    commit(&store, &create(site, &old, &[id(3)]));
+    let entries = conflict(&store, &create(site, &old, &[id(4)]), site.order);
+    assert_eq!(
+        list_entry(&entries, site).unwrap().outcome,
+        Resolved::Undecided("a record of the order of another class")
+    );
+}
+
+#[test]
+fn an_order_of_another_class_as_the_new_record_is_not_an_order() {
+    let store = open(ON);
+    let site = site(&store, &ids(0..3), None);
+    let old = snap(&store, site);
+    commit(&store, &create(site, &old, &[id(3)]));
+    let mut writes = create(site, &old, &[id(4)]);
+    let mut order = old.order.clone();
+    order.push(id(4));
+    for write in &mut writes {
+        if let Write::Store(oid, _, data) = write
+            && *oid == site.order
+        {
+            *data = other_list(&order);
+        }
+    }
+    let entries = conflict(&store, &writes, site.order);
+    assert!(list_entry(&entries, site).is_none(), "{entries:?}");
+}
+
+#[test]
+fn a_rename_on_create_on_the_committed_side_in_buckets_gives_no_answer() {
+    let store = open(ON);
+    let site = site(&store, &ids(0..6), Some(3));
+    let old = snap(&store, site);
+    commit(&store, &rename_on_create(&store, site, &old, "renamed"));
+    // The rebuild gave the root new children: the vote fails on the root
+    // that the transaction marked read-current, or on the order.
+    let mut txn = begin(&store, &create(site, &old, &[id(6)]), true);
+    assert!(
+        matches!(
+            txn.vote(),
+            Err(ZoeError::Conflict { .. } | ZoeError::ReadConflict { .. })
+        ),
+        "the vote passed"
+    );
+    drop(txn);
+    let mut expected = ids(0..6);
+    expected.push("renamed".to_owned());
+    assert_eq!(assert_agrees(&store, site), expected);
 }

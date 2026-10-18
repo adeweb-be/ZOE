@@ -6,8 +6,7 @@ whose attribute annotations, an `OOBTree`, hold the order, a
 positions, an `OIBTree` of id to index, under ``plone.folder.ordered.pos``.
 A creation runs the code of `DefaultOrdering.notifyAdded`: it appends the
 id to the order and gives it the index ``len(order) - 1`` in the positions.
-It also sets ``modification_date`` of the folder, and writes a key of the
-queue of queued indexing (ADR 0047) where the storage has namespaces.
+It also sets ``modification_date`` of the folder.
 
 In each round, each transaction creates one item from one snapshot, then
 they commit one after the other. The rounds pass a split of the bucket
@@ -17,10 +16,10 @@ id once, the positions are ``{id: index}`` of the order, and
 `BTrees.check` passes on the positions.
 
 The test runs in-process on `zoe.Storage`, and through `zoe serve` with the
-native client and with `ZEO.ClientStorage`. A stock `ZEO.ClientStorage` has
-no namespaces, so its transactions queue no indexing: the merge gives no
-answer, its rounds raise `ConflictError`, and the order and the positions
-still agree.
+native client and with `ZEO.ClientStorage`. A stock `ZEO.ClientStorage`
+does not declare `server_writes`, so the split merge gives no answer when
+both sides split the bucket of the positions (ADR 0049): those rounds raise
+`ConflictError` for it, and the order and the positions still agree.
 """
 
 import itertools
@@ -40,7 +39,6 @@ from persistent.list import PersistentList
 from ZODB.POSException import ConflictError
 
 import zoe
-import zoe.kv
 import zoe.policy
 import zoe.testing
 from zoe.testing import ZoeServer
@@ -55,8 +53,6 @@ TIMEOUT = 30
 MODES = ("in-process", "native-client", "zeo-client")
 ORDER_KEY = "plone.folder.ordered.order"
 POS_KEY = "plone.folder.ordered.pos"
-# The queue of queued indexing of a catalog.
-QUEUE = "zoe.plone.indexing:00000000000000ff"
 
 
 class Folder(persistent.Persistent):
@@ -159,7 +155,7 @@ def name(number):
     return f"item-{number:05d}"
 
 
-def create(conn, item, queue=True):
+def create(conn, item):
     """Create `item` in the folder of `conn`, as plone.folder does."""
     folder = conn.root()["folder"]
     order = folder.__annotations__[ORDER_KEY]
@@ -167,8 +163,6 @@ def create(conn, item, queue=True):
     order.append(item)
     pos[item] = len(order) - 1
     folder.modification_date += 1
-    if queue and zoe.kv._supported(conn):
-        zoe.kv.Namespace(conn, "durable", QUEUE).set(item, b"index")
 
 
 def rename_on_create(conn, item):
@@ -195,7 +189,7 @@ def setup(conn, items):
         folder.__annotations__[POS_KEY][name(number)] = number
 
 
-def one_round(db, start, queue=True):
+def one_round(db, start):
     """Run one round on `db` from the item number `start`. Return the
     outcome of each transaction: True when it committed."""
     managers = [transaction.TransactionManager() for _ in range(CREATORS)]
@@ -204,7 +198,7 @@ def one_round(db, start, queue=True):
         for manager in managers:
             manager.begin()
         for turn, conn in enumerate(conns):
-            create(conn, name(start + turn), queue)
+            create(conn, name(start + turn))
         outcomes = []
         for manager in managers:
             try:
@@ -302,7 +296,7 @@ class Site:
             self.server.__exit__(*exc)
 
 
-def run_rounds(mode, tmp_path, queue=True):
+def run_rounds(mode, tmp_path):
     """Run the rounds in `mode` from a folder a few items below the inline
     limit of its positions. Return the outcomes of each round and the lines
     of the order merge."""
@@ -312,7 +306,7 @@ def run_rounds(mode, tmp_path, queue=True):
         with site.db.transaction() as conn:
             setup(conn, start)
         for _ in range(ROUNDS):
-            outcomes = one_round(site.db, start, queue)
+            outcomes = one_round(site.db, start)
             rounds.append(outcomes)
             start += CREATORS
             site.check_elsewhere(tmp_path)
@@ -329,19 +323,13 @@ def test_with_the_order_merge_every_creation_commits_at_the_first_attempt(
     assert parts == {"list", "pos"}, lines
 
 
-def test_a_stock_client_queues_no_indexing_and_keeps_the_stock_behaviour(tmp_path):
+def test_a_stock_client_merges_but_where_both_sides_split_one_bucket(tmp_path):
     rounds, lines = run_rounds("zeo-client", tmp_path)
+    # The rounds after the first fill one inline bucket from one snapshot:
+    # both sides split it, and rule 3 gives no answer without
+    # `server_writes`. The other creations merge their order.
     assert not all(all(outcomes) for outcomes in rounds), rounds
-    assert lines, "the order merge ran"
-    assert all(line["outcome"] == "undecided" for line in lines), lines
-
-
-def test_a_transaction_that_queues_no_indexing_gets_no_merge(tmp_path):
-    rounds, lines = run_rounds("in-process", tmp_path, queue=False)
-    assert not all(all(outcomes) for outcomes in rounds), rounds
-    assert {line["reason"] for line in lines} == {
-        "a transaction that does not queue its indexing"
-    }, lines
+    assert any(line["order"] == "list" and line["applied"] for line in lines), lines
 
 
 def race(db, first, second):
@@ -390,7 +378,7 @@ def test_a_rename_on_create_merges_only_in_an_inline_positions_tree(items, tmp_p
         assert order[-2:] == ["appended", "renamed"]
 
 
-@pytest.mark.parametrize("mode", MODES[:2])
+@pytest.mark.parametrize("mode", MODES)
 def test_a_new_bucket_that_the_merge_renumbers_turns_into_a_ghost(mode, tmp_path):
     """The other side inserts into the first bucket of the positions. The
     transaction splits the full last bucket into it and a new bucket X,

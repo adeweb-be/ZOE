@@ -413,6 +413,20 @@ def test_two_sites_in_one_database_compose():
     assert merges.compose(None, new)["classes"]["m.Odd"] == {"tier2": "on"}
 
 
+def test_each_switch_takes_the_lower_mode_of_two_sites():
+    site_a = {"classes": {}, "folder_orders": "off", "split_merges": "on"}
+    site_b = {"classes": {}, "folder_orders": "on", "split_merges": "shadow"}
+    stored = merges.compose(None, site_a)
+    # The profile of the second site switches the order merge on: the off
+    # of the first site lasts.
+    stored = merges.compose(stored, site_b)
+    assert stored["folder_orders"] == "off"
+    assert stored["split_merges"] == "shadow"
+    # A switch that one site does not give keeps the mode of the other.
+    assert merges.compose(stored, {"classes": {}})["folder_orders"] == "off"
+    assert merges.compose(None, site_b)["folder_orders"] == "on"
+
+
 class Mode(enum.StrEnum):
     ON = "on"
 

@@ -18,9 +18,8 @@ plain values only, so the core reads it in Rust, in-process and in
   is off;
 - ``folder_orders``, optional: the mode of the order merge of ADR 0052,
   ``on``, ``shadow`` or ``off``. It merges two appends to the order of a
-  folder of plone.folder and renumbers its positions, in a transaction
-  that queues its indexing (queued indexing, ADR 0047). Its companions are
-  queued indexing and ``split_merges``. The store has no key of this name:
+  folder of plone.folder and renumbers its positions. Its companions are
+  queued indexing (ADR 0047) and ``split_merges``. The store has no key of this name:
   without the switch, the order merge is off. While it is not ``off``, a
   policy cannot give ``persistent.list.PersistentList`` a ``tier2`` other
   than ``off``: tier 2 would merge an order without its positions;

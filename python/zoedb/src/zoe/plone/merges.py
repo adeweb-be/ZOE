@@ -28,8 +28,10 @@ the overrides of each profile in turn, composes the result with the policy
 in the database, and writes it with `zoe.policy.install`. The composition
 keeps the classes of other sites of the database: the coupled groups of a
 class are the union of both, its fields take both, a blocked class stays
-blocked, and the other keys take the new value. A change of a Dexterity
-type derives the policy again (`fti_modified`).
+blocked, each switch takes the lower of its two modes (``off``, then
+``shadow``, then ``on``), so an ``off`` of one site lasts as a blocked
+class does, and the other keys take the new value. A change of a
+Dexterity type derives the policy again (`fti_modified`).
 
 The overrides are a JSON object with these keys, each optional:
 
@@ -38,11 +40,14 @@ The overrides are a JSON object with these keys, each optional:
 - ``structural_merges``, ``posting_dicts``, ``split_merges`` and
   ``folder_orders``: the switches of tier 1. The overrides of the profile
   ``zoe.plone:default`` set ``folder_orders`` to ``on`` (the order merge of
-  ADR 0052, which merges only in a transaction that queues its indexing);
-  they set no other switch, so the split merge of ADR 0048 stays off until
-  an override or `zoe.policy.install` sets it. An override of
-  ``folder_orders`` in the profile of a site wins, as the profiles apply in
-  turn;
+  ADR 0052); they set no other switch, so the split merge of ADR 0048
+  stays off until an override or `zoe.policy.install` sets it. The profile
+  alone merges no order: its derived entries stay in shadow mode, the
+  record of a folder conflicts before its order, and ``split_merges`` is
+  off. A site gets the order merge once its overrides switch on the entries
+  of its container classes, and ``split_merges`` where the positions of a
+  folder split. An override of ``folder_orders`` in the profile of a site
+  wins, as the profiles apply in turn;
 - ``classes``: entries by class name; an entry changes the keys that it
   gives, its ``fields`` add to the derived ones, and its ``coupled`` groups
   add to the derived groups; ``null`` removes the entry of a class. An
@@ -87,6 +92,8 @@ OVERRIDES = "zoe-merge-policy.json"
 DEFAULT_MODE = "shadow"
 #: The strategies of the derived entries. The other fields are strict.
 FIELDS = {"modification_date": "max"}
+#: The modes of a switch, from the lowest.
+LOWER = ("off", "shadow", "on")
 #: The attribute of the site that keeps the overrides of each profile.
 SITE_OVERRIDES = "_zoe_merge_overrides"
 
@@ -239,9 +246,14 @@ def compose(stored, new):
         return merge_policy.validate(new)
     result = {"classes": {}}
     for switch in merge_policy.SWITCHES:
-        value = new.get(switch, stored.get(switch))
-        if value is not None:
-            result[switch] = value
+        values = [
+            value
+            for value in (stored.get(switch), new.get(switch))
+            if value is not None
+        ]
+        if values:
+            # The lower mode wins, so an `off` of one site lasts.
+            result[switch] = min(values, key=LOWER.index)
     names = list(stored["classes"])
     names += [name for name in new["classes"] if name not in stored["classes"]]
     for name in names:

@@ -37,8 +37,6 @@ use crate::types::{Oid, Tid};
 
 /// The class of the order list, as `module.name`.
 pub(crate) const LIST_CLASS: &str = "persistent.list.PersistentList";
-/// The prefix of the names of the queues of queued indexing (ADR 0047).
-pub(crate) const QUEUE: &[u8] = b"zoe.plone.indexing:";
 /// The key of the order in the annotations of a folder.
 const ORDER_KEY: &str = "plone.folder.ordered.order";
 /// The key of the positions in the annotations of a folder.
@@ -311,6 +309,12 @@ fn find_folder(source: &dyn Source, list: Oid) -> Step<Option<Oid>> {
         if tier1_class(&record).is_some() || is_list(&record) {
             continue;
         }
+        // A record whose bytes do not hold the name of the attribute does
+        // not name annotations: the pickler writes a str once in a record,
+        // and the memo refers to it after. So only such a record decodes.
+        if !holds(&record, ANNOTATIONS.as_bytes()) {
+            continue;
+        }
         let Some(annotations) = annotations_of(&record) else {
             continue;
         };
@@ -333,6 +337,11 @@ fn find_folder(source: &dyn Source, list: Oid) -> Step<Option<Oid>> {
         return Ok(Some(pos));
     }
     Ok(None)
+}
+
+/// Tells if `bytes` holds `part`.
+fn holds(bytes: &[u8], part: &[u8]) -> bool {
+    bytes.windows(part.len()).any(|window| window == part)
 }
 
 /// Returns the oid of the annotations that the state of `record` names
