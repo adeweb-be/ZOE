@@ -73,6 +73,7 @@ mod encoded;
 mod group;
 mod intent;
 mod observer;
+mod order;
 mod split;
 mod staging;
 mod undo;
@@ -1351,6 +1352,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // The first conflict of a vote that takes the locks makes the plan
         // of the split merge (ADR 0048).
         let mut plan: Option<split::Plan> = None;
+        // The first conflict of a written oid also makes the plan of the
+        // order merge (ADR 0052).
+        let mut orders: Option<order::Plan> = None;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
@@ -1457,6 +1461,33 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     {
                         continue;
                     }
+                    if orders.is_none() {
+                        let rules = Rules {
+                            config: &self.store.structural_merges,
+                            policy: policy.as_ref().and_then(Option::as_deref),
+                        };
+                        let made = self.order_plan(&rules)?;
+                        if let Some((oid, current, read, entry)) = &made.refused {
+                            self.resolutions.push(entry.clone());
+                            return Ok(Check::Failed(Stale {
+                                oid: *oid,
+                                current: Some(*current),
+                                read: *read,
+                                read_only: false,
+                            }));
+                        }
+                        orders = Some(made);
+                    }
+                    if let Some(orders) = &orders {
+                        // The vote stages the merged order after the
+                        // check of every serial.
+                        if orders.covers(oid) {
+                            continue;
+                        }
+                        if let Some(entry) = orders.lines.get(&oid) {
+                            self.resolutions.push(entry.clone());
+                        }
+                    }
                 }
                 // Only a conflict reads its committed record. A deletion
                 // has an empty pickle and is never resolved. A record that
@@ -1466,7 +1497,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     Some(record) if record.tid == current && !record.data.is_empty() => record,
                     _ => return Ok(Check::Failed(stale)),
                 };
-                let resolved = if native {
+                // Tier 2 never merges the order of a folder.
+                let order = orders
+                    .as_ref()
+                    .is_some_and(|orders| orders.known.contains(&oid));
+                let resolved = if native && !order {
                     let rules = Rules {
                         config: &self.store.structural_merges,
                         policy: policy.as_ref().and_then(Option::as_deref),
@@ -1602,6 +1637,38 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     read,
                     read_only: true,
                 }));
+            }
+        }
+        // The order merge renumbers the records of the positions that the
+        // vote stages, then adds the merged lists.
+        if let Some(orders) = &orders
+            && !orders.merges.is_empty()
+        {
+            let current = policy.clone().flatten();
+            let failed = self.finish_orders(
+                orders,
+                current.as_deref(),
+                &mut merged,
+                &onto,
+                &mut stored_bytes,
+            )?;
+            if let Some((oid, current, read)) = failed {
+                let stale = Stale {
+                    oid,
+                    current: Some(current),
+                    read,
+                    read_only: false,
+                };
+                if !resolve {
+                    return Ok(Check::Failed(stale));
+                }
+                // The caller gets the order with its committed record.
+                match self.store.backend.load_before(oid, Tid::MAX)? {
+                    Some(record) if record.tid == current && !record.data.is_empty() => {
+                        conflicts.push((oid, record));
+                    }
+                    _ => return Ok(Check::Failed(stale)),
+                }
             }
         }
         Ok(Check::Passed {

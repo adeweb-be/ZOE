@@ -344,6 +344,20 @@ impl Staging {
         self.kv.get(&(flavour, row.to_vec()))
     }
 
+    /// Tells if a staged write of a durable namespace has a name that
+    /// starts with `prefix`. Reads the keys of the rows alone.
+    pub(crate) fn writes_durable_namespace(&self, prefix: &[u8]) -> bool {
+        self.kv.keys().any(|(flavour, row)| {
+            let Some((&len, rest)) = row.split_first() else {
+                return false;
+            };
+            *flavour == Flavour::Durable
+                && rest
+                    .get(..usize::from(len))
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
+    }
+
     /// Return the number of staged namespace writes.
     #[cfg(test)]
     pub(crate) fn kv_len(&self) -> usize {
