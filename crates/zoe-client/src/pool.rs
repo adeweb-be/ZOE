@@ -307,8 +307,11 @@ struct Slot {
     turn: bool,
     /// The turn came after the listener was lost.
     stale: bool,
+    /// The finish needs the oids of the commit: a vote listed an oid as
+    /// resolved.
+    wants_oids: bool,
     /// The oids of the commit, from its invalidation on the listener, when
-    /// the dispatcher gave the turn.
+    /// the dispatcher gave the turn and the finish needs them.
     oids: Option<Vec<Oid>>,
 }
 
@@ -893,6 +896,7 @@ impl Pool {
             lease,
             writes: Vec::new(),
             stored: HashSet::new(),
+            resolved: false,
             unstored: false,
         })
     }
@@ -1185,6 +1189,7 @@ impl PoolIntents {
             lease: self.lease.take().expect("a lease"),
             writes: Vec::new(),
             stored: HashSet::new(),
+            resolved: false,
             unstored: false,
         })
     }
@@ -1228,6 +1233,8 @@ pub struct PoolTransaction {
     writes: Vec<(Oid, Option<Vec<u8>>)>,
     /// The oids that the transaction stored, deleted or restored.
     stored: HashSet<Oid>,
+    /// True when a vote listed an oid as resolved.
+    resolved: bool,
     /// True when a vote listed as resolved an oid that the transaction did
     /// not store: the server wrote it (ADR 0049), or the oid of an undo.
     unstored: bool,
@@ -1419,6 +1426,7 @@ impl PoolTransaction {
     /// becomes a write without data, as `TransactionBuffer` of ZEO gives
     /// it: the turn ends its current entry.
     fn server_resolved(&mut self, resolved: &[Oid]) {
+        self.resolved |= !resolved.is_empty();
         if resolved.iter().any(|oid| !self.stored.contains(oid)) {
             self.unstored = true;
         }
@@ -1483,6 +1491,9 @@ impl PoolTransaction {
         let txn = self.txn.take().expect("an open transaction");
         let writes = std::mem::take(&mut self.writes);
         let unstored = self.unstored;
+        // The turn needs the oids of the commit for the consumer, or for the
+        // cache when the server resolved an oid.
+        let wants_oids = unstored || (self.resolved && shared.cache.is_some());
         let tid = txn.finish().await?;
         {
             let mut state = shared.lock();
@@ -1495,7 +1506,13 @@ impl PoolTransaction {
             if state.head.is_some_and(|head| head < tid.0) {
                 state.counters.waited += 1;
             }
-            state.replied.insert(tid.0, Slot::default());
+            state.replied.insert(
+                tid.0,
+                Slot {
+                    wants_oids,
+                    ..Slot::default()
+                },
+            );
         }
         flight.armed = false;
         drop(flight);
@@ -1576,7 +1593,10 @@ impl Finished {
     ///
     /// At the turn, before it returns, the commit goes into the cache of the
     /// pool: it ends the current entry of each oid that it wrote, and adds
-    /// the data of each store that the server did not resolve. A turn after
+    /// the data of each store that the server did not resolve. An oid that
+    /// the transaction wrote and that the commit does not hold, as a node
+    /// that the server resolved without a record (ADR 0049), only loses its
+    /// current entry: its next load enters the cache again. A turn after
     /// a lost listener only drops the current entry of each oid that it
     /// wrote, and the cache skips the tid (`Cache::skip`): the cache did
     /// not get the commits before it.
@@ -1601,7 +1621,21 @@ impl Finished {
                 let oids: Vec<Oid> = self.writes.iter().map(|(oid, _)| *oid).collect();
                 cache.skip(tid, &oids);
             } else {
-                cache.commit(tid, &last_writes(&self.writes));
+                let mut writes = last_writes(&self.writes);
+                // The server resolved some oids. It wrote no record for an
+                // oid that the commit does not hold: drop its current entry,
+                // and do not end it at the tid.
+                if let Some(commit) = &oids {
+                    let commit: HashSet<Oid> = commit.iter().copied().collect();
+                    writes.retain(|(oid, _)| {
+                        let held = commit.contains(oid);
+                        if !held {
+                            cache.drop_current(*oid);
+                        }
+                        held
+                    });
+                }
+                cache.commit(tid, &writes);
             }
         }
         // The oids of the commit go to the consumer only when the server
@@ -1841,7 +1875,9 @@ async fn deliver(shared: &Shared, listener: &Client, invalidation: Invalidation)
         }
         if let Some(slot) = state.replied.get_mut(&tid) {
             slot.turn = true;
-            slot.oids = Some(invalidation.oids.clone());
+            if slot.wants_oids {
+                slot.oids = Some(invalidation.oids.clone());
+            }
             state.started += 1;
             return Some(Some(Route::Own));
         }

@@ -170,6 +170,14 @@ _Avoid_: version, revision
 One backend write that removes the expired keys of the ephemeral namespaces, at most 1,000.
 _Avoid_: garbage collection, expiry pack
 
+**Moved registry**:
+A registry of plone.registry whose records `zoe.plone.registry.move` put in a durable namespace of its own, named by a random id, with a marker row that holds its oid and its write counter (ADR 0050).
+_Avoid_: registry storage, KV registry
+
+**Write counter**:
+The number in the state of a moved registry and in its marker that each transaction that writes the registry raises by 1. A registry whose marker holds a lower counter is a copy with stale rows.
+_Avoid_: version, generation
+
 ## Server
 
 **Invalidation hub**:

@@ -2441,6 +2441,7 @@ dependencies = [
  "tokio-rustls",
  "xxhash-rust",
  "zoe-core",
+ "zoe-pickle",
  "zoe-server",
 ]
 

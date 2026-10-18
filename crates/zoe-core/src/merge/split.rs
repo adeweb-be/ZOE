@@ -191,6 +191,11 @@ impl From<Outcome> for Stop {
     }
 }
 
+/// The reason of rule 3 when the lock of a new bucket of the other side is
+/// not free. The vote gives a line of rule 3 on the node for it (ADR 0049,
+/// section 9).
+pub(crate) const LOCKED: &str = "a bucket of the other side that another transaction locks";
+
 /// The result of a step of a rule.
 type Step<T> = std::result::Result<T, Stop>;
 
@@ -986,7 +991,7 @@ impl<'s> Group<'s> {
             return no("a new bucket of the other side that the transaction stored");
         }
         if !self.source.lock(oid)? {
-            return no("a bucket of the other side that another transaction locks");
+            return no(LOCKED);
         }
         Ok(())
     }
