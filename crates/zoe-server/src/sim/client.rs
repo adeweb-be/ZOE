@@ -16,18 +16,26 @@
 //! With a hot `Length`, the hot oid holds a `BTrees.Length.Length`. A
 //! transaction that writes it stores the value that it read plus 1, so the
 //! writers of the hot oid conflict, and tier 1 of the server merges them.
+//!
+//! A split writer (`Simulation::split_merges`) declares `server_writes`,
+//! and each of its transactions inserts one key into the tree of
+//! `tree.rs` instead: it reads the node and the bucket of the key, and
+//! stores the bucket with the node as read-current, or, when the bucket is
+//! full, the node, the bucket and a new bucket of the split.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zoe_client::{Client, Error};
+use zoe_client::{Client, Error, Options};
 use zoe_core::{Oid, Tid};
 
 use super::rng::Rng;
 use super::server::SimRuntime;
-use super::world::{Acked, Shared, phase, sleep};
+use super::tree::{self, MAX_KEYS};
+use super::world::{Acked, Shared, TreeCommit, phase, sleep};
 use crate::protocol::STORAGE_NAME;
+use crate::protocol::negotiation::SERVER_WRITES;
 
 /// The oids that the clients share.
 const OIDS: u64 = 6;
@@ -85,6 +93,8 @@ pub(crate) struct SimClient {
     pub(crate) blobs: bool,
     /// The hot oid holds a `Length` that the client increments.
     pub(crate) hot_length: bool,
+    /// The client declares `server_writes` and inserts into the tree.
+    pub(crate) split_merges: bool,
 }
 
 impl SimClient {
@@ -143,7 +153,16 @@ impl SimClient {
                 return None;
             }
             let runtime: Arc<dyn zoe_client::Runtime> = runtime.clone();
-            match Client::connect_with(runtime, ADDR, STORAGE_NAME).await {
+            let connected = if self.split_merges {
+                let options = Options {
+                    extensions: vec![SERVER_WRITES.to_owned()],
+                    ..Options::default()
+                };
+                Client::open(runtime, ADDR, STORAGE_NAME, &options).await
+            } else {
+                Client::connect_with(runtime, ADDR, STORAGE_NAME).await
+            };
+            match connected {
                 Ok(client) => {
                     self.trace("registered");
                     return Some(client);
@@ -213,6 +232,9 @@ impl SimClient {
     /// Try one transaction: read the current serials of one or two oids,
     /// store new records, vote and finish.
     async fn commit(&mut self, client: &Client, t: usize, attempt: usize) -> Outcome {
+        if self.split_merges {
+            return self.insert(client, t).await;
+        }
         // Half of the transactions write oid 1, a hot object as a catalog
         // or a counter is.
         let first = if self.rng.chance(0.5) {
@@ -304,9 +326,139 @@ impl SimClient {
                     tid: tid.0,
                     records: stored,
                     blobs,
+                    tree: None,
                 })
             }
             Err(Error::Disconnected) => Outcome::Lost { in_finish: true },
+            Err(_) => Outcome::Retry,
+        }
+    }
+}
+
+impl SimClient {
+    /// Try one transaction of a split writer: insert the key of `t` into
+    /// the tree, vote and finish.
+    ///
+    /// The client reads the node, then the bucket whose range holds the
+    /// key, then the node again: a node that changed between gives a new
+    /// try, so the two records are one state of the tree, as a snapshot of
+    /// ZODB gives them. A bucket that stays within `MAX_KEYS` keys is the
+    /// only record that it stores, with the node as read-current, as
+    /// BTrees marks it. A full bucket splits: the client stores the node
+    /// with the new bucket as a child, the bucket and the new bucket.
+    async fn insert(&mut self, client: &Client, t: usize) -> Outcome {
+        let (root, key) = {
+            let state = self.shared.lock();
+            let root = state.tree_root.expect("a run of split writers has a tree");
+            (root, tree::key(t, state.clients, self.id))
+        };
+        let (serial, data) = match self.load(client, root).await {
+            Ok(loaded) => loaded,
+            Err(outcome) => return outcome,
+        };
+        let Some(mut node) = data.as_deref().and_then(tree::node) else {
+            self.trace("reads a root of the tree that is not a node");
+            return Outcome::Retry;
+        };
+        let child = node.child_for(key);
+        let (child_serial, data) = match self.load(client, child).await {
+            Ok(loaded) => loaded,
+            Err(outcome) => return outcome,
+        };
+        let Some(mut bucket) = data.as_deref().and_then(tree::bucket) else {
+            self.trace(&format!("reads a child {child} that is not a bucket"));
+            return Outcome::Retry;
+        };
+        match self.serial(client, root).await {
+            Ok(again) if again == serial => {}
+            Ok(_) => return Outcome::Retry,
+            Err(outcome) => return outcome,
+        }
+        bucket.insert(key, self.id as i128);
+        let lost = |error: Error| match error {
+            Error::Disconnected => Outcome::Lost { in_finish: false },
+            _ => Outcome::Retry,
+        };
+        let mut writes = Vec::new();
+        let mut created = Vec::new();
+        let mut current = None;
+        if bucket.items.len() <= MAX_KEYS {
+            writes.push((child, child_serial, tree::bucket_record(&bucket)));
+            current = Some(root);
+        } else {
+            let new = match client.new_oids(1).await {
+                Ok(oids) => oids[0].0,
+                Err(error) => return lost(error),
+            };
+            let (left, right) = bucket.split(new);
+            node.insert_after(child, right.items[0].0, new);
+            writes.push((root, serial, tree::node_record(&node)));
+            writes.push((child, child_serial, tree::bucket_record(&left)));
+            writes.push((new, Tid::ZERO, tree::bucket_record(&right)));
+            created.push(new);
+        }
+        let user = format!("c{}", self.id);
+        let mut txn = match client.begin(user.as_bytes(), b"", b"").await {
+            Ok(txn) => txn,
+            Err(error) => return lost(error),
+        };
+        for (oid, serial, data) in &writes {
+            if let Err(error) = txn.store(Oid(*oid), *serial, data).await {
+                return lost(error);
+            }
+        }
+        if let Some(oid) = current
+            && let Err(error) = txn.check_current_serial(Oid(oid), serial).await
+        {
+            return lost(error);
+        }
+        self.reach(phase::STAGED);
+        let resolved: Vec<u64> = match txn.vote_resolved().await {
+            Ok(resolved) => resolved.into_iter().map(|oid| oid.0).collect(),
+            Err(error) => {
+                if let Error::Conflict { oid, .. } = &error {
+                    self.trace(&format!("conflicts on oid {}", oid.0));
+                }
+                if matches!(error, Error::Disconnected) && !created.is_empty() {
+                    self.shared.lock().interrupted_split_votes += 1;
+                }
+                return lost(error);
+            }
+        };
+        let commit = TreeCommit {
+            key,
+            stored: writes.iter().map(|(oid, _, _)| *oid).collect(),
+            created,
+            resolved,
+        };
+        let unstored = commit.wrote_unstored();
+        if unstored {
+            self.trace(&format!(
+                "votes a split merge: resolves {:?}, stored {:?}",
+                commit.resolved, commit.stored
+            ));
+        }
+        self.reach(phase::LOCKED);
+        match txn.finish().await {
+            Ok(tid) => {
+                let records = writes
+                    .into_iter()
+                    .filter(|(oid, _, _)| !commit.resolved.contains(oid))
+                    .map(|(oid, _, data)| (oid, data))
+                    .collect();
+                Outcome::Acked(Acked {
+                    tid: tid.0,
+                    records,
+                    blobs: Vec::new(),
+                    tree: Some(Box::new(commit)),
+                })
+            }
+            Err(Error::Disconnected) => {
+                if unstored {
+                    self.shared.lock().interrupted_split_finishes += 1;
+                }
+                Outcome::Lost { in_finish: true }
+            }
             Err(_) => Outcome::Retry,
         }
     }

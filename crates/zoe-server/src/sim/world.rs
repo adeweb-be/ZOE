@@ -123,12 +123,34 @@ pub(crate) struct ServerState {
 }
 
 /// A commit that a client saw acknowledged: its tid, its records and its
-/// blobs.
+/// blobs. A commit of a split writer has only the records that its vote
+/// did not resolve, and its insert into the tree.
 #[derive(Clone, Debug)]
 pub(crate) struct Acked {
     pub(crate) tid: u64,
     pub(crate) records: Vec<(u64, Vec<u8>)>,
     pub(crate) blobs: Vec<(u64, Vec<u8>)>,
+    pub(crate) tree: Option<Box<TreeCommit>>,
+}
+
+/// The insert of a split writer into the tree (`Simulation::split_merges`).
+#[derive(Clone, Debug)]
+pub(crate) struct TreeCommit {
+    /// The key that the transaction inserted.
+    pub(crate) key: i128,
+    /// The oids that the transaction stored.
+    pub(crate) stored: Vec<u64>,
+    /// The new bucket that the transaction stored, when it split one.
+    pub(crate) created: Vec<u64>,
+    /// The oids that the vote resolved.
+    pub(crate) resolved: Vec<u64>,
+}
+
+impl TreeCommit {
+    /// Tell if the vote wrote an oid that the transaction did not store.
+    pub(crate) fn wrote_unstored(&self) -> bool {
+        self.resolved.iter().any(|oid| !self.stored.contains(oid))
+    }
 }
 
 /// The phase of a commit when the server crashes.
@@ -198,6 +220,14 @@ pub(crate) struct State {
     pub(crate) listener_losses: usize,
     /// What the pools of the run delivered.
     pub(crate) pools: Pools,
+    /// The node of the tree of the split writers, when the run has them.
+    pub(crate) tree_root: Option<u64>,
+    /// The transactions of the split writers whose vote wrote an oid that
+    /// they did not store, and whose `tpc_finish` got no reply.
+    pub(crate) interrupted_split_finishes: usize,
+    /// The votes of the split writers that split a bucket and got no
+    /// reply.
+    pub(crate) interrupted_split_votes: usize,
 }
 
 /// What the pools of a run delivered, and the counts of their holds.
@@ -330,6 +360,21 @@ impl State {
             waited_finishes: self.pools.waited,
             lost_listener_finishes: self.pools.lost_listener_finishes,
             length_faults: Vec::new(),
+            tree_faults: Vec::new(),
+            tree_checks: 0,
+            unstored_writes: self
+                .acked
+                .iter()
+                .filter(|acked| {
+                    acked
+                        .tree
+                        .as_ref()
+                        .is_some_and(|commit| commit.wrote_unstored())
+                })
+                .count(),
+            dropped: 0,
+            interrupted_split_finishes: self.interrupted_split_finishes,
+            interrupted_split_votes: self.interrupted_split_votes,
             handoffs: 0,
             syncs: 0,
             synced_commits: 0,
@@ -415,6 +460,9 @@ impl Shared {
                 crash_now: None,
                 listener_losses: 0,
                 pools: Pools::default(),
+                tree_root: None,
+                interrupted_split_finishes: 0,
+                interrupted_split_votes: 0,
             }),
             ready: Ready::default(),
             permits: IdSet::default(),
