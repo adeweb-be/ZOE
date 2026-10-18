@@ -225,3 +225,44 @@ def test_serve_options_and_durability(monkeypatch):
         "zeo": "fsync(2) in FileStorage",
         "zoe": "fdatasync(2)",
     }
+
+
+def test_the_switch_split_merges_goes_into_the_policy_of_the_store():
+    import argparse
+
+    from plonebench.__main__ import add_settings, settings_of
+
+    # By default a run writes nothing, and the store keeps its policy.
+    assert stack.Settings().split_merges is None
+    default = stack.Settings()
+    assert stack.split_merges_refusal(stack.STACKS["zoe-native-qi"], default) is None
+
+    parser = argparse.ArgumentParser()
+    add_settings(parser)
+    settings = settings_of(parser.parse_args(["--split-merges", "on"]))
+    assert settings.split_merges == "on"
+    assert settings.to_json()["split_merges"] == "on"
+    # Only a stack of zoe serve with zoedb reads the policy.
+    assert stack.split_merges_refusal(stack.STACKS["zoe-native-qi"], settings) is None
+    assert "zeo" in stack.split_merges_refusal(stack.STACKS["zeo"], settings)
+    assert stack.split_merges_refusal(stack.STACKS["zoe-stock"], settings)
+    bad = stack.Settings(split_merges="sometimes")
+    assert stack.split_merges_refusal(stack.STACKS["zoe-native-qi"], bad)
+    # A store without a policy gets one with the switch alone.
+    assert stack.split_merges_policy(None, "on") == {
+        "classes": {},
+        "split_merges": "on",
+    }
+    # The classes and the other switches of a policy stay; the version
+    # goes, since `zoe.policy.install` sets it.
+    current = {
+        "version": 3,
+        "posting_dicts": "on",
+        "classes": {"m.Document": {"tier2": "shadow"}},
+    }
+    assert stack.split_merges_policy(current, "on") == {
+        "posting_dicts": "on",
+        "classes": {"m.Document": {"tier2": "shadow"}},
+        "split_merges": "on",
+    }
+    assert current["version"] == 3

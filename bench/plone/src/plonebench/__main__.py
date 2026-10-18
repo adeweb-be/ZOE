@@ -39,6 +39,7 @@ def settings_of(args) -> stack.Settings:
         zeo_fsync=args.zeo_fsync,
         zoe_cache_size=args.zoe_cache_size,
         zoe_compression=args.zoe_compression,
+        split_merges=args.split_merges,
         base_port=defaults.base_port + args.port_offset,
         server_port=defaults.server_port + args.port_offset,
         admin_port=defaults.admin_port + args.port_offset,
@@ -86,6 +87,14 @@ def add_settings(parser: argparse.ArgumentParser) -> None:
         default=defaults.zoe_compression,
         help="the --compression of zoe serve: none, zstd or zstd:LEVEL; by "
         "default the server keeps the default of the store (raw records)",
+    )
+    parser.add_argument(
+        "--split-merges",
+        choices=stack.SPLIT_MERGES,
+        default=defaults.split_merges,
+        help="write the switch split_merges of the merge policy (ADR 0048) "
+        "into the store before the instances start; a stack of zoe serve "
+        "with zoedb only. By default the store keeps the policy of the fixture",
     )
 
 
