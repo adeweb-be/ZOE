@@ -51,3 +51,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0045](0045-lock-intent.md) | Early write-intent locks: the lock before the read of a declared hot object (accepted) |
 | [0046](0046-the-merge-policy.md) | The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2 (accepted) |
 | [0047](0047-queued-indexing.md) | Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them (accepted) |
+| [0048](0048-the-split-merge.md) | The split merge: tier 1 merges the splits of a BTree, and a read-current node lets a split of another child through (proposed) |

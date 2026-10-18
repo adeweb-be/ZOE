@@ -16,3 +16,4 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 | [record-store.md](record-store.md) | Does redb or an append-only log with an in-memory index write fewer bytes and fewer fsyncs per commit, and which redb commit setting should the store use? |
 | [zeo-wire.md](zeo-wire.md) | What do a stock ZEO 6 server and an unmodified `ZEO.ClientStorage` send each other over msgpack, and where does the specification differ? |
 | [queued-indexing.md](queued-indexing.md) | Where do the catalog conflicts of B5 come from, how does the indexing queue of CMFCore process a transaction, and what does Plone read from the catalog right after a save? |
+| [concurrent-creations.md](concurrent-creations.md) | Which trees do concurrent creations of versioned content conflict on after queued indexing, why does ZODB refuse each case, and what does each candidate remove? |
