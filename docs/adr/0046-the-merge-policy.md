@@ -133,7 +133,7 @@ The core:
 
 ### 11. The strategy `keys`: a mapping merges key by key (ZOE-210)
 
-Status of this section: proposed. The orchestrator of the session reported that the human accepted this change before its text was written; the human confirms it on the pull request. Claude settled its open choices, which "Questions for the human" lists.
+Status of this section: accepted. The human accepted this change before its text was written, then confirmed the text as written. Claude settled its open choices, which "Questions for the human" lists (8 to 13).
 
 ZODB gives `PersistentMapping` no `_p_resolveConflict`, so ZODB refuses each conflict on it, also when two transactions change different keys. The state of a `PersistentMapping` is `{'data': {...}}`: one field, `data`. Two changes of different keys both change `data`, and `strict` refuses. In the B5 log, `PersistentMapping` gives 6 of the 64 `ConflictError`s that are left after ZOE-203: 3.5 for each 1,000 transactions.
 
