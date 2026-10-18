@@ -1,6 +1,6 @@
 # Spike: the bucket that a split merge replaces, and the insert that it loses
 
-Card ZOE-224, step 1; the success criterion on `ConflictError`s (section 1), F5 (tier 1) and lever 4 of section 9 of the specification; the gate of phase 4 (#440). The decision that follows is ADR 0049 (proposed).
+Card ZOE-224, step 1; the success criterion on `ConflictError`s (section 1), F5 (tier 1) and lever 4 of section 9 of the specification; the gate of phase 4 (#440). The decision that follows is ADR 0049 (accepted).
 
 **Verdict.** With the split merge on, `create-spread` on `zoe-native-qi` raised 28 `ConflictError`s in 1,038 operations over three runs (27.0 per 1,000). 18 of them are read conflicts "a path child that the other side replaced": the case of the card. Each one has the order of events of the card. S1 splits the last bucket A into A and Y. T reads the node right after S1 and inserts into Y. S2 read the node before S1, also split A, and rule 3 of ADR 0048 put its own new bucket X in the place of Y. T then fails its vote on the node. Every merge of rule 3 in the runs replaced a bucket (59 of 59), because the keys grow: two creations that read one state of a node split the same last bucket. No Y got a second record before it left the tree. A rule 3 that keeps Y in the tree removes the 18 cases: an estimate from the logs, since the runs did not have such a rule, leaves 10 `ConflictError`s (9.6 per 1,000). To keep Y, the vote of S2 must write Y, which S2 did not store: it needs a lock on Y and a client that invalidates Y in all its Connections.
 

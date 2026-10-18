@@ -52,4 +52,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0046](0046-the-merge-policy.md) | The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2 (accepted) |
 | [0047](0047-queued-indexing.md) | Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them (accepted) |
 | [0048](0048-the-split-merge.md) | The split merge: tier 1 merges the splits of a BTree, and a read-current node lets a split of another child through (accepted) |
-| [0049](0049-the-split-merge-keeps-the-bucket.md) | The split merge keeps the bucket of the committed side: rule 3 writes into it, and a declared client invalidates it (proposed) |
+| [0049](0049-the-split-merge-keeps-the-bucket.md) | The split merge keeps the bucket of the committed side: rule 3 writes into it, and a declared client invalidates it (accepted) |
