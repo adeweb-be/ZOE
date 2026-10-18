@@ -293,10 +293,13 @@ impl ReadOnlyServer {
     /// Stop the server with SIGTERM. Return its exit status and its
     /// stderr.
     fn stop(mut self) -> (ExitStatus, String) {
-        let sent = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()
-            .unwrap();
+        let sent = {
+            let _spawn = wire::spawn_lock();
+            Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status()
+                .unwrap()
+        };
         assert!(sent.success());
         let started = Instant::now();
         let status = loop {

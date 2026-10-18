@@ -17,10 +17,13 @@ use wire::{
 
 #[test]
 fn the_help_names_the_pool_option_and_its_twin() {
-    let output = std::process::Command::new(ZOE)
-        .args(["serve", "--help"])
-        .output()
-        .unwrap();
+    let output = {
+        let _spawn = wire::spawn_lock();
+        std::process::Command::new(ZOE)
+            .args(["serve", "--help"])
+            .output()
+            .unwrap()
+    };
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--blocking-threads"));

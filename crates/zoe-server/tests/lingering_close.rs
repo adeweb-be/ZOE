@@ -87,10 +87,13 @@ fn a_stop_never_resets_a_connection_that_sent_bytes_after_it() {
     // The server reads the four calls, commits, and fills the socket.
     std::thread::sleep(Duration::from_millis(500));
 
-    let sent = Command::new("kill")
-        .args(["-TERM", &server.pid().to_string()])
-        .status()
-        .unwrap();
+    let sent = {
+        let _spawn = wire::spawn_lock();
+        Command::new("kill")
+            .args(["-TERM", &server.pid().to_string()])
+            .status()
+            .unwrap()
+    };
     assert!(sent.success());
     // The connection reads no more calls after the stop. The client sends
     // bytes all the same, as another thread of a stock client does.

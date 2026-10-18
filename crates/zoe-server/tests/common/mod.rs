@@ -5,7 +5,7 @@
 //! that a test closed stays held while the child keeps its copy. If a test
 //! opens that store again during that time, the open fails with `Locked`.
 //!
-//! The child keeps its copies until `exec` returns in the child.
+//! The child keeps its copies until `exec` closes them in the child.
 //! `Command::spawn` can return before that: it uses `vfork`, and the kernel
 //! wakes the parent before the child releases these copies.
 //!

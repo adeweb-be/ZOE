@@ -28,7 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use zoe_core::{Compression, Oid, Options, Store, Tid};
 
 /// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` returns in the child, the lock of a store too.
+/// process until `exec` closes them in the child, the lock of a store too.
 /// `Command::spawn` can return before that: the kernel wakes the parent of
 /// a `vfork` before the child closes these copies. So each open of a store
 /// holds this mutex, and each spawn holds it until the child ends.

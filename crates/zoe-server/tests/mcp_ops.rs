@@ -82,16 +82,16 @@ struct Session {
 
 impl Session {
     fn start(dir: &Path) -> Session {
-        let mut child = {
-            let _spawn = spawn_lock();
-            Command::new(ZOE)
-                .args(["mcp", "--path", dir.to_str().unwrap()])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap()
-        };
+        // The reply to `initialize` comes after `exec`. So the mutex of the
+        // spawns stays held until the end of this call.
+        let _spawn = spawn_lock();
+        let mut child = Command::new(ZOE)
+            .args(["mcp", "--path", dir.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut session = Session {

@@ -54,10 +54,10 @@ fn a_sigterm_during_the_start_leaves_a_store_or_nothing() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = {
-            let _spawn = spawn_lock();
-            command.spawn().unwrap()
-        };
+        // The child may end before it writes anything. So the mutex of the
+        // spawns stays held until the child ends.
+        let spawn = spawn_lock();
+        let mut child = command.spawn().unwrap();
         // stdout stays open until the end of the process.
         let stdout = child.stdout.take().unwrap();
         std::thread::sleep(Duration::from_millis(step));
@@ -67,6 +67,7 @@ fn a_sigterm_during_the_start_leaves_a_store_or_nothing() {
             .unwrap();
         assert!(sent.success());
         let status = wait(&mut child, Duration::from_secs(30));
+        drop(spawn);
         drop(stdout);
 
         if status.signal() == Some(SIGTERM) {

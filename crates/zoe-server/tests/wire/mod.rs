@@ -41,11 +41,12 @@ pub const ZERO: [u8; 8] = [0; 8];
 pub const MAX: [u8; 8] = [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
 /// A spawned child keeps a copy of each file descriptor of the test
-/// process until `exec` returns in the child, the lock of a store too.
+/// process until `exec` closes them in the child, the lock of a store too.
 /// `Command::spawn` can return before that: the kernel wakes the parent of
 /// a `vfork` before the child closes these copies. So each open of a store
-/// holds this mutex, and each spawn holds it until the child writes to its
-/// stdout or ends (`spawn_until_output`).
+/// holds this mutex. Each spawn holds it until the child is past `exec`:
+/// until the child writes to its stdout (`spawn_until_output`), answers a
+/// request, or ends.
 static SPAWN: Mutex<()> = Mutex::new(());
 
 /// Take the mutex of the spawns.
@@ -233,10 +234,13 @@ impl Server {
     pub fn terminate(&mut self, timeout: Duration) -> (ExitStatus, Duration) {
         let mut child = self.child.take().expect("the server does not run");
         let started = Instant::now();
-        let sent = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .unwrap();
+        let sent = {
+            let _spawn = spawn_lock();
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+        };
         assert!(sent.success());
         loop {
             if let Some(status) = child.try_wait().unwrap() {
