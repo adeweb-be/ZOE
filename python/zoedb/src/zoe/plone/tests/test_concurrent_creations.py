@@ -125,7 +125,9 @@ def mechanism_on(test):
     """
     import zoe.policy
 
-    zoe.policy.install(test.layer["portal"]._p_jar, {"classes": {}, "split_merges": "on"})
+    zoe.policy.install(
+        test.layer["portal"]._p_jar, {"classes": {}, "split_merges": "on"}
+    )
     transaction.commit()
     return {}
 
