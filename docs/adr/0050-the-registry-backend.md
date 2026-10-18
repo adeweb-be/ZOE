@@ -141,7 +141,7 @@ Each registry has its own id, so its own namespace, its own marker and its own c
   4. **The undo of an undo of a move.** It gives back the moved registry with the rows of the move. A stock write between the two undos went to the trees, and is lost. Do not undo such an undo: move again.
   5. **A move back.** The undo gives back a moved registry whose rows are gone. **Each request of the site then raises `Unsupported`** until the undo of that undo gives back the stock registry. Never undo a move back.
 - **`zoe backup` and `zoe restore`** keep the rows and the oids (ADR 0030, ADR 0043). A restored site reads its registry.
-- **`zoe convert`** to a Data.fs leaves the rows out and prints a warning (ADR 0043). The registry of the Data.fs raises `Unsupported`. Move it back before the conversion.
+- **`zoe convert`** to a Data.fs refuses a store that holds a moved registry: a namespace `zoe.plone.registry:<id>` with its marker `m`. It fails with 1 before it writes anything, and its message names each registry by its oid and tells the way out: `move_back`, a commit, then the conversion. A marker of another layout also refuses, and the message names its namespace. `--force` (`ZOE_FORCE`) converts anyway: the Data.fs leaves the rows out (ADR 0043), and the command writes a warning that names each registry, to stderr and in its report. The registry of such a Data.fs raises `Unsupported`.
 - **`zoe verify`** checks the rows as it checks every durable row.
 
 ### 10. A site without the backend, on ZEO, or leaving ZOE
@@ -152,7 +152,7 @@ Each registry has its own id, so its own namespace, its own marker and its own c
 - **The way back.** `move_back(site.portal_registry)` and a commit, for example in a script of `bin/instance run`. Then remove the option. Nothing is lost.
 - **Leaving ZOE** (`zoe convert`, zodbconvert, a zexp into another database) needs the move back first. A copy without it raises `Unsupported` on each request. While the source store exists, `copy_rows` brings the rows into a ZOE copy; a copy outside ZOE has no namespaces, so the operator moves back in the source and copies again. When the source store is gone, `reset` and the import of the profiles bring the site back, without the values that it changed.
 - **A downgrade of `zoedb`** to a version without this backend needs the move back first. Else `_records` unpickles as a broken object, and each read of the registry raises.
-- **A later card** (proposed): `zoe convert` refuses a store that holds a namespace `zoe.plone.registry:<id>` with a marker, unless an option forces it. `zoe convert` is in the core and reads no pickle; a namespace name is enough. zodbconvert is not ZOE's, so it gets no such check.
+- **The guard of `zoe convert`**: `zoe convert --to-data-fs` refuses a store that holds a namespace `zoe.plone.registry:<id>` with a marker, unless `--force` (section 9). It reads no pickle: it walks the durable rows and keeps the marker rows of the registry namespaces. zodbconvert is not ZOE's, so it gets no such check.
 
 ### 11. The test layers
 
