@@ -16,6 +16,8 @@ use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
 #[derive(Clone)]
 enum V {
     Int(i128),
+    Bool(bool),
+    Float(f64),
     Str(&'static str),
     Bytes(&'static [u8]),
     List(Vec<V>),
@@ -29,6 +31,8 @@ enum V {
 fn value(heap: &mut Heap, v: &V) -> Value {
     match v {
         V::Int(int) => Value::Int(*int),
+        V::Bool(b) => Value::Bool(*b),
+        V::Float(float) => Value::Float(*float),
         V::Str(text) => heap.new_str(text),
         V::Bytes(bytes) => heap.new_bytes(bytes),
         V::List(items) => {
@@ -1176,4 +1180,83 @@ fn many_fields_of_the_strategy_keys_merge_in_proportion_to_their_record() {
     assert_eq!(resolution.changed, FIELDS);
     assert_eq!(resolution.keys.len(), 20);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn a_line_lists_20_changed_keys_and_counts_them_all() {
+    let key = |n: usize| -> &'static str { Box::leak(format!("key-{n:02}").into_boxed_str()) };
+    let base: Vec<(V, V)> = (0..30).map(|n| (s(key(n)), V::Int(0))).collect();
+    let mut committed = base.clone();
+    committed.push((s("other"), V::Int(1)));
+    let new: Vec<(V, V)> = (0..30).map(|n| (s(key(n)), V::Int(1))).collect();
+    let (resolution, merged) =
+        mapping_conflict(KEYS, &mapping(&base), &mapping(&committed), &mapping(&new));
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    assert!(merged.is_some());
+    assert_eq!(resolution.changed, 30);
+    let expected: Vec<String> = (0..20).map(|n| format!("\"{}\"", key(n))).collect();
+    assert_eq!(resolution.keys, expected);
+}
+
+#[test]
+fn two_fields_of_the_strategy_keys_list_their_keys_in_field_order() {
+    let state = |a: &[(V, V)], b: &[(V, V)]| {
+        doc(&[
+            ("map-a", V::Dict(a.to_vec())),
+            ("map-b", V::Dict(b.to_vec())),
+            ("title", s("A")),
+        ])
+    };
+    let base = state(&[(s("x"), V::Int(0))], &[(s("y"), V::Int(0))]);
+    let committed = state(
+        &[(s("x"), V::Int(0)), (s("c"), V::Int(1))],
+        &[(s("y"), V::Int(2))],
+    );
+    // The new side adds a key to map-a and changes y of map-b too.
+    let new = state(
+        &[(s("x"), V::Int(0)), (s("n"), V::Int(1))],
+        &[(s("y"), V::Int(3))],
+    );
+    let (resolution, merged) = mapping_conflict(ALL_KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Refused(Reason::KeyChanged));
+    assert_eq!(merged, None);
+    assert_eq!(resolution.fields, ["map-b"]);
+    // The keys of map-a, which merged before the refusal, then those of
+    // map-b.
+    assert_eq!(resolution.keys, ["\"n\"", "\"y\""]);
+    assert_eq!(resolution.changed, 2);
+    // Without the change of y, both fields merge.
+    let new = state(
+        &[(s("x"), V::Int(0)), (s("n"), V::Int(1))],
+        &[(s("y"), V::Int(0)), (s("m"), V::Int(4))],
+    );
+    let (resolution, merged) = mapping_conflict(ALL_KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    let expected = state(
+        &[
+            (s("x"), V::Int(0)),
+            (s("c"), V::Int(1)),
+            (s("n"), V::Int(1)),
+        ],
+        &[(s("y"), V::Int(2)), (s("m"), V::Int(4))],
+    );
+    assert_eq!(merged, Some(expected));
+    assert_eq!(resolution.keys, ["\"n\"", "\"m\""]);
+}
+
+#[test]
+fn a_bool_or_a_float_key_gives_no_answer() {
+    for key in [V::Bool(true), V::Float(1.0)] {
+        let (resolution, merged) = mapping_conflict(
+            KEYS,
+            &mapping(&[(key.clone(), s("one"))]),
+            &mapping(&[(key.clone(), s("two"))]),
+            &mapping(&[(key, s("one")), (s("key-b"), s("three"))]),
+        );
+        assert_eq!(
+            resolution.outcome,
+            Resolved::Undecided("a dict key of another type")
+        );
+        assert_eq!(merged, None);
+    }
 }

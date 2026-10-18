@@ -133,7 +133,8 @@ fn merge_fields(
             by_new.insert(name);
         }
     }
-    // The keys of the dicts that the strategy `keys` merged, by field.
+    // The keys of the dicts that the strategy `keys` merged or refused, by
+    // field.
     let mut expanded: HashMap<&str, Noted> = HashMap::new();
     note(merge, &by_new, &expanded);
     // Coupled fields stay strict: both sides changed the group, and they
@@ -684,4 +685,52 @@ fn keys(
         }
     }
     Ok(heap.new_dict(items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns a dict of one key, `key-a`, whose value is a list of `value`.
+    fn dict(heap: &mut Heap, value: i128) -> Value {
+        let key = heap.new_str("key-a");
+        let list = heap.new_list(vec![Value::Int(value)]);
+        heap.new_dict(vec![(key, list)])
+    }
+
+    #[test]
+    fn the_strategy_keys_gives_no_answer_past_its_step_budget() {
+        let mut heap = Heap::with_instances();
+        let (old, committed, new) = (dict(&mut heap, 1), dict(&mut heap, 2), dict(&mut heap, 3));
+        // Each list costs two steps: the first one takes the whole budget.
+        let mut noted = None;
+        let found = keys(
+            &mut heap,
+            &mut Canon::new(2),
+            Some(old),
+            committed,
+            new,
+            &mut noted,
+        );
+        assert_eq!(
+            found,
+            Err(Outcome::Undecided("a merge over its step budget"))
+        );
+        assert!(noted.is_none());
+        // With a larger budget, the merge refuses: key-a changed on both
+        // sides.
+        let found = keys(
+            &mut heap,
+            &mut Canon::new(100),
+            Some(old),
+            committed,
+            new,
+            &mut noted,
+        );
+        assert_eq!(found, Err(Outcome::Refused(Reason::KeyChanged)));
+        assert_eq!(
+            noted.map(|noted| noted.texts),
+            Some(vec!["\"key-a\"".to_owned()])
+        );
+    }
 }
