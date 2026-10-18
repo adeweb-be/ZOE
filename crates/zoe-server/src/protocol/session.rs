@@ -46,7 +46,7 @@ use super::blob::Download;
 use super::clock;
 use super::compress::{Compressor, Failed, Job};
 use super::extension;
-use super::invalidation::{ClientId, Commit, Others};
+use super::invalidation::{ClientId, Commit, Others, Publication};
 use super::iteration::{self, Iterators, Refused};
 use super::message::{self, Call};
 use super::negotiation;
@@ -607,6 +607,9 @@ pub(crate) struct Session {
 pub(crate) struct Transaction {
     session: Arc<Session>,
     open: Option<Open>,
+    /// The commit of the `tpc_finish` that runs, with its reply. `call`
+    /// publishes it after it counts the call.
+    committed: Option<(Finished, Option<Vec<u8>>)>,
     /// The early write-intent locks of the session (ADR 0045), from its
     /// first `lock_intent`. The next `tpc_begin` adopts them.
     intents: Option<IntentLocks<Arc<Store>>>,
@@ -766,29 +769,30 @@ impl Session {
     /// Run one call that is not a call of the transaction, and count it in
     /// the status and the metrics of the storage. The call puts its reply
     /// with `reply`, or takes a place there.
+    ///
+    /// The caller puts the reply after this count. A `loadBefore` puts its
+    /// reply itself, and counts itself before it (`Session::loaded`). So a
+    /// client that has a reply reads metrics that count its call.
     pub(crate) fn call(&self, call: &Call, reply: &mut Reply) -> Outcome {
-        let started = Instant::now();
         let outcome = self.dispatch(call, reply);
-        if call.method == "loadBefore" {
-            let metrics = &self.storage.metrics;
-            metrics.load_latency.observe_duration(started.elapsed());
-        }
         self.count(&call.method, &outcome);
         outcome
     }
 
     /// Count a call that ran, as ZEO counts it.
     fn count(&self, method: &str, outcome: &Outcome) {
-        let stats = &self.storage.stats;
-        let counter = match outcome {
-            Outcome::Close(_) | Outcome::Gone => None,
-            Outcome::Done(_) if method == "register" => Some(&stats.connections),
-            _ if method == "loadBefore" => Some(&stats.loads),
-            _ => None,
-        };
-        if let Some(counter) = counter {
-            Stats::add(counter);
+        if method == "register" && matches!(outcome, Outcome::Done(_)) {
+            Stats::add(&self.storage.stats.connections);
         }
+    }
+
+    /// Count one `loadBefore` that ran for `elapsed`, in the status and the
+    /// metrics of the storage, as ZEO counts it. The load calls this once,
+    /// before its reply goes into the queue.
+    fn loaded(&self, elapsed: Duration) {
+        Stats::add(&self.storage.stats.loads);
+        let metrics = &self.storage.metrics;
+        metrics.load_latency.observe_duration(elapsed);
     }
 
     /// Run one call.
@@ -960,12 +964,21 @@ impl Session {
     ///
     /// A publication during the read makes the call read again. After
     /// `LOAD_TRIES` reads, it reads under the mutex of the hub.
+    ///
+    /// The call counts itself before its reply goes into the queue: with
+    /// the put, under the mutex of the hub. A put that fails counts
+    /// nothing, so the call counts once.
     fn load_before(&self, call: &Call, reply: &mut Reply) -> Outcome {
+        let started = Instant::now();
         let parsed = arity::<2>(&call.args, "loadBefore")
             .and_then(|[oid, tid]| Ok((Oid(u64_of(oid)?), Tid(u64_of(tid)?))));
         let (oid, tid) = match parsed {
             Ok(parsed) => parsed,
-            Err(fault) => return Outcome::Failed(fault),
+            Err(fault) => {
+                // The caller puts the reply of the fault after this count.
+                self.loaded(started.elapsed());
+                return Outcome::Failed(fault);
+            }
         };
         let store = &self.store;
         let read = |published: Tid| -> (Outcome, Option<Parts>) {
@@ -1015,7 +1028,9 @@ impl Session {
             let (outcome, frame) = read(seen);
             #[cfg(test)]
             let frame = reply.keep(frame);
-            match invalidations.put_since(seen, room, frame) {
+            // Read the clock outside the mutex of the hub.
+            let elapsed = started.elapsed();
+            match invalidations.put_since(seen, room, frame, || self.loaded(elapsed)) {
                 Ok(sent) => {
                     reply.sent = Some(sent);
                     return outcome;
@@ -1027,6 +1042,7 @@ impl Session {
         let mut kept = None;
         let (outcome, sent) = invalidations.read_put(room, |published| {
             let (outcome, frame) = read(published);
+            self.loaded(started.elapsed());
             #[cfg(test)]
             {
                 kept = frame.as_ref().map(|parts| parts.concat());
@@ -1288,16 +1304,17 @@ impl Session {
         ]))
     }
 
-    /// Publish a commit of this connection. Every other client gets its
-    /// invalidation, with an empty list for a commit that wrote no oid, as
-    /// from ZEO. This client gets `info`, then `reply`.
+    /// Return the publication of a commit of this connection. Dropping it
+    /// publishes the commit. Every other client gets its invalidation, with
+    /// an empty list for a commit that wrote no oid, as from ZEO. This
+    /// client gets `info`, then `reply`.
     ///
     /// The oids come from the transaction index of the store. When they do
     /// not read, the hub closes the other connections, so each client
     /// verifies its cache when it connects again. The hub publishes the
     /// commit also when a read panics, so later commits never wait for
     /// this one.
-    fn publish(&self, finished: Finished, reply: Option<Vec<u8>>) {
+    fn publication(&self, finished: Finished, reply: Option<Vec<u8>>) -> Publication<'_> {
         let mut publication = self.storage.invalidations.prepare(Commit {
             previous: finished.previous,
             tid: finished.tid,
@@ -1335,6 +1352,7 @@ impl Session {
         if let Some(info) = info {
             commit.own.insert(0, info);
         }
+        publication
     }
 
     /// Return the serial of the current record of an oid, as the reads of
@@ -1576,6 +1594,7 @@ impl Transaction {
         Self {
             session,
             open: None,
+            committed: None,
             intents: None,
             compress: None,
         }
@@ -1641,17 +1660,29 @@ impl Transaction {
         }
     }
 
-    /// Run one call of the transaction, and count it in the status of the
-    /// storage. `storea` and `restorea` take the pickle out of the args of
-    /// `call` for the compression pool.
+    /// Run one call of the transaction, and count it in the status and the
+    /// metrics of the storage. `storea` and `restorea` take the pickle out
+    /// of the args of `call` for the compression pool.
+    ///
+    /// The caller puts the reply after this count. The reply of a commit
+    /// goes out with its publication, so the publication comes after the
+    /// count too. So a client that has a reply reads metrics that count its
+    /// call.
     pub(crate) fn call(&mut self, call: &mut Call) -> Outcome {
         let was_open = self.open.is_some();
         let listed = self.open.as_ref().map_or(0, |open| open.listed);
         let started = Instant::now();
         let outcome = self.dispatch(call);
+        // The publication exists before the count. So a panic of the count
+        // still publishes the commit.
+        let publication = self
+            .committed
+            .take()
+            .map(|(finished, reply)| self.session.publication(finished, reply));
         let elapsed = started.elapsed();
         self.count(&call.method, &outcome, was_open);
         self.measure(&call.method, &outcome, was_open, listed, elapsed);
+        drop(publication);
         outcome
     }
 
@@ -2126,9 +2157,9 @@ impl Transaction {
     }
 
     /// Commit the transaction. Its reply, the tid, goes out with the
-    /// invalidations of the commit. A finish that fails publishes nothing.
-    /// As in ZEO, a finish of a transaction that is not the open one does
-    /// nothing and gives None.
+    /// invalidations of the commit: `call` publishes the commit. A finish
+    /// that fails publishes nothing. As in ZEO, a finish of a transaction
+    /// that is not the open one does nothing and gives None.
     fn tpc_finish(&mut self, call: &Call) -> Outcome {
         let finished = match self.finish(&call.args) {
             Ok(Some(finished)) => finished,
@@ -2136,7 +2167,7 @@ impl Transaction {
             Err(fault) => return Outcome::Failed(fault),
         };
         let reply = (!call.oneway).then(|| message::reply(call.id.clone(), p64(finished.tid.0)));
-        self.session.publish(finished, reply);
+        self.committed = Some((finished, reply));
         Outcome::Published
     }
 
@@ -4498,6 +4529,187 @@ mod tests {
         );
     }
 
+    /// The counters of a storage that a call can change: the status, then
+    /// the metrics.
+    fn counters(storage: &NamedStorage) -> [u64; 12] {
+        let (stats, metrics) = (&storage.stats, &storage.metrics);
+        [
+            get_counter(&stats.connections),
+            get_counter(&stats.loads),
+            get_counter(&stats.stores),
+            get_counter(&stats.commits),
+            get_counter(&stats.aborts),
+            get_counter(&stats.active_txns),
+            get_counter(&stats.conflicts),
+            get_counter(&metrics.commits),
+            get_counter(&metrics.conflicts_raised),
+            metrics.load_latency.totals().0,
+            metrics.vote_latency.totals().0,
+            metrics.finish_latency.totals().0,
+        ]
+    }
+
+    /// The waker of the writer of a connection. A frame that goes into a
+    /// queue of the connection wakes it, in the thread of the put. Then it
+    /// reads the counters of the storage.
+    struct AtPut {
+        storage: Arc<NamedStorage>,
+        seen: Mutex<Vec<[u64; 12]>>,
+    }
+
+    impl std::task::Wake for AtPut {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let counters = counters(&self.storage);
+            self.seen.lock().unwrap().push(counters);
+        }
+    }
+
+    /// Run `method` with `args` as the connection runs it, and put its
+    /// reply. Return the counters at each put of a frame.
+    fn run_at_put(
+        s: &mut Client,
+        frames: &mut Inbox,
+        at_put: &Arc<AtPut>,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Vec<[u64; 12]> {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let waker = Waker::from(Arc::clone(at_put));
+        let mut cx = Context::from_waker(&waker);
+        let mut next = std::pin::pin!(frames.recv());
+        assert!(next.as_mut().poll(&mut cx).is_pending(), "a frame waits");
+        let mut call = Call {
+            id: Value::from(1),
+            oneway: false,
+            method: method.into(),
+            args,
+            context: None,
+        };
+        let outbox = s.session.outbox().clone();
+        let room = outbox.blocking_room();
+        let open = if s.is_registered() && in_transaction(method) {
+            let outcome = s.txn.call(&mut call);
+            Reply::new(room).send(&call, outcome, &outbox)
+        } else {
+            let mut reply = Reply::new(room);
+            let outcome = s.session.call(&call, &mut reply);
+            reply.send(&call, outcome, &outbox)
+        };
+        assert!(open, "{method} closed the connection");
+        assert!(
+            next.as_mut().poll(&mut cx).is_ready(),
+            "{method} sent no reply"
+        );
+        std::mem::take(&mut *at_put.seen.lock().unwrap())
+    }
+
+    #[test]
+    fn a_call_counts_before_its_reply_goes_out() {
+        let storage = storage("count-before-reply", Queues::DEFAULT);
+        let (outbox, mut frames, _closing) = Outbox::new(1_000, 1_000);
+        let mut s = Client::new(Arc::clone(&storage), outbox);
+        let at_put = Arc::new(AtPut {
+            storage: Arc::clone(&storage),
+            seen: Mutex::new(Vec::new()),
+        });
+        let begin = |id: i64| vec![Value::from(id), Value::Nil, Value::Nil, Value::Map(vec![])];
+        let store = |id: i64, serial: u64| {
+            let data = Value::Binary(b"x".to_vec());
+            vec![p64(1), p64(serial), data, Value::from(id)]
+        };
+        let mut run = |s: &mut Client, calls: Vec<(&str, Vec<Value>)>| {
+            for (method, args) in calls {
+                let seen = run_at_put(s, &mut frames, &at_put, method, args);
+                while frames.try_recv().is_some() {}
+                let now = counters(&storage);
+                assert!(!seen.is_empty(), "{method} put no frame");
+                for counted in seen {
+                    assert_eq!(counted, now, "{method} counted after its reply");
+                }
+            }
+        };
+        run(
+            &mut s,
+            vec![
+                ("register", vec![Value::from("1"), Value::Boolean(false)]),
+                ("tpc_begin", begin(1)),
+                ("storea", store(1, 0)),
+                ("vote", vec![Value::from(1)]),
+                ("tpc_finish", vec![Value::from(1)]),
+            ],
+        );
+        let tid = u64_of(&done(call(&mut s, "lastTransaction", vec![]))).unwrap();
+        run(
+            &mut s,
+            vec![
+                // A load of a record, of an oid without a record, and with
+                // bad arguments.
+                ("loadBefore", vec![p64(1), p64(u64::MAX)]),
+                ("loadBefore", vec![p64(9), p64(u64::MAX)]),
+                ("loadBefore", vec![p64(1)]),
+                // A stale serial fails the vote with a conflict.
+                ("tpc_begin", begin(2)),
+                ("storea", store(2, 0)),
+                ("vote", vec![Value::from(2)]),
+                // A transaction that aborts.
+                ("tpc_begin", begin(3)),
+                ("tpc_abort", vec![Value::from(3)]),
+                // A second commit, and a load of its record.
+                ("tpc_begin", begin(4)),
+                ("storea", store(4, tid)),
+                ("vote", vec![Value::from(4)]),
+                ("tpc_finish", vec![Value::from(4)]),
+                ("loadBefore", vec![p64(1), p64(u64::MAX)]),
+            ],
+        );
+        let [
+            connections,
+            loads,
+            stores,
+            commits,
+            aborts,
+            active,
+            conflicts,
+            ..,
+        ] = counters(&storage);
+        assert_eq!(
+            [
+                connections,
+                loads,
+                stores,
+                commits,
+                aborts,
+                active,
+                conflicts
+            ],
+            [1, 4, 3, 2, 1, 0, 1]
+        );
+        let [
+            ..,
+            committed,
+            raised,
+            load_latency,
+            vote_latency,
+            finish_latency,
+        ] = counters(&storage);
+        assert_eq!(
+            [
+                committed,
+                raised,
+                load_latency,
+                vote_latency,
+                finish_latency
+            ],
+            [2, 1, 4, 3, 2]
+        );
+    }
+
     #[test]
     fn a_closed_session_leaves_the_status() {
         let mut s = registered("closed");
@@ -5733,7 +5945,7 @@ mod tests {
         );
 
         // After the publication, a read gives the new revision.
-        s.publish(finished, None);
+        drop(s.publication(finished, None));
         assert_eq!(
             done(call(&mut s, "loadBefore", current)),
             Value::Array(vec![
