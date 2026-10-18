@@ -8,33 +8,43 @@ uninstalls it at its end.
 
 import json
 import logging
+import shutil
+import tempfile
 import threading
 import time
 import unittest
 from unittest import mock
 
 import transaction
+import ZODB
 import Zope2
 from Acquisition import aq_base
+from OFS.Traversable import Traversable
 from plone.app.testing import (
     PLONE_FUNCTIONAL_TESTING,
     PLONE_SITE_ID,
+    SITE_OWNER_NAME,
     TEST_USER_ID,
     TEST_USER_NAME,
     login,
     logout,
     setRoles,
 )
+from plone.testing import zope as zope_testing
 from Products.CMFCore.CatalogTool import CatalogTool
 from Products.CMFCore.indexing import PortalCatalogProcessor
 from Products.CMFCore.interfaces import IPortalCatalogQueueProcessor
 from Testing.makerequest import makerequest
+from ZODB.POSException import ConflictError, POSKeyError, StorageError
+from ZODB.serialize import referencesf
+from ZODB.utils import load_current
 from zope.component import getUtility
 from zope.component.hooks import setSite
 from zope.event import notify
 from zope.globalrequest import clearRequest, getRequest, setRequest
 from zope.lifecycleevent import ObjectModifiedEvent
 
+import zoe
 import zoe.kv
 from zoe.plone import indexing
 
@@ -53,11 +63,83 @@ def path_of(obj):
 
 
 def queue_of(portal):
-    """Return the queue of the catalog of `portal`."""
+    """Return the queue of the catalog of `portal`, on the connection of
+    the catalog."""
     catalog = aq_base(portal.portal_catalog)
     return zoe.kv.Namespace(
-        portal._p_jar, "durable", indexing.queue_name(catalog._p_oid)
+        catalog._p_jar, "durable", indexing.queue_name(catalog._p_oid)
     )
+
+
+def failed_of(portal):
+    """Return the failed operations of the catalog of `portal`."""
+    catalog = aq_base(portal.portal_catalog)
+    return zoe.kv.Namespace(
+        catalog._p_jar, "durable", indexing.failed_name(catalog._p_oid)
+    )
+
+
+def catalog_serials(portal):
+    """Return the serial of each record that the catalog of `portal`
+    reaches, in the store of the catalog."""
+    catalog = aq_base(portal.portal_catalog)
+    storage = catalog._p_jar.db().storage
+    serials = {}
+    todo = [catalog._p_oid]
+    while todo:
+        oid = todo.pop()
+        if oid in serials:
+            continue
+        data, serial = load_current(storage, oid)
+        serials[oid] = serial
+        todo.extend(referencesf(data))
+    return serials
+
+
+def add_second_site(test, name="second"):
+    """Add a second database of a `zoe.Storage` to the databases of the
+    database of the layer, a folder `name` of the Zope root in it, and a
+    Plone site `site` in that folder, as a mount point puts a site in
+    another database. Return the site. The database goes at the end of
+    the test."""
+    from OFS.Folder import Folder
+    from Products.CMFPlone.factory import addPloneSite
+
+    app = test.layer["app"]
+    db = test.layer["portal"]._p_jar.db()
+    directory = tempfile.mkdtemp(prefix="zoe-plone-second-")
+    second = ZODB.DB(
+        zoe.Storage(f"{directory}/zoe"), databases=db.databases, database_name=name
+    )
+
+    def close():
+        transaction.abort()
+        setSite(test.layer["portal"])
+        db.databases.pop(name, None)
+        second.close()
+        shutil.rmtree(directory, ignore_errors=True)
+
+    test.addCleanup(close)
+    folder = Folder(name)
+    app._p_jar.get_connection(name).add(folder)
+    app._setObject(name, folder)
+    zope_testing.login(app["acl_users"], SITE_OWNER_NAME)
+    indexing.uninstall()
+    try:
+        addPloneSite(
+            app[name],
+            "site",
+            setup_content=False,
+            extension_ids=("plone.app.contenttypes:default",),
+        )
+        transaction.commit()
+    finally:
+        indexing.install()
+        # The new site became the local site: give the layer its site back.
+        setSite(test.layer["portal"])
+    site = app[name]["site"]
+    assert aq_base(site.portal_catalog)._p_jar.db() is second
+    return site
 
 
 def drain(portal, **kwargs):
@@ -189,10 +271,12 @@ class TestProcessor(IndexingTestCase):
         self.portal.invokeFactory("Document", "doc", title="Document")
         transaction.commit()
         cookie = request.response.cookies[indexing.COOKIE]
-        oid, key, path = indexing._parse_cookie(cookie["value"])
+        oid, key, name, path = indexing._parse_cookie(cookie["value"])
         self.assertEqual(oid, aq_base(self.portal.portal_catalog)._p_oid)
         self.assertEqual(key, queue_of(self.portal).scan()[-1][0])
+        self.assertEqual(name, self.portal._p_jar.db().database_name)
         self.assertEqual(path, self.portal.absolute_url_path())
+        self.assertEqual(cookie["Path"], self.portal.absolute_url_path())
         self.assertTrue(cookie["HttpOnly"])
         self.assertEqual(cookie["SameSite"], "Lax")
 
@@ -359,6 +443,179 @@ class TestIndexer(IndexingTestCase):
         self.assertEqual(self.search(SearchableText=word), [path_of(portal["doc"])])
 
 
+class TestFailures(IndexingTestCase):
+    def setUp(self):
+        super().setUp()
+        self.portal.invokeFactory("Document", "doc", title="Document")
+        transaction.commit()
+        drain(self.portal)
+        self.doc = path_of(self.portal["doc"])
+
+    def edit_doc(self):
+        word = self.token()
+        edit(self.portal["doc"], f"Edited {word}")
+        transaction.commit()
+        return word
+
+    def assert_a_read_error_counts_a_failure(self, error):
+        self.edit_doc()
+        stock = Traversable.unrestrictedTraverse
+        doc = self.doc
+
+        def failing(obj, path, *args, **kwargs):
+            if path == doc:
+                raise error
+            return stock(obj, path, *args, **kwargs)
+
+        with (
+            mock.patch.object(Traversable, "unrestrictedTraverse", failing),
+            self.assertLogs("zoe.plone.indexing", logging.WARNING),
+        ):
+            drain(self.portal)
+        # The key stays, with its failure; the entry of the Document stays.
+        (value,) = [indexing.decode(value) for _, value in queue_of(self.portal).scan()]
+        self.assertEqual(value["failures"], 1)
+        self.assertIn(type(error).__name__, value["error"])
+        self.assertIn(doc, self.portal.portal_catalog._catalog.uids)
+        drain(self.portal)
+        self.assertEqual(queue_of(self.portal).scan(), [])
+
+    def test_a_storage_error_at_resolve_keeps_the_entry_and_the_keys(self):
+        self.assert_a_read_error_counts_a_failure(StorageError("a read error"))
+
+    def test_a_poskeyerror_at_resolve_keeps_the_entry_and_the_keys(self):
+        self.assert_a_read_error_counts_a_failure(POSKeyError(b"\0" * 8))
+
+    def test_a_failing_stale_path_does_not_stop_the_queue(self):
+        portal = self.portal
+        portal.invokeFactory("Folder", "a", title="A")
+        portal.invokeFactory("Folder", "b", title="B")
+        transaction.commit()
+        drain(portal)
+        queue = queue_of(portal)
+        portal["a"].manage_pasteObjects(portal.manage_cutObjects(["doc"]))
+        transaction.commit()
+        first = queue.scan()
+        portal["b"].manage_pasteObjects(portal["a"].manage_cutObjects(["doc"]))
+        transaction.commit()
+        second = [pair for pair in queue.scan() if pair not in first]
+        earliest = min(indexing.key_time(key) for key, _ in first)
+        for number, (key, value) in enumerate(second):
+            queue.delete(key)
+            micros = int((earliest - 1) * 1_000_000)
+            queue.set(indexing.make_key(micros, b"\x00" * 8, number), value)
+        transaction.commit()
+        # The first batch frees the UID at the stale path, and the read of
+        # that path fails once.
+        stale = self.doc
+        stock = indexing._resolve
+        calls = []
+
+        def failing(app, path):
+            if path == stale and not calls:
+                calls.append(path)
+                raise StorageError("a read error of the stale path")
+            return stock(app, path)
+
+        with (
+            mock.patch.object(indexing, "_resolve", failing),
+            self.assertLogs("zoe.plone.indexing", logging.ERROR) as logs,
+        ):
+            drain(portal, batch_size=len(second))
+        self.assertEqual(calls, [stale])
+        self.assertTrue(any(stale in line for line in logs.output))
+        self.assertEqual(queue_of(portal).scan(), [])
+
+    def test_a_malformed_value_moves_to_the_failed_namespace(self):
+        queue = queue_of(self.portal)
+        first = indexing.make_key(1, b"\x00" * 8, 0)
+        second = indexing.make_key(2, b"\x00" * 8, 0)
+        queue.set(first, b"not json")
+        queue.set(second, b'{"op": "reindex"}')
+        transaction.commit()
+        word = self.edit_doc()
+        with self.assertLogs("zoe.plone.indexing", logging.ERROR):
+            drain(self.portal)
+        self.assertEqual(queue_of(self.portal).scan(), [])
+        self.assertEqual(self.search(SearchableText=word), [self.doc])
+        failed = dict(failed_of(self.portal).scan())
+        self.assertEqual(set(failed), {first, second})
+        record = json.loads(failed[first])
+        self.assertIn("not JSON", record["error"])
+        self.assertEqual(bytes.fromhex(record["value"]), b"not json")
+        self.assertIn("path", json.loads(failed[second])["error"])
+        self.assertEqual(indexing.status(self.portal)["failed"], 2)
+
+    def test_a_failing_subtree_search_keeps_the_keys_of_its_path(self):
+        # Documents have no workflow, so a Document takes the View of its
+        # folder.
+        portal = self.portal
+        workflow = portal.portal_workflow
+        workflow.setChainForPortalTypes(("Document",), ())
+        workflow.setChainForPortalTypes(("Folder",), ("simple_publication_workflow",))
+        portal.invokeFactory("Folder", "folder", title="Folder")
+        word = self.token()
+        portal["folder"].invokeFactory("Document", "inner", title=f"Inner {word}")
+        workflow.doActionFor(portal["folder"], "publish")
+        transaction.commit()
+        drain(portal)
+        workflow.doActionFor(portal["folder"], "retract")
+        transaction.commit()
+        folder = path_of(portal["folder"])
+        stock = CatalogTool.unrestrictedSearchResults
+
+        def failing(catalog, *args, **kwargs):
+            if kwargs.get("path") == folder:
+                raise ValueError("a search error of the test")
+            return stock(catalog, *args, **kwargs)
+
+        def anonymous():
+            logout()
+            try:
+                brains = portal.portal_catalog.searchResults(SearchableText=word)
+                return [brain.getPath() for brain in brains]
+            finally:
+                login(portal, TEST_USER_NAME)
+
+        with (
+            mock.patch.object(CatalogTool, "unrestrictedSearchResults", failing),
+            self.assertLogs("zoe.plone.indexing", logging.WARNING) as logs,
+        ):
+            drain(portal)
+        self.assertTrue(any("search error" in line for line in logs.output))
+        values = [indexing.decode(value) for _, value in queue_of(portal).scan()]
+        self.assertTrue(values)
+        for value in values:
+            self.assertEqual(value["path"], folder)
+            self.assertEqual(value["failures"], 1)
+        drain(portal)
+        self.assertEqual(queue_of(portal).scan(), [])
+        self.assertEqual(anonymous(), [])
+        (brain,) = portal.portal_catalog.unrestrictedSearchResults(
+            path={"query": folder, "depth": 0}
+        )
+        self.assertEqual(brain.review_state, "private")
+
+    def test_run_raises_after_the_last_try(self):
+        self.edit_doc()
+        tries = []
+
+        class Conflicting(indexing.Indexer):
+            def _begin(self, tm, connection):
+                super()._begin(tm, connection)
+                tries.append(1)
+                raise ConflictError("a conflict of the test")
+
+        with (
+            mock.patch.object(indexing, "PAUSES", (0.0,) * 4),
+            self.assertRaises(ConflictError),
+        ):
+            Conflicting(self.portal).run()
+        transaction.begin()
+        self.assertEqual(len(tries), indexing.TRIES)
+        self.assertEqual(len(queue_of(self.portal).scan()), 1)
+
+
 class TestStatus(IndexingTestCase):
     def test_the_status_counts_the_queue_and_the_delays(self):
         portal = self.portal
@@ -468,13 +725,200 @@ class TestWait(IndexingTestCase):
         indexing.request_started(_Event(request))
         self.assertEqual(request.response.cookies[indexing.COOKIE]["value"], "deleted")
 
+    def test_a_bad_cookie_is_expired_with_the_path_of_the_site(self):
+        request = self.later_request("not-a-cookie")
+        request.environ["PATH_INFO"] = request["PATH_INFO"] = "/plone/doc/view"
+        indexing.request_started(_Event(request))
+        cookie = request.response.cookies[indexing.COOKIE]
+        self.assertEqual(cookie["value"], "deleted")
+        self.assertEqual(cookie["Path"], "/plone")
+
+    def test_a_cookie_from_the_future_is_ignored(self):
+        value = self.save()
+        oid, key, name, path = indexing._parse_cookie(value)
+        later = indexing.make_key(int((time.time() + 3600) * 1_000_000), b"\x00" * 8, 0)
+        forged = f"{oid.hex()}-{later.hex()}-{name.encode().hex()}-{path}"
+        request = self.later_request(forged)
+        start = time.monotonic()
+        indexing.request_started(_Event(request))
+        self.assertLess(time.monotonic() - start, 0.1)
+        self.assertEqual(request.response.cookies[indexing.COOKIE]["value"], "deleted")
+
+    def test_a_save_after_the_wait_keeps_its_cookie(self):
+        # Two saves with no read between them: the second request has the
+        # cookie of the first save, and saves too.
+        first = self.save()
+        drain(self.portal)
+        request = self.later_request(first)
+        setRequest(request)
+        self.addCleanup(setRequest, self.layer["request"])
+        indexing.request_started(_Event(request))
+        edit(self.portal["doc"], f"Edited {self.token()}")
+        transaction.commit()
+        cookie = request.response.cookies[indexing.COOKIE]
+        self.assertNotEqual(cookie["value"], "deleted")
+        self.assertFalse({name.lower() for name in cookie} & {"max-age", "expires"})
+        # A third request with the cookie of the second save waits for it.
+        third = self.later_request(cookie["value"])
+        indexer = indexing.Indexer(self.portal)
+
+        def later():
+            time.sleep(0.3)
+            indexer.run()
+
+        thread = threading.Thread(target=later)
+        start = time.monotonic()
+        thread.start()
+        indexing.request_started(_Event(third))
+        waited = time.monotonic() - start
+        thread.join(TIMEOUT)
+        self.assertGreaterEqual(waited, 0.25)
+        transaction.begin()
+        self.assertEqual(queue_of(self.portal).scan(), [])
+
+
+class TestSecondDatabase(IndexingTestCase):
+    """A site whose catalog is in another database, as a mount point puts
+    it there: its queue, its keys and its lease are in the store of that
+    database. Plone finds the catalog of the local site, so each test sets
+    the local site of the content that it saves, as the traversal of a
+    request does."""
+
+    def setUp(self):
+        super().setUp()
+        self.site = add_second_site(self)
+        self.db = self.portal._p_jar.db()
+        self.second = aq_base(self.site.portal_catalog)._p_jar.db()
+        self.addCleanup(setSite, self.portal)
+
+    def site_search(self, **query):
+        brains = self.site.portal_catalog.unrestrictedSearchResults(**query)
+        return sorted(brain.getPath() for brain in brains)
+
+    def save_in(self, site, title, create=False):
+        """Add or edit the Document `doc` of `site`, in a transaction of its
+        own, with `site` as the local site."""
+        setSite(site)
+        try:
+            if create:
+                site.invokeFactory("Document", "doc", title=title)
+            else:
+                edit(site["doc"], title)
+            transaction.commit()
+        finally:
+            setSite(self.portal)
+
+    def test_a_save_writes_no_catalog_object_in_either_store(self):
+        before = (catalog_serials(self.portal), catalog_serials(self.site))
+        word = self.token()
+        self.save_in(self.site, f"Second {word}", create=True)
+        self.assertEqual(
+            (catalog_serials(self.portal), catalog_serials(self.site)), before
+        )
+        # The keys are in the store of the catalog of the site.
+        self.assertTrue(queue_of(self.site).scan())
+        self.assertEqual(queue_of(self.portal).scan(), [])
+        drain(self.site)
+        self.assertEqual(queue_of(self.site).scan(), [])
+        self.assertEqual(
+            self.site_search(SearchableText=word), [path_of(self.site["doc"])]
+        )
+
+    def start_threads(self):
+        """Start the threads of the two databases, as at the opening of the
+        root database."""
+        indexing._root["db"] = self.db
+        self.addCleanup(indexing._root.clear)
+        services = [indexing._service_for(self.db), indexing._service_for(self.second)]
+        for service in services:
+            self.addCleanup(indexing._services.pop, id(service._db), None)
+            self.addCleanup(service.join, TIMEOUT)
+            self.addCleanup(service.stop)
+        return services
+
+    def test_two_sites_in_two_databases_get_two_leases(self):
+        threads = self.start_threads()
+        self.assertEqual(len({id(thread) for thread in threads}), 2)
+        first, second = self.token(), self.token()
+        self.save_in(self.portal, f"Root {first}", create=True)
+        self.save_in(self.site, f"Second {second}", create=True)
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline and (
+            queue_of(self.portal).scan(limit=1) or queue_of(self.site).scan(limit=1)
+        ):
+            time.sleep(0.05)
+        transaction.begin()
+        self.assertEqual(
+            self.search(SearchableText=first), [path_of(self.portal["doc"])]
+        )
+        self.assertEqual(
+            self.site_search(SearchableText=second), [path_of(self.site["doc"])]
+        )
+        # Each lease is in the store of its catalog.
+        self.assertTrue(indexing.status(self.portal)["lease"])
+        self.assertTrue(indexing.status(self.site)["lease"])
+
+    def test_a_commit_wakes_the_thread_of_each_database(self):
+        woken = {}
+
+        class Thread:
+            def __init__(self, name):
+                self.name = name
+
+            def wake(self, path=None):
+                woken.setdefault(self.name, []).append(path)
+
+        for db in (self.db, self.second):
+            indexing._services[id(db)] = Thread(db.database_name)
+            self.addCleanup(indexing._services.pop, id(db), None)
+        for number, site in enumerate((self.portal, self.site)):
+            catalog = site.portal_catalog
+            base = aq_base(catalog)
+            key = indexing.make_key(int(time.time() * 1_000_000), b"\x00" * 8, number)
+            indexing._written(base._p_jar, catalog, base._p_oid, key)
+        transaction.commit()
+        self.assertEqual(
+            woken,
+            {
+                self.db.database_name: [self.portal.getPhysicalPath()],
+                self.second.database_name: [self.site.getPhysicalPath()],
+            },
+        )
+
+    def test_the_cookie_wait_reads_the_store_of_the_catalog(self):
+        patcher = mock.patch.object(Zope2, "DB", self.db, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        request = getRequest()
+        self.save_in(self.site, "Second", create=True)
+        value = request.response.cookies[indexing.COOKIE]["value"]
+        self.assertEqual(indexing._parse_cookie(value)[2], self.second.database_name)
+        later = makerequest(aq_base(self.layer["app"])).REQUEST
+        later.cookies[indexing.COOKIE] = value
+        indexer = indexing.Indexer(self.site)
+
+        def run():
+            time.sleep(0.3)
+            indexer.run()
+
+        thread = threading.Thread(target=run)
+        start = time.monotonic()
+        thread.start()
+        indexing.request_started(_Event(later))
+        waited = time.monotonic() - start
+        thread.join(TIMEOUT)
+        self.assertGreaterEqual(waited, 0.25)
+        self.assertLess(waited, indexing.WAIT)
+        transaction.begin()
+        self.assertEqual(queue_of(self.site).scan(), [])
+
 
 class TestService(IndexingTestCase):
     def test_the_lease_has_one_holder(self):
         db = self.portal._p_jar.db()
         oid = aq_base(self.portal.portal_catalog)._p_oid
-        first = indexing._Service(db)
-        second = indexing._Service(db)
+        first = indexing._Service(db, db)
+        second = indexing._Service(db, db)
         tm = transaction.TransactionManager()
         connection = db.open(transaction_manager=tm)
         try:
@@ -493,7 +937,7 @@ class TestService(IndexingTestCase):
         db = portal._p_jar.db()
         portal.invokeFactory("Document", "doc", title="Document")
         transaction.commit()
-        service = indexing._Service(db)
+        service = indexing._Service(db, db)
         indexing._services[id(db)] = service
         self.addCleanup(indexing._services.pop, id(db), None)
         self.addCleanup(service.stop)

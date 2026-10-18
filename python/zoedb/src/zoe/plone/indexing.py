@@ -11,8 +11,9 @@ one of them gets a `ConflictError`.
 `install()` puts the processor of this module in the place of
 `portal-catalog`. When the storage of the catalog has KV namespaces
 (`zoe.kv`), the processor writes one key for each operation in the
-durable namespace `QUEUE` followed by the oid of the catalog in hex. It
-writes no object of the catalog. Else it calls the stock processor.
+durable namespace `QUEUE` followed by the oid of the catalog in hex, in
+the store of the catalog. It writes no object of the catalog. Else it
+calls the stock processor.
 
 `Indexer(site)` applies the queue of the catalog of `site`. `run()`
 applies batches until the queue is empty. Each batch reads the objects in
@@ -21,9 +22,12 @@ path, and deletes its keys, in one transaction. Each path resolves
 against the newest state, so the order of the paths does not change the
 result, except for the UID index: the removals come first.
 
-When the backend is installed, a thread of each Zope process runs the
-indexer of each site while it holds the lease of the site: a key of the
-ephemeral namespace `LEASE`. `Indexer.run()` itself takes no lease.
+When the backend is installed, each Zope process has a thread for each of
+its databases with KV namespaces: the root database and each mounted
+database. The thread of a database runs the indexer of each site whose
+catalog is in that database, while it holds the lease of the site: a key
+of the ephemeral namespace `LEASE` in that database. `Indexer.run()`
+itself takes no lease.
 
 The response of a request that queued operations sets the cookie
 `COOKIE`. A later request with the cookie waits at `PubStart` until the
@@ -78,9 +82,14 @@ COOKIE = "zoe.indexing"
 NOTE = "zoe.plone: indexing queue"
 # The security indexes of CMFCore (`CMFCatalogAware._cmf_security_indexes`).
 SECURITY = frozenset({"allowedRolesAndUsers"})
+# The operations of the queue.
+OPERATIONS = frozenset({"index", "reindex", "unindex"})
 
 # The most keys in a batch.
 BATCH_SIZE = 100
+# The most batches of one run of the thread, so that one busy site does
+# not hold the thread.
+THREAD_BATCHES = 50
 # The time between two scans of the queues of the thread, in seconds.
 POLL = 0.2
 # The time between two searches of the sites of the thread, in seconds.
@@ -89,6 +98,9 @@ SITES_EVERY = 60.0
 LEASE_TTL = 30
 # The longest wait of a request for its own operations, in seconds.
 WAIT = 2.0
+# How far in the future the key of a cookie can be, in seconds. A request
+# ignores a cookie whose key is later.
+COOKIE_SKEW = 60.0
 # The longest wait of a batch for its storage to see the queue, in seconds.
 VIEW_WAIT = 10.0
 # The tries of a batch that meets a transient error, and the pauses
@@ -139,6 +151,28 @@ def encode(op, path, idxs, metadata, failures=0, error=None):
 def decode(data):
     """Return the operation of a value as a dict."""
     return json.loads(data.decode("utf-8"))
+
+
+def parse(data):
+    """Return the operation of a value as a dict. A value that is not an
+    operation raises `ValueError`."""
+    try:
+        operation = decode(data)
+    except (AttributeError, ValueError) as error:
+        raise ValueError(f"the value is not JSON: {error}") from error
+    if not isinstance(operation, dict):
+        raise ValueError("the value is not a JSON object")
+    if operation.get("op") not in OPERATIONS:
+        raise ValueError(f"the operation {operation.get('op')!r} is not known")
+    path = operation.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError(f"the path {path!r} is not a path")
+    idxs = operation.get("idxs")
+    if not isinstance(idxs, list) or not all(isinstance(name, str) for name in idxs):
+        raise ValueError("the indexes are not a list of str")
+    if not isinstance(operation.get("metadata"), bool):
+        raise ValueError("the metadata flag is not a bool")
+    return operation
 
 
 class Entry:
@@ -201,7 +235,8 @@ def highest(paths):
 _installed = {}
 
 # The state of the processing of the queue in each thread: the random part
-# of the keys and the number of the next operation.
+# of the keys, the number of the next operation, and the transaction that
+# wakes the threads after its commit, with the sites of each database.
 _local = threading.local()
 
 # The storages without namespaces that the processor warned about.
@@ -263,25 +298,32 @@ def uninstall():
 
 
 def _warn(jar):
-    """Log one WARN event for each storage without namespaces."""
+    """Log one WARN event for each storage without namespaces, and one for
+    the catalogs that are in no database yet."""
     storage = jar.db().storage if jar is not None else None
     with _warned_lock:
         if id(storage) in _warned:
             return
         _warned.add(id(storage))
-    logger.warning(
-        "queued indexing: the storage %s has no KV namespaces, so each save"
-        " writes the catalog",
-        type(storage).__name__,
-    )
+    if storage is None:
+        logger.warning(
+            "queued indexing: a catalog is in no database yet, as in the"
+            " transaction that adds its site, so its saves write the catalog"
+        )
+    else:
+        logger.warning(
+            "queued indexing: the storage %s has no KV namespaces, so each save"
+            " writes the catalog",
+            type(storage).__name__,
+        )
 
 
 class QueueProcessor:
     """The queue processor of `zoe.plone`.
 
     It writes each operation to the queue of the catalog of the object, in
-    the current transaction. When the storage of the catalog has no
-    namespaces, it calls the stock processor.
+    the store of the catalog and in the current transaction. When that
+    storage has no namespaces, it calls the stock processor.
     """
 
     def __init__(self, stock):
@@ -341,33 +383,45 @@ class QueueProcessor:
 
 
 def _written(jar, catalog, oid, key):
-    """After a write to the queue: wake the thread of the process after
-    the commit, name the site to the thread, and set the cookie of the
-    user."""
+    """After a write to the queue: name the site to the thread of the
+    database of the catalog, wake that thread after the commit, and set the
+    cookie of the user."""
     from Acquisition import aq_inner, aq_parent
     from zope.globalrequest import getRequest
 
     site = aq_parent(aq_inner(catalog))
-    path = site.getPhysicalPath()
+    db = jar.db()
     txn = jar.transaction_manager.get()
-    if getattr(_local, "hooked", None) is not txn:
-        _local.hooked = txn
-        txn.addAfterCommitHook(_committed, (jar.db(), path))
+    hooked = getattr(_local, "hooked", None)
+    if hooked is None or hooked[0] is not txn:
+        # The databases of the commit, with the sites of each.
+        hooked = _local.hooked = (txn, {})
+        txn.addAfterCommitHook(_committed, (hooked[1],))
+    hooked[1].setdefault(id(db), (db, set()))[1].add(tuple(site.getPhysicalPath()))
     request = getRequest()
     response = getattr(request, "response", None)
     if response is not None and hasattr(response, "setCookie"):
         url = site.absolute_url_path() or "/"
-        value = f"{oid.hex()}-{key.hex()}-{urllib.parse.quote(url, safe='/')}"
+        name = db.database_name.encode("utf-8").hex()
+        value = f"{oid.hex()}-{key.hex()}-{name}-{urllib.parse.quote(url, safe='/')}"
+        # A cookie that the response already expires, as a request with the
+        # cookie does at its start, must not keep that expiry.
+        cookies = getattr(response, "cookies", None)
+        if isinstance(cookies, dict):
+            cookies.pop(COOKIE, None)
         response.setCookie(COOKIE, value, path=url, http_only=True, same_site="Lax")
 
 
-def _committed(status, db, path):
-    """Wake the thread of the database after a commit that wrote keys."""
+def _committed(status, databases):
+    """Wake the thread of each database that the commit wrote keys to, for
+    each site of that database."""
     if not status:
         return
-    service = _services.get(id(db))
-    if service is not None:
-        service.wake(path)
+    for db, paths in databases.values():
+        service = _service_for(db)
+        if service is not None:
+            for path in paths:
+                service.wake(path)
 
 
 class StaleView(TransientError):
@@ -387,36 +441,45 @@ def _nothing(indexer, keys):
     """The default `after_batch`: do nothing."""
 
 
+def _text(error):
+    """Return the text of an error for the failed namespace and the log."""
+    return f"{type(error).__name__}: {error}"[:500]
+
+
 class Indexer:
     """Apply the queue of the catalog of `site`.
 
     `run()` applies batches of at most `batch_size` keys until a scan of
     the queue gives no key. After the commit of each batch it calls
     `after_batch(indexer, keys)`. The indexer works on a connection and a
-    transaction manager of its own, under the system user.
+    transaction manager of its own, under the system user. It opens the
+    connection on the root database of `site` and finds the site by its
+    path, through a mount point when the site is in a mounted database.
+    The queue, the keys and the lease are in the store of the catalog.
     """
 
     def __init__(self, site, batch_size=BATCH_SIZE):
         from Acquisition import aq_base
-        from Products.CMFCore.utils import getToolByName
 
         if not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("the batch size is an int of 1 or more")
-        self._db = aq_base(site)._p_jar.db()
+        self._db = aq_base(site.getPhysicalRoot())._p_jar.db()
         self._path = site.getPhysicalPath()
-        catalog = aq_base(getToolByName(site, "portal_catalog"))
+        # The catalog of the site itself, not the catalog of the local site
+        # of the caller.
+        catalog = aq_base(aq_base(site).portal_catalog)
         self._oid = catalog._p_oid
+        self._catalog_db = catalog._p_jar.db()
         self.batch_size = batch_size
         self.after_batch = _nothing
         # The token of the thread that holds the lease of the site, or
         # None. The transaction of each batch then writes the lease again.
         self._lease = None
-        # The keys that failed in this run, and the paths of a security
-        # subtree whose reindex failed in this run.
+        # The keys that failed in this run, and the paths without keys
+        # whose application failed in this run.
         self._skipped = set()
         self._broken = set()
-        # The most batches of one run, or None. The thread of the process
-        # sets it, so that one busy site does not hold the thread.
+        # The most batches of one run, or None.
         self._max_batches = None
 
     @property
@@ -427,6 +490,8 @@ class Indexer:
     def run(self):
         """Apply batches until the queue is empty. Return the number of
         keys that the batches applied."""
+        from Acquisition import aq_base
+
         tm = transaction.TransactionManager()
         connection = self._db.open(transaction_manager=tm)
         context = _Context()
@@ -435,9 +500,12 @@ class Indexer:
             app = context.enter(connection)
             site = app.unrestrictedTraverse(self._path)
             context.site(site)
+            # The connection of the catalog: the connection of the root
+            # database, or its connection to the mounted database.
+            jar = aq_base(aq_base(site).portal_catalog)._p_jar
             batches = 0
             while self._max_batches is None or batches < self._max_batches:
-                count = self._apply_batch(app, site, connection, tm)
+                count = self._apply_batch(app, site, jar, tm)
                 if not count:
                     break
                 applied += count
@@ -451,12 +519,12 @@ class Indexer:
             connection.close()
         return applied
 
-    def _apply_batch(self, app, site, connection, tm):
+    def _apply_batch(self, app, site, jar, tm):
         """Apply one batch, again after a transient error. Return the
         number of keys of the batch."""
         for attempt in range(TRIES):
             try:
-                return self._batch(app, site, connection, tm)
+                return self._batch(app, site, jar, tm)
             except TransientError:
                 tm.abort()
                 if attempt == TRIES - 1:
@@ -464,9 +532,9 @@ class Indexer:
                 time.sleep(PAUSES[min(attempt, len(PAUSES) - 1)])
         return 0
 
-    def _scan(self, connection):
+    def _scan(self, jar):
         """Return the pairs of the next batch, without the skipped keys."""
-        queue = zoe.kv.Namespace(connection, "durable", self.name)
+        queue = zoe.kv.Namespace(jar, "durable", self.name)
         pairs = []
         start = None
         while len(pairs) < self.batch_size:
@@ -478,8 +546,9 @@ class Indexer:
         return pairs[: self.batch_size]
 
     def _wait_for(self, generation):
-        """Wait until the storage saw the commit `generation`."""
-        storage = self._db.storage
+        """Wait until the storage of the catalog saw the commit
+        `generation`."""
+        storage = self._catalog_db.storage
         if isinstance(storage, DemoStorage):
             # The overlays of zoe.kv give generations that are not tids,
             # and the commits are in this process.
@@ -494,28 +563,42 @@ class Indexer:
         """Begin the transaction of a batch: a new snapshot."""
         tm.begin()
 
-    def _batch(self, app, site, connection, tm):
-        pairs = self._scan(connection)
+    def _batch(self, app, site, jar, tm):
+        pairs = self._scan(jar)
         if not pairs:
             return 0
-        queue = zoe.kv.Namespace(connection, "durable", self.name)
+        good = []
+        bad = []
+        for key, value in pairs:
+            try:
+                parse(value)
+            except ValueError as error:
+                bad.append((key, value, error))
+            else:
+                good.append((key, value))
+        if bad:
+            self._reject(jar, tm, bad)
+            if not good:
+                return len(bad)
+        queue = zoe.kv.Namespace(jar, "durable", self.name)
         # Each key of the scan committed at or before the generation.
         self._wait_for(queue.generation())
-        self._begin(tm, connection)
+        self._begin(tm, jar)
         began = time.monotonic()
-        entries = coalesce(pairs)
+        entries = coalesce(good)
         try:
             self._apply(app, site, entries)
         except _PathFailure as failure:
             tm.abort()
-            self._fail(connection, tm, entries, failure)
-            return len(entries[failure.path].keys) or 1
+            entry = entries.get(failure.path)
+            self._fail(jar, tm, entry, failure)
+            return len(entry.keys) if entry is not None and entry.keys else 1
         keys = [key for entry in entries.values() for key in entry.keys]
-        queue = zoe.kv.Namespace(connection, "durable", self.name)
+        queue = zoe.kv.Namespace(jar, "durable", self.name)
         for key in keys:
             queue.delete(key)
         if self._lease is not None:
-            lease = zoe.kv.Namespace(connection, "ephemeral", LEASE)
+            lease = zoe.kv.Namespace(jar, "ephemeral", LEASE)
             lease.set(self._oid, self._lease, ttl=LEASE_TTL)
         txn = tm.get()
         txn.note(NOTE)
@@ -538,9 +621,7 @@ class Indexer:
     def _apply(self, app, site, entries):
         """Apply the entries to the catalog: the removals first, then the
         index or the reindex of each path that has an object."""
-        from Products.CMFCore.utils import getToolByName
-
-        catalog = getToolByName(site, "portal_catalog")
+        catalog = site.portal_catalog
         self._expand_security(catalog, entries)
         inner = catalog._catalog
         uids = inner.uids
@@ -548,6 +629,8 @@ class Indexer:
         removals = []
         updates = []
         for path, entry in entries.items():
+            if not entry.keys and path in self._broken:
+                continue
             obj = self._guarded(path, _resolve, app, path)
             rid = uids.get(path)
             if obj is None:
@@ -565,7 +648,11 @@ class Indexer:
                 other = uid_index._index.get(uid)
                 if other is not None and other != rid:
                     stale = inner.paths.get(other)
-                    if stale is not None and stale != path:
+                    if (
+                        stale is not None
+                        and stale != path
+                        and stale not in self._broken
+                    ):
                         found = self._guarded(stale, _resolve, app, stale)
                         if found is None or _uid(found) != uid:
                             removals.append(stale)
@@ -591,12 +678,20 @@ class Indexer:
     def _expand_security(self, catalog, entries):
         """Add to `entries` each path that the catalog holds below a path
         whose operations reindex only the security indexes, with those
-        indexes. Search only below the highest such paths."""
+        indexes. Search only below the highest such paths. A search that
+        fails is a failure of its highest path, so the keys of that path
+        stay in the queue and count the failure."""
         tops = highest(path for path, entry in entries.items() if entry.security)
         for top in tops:
             idxs = set(entries[top].idxs & SECURITY) or set(SECURITY)
-            for brain in catalog.unrestrictedSearchResults(path=top):
-                path = brain.getPath()
+            found = self._guarded(
+                top,
+                lambda top=top: [
+                    brain.getPath()
+                    for brain in catalog.unrestrictedSearchResults(path=top)
+                ],
+            )
+            for path in found:
                 if path == top or path in self._broken:
                     continue
                 entry = entries.get(path)
@@ -617,24 +712,47 @@ class Indexer:
         except Exception as error:
             raise _PathFailure(path, error) from error
 
-    def _fail(self, connection, tm, entries, failure):
+    def _reject(self, jar, tm, bad):
+        """Move each value that is not an operation to the failed
+        namespace, with its error, in a transaction of its own."""
+        queue = zoe.kv.Namespace(jar, "durable", self.name)
+        failed = zoe.kv.Namespace(jar, "durable", failed_name(self._oid))
+        self._skipped.update(key for key, _value, _error in bad)
+        tm.begin()
+        try:
+            for key, value, error in bad:
+                record = {"error": _text(error), "value": value.hex()}
+                failed.set(key, json.dumps(record, sort_keys=True).encode("utf-8"))
+                queue.delete(key)
+                logger.error(
+                    "queued indexing: a value of the queue %s is not an operation"
+                    " and left the queue: %s",
+                    self.name,
+                    _text(error),
+                )
+            tm.get().note(NOTE)
+            tm.commit()
+        except TransientError:
+            tm.abort()
+
+    def _fail(self, jar, tm, entry, failure):
         """Count a failure for each key of the path that failed, in a
         transaction of its own. A key with `FAILURES` failures goes to the
-        failed namespace. The run skips the keys of the path."""
-        entry = entries[failure.path]
-        text = f"{type(failure.error).__name__}: {failure.error}"[:500]
-        if not entry.keys:
-            # A path that only the security subtree named: skip it.
+        failed namespace. The run skips the keys of the path. A path
+        without keys, as a stale path of the UID index or a path of a
+        security subtree, logs an ERROR event, and the run skips it."""
+        text = _text(failure.error)
+        if entry is None or not entry.keys:
             self._broken.add(failure.path)
             logger.error(
-                "queued indexing: the security reindex of %s failed: %s",
+                "queued indexing: %s failed and the run skips it: %s",
                 failure.path,
                 text,
             )
             return
         self._skipped.update(entry.keys)
-        queue = zoe.kv.Namespace(connection, "durable", self.name)
-        failed = zoe.kv.Namespace(connection, "durable", failed_name(self._oid))
+        queue = zoe.kv.Namespace(jar, "durable", self.name)
+        failed = zoe.kv.Namespace(jar, "durable", failed_name(self._oid))
         tm.begin()
         try:
             for key in entry.keys:
@@ -677,14 +795,18 @@ class Indexer:
 def _resolve(app, path):
     """Return the object at `path` that the catalog can index, or None.
     The object is found without acquisition: its physical path is the
-    path."""
+    path. Only the errors of a missing path give None. A read error of the
+    store, `POSKeyError` included, stays an error."""
     from Acquisition import aq_base
+    from zExceptions import NotFound
+    from ZODB.POSException import POSKeyError
 
     try:
         obj = app.unrestrictedTraverse(path)
-    except TransientError:
+    except (TransientError, POSKeyError):
         raise
-    except Exception:
+    except (KeyError, AttributeError, NotFound):
+        # `LocationError` of zope.location is a `KeyError`.
         return None
     try:
         if "/".join(obj.getPhysicalPath()) != path:
@@ -762,16 +884,6 @@ def _storage(db):
         return None
 
 
-def _site_storage(site):
-    """Return the namespaces of the storage of `site`, or None."""
-    from Acquisition import aq_base
-
-    jar = getattr(aq_base(site), "_p_jar", None)
-    if jar is None:
-        return None
-    return _storage(jar.db())
-
-
 def status(site, since=None):
     """Return the status of the queue of `site` as a dict: the keys in the
     queue, the age of the oldest key, the failed keys, whether a thread
@@ -779,13 +891,14 @@ def status(site, since=None):
     process applied. With `since`, a time in seconds since the Unix epoch,
     the delays are those of the batches that committed at or after it."""
     from Acquisition import aq_base
-    from Products.CMFCore.utils import getToolByName
 
     result = {"installed": installed(), "namespaces": False}
-    storage = _site_storage(site)
+    catalog = aq_base(aq_base(site).portal_catalog)
+    jar = getattr(catalog, "_p_jar", None)
+    storage = _storage(jar.db()) if jar is not None else None
     if storage is None:
         return result
-    oid = aq_base(getToolByName(site, "portal_catalog"))._p_oid
+    oid = catalog._p_oid
     result["namespaces"] = True
     pending, oldest = _count(storage, queue_name(oid))
     failed, _ = _count(storage, failed_name(oid))
@@ -850,22 +963,38 @@ class StatusView:
 
 
 def _parse_cookie(value):
-    """Return `(oid, key, path)` of the value of the cookie, or None."""
+    """Return `(oid, key, database name, path)` of the value of the
+    cookie, or None."""
     try:
-        oid, key, path = value.split("-", 2)
+        oid, key, name, path = value.split("-", 3)
         oid, key = bytes.fromhex(oid), bytes.fromhex(key)
+        name = bytes.fromhex(name).decode("utf-8")
     except (AttributeError, ValueError):
         return None
-    if len(oid) != 8 or len(key) != _KEY.size:
+    if len(oid) != 8 or len(key) != _KEY.size or not name:
         return None
-    return oid, key, urllib.parse.unquote(path) or "/"
+    return oid, key, name, urllib.parse.unquote(path) or "/"
+
+
+def _cookie_path(value, request):
+    """Return the path of a cookie whose value does not parse: the path in
+    the value when it has one, else the first segment of the path of the
+    request, where a site at the top of the Zope root lives."""
+    if isinstance(value, str):
+        last = value.rsplit("-", 1)[-1]
+        if last.startswith("/"):
+            return urllib.parse.unquote(last)
+    path = request.get("PATH_INFO", "") or ""
+    first = path.strip("/").split("/", 1)[0]
+    return f"/{first}" if first else "/"
 
 
 def request_started(event):
     """Wait, at the start of a request with the cookie of the user, until
     the indexer applied the operations of the save of the user. Then
     begin the transaction of the request again, so that its snapshot holds
-    them. The wait lasts at most `WAIT`."""
+    them. The wait lasts at most `WAIT`. The request expires the cookie,
+    also after a wait that ran out."""
     if not _installed:
         return
     request = event.request
@@ -874,27 +1003,32 @@ def request_started(event):
         return
     parsed = _parse_cookie(value)
     if parsed is None:
-        request.response.expireCookie(COOKIE, path="/")
+        request.response.expireCookie(COOKIE, path=_cookie_path(value, request))
         return
-    oid, key, path = parsed
+    oid, key, name, path = parsed
+    if key_time(key) > time.time() + COOKIE_SKEW:
+        # A key from the future: no save of this process made it.
+        request.response.expireCookie(COOKIE, path=path)
+        return
     import Zope2
 
-    db = getattr(Zope2, "DB", None)
+    root = getattr(Zope2, "DB", None)
+    db = root.databases.get(name) if root is not None else None
     storage = _storage(db) if db is not None else None
     if storage is None:
         request.response.expireCookie(COOKIE, path=path)
         return
-    name = queue_name(oid)
+    queue = queue_name(oid)
     stop = key + b"\x00"
     deadline = time.monotonic() + WAIT
     late = False
-    while storage.kv_scan("durable", name, None, stop, 1):
+    while storage.kv_scan("durable", queue, None, stop, 1):
         if time.monotonic() > deadline:
             late = True
             break
         time.sleep(0.02)
     if not late and not isinstance(db.storage, DemoStorage):
-        generation = storage.kv_generation(name)
+        generation = storage.kv_generation(queue)
         while db.storage.lastTransaction() < generation:
             if time.monotonic() > deadline:
                 late = True
@@ -913,30 +1047,57 @@ def request_started(event):
     report.request_started(event)
 
 
+# The root database of the process, from `IDatabaseOpenedWithRoot`.
+_root = {}
+
 # The threads of this process, by the id of their database.
 _services = {}
 _services_lock = threading.Lock()
 
 
 def database_opened(event):
-    """Start the thread of the database, when the backend is installed."""
+    """Start a thread for the root database and for each database that
+    Zope opened with it, when the backend is installed. Zope opens each
+    database of a mount point before this event."""
     if not _installed:
         return
-    db = event.database
+    _root["db"] = event.database
+    for db in list(event.database.databases.values()):
+        _service_for(db)
+
+
+def _service_for(db):
+    """Return the thread of `db`, and start it when the database is part of
+    the databases of the root database and has KV namespaces. Return None
+    for another database, or before the root database opened."""
     with _services_lock:
-        if id(db) in _services:
-            return
-        service = _services[id(db)] = _Service(db)
+        service = _services.get(id(db))
+        if service is not None:
+            return service
+        root = _root.get("db")
+        if root is None or not _installed:
+            return None
+        if root.databases.get(db.database_name) is not db:
+            return None
+        if _storage(db) is None:
+            return None
+        service = _services[id(db)] = _Service(db, root)
     service.start()
+    return service
 
 
 class _Service(threading.Thread):
-    """The thread of a database: it runs the indexer of each site of the
-    database while it holds the lease of the site."""
+    """The thread of a database: it runs the indexer of each site whose
+    catalog is in the database, while it holds the lease of the site in
+    the database. It finds the site through the root database `root`. The
+    thread of the root database searches the sites: at the top of the Zope
+    root and at each mount point, and gives each site to the thread of the
+    database of its catalog."""
 
-    def __init__(self, db):
-        super().__init__(name="zoe.plone.indexing", daemon=True)
+    def __init__(self, db, root):
+        super().__init__(name=f"zoe.plone.indexing {db.database_name}", daemon=True)
         self._db = db
+        self._root = root
         self._token = os.urandom(16)
         self._event = threading.Event()
         self._sites = set()
@@ -944,9 +1105,13 @@ class _Service(threading.Thread):
         self._stopping = False
         atexit.register(self.stop)
 
+    def add(self, path):
+        """Serve the site at `path`."""
+        self._sites.add(tuple(path))
+
     def wake(self, path=None):
         if path is not None:
-            self._sites.add(tuple(path))
+            self.add(path)
         self._event.set()
 
     def stop(self):
@@ -978,29 +1143,55 @@ class _Service(threading.Thread):
             self._event.clear()
             if self._stopping:
                 break
-            try:
-                if found is None or time.monotonic() - found > SITES_EVERY:
+            if self._db is self._root and (
+                found is None or time.monotonic() - found > SITES_EVERY
+            ):
+                found = time.monotonic()
+                try:
                     self._find_sites()
-                    found = time.monotonic()
-                for path in list(self._sites):
+                except Exception:
+                    logger.exception("queued indexing: the search of the sites failed")
+            for path in list(self._sites):
+                try:
                     self._serve(path)
-            except Exception:
-                logger.exception("queued indexing: the thread failed")
-                time.sleep(1)
+                except Exception:
+                    logger.exception(
+                        "queued indexing: the queue of %s failed", "/".join(path)
+                    )
 
     def _find_sites(self):
-        """Add the sites at the top of the Zope root."""
+        """Give each site at the top of the Zope root, and at or just below
+        each mount point, to the thread of the database of its catalog."""
         from Acquisition import aq_base
         from Products.CMFCore.interfaces import ISiteRoot
 
         tm = transaction.TransactionManager()
-        connection = self._db.open(transaction_manager=tm)
+        connection = self._root.open(transaction_manager=tm)
         try:
             app = connection.root()["Application"]
-            for obj in app.objectValues():
+            candidates = list(app.objectValues())
+            for path in _mount_paths():
+                try:
+                    mounted = app.unrestrictedTraverse(path)
+                except (KeyError, AttributeError):
+                    continue
+                candidates.append(mounted)
+                values = getattr(mounted, "objectValues", None)
+                if values is not None:
+                    candidates.extend(values())
+            for obj in candidates:
                 base = aq_base(obj)
-                if ISiteRoot.providedBy(base) and hasattr(base, "portal_catalog"):
-                    self._sites.add(tuple(obj.getPhysicalPath()))
+                if not ISiteRoot.providedBy(base) or not hasattr(
+                    base, "portal_catalog"
+                ):
+                    continue
+                catalog = aq_base(base.portal_catalog)
+                jar = getattr(catalog, "_p_jar", None)
+                if jar is None:
+                    continue
+                service = _service_for(jar.db())
+                if service is not None:
+                    service.add(obj.getPhysicalPath())
         finally:
             tm.abort()
             connection.close()
@@ -1009,29 +1200,29 @@ class _Service(threading.Thread):
         """Run the indexer of the site at `path` when its queue holds keys
         and the thread holds the lease."""
         from Acquisition import aq_base
-        from Products.CMFCore.utils import getToolByName
 
         tm = transaction.TransactionManager()
-        connection = self._db.open(transaction_manager=tm)
+        connection = self._root.open(transaction_manager=tm)
         try:
             try:
                 site = connection.root()["Application"].unrestrictedTraverse(path)
-                catalog = aq_base(getToolByName(site, "portal_catalog"))
+                catalog = aq_base(aq_base(site).portal_catalog)
             except (KeyError, AttributeError):
                 self._sites.discard(path)
                 return
-            if not zoe.kv._supported(connection):
+            jar = getattr(catalog, "_p_jar", None)
+            if jar is None or jar.db() is not self._db or not zoe.kv._supported(jar):
                 self._sites.discard(path)
                 return
             oid = catalog._p_oid
-            queue = zoe.kv.Namespace(connection, "durable", queue_name(oid))
+            queue = zoe.kv.Namespace(jar, "durable", queue_name(oid))
             if not queue.scan(limit=1):
                 return
-            if not self._take(connection, tm, oid):
+            if not self._take(jar, tm, oid):
                 return
             indexer = Indexer(site)
             indexer._lease = self._token
-            indexer._max_batches = 50
+            indexer._max_batches = THREAD_BATCHES
             indexer.run()
             if queue.scan(limit=1):
                 # The site has more keys: serve it again at once.
@@ -1040,10 +1231,11 @@ class _Service(threading.Thread):
             tm.abort()
             connection.close()
 
-    def _take(self, connection, tm, oid):
-        """Take the lease of the catalog `oid`, or keep it. Return True
-        when the thread holds it."""
-        lease = zoe.kv.Namespace(connection, "ephemeral", LEASE)
+    def _take(self, jar, tm, oid):
+        """Take the lease of the catalog `oid`, in the store of the
+        connection `jar`, or keep it. Return True when the thread holds
+        it."""
+        lease = zoe.kv.Namespace(jar, "ephemeral", LEASE)
         current = lease.get(oid)
         if current == self._token:
             return True
@@ -1058,3 +1250,17 @@ class _Service(threading.Thread):
         if held:
             self._held.add(oid)
         return held
+
+
+def _mount_paths():
+    """Return the paths of the mount points of the configuration of Zope,
+    or nothing outside Zope."""
+    try:
+        from App.config import getConfiguration
+
+        dbtab = getattr(getConfiguration(), "dbtab", None)
+    except Exception:
+        return []
+    if dbtab is None:
+        return []
+    return [path for path, _name in dbtab.listMountPaths() if path != "/"]
