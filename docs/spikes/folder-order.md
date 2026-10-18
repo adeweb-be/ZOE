@@ -108,6 +108,7 @@ One run of each scenario on `zoe-native-qi` with the split merge, at 4 and 16 us
 - In `create-spread` the 5 `ConflictError`s are on a `Folder` too: two creations in one folder of a section, 11.7 per 1,000 operations over both steps. No other object conflicts in either run: every `ConflictError` of both runs is the case of this card.
 - The resolution logs (412 lines for `create-shared`, 673 for `create-spread`, over the whole runs) hold the merges of every tree of the site, not only of the folders: tier 1 with no split (`OOBucket`, `OIBucket`, `OIBTree`, `Length`), rule 3 of the split merge (33 and 128 lines), rule 1 (5 and 19 nodes), and the buckets of the intid utility that the client resolves ("a NEWOBJ that the model does not model", 105 and 261 lines).
 - The failed operation of `create-shared` at 4 users is a creation that exhausted its retries on the `Folder`.
+- Creations in one folder commit one for each sync of the store, also once they merge: the `Folder` and its order are not classes of tier 1, so the lock hand-off of ADR 0044 never applies to them, and each vote waits until the commit before it is durable. So the rate of `create-shared` has the sync as its bound, with or without the mechanism; its `ConflictError`s and their retries are what the mechanism removes.
 
 ### 6. The acceptance test
 
