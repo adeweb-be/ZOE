@@ -233,8 +233,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             .push((record.oid, record.current, record.pickle));
                     }
                 }
-                Split::Refused { rule, reason } => {
-                    let (read, current) = serials[&oid];
+                Split::Refused {
+                    rule,
+                    reason,
+                    oid,
+                    class,
+                } => {
+                    // The refusal names the stale record of its range, the
+                    // record that the vote reports as in conflict.
+                    let Some(&(read, current)) = serials.get(&oid) else {
+                        continue;
+                    };
                     if node_mode == Mode::Shadow {
                         plan.shadows.insert(
                             oid,
@@ -398,6 +407,8 @@ mod tests {
     use zoe_pickle::btrees::new_bucket_state;
     use zoe_pickle::python::{Heap, Pickler, Value};
 
+    use crate::error::ZoeError;
+    use crate::merge::Resolved;
     use crate::store::Store;
     use crate::types::{Oid, Tid};
     use crate::vfs::MemVfs;
@@ -450,16 +461,16 @@ mod tests {
         record(&heap, class, Value::Int(value))
     }
 
-    /// Returns the record of a policy that sets `split_merges` to `on`, and
-    /// the root that names it at `policy`.
-    fn policy_and_root(policy: Oid) -> (Vec<u8>, Vec<u8>) {
+    /// Returns the record of a policy that sets `split_merges` to `mode`,
+    /// and the root that names it at `policy`.
+    fn policy_and_root(policy: Oid, mode: &str) -> (Vec<u8>, Vec<u8>) {
         let mut heap = Heap::new();
         let class = heap.new_class("zoe.policy", "MergePolicy");
         let classes = heap.new_dict(Vec::new());
         let items = vec![
             (heap.new_str("version"), Value::Int(1)),
             (heap.new_str("classes"), classes),
-            (heap.new_str("split_merges"), heap.new_str("on")),
+            (heap.new_str("split_merges"), heap.new_str(mode)),
         ];
         let state = heap.new_dict(items);
         let root = [
@@ -502,11 +513,13 @@ mod tests {
     /// snapshot. The second one votes while the commit of the first one is
     /// in flight, with the lock of the node handed off. With `stale_first`,
     /// a `Length` below the node in oid order conflicts too, so the plan
-    /// of the split merge starts before the vote checks the node.
-    fn merge_after_a_commit_in_flight(stale_first: bool) {
+    /// of the split merge starts before the vote checks the node. In mode
+    /// `shadow`, the vote waits as in mode `on`, then fails on the node as
+    /// without the rules.
+    fn merge_after_a_commit_in_flight(stale_first: bool, mode: &str) {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
-        let (policy_record, root) = policy_and_root(policy);
+        let (policy_record, root) = policy_and_root(policy, mode);
         commit(&store, &[(policy, Tid::ZERO, policy_record)]);
         commit(&store, &[(Oid(0), Tid::ZERO, root)]);
         let counter = new_oid(&store);
@@ -561,10 +574,24 @@ mod tests {
             drop(sequencer);
             finish.join().unwrap().unwrap();
             let (voted, txn) = second.join().unwrap();
+            if mode == "shadow" {
+                assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == n));
+                let shadowed = txn.resolutions().iter().any(|resolution| {
+                    resolution.oid == n
+                        && resolution.split == Some(2)
+                        && resolution.shadow == Some(Resolved::Merged)
+                });
+                assert!(shadowed, "{:?}", txn.resolutions());
+                return;
+            }
             assert_eq!(voted.unwrap(), []);
             assert!(txn.natively_resolved().contains(&n));
             txn.finish().unwrap();
         });
+        assert!(store.locks.is_empty());
+        if mode == "shadow" {
+            return;
+        }
         let (data, _) = store.load(n).unwrap();
         assert_eq!(data, node(b0, &[(20, y), (40, b1), (50, x)]));
         if stale_first {
@@ -575,11 +602,16 @@ mod tests {
 
     #[test]
     fn a_split_merge_waits_for_a_commit_in_flight_of_its_node() {
-        merge_after_a_commit_in_flight(false);
+        merge_after_a_commit_in_flight(false, "on");
     }
 
     #[test]
     fn a_plan_that_starts_before_the_node_waits_for_its_commit_in_flight() {
-        merge_after_a_commit_in_flight(true);
+        merge_after_a_commit_in_flight(true, "on");
+    }
+
+    #[test]
+    fn in_shadow_mode_a_refused_split_waits_for_its_commit_in_flight() {
+        merge_after_a_commit_in_flight(false, "shadow");
     }
 }

@@ -27,6 +27,9 @@ testing = []
 # This crate with the test hook. Cargo builds dev-dependencies only for
 # tests, examples and benchmarks.
 zoe-core = { workspace = true, features = ["testing"] }
+# zoe-pickle with `Heap::new_reference`, which the tests use to build
+# records.
+zoe-pickle = { path = "../zoe-pickle", features = ["testing"] }
 
 [lints]
 workspace = true

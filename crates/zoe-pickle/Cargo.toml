@@ -11,5 +11,10 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 
+[features]
+# `Heap::new_reference`, which only tests use to build records. Only the
+# dev-dependency of zoe-core turns it on.
+testing = []
+
 [lints]
 workspace = true

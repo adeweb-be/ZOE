@@ -16,6 +16,8 @@
 //! 2. The splits of different children merge: the merged node is the
 //!    committed node with the new children of the transaction right after
 //!    their anchors ([`written_node`]).
+//!    Each node runs the rules on its own records, at any depth, so a split
+//!    of a child node that the other side did not change merges too.
 //! 3. A split of one bucket merges the keys of its range with the rules of
 //!    `bucket_merge`. The merged keys go to the bucket and to the new bucket
 //!    of the transaction, at the separator of the committed side when it
@@ -94,8 +96,15 @@ pub(crate) enum Split {
     Merged { rule: u8, records: Vec<Written> },
     /// Rule 1: the read-current node passes.
     Passed,
-    /// Rule 3: `bucket_merge` refuses the merge of a range.
-    Refused { rule: u8, reason: Reason },
+    /// Rule 3: `bucket_merge` refuses the merge of a range. `oid` is the
+    /// stale record of the range, of the class `class`: the split bucket,
+    /// or the root that held its bucket inline. The vote fails on it.
+    Refused {
+        rule: u8,
+        reason: Reason,
+        oid: Oid,
+        class: String,
+    },
     /// No answer: the vote goes on as without the rules. The text says why.
     Undecided(&'static str),
 }
@@ -147,11 +156,11 @@ impl From<ZoeError> for Stop {
 }
 
 impl From<Outcome> for Stop {
-    /// A refusal of a merge of tier 1 inside a rule is a refusal of rule
-    /// 3, the only rule that merges keys.
+    /// An outcome of a comparison that gives no merge. Only the merge of a
+    /// range refuses: [`Group::merge`] names the record of its refusal.
     fn from(outcome: Outcome) -> Self {
         Stop::Answer(match outcome {
-            Outcome::Refused(reason) => Split::Refused { rule: 3, reason },
+            Outcome::Refused(_) => Split::Undecided("values that Python cannot compare"),
             Outcome::Undecided(why) => Split::Undecided(why),
             Outcome::Merged(_) => Split::Undecided("a merge where a refusal was due"),
         })
@@ -447,22 +456,34 @@ impl<'s> Group<'s> {
     /// Merges the range of one bucket with the rules of `bucket_merge`, and
     /// cuts the merged items at `separator`. Returns the items below the
     /// separator, the items at and above it, the keys that the new side
-    /// changed and their number. Neither half may be empty.
+    /// changed and their number. Neither half may be empty. A refusal of
+    /// `bucket_merge` names `stale`, the stale record of the range, and its
+    /// class.
     fn merge(
         &mut self,
         old: &[Value],
         committed: &[Value],
         new: &[Value],
         separator: Value,
+        stale: (Oid, &str),
     ) -> Step<Cut> {
-        let (mut items, keys, changed) = merge_range(
+        let merged = merge_range(
             &mut self.heap,
             self.family,
             self.mapping,
             old,
             committed,
             new,
-        )?;
+        );
+        let (mut items, keys, changed) = merged.map_err(|outcome| match outcome {
+            Outcome::Refused(reason) => Stop::Answer(Split::Refused {
+                rule: 3,
+                reason,
+                oid: stale.0,
+                class: stale.1.to_owned(),
+            }),
+            other => Stop::from(other),
+        })?;
         let width = if self.mapping { 2 } else { 1 };
         let mut cut = items.len();
         for (index, item) in items.chunks(width).enumerate() {
@@ -524,6 +545,11 @@ impl<'s> Group<'s> {
     /// Rule 3 on a root that held its one bucket inline in the record that
     /// the transaction read, and that the transaction split into two new
     /// buckets.
+    ///
+    /// A record cannot tell such a root from the last node of a tree that
+    /// holds its one bucket inline. The rule writes the same records there:
+    /// the node and its two new buckets. No other record refers to them, so
+    /// the node above does not change, and no update is lost.
     fn inline(&mut self, node: &Merging, bucket: Value, committed: Tree, new: Tree) -> Step<Split> {
         if node.current == node.read {
             return no("a root that the other side did not change");
@@ -584,7 +610,13 @@ impl<'s> Group<'s> {
             high,
             keys,
             changed,
-        } = self.merge(&old.items, &committed, &ours, separator)?;
+        } = self.merge(
+            &old.items,
+            &committed,
+            &ours,
+            separator,
+            (node.oid, &node.name),
+        )?;
         let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
         let x_state = new_bucket_state(&mut self.heap, high, None);
         let children = self
@@ -769,7 +801,13 @@ impl<'s> Group<'s> {
             high,
             keys,
             changed,
-        } = self.merge(&a_old.items, &committed, &ours, separator)?;
+        } = self.merge(
+            &a_old.items,
+            &committed,
+            &ours,
+            separator,
+            (anchor.child.oid, &a_name),
+        )?;
         let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
         let x_state = new_bucket_state(&mut self.heap, high, x_new.next);
         Ok([

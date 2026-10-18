@@ -744,13 +744,20 @@ fn a_refusal_inside_the_range_refuses_with_its_reason() {
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 50], &[60, 70]));
     let voted = txn.vote_resolving();
-    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    // The vote fails on the bucket whose range refused.
+    let anchor = tree.buckets[1];
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == anchor));
     let [resolution] = txn.resolutions() else {
         panic!("{:?}", txn.resolutions());
     };
     assert_eq!(
-        (resolution.split, resolution.outcome, resolution.applied),
-        (Some(3), Resolved::Refused(Reason::BTrees(6)), true)
+        (
+            resolution.oid,
+            resolution.split,
+            resolution.outcome,
+            resolution.applied
+        ),
+        (anchor, Some(3), Resolved::Refused(Reason::BTrees(6)), true)
     );
     assert!(txn.conflict_serials().is_some());
 }
@@ -1065,4 +1072,219 @@ fn keys_that_the_order_does_not_take_give_no_answer() {
         }
     });
     assert!(matches!(voted, Err(ZoeError::Conflict { .. })));
+}
+
+/// Runs a transaction that `ours` makes against the writes of the other
+/// side that `other` makes, on the tree of [`two_buckets`]. `ours` gives
+/// the writes of the transaction and the oids that it marks read-current.
+/// Returns the tree, the outcome of the vote and the entries of the vote.
+fn sides(
+    other: impl FnOnce(&Store, &Tree) -> Vec<(Oid, Tid, Vec<u8>)>,
+    ours: impl FnOnce(&Store, &Tree) -> (Vec<(Oid, Tid, Vec<u8>)>, Vec<Oid>),
+) -> (Tree, zoe_core::Result<()>, Vec<zoe_core::Resolution>) {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    let writes = other(&store, &tree);
+    commit(&store, &writes);
+    let (writes, read) = ours(&store, &tree);
+    let mut txn = writing(&store, &writes);
+    for oid in read {
+        txn.check_current_serial(oid, tree.tid).unwrap();
+    }
+    let voted = txn.vote();
+    let resolutions = txn.resolutions().to_vec();
+    (tree, voted, resolutions)
+}
+
+#[test]
+fn a_refusal_fails_on_the_stale_bucket_when_the_node_did_not_change() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    // The other side inserts 70 into the second bucket, without a split.
+    let current = commit(
+        &store,
+        &[(
+            tree.buckets[1],
+            tree.tid,
+            bucket(II, &ints(&[40, 50, 60, 70]), None),
+        )],
+    );
+    // The transaction splits it and inserts 70 too.
+    let x = new_oid(&store);
+    let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 50], &[60, 70]));
+    let voted = txn.vote();
+    let anchor = tree.buckets[1];
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == anchor));
+    assert_eq!(txn.conflict_serials(), Some((current, tree.tid)));
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (
+            resolution.oid,
+            &resolution.class[..],
+            resolution.split,
+            resolution.outcome
+        ),
+        (
+            anchor,
+            "BTrees.IIBTree.IIBucket",
+            Some(3),
+            Resolved::Refused(Reason::BTrees(6))
+        )
+    );
+}
+
+#[test]
+fn splits_of_different_child_nodes_merge_at_the_root() {
+    let store = open(Some("on"));
+    // A root of two nodes, each of two buckets.
+    let (root, n1, n2) = (new_oid(&store), new_oid(&store), new_oid(&store));
+    let b: Vec<Oid> = (0..4).map(|_| new_oid(&store)).collect();
+    let keys = [[10, 20], [30, 40], [50, 60], [70, 80]];
+    let mut writes = Vec::new();
+    for index in 0..4 {
+        let next = b.get(index + 1).copied();
+        writes.push((b[index], Tid::ZERO, bucket(II, &ints(&keys[index]), next)));
+    }
+    writes.push((n1, Tid::ZERO, leaf_node(II, b[0], &[(Key::Int(30), b[1])])));
+    writes.push((n2, Tid::ZERO, leaf_node(II, b[2], &[(Key::Int(70), b[3])])));
+    let tree_name = II.tree();
+    writes.push((
+        root,
+        Tid::ZERO,
+        node(II, n1, &[(Key::Int(50), n2)], &tree_name, b[0]),
+    ));
+    let tid = commit(&store, &writes);
+    // The other side splits the node n1 into n1 and n3.
+    let n3 = new_oid(&store);
+    commit(
+        &store,
+        &[
+            (
+                root,
+                tid,
+                node(
+                    II,
+                    n1,
+                    &[(Key::Int(30), n3), (Key::Int(50), n2)],
+                    &tree_name,
+                    b[0],
+                ),
+            ),
+            (n1, tid, leaf_node(II, b[0], &[])),
+            (n3, Tid::ZERO, leaf_node(II, b[1], &[])),
+        ],
+    );
+    // The transaction splits the node n2 into n2 and n4.
+    let n4 = new_oid(&store);
+    let mut txn = writing(
+        &store,
+        &[
+            (
+                root,
+                tid,
+                node(
+                    II,
+                    n1,
+                    &[(Key::Int(50), n2), (Key::Int(70), n4)],
+                    &tree_name,
+                    b[0],
+                ),
+            ),
+            (n2, tid, leaf_node(II, b[2], &[])),
+            (n4, Tid::ZERO, leaf_node(II, b[3], &[])),
+        ],
+    );
+    txn.vote().unwrap();
+    assert_eq!(txn.natively_resolved(), [root]);
+    assert_eq!(txn.resolutions()[0].split, Some(2));
+    txn.finish().unwrap();
+    let (data, _) = store.load(root).unwrap();
+    assert_eq!(
+        data,
+        node(
+            II,
+            n1,
+            &[(Key::Int(30), n3), (Key::Int(50), n2), (Key::Int(70), n4)],
+            &tree_name,
+            b[0],
+        )
+    );
+    let (buckets, keys) = walk(&store, root);
+    assert_eq!(buckets, b);
+    assert_eq!(keys, [10, 20, 30, 40, 50, 60, 70, 80]);
+}
+
+/// The writes of a split of the second bucket of [`two_buckets`] by the
+/// other side: it keeps [40, 50], and a new bucket gets [60, 70].
+fn other_split(store: &Store, tree: &Tree) -> Vec<(Oid, Tid, Vec<u8>)> {
+    let y = new_oid(store);
+    split_writes(tree, 1, y, &[40, 50], &[60, 70])
+}
+
+#[test]
+fn a_path_child_that_the_transaction_stored_and_the_other_side_split_conflicts() {
+    let (tree, voted, resolutions) = sides(other_split, |_, tree| {
+        // A plain insert of 45 into the second bucket, under the node that
+        // the transaction read.
+        let writes = vec![(
+            tree.buckets[1],
+            tree.tid,
+            bucket(II, &ints(&[40, 45, 50, 60]), None),
+        )];
+        (writes, vec![tree.root])
+    });
+    let anchor = tree.buckets[1];
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == anchor));
+    assert!(
+        resolutions.iter().all(|r| r.split.is_none()),
+        "{resolutions:?}"
+    );
+}
+
+#[test]
+fn two_splits_of_one_bucket_by_the_transaction_give_no_answer() {
+    let (tree, voted, resolutions) = sides(other_split, |store, tree| {
+        let (x1, x2) = (new_oid(store), new_oid(store));
+        let children = [
+            (Key::Int(40), tree.buckets[1]),
+            (Key::Int(50), x1),
+            (Key::Int(60), x2),
+        ];
+        let writes = vec![
+            (
+                tree.root,
+                tree.tid,
+                leaf_node(II, tree.buckets[0], &children),
+            ),
+            (
+                tree.buckets[1],
+                tree.tid,
+                bucket(II, &ints(&[40, 45]), Some(x1)),
+            ),
+            (x1, Tid::ZERO, bucket(II, &ints(&[50]), Some(x2))),
+            (x2, Tid::ZERO, bucket(II, &ints(&[60]), None)),
+        ];
+        (writes, Vec::new())
+    });
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    assert!(
+        resolutions.iter().all(|r| r.split.is_none()),
+        "{resolutions:?}"
+    );
+}
+
+#[test]
+fn a_delete_by_the_transaction_in_the_range_gives_no_answer() {
+    let (tree, voted, resolutions) = sides(other_split, |store, tree| {
+        // The transaction splits the second bucket and deletes 50.
+        let x = new_oid(store);
+        (split_writes(tree, 1, x, &[40, 45], &[60]), Vec::new())
+    });
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    assert!(
+        resolutions.iter().all(|r| r.split.is_none()),
+        "{resolutions:?}"
+    );
 }
