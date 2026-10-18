@@ -190,14 +190,20 @@ impl Invalidations {
     /// its reply and puts it here. When it goes in, it goes out before the
     /// invalidation of each later commit. When it does not, a commit came
     /// in between, and the reader reads again.
+    ///
+    /// `before` runs only when the frame goes in, just before the put. So
+    /// the reader counts its call once, before the client can have the
+    /// reply.
     pub(crate) fn put_since(
         &self,
         seen: Tid,
         room: Room,
         frame: Option<Parts>,
+        before: impl FnOnce(),
     ) -> Result<bool, Room> {
         let state = self.lock();
         if state.published == seen {
+            before();
             Ok(room.put_parts(frame))
         } else {
             Err(room)
@@ -525,20 +531,26 @@ mod tests {
         let mut writer = Client::new(&hub, 10);
         let mut reader = Client::new(&hub, 10);
         let seen = hub.published();
+        // `before` runs once for each frame that goes in.
+        let puts = std::cell::Cell::new(0);
+        let before = || puts.set(puts.get() + 1);
         // A reply in two parts goes out as one frame.
         let load = Some(vec![b"lo".to_vec(), b"ad".to_vec()]);
-        let put = hub.put_since(seen, reader.outbox.blocking_room(), load.clone());
+        let put = hub.put_since(seen, reader.outbox.blocking_room(), load.clone(), before);
         assert!(put.unwrap());
+        assert_eq!(puts.get(), 1);
         // A commit after the reply goes out after it.
         hub.publish(writer.commit(0, 1));
         assert_eq!(reader.take(), text(&["load", "inv 1"]));
         // A commit between the read and the reply: the reader reads again.
         hub.publish(writer.commit(1, 2));
         let room = hub
-            .put_since(Tid(1), reader.outbox.blocking_room(), load)
+            .put_since(Tid(1), reader.outbox.blocking_room(), load, before)
             .unwrap_err();
+        assert_eq!(puts.get(), 1);
         assert_eq!(reader.take(), text(&["inv 2"]));
-        assert!(hub.put_since(Tid(2), room, None).unwrap());
+        assert!(hub.put_since(Tid(2), room, None, before).unwrap());
+        assert_eq!(puts.get(), 2);
         assert!(reader.take().is_empty());
         assert_eq!(writer.take().len(), 4);
     }
