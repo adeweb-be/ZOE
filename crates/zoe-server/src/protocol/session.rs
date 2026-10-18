@@ -1663,7 +1663,8 @@ impl Transaction {
         let listed = self.open.as_ref().map_or(0, |open| open.listed);
         let started = Instant::now();
         let outcome = self.dispatch(call);
-        // A panic of the count still publishes the commit.
+        // The publication exists before the count. So a panic of the count
+        // still publishes the commit.
         let publication = self
             .committed
             .take()
