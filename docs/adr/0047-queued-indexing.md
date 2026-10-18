@@ -1,6 +1,6 @@
 # 0047. Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them
 
-Status: accepted. The checkpoint of ZOE-218 (step 2). The human approved it with the recommendation of each of the questions at its end. After the review of the build, the human chose to serve mounted databases (the last item of section 4); that item and the cookie of section 6 wait for the human's approval of their text. It adds an opt-in backend to `zoe.plone`, a public Python API (`zoe.plone.indexing`), and a behaviour that the specification states (lever 4 of section 9). It changes no on-disk format, no wire protocol and no code of the core.
+Status: accepted. The checkpoint of ZOE-218 (step 2). The human approved it with the recommendation of each of the questions at its end. After the review of the build, the human chose to serve mounted databases (the last item of section 4), then approved the text of that item and of the cookie of section 6. It adds an opt-in backend to `zoe.plone`, a public Python API (`zoe.plone.indexing`), and a behaviour that the specification states (lever 4 of section 9). It changes no on-disk format, no wire protocol and no code of the core.
 
 ## Context
 
