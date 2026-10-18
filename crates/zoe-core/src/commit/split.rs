@@ -8,7 +8,8 @@
 //!
 //! In mode `on`, the vote stages the records of each merge over the serials
 //! of the committed records, lets each node of rule 1 pass, and fails on a
-//! refusal. In mode `shadow`, the vote goes on as without the rules, and
+//! refusal. The plan keeps the reason of each stale read-current node for
+//! which rule 1 gives no answer, for the entry of a read conflict. In mode `shadow`, the vote goes on as without the rules, and
 //! the entries of the stale oids of the plan carry the outcome of the
 //! rules. A commit with no conflict makes no plan.
 //!
@@ -47,6 +48,9 @@ pub(super) struct Plan {
     pub(super) refused: Option<(Oid, Tid, Tid)>,
     /// In mode `shadow`, what the rules give for each stale oid of a node.
     pub(super) shadows: BTreeMap<Oid, Shadow>,
+    /// In mode `on`, the stale read-current nodes for which rule 1 gives no
+    /// answer: the class of each one and the reason.
+    pub(super) unanswered: BTreeMap<Oid, (String, &'static str)>,
     /// The transaction size with the merged pickles.
     pub(super) stored_bytes: u64,
     /// The time that the plan waited for commits in flight.
@@ -290,12 +294,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     continue;
                 };
                 let node_mode = both(mode, rules.tier1_mode(&class));
-                if node_mode == Mode::Off || split::read_node(&source, oid, read)? != Split::Passed
-                {
+                if node_mode == Mode::Off {
                     continue;
                 }
+                let outcome = match split::read_node(&source, oid, read)? {
+                    Split::Passed => Resolved::Merged,
+                    Split::Undecided(why) => Resolved::Undecided(why),
+                    Split::Merged { .. } | Split::Refused { .. } => continue,
+                };
                 if node_mode == Mode::Shadow {
-                    let outcome = Resolved::Merged;
                     plan.shadows.insert(
                         oid,
                         Shadow {
@@ -304,6 +311,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             class,
                         },
                     );
+                    continue;
+                }
+                if let Resolved::Undecided(why) = outcome {
+                    plan.unanswered.insert(oid, (class, why));
                     continue;
                 }
                 plan.passed.insert(oid);
@@ -376,9 +387,40 @@ fn refusal(
     }
 }
 
+/// Returns the entry of the resolution log of a stale read-current node on
+/// which the vote fails in mode `on`, when rule 1 gives no answer for it:
+/// `why` is the reason of rule 1. The vote fails as without the rules, so
+/// the entry is not applied.
+pub(super) fn read_conflict(
+    oid: Oid,
+    class: &str,
+    why: &'static str,
+    read: Tid,
+    current: Tid,
+    rules: &Rules<'_>,
+) -> Resolution {
+    Resolution {
+        oid,
+        tier: 1,
+        class: class.to_owned(),
+        mode: Mode::On,
+        policy: rules.version(),
+        outcome: Resolved::Undecided(why),
+        applied: false,
+        undo: false,
+        keys: Vec::new(),
+        changed: 0,
+        committed: current,
+        read,
+        shadow: None,
+        fields: Vec::new(),
+        split: Some(1),
+    }
+}
+
 /// Returns the entry of the resolution log of a stale read-current node in
 /// mode `shadow`: the vote fails as without the rules, and the shadow
-/// outcome tells that rule 1 lets the node through.
+/// outcome tells what rule 1 gives: the node passes, or no answer.
 pub(super) fn read_shadow(
     oid: Oid,
     shadow: &Shadow,

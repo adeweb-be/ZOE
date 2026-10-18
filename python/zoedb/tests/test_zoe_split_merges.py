@@ -311,8 +311,13 @@ def test_in_shadow_mode_the_rounds_raise_conflict_error_and_log_the_rules(tmp_pa
     rounds, lines = run_rounds("in-process", "shadow", tmp_path)
     assert not all(all(outcomes) for outcomes in rounds), rounds
     # A line of shadow mode gives the outcome of the vote without the rules,
-    # and what the rules give in its field `shadow`.
+    # and what the rules give in its field `shadow`. A read-current node for
+    # which rule 1 gives no answer gets a line that says why.
     assert lines, "the shadow mode logs what the rules give"
     for line in lines:
         assert line["outcome"] != "merged", line
-        assert line["shadow"]["outcome"] in ("merged", "passed"), line
+        shadow = line["shadow"]
+        if shadow["outcome"] == "undecided":
+            assert line["split"] == 1 and shadow["reason"], line
+        else:
+            assert shadow["outcome"] in ("merged", "passed"), line

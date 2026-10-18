@@ -1514,9 +1514,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             continue;
                         }
                     }
-                    if let Some(shadow) = plan.as_ref().and_then(|plan| plan.shadows.get(&oid)) {
-                        let entry = split::read_shadow(oid, shadow, read, current, &rules);
-                        self.resolutions.push(entry);
+                    // The entry tells why rule 1 did not let the node
+                    // through, or what it gives in mode `shadow`.
+                    if let Some(plan) = &plan {
+                        if let Some(shadow) = plan.shadows.get(&oid) {
+                            let entry = split::read_shadow(oid, shadow, read, current, &rules);
+                            self.resolutions.push(entry);
+                        } else if let Some(&(ref class, why)) = plan.unanswered.get(&oid) {
+                            let entry =
+                                split::read_conflict(oid, class, why, read, current, &rules);
+                            self.resolutions.push(entry);
+                        }
                     }
                 }
                 return Ok(Check::Failed(Stale {

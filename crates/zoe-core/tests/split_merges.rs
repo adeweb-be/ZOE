@@ -860,7 +860,48 @@ fn a_read_current_node_whose_path_child_split_gives_no_answer() {
     txn.check_current_serial(tree.buckets[1], tree.tid).unwrap();
     let voted = txn.vote();
     assert!(matches!(voted, Err(ZoeError::ReadConflict { oid }) if oid == tree.root));
-    assert!(txn.resolutions().is_empty());
+    // The vote gives one entry for the node: rule 1 gives no answer, and
+    // says why.
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (resolution.oid, resolution.split, resolution.applied),
+        (tree.root, Some(1), false)
+    );
+    assert!(
+        matches!(resolution.outcome, Resolved::Undecided(why) if !why.is_empty()),
+        "{resolution:?}"
+    );
+}
+
+#[test]
+fn in_shadow_mode_a_read_conflict_tells_why_rule_1_gives_no_answer() {
+    let store = open(Some("shadow"));
+    let tree = two_buckets(&store);
+    split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let other = new_oid(&store);
+    let mut txn = writing(&store, &[(other, Tid::ZERO, inline(II, &ints(&[1])))]);
+    txn.check_current_serial(tree.root, tree.tid).unwrap();
+    txn.check_current_serial(tree.buckets[1], tree.tid).unwrap();
+    let voted = txn.vote();
+    assert!(matches!(voted, Err(ZoeError::ReadConflict { oid }) if oid == tree.root));
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (resolution.mode, resolution.split, resolution.applied),
+        (Mode::Shadow, Some(1), false)
+    );
+    assert!(
+        matches!(resolution.shadow, Some(Resolved::Undecided(why)) if !why.is_empty()),
+        "{resolution:?}"
+    );
+    let line = &txn.resolution_log_lines(SystemTime::now(), None)[0];
+    assert!(
+        line.contains("\"shadow\":{\"outcome\":\"undecided\""),
+        "{line}"
+    );
 }
 
 #[test]
