@@ -244,7 +244,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     let Some(&(read, current)) = serials.get(&oid) else {
                         continue;
                     };
-                    if node_mode == Mode::Shadow {
+                    // The mode of the record of the refusal joins the mode
+                    // of the node, as for a merged group.
+                    let group_mode = both(node_mode, rules.tier1_mode(&class));
+                    if group_mode == Mode::Off {
+                        continue;
+                    }
+                    if group_mode == Mode::Shadow {
                         plan.shadows.insert(
                             oid,
                             Shadow {
@@ -611,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn in_shadow_mode_a_refused_split_waits_for_its_commit_in_flight() {
+    fn in_shadow_mode_the_plan_waits_for_its_commit_in_flight() {
         merge_after_a_commit_in_flight(false, "shadow");
     }
 }

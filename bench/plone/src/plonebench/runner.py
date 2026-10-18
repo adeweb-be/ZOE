@@ -195,11 +195,15 @@ def run(options: RunOptions) -> Path:
         sample.watch("server", st.processes["server"].pid)
         if options.settings.split_merges is not None:
             # The switch commits before the instances start, so every
-            # transaction of the run votes with it.
+            # transaction of the run votes with it. Its client does not
+            # count in the startup of the stack.
+            written = time.time()
             out = st.run_script(
                 "split_merges.py", options.settings.split_merges, name="policy"
             )
             result["merge_policy"] = json.loads(out.strip().splitlines()[-1])
+            result["policy_seconds"] = time.time() - written
+            t0 += result["policy_seconds"]
         sample.start()
         st.start_instances()
         for name, process in st.processes.items():

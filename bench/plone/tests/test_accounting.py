@@ -230,7 +230,7 @@ def test_serve_options_and_durability(monkeypatch):
 def test_the_switch_split_merges_goes_into_the_policy_of_the_store():
     import argparse
 
-    from plonebench.__main__ import add_settings, settings_of
+    from plonebench.__main__ import add_run, settings_of
 
     # By default a run writes nothing, and the store keeps its policy.
     assert stack.Settings().split_merges is None
@@ -238,7 +238,7 @@ def test_the_switch_split_merges_goes_into_the_policy_of_the_store():
     assert stack.split_merges_refusal(stack.STACKS["zoe-native-qi"], default) is None
 
     parser = argparse.ArgumentParser()
-    add_settings(parser)
+    add_run(parser)
     settings = settings_of(parser.parse_args(["--split-merges", "on"]))
     assert settings.split_merges == "on"
     assert settings.to_json()["split_merges"] == "on"
@@ -266,3 +266,31 @@ def test_the_switch_split_merges_goes_into_the_policy_of_the_store():
         "split_merges": "on",
     }
     assert current["version"] == 3
+
+
+def test_a_campaign_gives_the_switch_only_to_the_stacks_that_take_it():
+    import argparse
+
+    from plonebench import __main__ as cli
+
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command")
+    campaign = commands.add_parser("campaign")
+    cli.add_run(campaign)
+    args = parser.parse_args(["campaign", "--split-merges", "on", "--fixture", "f"])
+    zeo = cli.options_of(args, "zeo", "edit", 0, campaign=True)
+    qi = cli.options_of(args, "zoe-native-qi", "edit", 0, campaign=True)
+    assert zeo.settings.split_merges is None
+    assert qi.settings.split_merges == "on"
+    # So the runner refuses neither run.
+    for options in (zeo, qi):
+        config = stack.STACKS[options.stack]
+        assert stack.split_merges_refusal(config, options.settings) is None
+    # One run still refuses the switch on a stack that does not take it.
+    one = cli.options_of(args, "zeo", "edit", 0)
+    assert stack.split_merges_refusal(stack.STACKS["zeo"], one.settings)
+    # `prepare` and `serve` do not take the switch.
+    serve = argparse.ArgumentParser()
+    cli.add_settings(serve)
+    assert not any(a.dest == "split_merges" for a in serve._actions)
+    assert cli.settings_of(serve.parse_args([])).split_merges is None

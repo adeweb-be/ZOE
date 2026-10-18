@@ -228,6 +228,15 @@ def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
     return None
 
 
+def campaign_settings(config: StackConfig, settings: Settings) -> Settings:
+    """Return the settings of a run of `config` in a campaign: without the
+    switch `split_merges` when the stack does not take it, so a campaign of
+    mixed stacks runs each of them."""
+    if config.server == "zoe" and config.section == "zoeclient":
+        return settings
+    return dataclasses.replace(settings, split_merges=None)
+
+
 def split_merges_policy(current: dict | None, mode: str) -> dict:
     """Return the policy that `zoe.policy.install` takes: the policy
     `current`, as `zoe.policy.read` gives it, or none, with the switch
