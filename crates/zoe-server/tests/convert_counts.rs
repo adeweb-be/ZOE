@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use zoe_convert::to_datafs;
-use zoe_core::{Oid, Store, Tid};
+use zoe_core::{Oid, Tid};
+
+mod common;
 
 /// The binary under test.
 const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
@@ -67,7 +69,7 @@ fn remove_blob_files(dir: &Path) -> u64 {
 /// Write the `Data.fs` and its blob directory in `dir`, without the blob
 /// files, and the target store. Return the paths of the three.
 fn prepare(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let source = Store::open(dir.join("source")).unwrap();
+    let source = common::open(&dir.join("source"));
     let mut txn = source.tpc_begin(b"admin", b"create", b"").unwrap();
     txn.store(Oid(1), Tid(0), &record(b"a")).unwrap();
     txn.vote().unwrap();
@@ -87,7 +89,7 @@ fn prepare(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     assert_eq!(remove_blob_files(&blobs), MISSING);
 
     let path = dir.join("target");
-    let target = Store::open(&path).unwrap();
+    let target = common::open(&path);
     let mut txn = target
         .tpc_begin_restore(first, b"admin", b"create", b"")
         .unwrap();
@@ -114,12 +116,13 @@ fn the_report_counts_problems_by_kind_before_the_list() {
             command.env_remove(name);
         }
     }
-    let output = command
+    command
         .args(["convert", "--from-data-fs", s(&data_fs)])
         .args(["--data-fs-blob-dir", s(&blobs), "--path", s(&path)])
         .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::output(&mut command);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     // The exit status does not change: a conversion with problems fails.

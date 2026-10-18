@@ -21,10 +21,13 @@ use wire::{Conn, Server, Value, begin, commit, fresh_dir, load, new_oids, p64, r
 
 #[test]
 fn the_help_names_the_timeout_and_its_twin() {
-    let output = std::process::Command::new(wire::ZOE)
-        .args(["serve", "--help"])
-        .output()
-        .unwrap();
+    let output = {
+        let _spawn = wire::spawn_lock();
+        std::process::Command::new(wire::ZOE)
+            .args(["serve", "--help"])
+            .output()
+            .unwrap()
+    };
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--shutdown-timeout"));
     assert!(help.contains("ZOE_SHUTDOWN_TIMEOUT"));

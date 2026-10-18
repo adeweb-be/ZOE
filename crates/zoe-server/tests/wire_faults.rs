@@ -9,6 +9,8 @@
 //! `--client-queue-size` messages (`ZOE_CLIENT_QUEUE_SIZE`, 1,000 by
 //! default) wait for it, and the other clients do not notice.
 
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 mod wire;
@@ -27,6 +29,28 @@ fn commit_promptly(server: &Server, oid: u64, serial: u64) -> u64 {
         "the commit waited for a lock of a dead client"
     );
     tid
+}
+
+/// The value of `zoe_clients_connected` on the admin port `admin`: the
+/// connections that registered.
+fn clients_connected(admin: SocketAddr) -> f64 {
+    let mut stream = TcpStream::connect_timeout(&admin, Duration::from_secs(10)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: zoe\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    response
+        .lines()
+        .filter(|line| line.split('{').next() == Some("zoe_clients_connected"))
+        .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+        .sum()
 }
 
 #[test]
@@ -196,12 +220,21 @@ fn a_server_killed_during_a_vote_commits_nothing_of_it() {
 fn a_client_that_does_not_read_is_closed_and_the_others_go_on() {
     let dir = fresh_dir("slow");
     let server = Server::start(
-        &["--path", s(&dir.join("store")), "--client-queue-size", "10"],
+        &[
+            "--path",
+            s(&dir.join("store")),
+            "--client-queue-size",
+            "10",
+            "--admin-listen",
+            "127.0.0.1:0",
+        ],
         &[],
     );
+    let admin = server.admin.expect("the server has no admin port");
     let mut writer = server.client("1");
     let mut reader = server.client("1");
     let mut slow = server.client("1");
+    let connected = clients_connected(admin);
 
     // A large object fills the socket of the slow client fast.
     let big = new_oids(&mut writer, 1)[0];
@@ -213,19 +246,26 @@ fn a_client_that_does_not_read_is_closed_and_the_others_go_on() {
         slow.send_call("loadBefore", vec![p64(big), Value::Binary(MAX.to_vec())]);
     }
 
-    // The slow client reads nothing while 50 commits go out.
-    let oids = new_oids(&mut writer, 50);
-    let mut tids = Vec::new();
-    for (n, oid) in oids.iter().enumerate() {
-        tids.push(commit(&mut writer, n as i64 + 2, &[(*oid, 0, record(b"v"))]).unwrap());
-    }
-
-    // The reader got each of them, in order.
-    for tid in &tids {
+    // The slow client reads nothing while commits go out. The hub queue of
+    // the slow client fills only after a reply blocks its socket, and a
+    // load can end after many commits. So the commits go on until the
+    // server closes the slow client.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut txn = 2;
+    while clients_connected(admin) == connected {
+        assert!(
+            Instant::now() < deadline,
+            "the slow client was not closed after {} commits",
+            txn - 2
+        );
+        let oid = new_oids(&mut writer, 1)[0];
+        let tid = commit(&mut writer, txn, &[(oid, 0, record(b"v"))]).unwrap();
+        txn += 1;
+        // The reader gets each invalidation, in order.
         let args = reader
             .wait_for("invalidateTransaction", Duration::from_secs(30))
             .expect("the reader missed an invalidation");
-        assert_eq!(u64_of(&wire::items(&args)[0]), *tid);
+        assert_eq!(u64_of(&wire::items(&args)[0]), tid);
     }
     // The slow client was closed.
     assert!(slow.closed_within(Duration::from_secs(60)));

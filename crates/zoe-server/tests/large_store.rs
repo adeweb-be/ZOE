@@ -177,11 +177,14 @@ fn a_large_store_starts_fast_and_serves_in_bounded_memory() {
     );
 
     // The help names the option and its twin.
-    let help = Command::new(ZOE)
-        .args(["serve", "--help"])
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
+    let help = {
+        let _spawn = spawn_lock();
+        Command::new(ZOE)
+            .args(["serve", "--help"])
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap()
+    };
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--cache-size") && help.contains("ZOE_CACHE_SIZE"));
 }
