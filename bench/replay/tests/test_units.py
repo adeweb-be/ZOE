@@ -99,10 +99,10 @@ def test_other_classes_and_trees_of_many_buckets_raise_value_error():
     db.close()
 
 
-def tids(path, count):
-    """Commit `count` transactions to a new FileStorage at path. Return the
-    commit time of the creation of the root, then the tid and the commit
-    time of each transaction."""
+def tids(path, count, notes=()):
+    """Commit `count` transactions to a new FileStorage at path, the first
+    ones with the `notes`. Return the commit time of the creation of the
+    root, then the tid and the commit time of each transaction."""
     db = ZODB.DB(FileStorage(str(path)))
     manager = transaction.TransactionManager()
     conn = db.open(manager)
@@ -110,6 +110,8 @@ def tids(path, count):
         # The commits are apart, so a start between two of them is clear.
         time.sleep(0.05)
         conn.root()["n"] = i
+        if i < len(notes):
+            manager.get().note(notes[i])
         manager.commit()
     db.close()
     storage = FileStorage(str(path), read_only=True)
@@ -160,6 +162,21 @@ def test_a_tid_that_no_request_explains_starts_at_its_commit(tmp_path):
     starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
     assert matched == {"matched": 1, "unmatched": 1, "requests": 1}
     assert starts[second] == pytest.approx(c2)
+
+
+def test_a_transaction_of_a_background_job_starts_at_its_commit(tmp_path):
+    note = log.BACKGROUND[0].decode()
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2, [note])
+    t1 = (root + c1) / 2
+    probes = tmp_path / "instance0.jsonl"
+    # One request is in flight at both commits. It commits once.
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 1}
+    probes.write_text(json.dumps(request) + "\n")
+    starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
+    assert matched == {"matched": 1, "unmatched": 1, "requests": 1}
+    # The batch takes no request. The request makes the second transaction.
+    assert starts[first] == pytest.approx(c1)
+    assert starts[second] == pytest.approx(t1, abs=1e-6)
 
 
 def test_a_run_that_replays_no_transaction_does_not_count():

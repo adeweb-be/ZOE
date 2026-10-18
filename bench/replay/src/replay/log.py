@@ -13,6 +13,11 @@ from ZODB.FileStorage import FileStorage
 from ZODB.TimeStamp import TimeStamp
 
 
+# The notes of the transactions of a background job, such as the batches of
+# the indexer of `zoe.plone`. No request makes these transactions.
+BACKGROUND = (b"zoe.plone: indexing queue",)
+
+
 @dataclasses.dataclass(frozen=True)
 class Record:
     """A record of a transaction of the log."""
@@ -99,8 +104,12 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
     whose `ConflictError` reaches Zope is the first one. A request that
     commits several times begins each next transaction at its previous
     commit. A tid that no request explains starts at its commit: it reads
-    its serials when it commits, so it overlaps nothing. The transactions
-    that commit before the first request starts are the base.
+    its serials when it commits, so it overlaps nothing. A transaction of a
+    background job (its note is in `BACKGROUND`) starts at its commit too,
+    and takes no request: no request makes it, and the job runs its
+    transactions one after the other. The report counts these transactions
+    as unmatched. The transactions that commit before the first request
+    starts are the base.
     """
     requests = []
     for path in probes:
@@ -112,16 +121,20 @@ def starts_of_probes(store, probes: list[Path]) -> tuple[dict[bytes, float], dic
     requests.sort()
     storage = FileStorage(str(store), read_only=True)
     try:
-        tids = [txn.tid for txn in storage.iterator()]
+        tids = [(txn.tid, txn.description) for txn in storage.iterator()]
     finally:
         storage.close()
     first = min((request[1] for request in requests), default=None)
     starts: dict[bytes, float] = {}
     matched = unmatched = 0
     index = 0
-    for tid in tids:
+    for tid, description in tids:
         commit = TimeStamp(tid).timeTime()
         if first is None or commit < first:
+            continue
+        if description in BACKGROUND:
+            starts[tid] = commit
+            unmatched += 1
             continue
         while index < len(requests) and requests[index][0] < commit:
             index += 1
