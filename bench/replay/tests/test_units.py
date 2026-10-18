@@ -218,6 +218,47 @@ def test_the_command_refuses_a_run_without_probe_records(tmp_path, capsys):
     assert not (tmp_path / "result.json").exists()
 
 
+def test_the_command_exits_with_0_when_the_ratio_is_above_10_percent(
+    tmp_path, monkeypatch, capsys
+):
+    root, [(_first, c1), (_second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    (tmp_path / "probe").mkdir()
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 2}
+    (tmp_path / "probe" / "instance0.jsonl").write_text(json.dumps(request) + "\n")
+
+    def replayed(stack):
+        # Each stack raises one ConflictError: zoe serve is at 100 % of zeo.
+        return {
+            "stack": stack,
+            "speed": 1,
+            "repetition": 1,
+            "transactions": 2,
+            "order": [],
+            "conflicts": {},
+            "conflict_errors": 1,
+            "check": {"acknowledged": 1, "missing": []},
+            "counts": True,
+            "seconds": 1.0,
+            "read_load": {"error": None},
+            "rebases": {},
+        }
+
+    def run(_log, **_options):
+        runs = [replayed("zeo"), replayed("zoe-native")]
+        return {"schema_version": 1, "speeds": [1], "runs": runs}
+
+    monkeypatch.setattr(runner, "run", run)
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--speeds", "1"]
+    assert command.main(line) == 0
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("success criterion:"), last
+    assert "zoe-native at 100.0 % of zeo" in last, last
+    assert (tmp_path / "result.json").exists()
+
+
 def test_the_next_transaction_of_a_request_starts_at_its_previous_commit(tmp_path):
     root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
     t1 = (root + c1) / 2
