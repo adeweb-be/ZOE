@@ -8,14 +8,72 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{ArgGroup, Args};
+use clap::builder::BoolishValueParser;
+use clap::{ArgAction, ArgGroup, Args};
 use zoe_convert::Report;
-use zoe_core::{Options, Store};
+use zoe_core::{DurableRow, Options, Store};
 
 use super::{Failure, blob_dir_failure, open_with_blobs, store_failure};
 
 /// The first bytes of a FileStorage file.
 const MAGIC: &[u8] = b"FS30";
+
+/// The start of the name of the durable namespace of a moved registry of
+/// `zoe.plone` (ADR 0050).
+const REGISTRY_PREFIX: &str = "zoe.plone.registry:";
+
+/// The key of the marker row of a moved registry.
+const MARKER: &[u8] = b"m";
+
+/// The version of the layout of a marker that the command decodes. A
+/// marker of this layout holds 17 bytes: this byte, the oid of the
+/// registry (8 bytes, big-endian) and the write counter (8 bytes).
+const MARKER_LAYOUT: u8 = 1;
+
+/// The number of durable rows that one read of the walk gives.
+const ROW_CHUNK: usize = 1024;
+
+/// A moved registry that a marker row shows.
+#[derive(Debug, PartialEq, Eq)]
+struct MovedRegistry {
+    /// The name of its namespace.
+    namespace: String,
+    /// Its oid, or `None` for a marker of another layout.
+    oid: Option<u64>,
+}
+
+impl MovedRegistry {
+    /// Return the moved registry that `row` shows, or `None` when `row`
+    /// is not the marker of a registry namespace.
+    fn of(row: &DurableRow) -> Option<Self> {
+        if row.key != MARKER || !row.name.starts_with(REGISTRY_PREFIX) {
+            return None;
+        }
+        let oid = match row.payload.as_slice() {
+            [MARKER_LAYOUT, rest @ ..] if rest.len() == 16 => {
+                rest[..8].try_into().ok().map(u64::from_be_bytes)
+            }
+            _ => None,
+        };
+        Some(Self {
+            namespace: row.name.clone(),
+            oid,
+        })
+    }
+}
+
+impl std::fmt::Display for MovedRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.oid {
+            Some(oid) => write!(f, "registry {oid:#018x} (namespace {})", self.namespace),
+            None => write!(
+                f,
+                "registry of the namespace {}: a marker of another layout",
+                self.namespace
+            ),
+        }
+    }
+}
 
 /// The options of `zoe convert`. The command takes one direction:
 /// `--from-data-fs` or `--to-data-fs`.
@@ -65,6 +123,28 @@ pub(super) struct ConvertArgs {
     /// report counts the blob records as a problem.
     #[arg(long, env = "ZOE_DATA_FS_BLOB_DIR", value_name = "DIR")]
     data_fs_blob_dir: Option<PathBuf>,
+
+    /// Convert a store that holds a moved registry of zoe.plone into a
+    /// Data.fs anyway.
+    ///
+    /// Without it, --to-data-fs refuses such a store and writes nothing: a
+    /// Data.fs holds no namespace, so the registry of the copy raises
+    /// Unsupported on each request. Move each registry back first. With
+    /// --force, the command converts and writes a warning that names each
+    /// registry. With --force=false the command refuses, also when the twin
+    /// forces. With --from-data-fs it has no effect.
+    #[arg(
+        long,
+        env = "ZOE_FORCE",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = BoolishValueParser::new(),
+        action = ArgAction::Set
+    )]
+    force: bool,
 }
 
 /// Run `zoe convert` and write its report to `out`.
@@ -74,7 +154,7 @@ pub(super) fn run(args: &ConvertArgs, out: &mut dyn Write) -> Result<(), Failure
     match (&args.from_data_fs, &args.to_data_fs, data_fs_blobs) {
         (Some(data_fs), None, _) => from_data_fs(data_fs, data_fs_blobs, path, blob_dir, out),
         (None, Some(data_fs), Some(data_fs_blobs)) => {
-            to_data_fs(path, blob_dir, data_fs, data_fs_blobs, out)
+            to_data_fs(path, blob_dir, data_fs, data_fs_blobs, args.force, out)
         }
         // The parser refuses these cases. This arm keeps the match whole.
         _ => Err(Failure::Message(
@@ -106,7 +186,7 @@ fn from_data_fs(
     let title = format!("{} into the store {}", data_fs.display(), path.display());
     // A conversion that does not verify fails, also when the report does
     // not go out.
-    let written = write_report(out, &title, &report);
+    let written = write_report(out, &title, &report, &[]);
     verified(&report)?;
     Ok(written?)
 }
@@ -136,11 +216,15 @@ fn check_data_fs(data_fs: &Path) -> Result<(), Failure> {
 
 /// Convert the store in `path`, with its blob files in `blob_dir`, into
 /// the `Data.fs` `data_fs` and the blob directory `data_fs_blobs`.
+///
+/// A store that holds a moved registry fails before the conversion
+/// writes anything, unless `force` is true.
 fn to_data_fs(
     path: &Path,
     blob_dir: Option<&Path>,
     data_fs: &Path,
     data_fs_blobs: &Path,
+    force: bool,
     out: &mut dyn Write,
 ) -> Result<(), Failure> {
     // The conversion only reads the store. A read-only open changes no
@@ -149,17 +233,85 @@ fn to_data_fs(
     // store. A wrong blob directory fails here, before the conversion
     // writes anything.
     let store = open_with_blobs(path, blob_dir)?;
+    // The guard runs before the conversion, so a refusal writes nothing.
+    let moved = moved_registries(&store).map_err(|e| store_failure(path, e))?;
+    if !moved.is_empty() && !force {
+        return Err(Failure::Message(refusal(path, &moved)));
+    }
     let report = zoe_convert::to_datafs(&store, data_fs, data_fs_blobs)
         .map_err(|e| convert_failure(path, e))?;
     let title = format!("the store {} into {}", path.display(), data_fs.display());
     if report.durable_keys > 0 {
         eprintln!("{}", left_out_warning(report.durable_keys));
     }
+    if !moved.is_empty() {
+        eprintln!("{}", forced_warning(&moved));
+    }
     // A conversion that does not verify fails, also when the report does
     // not go out.
-    let written = write_report(out, &title, &report);
+    let written = write_report(out, &title, &report, &moved);
     verified(&report)?;
     Ok(written?)
+}
+
+/// Return each moved registry of `store`, in the order of the names of
+/// their namespaces.
+///
+/// The walk reads the durable rows in chunks of `ROW_CHUNK` rows, and
+/// keeps only the marker rows of the registry namespaces.
+fn moved_registries(store: &Store) -> zoe_core::Result<Vec<MovedRegistry>> {
+    let mut moved = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (rows, next) = store.kv_durable_rows(after.as_deref(), ROW_CHUNK)?;
+        moved.extend(rows.iter().filter_map(MovedRegistry::of));
+        if rows.len() < ROW_CHUNK {
+            moved.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+            return Ok(moved);
+        }
+        after = next;
+    }
+}
+
+/// Return the message of the refusal of the store in `path`, which holds
+/// the moved registries `moved`.
+fn refusal(path: &Path, moved: &[MovedRegistry]) -> String {
+    let mut message = format!(
+        "{}: the store holds {}. A Data.fs holds no namespace, so the registry of \
+         the copy raises Unsupported on each request:",
+        path.display(),
+        count(moved)
+    );
+    for registry in moved {
+        message.push_str("\n  ");
+        message.push_str(&registry.to_string());
+    }
+    message.push_str(
+        "\nMove each registry back first: run move_back(site.portal_registry) and \
+         commit, then convert. Or give --force (ZOE_FORCE) to convert anyway.",
+    );
+    message
+}
+
+/// Return the warning of a forced conversion of a store that holds the
+/// moved registries `moved`.
+fn forced_warning(moved: &[MovedRegistry]) -> String {
+    let registries: Vec<String> = moved.iter().map(ToString::to_string).collect();
+    format!(
+        "warning: --force: the Data.fs leaves out the rows of {}: {}. The registry \
+         of the copy raises Unsupported on each request. Move each registry back in \
+         the store, then convert again.",
+        count(moved),
+        registries.join(", ")
+    )
+}
+
+/// Return the count of the moved registries `moved`, as text.
+fn count(moved: &[MovedRegistry]) -> String {
+    match moved.len() {
+        1 => "1 moved registry of zoe.plone".to_owned(),
+        n => format!("{n} moved registries of zoe.plone"),
+    }
 }
 
 /// Return the warning of a conversion to a `Data.fs` that leaves out
@@ -194,8 +346,14 @@ fn convert_failure(path: &Path, error: zoe_convert::Error) -> Failure {
 ///
 /// The line `problems` gives the number of problems. One line for each
 /// kind with a problem follows, with its count and no cap. Then come the
-/// lines of the capped list.
-fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::Result<()> {
+/// lines of the capped list. A forced conversion of a store with the moved
+/// registries `moved` gives them before the line `problems`.
+fn write_report(
+    out: &mut dyn Write,
+    title: &str,
+    report: &Report,
+    moved: &[MovedRegistry],
+) -> std::io::Result<()> {
     writeln!(out, "Converted {title}")?;
     writeln!(out, "  transactions  {}", report.transactions)?;
     writeln!(out, "  copied        {}", report.copied)?;
@@ -209,6 +367,14 @@ fn write_report(out: &mut dyn Write, title: &str, report: &Report) -> std::io::R
             report.durable_keys
         )?;
         writeln!(out, "  {}", left_out_warning(report.durable_keys))?;
+    }
+    if !moved.is_empty() {
+        writeln!(
+            out,
+            "  registries    {}, converted with --force",
+            count(moved)
+        )?;
+        writeln!(out, "  {}", forced_warning(moved))?;
     }
     writeln!(out, "  problems      {}", report.problem_count())?;
     let width = report
@@ -239,12 +405,100 @@ fn verified(report: &Report) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-    use super::left_out_warning;
+    use std::path::Path;
+
+    use zoe_core::DurableRow;
+
+    use super::{MovedRegistry, forced_warning, left_out_warning, refusal};
+
+    /// The name of the namespace of a registry.
+    const NAMESPACE: &str = "zoe.plone.registry:0123456789abcdef0123456789abcdef";
+
+    fn row(name: &str, key: &[u8], payload: &[u8]) -> DurableRow {
+        DurableRow {
+            name: name.to_owned(),
+            key: key.to_vec(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Return a marker of the layout 1 for the registry `oid`.
+    fn marker(oid: u64) -> Vec<u8> {
+        let mut data = vec![1];
+        data.extend_from_slice(&oid.to_be_bytes());
+        data.extend_from_slice(&7u64.to_be_bytes());
+        data
+    }
 
     #[test]
     fn the_warning_of_left_out_keys_counts_them() {
         let warning = left_out_warning(3);
         assert!(warning.starts_with("warning: "), "{warning}");
         assert!(warning.contains("leaves out 3 keys"), "{warning}");
+    }
+
+    #[test]
+    fn only_the_marker_of_a_registry_namespace_shows_a_moved_registry() {
+        let moved = MovedRegistry::of(&row(NAMESPACE, b"m", &marker(0x2a)));
+        assert_eq!(
+            moved,
+            Some(MovedRegistry {
+                namespace: NAMESPACE.to_owned(),
+                oid: Some(0x2a),
+            })
+        );
+        // The other rows of the namespace, its generation row included.
+        for key in [&b""[..], b"fplone.site_title", b"vplone.site_title", b"mm"] {
+            assert_eq!(MovedRegistry::of(&row(NAMESPACE, key, &marker(1))), None);
+        }
+        // A key `m` of another namespace.
+        for name in ["app.settings", "zoe.plone.registry", "zoe.plone.other:1"] {
+            assert_eq!(MovedRegistry::of(&row(name, b"m", &marker(1))), None);
+        }
+    }
+
+    #[test]
+    fn a_marker_of_another_layout_shows_a_registry_without_an_oid() {
+        let mut other = marker(0x2a);
+        other[0] = 2;
+        let mut longer = marker(0x2a);
+        longer.push(0);
+        for payload in [other, longer, vec![1], Vec::new()] {
+            let moved = MovedRegistry::of(&row(NAMESPACE, b"m", &payload));
+            assert_eq!(
+                moved,
+                Some(MovedRegistry {
+                    namespace: NAMESPACE.to_owned(),
+                    oid: None,
+                }),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_and_the_warning_name_each_registry() {
+        let moved = [
+            MovedRegistry {
+                namespace: NAMESPACE.to_owned(),
+                oid: Some(0x2a),
+            },
+            MovedRegistry {
+                namespace: "zoe.plone.registry:other".to_owned(),
+                oid: None,
+            },
+        ];
+        let message = refusal(Path::new("store"), &moved);
+        assert!(message.starts_with("store: "), "{message}");
+        let warning = forced_warning(&moved);
+        assert!(warning.starts_with("warning: "), "{warning}");
+        for text in [&message, &warning] {
+            assert!(text.contains("0x000000000000002a"), "{text}");
+            assert!(text.contains(NAMESPACE), "{text}");
+            assert!(text.contains("zoe.plone.registry:other"), "{text}");
+            assert!(text.contains("another layout"), "{text}");
+        }
+        assert!(message.contains("move_back"), "{message}");
+        assert!(message.contains("--force (ZOE_FORCE)"), "{message}");
     }
 }
