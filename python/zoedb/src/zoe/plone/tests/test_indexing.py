@@ -1006,6 +1006,51 @@ class TestSecondDatabase(IndexingTestCase):
 
 
 class TestService(IndexingTestCase):
+    def test_a_success_resets_the_pause_of_a_site(self):
+        db = self.portal._p_jar.db()
+        path = ("", "flaky")
+        # Fail twice, succeed once, then fail again.
+        outcomes = [False, False, True, False]
+        # The count of failures of the site at the start of each call.
+        calls = []
+
+        def serve(service, served):
+            if served != path:
+                return
+            calls.append(service._failures.get(path, (0,))[0])
+            if len(calls) > len(outcomes) or not outcomes[len(calls) - 1]:
+                raise RuntimeError("a flaky site")
+
+        patcher = mock.patch.object(indexing._Service, "_serve", serve)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(indexing._Service, "_find_sites", lambda self: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        service = indexing._Service(db, db)
+        indexing._services[id(db)] = service
+        stop_services(self)
+        service.add(path)
+        with self.assertLogs(indexing.logger, logging.ERROR):
+            service.start()
+            deadline = time.monotonic() + TIMEOUT
+            while len(calls) < len(outcomes) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            service.stop()
+            service.join(TIMEOUT)
+        # The success of the third call removed the count of failures.
+        self.assertEqual(calls[: len(outcomes)], [0, 1, 2, 0])
+
+    def test_a_dropped_site_loses_its_failures(self):
+        db = self.portal._p_jar.db()
+        service = indexing._Service(db, db)
+        path = ("", "gone")
+        service.add(path)
+        service._failures[path] = (3, time.monotonic())
+        service._serve(path)
+        self.assertNotIn(path, service._sites)
+        self.assertNotIn(path, service._failures)
+
     def test_a_run_stops_when_another_thread_holds_the_lease(self):
         portal = self.portal
         catalog = aq_base(portal.portal_catalog)

@@ -494,7 +494,9 @@ class Indexer:
         """Apply batches until the queue is empty. Return the number of
         keys that the batches handled: the keys that they applied, the
         values that they moved to the failed namespace, and the keys of
-        each path that failed, or 1 for a failed path without keys."""
+        each path that failed, or 1 for a failed path without keys. The run
+        of a thread also stops at a batch when the lease of the site holds
+        the token of another thread."""
         from Acquisition import aq_base
 
         tm = transaction.TransactionManager()
@@ -1241,11 +1243,11 @@ class _Service(threading.Thread):
                 site = connection.root()["Application"].unrestrictedTraverse(path)
                 catalog = aq_base(aq_base(site).portal_catalog)
             except (KeyError, AttributeError):
-                self._sites.discard(path)
+                self._drop(path)
                 return
             jar = getattr(catalog, "_p_jar", None)
             if jar is None or jar.db() is not self._db or not zoe.kv._supported(jar):
-                self._sites.discard(path)
+                self._drop(path)
                 return
             oid = catalog._p_oid
             queue = zoe.kv.Namespace(jar, "durable", queue_name(oid))
@@ -1263,6 +1265,11 @@ class _Service(threading.Thread):
         finally:
             tm.abort()
             connection.close()
+
+    def _drop(self, path):
+        """Stop to serve the site at `path`, and forget its failures."""
+        self._sites.discard(path)
+        self._failures.pop(path, None)
 
     def _take(self, jar, tm, oid):
         """Take the lease of the catalog `oid`, in the store of the
