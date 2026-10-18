@@ -33,6 +33,7 @@ pub mod python;
 mod references;
 mod text;
 mod tree;
+mod zones;
 
 pub use decode::{Limits, NODE_BUDGET, decode_class_name, decode_record, decode_record_with};
 pub use encode::encode_record;
