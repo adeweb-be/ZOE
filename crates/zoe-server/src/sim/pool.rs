@@ -485,6 +485,7 @@ impl Run {
                 .map(|(oid, _, data)| (oid, data))
                 .collect(),
             blobs: Vec::new(),
+            tree: None,
         });
         drop(state);
         self.reach(phase::ACKNOWLEDGED);

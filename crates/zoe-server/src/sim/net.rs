@@ -407,7 +407,7 @@ pub(crate) async fn connect(shared: &Arc<Shared>, client: usize) -> io::Result<S
         conn,
         client_side,
     };
-    let task = server::accept(shared, client, generation, end(false), storages);
+    let task = server::accept(shared, client, conn, generation, end(false), storages);
     state.spawn(&shared.ready, Owner::Server(generation), task);
     Ok(end(true))
 }

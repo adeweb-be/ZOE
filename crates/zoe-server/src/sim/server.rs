@@ -23,6 +23,8 @@ pub(crate) struct SimRuntime {
     owner: Owner,
     /// The client of the actor, or of the connection of the server.
     client: Option<usize>,
+    /// The connection of the server that the actor serves.
+    conn: Option<u64>,
 }
 
 impl SimRuntime {
@@ -32,6 +34,7 @@ impl SimRuntime {
             shared: Arc::clone(shared),
             owner: Owner::Client(client),
             client: Some(client),
+            conn: None,
         }
     }
 
@@ -54,7 +57,7 @@ impl Runtime for SimRuntime {
         let Owner::Server(generation) = self.owner else {
             unreachable!("only the server starts a blocking thread");
         };
-        world::spawn_thread(&self.shared, generation, self.client, work);
+        world::spawn_thread(&self.shared, generation, self.client, self.conn, work);
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
@@ -88,12 +91,13 @@ impl zoe_client::Runtime for SimRuntime {
     }
 }
 
-/// Return the task that serves the connection of `client` to the server
-/// of `generation` on `stream`, as the accept loop of `zoe serve` starts
-/// it, with the default bounds of `zoe serve`.
+/// Return the task that serves the connection `conn` of `client` to the
+/// server of `generation` on `stream`, as the accept loop of `zoe serve`
+/// starts it, with the default bounds of `zoe serve`.
 pub(crate) fn accept(
     shared: &Arc<Shared>,
     client: usize,
+    conn: u64,
     generation: u32,
     stream: SimStream,
     storages: Arc<Storages>,
@@ -102,6 +106,7 @@ pub(crate) fn accept(
         shared: Arc::clone(shared),
         owner: Owner::Server(generation),
         client: Some(client),
+        conn: Some(conn),
     };
     let connection = Connection {
         peer: format!("c{client}"),

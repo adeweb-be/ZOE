@@ -29,6 +29,7 @@ mod net;
 mod pool;
 mod rng;
 mod server;
+mod tree;
 mod world;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +47,7 @@ use client::SimClient;
 use disk::{Cache, DATABASE, SimClock, SimVfs};
 use pool::SimPoolClient;
 use rng::Rng;
+pub(crate) use world::handed_off;
 use world::{
     Baton, NetFault, Owner, PlannedCrash, Resume, Shared, Task, TaskWaker, Timer, Wait, Why, phase,
 };
@@ -63,7 +65,8 @@ const BATON_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_DELAY: Duration = Duration::from_millis(2);
 
 /// The directory of the store, as the status of the server names it. It
-/// does not exist, so the server sends no sizes.
+/// does not exist: the store is on a `MemVfs`, so `get_info` gives the
+/// size 0 (`NamedStorage::in_memory`).
 const STORE_PATH: &str = "/nonexistent/zoe-sim";
 
 /// The threads of the read pool of the simulated server. A fixed number
@@ -172,6 +175,50 @@ pub struct Report {
     /// record before it plus 1, or the first record not 1, or a record that
     /// does not read as a `Length`.
     pub length_faults: Vec<String>,
+    /// With `Simulation::split_merges`, each break of the tree that the
+    /// check after each recovery and after the run found, as text: a
+    /// separator, an order of keys or a next bucket that is wrong, a key of
+    /// an acknowledged commit that the tree does not hold, a bucket outside
+    /// the tree, and a transaction index that does not agree with the
+    /// records of a commit whose vote resolved oids.
+    pub tree_faults: Vec<String>,
+    /// The checks of the tree of the split writers: one after each
+    /// recovery, and one after the run.
+    pub tree_checks: usize,
+    /// The acknowledged commits of the split writers whose vote wrote an
+    /// oid that the transaction did not store: rule 3 of ADR 0049 kept the
+    /// bucket of the other side.
+    pub unstored_writes: usize,
+    /// The oids that acknowledged commits of the split writers stored and
+    /// that their votes resolved without a record, as the store holds them
+    /// after the run.
+    pub dropped: usize,
+    /// The transactions of the split writers whose vote wrote an oid that
+    /// they did not store and whose `tpc_finish` got no reply: a crash or a
+    /// lost connection came between the vote and the reply.
+    pub interrupted_split_finishes: usize,
+    /// The votes of the split writers that split a bucket and got no
+    /// reply: a crash or a lost connection came before the reply.
+    pub interrupted_split_votes: usize,
+    /// The locks that finishes handed off, summed over the acknowledged
+    /// commits of the split writers whose vote wrote an oid that the
+    /// commit did not store. In a tree of one node, such a finish hands off
+    /// nothing (ADR 0049, section 12), so a count above 0 is a hand-off of
+    /// the node or of the new bucket of the transaction, or breaks that
+    /// premise.
+    pub split_handoffs: usize,
+    /// The locks that the finish of an acknowledged commit of a split
+    /// writer whose vote resolved oids handed off beyond the records of
+    /// its commit, summed over those commits. The finish hands off only
+    /// staged oids, so this is a general bound, and it must be 0. It fires
+    /// only when a finish hands off more locks than its commit has
+    /// records: the observer of the core gives a count for each finish,
+    /// not the oids.
+    pub excess_handoffs: usize,
+    /// The locks that the finishes of the acknowledged commits of the split
+    /// writers handed off. The other hand-offs of `handoffs` are those of
+    /// finishes whose reply did not come.
+    pub acked_handoffs: usize,
     /// The locks that the finishes of the server handed to the vote at the
     /// head of their queues (ADR 0044), over every server process of the
     /// run.
@@ -201,6 +248,8 @@ pub struct Simulation {
     /// A sync of the database file takes simulated time, and other tasks
     /// and threads run meanwhile.
     slow_syncs: bool,
+    /// The clients are split writers of one tree, with `split_merges` on.
+    split_merges: bool,
 }
 
 impl Simulation {
@@ -217,6 +266,7 @@ impl Simulation {
             pool: None,
             hot_length: false,
             slow_syncs: false,
+            split_merges: false,
         }
     }
 
@@ -290,6 +340,22 @@ impl Simulation {
         self
     }
 
+    /// With `true`, the store holds a merge policy that sets
+    /// `split_merges` to `on`, and one `BTrees.IIBTree.IIBTree` with buckets
+    /// of at most 4 keys (`tree.rs`). Each client declares `server_writes`,
+    /// and each of its transactions inserts one growing key into the tree.
+    /// So two clients that read one state of the last bucket both split
+    /// it, and the vote of the second merges with rule 3 of ADR 0049: it
+    /// writes the bucket and the new bucket of the other side, and resolves
+    /// the node and its own new bucket without a record. The clients write
+    /// nothing else: no hot oid and no blob. After each recovery and after
+    /// the run, the driver checks the tree (`Report::tree_faults`).
+    #[must_use]
+    pub fn split_merges(mut self, split_merges: bool) -> Self {
+        self.split_merges = split_merges;
+        self
+    }
+
     /// Inject `faults`.
     #[must_use]
     pub fn faults(mut self, faults: Faults) -> Self {
@@ -329,6 +395,11 @@ struct Driver {
     /// The syncs of commit batches of the server processes that stopped,
     /// and the commits that they made durable.
     syncs: (u64, u64),
+    /// The breaks of the tree of the split writers that the checks after
+    /// the recoveries found.
+    tree_faults: Vec<String>,
+    /// The checks of the tree of the split writers that ran.
+    tree_checks: usize,
 }
 
 impl Driver {
@@ -380,10 +451,16 @@ impl Driver {
             flush_pending: false,
             handoffs: 0,
             syncs: (0, 0),
+            tree_faults: Vec::new(),
+            tree_checks: 0,
         }
     }
 
     fn run(mut self) -> Report {
+        if self.plan.split_merges {
+            let root = tree::plant(&self.disk).expect("the tree plants on a new disk");
+            self.shared.lock().tree_root = Some(root);
+        }
         self.start_server("starts");
         let clients = self.plan.clients;
         for id in 0..clients {
@@ -410,6 +487,8 @@ impl Driver {
                         stall: self.plan.faults.stall_client_for.filter(|_| id == 0),
                         blobs: self.plan.blobs,
                         hot_length: self.plan.hot_length,
+                        split_merges: self.plan.split_merges,
+                        conn: None,
                     }
                     .run(),
                 ),
@@ -429,7 +508,7 @@ impl Driver {
         // The end of the run is a crash too. Then the store opens from what
         // is durable, and every acknowledged commit must be there.
         self.stop("stops at the end of the run");
-        let (lost, verify, tids, length_faults) = self.verify();
+        let (lost, verify, tids, length_faults, checked) = self.verify();
         let mut state = self.shared.lock();
         let logs = std::mem::take(&mut state.pools.logs);
         let mut report = state.report();
@@ -440,6 +519,13 @@ impl Driver {
         report.lost = lost;
         report.verify = verify;
         report.length_faults = length_faults;
+        report.tree_faults = std::mem::take(&mut self.tree_faults);
+        report.tree_faults.extend(checked.faults);
+        report.dropped = checked.dropped;
+        report.split_handoffs = checked.split_handoffs;
+        report.excess_handoffs = checked.excess_handoffs;
+        report.acked_handoffs = checked.acked_handoffs;
+        report.tree_checks = self.tree_checks;
         report.handoffs = self.handoffs;
         (report.syncs, report.synced_commits) = self.syncs;
         report.crashes = self.crashes;
@@ -459,19 +545,45 @@ impl Driver {
             Ok(store) => {
                 let store = Arc::new(store);
                 state.server.store = Some(Arc::clone(&store));
-                let storage =
-                    NamedStorage::new(STORAGE_NAME, Path::new(STORE_PATH), store, Queues::DEFAULT)
-                        .started_at(start);
+                let storage = NamedStorage::new(
+                    STORAGE_NAME,
+                    Path::new(STORE_PATH),
+                    Arc::clone(&store),
+                    Queues::DEFAULT,
+                )
+                .started_at(start)
+                .in_memory();
                 let storages = Storages::new(vec![Arc::new(storage)], Queues::DEFAULT.client)
                     .with_pool(Pool::new(SIM_POOL));
                 state.server.storages = Some(Arc::new(storages));
                 state.server.up = true;
                 state.trace(format!("server {why}"));
+                let checking = state.tree_root.filter(|_| self.crashes > 0);
+                let acked = checking.map(|_| state.acked.clone());
+                drop(state);
+                if let (Some(root), Some(acked)) = (checking, acked) {
+                    self.check_tree(&store, root, &acked);
+                }
             }
             Err(error) => {
                 state.trace(format!("server {why} and fails: {error}"));
                 state.server.halted = true;
             }
+        }
+    }
+
+    /// Check the tree of the split writers on `store`, which the server
+    /// opened after a crash, against the commits `acked` that the clients
+    /// saw acknowledged before it. Keep and trace each break.
+    fn check_tree(&mut self, store: &Store, root: u64, acked: &[world::Acked]) {
+        let checked = tree::check(store, root, acked);
+        self.tree_checks += 1;
+        let crash = self.crashes;
+        let mut state = self.shared.lock();
+        for fault in checked.faults {
+            let fault = format!("after crash {crash}: {fault}");
+            state.trace(format!("check: {fault}"));
+            self.tree_faults.push(fault);
         }
     }
 
@@ -832,13 +944,24 @@ impl Driver {
 
     /// Open the disk after the last stop. Return the number of the
     /// acknowledged commits that it does not hold whole, records and blobs,
-    /// the findings on the store, the tids of the store, and the breaks of
-    /// the history of the hot `Length`.
+    /// the findings on the store, the tids of the store, the breaks of the
+    /// history of the hot `Length`, and the check of the tree of the split
+    /// writers.
     ///
     /// With `Simulation::hot_length`, a commit of the hot oid holds the
     /// record that tier 1 merged, not the record of the client: it counts
-    /// when the store holds a `Length` at its tid.
-    fn verify(&mut self) -> (usize, Vec<String>, BTreeSet<u64>, Vec<String>) {
+    /// when the store holds a `Length` at its tid. With
+    /// `Simulation::split_merges`, a commit counts when the store holds its
+    /// records that the vote did not resolve, and the tree holds its key.
+    fn verify(
+        &mut self,
+    ) -> (
+        usize,
+        Vec<String>,
+        BTreeSet<u64>,
+        Vec<String>,
+        tree::Checked,
+    ) {
         let acked = self.shared.lock().acked.clone();
         let clock = SimClock(Arc::clone(&self.shared));
         let vfs = SimVfs::new(self.disk.clone());
@@ -847,8 +970,22 @@ impl Driver {
             Err(error) => {
                 let finding = format!("the store does not open: {error}");
                 self.shared.lock().trace(&finding);
-                return (acked.len(), vec![finding], BTreeSet::new(), Vec::new());
+                return (
+                    acked.len(),
+                    vec![finding],
+                    BTreeSet::new(),
+                    Vec::new(),
+                    tree::Checked::default(),
+                );
             }
+        };
+        let tree_root = self.shared.lock().tree_root;
+        let checked = match tree_root {
+            Some(root) => {
+                self.tree_checks += 1;
+                tree::check(&store, root, &acked)
+            }
+            None => tree::Checked::default(),
         };
         let lost = acked
             .iter()
@@ -868,7 +1005,13 @@ impl Driver {
                     .blobs
                     .iter()
                     .all(|(oid, bytes)| read_blob(&store, Oid(*oid), tid).as_ref() == Some(bytes));
-                !(records && blobs)
+                let key = commit.tree.as_ref().is_none_or(|insert| {
+                    checked
+                        .keys
+                        .as_ref()
+                        .is_some_and(|keys| keys.contains(&insert.key))
+                });
+                !(records && blobs && key)
             })
             .count();
         let mut findings = findings(&store, &self.disk);
@@ -895,10 +1038,10 @@ impl Driver {
         };
         let mut state = self.shared.lock();
         state.trace(format!("verify: {} acknowledged, {lost} lost", acked.len()));
-        for finding in findings.iter().chain(&length_faults) {
+        for finding in findings.iter().chain(&length_faults).chain(&checked.faults) {
             state.trace(format!("verify: {finding}"));
         }
-        (lost, findings, tids, length_faults)
+        (lost, findings, tids, length_faults, checked)
     }
 
     /// Move the clock to the next timer or lock deadline.
