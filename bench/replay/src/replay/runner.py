@@ -16,6 +16,10 @@ stores its own change instead: the change from the record of the oid
 before it in the log to its own record, applied to the state that it read
 (`rebase`). This is not a conflict, and no count holds it. Each run
 counts how its records came to be (`REBASES`).
+
+A run of `zoe serve` can install a merge policy in its store after the
+base (`install_policy`), so tier 2 merges the classes that it names. The
+ZEO server has no merge policy.
 """
 
 import random
@@ -26,7 +30,7 @@ from pathlib import Path
 
 from ZODB.Connection import TransactionMetaData
 from ZODB.POSException import ConflictError, POSKeyError
-from ZODB.utils import get_pickle_metadata, z64
+from ZODB.utils import get_pickle_metadata, u64, z64
 
 from replay import servers
 from replay.log import Log, Record, Transaction
@@ -203,6 +207,26 @@ def copy_base(storage, base: list[Transaction]) -> None:
         storage.tpc_finish(meta)
 
 
+def install_policy(storage, policy: dict, above: int = 0) -> None:
+    """Commit `policy` as the merge policy of the store of `storage`, with
+    `zoe.policy.install`, in one transaction of its own. Close `storage`.
+
+    The policy takes an oid above `above`, the highest oid of the log: a
+    transaction of the log that makes a new object writes the oid that the
+    store of the log gave it, and it would write over the policy."""
+    import ZODB
+    import zoe.policy
+
+    while u64(storage.new_oid()) <= above:
+        pass
+    db = ZODB.DB(storage)
+    try:
+        with db.transaction("the merge policy of the replay") as conn:
+            zoe.policy.install(conn, policy)
+    finally:
+        db.close()
+
+
 class _ReadLoad:
     """Loads the oids of the log on a client of its own while a run plays."""
 
@@ -343,8 +367,10 @@ def run_one(
     directory: Path,
     check,
     serve_args=(),
+    policy=None,
 ):
-    """One run of `stack` at `speed`. Return its item of the result."""
+    """One run of `stack` at `speed`. Return its item of the result. A run
+    of `zoe serve` installs `policy` after the base, when it is given."""
     directory.mkdir(parents=True, exist_ok=True)
     item = {
         "stack": stack,
@@ -360,6 +386,10 @@ def run_one(
         storage = servers.client(stack, address)
         try:
             copy_base(storage, log.base)
+            if policy is not None and stack != "zeo":
+                top = max(map(u64, oids), default=0)
+                top = max([top, *(u64(r.oid) for t in log.base for r in t.records)])
+                install_policy(servers.client(stack, address), policy, top)
             reader = servers.client(stack, address)
             try:
                 with _ReadLoad(reader, oids) as load:
@@ -391,16 +421,18 @@ def run(
     repetitions=1,
     check=check,
     serve_args=(),
+    policy=None,
 ):
     """Replay `log` on each stack, at each speed, `repetitions` times.
 
     The runs alternate: for each speed, for each repetition, one run of each
     stack, in the order of `stacks`. Each run has a new server on a new
     store under `workdir`. `serve_args` go to `zoe serve` after its own
-    arguments. Return the result. It records the software before the
-    first run, and again under `software_after` when it differs at the
-    end. Raise `ValueError` for a speed that is not positive or that comes
-    twice.
+    arguments. Each run of `zoe serve` installs the merge policy `policy`
+    after the base, when it is given, and the result holds it. Return the
+    result. It records the software before the first run, and again under
+    `software_after` when it differs at the end. Raise `ValueError` for a
+    speed that is not positive or that comes twice.
     """
     if any(speed <= 0 for speed in speeds) or len(set(speeds)) != len(speeds):
         raise ValueError(f"the speeds must be positive and distinct: {speeds}")
@@ -413,7 +445,16 @@ def run(
             for stack in stacks:
                 directory = workdir / f"{stack}-{speed}x-{repetition}"
                 runs.append(
-                    run_one(log, stack, speed, repetition, directory, check, serve_args)
+                    run_one(
+                        log,
+                        stack,
+                        speed,
+                        repetition,
+                        directory,
+                        check,
+                        serve_args,
+                        policy,
+                    )
                 )
     result = {
         "schema_version": 1,
@@ -421,6 +462,8 @@ def run(
         "speeds": list(speeds),
         "runs": runs,
     }
+    if policy is not None:
+        result["policy"] = policy
     # Record the software again when it changed during the runs.
     after = servers.software(serve_args)
     if after != software:

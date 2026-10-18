@@ -9,7 +9,8 @@ import pytest
 import transaction
 import ZODB
 from BTrees.Length import Length
-from ZODB.POSException import ConflictError
+from persistent.mapping import PersistentMapping
+from ZODB.POSException import ConflictError, UndoError
 
 import zoe
 from zoe import policy
@@ -23,6 +24,16 @@ class Item(persistent.Persistent):
 
 
 ITEM = f"{Item.__module__}.Item"
+
+
+class Registry(PersistentMapping):
+    """A mapping of a class of its own, whose keys do not depend on each
+    other."""
+
+
+REGISTRY = f"{Registry.__module__}.Registry"
+# A policy that merges a Registry key by key.
+KEYS = {"classes": {REGISTRY: {"tier2": "on", "fields": {"data": "keys"}}}}
 
 
 def test_install_and_read_give_the_policy_back(tmp_path):
@@ -185,3 +196,103 @@ def test_tier_2_in_shadow_mode_logs_the_merge_and_raises_the_conflict(tmp_path):
         "merged",
         ["b"],
     )
+
+
+def test_the_strategy_keys_is_valid_in_fields_and_as_default():
+    entry = {"default": "keys", "fields": {"data": "keys"}}
+    checked = policy.validate({"classes": {REGISTRY: entry}})
+    assert checked["classes"][REGISTRY] == entry
+    assert "keys" in policy.STRATEGIES
+
+
+def item(key, value):
+    def change(mapping):
+        mapping[key] = value
+
+    return change
+
+
+def registry():
+    return Registry(a=1, b=2)
+
+
+def test_changes_of_different_keys_of_a_mapping_both_commit(tmp_path):
+    log = tmp_path / "merges.log"
+    storage = zoe.Storage(str(tmp_path / "store"), resolution_log=str(log))
+    found = race(storage, KEYS, item("a", 5), item("b", 6), make=registry)
+    assert found == ("merged", {"data": {"a": 5, "b": 6}})
+    # The line names the key of the mapping that the new record changed, as
+    # tier 1 writes a key, in place of the field data.
+    (line,) = lines(log)
+    assert (line["tier"], line["outcome"], line["keys"], line["changed"]) == (
+        2,
+        "merged",
+        ['"b"'],
+        1,
+    )
+
+
+def test_one_key_of_a_mapping_changed_differently_raises_conflict_error(tmp_path):
+    log = tmp_path / "merges.log"
+    storage = zoe.Storage(str(tmp_path / "store"), resolution_log=str(log))
+    found = race(storage, KEYS, item("a", 5), item("a", 6), make=registry)
+    assert found == ("conflict", {"data": {"a": 5, "b": 2}})
+    (line,) = lines(log)
+    assert (line["outcome"], line["reason"], line["fields"], line["keys"]) == (
+        "refused",
+        "Key of a mapping changed on both sides",
+        ["data"],
+        ['"a"'],
+    )
+
+
+def test_a_mapping_without_the_strategy_keys_never_merges(tmp_path):
+    storage = zoe.Storage(str(tmp_path / "store"))
+    strict = {"classes": {REGISTRY: {"tier2": "on"}}}
+    found = race(storage, strict, item("a", 5), item("b", 6), make=registry)
+    assert found == ("conflict", {"data": {"a": 5, "b": 2}})
+
+
+def test_an_undo_merges_a_mapping_key_by_key(tmp_path):
+    db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
+
+    def change(description, **items):
+        with db.transaction(description) as conn:
+            conn.root()["object"].update(items)
+
+    def undo(description):
+        (undo_id,) = [
+            info["id"]
+            for info in db.undoLog(0, 100)
+            if info["description"] == description
+        ]
+        manager = transaction.TransactionManager()
+        manager.begin()
+        db.undo(undo_id, manager.get())
+        try:
+            manager.commit()
+        except BaseException:
+            manager.abort()
+            raise
+
+    def data():
+        with db.transaction() as conn:
+            return dict(conn.root()["object"])
+
+    try:
+        with db.transaction() as conn:
+            policy.install(conn, KEYS)
+            conn.root()["object"] = Registry(a=1, b=2, c=3)
+        change("first", a=10)
+        change("second", b=20)
+        # No later transaction changed the key of the first one.
+        undo("first")
+        assert data() == {"a": 1, "b": 20, "c": 3}
+        # A later transaction changed the key of the third one.
+        change("third", c=30)
+        change("fourth", c=31)
+        with pytest.raises(UndoError):
+            undo("third")
+        assert data() == {"a": 1, "b": 20, "c": 31}
+    finally:
+        db.close()
