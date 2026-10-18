@@ -170,6 +170,7 @@ The human approved this section with the rest of this ADR.
 - A failed call for the lock of Y, and a transaction without the flag, give no line of their own: rule 3 gives no answer, and the vote goes on as without the rule, with the lines of tier 1 for the node. The reason of section 9 and the `debug` event are not built.
 - The pool of the native client marks a transaction whose vote listed an oid that it did not store. Its turn then gives the oids of the commit from the invalidation of the listener (`Turn::unstored_commit`), and `zoe.zeo.ClientStorage` calls `invalidate(tid, oids)` of the database with them before `f(tid)`. The oids of an undo take the same path: the Connections get them twice, which changes nothing.
 - `zoe.Storage` sets the flag in `registerDB` when its database is a ZODB `MVCCAdapter`. Its `tpc_finish` (in Python) reads every oid of the commit before the finish (`_unstored_commit`) and calls `invalidate(tid, oids)` before the callback.
+- Step 4 of the card, one repetition of each cell (B5, `--steps 4:60,16:60`): `create-spread` gives 106 and 107 `ConflictError`s on `zeo` and 0 and 4 on `zoe-native-qi` with the switch on, at 4 and 16 users; `edit` gives 106 and 86 on `zeo` and 0 and 0. No read conflict: the resolution log of the `create-spread` run has no line "a path child that the other side replaced". The 4 conflicts are 3 on a `Folder` and 1 on an `OOBucket` ("Conflicting bucket split" of BTrees). The other two repetitions did not run.
 
 ## Consequences
 
