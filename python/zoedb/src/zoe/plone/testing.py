@@ -11,8 +11,10 @@ stack does not change, so the suites run unchanged.
   at that address.
 
 `ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
-on, separated by commas: `locking` is the only one. `install` installs
-them.
+on, separated by commas: `locking` or `indexing`. `install` installs them.
+The suites of Plone run without `indexing`: they search the catalog right
+after a change, in the same transaction. The tests of queued indexing
+install it themselves.
 
 Call `install` before zope.testrunner sets up the layers, for example in
 the `initialization` of the test script. It makes the layer a base of

@@ -1,0 +1,16 @@
+<configure
+    xmlns="http://namespaces.zope.org/zope"
+    xmlns:zcml="http://namespaces.zope.org/zcml"
+    >
+
+  <!-- Opt in: a save writes its catalog operations to a durable namespace
+       of the store, and one indexer for each site applies them. Include
+       this file in the ZCML of the site. The backend installs when the
+       ZCML loads. -->
+  <include
+      package="z3c.zcmlhook"
+      file="meta.zcml"
+      />
+  <zcml:customAction handler=".indexing.install" />
+
+</configure>

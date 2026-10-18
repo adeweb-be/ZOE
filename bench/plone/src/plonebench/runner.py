@@ -4,7 +4,8 @@
 2. Restore the store of the stack from the fixture.
 3. Start the server and the instances, and wait until each serves the site.
 4. Warm up with the `warmup` scenario, unless the run is a cold start.
-5. Run the scenario, with the server counters read before and after.
+5. Run the scenario, with the server counters read before and after. With
+   queued indexing, wait until the indexer applied the queue of the site.
 6. Stop the instances, then read the site through a client of its own and
    check it against the ledger, before any repair.
 7. Stop the server, write `result.json`, and remove the copy of the store.
@@ -16,6 +17,7 @@ and the software.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -23,11 +25,13 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from plonebench import (
     analysis,
+    corpus,
     environment,
     fixture,
     ledger,
@@ -39,6 +43,10 @@ from plonebench import (
 )
 
 SCHEMA = "plonebench-result/1"
+
+# The longest wait for the queue of queued indexing to empty after the
+# measured steps, in seconds.
+DRAIN_TIMEOUT = 300.0
 
 
 @dataclass
@@ -221,6 +229,10 @@ def run(options: RunOptions) -> Path:
         result["locust_exit"] = code
         result["measured"] = {"start": locust_started, "end": locust_ended}
         result["server"] = _server_result(config, before, after, run_dir)
+        if "indexing" in config.backends.split(","):
+            result["indexing"] = _drain_queue(
+                urls, fixture_dir, locust_started, locust_ended, options.steps
+            )
 
         result["stop_codes"] = st.stop_instances()
         if options.verify:
@@ -284,6 +296,61 @@ def _server_result(config, before: dict, after: dict, run_dir: Path) -> dict:
                     "buckets": hist["buckets"],
                 }
         result["histograms"] = histograms
+    return result
+
+
+def _status(url: str, site: str, password: str, since: float | None = None) -> dict:
+    """Return the status of the queue of `site` through `@@zoe-indexing` of
+    the instance at `url`, as the maintainer, a Manager."""
+    query = "" if since is None else f"?since={since:.6f}"
+    request = urllib.request.Request(f"{url}/{site}/@@zoe-indexing{query}")
+    token = base64.b64encode(f"{corpus.MAINTAINER}:{password}".encode()).decode()
+    request.add_header("Authorization", f"Basic {token}")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def _drain_queue(
+    urls: list[str],
+    fixture_dir: Path,
+    started: float,
+    ended: float,
+    steps: list[tuple[int, float]],
+    timeout: float = DRAIN_TIMEOUT,
+) -> dict:
+    """Wait until the indexer applied the queue of the site, before the
+    instances stop for the verification. Return the time that the queue
+    took to empty after the end of the measured steps, and the status of
+    each instance: for the whole run, and for each step."""
+    password = json.loads((fixture_dir / "credentials.json").read_text())["password"]
+    site = json.loads((fixture_dir / "manifest.json").read_text())["site"]
+    deadline = time.time() + timeout
+    drained = None
+    last: dict = {}
+    while time.time() < deadline:
+        last = _status(urls[0], site, password)
+        if last.get("pending") == 0:
+            drained = time.time()
+            break
+        time.sleep(0.2)
+    result: dict = {
+        "drained": drained is not None,
+        "drained_after_seconds": None if drained is None else drained - ended,
+        "pending_at_end": last.get("pending"),
+        "instances": {},
+    }
+    starts = []
+    clock = started
+    for users, seconds in steps:
+        starts.append((users, clock))
+        clock += seconds
+    for index, url in enumerate(urls):
+        instance = {"run": _status(url, site, password), "steps": {}}
+        for users, since in starts:
+            instance["steps"][str(users)] = _status(url, site, password, since)[
+                "delays"
+            ]
+        result["instances"][f"instance{index}"] = instance
     return result
 
 
@@ -375,3 +442,22 @@ def _print_summary(result: dict) -> None:
             f"p95 {p95:6.0f} ms, failures {total['failure_rate'] or 0:.2%}, "
             f"conflicts {conflicts}"
         )
+    indexing = result.get("indexing")
+    if indexing:
+        after = indexing["drained_after_seconds"]
+        print(
+            "  indexer: queue "
+            + (
+                f"empty {after:.1f} s after the steps"
+                if after is not None
+                else "not empty"
+            )
+        )
+        for name, instance in indexing["instances"].items():
+            for users, delays in instance["steps"].items():
+                if delays["count"]:
+                    print(
+                        f"  indexer {name} from step users {users:>3}: "
+                        f"{delays['count']} keys, delay p50 {delays['p50']:.3f} s, "
+                        f"p95 {delays['p95']:.3f} s, max {delays['max']:.3f} s"
+                    )

@@ -1,5 +1,6 @@
 <configure
     xmlns="http://namespaces.zope.org/zope"
+    xmlns:browser="http://namespaces.zope.org/browser"
     xmlns:genericsetup="http://namespaces.zope.org/genericsetup"
     xmlns:plone="http://namespaces.plone.org/plone"
     xmlns:zcml="http://namespaces.zope.org/zcml"
@@ -13,14 +14,33 @@
       handler=".uidgenerator.database_opened"
       />
 
-  <!-- The backend that ZOE_PLONE_BACKENDS names: locking. It is opt-in.
-       It installs when the ZCML loads, so an instance, its scripts and
-       bin/instance run see the same backend. -->
+  <!-- The backends that ZOE_PLONE_BACKENDS names: locking, indexing. They
+       are opt-in. They install when the ZCML loads, so an instance, its
+       scripts and bin/instance run see the same backends. -->
   <include
       package="z3c.zcmlhook"
       file="meta.zcml"
       />
   <zcml:customAction handler=".backends_from_environment" />
+
+  <!-- Queued indexing, when its backend is installed: the thread of the
+       indexer of each database, the wait of a request for the save of its
+       user, and the status of the queue of a site. -->
+  <subscriber
+      for="zope.processlifetime.IDatabaseOpenedWithRoot"
+      handler=".indexing.database_opened"
+      />
+  <subscriber
+      for="ZPublisher.interfaces.IPubStart"
+      handler=".indexing.request_started"
+      />
+  <include package="Products.Five" file="meta.zcml" />
+  <browser:page
+      name="zoe-indexing"
+      for="Products.CMFCore.interfaces.ISiteRoot"
+      class=".indexing.StatusView"
+      permission="cmf.ManagePortal"
+      />
 
   <!-- The writes-on-GET report: each transaction of a GET or a HEAD request
        carries the method of the request, and zoe serve counts the records

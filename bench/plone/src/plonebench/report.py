@@ -16,7 +16,14 @@ from pathlib import Path
 
 from plonebench import analysis, ledger
 
-STACK_ORDER = ["zeo", "zoe-native", "zoe-native-kv", "zoe-asyncio", "zoe-stock"]
+STACK_ORDER = [
+    "zeo",
+    "zoe-native",
+    "zoe-native-kv",
+    "zoe-native-qi",
+    "zoe-asyncio",
+    "zoe-stock",
+]
 
 
 def load(runs: list[Path]) -> list[dict]:
@@ -233,6 +240,7 @@ def summarize(results: list[dict]) -> dict:
                 for r in group
             ],
             "resolution": [_resolution(r) for r in group],
+            "indexing": [_indexing(r) for r in group],
             "fsync_batch_mean": [
                 (h["sum"] / h["count"])
                 if (h := s.get("histograms", {}).get("zoe_fsync_batch_size"))
@@ -242,6 +250,26 @@ def summarize(results: list[dict]) -> dict:
             ],
         }
     return summary
+
+
+def _indexing(result: dict) -> dict | None:
+    """The indexer of a run with queued indexing: the seconds that its
+    queue took to empty after the steps, and the delays of its keys from
+    the start of each step, over the instances (the count, the highest p95
+    of an instance, the highest delay). None for a run without it."""
+    indexing = result.get("indexing")
+    if not indexing:
+        return None
+    steps = {}
+    for instance in indexing["instances"].values():
+        for users, delays in instance["steps"].items():
+            entry = steps.setdefault(users, {"count": 0, "p95": None, "max": None})
+            if not delays["count"]:
+                continue
+            entry["count"] += delays["count"]
+            entry["p95"] = max(entry["p95"] or 0.0, delays["p95"])
+            entry["max"] = max(entry["max"] or 0.0, delays["max"])
+    return {"drained_after": indexing["drained_after_seconds"], "steps": steps}
 
 
 def _resolution(result: dict) -> dict:
@@ -402,6 +430,20 @@ def build(runs: list[Path]) -> tuple[str, dict]:
                     f"- {row['stack']}: resolved {resolution['resolved']}, lost in "
                     f"failed attempts or votes {resolution['lost']}; failed "
                     f"resolutions: {reasons or 'none'}"
+                )
+        for row in rows:
+            for run, indexing in zip(row["runs"], row["indexing"], strict=True):
+                if indexing is None:
+                    continue
+                after = indexing["drained_after"]
+                delays = "; ".join(
+                    f"from the step of {users} users {d['count']} keys, p95 "
+                    f"{_num(d['p95'], 3)} s, max {_num(d['max'], 3)} s"
+                    for users, d in indexing["steps"].items()
+                )
+                lines.append(
+                    f"- {row['stack']} {run}: the queue was empty "
+                    f"{_num(after, 1)} s after the steps; {delays}"
                 )
         lines.append("")
     return "\n".join(lines) + "\n", summary
