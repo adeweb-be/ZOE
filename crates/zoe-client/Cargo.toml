@@ -25,6 +25,8 @@ zoe-core.workspace = true
 [dev-dependencies]
 futures.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# The records of BTrees of the split merge tests, with `Heap::new_reference`.
+zoe-pickle = { workspace = true, features = ["testing"] }
 zoe-server = { workspace = true, features = ["serve"] }
 
 [lints]
