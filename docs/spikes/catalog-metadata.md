@@ -55,3 +55,18 @@ The table of names is the one of DateTime 6.0 with pytz 2026.5. A client with an
 The acceptance test `test_catalog_metadata.py` runs 120 seeded cases with the 44 columns of Plone 6.1. Before the build, outcomes and records matched, and 75 of the 120 cases ran `tryToResolveConflict` in the client on a metadata bucket, in each of the three modes. After it, the 4 tests pass: each case has the outcome and the records of FileStorage with ZODB's resolver, and no case where ZODB merges calls the client.
 
 The new tests of `zoe_pickle::python` compare the bytes of a record with 20 values and the 800 comparisons of `<` and `==` of their pairs with CPython: the model gives the answer of Python or no answer, and it gives an answer for each `==` with a `DateTime`, a `Message` or `Missing.Value`. The tests of `structural_merges` merge three records of an `IOBucket` of metadata, written by CPython, to the record of `tryToResolveConflict`.
+
+## B5 `contention-fields`
+
+Step 3 of the card. One run of each binary of `zoe serve`, the branch and `main` at `a5c8ebd`, with the same instances and the same client: `zoe-native-qi`, the small fixture, steps `4:60,16:60`, `--port-offset 420`, the merge policy of the fixture (split merge off), on a Linux machine with a 1-minute load of 5 to 9 that other runs shared, so the times do not compare. Per step: ok operations per second, first-attempt successes, p95 in ms, `ConflictError`s at the vote, and their classes; then the outcomes of tier 1 over the run.
+
+| binary | users | ok/s | 1st try | p95 | conflicts | classes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| branch | 4 | 13.2 | 89.3 % | 905 | 119 | `IIBTree` 102, `IOBTree` 9, `OOBTree` 8 |
+| branch | 16 | 26.9 | 89.7 % | 1,365 | 172 | `IIBTree` 118, `IOBTree` 30, `OOBTree` 24 |
+| `main` | 4 | 6.4 | 86.7 % | 1,513 | 69 | `IIBTree` 55, `IOBTree` 7, `OOBTree` 6, `IOBucket` 1 |
+| `main` | 16 | 28.5 | 92.1 % | 1,557 | 139 | `IIBTree` 109, `OOBTree` 15, `IOBTree` 14, `IOBucket` 1 |
+
+Tier 1 over the run (warm-up included): the branch merged 5, refused 317 and gave no answer for 5; `main` merged 10, refused 231 and gave no answer for 6. The clients resolved nothing; 5 and 6 resolutions in the clients failed on `OOBucket`.
+
+With queued indexing, a save of `contention-fields` does not write the catalog: the indexer of the site applies the catalog operations one batch after the other, so two saves rarely meet on a metadata bucket. The conflicts that remain are on the nodes of trees (`IIBTree`, `IOBTree`, `OOBTree`), which tier 1 refuses as BTrees does, and which the split merge of ADR 0048 (off in these runs) takes. This card does not move them, and the two runs differ by their load, not by the card. The gate of phase 4 counts `ConflictError`s, and a conflict on a metadata bucket that ZODB merges was never one: the client merged it before this card, and the store merges it now, one round trip earlier. So the gate does not need this card; the replay counts these conflicts under `native` instead of `python-client`.
