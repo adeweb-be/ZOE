@@ -203,6 +203,16 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// What the vote after `vote_resolving` found for each merge of
     /// shadow mode that the caller resolved.
     verifications: Vec<Verification>,
+    /// True when the client takes records that it did not store (ADR
+    /// 0049): rule 3 of the split merge can then write the new bucket of
+    /// the other side.
+    server_writes: bool,
+    /// The stored oids that the split merge of the last vote that took the
+    /// locks resolves without a record. A vote that passes takes them out
+    /// of the staging.
+    dropping: Vec<Oid>,
+    /// The oids that the vote staged and that the client did not store.
+    unstored: BTreeSet<Oid>,
 }
 
 /// A merge of shadow mode, kept for its check against the resolution of
@@ -285,7 +295,28 @@ impl<S: Deref<Target = Store>> Txn<S> {
             undone: None,
             shadows: BTreeMap::new(),
             verifications: Vec::new(),
+            server_writes: false,
+            dropping: Vec::new(),
+            unstored: BTreeSet::new(),
         }
+    }
+
+    /// Tell the vote whether the client of the transaction takes records
+    /// that it did not store (ADR 0049): it ends their current entries in
+    /// its cache, and gives every Connection of its process one
+    /// invalidation with every oid of the commit before it publishes the
+    /// tid. Only then can rule 3 of the split merge keep the new bucket of
+    /// the other side when both sides split one bucket; without it the
+    /// rule gives no answer there. The default is false.
+    pub fn set_server_writes(&mut self, on: bool) {
+        self.server_writes = on;
+    }
+
+    /// Tell if the last vote that took the locks and passed staged a record
+    /// that the client did not store. The client then gives every
+    /// Connection of its process every oid of the commit (ADR 0049).
+    pub fn wrote_unstored(&self) -> bool {
+        !self.unstored.is_empty()
     }
 
     /// Begin a restore transaction on `store`: a copy of a transaction with
@@ -1163,6 +1194,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// or an error, fails the check and releases the locks.
     fn check(&mut self, resolve: bool, native: bool) -> Result<Vec<(Oid, Record)>> {
         if native {
+            self.dropping.clear();
+            self.unstored.clear();
             // The entries of the undos come first, and they stay.
             self.resolutions.truncate(self.undo_resolutions);
             self.shadows.clear();
@@ -1180,6 +1213,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     stored_bytes,
                 } => {
                     self.stage_merged(merged, stored_bytes)?;
+                    self.drop_resolved();
                     self.onto.extend(onto);
                     // A node that rule 1 let through counts once the vote
                     // passes.
@@ -1274,6 +1308,27 @@ impl<S: Deref<Target = Store>> Txn<S> {
             }
         }
         Ok(())
+    }
+
+    /// Take each stored oid that the split merge resolves without a record
+    /// out of the staging, with its blob, and mark its entry as applied.
+    /// No batch writes it, the transaction index does not list it, and the
+    /// finish never hands its lock off. The vote keeps its lock until the
+    /// end of the transaction.
+    fn drop_resolved(&mut self) {
+        let dropping = std::mem::take(&mut self.dropping);
+        if dropping.is_empty() {
+            return;
+        }
+        for &oid in &dropping {
+            self.staged.remove(oid);
+            self.blobs.remove(&oid);
+        }
+        for resolution in &mut self.resolutions[self.undo_resolutions..] {
+            if resolution.outcome == Resolved::Merged && dropping.contains(&resolution.oid) {
+                resolution.applied = true;
+            }
+        }
     }
 
     /// Compare the serial that the client read of each oid with its current
@@ -1379,9 +1434,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         let mut made = self.split_plan(&rules, stored_bytes)?;
                         let refused = adopt(
                             &mut made,
-                            &mut self.resolutions,
-                            &mut self.passed,
-                            &mut self.lock_waited,
+                            &mut Adopted {
+                                resolutions: &mut self.resolutions,
+                                passed: &mut self.passed,
+                                waited: &mut self.lock_waited,
+                                locks: &mut self.locks,
+                                dropping: &mut self.dropping,
+                                unstored: &mut self.unstored,
+                            },
                             &mut merged,
                             &mut stored_bytes,
                         );
@@ -1503,9 +1563,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         let mut made = self.split_plan(&rules, stored_bytes)?;
                         let refused = adopt(
                             &mut made,
-                            &mut self.resolutions,
-                            &mut self.passed,
-                            &mut self.lock_waited,
+                            &mut Adopted {
+                                resolutions: &mut self.resolutions,
+                                passed: &mut self.passed,
+                                waited: &mut self.lock_waited,
+                                locks: &mut self.locks,
+                                dropping: &mut self.dropping,
+                                unstored: &mut self.unstored,
+                            },
                             &mut merged,
                             &mut stored_bytes,
                         );
@@ -2087,17 +2152,24 @@ const READ_CHUNK: usize = 256;
 /// refusal, which fails the vote.
 fn adopt(
     plan: &mut split::Plan,
-    resolutions: &mut Vec<Resolution>,
-    passed: &mut BTreeSet<Oid>,
-    waited: &mut Option<Duration>,
+    into: &mut Adopted<'_>,
     merged: &mut Vec<(Oid, Tid, Vec<u8>)>,
     stored_bytes: &mut u64,
 ) -> Option<Stale> {
-    resolutions.append(&mut plan.resolutions);
-    passed.extend(plan.passed.iter().copied());
-    if let Some(total) = waited {
+    into.resolutions.append(&mut plan.resolutions);
+    into.passed.extend(plan.passed.iter().copied());
+    if let Some(total) = into.waited {
         *total += plan.waited;
     }
+    // The vote holds the locks of the plan until the end of the
+    // transaction, and releases them with its others.
+    if !plan.locked.is_empty() {
+        let held = into.locks.get_or_insert_with(Vec::new);
+        held.append(&mut plan.locked);
+        held.sort_by_key(|lock| lock.oid);
+    }
+    into.dropping.append(&mut plan.dropped);
+    into.unstored.extend(plan.unstored.drain(..));
     merged.append(&mut plan.records);
     *stored_bytes = plan.stored_bytes;
     plan.refused.map(|(oid, current, read)| Stale {
@@ -2106,6 +2178,16 @@ fn adopt(
         read,
         read_only: false,
     })
+}
+
+/// The parts of a transaction that `adopt` changes.
+struct Adopted<'t> {
+    resolutions: &'t mut Vec<Resolution>,
+    passed: &'t mut BTreeSet<Oid>,
+    waited: &'t mut Option<Duration>,
+    locks: &'t mut Option<Vec<Held>>,
+    dropping: &'t mut Vec<Oid>,
+    unstored: &'t mut BTreeSet<Oid>,
 }
 
 /// The most records of the history of an oid that a line of the resolution

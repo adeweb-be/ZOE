@@ -15,16 +15,22 @@
 //! conflict makes no plan.
 //!
 //! Before the rules read the store, the plan waits until each commit in
-//! flight of a hand-off is durable or failed: the rules read records that
-//! the transaction did not lock, such as the new bucket of the other side.
+//! flight of a hand-off is durable or failed.
+//!
+//! Rule 3 reads and writes the new bucket of the other side only under its
+//! exclusive lock, which the plan takes without a wait (ADR 0049). The plan
+//! gives these locks to the vote. A group of records that the vote does
+//! not take releases its locks at once. In mode `shadow`, the plan takes
+//! no lock and writes nothing.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::time::Duration;
 
 use super::{READ_CHUNK, Txn};
 use crate::error::Result;
-use crate::lock::Waited;
+use crate::lock::{Held, Waited};
 use crate::merge::policy::Rules;
 use crate::merge::split::{self, Source, Split, Written};
 use crate::merge::{Mode, Reason, Resolution, Resolved};
@@ -42,6 +48,13 @@ pub(super) struct Plan {
     /// The records to stage: the oid, the serial of the committed record
     /// and the merged pickle.
     pub(super) records: Vec<(Oid, Tid, Vec<u8>)>,
+    /// The stored oids that the merges resolve without a record: the vote
+    /// takes them out of the staging.
+    pub(super) dropped: Vec<Oid>,
+    /// The oids of `records` that the transaction did not store.
+    pub(super) unstored: Vec<Oid>,
+    /// The locks that rule 3 took, for the vote to hold.
+    pub(super) locked: Vec<Held>,
     /// The entries of the resolution log of the plan, in mode `on`.
     pub(super) resolutions: Vec<Resolution>,
     /// The node of a refusal, with its current serial and the serial that
@@ -83,6 +96,21 @@ fn both(a: Mode, b: Mode) -> Mode {
 /// The records of a transaction and of its store, as the rules read them.
 struct TxnSource<'t, S: Deref<Target = Store>> {
     txn: &'t Txn<S>,
+    /// The locks that the rules took.
+    locked: RefCell<Vec<Held>>,
+    /// True while the rules run in mode `shadow`: they take no lock.
+    shadow: Cell<bool>,
+}
+
+impl<S: Deref<Target = Store>> TxnSource<'_, S> {
+    /// Release the locks that the rules took after the first `kept`.
+    fn release_from(&self, kept: usize) {
+        let mut locked = self.locked.borrow_mut();
+        if locked.len() > kept {
+            let released = locked.split_off(kept);
+            self.txn.store.locks.release(&released);
+        }
+    }
 }
 
 impl<S: Deref<Target = Store>> Source for TxnSource<'_, S> {
@@ -119,6 +147,28 @@ impl<S: Deref<Target = Store>> Source for TxnSource<'_, S> {
     fn read_current(&self, oid: Oid) -> bool {
         self.txn.read_current.contains_key(&oid)
     }
+
+    fn server_writes(&self) -> bool {
+        self.txn.server_writes
+    }
+
+    fn lock(&self, oid: Oid) -> Result<bool> {
+        if self.shadow.get() {
+            return Ok(true);
+        }
+        let mut locked = self.locked.borrow_mut();
+        if locked.iter().any(|held| held.oid == oid) {
+            return Ok(true);
+        }
+        let store: &Store = &self.txn.store;
+        match store.locks.try_exclusive(oid, &*store.clock) {
+            Some(held) => {
+                locked.push(held);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 impl<S: Deref<Target = Store>> Txn<S> {
@@ -126,6 +176,31 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// `rules`, for a transaction of `stored_bytes`. The vote holds its
     /// locks.
     pub(super) fn split_plan(&self, rules: &Rules<'_>, stored_bytes: u64) -> Result<Plan> {
+        let source = TxnSource {
+            txn: self,
+            locked: RefCell::new(Vec::new()),
+            shadow: Cell::new(false),
+        };
+        match self.plan_with(&source, rules, stored_bytes) {
+            Ok(mut plan) => {
+                plan.locked = source.locked.into_inner();
+                Ok(plan)
+            }
+            Err(error) => {
+                // A plan that fails gives its locks back.
+                source.release_from(0);
+                Err(error)
+            }
+        }
+    }
+
+    /// Makes the plan of `split_plan` with the records of `source`.
+    fn plan_with(
+        &self,
+        source: &TxnSource<'_, S>,
+        rules: &Rules<'_>,
+        stored_bytes: u64,
+    ) -> Result<Plan> {
         let mut plan = Plan {
             stored_bytes,
             ..Plan::default()
@@ -156,7 +231,6 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 return Ok(plan);
             }
         }
-        let source = TxnSource { txn: self };
         // The written oids that the rules can merge, with the serial that
         // the transaction read and the current serial.
         let staged: Vec<(Oid, Tid)> = self
@@ -198,7 +272,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
             if node_mode == Mode::Off {
                 continue;
             }
-            match split::written_node(&source, oid)? {
+            source.shadow.set(node_mode == Mode::Shadow);
+            let kept = source.locked.borrow().len();
+            match split::written_node(source, oid)? {
                 Split::Merged { rule, records } => {
                     let group_mode = records.iter().fold(node_mode, |all, record| {
                         both(all, rules.tier1_mode(&record.class))
@@ -206,9 +282,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     if group_mode == Mode::Off
                         || records.iter().any(|record| claimed.contains(&record.oid))
                     {
+                        source.release_from(kept);
                         continue;
                     }
                     if group_mode == Mode::Shadow {
+                        source.release_from(kept);
                         for record in records
                             .iter()
                             .filter(|record| record.read != record.current)
@@ -227,6 +305,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     let Some(size) = records.iter().try_fold(plan.stored_bytes, |size, record| {
                         self.merged_size(record.oid, &record.pickle, size)
                     }) else {
+                        source.release_from(kept);
                         continue;
                     };
                     plan.stored_bytes = size;
@@ -236,6 +315,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             plan.covered.insert(record.oid);
                         }
                         plan.resolutions.push(entry(&record, rule, rules));
+                        if record.dropped {
+                            plan.dropped.push(record.oid);
+                            continue;
+                        }
+                        if self.staged.record(record.oid).is_none() {
+                            plan.unstored.push(record.oid);
+                        }
                         plan.records
                             .push((record.oid, record.current, record.pickle));
                     }
@@ -246,6 +332,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     oid,
                     class,
                 } => {
+                    source.release_from(kept);
                     // The refusal names the stale record of its range, the
                     // record that the vote reports as in conflict.
                     let Some(&(read, current)) = serials.get(&oid) else {
@@ -273,9 +360,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     plan.refused = Some((oid, current, read));
                     return Ok(plan);
                 }
-                Split::Passed | Split::Undecided(_) => {}
+                Split::Passed | Split::Undecided(_) => source.release_from(kept),
             }
         }
+        source.shadow.set(false);
         // Rule 1: the stale nodes that the transaction only read.
         let read: Vec<(Oid, Tid)> = self
             .read_current
@@ -300,7 +388,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 if node_mode == Mode::Off {
                     continue;
                 }
-                let outcome = match split::read_node(&source, oid, read)? {
+                let outcome = match split::read_node(source, oid, read)? {
                     Split::Passed => Resolved::Merged,
                     Split::Undecided(why) => Resolved::Undecided(why),
                     Split::Merged { .. } | Split::Refused { .. } => continue,
@@ -329,6 +417,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     pickle: Vec::new(),
                     keys: Vec::new(),
                     changed: 0,
+                    dropped: false,
                 };
                 plan.resolutions.push(entry(&passed, 1, rules));
             }
@@ -664,5 +753,144 @@ mod tests {
     #[test]
     fn in_shadow_mode_the_plan_waits_for_its_commit_in_flight() {
         merge_after_a_commit_in_flight(false, "shadow");
+    }
+
+    /// The store, its node `n` of two buckets `b0` [10, 20, 30] and `b1`
+    /// [40, 50, 60] at `read`, and the split of S1 that made `y` [60, 70]
+    /// at `s1`.
+    fn after_s1() -> (Store, Oid, Oid, Oid, Oid, Tid, Tid) {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let policy = new_oid(&store);
+        let (policy_record, root) = policy_and_root(policy, "on");
+        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        let (n, b0, b1) = (new_oid(&store), new_oid(&store), new_oid(&store));
+        let read = commit(
+            &store,
+            &[
+                (n, Tid::ZERO, node(b0, &[(40, b1)])),
+                (b0, Tid::ZERO, bucket(&[10, 20, 30], Some(b1))),
+                (b1, Tid::ZERO, bucket(&[40, 50, 60], None)),
+            ],
+        );
+        let y = new_oid(&store);
+        let s1 = commit(
+            &store,
+            &[
+                (n, read, node(b0, &[(40, b1), (60, y)])),
+                (b1, read, bucket(&[40, 50], Some(y))),
+                (y, Tid::ZERO, bucket(&[60, 70], None)),
+            ],
+        );
+        (store, n, b0, b1, y, read, s1)
+    }
+
+    #[test]
+    fn a_node_without_a_record_is_never_handed_off() {
+        let (owned, n, b0, b1, y, read, s1) = after_s1();
+        let store = &owned;
+        // S2 read before S1 and splits b1: the node keeps the record of S1.
+        let x = new_oid(&store);
+        let mut s2 = store.tpc_begin(b"", b"", b"").unwrap();
+        s2.set_server_writes(true);
+        for (oid, serial, data) in [
+            (n, read, node(b0, &[(40, b1), (50, x)])),
+            (b1, read, bucket(&[40, 45], Some(x))),
+            (x, Tid::ZERO, bucket(&[50, 60], None)),
+        ] {
+            s2.store(oid, serial, &data).unwrap();
+        }
+        s2.vote().unwrap();
+        thread::scope(|scope| {
+            // T' read after S1, splits b0 and stores the node.
+            let z = new_oid(&store);
+            let other = scope.spawn(move || {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                for (oid, serial, data) in [
+                    (n, s1, node(b0, &[(20, z), (40, b1), (60, y)])),
+                    (b0, read, bucket(&[10, 15], Some(z))),
+                    (z, Tid::ZERO, bucket(&[20, 30], Some(b1))),
+                ] {
+                    txn.store(oid, serial, &data).unwrap();
+                }
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+                z
+            });
+            wait_until(|| store.locks.waiting(n) == 1);
+            let sequencer = store.lock_sequencer();
+            let finish = scope.spawn(move || s2.finish());
+            // The finish of S2 is in flight: the node is not staged, so it
+            // gives no hand-off, and T' still waits for it.
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(store.locks.waiting(n), 1);
+            drop(sequencer);
+            finish.join().unwrap().unwrap();
+            let z = other.join().unwrap();
+            assert_eq!(
+                store.load(n).unwrap().0,
+                node(b0, &[(20, z), (40, b1), (60, y)])
+            );
+        });
+        assert_eq!(store.load(b1).unwrap().0, bucket(&[40, 45, 50], Some(y)));
+        assert!(store.load(x).is_err());
+        assert!(store.locks.is_empty());
+    }
+
+    #[test]
+    fn a_vote_that_gets_the_node_at_the_hand_off_waits_for_the_kept_bucket() {
+        let (owned, n, b0, b1, y, read, s1) = after_s1();
+        let store = &owned;
+        // S2 read before S1, splits b0 (rule 2) and b1 (rule 3): the node
+        // gets a record.
+        let (z, x) = (new_oid(&store), new_oid(&store));
+        let mut s2 = store.tpc_begin(b"", b"", b"").unwrap();
+        s2.set_server_writes(true);
+        for (oid, serial, data) in [
+            (n, read, node(b0, &[(20, z), (40, b1), (50, x)])),
+            (b0, read, bucket(&[10, 15], Some(z))),
+            (z, Tid::ZERO, bucket(&[20, 30], Some(b1))),
+            (b1, read, bucket(&[40, 45], Some(x))),
+            (x, Tid::ZERO, bucket(&[50, 60], None)),
+        ] {
+            s2.store(oid, serial, &data).unwrap();
+        }
+        s2.vote().unwrap();
+        assert!(s2.wrote_unstored());
+        thread::scope(|scope| {
+            // T' read after S1, and splits y: it stores the node and y.
+            let w = new_oid(&store);
+            let other = scope.spawn(move || {
+                let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+                txn.set_server_writes(true);
+                for (oid, serial, data) in [
+                    (n, s1, node(b0, &[(40, b1), (60, y), (70, w)])),
+                    (y, s1, bucket(&[60], Some(w))),
+                    (w, Tid::ZERO, bucket(&[70, 80], None)),
+                ] {
+                    txn.store(oid, serial, &data).unwrap();
+                }
+                txn.vote().unwrap();
+                txn.finish().unwrap();
+            });
+            wait_until(|| store.locks.waiting(n) == 1);
+            let sequencer = store.lock_sequencer();
+            let finish = scope.spawn(move || s2.finish());
+            // T' gets the node at the hand-off, then waits for y, which S2
+            // holds until its commit is durable.
+            wait_until(|| store.locks.waiting(y) == 1);
+            assert_eq!(store.locks.waiting(n), 0);
+            drop(sequencer);
+            finish.join().unwrap().unwrap();
+            other.join().unwrap();
+            assert_eq!(
+                store.load(n).unwrap().0,
+                node(b0, &[(20, z), (40, b1), (60, y), (70, w)])
+            );
+            assert_eq!(store.load(y).unwrap().0, bucket(&[60], Some(w)));
+            assert_eq!(store.load(w).unwrap().0, bucket(&[70, 80], None));
+        });
+        assert_eq!(store.load(b1).unwrap().0, bucket(&[40, 45, 50], Some(y)));
+        assert!(store.locks.is_empty());
     }
 }
