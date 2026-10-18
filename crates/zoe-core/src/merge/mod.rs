@@ -232,9 +232,10 @@ pub struct Merge {
     pub outcome: Outcome,
     /// The keys that the new record changed, inserted or deleted, as text,
     /// in key order: the fields for tier 2, and the keys of the dict of a
-    /// field that the strategy `keys` merged, in place of that field. At
-    /// most [`MAX_KEYS`]; `changed` counts them all. With the rules of ADR 0042 in shadow mode, they are
-    /// the keys of the merge of the rules.
+    /// field that the strategy `keys` merged or refused, in place of that
+    /// field. At most [`MAX_KEYS`]; `changed` counts them all. With the
+    /// rules of ADR 0042 in shadow mode, they are the keys of the merge of
+    /// the rules.
     pub keys: Vec<String>,
     /// The number of keys that the new record changed, inserted or
     /// deleted.

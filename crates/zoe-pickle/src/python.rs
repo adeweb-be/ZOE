@@ -180,8 +180,12 @@ enum ReferenceKey {
 
 /// A key of a dict that the model keeps: an int, a str, a bytes, or, in a
 /// heap of [`Heap::with_instances`], a tuple of those. Two keys are one key
-/// of a Python dict when they are equal here. Keys of one kind are in the
-/// order of Python; keys of two kinds are in the order of the variants.
+/// of a Python dict when they are equal here. The order is the order of
+/// the variants, then of the values: ints by value, strs by code point,
+/// bytes by byte, and tuples item by item, with the same order for two
+/// items. Python has the same order for two ints, two strs or two bytes,
+/// and for two tuples whose items at each place are of one kind. It has
+/// no order for other pairs. Only the resolution log uses this order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DictKey {
     /// An int.

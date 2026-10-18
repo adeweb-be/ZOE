@@ -308,3 +308,31 @@ def test_a_run_of_zoe_serve_installs_the_policy_in_its_store(tmp_path):
             db.close()
     assert found == {"version": 1, **policy}
     assert int.from_bytes(oid, "big") > 300
+
+
+def test_a_policy_and_a_timed_transaction_that_writes_the_root_are_refused(
+    tmp_path, capsys
+):
+    # Each transaction of `tids` writes the root.
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    (tmp_path / "probe").mkdir()
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 2}
+    (tmp_path / "probe" / "instance0.jsonl").write_text(json.dumps(request) + "\n")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"classes": {}}))
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--policy", str(policy)]
+    assert command.main(line) == 2
+    error = capsys.readouterr().err
+    assert f"the timed transaction {first.hex()} writes the root" in error
+    assert not (tmp_path / "result.json").exists()
+    # run refuses it too.
+    starts, _ = log.starts_of_probes(
+        tmp_path / "Data.fs", [tmp_path / "probe" / "instance0.jsonl"]
+    )
+    replayed = log.read_log(tmp_path / "Data.fs", starts)
+    assert runner.root_writes(replayed) == [first, second]
+    with pytest.raises(ValueError, match="writes the root"):
+        runner.run(replayed, workdir=tmp_path, stacks=(), speeds=(1,), policy={})

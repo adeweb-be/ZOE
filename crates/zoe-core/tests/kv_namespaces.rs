@@ -14,6 +14,7 @@ const PICKLE: &[u8] =
     b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00datag\x01s.";
 
 const MINUTE: Duration = Duration::from_secs(60);
+const DAY: Duration = Duration::from_secs(86_400);
 
 /// A clock that moves only when the test moves it.
 #[derive(Clone)]
@@ -464,7 +465,11 @@ fn a_durable_key_survives_a_reopen_and_a_crash() {
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         txn.kv_set(Flavour::Durable, "registry", b"later", b"x", None)
             .unwrap();
-        txn.kv_set(Flavour::Ephemeral, "sessions", b"later", b"x", Some(MINUTE))
+        // The store reads the system clock. A slow run, such as under
+        // ThreadSanitizer, can check the crash images for more than a
+        // minute. No run lasts a day, so the key does not expire in this
+        // test.
+        txn.kv_set(Flavour::Ephemeral, "sessions", b"later", b"x", Some(DAY))
             .unwrap();
         txn.vote().unwrap();
         vfs.mark("voted");
