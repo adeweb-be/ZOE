@@ -114,7 +114,7 @@ The only way for the copy of B to hold the change of A is to make the copy after
 `zoe.plone` can move the save of the version out of the transaction of the edit:
 
 1. The edit transaction sets the field and makes the decision of the stock subscriber (the same checks, with `isUpToDate`). It does not save the version. It adds an after-commit hook. So it writes the Document only: the field and `modification_date`. Tier 2 merges two such edits of different fields.
-2. After a commit that succeeded, the hook opens a new connection of the same database, with its own transaction manager. It finds the object by its physical path, under the request of the thread, with the same user wrapped in the user folder of the new connection, and calls `portal_repository.save`. It commits. On a `ConflictError` it aborts and tries again from a new snapshot.
+2. After a commit that succeeded, the hook opens a new connection of the same database, with its own transaction manager. It finds the object by its physical path, under the request of the thread, with the user wrapped in the user folder of the new connection, and calls `portal_repository.save`. It commits. On a `ConflictError` it aborts and tries again from a new snapshot.
 3. The version transaction starts after the edit committed, so its copy holds the edit and every edit that committed before it. It numbers its version after every committed version.
 
 The prototype (outside the repository) replaces `create_version_on_save` in the global registry with such a handler. Results:
@@ -125,11 +125,20 @@ The prototype (outside the repository) replaces `create_version_on_save` in the 
 - **The other order** (A and B commit their edits, then the two version transactions run): no error; the second version transaction conflicts once and commits at its second attempt. The versions are 0 (old, old), 1 (A, B), 2 (A, B). The Document is right, no change is lost, but version 1 holds the change of B too, and two versions hold the same state. The history is coarser than the sequential one.
 - The first version of the prototype failed with `Unauthorized` on `save`: the user of the security manager belongs to the user folder of the first connection, and the check of PAS needs the user folder in the acquisition chain of the object. The user must be wrapped in the user folder of the new connection.
 
+The prototype is enough to show that the mechanism passes the acceptance module, but not enough to build. An adversarial review of ADR 0051 found these gaps, and the ADR (sections 2 and 3) closes them:
+
+- **The current transaction.** The prototype keeps the edit as the transaction of the thread during the hook. So `transaction.savepoint()` in `save` goes to the committed edit, and the indexing queue of CMFCore joins `transaction.get()`, the committed edit, which raises `ValueError` (`transaction/_transaction.py:187-193`). The test passed because the Document and its container have a history id already, so the save reindexes nothing. A versioned object without a history id, or with a parent without one, loses its version. The ADR makes the version transaction the current one of the thread for the length of the hook.
+- **The user.** The prototype looks the user up again by id in the user folder of the site. That gives `None` for a user of the root `acl_users` and for a special user, and the user at the commit can differ from the user at the event. The ADR keeps the user object of the event and re-wraps it.
+- **The site and the database.** The prototype takes the site from the first two parts of the path, and the database of the object. That is wrong for a site in a folder, a child site, and an object in a mounted database. The ADR takes the site from `getSite()` and the root database from the `Application`.
+- **The path.** The prototype takes the path at the event. A move later in the transaction loses the version. The ADR reads the path at the commit of the edit.
+- **The end.** The prototype closes the connection without an abort after an error that is not a conflict. ZODB refuses to close a joined connection, so the connection leaks. The ADR aborts on every path, then closes.
+- **The decision and the retries.** The prototype copies part of the stock decision, makes one version transaction for each modified event, retries only on `ConflictError` and without a wait, and saves again without a re-check. In the other order of the commits, a re-check of `isUpToDate` before the save skips the second version when it has no change note: the versions are then 0 (old, old) and 1 (A, B).
+
 The limits of the mechanism:
 
-- The history equals the sequential one only when each version transaction commits before the next edit of the object commits.
-- A crash between the two commits loses the version of that edit. The next edit makes a version that holds the change, because `isUpToDate` compares the modification dates.
-- The request waits for one more commit for each edit of a versioned object.
+- The history equals the sequential one only when the snapshot of each version transaction comes before the commit of the next edit of the object. Else a version can hold the change of a later edit, credited to the user and the change note of another edit (ADR 0051, section 4).
+- A crash between the two commits loses the version of that edit and its change note. With the policy `at_edit_autoversion`, the next edit makes a version that holds the change, because `isUpToDate` compares the modification dates; the lost change note is not recovered.
+- The request waits for one more commit for each edit of a versioned object, and the thread holds two connections during the hook.
 - Two version transactions of one object conflict with each other on the history. These are retries inside the hook, not `ConflictError`s of the request.
 - The edit subscriber of plone.app.versioningbehavior does not run. A site with this mechanism runs a copy of its decision. Other callers of `portal_repository.save` (the first version at a creation, revert, plone.app.iterate, scripts) keep saving in their own transaction.
 
@@ -144,4 +153,5 @@ The limits of the mechanism:
 - B5 `contention-fields` with the prototype: it changes what a save writes, and the version transactions add commits.
 - Edits through the forms and plone.restapi: the trace uses the save of the acceptance test (the field, then `ObjectModifiedEvent`).
 - A change note, the first version at a creation, a purge policy that keeps N versions (it purges inside the save), types with blobs or relations, and `zoe.zeo.ClientStorage`.
-- The prototype in a published request: the after-commit hook of the prototype calls `portal_repository.save`, which takes a savepoint of the transaction of the thread, which has just committed. That worked in the test, and the build must check it in the publisher.
+- The prototype in a published request. In the test, the savepoint that `portal_repository.save` takes went to the committed edit and did no harm, because nothing joined it. A save that reindexes joins the committed edit and fails (section 6, the gaps of the prototype).
+- An object or a parent without a history id, a user of the root `acl_users`, a site in a folder, a mount point, and two modified events in one request.
