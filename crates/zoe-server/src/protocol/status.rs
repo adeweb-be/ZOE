@@ -3,7 +3,8 @@
 //!
 //! The store has no storage-wide commit lock. So `lock_time` is always
 //! nil and `waiting` is always 0. `timeout-thread-is-alive` is true when
-//! the server closes a silent connection (`--idle-timeout`), as for a ZEO
+//! the server closes a silent connection (`--idle-timeout`) or a voted
+//! transaction that stays open (`--transaction-timeout`), as for a ZEO
 //! server with a transaction timeout. Otherwise it is `"stub"`, the value
 //! of a ZEO server without a transaction timeout.
 //! `conflicts_resolved` counts the conflicts that the clients resolved

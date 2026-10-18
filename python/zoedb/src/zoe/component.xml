@@ -348,6 +348,13 @@
         seconds. 0 closes no idle connection.
       </description>
     </key>
+    <key name="transaction-timeout" datatype="string">
+      <description>
+        The longest time that a transaction stays open after its vote, in
+        whole seconds. The server then closes its connection, and the
+        transaction aborts. 0 closes no connection for this reason.
+      </description>
+    </key>
     <key name="blocking-threads" datatype="string">
       <description>
         The number of threads that run the calls that read, for all the

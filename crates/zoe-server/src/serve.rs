@@ -173,6 +173,7 @@ pub struct ServeOptions {
     max_frame_size: NonZeroU32,
     shutdown_timeout: Duration,
     idle_timeout: Duration,
+    transaction_timeout: Duration,
     blocking_threads: Option<NonZeroUsize>,
     read_only: bool,
     pack_gc: bool,
@@ -212,6 +213,7 @@ impl ServeOptions {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            transaction_timeout: Duration::ZERO,
             blocking_threads: None,
             read_only: false,
             pack_gc: true,
@@ -346,6 +348,20 @@ impl ServeOptions {
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Close the connection of a transaction that stays open for longer
+    /// than `timeout` after a vote that passed, as the key
+    /// `transaction-timeout` of ZEO does. The transaction holds its locks
+    /// from that vote until it ends. The close aborts it and releases its
+    /// locks, and the server logs one ERROR line. The calls of the
+    /// transaction that wait do not run. A connection without a voted
+    /// transaction stays open, whatever its idle time. A timeout of 0, the
+    /// default, closes no connection for this reason.
+    #[must_use]
+    pub fn transaction_timeout(mut self, timeout: Duration) -> Self {
+        self.transaction_timeout = timeout;
         self
     }
 
@@ -660,7 +676,10 @@ impl Server {
                 .read_only(read_only)
                 .resolution_log(resolution_log.clone())
                 .shared_blob_dir(options.shared_blob_dir)
-                .timeout(!options.idle_timeout.is_zero());
+                .timeout(!options.idle_timeout.is_zero() || !options.transaction_timeout.is_zero())
+                .transaction_timeout(
+                    (!options.transaction_timeout.is_zero()).then_some(options.transaction_timeout),
+                );
             storages.push(Arc::new(named));
         }
         health.measured(storages.iter().map(|storage| storage.exported()).collect());
