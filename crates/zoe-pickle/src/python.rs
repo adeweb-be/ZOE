@@ -183,9 +183,15 @@ enum ReferenceKey {
 /// of a Python dict when they are equal here. The order is the order of
 /// the variants, then of the values: ints by value, strs by code point,
 /// bytes by byte, and tuples item by item, with the same order for two
-/// items. Python has the same order for two ints, two strs or two bytes,
-/// and for two tuples whose items at each place are of one kind. It has
-/// no order for other pairs. Only the resolution log uses this order.
+/// items. Two tuples compare at the first place where their items are not
+/// equal. When the shorter tuple ends before such a place, it comes first.
+/// Python gives the same order for each pair that it orders: two ints, two
+/// strs, two bytes, and two tuples with no such place, or whose items at
+/// that place are of one kind. Python raises `TypeError` for the other
+/// pairs: two keys of two kinds, and two tuples whose items at the first
+/// such place are of two kinds. Here these pairs order by the kind of the
+/// two keys, or, for two tuples, by the kind of their items at that place:
+/// ints, strs, bytes, then tuples. Only the resolution log uses this order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DictKey {
     /// An int.

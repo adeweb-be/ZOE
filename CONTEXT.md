@@ -111,12 +111,24 @@ A versioned object in the store, `root['zoe.merge_policy']`, that says which cla
 _Avoid_: resolver config, merge rules
 
 **Strategy**:
-What tier 2 does with a field that both sides changed to different values: `strict`, `lww`, `max`, `sum`, `union` or `append`.
+What tier 2 does with a field that both sides changed to different values: `strict`, `lww`, `max`, `sum`, `union`, `append` or `keys`. `keys` merges a dict key by key, with the rules of tier 2 one level down (ADR 0046, section 11).
 _Avoid_: merge function, resolver
 
 **Coupled fields**:
 A group of fields of a class that tier 2 never merges apart: when both sides changed the group, they must agree on each of its fields.
 _Avoid_: linked fields, invariant fields
+
+**Split merge**:
+The rules of tier 1 that merge the splits of a BTree where ZODB's resolver refuses (ADR 0048). Rule 1: a read-current node that the other side changed only by splits passes, when the other side split none of the children under which the transaction wrote. Rule 2: splits of different children of one node merge. Rule 3: a bucket that the transaction split once, and that the other side split once or changed without a split, merges the keys of its range. The switch `split_merges` of the merge policy turns it on or into shadow mode; it is off by default.
+_Avoid_: split resolution, BTree merge
+
+**Anchor**:
+The child of a node that a split cuts in two: it keeps the keys below the new separator, and the new child right after it gets the others.
+_Avoid_: parent bucket, split source
+
+**Passed node**:
+A node that the transaction marked read-current and did not store, that the other side changed only by splits, and that rule 1 of the split merge lets through the vote, because the other side split none of the children under which the transaction wrote. The vote writes nothing for it, and its locks stay shared. Its line in the resolution log has the outcome `passed`.
+_Avoid_: merged node (rule 1 writes no record), skipped node
 
 **Verification**:
 The check of a merge of shadow mode against the resolution of the client: the second vote compares the record that the client stored with the merged record, and the resolution log says whether they are the same.
@@ -253,6 +265,30 @@ _Avoid_: patch, diff
 **Projection**:
 The catalog kept only as delta records and snapshots, with no index buckets in the store.
 _Avoid_: materialised view
+
+**Queued indexing**:
+The opt-in backend `indexing` of `zoe.plone` (ADR 0047): a save writes its catalog operations as keys of the queue, and writes no object of the catalog; the indexer applies them later.
+_Avoid_: async indexing, deferred indexing
+
+**Queue**:
+The durable namespace `zoe.plone.indexing:` followed by the oid of the catalog, with one key for each catalog operation of a save: the time, a random part and the number of the operation, with the operation as JSON.
+_Avoid_: indexing queue (that is the queue of CMFCore, in memory, for one transaction)
+
+**Indexer**:
+The object that applies the queue of one site in batches, on a connection of its own: each batch resolves each path in its snapshot, applies the removals first, and deletes its keys in the transaction that applies them, so each key applies once.
+_Avoid_: worker, consumer
+
+**Lease**:
+The key of the ephemeral namespace `zoe.plone.indexing.lease` for one catalog, with the token of one thread and a TTL of 30 s; only the thread that holds it runs the indexer of that site, and each batch writes it again.
+_Avoid_: lock (it is no per-OID lock), the Lease of Kubernetes (that elects the leader of deployment tier 2)
+
+**Window**:
+The time from the commit of a save to the commit of the batch that applies it; meanwhile the catalog shows the site as before the save.
+_Avoid_: lag, delay (the delay of a key runs from the time in the key to the commit of its batch)
+
+**Cookie wait**:
+The wait of a request that carries the session cookie `zoe.indexing`: at `PubStart`, at most 2 s, until the queue holds no key at or below the last key of the save of that browser, so the user who saved reads a catalog that holds the save.
+_Avoid_: sticky session, read-your-writes
 
 **Derivation**:
 A value computed from one record and keyed by oid, tid and kind, such as an image scale or an embedding.
