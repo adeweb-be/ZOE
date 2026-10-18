@@ -28,11 +28,7 @@ fn spawn(args: &[&str]) -> (Child, SocketAddr, BufReader<ChildStdout>) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut child = {
-        let _spawn = wire::spawn_lock();
-        command.spawn().unwrap()
-    };
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (child, mut stdout) = wire::spawn_until_output(&mut command);
     loop {
         let mut line = String::new();
         assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "zoe serve stopped");

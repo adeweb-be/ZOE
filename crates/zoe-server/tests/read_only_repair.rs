@@ -209,12 +209,11 @@ fn zoe_with_input(root: &Path, args: &[String], obey_modes: bool, input: &str) -
         .stdin(fs::File::open(&stdin).unwrap())
         .stdout(fs::File::create(&stdout).unwrap())
         .stderr(fs::File::create(&stderr).unwrap());
-    let mut child = {
-        let _spawn = wire::spawn_lock();
-        command
-            .spawn()
-            .unwrap_or_else(|e| panic!("zoe {args:?} does not start: {e}"))
-    };
+    // The mutex of the spawns stays held until the child ends.
+    let _spawn = wire::spawn_lock();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("zoe {args:?} does not start: {e}"));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -269,11 +268,7 @@ impl ReadOnlyServer {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(&stderr).unwrap());
-        let mut child = {
-            let _spawn = wire::spawn_lock();
-            command.spawn().unwrap()
-        };
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let (mut child, mut stdout) = wire::spawn_until_output(&mut command);
         let addr = loop {
             let mut line = String::new();
             if stdout.read_line(&mut line).unwrap() == 0 {
