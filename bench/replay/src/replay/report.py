@@ -1,10 +1,11 @@
 """The report of a result of the replay: one row per run, the conflicts per
-1,000 transactions by class and by path, and the verdict of the gate."""
+1,000 transactions by class and by path, and the measure of the success
+criterion."""
 
 import json
 from pathlib import Path
 
-from replay.gate import LIMIT, gate
+from replay.gate import gate
 from replay.runner import PATHS, REBASES, STACKS
 
 
@@ -31,7 +32,8 @@ def _rate(count, transactions):
 
 
 def lines(result: dict) -> list[str]:
-    """Return the lines of the report. The last one is the verdict."""
+    """Return the lines of the report. The last one is the measure of the
+    success criterion."""
     out = []
     if "policy" in result:
         classes = ", ".join(sorted(result["policy"].get("classes", {}))) or "none"
@@ -87,16 +89,21 @@ def lines(result: dict) -> list[str]:
                 for how, n in hows.items():
                     built[how] += n
         out.append(f"{stack}: " + ", ".join(f"{how} {n}" for how, n in built.items()))
-    verdict = gate(result)
+    measure = gate(result)
     out.append("")
     rates = ", ".join(
         f"{stack} {'none' if rate is None else f'{rate:.1f}'}"
-        for stack, rate in verdict.rates.items()
+        for stack, rate in measure.rates.items()
     )
-    detail = f"ConflictErrors per 1,000 transactions: {rates}; limit {LIMIT:.0%} of zeo"
-    if verdict.missing:
-        absent = ", ".join(f"{stack} at {speed}x" for stack, speed in verdict.missing)
+    if measure.ratio is None:
+        share = "no ratio"
+    else:
+        share = f"zoe-native at {100 * measure.ratio:.1f} % of zeo"
+    detail = (
+        f"ConflictErrors per 1,000 transactions: {rates}; {share} (target at most 10 %)"
+    )
+    if measure.missing:
+        absent = ", ".join(f"{stack} at {speed}x" for stack, speed in measure.missing)
         detail += f"; no run that counts for {absent}"
-    word = "passed" if verdict.verdict == "pass" else "failed"
-    out.append(f"gate {word}: {detail}")
+    out.append(f"success criterion: {detail}")
     return out

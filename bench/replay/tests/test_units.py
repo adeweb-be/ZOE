@@ -99,10 +99,10 @@ def test_other_classes_and_trees_of_many_buckets_raise_value_error():
     db.close()
 
 
-def tids(path, count):
-    """Commit `count` transactions to a new FileStorage at path. Return the
-    commit time of the creation of the root, then the tid and the commit
-    time of each transaction."""
+def tids(path, count, notes=()):
+    """Commit `count` transactions to a new FileStorage at path, the first
+    ones with the `notes`. Return the commit time of the creation of the
+    root, then the tid and the commit time of each transaction."""
     db = ZODB.DB(FileStorage(str(path)))
     manager = transaction.TransactionManager()
     conn = db.open(manager)
@@ -110,6 +110,8 @@ def tids(path, count):
         # The commits are apart, so a start between two of them is clear.
         time.sleep(0.05)
         conn.root()["n"] = i
+        if i < len(notes):
+            manager.get().note(notes[i])
         manager.commit()
     db.close()
     storage = FileStorage(str(path), read_only=True)
@@ -162,6 +164,21 @@ def test_a_tid_that_no_request_explains_starts_at_its_commit(tmp_path):
     assert starts[second] == pytest.approx(c2)
 
 
+def test_a_transaction_of_a_background_job_starts_at_its_commit(tmp_path):
+    note = log.BACKGROUND[0].decode()
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2, [note])
+    t1 = (root + c1) / 2
+    probes = tmp_path / "instance0.jsonl"
+    # One request is in flight at both commits. It commits once.
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 1}
+    probes.write_text(json.dumps(request) + "\n")
+    starts, matched = log.starts_of_probes(tmp_path / "Data.fs", [probes])
+    assert matched == {"matched": 1, "unmatched": 1, "requests": 1}
+    # The batch takes no request. The request makes the second transaction.
+    assert starts[first] == pytest.approx(c1)
+    assert starts[second] == pytest.approx(t1, abs=1e-6)
+
+
 def test_a_run_that_replays_no_transaction_does_not_count():
     run = {
         "stack": "zeo",
@@ -175,7 +192,7 @@ def test_a_run_that_replays_no_transaction_does_not_count():
     found = gate({"speeds": [1], "runs": [run, other]})
     assert found.excluded == [("zeo", 1, 1), ("zoe-native", 1, 1)]
     assert found.missing == [("zeo", 1), ("zoe-native", 1)]
-    assert found.verdict == "fail"
+    assert found.ratio is None
 
 
 def test_speeds_must_be_positive_and_distinct(tmp_path):
@@ -199,6 +216,47 @@ def test_the_command_refuses_a_run_without_probe_records(tmp_path, capsys):
     assert command.main(line) == 2
     assert "explain no transaction" in capsys.readouterr().err
     assert not (tmp_path / "result.json").exists()
+
+
+def test_the_command_exits_with_0_when_the_ratio_is_above_10_percent(
+    tmp_path, monkeypatch, capsys
+):
+    root, [(_first, c1), (_second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    (tmp_path / "probe").mkdir()
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 2}
+    (tmp_path / "probe" / "instance0.jsonl").write_text(json.dumps(request) + "\n")
+
+    def replayed(stack):
+        # Each stack raises one ConflictError: zoe serve is at 100 % of zeo.
+        return {
+            "stack": stack,
+            "speed": 1,
+            "repetition": 1,
+            "transactions": 2,
+            "order": [],
+            "conflicts": {},
+            "conflict_errors": 1,
+            "check": {"acknowledged": 1, "missing": []},
+            "counts": True,
+            "seconds": 1.0,
+            "read_load": {"error": None},
+            "rebases": {},
+        }
+
+    def run(_log, **_options):
+        runs = [replayed("zeo"), replayed("zoe-native")]
+        return {"schema_version": 1, "speeds": [1], "runs": runs}
+
+    monkeypatch.setattr(runner, "run", run)
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--speeds", "1"]
+    assert command.main(line) == 0
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("success criterion:"), last
+    assert "zoe-native at 100.0 % of zeo" in last, last
+    assert (tmp_path / "result.json").exists()
 
 
 def test_the_next_transaction_of_a_request_starts_at_its_previous_commit(tmp_path):
