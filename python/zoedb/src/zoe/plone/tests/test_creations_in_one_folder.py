@@ -4,7 +4,8 @@ A creation of a Document in a folder of plone.app.contenttypes writes the
 folder too:
 
 - `BTreeFolder2Base._setOb` inserts the id into `_tree`, adds 1 to
-  `_count` and inserts the id into `_mt_index["Document"]`.
+  `_count` and inserts the id into `_mt_index["Dexterity Item"]`. The
+  key is the meta type of a Dexterity item, and a Document is one.
 - `DefaultOrdering.notifyAdded` of plone.folder appends the id to the
   order, a `PersistentList` in the annotations of the folder, and inserts
   the id into the positions, the `OIBTree` `pos` beside it. `pos` gives
@@ -13,11 +14,12 @@ folder too:
   the `Folder` changes.
 
 Tier 1 merges `_count`, and the inserts of different ids into `_tree`,
-`_mt_index["Document"]` and `pos`. Two creations from one snapshot both
-set `modification_date`, so the record of the `Folder` conflicts. Each one
-also appends to the order: the `PersistentList` has no resolver, so it
-conflicts too. It must conflict as long as no merge changes the order and
-`pos` together: both creations give their id the same position in `pos`.
+`_mt_index["Dexterity Item"]` and `pos`. Two creations from one snapshot
+both set `modification_date`, so the record of the `Folder` conflicts.
+Each one also appends to the order: the `PersistentList` has no
+resolver, so it conflicts too. It must conflict as long as no merge
+changes the order and `pos` together: both creations give their id the
+same position in `pos`.
 
 The test checks, on a Plone site of the functional layer of
 plone.app.testing on a ZOE store, with queued indexing on:
@@ -43,13 +45,13 @@ again from a new snapshot and then commits. The last test of the module
 checks that behaviour on a ZOE store.
 
 The rounds. The folder holds one Document before the rounds, as a folder
-that is in use: the first Document of a meta type inserts the key
-`Document` into `_mt_index`, and two such inserts of one key conflict.
-Each round adds `CREATORS` items to the folder, so the trees of the folder
-(`_tree`, `_mt_index["Document"]` and `pos`) fill and split during the
-rounds. The split merge of ADR 0048 merges these splits, so the mechanism
-of the test switches it on, as it switches on the merges of the trees of
-CMFEditions and of the intid utility.
+that is in use: the first item of a meta type inserts the key
+`Dexterity Item` into `_mt_index`, and two such inserts of one key
+conflict. Each round adds `CREATORS` items to the folder, so the trees of
+the folder (`_tree`, `_mt_index["Dexterity Item"]` and `pos`) fill and
+split during the rounds. The split merge of ADR 0048 merges these
+splits, so the mechanism of the test switches it on, as it switches on
+the merges of the trees of CMFEditions and of the intid utility.
 
 The store. The layer keeps the site in a `DemoStorage`, which resolves
 conflicts in Python, not with the tiers of the store. So each test copies
@@ -58,9 +60,9 @@ acceptance test of concurrent creations in `test_concurrent_creations`
 does, and the rounds run there. The merges of ZOE run in the core, so the
 in-process `zoe.Storage` and a client of `zoe serve` get the same ones.
 
-The ADR of the card names the mechanism. Only the helpers `mechanism_on`
-and `mechanism_off` name it, through the constant `SWITCH`. The ADR can
-give the switch another name.
+ADR 0052 names the mechanism and keeps the name of the switch. Only the
+helpers `mechanism_on` and `mechanism_off` name it, through the constant
+`SWITCH`.
 
 The layers of plone.app.testing need the interpreter of a Plone instance.
 So this module is in the package, with the other tests of `zoe.plone` that
@@ -112,9 +114,14 @@ WORKFLOW = "simple_publication_workflow"
 FOLDER = "folder"
 # The id of the Document that the folder holds before the rounds.
 FIRST = "first"
-# The switch of the merge policy for the mechanism of the card. The ADR of
-# the card can give it another name.
+# The switch of the merge policy for the mechanism of ADR 0052.
 SWITCH = "folder_orders"
+# The tier 2 entry of the class of the folder (ADR 0052).
+FOLDER_ENTRY = {
+    "tier2": "on",
+    "default": "strict",
+    "fields": {"modification_date": "max"},
+}
 
 
 def mechanism_on(test):
@@ -127,20 +134,22 @@ def mechanism_on(test):
     of the layer.
 
     The helper writes a merge policy into the site of the layer and gives
-    no keyword argument. The policy switches on the split merge of ADR
-    0048 (`split_merges`), because the trees of the folder and of
-    CMFEditions split during the rounds. It also switches on `SWITCH`, when
-    `zoe.policy` knows that switch. Today `zoe.policy` does not know it, so
-    the policy holds `split_merges` only.
+    no keyword argument, as ADR 0052 says. The policy switches on the split
+    merge of ADR 0048 (`split_merges`), because the trees of the folder and
+    of CMFEditions split during the rounds. It gives the class of the
+    folder the tier 2 entry `FOLDER_ENTRY`, which merges
+    `modification_date` with `max`. It also switches on `SWITCH`, when
+    `zoe.policy` knows that switch. Until the build adds it, the policy
+    holds no `SWITCH`.
 
-    The ADR of the card can rename `SWITCH`, or put the mechanism in
-    another place: an entry of tier 2 for the folder classes, for example.
-    The builder then changes this helper and `mechanism_off`, and only
-    these two. The human approves a change of these helpers with the ADR.
+    The human approves a change of these helpers with the ADR.
     """
     import zoe.policy
 
-    policy = {"classes": {}, "split_merges": "on"}
+    policy = {
+        "classes": {"plone.app.contenttypes.content.Folder": FOLDER_ENTRY},
+        "split_merges": "on",
+    }
     if SWITCH in zoe.policy.SWITCHES:
         policy[SWITCH] = "on"
     zoe.policy.install(test.layer["portal"]._p_jar, policy)
@@ -155,15 +164,20 @@ def mechanism_off(test):
     of the test.
 
     The test calls it as it calls `mechanism_on`. The helper writes the
-    policy of a site with the split merge of ADR 0048 and without `SWITCH`,
-    and gives no keyword argument. So the trees merge their splits, and
-    only the folder and its order conflict. The builder changes it with
-    `mechanism_on`, and the human approves a change of it with the ADR.
+    policy of `mechanism_on` without `SWITCH`, and gives no keyword
+    argument, as ADR 0052 says. So the trees merge their splits, the
+    record of the folder merges `modification_date`, and only the order of
+    the folder conflicts. The human approves a change of this helper with
+    the ADR.
     """
     import zoe.policy
 
     zoe.policy.install(
-        test.layer["portal"]._p_jar, {"classes": {}, "split_merges": "on"}
+        test.layer["portal"]._p_jar,
+        {
+            "classes": {"plone.app.contenttypes.content.Folder": FOLDER_ENTRY},
+            "split_merges": "on",
+        },
     )
     transaction.commit()
     return {}
@@ -377,7 +391,7 @@ class TestCreationsInOneFolder(unittest.TestCase):
             start += CREATORS
         self.assertEqual(len(order), start)
         self.assertEqual(
-            set(self.portal[FOLDER]._mt_index["Document"].keys()), set(order)
+            set(self.portal[FOLDER]._mt_index["Dexterity Item"].keys()), set(order)
         )
 
     def test_each_new_item_is_found_from_another_connection(self):
