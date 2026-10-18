@@ -148,6 +148,51 @@ fn the_counters_follow_the_work() {
     );
 }
 
+/// A client that reads `/metrics` right after a reply reads counters that
+/// already count its call: the server counts a call before its reply goes
+/// out.
+#[test]
+fn a_reply_comes_after_the_count_of_its_call() {
+    let dir = fresh_dir("count-before-reply");
+    let server = Server::start(
+        &[
+            "--path",
+            s(&dir.join("store")),
+            "--admin-listen",
+            "127.0.0.1:0",
+        ],
+        &[],
+    );
+    let admin = server.admin.unwrap();
+    let one = [("storage", "1")];
+    let mut a = server.client("1");
+    let before = samples(&get(admin, "/metrics"));
+    // The calls that each metric of `names` counted since the start of the
+    // test, from one read.
+    let counted = |names: [&str; 2]| {
+        let metrics = samples(&get(admin, "/metrics"));
+        names.map(|name| sample(&metrics, name, &one) - sample(&before, name, &one))
+    };
+    let oid = new_oids(&mut a, 1)[0];
+    let mut serial = 0;
+    for n in 1..=20 {
+        serial = commit(&mut a, n, &[(oid, serial, record(b"v"))]).unwrap();
+        let counts = counted(["zoe_commits_total", "zoe_finish_latency_seconds_count"]);
+        assert!(
+            counts.iter().all(|&c| c >= n as f64),
+            "commit {n}: {counts:?}"
+        );
+    }
+    for n in 1..=200 {
+        load(&mut a, oid).unwrap();
+        let counts = counted(["zoe_loads_total", "zoe_load_latency_seconds_count"]);
+        assert!(
+            counts.iter().all(|&c| c >= n as f64),
+            "load {n}: {counts:?}"
+        );
+    }
+}
+
 /// Find each value of `key` anywhere in a JSON value.
 fn values_of<'a>(value: &'a serde_json::Value, key: &str, out: &mut Vec<&'a serde_json::Value>) {
     match value {
