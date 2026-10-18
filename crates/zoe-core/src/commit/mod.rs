@@ -950,8 +950,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// Return what tiers 1 and 2 did in the undos of the transaction, then
     /// in the last vote that took the locks: one entry for each three-way
     /// merge of an undo, and one for each stale written oid of the vote, of
-    /// a class of a tier whose mode is not `Off`, in oid order. The vote that comes
-    /// after `vote_resolving` keeps the entries of `vote_resolving`.
+    /// a class of a tier whose mode is not `Off`, in oid order. With the
+    /// split merge, the vote also gives one entry for each stale
+    /// read-current node that rule 1 lets through, and one for the
+    /// read-current node on which it fails when rule 1 gives no answer for
+    /// it. The vote that comes after `vote_resolving` keeps the entries of
+    /// `vote_resolving`.
     pub fn resolutions(&self) -> &[Resolution] {
         &self.resolutions
     }
@@ -1514,9 +1518,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             continue;
                         }
                     }
-                    if let Some(shadow) = plan.as_ref().and_then(|plan| plan.shadows.get(&oid)) {
-                        let entry = split::read_shadow(oid, shadow, read, current, &rules);
-                        self.resolutions.push(entry);
+                    // The entry tells why rule 1 did not let the node
+                    // through, or what it gives in mode `shadow`.
+                    if let Some(plan) = &plan {
+                        if let Some(shadow) = plan.shadows.get(&oid) {
+                            let entry = split::read_shadow(oid, shadow, read, current, &rules);
+                            self.resolutions.push(entry);
+                        } else if let Some(&(ref class, why)) = plan.unanswered.get(&oid) {
+                            let entry =
+                                split::read_conflict(oid, class, why, read, current, &rules);
+                            self.resolutions.push(entry);
+                        }
                     }
                 }
                 return Ok(Check::Failed(Stale {
