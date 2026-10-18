@@ -53,4 +53,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0047](0047-queued-indexing.md) | Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them (accepted) |
 | [0048](0048-the-split-merge.md) | The split merge: tier 1 merges the splits of a BTree, and a read-current node lets a split of another child through (accepted) |
 | [0051](0051-the-version-of-an-edit-in-a-transaction-of-its-own.md) | The version of an edit in a transaction of its own: `zoe.plone` saves it after the commit of the edit (rejected; see ADR 0053) |
-| [0053](0053-the-lock-of-an-edit.md) | The lock of an edit: an edit request takes the intent lock of its object after the traversal and reads from the grant (proposed) |
+| [0053](0053-the-lock-of-an-edit.md) | The lock of an edit: an edit of versioned content reads its object after the commit of the edit before it; the lock at the retry, or the move with re-checks (proposed) |

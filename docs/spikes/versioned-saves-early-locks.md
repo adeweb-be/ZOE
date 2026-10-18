@@ -135,7 +135,7 @@ Without early locks, two saves from one snapshot: the second gets `ConflictError
 ## Consequences for the card
 
 - Early locks on the history classes do not meet the goal: as ADR 0045 builds them they turn the conflict into a `KeyError`, and with a covered subtree they give versions that miss committed changes.
-- The lock of the edited object after the traversal, with the snapshot at the grant, gives the sequential history at the first attempt. ADR 0053 proposes it. It needs a new function in `zoe.zodb`, outside the scope fence of the card, and a call from `zoe.plone` at the traversal.
+- The lock of the edited object after the traversal, with the snapshot at the grant, gives the sequential history at the first attempt. ADR 0053 proposes it as variant (b), with the re-checks that its review asks for, beside variant (a), which takes the lock only at the retry, before its snapshot (not run in this spike). Both need code in `zoe.zodb`, outside the scope fence of the card, and a subscriber of `zoe.plone`.
 - The acceptance test cannot pass unchanged with any early lock (finding 1). The planner must write a new one, with the approval of the human.
 
 ## Not measured
