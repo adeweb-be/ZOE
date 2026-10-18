@@ -19,3 +19,4 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 | [concurrent-creations.md](concurrent-creations.md) | Which trees do concurrent creations of versioned content conflict on after queued indexing, why does ZODB refuse each case, and what does each candidate remove? |
 | [server-write-volume.md](server-write-volume.md) | Where do the bytes that `zoe serve` writes for one B5 operation go, why does B5 show 20 times the bytes of ZEO, and which levers reduce them? |
 | [catalog-metadata.md](catalog-metadata.md) | Which values do the metadata buckets of a catalog hold, how do they pickle, which comparisons does BTrees make on them in a merge, and what must tier 1 model to merge them as ZODB does? |
+| [zope-sessions.md](zope-sessions.md) | Does Plone 6.1, or an add-on of a Plone 6.1 site, write a Zope session on a standard site, and where does Plone keep the data that a session kept before? |

@@ -6,8 +6,8 @@
 //! `/proc/<pid>/stat`, and prints the CPU of the server per load and the
 //! wall time of one load, for 1 and for 4 clients. It also prints the mean
 //! of `zoe_load_latency_seconds` of `/metrics`: the time of the call of
-//! each load in the server, from its start until its reply is in the queue
-//! of the connection.
+//! each load in the server, from its start until just before its reply
+//! goes into the queue of the connection.
 //!
 //! The records of 100 KB are of two kinds. The text records hold words of
 //! a list, as the records of the harness do, so zstd compresses them. The

@@ -99,7 +99,7 @@ impl Histogram {
     }
 
     /// Return the number of observations and their sum.
-    #[cfg(feature = "sim")]
+    #[cfg(any(test, feature = "sim"))]
     pub(crate) fn totals(&self) -> (u64, f64) {
         let count = self
             .counts
