@@ -706,6 +706,115 @@ impl Rng {
     }
 }
 
+/// The records of an `IOBucket` of the metadata of a catalog: each rid maps
+/// to `(title, created, modified, start, Type, created)`, with
+/// `DateTime`s in three zones, `Missing.Value` and `Message`s, as ZODB 6
+/// writes them with Python 3.13. The committed transaction moves
+/// `modified` of rid 1 to the same instant in another zone, and gives rid
+/// 5 a `start`. The new transaction gives `Type` of rid 3 another domain,
+/// equal as a str, and inserts rid 4. `CATALOG_MERGED` is the record that
+/// ZODB's resolver writes. `CATALOG_NEW2` changes the title of rid 1, so
+/// both transactions change rid 1, and ZODB's resolver refuses.
+const CATALOG_OLD: &[u8] =
+    b"\x80\x03cBTrees.IOBTree\nIOBucket\nq\x00.\x80\x03(K\x01(X\x03\x00\x00\x00oneq\x01cDateTi\
+    me.DateTime\nDateTime\nq\x02)\x81q\x03\x8a\x07\x00@ FHG\x06\x89X\x05\x00\x00\x00GMT+2q\
+    \x04\x87q\x05bh\x03cMissing\nV\nq\x06czope.i18nmessageid.message\nMessage\nq\x07(X\x04\
+    \x00\x00\x00Pageq\x08X\x05\x00\x00\x00ploneq\x09NNNNNtq\nRq\x0bh\x03tq\x0cK\x03(X\x05\
+    \x00\x00\x00threeq\x0dh\x03h\x02)\x81q\x0e\x8a\x07\x00!\x16LHG\x06\x89X\x03\x00\x00\x00U\
+    TCq\x0f\x87q\x10bh\x06h\x0bh\x03tq\x11K\x05(X\x04\x00\x00\x00fiveq\x12h\x03h\x03h\x06h\
+    \x0bh\x03tq\x13tq\x14\x85q\x15.";
+const CATALOG_COMMITTED: &[u8] =
+    b"\x80\x03cBTrees.IOBTree\nIOBucket\nq\x00.\x80\x03(K\x01(X\x03\x00\x00\x00oneq\x01cDateTi\
+    me.DateTime\nDateTime\nq\x02)\x81q\x03\x8a\x07\x00@ FHG\x06\x89X\x05\x00\x00\x00GMT+2q\
+    \x04\x87q\x05bh\x02)\x81q\x06\x8a\x07\x00@ FHG\x06\x89X\x03\x00\x00\x00UTCq\x07\x87q\x08\
+    bcMissing\nV\nq\x09czope.i18nmessageid.message\nMessage\nq\n(X\x04\x00\x00\x00Pageq\x0bX\
+    \x05\x00\x00\x00ploneq\x0cNNNNNtq\x0dRq\x0eh\x03tq\x0fK\x03(X\x05\x00\x00\x00threeq\x10h\
+    \x03h\x02)\x81q\x11\x8a\x07\x00!\x16LHG\x06\x89h\x07\x87q\x12bh\x09h\x0eh\x03tq\x13K\x05\
+    (X\x04\x00\x00\x00fiveq\x14h\x03h\x03h\x02)\x81q\x15\x8a\x07\xc0\xa9SLIG\x06\x89X\x05\
+    \x00\x00\x00GMT-5q\x16\x87q\x17bh\x0eh\x03tq\x18tq\x19\x85q\x1a.";
+const CATALOG_NEW: &[u8] =
+    b"\x80\x03cBTrees.IOBTree\nIOBucket\nq\x00.\x80\x03(K\x01(X\x03\x00\x00\x00oneq\x01cDateTi\
+    me.DateTime\nDateTime\nq\x02)\x81q\x03\x8a\x07\x00@ FHG\x06\x89X\x05\x00\x00\x00GMT+2q\
+    \x04\x87q\x05bh\x03cMissing\nV\nq\x06czope.i18nmessageid.message\nMessage\nq\x07(X\x04\
+    \x00\x00\x00Pageq\x08X\x05\x00\x00\x00ploneq\x09NNNNNtq\nRq\x0bh\x03tq\x0cK\x03(X\x05\
+    \x00\x00\x00threeq\x0dh\x03h\x02)\x81q\x0e\x8a\x07\x00!\x16LHG\x06\x89X\x03\x00\x00\x00U\
+    TCq\x0f\x87q\x10bh\x06h\x07(X\x04\x00\x00\x00Pageq\x11X\x16\x00\x00\x00plone.app.content\
+    typesq\x12NNNNNtq\x13Rq\x14h\x03tq\x15K\x04(X\x04\x00\x00\x00fourq\x16h\x03h\x03h\x06h\
+    \x0bh\x03tq\x17K\x05(X\x04\x00\x00\x00fiveq\x18h\x03h\x03h\x06h\x0bh\x03tq\x19tq\x1a\x85\
+    q\x1b.";
+const CATALOG_MERGED: &[u8] =
+    b"\x80\x03cBTrees.IOBTree\nIOBucket\nq\x00.\x80\x03(K\x01(X\x03\x00\x00\x00oneq\x01cDateTi\
+    me.DateTime\nDateTime\nq\x02)\x81q\x03\x8a\x07\x00@ FHG\x06\x89X\x05\x00\x00\x00GMT+2q\
+    \x04\x87q\x05bh\x02)\x81q\x06\x8a\x07\x00@ FHG\x06\x89X\x03\x00\x00\x00UTCq\x07\x87q\x08\
+    bcMissing\nV\nq\x09czope.i18nmessageid.message\nMessage\nq\n(X\x04\x00\x00\x00Pageq\x0bX\
+    \x05\x00\x00\x00ploneq\x0cNNNNNtq\x0dRq\x0eh\x03tq\x0fK\x03(X\x05\x00\x00\x00threeq\x10h\
+    \x02)\x81q\x11\x8a\x07\x00@ FHG\x06\x89h\x04\x87q\x12bh\x02)\x81q\x13\x8a\x07\x00!\x16LH\
+    G\x06\x89h\x07\x87q\x14bh\x09h\n(X\x04\x00\x00\x00Pageq\x15X\x16\x00\x00\x00plone.app.co\
+    ntenttypesq\x16NNNNNtq\x17Rq\x18h\x11tq\x19K\x04(X\x04\x00\x00\x00fourq\x1ah\x11h\x11h\
+    \x09h\n(X\x04\x00\x00\x00Pageq\x1bX\x05\x00\x00\x00ploneq\x1cNNNNNtq\x1dRq\x1eh\x11tq\
+    \x1fK\x05(X\x04\x00\x00\x00fiveq h\x03h\x03h\x02)\x81q!\x8a\x07\xc0\xa9SLIG\x06\x89X\x05\
+    \x00\x00\x00GMT-5q\"\x87q#bh\x0eh\x03tq$tq%\x85q&.";
+const CATALOG_NEW2: &[u8] =
+    b"\x80\x03cBTrees.IOBTree\nIOBucket\nq\x00.\x80\x03(K\x01(X\x04\x00\x00\x00one!q\x01cDateT\
+    ime.DateTime\nDateTime\nq\x02)\x81q\x03\x8a\x07\x00@ FHG\x06\x89X\x05\x00\x00\x00GMT+2q\
+    \x04\x87q\x05bh\x03cMissing\nV\nq\x06czope.i18nmessageid.message\nMessage\nq\x07(X\x04\
+    \x00\x00\x00Pageq\x08X\x05\x00\x00\x00ploneq\x09NNNNNtq\nRq\x0bh\x03tq\x0cK\x03(X\x05\
+    \x00\x00\x00threeq\x0dh\x03h\x02)\x81q\x0e\x8a\x07\x00!\x16LHG\x06\x89X\x03\x00\x00\x00U\
+    TCq\x0f\x87q\x10bh\x06h\x0bh\x03tq\x11K\x05(X\x04\x00\x00\x00fiveq\x12h\x03h\x03h\x06h\
+    \x0bh\x03tq\x13tq\x14\x85q\x15.";
+
+#[test]
+fn metadata_with_datetimes_messages_and_missing_values_merge_as_zodb_merges_them() {
+    let store = open(StructuralMerges::default());
+    let (oid, read) = conflict(&store, CATALOG_OLD, CATALOG_COMMITTED);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, CATALOG_NEW).unwrap();
+    assert_eq!(txn.vote_resolving().unwrap(), []);
+    assert_eq!(txn.natively_resolved(), [oid]);
+    let tid = txn.finish().unwrap();
+    assert_eq!(store.load(oid).unwrap(), (CATALOG_MERGED.to_vec(), tid));
+}
+
+#[test]
+fn a_datetime_in_another_zone_is_a_change_of_its_value() {
+    let store = open(StructuralMerges::default());
+    let (oid, read) = conflict(&store, CATALOG_OLD, CATALOG_COMMITTED);
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, CATALOG_NEW2).unwrap();
+    assert!(matches!(
+        txn.vote_resolving(),
+        Err(ZoeError::Conflict { .. })
+    ));
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(resolution.outcome, Resolved::Refused(Reason::BTrees(1)));
+}
+
+#[test]
+fn a_datetime_of_a_zone_out_of_the_table_gives_no_answer() {
+    // `_zmap` of DateTime maps `utc` to `UTC`: the name in the state is
+    // not the name that `__setstate__` gives.
+    let lower = |record: &[u8]| -> Vec<u8> {
+        let at = record
+            .windows(7)
+            .position(|window| window == b"\x03\x00\x00\x00UTC")
+            .unwrap();
+        let mut record = record.to_vec();
+        record[at + 4..at + 7].copy_from_slice(b"utc");
+        record
+    };
+    let store = open(StructuralMerges::default());
+    let (oid, read) = conflict(&store, CATALOG_OLD, &lower(CATALOG_COMMITTED));
+    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+    txn.store(oid, read, CATALOG_NEW).unwrap();
+    assert_eq!(txn.vote_resolving().unwrap().len(), 1);
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert!(matches!(resolution.outcome, Resolved::Undecided(_)));
+}
+
 /// Changes one to four bytes of `record`, or cuts it.
 fn damaged(rng: &mut Rng, record: &[u8]) -> Vec<u8> {
     let mut out = record.to_vec();
