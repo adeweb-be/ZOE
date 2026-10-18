@@ -51,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
         fields: BTreeMap::new(),
         coupled,
         blocked: false,
+        append_state: None,
     };
     let class = zoe_core::merge::class_name(new).unwrap_or_else(|| "m.C".to_owned());
     let merge = zoe_core::merge::tier2(old, committed, new, &class, &entry);

@@ -70,9 +70,18 @@ def test_the_keys_of_a_loaded_history_are_interned():
 def test_the_policy_of_the_history_appends_each_workflow():
     assert history.policy() == {
         "classes": {
-            "zoe.plone.history.WorkflowHistory": {"tier2": "on", "default": "append"}
+            "zoe.plone.history.WorkflowHistory": {
+                "tier2": "on",
+                "default": "append",
+                "options": {"append": {"state": "review_state"}},
+            }
         }
     }
+    # The policy is a copy: a change of it does not change `ENTRY`.
+    history.policy()["classes"]["zoe.plone.history.WorkflowHistory"]["options"][
+        "append"
+    ]["state"] = "other"
+    assert history.ENTRY["options"]["append"]["state"] == "review_state"
 
 
 class Doc(persistent.Persistent):
@@ -430,28 +439,55 @@ def test_validate_stores_the_constants():
     assert "fields" not in checked["classes"]["m.Page"]
 
 
-def test_concurrent_transitions_of_a_history_merge_in_process(tmp_path):
+def status(action, state):
+    """Return a status as DCWorkflow makes it: its action, and the state of
+    the object after it."""
+    return {"action": action, "review_state": state}
+
+
+def transitions(tmp_path, statuses):
+    """Run one transition for each of `statuses` on a history from one
+    snapshot, and commit them in order. Return the outcome of each, and the
+    statuses of the workflow after them."""
     db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
     try:
         with db.transaction() as conn:
             policy.install(conn, history.policy())
-            conn.root()["h"] = history.WorkflowHistory({"wf": ("created",)})
-        managers = [transaction.TransactionManager() for _ in range(3)]
+            created = status("create", "private")
+            conn.root()["h"] = history.WorkflowHistory({"wf": (created,)})
+        managers = [transaction.TransactionManager() for _ in statuses]
         conns = [db.open(transaction_manager=tm) for tm in managers]
-        for number, (tm, conn) in enumerate(zip(managers, conns, strict=True)):
+        for tm, conn, added in zip(managers, conns, statuses, strict=True):
             tm.begin()
             wfh = conn.root()["h"]
-            wfh["wf"] = (*wfh["wf"], f"transition {number}")
+            wfh["wf"] = (*wfh["wf"], added)
+        outcomes = []
         for tm in managers:
-            tm.commit()
+            try:
+                tm.commit()
+            except ConflictError:
+                tm.abort()
+                outcomes.append("conflict")
+            else:
+                outcomes.append("committed")
         for conn in conns:
             conn.close()
         with db.transaction() as conn:
-            assert conn.root()["h"]["wf"] == (
-                "created",
-                "transition 0",
-                "transition 1",
-                "transition 2",
-            )
+            return outcomes, [added["action"] for added in conn.root()["h"]["wf"]]
     finally:
         db.close()
+
+
+def test_concurrent_transitions_of_a_history_merge_in_process(tmp_path):
+    comments = [status(f"comment {number}", "private") for number in range(3)]
+    outcomes, actions = transitions(tmp_path, comments)
+    assert outcomes == ["committed"] * 3
+    assert actions == ["create", "comment 0", "comment 1", "comment 2"]
+
+
+def test_two_changes_of_state_of_a_history_conflict_in_process(tmp_path):
+    publish = status("publish", "published")
+    submit = status("submit", "pending")
+    outcomes, actions = transitions(tmp_path, [publish, submit])
+    assert outcomes == ["committed", "conflict"]
+    assert actions == ["create", "publish"]

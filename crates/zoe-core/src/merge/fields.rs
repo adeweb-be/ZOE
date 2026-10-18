@@ -172,8 +172,10 @@ fn merge_fields(
                         Ok(false) => {
                             let old = old_map.get(name).copied();
                             let strategy = entry.strategy(name);
+                            let state = entry.append_state.as_deref();
                             let mut noted = None;
-                            let value = both_changed(heap, canon, strategy, old, c, n, &mut noted);
+                            let value =
+                                both_changed(heap, canon, strategy, state, old, c, n, &mut noted);
                             if let Some(noted) = noted {
                                 expanded.insert(name.as_str(), noted);
                             }
@@ -373,13 +375,16 @@ fn holds_mutable(heap: &Heap, id: ObjectId, memo: &mut HashMap<ObjectId, bool>) 
 }
 
 /// Merges a field that both sides changed to different values, with its
-/// strategy. `old` is its value in the old state, if it had one. The
-/// strategy `keys` puts into `noted` the keys of the dict that the new
-/// record changed.
+/// strategy. `state` is the option `state` of `append`, if the entry gives
+/// it. `old` is its value in the old state, if it had one. The strategy
+/// `keys` puts into `noted` the keys of the dict that the new record
+/// changed.
+#[allow(clippy::too_many_arguments)]
 fn both_changed(
     heap: &mut Heap,
     canon: &mut Canon,
     strategy: Strategy,
+    state: Option<&str>,
     old: Option<Value>,
     committed: Value,
     new: Value,
@@ -409,7 +414,7 @@ fn both_changed(
             )),
         },
         Strategy::Union => union(heap, canon, old, committed, new),
-        Strategy::Append => append(heap, canon, old, committed, new),
+        Strategy::Append => append(heap, canon, state, old, committed, new),
         Strategy::Keys => keys(heap, canon, old, committed, new, noted),
     }
 }
@@ -513,10 +518,12 @@ fn union(
 /// The strategy `append`: the three values are lists, or the three are
 /// tuples, and the old value is a prefix of both others; the result is the
 /// committed value, then the items that the new side added after the old
-/// value.
+/// value. With the option `state`, each item that the committed side
+/// added must keep the state of the old value (see `keeps_state`).
 fn append(
     heap: &mut Heap,
     canon: &mut Canon,
+    state: Option<&str>,
     old: Option<Value>,
     committed: Value,
     new: Value,
@@ -545,9 +552,53 @@ fn append(
             }
         }
     }
+    if let Some(key) = state {
+        keeps_state(
+            heap,
+            canon,
+            key,
+            &old_items,
+            &committed_items[old_items.len()..],
+        )?;
+    }
     let mut result = committed_items;
     result.extend_from_slice(&new_items[old_items.len()..]);
     Ok(make(heap, kind, result))
+}
+
+/// The check of the option `state` of `append` (ADR 0046, section 12). The
+/// state of the old value is the value under `key` of its last item. Each
+/// item in `added`, in order, must hold the same state, else the merge
+/// refuses. An old value without items, or an item that is not a dict
+/// with `key`, gives no answer.
+fn keeps_state(
+    heap: &Heap,
+    canon: &mut Canon,
+    key: &str,
+    old: &[Value],
+    added: &[Value],
+) -> Result<(), Outcome> {
+    let no_state = Outcome::Undecided("a status without the state key");
+    let last = *old
+        .last()
+        .ok_or(Outcome::Undecided("an old value without a status"))?;
+    let state = state_of(heap, last, key).ok_or(no_state.clone())?;
+    for &item in added {
+        let other = state_of(heap, item, key).ok_or(no_state.clone())?;
+        if !canon.same(heap, state, other).map_err(undecided)? {
+            return Err(Outcome::Refused(Reason::StateChanged));
+        }
+    }
+    Ok(())
+}
+
+/// Returns the value under the str key `key` of the dict `item`, or `None`
+/// when `item` is not a dict or does not hold `key`.
+fn state_of(heap: &Heap, item: Value, key: &str) -> Option<Value> {
+    heap.dict(item)?
+        .iter()
+        .find(|&&(name, _)| heap.str(name) == Some(key))
+        .map(|&(_, value)| value)
 }
 
 /// One dict of the strategy `keys`: its items, the key of each item, and
@@ -690,6 +741,215 @@ fn keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge::{Mode, tier2};
+    use std::collections::BTreeMap;
+
+    /// The workflow id: the one field of the histories of these tests.
+    const WORKFLOW: &str = "wf";
+
+    /// One status: its action, its actor and its state. `None` for the
+    /// state gives a status without the state key.
+    type Status<'a> = (&'a str, &'a str, Option<&'a str>);
+
+    const CREATED: Status = ("create", "u0", Some("private"));
+    const PUBLISH: Status = ("publish", "u1", Some("published"));
+    const SUBMIT: Status = ("submit", "u2", Some("pending"));
+    const PUBLISH_AGAIN: Status = ("publish", "u3", Some("published"));
+    const COMMENT: Status = ("comment", "u4", Some("private"));
+    const COMMENT_AGAIN: Status = ("comment", "u5", Some("private"));
+    const RETRACT: Status = ("retract", "u6", Some("private"));
+    const NO_STATE: Status = ("comment", "u7", None);
+
+    /// Returns the record of a history whose workflow holds `statuses`.
+    fn history(statuses: &[Status]) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("m", "History");
+        let items = statuses
+            .iter()
+            .map(|&(action, actor, state)| {
+                let mut items = vec![
+                    (heap.new_str("action"), heap.new_str(action)),
+                    (heap.new_str("actor"), heap.new_str(actor)),
+                ];
+                if let Some(state) = state {
+                    items.push((heap.new_str("review_state"), heap.new_str(state)));
+                }
+                heap.new_dict(items)
+            })
+            .collect();
+        let tuple = heap.new_tuple(items);
+        let name = heap.new_str(WORKFLOW);
+        let state = heap.new_dict(vec![(name, tuple)]);
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(class).unwrap();
+        pickler.dump(state).unwrap();
+        pickler.into_bytes()
+    }
+
+    /// Returns the actions of the statuses of a history record.
+    fn actions(record: &[u8]) -> Vec<String> {
+        let mut heap = Heap::with_instances();
+        let tree = zoe_pickle::decode_record(record).unwrap();
+        let (_, state) = heap.load(&tree).unwrap();
+        let (_, workflow) = heap.dict(state).unwrap()[0];
+        heap.tuple(workflow)
+            .unwrap()
+            .iter()
+            .map(|&status| {
+                let action = state_of(&heap, status, "action").unwrap();
+                heap.str(action).unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    /// Returns the entry of the history, with the option `state` when
+    /// `state` is true.
+    fn entry(state: bool) -> ClassPolicy {
+        ClassPolicy {
+            tier1: None,
+            tier2: Mode::On,
+            default: Strategy::Append,
+            fields: BTreeMap::new(),
+            coupled: Vec::new(),
+            blocked: false,
+            append_state: state.then(|| "review_state".to_owned()),
+        }
+    }
+
+    /// Merges the three histories with the option `state`.
+    fn merge_histories(old: &[Status], committed: &[Status], new: &[Status]) -> Merge {
+        let (old, committed, new) = (history(old), history(committed), history(new));
+        tier2(&old, &committed, &new, "m.History", &entry(true))
+    }
+
+    #[test]
+    fn two_changes_of_state_from_one_state_refuse() {
+        for second in [SUBMIT, PUBLISH_AGAIN] {
+            let merge = merge_histories(&[CREATED], &[CREATED, PUBLISH], &[CREATED, second]);
+            assert_eq!(merge.outcome, Outcome::Refused(Reason::StateChanged));
+            assert_eq!(merge.fields, [WORKFLOW]);
+        }
+    }
+
+    #[test]
+    fn a_stale_status_after_a_change_of_state_refuses() {
+        let merge = merge_histories(&[CREATED], &[CREATED, PUBLISH], &[CREATED, COMMENT]);
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::StateChanged));
+        // A change of state and a change back refuse too.
+        let merge = merge_histories(
+            &[CREATED],
+            &[CREATED, PUBLISH, RETRACT],
+            &[CREATED, COMMENT],
+        );
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::StateChanged));
+    }
+
+    #[test]
+    fn statuses_that_keep_the_state_merge() {
+        // A comment, then a change of state.
+        let merge = merge_histories(&[CREATED], &[CREATED, COMMENT], &[CREATED, PUBLISH]);
+        let Outcome::Merged(record) = merge.outcome else {
+            panic!("{:?}", merge.outcome);
+        };
+        assert_eq!(actions(&record), ["create", "comment", "publish"]);
+        // Two comments.
+        let merge = merge_histories(&[CREATED], &[CREATED, COMMENT], &[CREATED, COMMENT_AGAIN]);
+        let Outcome::Merged(record) = merge.outcome else {
+            panic!("{:?}", merge.outcome);
+        };
+        assert_eq!(actions(&record), ["create", "comment", "comment"]);
+    }
+
+    #[test]
+    fn a_state_that_does_not_read_gives_no_answer() {
+        let no_state = Outcome::Undecided("a status without the state key");
+        // The last status of the old value has no state.
+        let merge = merge_histories(&[NO_STATE], &[NO_STATE, COMMENT], &[NO_STATE, PUBLISH]);
+        assert_eq!(merge.outcome, no_state);
+        // A status of the committed side has no state.
+        let merge = merge_histories(&[CREATED], &[CREATED, NO_STATE], &[CREATED, PUBLISH]);
+        assert_eq!(merge.outcome, no_state);
+        assert_eq!(merge.fields, [WORKFLOW]);
+        // The first status of the committed side decides.
+        let merge = merge_histories(
+            &[CREATED],
+            &[CREATED, PUBLISH, NO_STATE],
+            &[CREATED, COMMENT],
+        );
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::StateChanged));
+        // A status of the new side without the state does not stop it.
+        let merge = merge_histories(&[CREATED], &[CREATED, COMMENT], &[CREATED, NO_STATE]);
+        assert!(matches!(merge.outcome, Outcome::Merged(_)));
+        // An old value without a status.
+        let merge = merge_histories(&[], &[COMMENT], &[PUBLISH]);
+        assert_eq!(
+            merge.outcome,
+            Outcome::Undecided("an old value without a status")
+        );
+    }
+
+    #[test]
+    fn a_status_that_is_not_a_dict_gives_no_answer() {
+        let mut heap = Heap::with_instances();
+        let mut canon = Canon::new(1000);
+        let dict = {
+            let key = heap.new_str("review_state");
+            let state = heap.new_str("private");
+            heap.new_dict(vec![(key, state)])
+        };
+        let text = heap.new_str("private");
+        let found = keeps_state(&heap, &mut canon, "review_state", &[dict], &[text]);
+        assert_eq!(
+            found,
+            Err(Outcome::Undecided("a status without the state key"))
+        );
+        let found = keeps_state(&heap, &mut canon, "review_state", &[text], &[dict]);
+        assert_eq!(
+            found,
+            Err(Outcome::Undecided("a status without the state key"))
+        );
+    }
+
+    #[test]
+    fn the_checks_of_append_come_first() {
+        // The committed side is not an append to the old value.
+        let merge = merge_histories(&[CREATED], &[NO_STATE], &[CREATED, PUBLISH]);
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::NotAppend));
+    }
+
+    #[test]
+    fn append_without_the_option_merges_two_changes_of_state() {
+        let (old, committed, new) = (
+            history(&[CREATED]),
+            history(&[CREATED, PUBLISH]),
+            history(&[CREATED, SUBMIT]),
+        );
+        let merge = tier2(&old, &committed, &new, "m.History", &entry(false));
+        let Outcome::Merged(record) = merge.outcome else {
+            panic!("{:?}", merge.outcome);
+        };
+        assert_eq!(actions(&record), ["create", "publish", "submit"]);
+    }
+
+    #[test]
+    fn an_undo_merges_as_a_vote() {
+        // The undo of a publish after a later comment: the base is the
+        // record after the publish, the committed side the current record,
+        // the new side the record before the publish.
+        let merge = merge_histories(
+            &[CREATED, PUBLISH],
+            &[CREATED, PUBLISH, COMMENT],
+            &[CREATED],
+        );
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::NotAppend));
+        // Without a later change, the undo takes the record before the
+        // publish, and no strategy runs.
+        let merge = merge_histories(&[CREATED, PUBLISH], &[CREATED, PUBLISH], &[CREATED]);
+        let Outcome::Merged(record) = merge.outcome else {
+            panic!("{:?}", merge.outcome);
+        };
+        assert_eq!(actions(&record), ["create"]);
+    }
 
     /// Returns a dict of one key, `key-a`, whose value is a list of `value`.
     fn dict(heap: &mut Heap, value: i128) -> Value {

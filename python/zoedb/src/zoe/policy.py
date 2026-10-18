@@ -30,7 +30,19 @@ The entry of a class has these keys, each optional:
 - ``coupled``: a list of groups of fields, each a list of field names;
 - ``blocked``: True for a class that never merges in tier 2, whatever its
   other keys say; `zoe.plone` blocks a class whose invariant it cannot
-  read.
+  read;
+- ``options``: a dict of strategy names to their options. Only ``append``
+  takes options, and its only option is ``state`` (see below).
+
+The option ``state`` of ``append`` names a key of the items of the field,
+such as ``review_state`` in the statuses of a workflow history. When both
+sides appended items, the merge goes ahead only if each item that the
+committed side appended holds the state of the last item of the old value
+under that key; else it refuses. An item without the key, or an old value
+without items, gives no answer (ADR 0046, section 12)::
+
+    {"tier2": "on", "default": "append",
+     "options": {"append": {"state": "review_state"}}}
 
 The strategy ``keys`` merges a field whose value is a dict key by key: a
 key that one side changed, added or deleted takes that change, and two
@@ -67,7 +79,9 @@ STRATEGIES = ("strict", "lww", "max", "sum", "union", "append", "keys")
 #: The keys of a policy that `install` takes, besides ``classes``.
 SWITCHES = ("structural_merges", "posting_dicts", "split_merges")
 #: The keys of the entry of a class.
-ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled", "blocked")
+ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled", "blocked", "options")
+#: The options that each strategy takes.
+OPTIONS = {"append": ("state",)}
 
 
 class MergePolicy(persistent.Persistent):
@@ -104,6 +118,34 @@ def _mode(value, where):
 
 def _strategy(value, where):
     return _canonical(value, STRATEGIES, where, f"one of {', '.join(STRATEGIES)}")
+
+
+def _options(options, where):
+    """Return a copy of the options of an entry, with plain values only."""
+    if type(options) is not dict:
+        raise ValueError(f"{where}: options is a dict of strategies to options")
+    checked = {}
+    for strategy, given in options.items():
+        if strategy not in OPTIONS:
+            raise ValueError(f"{where}: the strategy {strategy!r} takes no options")
+        if type(given) is not dict:
+            raise ValueError(f"{where}: the options of {strategy} are a dict")
+        names = OPTIONS[strategy]
+        unknown = set(given) - set(names)
+        if unknown:
+            raise ValueError(
+                f"{where}: {strategy} has no option {sorted(map(str, unknown))[0]!r}"
+            )
+        values = {}
+        for name in names:
+            if given.get(name) is not None:
+                value = _text(given[name], f"{where}: {strategy} {name}")
+                if not value:
+                    raise ValueError(f"{where}: {strategy} {name} is an empty str")
+                values[name] = value
+        if values:
+            checked[_strategy(strategy, f"{where}: options")] = values
+    return checked
 
 
 def validate(policy):
@@ -173,6 +215,10 @@ def validate(policy):
                 )
             if groups:
                 checked["coupled"] = groups
+        if entry.get("options") is not None:
+            options = _options(entry["options"], f"{name}: options")
+            if options:
+                checked["options"] = options
         result["classes"][name] = checked
     return result
 
