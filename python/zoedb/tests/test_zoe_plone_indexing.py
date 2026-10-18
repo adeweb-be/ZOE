@@ -130,14 +130,61 @@ def test_the_summary_of_the_delays():
     }
 
 
-def test_the_cookie_holds_the_oid_the_key_and_the_path():
+def test_the_cookie_holds_the_oid_the_key_the_database_and_the_path():
     oid = b"\x00" * 7 + b"\x09"
     key = make_key(1, b"\x01" * 8, 3)
-    value = f"{oid.hex()}-{key.hex()}-/plone/a%20b"
-    assert indexing._parse_cookie(value) == (oid, key, "/plone/a b")
-    assert indexing._parse_cookie(f"{oid.hex()}-{key.hex()}-") == (oid, key, "/")
-    for bad in ("", "x", f"{oid.hex()}-00-/", f"zz-{key.hex()}-/", None):
+    name = b"second-db".hex()
+    value = f"{oid.hex()}-{key.hex()}-{name}-/plone/a%20b-c"
+    assert indexing._parse_cookie(value) == (oid, key, "second-db", "/plone/a b-c")
+    assert indexing._parse_cookie(f"{oid.hex()}-{key.hex()}-{name}-") == (
+        oid,
+        key,
+        "second-db",
+        "/",
+    )
+    for bad in (
+        "",
+        "x",
+        f"{oid.hex()}-00-{name}-/",
+        f"zz-{key.hex()}-{name}-/",
+        f"{oid.hex()}-{key.hex()}--/",
+        f"{oid.hex()}-{key.hex()}-/plone",
+        None,
+    ):
         assert indexing._parse_cookie(bad) is None
+
+
+class Request(dict):
+    """A request with the `get` of a mapping."""
+
+
+def test_a_cookie_that_does_not_parse_expires_with_its_path():
+    assert indexing._cookie_path("x-y-/plone", Request()) == "/plone"
+    request = Request(PATH_INFO="/plone/folder/doc")
+    assert indexing._cookie_path("garbage", request) == "/plone"
+    assert indexing._cookie_path(None, Request()) == "/"
+
+
+@pytest.mark.parametrize(
+    "value, error",
+    [
+        (b"not json", "not JSON"),
+        (b"[]", "not a JSON object"),
+        (b'{"op": "drop", "path": "/p", "idxs": [], "metadata": true}', "operation"),
+        (b'{"op": "reindex", "path": "p", "idxs": [], "metadata": true}', "path"),
+        (b'{"op": "reindex", "path": "/p", "idxs": [1], "metadata": true}', "indexes"),
+        (b'{"op": "reindex", "path": "/p", "idxs": [], "metadata": 1}', "metadata"),
+        (b"\xff", "not JSON"),
+    ],
+)
+def test_parse_refuses_a_value_that_is_not_an_operation(value, error):
+    with pytest.raises(ValueError, match=error):
+        indexing.parse(value)
+
+
+def test_parse_takes_an_operation():
+    value = encode("unindex", "/plone/doc", (), True)
+    assert indexing.parse(value)["op"] == "unindex"
 
 
 def test_installed_is_false_without_install():
