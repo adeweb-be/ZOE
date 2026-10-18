@@ -1,6 +1,6 @@
 # 0046. The merge policy: a persistent object under the root, read at the vote, and the field merges of tier 2
 
-Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human". During the build the human approved two changes, which the text below holds: the digest of a merge of shadow mode is BLAKE3, the hash that the core already links, in place of sha256; and the strs and bytes that CPython shares in every record (the empty ones, those of one character below U+0100, and the interned keys of dict states) do not count as an object that two fields share. The second checkpoint of the card, the classes of `zoe.plone` (section 9), is approved too. The review of the build then asked for changes; the human was away and asked Claude to decide them, and section 10 holds those decisions, which are Claude's. Section 11, the strategy `keys`, is a later change with its own status.
+Status: accepted. The first checkpoint of ZOE-205. The human asked Claude to settle the questions that had no proposal and to mark each answer as its own choice, then approved the ADR as written, with the answers of "Questions for the human". During the build the human approved two changes, which the text below holds: the digest of a merge of shadow mode is BLAKE3, the hash that the core already links, in place of sha256; and the strs and bytes that CPython shares in every record (the empty ones, those of one character below U+0100, and the interned keys of dict states) do not count as an object that two fields share. The second checkpoint of the card, the classes of `zoe.plone` (section 9), is approved too. The review of the build then asked for changes; the human was away and asked Claude to decide them, and section 10 holds those decisions, which are Claude's. Sections 11 (the strategy `keys`) and 12 (the option `state` of `append`) are later changes, each with its own status.
 
 ## Context
 
@@ -166,6 +166,67 @@ ZODB gives `PersistentMapping` no `_p_resolveConflict`, so ZODB refuses each con
 10. **Undo.** An undo merges through tier 2 (section 4): the base is the record of the undone transaction, the committed side is the current record, and the new side is the record before the undone transaction. `keys` merges an undo as it merges a vote, so it acts as `strict` for each key. A key that only the undone transaction changed gets its value from before that transaction back. A key that only a later transaction changed keeps the later change. A key that the undone transaction and a later transaction both changed refuses with `UndoError`, unless the later change gave it its value from before the undone transaction again. A key that the undone transaction added and a later transaction changed refuses too. `keys` has no part that takes the value of one side, as `lww` does, so the undo uses it as it is.
 11. **The code.** `merge::policy::Strategy::Keys` reads `"keys"`, and `zoe.policy.STRATEGIES` holds it, so `zoe.policy.validate` takes it in `fields` and as `default`. The merge is in `merge::fields`, with the same `Canon` and the same step budget as the other strategies, and no recursion. `zoe_pickle::python` keeps the tuple keys of a dict in a heap of `Heap::with_instances` only.
 
+### 12. The option `state` of `append`: a history that refuses two changes of state from one state (ZOE-214)
+
+Status of this section: accepted. The rule and the option are a decision of the human, recorded on the card (#436). The human then approved this text with the recommendation of each of points 14 to 21 of "Questions for the human", which are Claude's choices.
+
+DCWorkflow keeps the history of an object in `workflow_history`: a mapping of workflow id to the tuple of its statuses. A status is a dict. It holds the state of the object after the transition, under the state variable of the workflow (`review_state` in every workflow of Plone). The last status of a workflow gives the state of the object in that workflow. DCWorkflow treats two transitions that change the state from one state as exclusive: the second one starts from a state that is no longer the state of the object.
+
+With the entry of section 9, `append` merges two transitions of one object from one snapshot. So two changes of state from one state can both commit, when the permission fields of the object and the `review_state` index of the catalog do not conflict (a site with another index, or a class that a site switches on). The history then holds both statuses, and the last voter gives the state. A worse case: a comment from the old snapshot that commits after a change of state lands after it. The comment holds the old state, so the object goes back to the old state, and the change of state is lost. The acceptance test of the card shows both.
+
+1. **The rule.** A field of strategy `append` whose entry gives the option `state` (point 3) merges as `append` does, with one more check. When both sides appended statuses to the field, the merge goes ahead only if every status that the committed side appended keeps the state of the old value. The state of the old value is the value under the key `state` of its last status. A status keeps that state when its value under the key has the same structure (its canonical id, section 10). Else the merge refuses: the vote fails with `ConflictError` at once, as for the other strategies. Zope retries the request, and the retry runs the transition again from the state that committed. There DCWorkflow runs it, or refuses it when the new state does not allow it.
+
+   The check reads only the old value and the committed side. The statuses of the new side can change the state: their last status gives the state of the result.
+
+2. **The cases.** The old history ends in `private`.
+
+   | Committed side | New side | Result |
+   | --- | --- | --- |
+   | `publish` (`published`) | `submit` (`pending`) | refuses: the committed status changes the state |
+   | `publish` (`published`) | `publish` (`published`) | refuses: the same target does not help |
+   | `publish` (`published`) | a comment (`private`) | refuses: the stale status would land after the change of state |
+   | a comment (`private`) | `publish` (`published`) | merges: the comment, then `publish`; the state is `published` |
+   | a comment (`private`) | a comment (`private`) | merges: both comments; the state stays `private` |
+   | `publish`, then `retract` (`private`) | a comment (`private`) | refuses: a committed status changes the state, even if a later one changes it back |
+
+   The committed side can hold the statuses of several transactions since the snapshot of the new one. The rule reads each of them.
+
+3. **The option.** The class entry gets the key `options`: a dict of strategy name to the options of that strategy. Only `append` takes options, and its only option is `state`, the name of the state key, a non-empty `str`:
+
+   ```python
+   {"tier2": "on", "default": "append", "options": {"append": {"state": "review_state"}}}
+   ```
+
+   The option applies to each field of the entry whose strategy is `append`, in `fields` or as `default`. The fields of a history are its workflow ids, which the policy cannot name before a site has them. So the option goes with the strategy of the entry, not with a field. A field of strategy `append` in an entry without the option merges as section 4 says.
+
+   `zoe.plone.history.ENTRY` becomes the entry above, so `zoe.plone.history.policy()` sets `state` to `review_state`. `zoe.policy.validate` takes `options`: a strategy other than `append`, an option other than `state`, or a `state` that is not a non-empty `str` is an error. The core reads the option into `merge::policy::ClassPolicy`, and a key of `options` that it does not know makes the policy unreadable, as an unknown key of an entry does today (section 2).
+
+4. **An option of `append`, not a named strategy.** The human chose a policy option. The code allows it: the strategy stays a name, the entry carries the option, and `append` reads it. The core learns the name of a key, not the shape of a DCWorkflow history. A named strategy would need the same name of the key, so it would be a second name for `append` with an option.
+
+5. **No answer.** The merge cannot read the state, and gives no answer, when:
+   - the last status of the old value, or a status that the committed side appended, is not a dict, or has no key `state`;
+   - the old value has no status (an empty tuple): the state of the object is then the initial state of the workflow, which the store does not know.
+
+   The conflict then goes to tier 3. `WorkflowHistory` has no `_p_resolveConflict`, so the client raises `ConflictError`. The checks run in this order: the checks of `append` (the kinds and the prefix, which refuse), then the last status of the old value, then the statuses of the committed side in their order, where the first status without the key gives no answer and the first status of another state refuses. A field that the old state does not hold (both sides added the first status of a workflow) refuses as `append` does today, before the option is read.
+
+6. **No update is lost.** Let the old value be H, with the state s. The committed value is H then c1 … ck, and the new value is H then n1 … nm, with k and m at least 1. The merge gives H, c1 … ck, n1 … nm. When every ci keeps s, the object is in state s after the committed transaction, the state that the new transaction read. So the new transaction, run after the committed one, starts from the same state and appends the same statuses: the serial order gives the merged value. Its last status is nm, so the state is the state that the new transaction set, as in the serial order. When a ci changes the state, the new transaction started from a state that is no longer the state of the object, and no merge can give the serial order: the rule refuses. The rule speaks for the history alone. The other effects of a transition (the permission fields of the object, its entry in the catalog) are in other fields and oids, and merge or conflict by their own rules.
+
+7. **A chain of two workflows.** Each workflow id is a field of `WorkflowHistory`, so each workflow merges alone. Two changes of state of one workflow from one snapshot refuse. A transition of one workflow and a transition of another workflow from one snapshot both commit, as today. A transaction that appends to two workflows is checked field by field, and one refusal refuses the record. A guard of one workflow that reads the state of another is outside what the merge sees.
+
+8. **Undo (ZOE-206).** `append` with `state` merges an undo as it merges a vote, as section 4 says for `append`. In an undo of a transaction T, the base is the record after T, the committed side is the current record, and the new side is the record before T. When T appended a status and a later transaction appended to the same workflow, the base is not a prefix of the new side: the undo refuses with `UndoError` before the option is read, as today. When no later transaction changed that workflow, only the new side changed the field: the undo takes the history before T, and no strategy runs.
+
+9. **A site on ZEO.** Nothing changes. A ZEO server runs no tier 2, and `WorkflowHistory` has no `_p_resolveConflict`, so two transitions of one object from one snapshot conflict there, as with the stock history. The policy object is data that the ZEO server does not read. A stock `ZEO.ClientStorage` on `zoe serve` gets the merge of the server core, as in-process.
+
+10. **The resolution log.** A refusal writes a line of tier 2 with the outcome `refused`, the reason `State changed by a status of the committed side` (the new `Reason::StateChanged`), and the workflow id in `fields`. `keys` lists the workflow ids that the new record changed, as for every line of tier 2. A line of an undo says `"undo":true`. A case of point 5 writes the outcome `undecided`, with the reason `a status without the state key` or `an old value without a status`, and the workflow id in `fields`. `zoe_structural_merges_total` counts the line with the label `tier` 2, as each result of tier 2. In shadow mode the line is written and the conflict goes on, as section 6 says.
+
+11. **A site that has the old entry.** A database whose policy holds the entry of section 9 without `options` merges as before. The site gets the option at its next import of the profile `zoe.plone:default` (the step `zoe.plone.merge_policy`), or at the next change of a Dexterity type, which derives the policy again (section 10). The composition of section 10 gives `options` the new value, as for the other keys of an entry.
+
+12. **The tests that the build adds.**
+    - The acceptance test of the planner, `python/zoedb/tests/acceptance/test_workflow_states.py`, in-process and through `zoe serve` with `ZEO.ClientStorage` and with the native client: two changes of state from one state conflict (to another state and to the same state), the history holds the first status, and its record equals the record of that one transition on FileStorage; a comment then a change of state merge, with no call of `tryToResolveConflict`, and the record equals the two transitions one after the other on FileStorage; a comment from the old snapshot after a change of state loses no state; transitions one after the other commit.
+    - Rust unit tests in `crates/zoe-core/src/merge/`: `policy.rs` reads `options.append.state`, and refuses an unknown strategy or option and a `state` that is not a `str`; `fields.rs` checks each case of the table of point 2, each case of point 5, that the prefix check refuses first, that `append` without the option still merges two changes of state, and an undo of point 8 (the base after T, the record before T as the new side); `mod.rs` checks the reason and the `fields` of the line.
+    - Python unit tests: `zoe.policy.validate` of `options`, and the entry of `zoe.plone.history.policy()`.
+    - The acceptance tests of ZOE-205 (`test_append_fields.py`), whose statuses all keep the state `private`, stay green unchanged.
+
 ## Consequences
 
 - Section 5 of the specification changes: tier 2, the policy object and its reading, the precedence of the keys, the verifying shadow mode, the fields of the log; F5, F6 and F30 and the feature triage change to match.
@@ -173,12 +234,16 @@ ZODB gives `PersistentMapping` no `_p_resolveConflict`, so ZODB refuses each con
 - `zoe_pickle::python` models instances of other classes. Tier 1 refuses or gives no answer on them as today: the merges of BTrees do not change.
 - A wrong policy can merge two changes that the application meant to exclude each other. That is why a class is strict until its entry says otherwise, and why shadow mode comes first.
 - A change of the policy applies from the next conflict, without a restart.
-- `append` merges two transitions of one object from one snapshot. Two transitions that change the state from one state can then both commit, when the permission fields of the object and the `review_state` of the catalog do not conflict: the history holds both statuses, and the last one gives the state. A named merge that refuses two changes of state is a later card.
+- `append` merges two transitions of one object from one snapshot. Two transitions that change the state from one state can then both commit, when the permission fields of the object and the `review_state` of the catalog do not conflict: the history holds both statuses, and the last one gives the state. A named merge that refuses two changes of state is a later card. Section 12 refuses them with the option `state` of `append`.
 - `union` keeps no reorder of the items on one side: the order of the result is that of the old value, then of the committed one, then of the new one.
 - Shadow mode verifies a merge only when the client resolves the conflict with a `_p_resolveConflict`. A Dexterity class has none, so shadow mode of tier 2 on it logs its merges and checks none of them.
 - With `keys` (section 11), two transactions that change different keys of one mapping of a marked class both commit. A site that marks a mapping class says that its keys are independent: a wrong mark merges two changes that the application meant to exclude each other, as the locks of section 11, point 8, show.
 - An entry cannot couple two keys of one mapping. A mapping whose keys depend on each other stays strict.
 - The model of tier 2 loads the tuple keys of a dict, so a record with such a dict can merge its other fields in tier 2, where it gave no answer before.
+- With the option `state` (section 12), two transitions of one workflow from one snapshot both commit only when the committed one keeps the state. Two changes of state, or a change of state and a later status of the stale state, conflict, and Zope retries. Comments still merge, and a comment then a change of state still merge.
+- The rule errs toward a conflict: a committed side that changes the state and changes it back refuses, though the state at its end is the old one.
+- The public module `zoe.policy` takes the key `options` in a class entry. A core of an older build reads a policy with `options` as no policy: tier 2 is off on every class, and the store writes a warning. A site updates its servers before it writes the new policy.
+- Section 5 of the specification, F30 and the paragraph on the classes of `zoe.plone` change to name the option.
 
 ## Alternatives
 
@@ -191,6 +256,13 @@ ZODB gives `PersistentMapping` no `_p_resolveConflict`, so ZODB refuses each con
 - **A refusal in `zoe.policy.validate` of `keys` on the stock mapping classes.** It would also stop a site that knows its stock mappings, and a measure on a log of stock mappings. Section 11 warns instead.
 - **A named native merge per class** (the specification's "or a named native merge such as an append-only `workflow_history`"). The five strategies cover the classes of step 4 when `workflow_history`, comments and audit entries move to classes of their own; a named merge comes when a class needs one.
 - **Verify in the client.** The client would need to know the merge of the server: a change of the protocol. The server already sees both records.
+- **The rule of the card** (section 12): refuse when both sides appended a status whose state differs from the state of the old value. A comment from the old snapshot holds the old state, so it passes after a change of state, lands last, and puts the object back in the old state. The change of state is lost.
+- **Rewrite the stale status** (section 12): give a status of the new side the state that committed. The human rejected it. The history would hold a status that no transaction wrote, and the other effects of the stale transition, which DCWorkflow computed from the old state, would not match it.
+- **Read only the last status of the committed side** (section 12). It would merge a change of state and a change back. The rule of the human reads every committed status: it is simpler, and it errs toward a conflict.
+- **A named strategy for the history** (section 12). It would need the name of the state key too, so it would be `append` with an option under a second name. The human chose an option.
+- **A flat key `state` in the entry** (section 12). It is one level less deep, but it does not say which strategy reads it.
+- **A strategy as a dict**, such as `"default": {"strategy": "append", "state": "review_state"}` (section 12). It changes the type of every strategy value that `zoe.policy.validate`, the composition of `zoe.plone.merges` and the core read. `options` is one new key.
+- **Read the state variable from the workflow** (section 12). The workflows are in `portal_workflow`, other objects, and the core runs no Python.
 
 ## Questions for the human
 
@@ -212,3 +284,14 @@ The choices of section 11, each Claude's, for the review of the human:
 11. The line of the resolution log lists the changed keys of the dict in place of the field, written as tier 1 writes a key, in the order of the model: yes.
 12. No refusal in `zoe.policy.validate` of an entry for a stock mapping class; the ADR and the documentation of `zoe.policy` warn: yes.
 13. In an undo, `keys` merges as in a vote, which is `strict` for each key: yes.
+
+The choices of section 12, each Claude's, for the review of the human. The rule, the option `state` and its value `review_state` in `zoe.plone` are decisions of the human.
+
+14. The option is the key `options` of the class entry, `{"append": {"state": "review_state"}}`, and applies to each field of the entry whose strategy is `append`; not a flat key `state`, and not a strategy as a dict. Recommendation: yes.
+15. The strategy keeps the name `append`, with the option; no named strategy. Recommendation: yes.
+16. An old value without a status (an empty tuple) gives no answer, as a status without the key does. The other choice is a refusal: for `WorkflowHistory`, which has no `_p_resolveConflict`, both end in `ConflictError`, but a refusal ends at the vote and names the field. Recommendation: no answer, because the store cannot tell the state.
+17. The rule reads the last status of the old value and the statuses of the committed side only. A status of the new side without the key does not stop the merge. Recommendation: yes.
+18. A committed side that changes the state and changes it back refuses (the last row of the table of point 2). Recommendation: yes, the rule as the human stated it.
+19. The scope fence. `zoe.policy.validate` must take `options`, or `zoe.policy.install` refuses the entry of `zoe.plone`; `python/zoedb/src/zoe/policy.py` is outside the fence of the card, and the change adds a key to the public module `zoe.policy`. The fuzz target `crates/zoe-server/fuzz/fuzz_targets/fields.rs` builds a `ClassPolicy` by its fields, so the new field of the option needs one line there, outside the fence too. Recommendation: widen the fence to these two files; the fuzz target does not pick the option yet.
+20. A site that has the old entry gets the option at its next import of `zoe.plone:default`; the profile gets no upgrade step, as it has one version (section 10). Recommendation: yes.
+21. A core of an older build reads a policy with `options` as no policy, with a warning, as for any unknown key; it does not skip the key. Recommendation: yes: a server that cannot read an option must not merge without it.

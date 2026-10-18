@@ -10,10 +10,15 @@ the one field `data`, and conflict.
 
 `WorkflowHistory` is the same mapping, but its state is the mapping
 itself, so each workflow is a field of its own. Its entry in the merge
-policy, `ENTRY`, gives every field the strategy `append`: two transitions
-from one snapshot both add their status, the committed one first, and the
-store merges them at the vote (tier 2). The record equals the record of the
-same transitions one after the other.
+policy, `ENTRY`, gives every field the strategy `append` with the option
+`state` set to `review_state`, the state variable of the workflows of
+Plone (ADR 0046, section 12). Two transitions from one snapshot both add
+their status, the committed one first, and the store merges them at the
+vote (tier 2), when each status of the committed one keeps the state of
+the old history: a comment, then a change of state, merge. Two changes of
+state from one state, or a status of the old state after a change of
+state, conflict. The record equals the record of the same transitions one
+after the other.
 
 The opt-in behaviour `zoe.plone.history` (`IAppendOnlyHistory`) gives an
 object of a type with the behaviour a `WorkflowHistory` at its next status:
@@ -29,6 +34,7 @@ Only `move_histories`, `restore_histories` and the import steps import
 Plone.
 """
 
+import copy
 import sys
 from collections.abc import MutableMapping
 
@@ -53,7 +59,11 @@ __all__ = [
 ]
 
 #: The entry of `WorkflowHistory` in the merge policy.
-ENTRY = {"tier2": "on", "default": "append"}
+ENTRY = {
+    "tier2": "on",
+    "default": "append",
+    "options": {"append": {"state": "review_state"}},
+}
 
 #: The number of objects that an import step changes in one transaction.
 BATCH = 100
@@ -118,7 +128,7 @@ class WorkflowHistory(Persistent, MutableMapping):
 def policy():
     """Return the merge policy of `WorkflowHistory` alone, for
     `zoe.policy.install`."""
-    return {"classes": {f"{__name__}.WorkflowHistory": dict(ENTRY)}}
+    return {"classes": {f"{__name__}.WorkflowHistory": copy.deepcopy(ENTRY)}}
 
 
 def _base(obj):
