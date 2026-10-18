@@ -95,3 +95,5 @@ The human decides between:
 3. **Defer**: F31 keeps its text of today ("no session data manager yet"); the card goes back to the backlog with this finding, and the acceptance test stays on the branch `plan/ZOE-211` until a site names a need.
 
 Recommendation: 3, defer. No code of the target writes a session, and the one maintained add-on that can use one has a cookie mode by default. The acceptance test and this finding stay ready for the day that a site needs shared sessions.
+
+Decision: the human deferred the session backend to the card ZOE-232 (#477), which keeps this finding and the acceptance test on the branch `plan/ZOE-211`.
