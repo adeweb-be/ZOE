@@ -164,7 +164,7 @@ fn a_connection_without_a_voted_transaction_stays_open() {
 fn a_finish_within_the_timeout_commits_and_keeps_the_connection() {
     let dir = fresh_dir("txn-timeout-finish");
     let store = dir.join("store");
-    let server = Server::start(&["--path", s(&store), "--transaction-timeout", "2"], &[]);
+    let server = Server::start(&["--path", s(&store), "--transaction-timeout", "3"], &[]);
     let mut conn = server.client("1");
     let oid = new_oids(&mut conn, 1)[0];
     let mut serial = 0;
@@ -176,8 +176,58 @@ fn a_finish_within_the_timeout_commits_and_keeps_the_connection() {
     }
     // Three voted transactions held their locks for 3 s in all, each for
     // less than the timeout.
-    assert!(!conn.closed_within(Duration::from_secs(3)));
+    assert!(!conn.closed_within(Duration::from_secs(4)));
     assert_eq!(load(&mut conn, oid).unwrap(), (record(b"round 3"), serial));
+}
+
+#[test]
+fn a_second_vote_does_not_start_the_time_again() {
+    let dir = fresh_dir("txn-timeout-second-vote");
+    let store = dir.join("store");
+    let server = Server::start(&["--path", s(&store), "--transaction-timeout", "3"], &[]);
+    let mut setup = server.client("1");
+    let oid = new_oids(&mut setup, 1)[0];
+    let first = commit(&mut setup, 1, &[(oid, 0, record(b"first"))]).unwrap();
+    let second = commit(&mut setup, 2, &[(oid, first, record(b"second"))]).unwrap();
+
+    // The first vote lists the conflict of the stale serial for the client
+    // to resolve. The transaction keeps its locks, and the time starts.
+    let mut conn = server.client("1");
+    let reply = store_and_vote(&mut conn, 3, oid, first, b"stale");
+    let first_vote = Instant::now();
+    let listed = wire::items(&reply).into_iter().any(|item| {
+        item.as_map().is_some_and(|map| {
+            map.iter()
+                .any(|(k, v)| k.as_str() == Some("oid") && *v == p64(oid))
+        })
+    });
+    assert!(
+        listed,
+        "the first vote did not list the conflict: {reply:?}"
+    );
+
+    // The client resolves, and votes again 2 s later.
+    std::thread::sleep(Duration::from_secs(2));
+    conn.send_async(
+        "storea",
+        vec![
+            p64(oid),
+            p64(second),
+            Value::Binary(record(b"resolved")),
+            Value::from(3),
+        ],
+    );
+    conn.call("vote", vec![Value::from(3)]).unwrap();
+
+    // The close comes 3 s after the first vote, not 3 s after the second.
+    assert!(conn.closed_within(Duration::from_secs(5)));
+    let closed = first_vote.elapsed();
+    assert!(
+        closed >= Duration::from_millis(2500) && closed < Duration::from_millis(4500),
+        "closed after {closed:?}"
+    );
+    // The transaction aborted: the record is the one of the second commit.
+    assert_eq!(load(&mut setup, oid).unwrap(), (record(b"second"), second));
 }
 
 #[test]

@@ -396,6 +396,10 @@ def test_the_transaction_timeout_closes_a_voted_transaction_in_the_log_file(
             assert time.monotonic() < deadline, "the connection did not close"
             time.sleep(0.1)
         storage.tpc_abort(txn)
+        # The client connects again without a voted transaction: the server
+        # does not close it again.
+        time.sleep(2)
+        assert log.read_text().count("transaction timeout after the vote") == 1
     finally:
         storage.close()
     stop()
