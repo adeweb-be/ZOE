@@ -16,6 +16,7 @@ The kernel kills the server with the parent-death signal of Linux
 platforms have neither, so the tests skip there.
 """
 
+import contextlib
 import os
 import pathlib
 import signal
@@ -91,12 +92,17 @@ def children(pid):
 
 
 def alive(pid):
-    """Tell if the process `pid` runs. A zombie does not run."""
+    """Tell if the process `pid` runs.
+
+    A process that ended does not run. Until its parent reaps it, it is a
+    zombie (state Z). While the parent reaps it, its state is X. Then its
+    entry goes from `/proc`.
+    """
     try:
         stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
 
 
 def name_of(pid):
@@ -136,7 +142,9 @@ def assert_dies_with_its_parent(child, server):
         assert not alive(server), "zoe serve outlives the process that started it"
     finally:
         if alive(server):
-            os.kill(server, signal.SIGKILL)
+            # The server can end between the check and the kill.
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(server, signal.SIGKILL)
         if child.poll() is None:
             child.kill()
             child.wait()
