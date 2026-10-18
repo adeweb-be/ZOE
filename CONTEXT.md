@@ -200,6 +200,10 @@ _Avoid_: keepalive (that is TCP's, which the server does not set), ping
 The longest time that a connection may send no frame, `--idle-timeout`; at its end the server closes the connection, which aborts its open transaction and releases its locks.
 _Avoid_: lock timeout (that bounds a lock wait), keepalive
 
+**Transaction timeout**:
+The longest time that a transaction may stay open after a vote that passed, `--transaction-timeout`, as the `transaction-timeout` of ZEO; at its end the server closes the connection of the transaction, which aborts it and releases its locks. It closes no connection without a voted transaction.
+_Avoid_: idle timeout (that closes a silent connection), lock timeout
+
 ## Client
 
 **Runtime**:

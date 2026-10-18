@@ -244,6 +244,22 @@ pub(super) struct ServeArgs {
     )]
     idle_timeout: Duration,
 
+    /// The longest time that a transaction stays open after its vote, in
+    /// whole seconds, such as 30, 30s or 1m, as the key
+    /// transaction-timeout of ZEO. The transaction holds its locks from
+    /// its vote until tpc_finish or tpc_abort. Past this time, the server
+    /// closes its connection: the transaction aborts and its locks go. A
+    /// connection without a voted transaction stays open. 0 closes no
+    /// connection for this reason.
+    #[arg(
+        long,
+        env = "ZOE_TRANSACTION_TIMEOUT",
+        value_name = "SECONDS",
+        default_value = "0",
+        value_parser = whole_seconds
+    )]
+    transaction_timeout: Duration,
+
     /// The number of threads that run the calls that read, such as
     /// loadBefore, for all the connections together. The default is the
     /// number of cores. A transaction, a download and a pack each run on a
@@ -700,6 +716,7 @@ pub(super) fn run(args: &ServeArgs, out: &mut dyn Write) -> Result<(), Failure> 
         .client_queue_size(usize::try_from(args.client_queue_size).unwrap_or(usize::MAX))
         .shutdown_timeout(args.shutdown_timeout)
         .idle_timeout(args.idle_timeout)
+        .transaction_timeout(args.transaction_timeout)
         .read_only(args.read_only)
         .pack_gc(args.pack_gc)
         .shared_blob_dir(args.shared_blob_dir)
@@ -941,6 +958,15 @@ mod tests {
         let args = serve(&["--idle-timeout", "0"]).unwrap();
         assert_eq!(args.idle_timeout, Duration::ZERO);
         let error = serve(&["--idle-timeout", "1.5"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_transaction_timeout_is_off_by_default_and_takes_whole_seconds() {
+        assert_eq!(serve(&[]).unwrap().transaction_timeout, Duration::ZERO);
+        let args = serve(&["--transaction-timeout", "1m"]).unwrap();
+        assert_eq!(args.transaction_timeout, Duration::from_secs(60));
+        let error = serve(&["--transaction-timeout", "1.5"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
