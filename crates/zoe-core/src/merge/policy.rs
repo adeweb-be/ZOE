@@ -8,7 +8,8 @@
 //!  "split_merges": "on",
 //!  "classes": {"module.Class": {"tier1": "shadow", "tier2": "on",
 //!              "default": "strict", "fields": {"field": "max", "data": "keys"},
-//!              "coupled": [["start", "end"]]}}}
+//!              "coupled": [["start", "end"]],
+//!              "options": {"append": {"state": "review_state"}}}}}
 //! ```
 //!
 //! [`Rules`] gives the settings of a vote: a switch of the policy wins
@@ -99,6 +100,10 @@ pub struct ClassPolicy {
     /// True for a class that never merges in tier 2, whatever `tier2`
     /// says: `zoe.plone` blocks a class whose invariant it cannot read.
     pub blocked: bool,
+    /// The option `state` of `append`: the key of the state in each item
+    /// of a field of strategy `append` (ADR 0046, section 12). `None` when
+    /// the entry does not give it.
+    pub append_state: Option<String>,
 }
 
 impl ClassPolicy {
@@ -393,6 +398,7 @@ fn class_policy(heap: &Heap, value: Value) -> std::result::Result<ClassPolicy, &
         fields: BTreeMap::new(),
         coupled: Vec::new(),
         blocked: false,
+        append_state: None,
     };
     let strategy = |value: Value| {
         heap.str(value)
@@ -429,6 +435,24 @@ fn class_policy(heap: &Heap, value: Value) -> std::result::Result<ClassPolicy, &
                     entry
                         .coupled
                         .push(fields.ok_or("a coupled group that is not a list of fields")?);
+                }
+            }
+            "options" => {
+                for (name, options) in str_dict(heap, value).ok_or("options that are not a dict")? {
+                    if name != "append" {
+                        return Err("options of a strategy that takes none");
+                    }
+                    let options = str_dict(heap, options).ok_or("options that are not a dict")?;
+                    for (option, value) in options {
+                        if option != "state" {
+                            return Err("an option that append does not take");
+                        }
+                        let state = heap
+                            .str(value)
+                            .filter(|state| !state.is_empty())
+                            .ok_or("a state that is not a non-empty str")?;
+                        entry.append_state = Some(state.to_owned());
+                    }
                 }
             }
             _ => return Err("a class entry with an unknown key"),
@@ -575,6 +599,101 @@ mod tests {
         assert_eq!(Policy::read(&record), Err("a policy without a version"));
     }
 
+    /// Returns the record of a policy with one class, `m.History`, whose
+    /// entry gives the strategy `append` and `options`, built by `make`.
+    fn with_options(make: impl FnOnce(&mut Heap) -> Value) -> Vec<u8> {
+        record(|heap| {
+            let options = make(heap);
+            let entry = {
+                let items = vec![
+                    (text(heap, "tier2"), text(heap, "on")),
+                    (text(heap, "default"), text(heap, "append")),
+                    (text(heap, "options"), options),
+                ];
+                heap.new_dict(items)
+            };
+            let classes = {
+                let name = text(heap, "m.History");
+                heap.new_dict(vec![(name, entry)])
+            };
+            let items = vec![
+                (text(heap, "version"), Value::Int(1)),
+                (text(heap, "classes"), classes),
+            ];
+            heap.new_dict(items)
+        })
+    }
+
+    /// Returns `{strategy: {option: value}}`.
+    fn options(heap: &mut Heap, strategy: &str, option: &str, value: Value) -> Value {
+        let inner = {
+            let option = text(heap, option);
+            heap.new_dict(vec![(option, value)])
+        };
+        let strategy = text(heap, strategy);
+        heap.new_dict(vec![(strategy, inner)])
+    }
+
+    #[test]
+    fn an_entry_reads_the_option_state_of_append() {
+        let read = with_options(|heap| {
+            let state = text(heap, "review_state");
+            options(heap, "append", "state", state)
+        });
+        let policy = Policy::read(&read).unwrap();
+        let entry = &policy.classes["m.History"];
+        assert_eq!(
+            entry.strategy("simple_publication_workflow"),
+            Strategy::Append
+        );
+        assert_eq!(entry.append_state.as_deref(), Some("review_state"));
+        // An entry without options has no state.
+        let plain = record(|heap| {
+            let entry = {
+                let items = vec![(text(heap, "default"), text(heap, "append"))];
+                heap.new_dict(items)
+            };
+            let classes = {
+                let name = text(heap, "m.History");
+                heap.new_dict(vec![(name, entry)])
+            };
+            let items = vec![
+                (text(heap, "version"), Value::Int(1)),
+                (text(heap, "classes"), classes),
+            ];
+            heap.new_dict(items)
+        });
+        let policy = Policy::read(&plain).unwrap();
+        assert_eq!(policy.classes["m.History"].append_state, None);
+    }
+
+    #[test]
+    fn options_that_break_their_rules_do_not_read() {
+        // Each case: the reason, and the options that it reads.
+        type Case = (&'static str, fn(&mut Heap) -> Value);
+        let cases: [Case; 5] = [
+            ("options of a strategy that takes none", |heap| {
+                let state = text(heap, "review_state");
+                options(heap, "union", "state", state)
+            }),
+            ("an option that append does not take", |heap| {
+                let state = text(heap, "review_state");
+                options(heap, "append", "colour", state)
+            }),
+            ("a state that is not a non-empty str", |heap| {
+                options(heap, "append", "state", Value::Int(1))
+            }),
+            ("a state that is not a non-empty str", |heap| {
+                let state = text(heap, "");
+                options(heap, "append", "state", state)
+            }),
+            ("options that are not a dict", |heap| text(heap, "append")),
+        ];
+        for (why, make) in cases {
+            assert_eq!(Policy::read(&with_options(make)), Err(why));
+        }
+    }
+
     #[test]
     fn the_mode_of_a_class_follows_the_order_of_precedence() {
         let mut config = StructuralMerges::default();
@@ -605,6 +724,7 @@ mod tests {
                 fields: BTreeMap::new(),
                 coupled: Vec::new(),
                 blocked: false,
+                append_state: None,
             },
         );
         assert_eq!(rules(&config, &policy), Mode::On);

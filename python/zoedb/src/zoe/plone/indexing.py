@@ -94,6 +94,9 @@ THREAD_BATCHES = 50
 POLL = 0.2
 # The time between two searches of the sites of the thread, in seconds.
 SITES_EVERY = 60.0
+# The longest pause of the thread before it serves a site again after a
+# failure, in seconds. The pause doubles from `POLL` at each failure.
+BACKOFF = 30.0
 # The TTL of a lease, in seconds.
 LEASE_TTL = 30
 # The longest wait of a request for its own operations, in seconds.
@@ -489,7 +492,11 @@ class Indexer:
 
     def run(self):
         """Apply batches until the queue is empty. Return the number of
-        keys that the batches applied."""
+        keys that the batches handled: the keys that they applied, the
+        values that they moved to the failed namespace, and the keys of
+        each path that failed, or 1 for a failed path without keys. The run
+        of a thread also stops at a batch when the lease of the site holds
+        the token of another thread."""
         from Acquisition import aq_base
 
         tm = transaction.TransactionManager()
@@ -564,6 +571,11 @@ class Indexer:
         tm.begin()
 
     def _batch(self, app, site, jar, tm):
+        if self._lease is not None:
+            holder = zoe.kv.Namespace(jar, "ephemeral", LEASE).get(self._oid)
+            if holder is not None and holder != self._lease:
+                # Another thread took the lease. The run stops.
+                return 0
         pairs = self._scan(jar)
         if not pairs:
             return 0
@@ -981,9 +993,11 @@ def _cookie_path(value, request):
     the value when it has one, else the first segment of the path of the
     request, where a site at the top of the Zope root lives."""
     if isinstance(value, str):
-        last = value.rsplit("-", 1)[-1]
-        if last.startswith("/"):
-            return urllib.parse.unquote(last)
+        # The other fields are hex, so the first "-/" starts the path. The
+        # path itself can hold a dash.
+        start = value.find("-/")
+        if start >= 0:
+            return urllib.parse.unquote(value[start + 1 :])
     path = request.get("PATH_INFO", "") or ""
     first = path.strip("/").split("/", 1)[0]
     return f"/{first}" if first else "/"
@@ -1007,7 +1021,8 @@ def request_started(event):
         return
     oid, key, name, path = parsed
     if key_time(key) > time.time() + COOKIE_SKEW:
-        # A key from the future: no save of this process made it.
+        # The time of the key is too far in the future. The clock of the
+        # instance that set the cookie is wrong, or no save set it.
         request.response.expireCookie(COOKIE, path=path)
         return
     import Zope2
@@ -1089,10 +1104,11 @@ def _service_for(db):
 class _Service(threading.Thread):
     """The thread of a database: it runs the indexer of each site whose
     catalog is in the database, while it holds the lease of the site in
-    the database. It finds the site through the root database `root`. The
-    thread of the root database searches the sites: at the top of the Zope
-    root and at each mount point, and gives each site to the thread of the
-    database of its catalog."""
+    the database. It finds the site through the root database `root`.
+    Each thread searches the sites of its own database: the thread of the
+    root database at the top of the Zope root, the thread of a mounted
+    database at the mount points of that database. It gives each site to
+    the thread of the database of its catalog."""
 
     def __init__(self, db, root):
         super().__init__(name=f"zoe.plone.indexing {db.database_name}", daemon=True)
@@ -1102,6 +1118,9 @@ class _Service(threading.Thread):
         self._event = threading.Event()
         self._sites = set()
         self._held = set()
+        # The failures of each site: the count and the time of the next
+        # try, from `time.monotonic()`.
+        self._failures = {}
         self._stopping = False
         atexit.register(self.stop)
 
@@ -1143,25 +1162,37 @@ class _Service(threading.Thread):
             self._event.clear()
             if self._stopping:
                 break
-            if self._db is self._root and (
-                found is None or time.monotonic() - found > SITES_EVERY
-            ):
+            if found is None or time.monotonic() - found > SITES_EVERY:
                 found = time.monotonic()
                 try:
                     self._find_sites()
                 except Exception:
                     logger.exception("queued indexing: the search of the sites failed")
             for path in list(self._sites):
+                failed = self._failures.get(path)
+                if failed is not None and time.monotonic() < failed[1]:
+                    continue
                 try:
                     self._serve(path)
                 except Exception:
+                    count = failed[0] + 1 if failed is not None else 1
+                    pause = min(POLL * 2 ** min(count, 16), BACKOFF)
+                    self._failures[path] = (count, time.monotonic() + pause)
                     logger.exception(
-                        "queued indexing: the queue of %s failed", "/".join(path)
+                        "queued indexing: the queue of %s failed %d times;"
+                        " the next try is in %.1f s",
+                        "/".join(path),
+                        count,
+                        pause,
                     )
+                else:
+                    self._failures.pop(path, None)
 
     def _find_sites(self):
-        """Give each site at the top of the Zope root, and at or just below
-        each mount point, to the thread of the database of its catalog."""
+        """Search the sites of the database of the thread: at the top of
+        the Zope root for the root database, at or just below each mount
+        point of the database for a mounted database. Give each site to
+        the thread of the database of its catalog."""
         from Acquisition import aq_base
         from Products.CMFCore.interfaces import ISiteRoot
 
@@ -1169,8 +1200,12 @@ class _Service(threading.Thread):
         connection = self._root.open(transaction_manager=tm)
         try:
             app = connection.root()["Application"]
-            candidates = list(app.objectValues())
-            for path in _mount_paths():
+            candidates = []
+            if self._db is self._root:
+                candidates.extend(app.objectValues())
+            for path, name in _mount_paths():
+                if name != self._db.database_name:
+                    continue
                 try:
                     mounted = app.unrestrictedTraverse(path)
                 except (KeyError, AttributeError):
@@ -1208,11 +1243,11 @@ class _Service(threading.Thread):
                 site = connection.root()["Application"].unrestrictedTraverse(path)
                 catalog = aq_base(aq_base(site).portal_catalog)
             except (KeyError, AttributeError):
-                self._sites.discard(path)
+                self._drop(path)
                 return
             jar = getattr(catalog, "_p_jar", None)
             if jar is None or jar.db() is not self._db or not zoe.kv._supported(jar):
-                self._sites.discard(path)
+                self._drop(path)
                 return
             oid = catalog._p_oid
             queue = zoe.kv.Namespace(jar, "durable", queue_name(oid))
@@ -1230,6 +1265,11 @@ class _Service(threading.Thread):
         finally:
             tm.abort()
             connection.close()
+
+    def _drop(self, path):
+        """Stop to serve the site at `path`, and forget its failures."""
+        self._sites.discard(path)
+        self._failures.pop(path, None)
 
     def _take(self, jar, tm, oid):
         """Take the lease of the catalog `oid`, in the store of the
@@ -1253,8 +1293,8 @@ class _Service(threading.Thread):
 
 
 def _mount_paths():
-    """Return the paths of the mount points of the configuration of Zope,
-    or nothing outside Zope."""
+    """Return `(path, database name)` of each mount point of the
+    configuration of Zope, or nothing outside Zope."""
     try:
         from App.config import getConfiguration
 
@@ -1263,4 +1303,4 @@ def _mount_paths():
         return []
     if dbtab is None:
         return []
-    return [path for path, _name in dbtab.listMountPaths() if path != "/"]
+    return [(path, name) for path, name in dbtab.listMountPaths() if path != "/"]

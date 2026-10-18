@@ -76,6 +76,12 @@ def test_install_and_read_give_the_policy_back(tmp_path):
         {"classes": {ITEM: {"fields": {"n": "average"}}}},
         {"classes": {ITEM: {"coupled": ["ab"]}}},
         {"classes": {ITEM: {"colour": "red"}}},
+        {"classes": {ITEM: {"options": "append"}}},
+        {"classes": {ITEM: {"options": {"union": {"state": "review_state"}}}}},
+        {"classes": {ITEM: {"options": {"append": "review_state"}}}},
+        {"classes": {ITEM: {"options": {"append": {"colour": "red"}}}}},
+        {"classes": {ITEM: {"options": {"append": {"state": 1}}}}},
+        {"classes": {ITEM: {"options": {"append": {"state": ""}}}}},
     ],
 )
 def test_a_policy_that_breaks_the_rules_raises_value_error(bad):
@@ -204,6 +210,23 @@ def test_the_strategy_keys_is_valid_in_fields_and_as_default():
     checked = policy.validate({"classes": {REGISTRY: entry}})
     assert checked["classes"][REGISTRY] == entry
     assert "keys" in policy.STRATEGIES
+
+
+def test_the_option_state_of_append_is_valid():
+    entry = {
+        "tier2": "on",
+        "default": "append",
+        "options": {"append": {"state": "review_state"}},
+    }
+    checked = policy.validate({"classes": {ITEM: entry}})
+    assert checked["classes"][ITEM] == entry
+    # The copy holds plain values of its own.
+    assert checked["classes"][ITEM]["options"] is not entry["options"]
+    assert policy.OPTIONS == {"append": ("state",)}
+    # Empty options, or an option of None, leave no key.
+    for options in ({}, {"append": {}}, {"append": {"state": None}}):
+        checked = policy.validate({"classes": {ITEM: {"options": options}}})
+        assert checked["classes"][ITEM] == {}
 
 
 def item(key, value):

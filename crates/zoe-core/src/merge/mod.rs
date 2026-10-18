@@ -171,6 +171,10 @@ pub enum Reason {
     /// Tier 2, the strategy `keys`: one side deleted a key of a mapping
     /// that the other side changed.
     KeyDeleted,
+    /// Tier 2, the strategy `append` with the option `state`: an item that
+    /// the committed side appended does not keep the state of the old
+    /// value.
+    StateChanged,
 }
 
 impl Reason {
@@ -212,6 +216,7 @@ impl Reason {
             Reason::NotAppend => "Field that is not an append to its old value",
             Reason::KeyChanged => "Key of a mapping changed on both sides",
             Reason::KeyDeleted => "Key of a mapping deleted on one side and changed on the other",
+            Reason::StateChanged => "State changed by a status of the committed side",
         }
     }
 }
@@ -634,5 +639,43 @@ impl Resolved {
             code.map_or_else(|| "null".to_owned(), |code| code.to_string()),
             reason.map_or_else(|| "null".to_owned(), json),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_of_the_option_state_names_its_reason_and_its_field() {
+        let merge = Merge {
+            tier: 2,
+            class: "m.History".to_owned(),
+            outcome: Outcome::Refused(Reason::StateChanged),
+            keys: vec!["wf".to_owned()],
+            changed: 1,
+            shadow: None,
+            fields: vec!["wf".to_owned()],
+        };
+        let resolution = Resolution::of(Oid(1), Mode::On, Some(2), &merge, Tid(3), Tid(4));
+        let context = LogContext {
+            time: SystemTime::UNIX_EPOCH,
+            storage: None,
+            user: b"",
+            description: b"",
+            committed_user: None,
+            committed_description: None,
+        };
+        let line = log_line(&resolution, &context);
+        assert!(line.contains("\"tier\":2,"), "{line}");
+        assert!(
+            line.contains("\"outcome\":\"refused\",\"code\":null,"),
+            "{line}"
+        );
+        assert!(
+            line.contains("\"reason\":\"State changed by a status of the committed side\""),
+            "{line}"
+        );
+        assert!(line.contains("\"fields\":[\"wf\"]"), "{line}");
     }
 }

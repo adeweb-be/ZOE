@@ -593,11 +593,11 @@ plone scenario="zoe" command="start" *args:
 # transactions of the store that the B5 run RUN kept (`--keep-store` on
 # zeo), against ZEO and against zoe serve, in the interpreter of the
 # zoeclient Plone instance. It writes target/bench/replay/<started>.json and
-# prints the report and the verdict of the gate of phase 4, and fails when
-# the gate fails. `--zoe-serve-arg ARG` passes ARG to zoe serve, such as
-# `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`. It needs
-# `just plone zoeclient build`, whose package zoe the native client runs,
-# and builds `zoe` in release first.
+# prints the report, whose last line gives the ratio of the success
+# criterion, a measure, not a gate. `--zoe-serve-arg ARG` passes ARG to
+# zoe serve, such as `--zoe-serve-arg=--posting-dicts --zoe-serve-arg=on`.
+# It needs `just plone zoeclient build`, whose package zoe the native
+# client runs, and builds `zoe` in release first.
 # `just bench replay report FILE` prints the report of a result, and
 # `just bench replay test` runs the tests of the replay.
 bench *args="run":
