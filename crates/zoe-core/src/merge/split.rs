@@ -21,14 +21,23 @@
 //!    Each node runs the rules on its own records, at any depth, so a split
 //!    of a child node that the other side did not change merges too.
 //! 3. A split of one bucket merges the keys of its range with the rules of
-//!    `bucket_merge`. The merged keys go to the bucket and to the new bucket
-//!    of the transaction, at the separator of the committed side when it
-//!    split, else at the separator of the transaction. The new bucket of
-//!    the transaction takes the place of the new bucket of the committed
-//!    side ([`written_node`]).
+//!    `bucket_merge` ([`written_node`]). When the other side changed the
+//!    bucket without a split, the merged keys go to the bucket and to the
+//!    new bucket of the transaction, at the separator of the transaction.
+//!    When the other side split the bucket too, the merged keys go to the
+//!    bucket and to the new bucket of the other side, at its separator, and
+//!    the new bucket of the transaction gets no place in the tree (ADR
+//!    0049). This needs a client that takes records that it did not store,
+//!    and the lock of the new bucket of the other side. Without them the
+//!    rule gives no answer. So no rule takes a bucket out of the tree.
 //!
-//! The rules write only records that the transaction stored. They read the
-//! records through a [`Source`]. They give no answer for a node that
+//! A merge of rule 3 with a split on both sides writes the new bucket of
+//! the other side, which the transaction did not store. It gives no record
+//! of the new bucket of the transaction, and none of the node when the
+//! merged node is the committed node: these are resolved without a record
+//! ([`Written::dropped`]). The rules read the records through a
+//! [`Source`], and read a bucket that the transaction did not store only
+//! under its lock. They give no answer for a node that
 //! changed by anything but splits (rule 1 also takes replacements), for a
 //! delete in a range that they merge, for two splits of one child on one
 //! side, and for a state that the model does not hold. Two key references of one class compare by the oids of
@@ -68,6 +77,15 @@ pub(crate) trait Source {
 
     /// Tells if the transaction marked `oid` read-current.
     fn read_current(&self, oid: Oid) -> bool;
+
+    /// Tells if the client of the transaction takes records that it did
+    /// not store (ADR 0049).
+    fn server_writes(&self) -> bool;
+
+    /// Takes the exclusive lock of `oid` for the vote, without a wait.
+    /// Returns false when another transaction holds it or waits for it,
+    /// or when a hand-off is in its entry.
+    fn lock(&self, oid: Oid) -> Result<bool>;
 }
 
 /// A record that a rule writes.
@@ -89,6 +107,10 @@ pub(crate) struct Written {
     pub(crate) keys: Vec<String>,
     /// The number of keys that the new side changed.
     pub(crate) changed: usize,
+    /// True for an oid that the transaction stored and that the merge
+    /// resolves without a record: the vote takes it out of the staging,
+    /// and `pickle` is empty.
+    pub(crate) dropped: bool,
 }
 
 /// What the rules give for one node.
@@ -610,31 +632,44 @@ impl<'s> Group<'s> {
         if old.next.is_some() {
             return no("an inline bucket with a next bucket");
         }
-        let (committed, separator) = match committed {
+        let (committed, separator, theirs) = match committed {
             Tree::Inline(bucket) => {
                 let bucket = self.bucket(bucket)?;
                 if bucket.next.is_some() {
                     return no("an inline bucket with a next bucket");
                 }
-                (bucket.items, x.separator)
+                (bucket.items, x.separator, None)
             }
             Tree::Node(committed) => {
+                if !self.source.server_writes() {
+                    return no(
+                        "a bucket that the other side split, for a client without server_writes",
+                    );
+                }
                 let [c, y] = committed.children[..] else {
                     return no("two splits of one bucket by the other side");
                 };
                 if committed.first_oid != c.oid {
                     return no("a first bucket that is not the first child");
                 }
-                let (_, c_record) = self.current(c.oid)?;
-                let (_, y_record) = self.current(y.oid)?;
-                let (_, _, c_leaf) = self.leaf(&c_record)?;
-                let (_, _, y_leaf) = self.leaf(&y_record)?;
+                // The two new buckets of the other side stay in the tree.
+                self.take(c.oid)?;
+                self.take(y.oid)?;
+                let (c_current, c_record) = self.current(c.oid)?;
+                let (y_current, y_record) = self.current(y.oid)?;
+                let (c_class, c_name, c_leaf) = self.leaf(&c_record)?;
+                let (y_class, y_name, y_leaf) = self.leaf(&y_record)?;
                 if c_leaf.next_oid != Some(y.oid) || y_leaf.next.is_some() {
                     return no("next buckets that are not those of one split");
                 }
+                let next = c_leaf.next;
                 let mut items = c_leaf.items;
                 items.extend(y_leaf.items);
-                (items, y.separator)
+                let theirs = Theirs {
+                    low: (c, c_current, c_class, c_name, next),
+                    high: (y, y_current, y_class, y_name, None),
+                };
+                (items, y.separator, Some(theirs))
             }
         };
         let Some(separator) = separator else {
@@ -654,6 +689,18 @@ impl<'s> Group<'s> {
             separator,
             (node.oid, &node.name),
         )?;
+        if let Some(theirs) = theirs {
+            return self.kept(
+                node,
+                theirs,
+                low,
+                high,
+                keys,
+                changed,
+                [a, x],
+                [a_name, x_name],
+            );
+        }
         let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
         let x_state = new_bucket_state(&mut self.heap, high, None);
         let children = self
@@ -669,6 +716,7 @@ impl<'s> Group<'s> {
                 pickle: self.pickle(node.class, root)?,
                 keys: keys.clone(),
                 changed,
+                dropped: false,
             },
             Written {
                 oid: a.oid,
@@ -678,6 +726,7 @@ impl<'s> Group<'s> {
                 pickle: self.pickle(a_class, a_state)?,
                 keys: keys.clone(),
                 changed,
+                dropped: false,
             },
             Written {
                 oid: x.oid,
@@ -687,6 +736,7 @@ impl<'s> Group<'s> {
                 pickle: self.pickle(x_class, x_state)?,
                 keys,
                 changed,
+                dropped: false,
             },
         ];
         Ok(Split::Merged { rule: 3, records })
@@ -743,6 +793,11 @@ impl<'s> Group<'s> {
                 _ => return no("two splits of one child on one side"),
             };
             rule = 3;
+            if y.is_some() && !self.source.server_writes() {
+                return no(
+                    "a bucket that the other side split, for a client without server_writes",
+                );
+            }
             let anchor = Anchor {
                 child: *anchor,
                 read: anchor_read,
@@ -757,12 +812,27 @@ impl<'s> Group<'s> {
                 return no("a new child without a separator");
             };
             records.extend(self.split_bucket(&anchor, x, y, separator)?);
+            // The new bucket of the other side keeps its place.
             merged.push(Child {
                 separator: Some(separator),
-                ..x
+                ..y.unwrap_or(x)
             });
         }
-        if node.current != node.read {
+        let unchanged = merged.len() == committed.children.len()
+            && merged
+                .iter()
+                .zip(&committed.children)
+                .all(|(a, b)| a.oid == b.oid);
+        if node.current != node.read && unchanged {
+            // The merged node is the committed node: no record of it.
+            let (keys, changed) = records.first().map_or((Vec::new(), 0), |record: &Written| {
+                (record.keys.clone(), record.changed)
+            });
+            records.insert(
+                0,
+                dropped(node.oid, &node.name, node.read, node.current, keys, changed),
+            );
+        } else if node.current != node.read {
             let mut items = Vec::with_capacity(merged.len() * 2);
             for child in &merged {
                 items.extend(child.separator);
@@ -783,6 +853,7 @@ impl<'s> Group<'s> {
                     pickle: self.pickle(node.class, state)?,
                     keys,
                     changed,
+                    dropped: false,
                 },
             );
         }
@@ -795,14 +866,15 @@ impl<'s> Group<'s> {
     /// Rule 3 on the bucket `anchor`, which the transaction split into the
     /// anchor and `x`, and which the other side split into the anchor and
     /// `y`, or changed without a split. Returns the records of the anchor
-    /// and of `x`.
+    /// and of `x`, or with `y`, the records of the anchor and of `y`, and
+    /// `x` without a record.
     fn split_bucket(
         &mut self,
         anchor: &Anchor,
         x: Child,
         y: Option<Child>,
         separator: Value,
-    ) -> Step<[Written; 2]> {
+    ) -> Step<Vec<Written>> {
         let x_record = self.new_object(x.oid)?;
         let Some(old_record) = self.source.at(anchor.child.oid, anchor.read)? else {
             return no("the record that the transaction read is gone");
@@ -815,15 +887,21 @@ impl<'s> Group<'s> {
         if a_new.next_oid != Some(x.oid) || x_new.next_oid != next {
             return no("next buckets that are not those of one split");
         }
+        let a_next = a_committed.next;
         let mut committed = a_committed.items;
+        let mut theirs = None;
         match y {
             Some(y) => {
-                let (_, y_record) = self.current(y.oid)?;
-                let (_, _, y_leaf) = self.leaf(&y_record)?;
+                // The rule reads the new bucket of the other side only
+                // under its lock.
+                self.take(y.oid)?;
+                let (y_current, y_record) = self.current(y.oid)?;
+                let (y_class, y_name, y_leaf) = self.leaf(&y_record)?;
                 if a_committed.next_oid != Some(y.oid) || y_leaf.next_oid != next {
                     return no("next buckets that are not those of one split");
                 }
                 committed.extend(y_leaf.items);
+                theirs = Some((y, y_current, y_class, y_name, y_leaf.next));
             }
             None => {
                 if a_committed.next_oid != next {
@@ -845,9 +923,38 @@ impl<'s> Group<'s> {
             separator,
             (anchor.child.oid, &a_name),
         )?;
+        if let Some((y, y_current, y_class, y_name, y_next)) = theirs {
+            // The keys go to the anchor and to the new bucket of the other
+            // side, with their next buckets of the committed side.
+            let a_state = new_bucket_state(&mut self.heap, low, a_next);
+            let y_state = new_bucket_state(&mut self.heap, high, y_next);
+            return Ok(vec![
+                Written {
+                    oid: anchor.child.oid,
+                    class: a_name,
+                    read: anchor.read,
+                    current: anchor.current.0,
+                    pickle: self.pickle(a_class, a_state)?,
+                    keys: keys.clone(),
+                    changed,
+                    dropped: false,
+                },
+                Written {
+                    oid: y.oid,
+                    class: y_name,
+                    read: y_current,
+                    current: y_current,
+                    pickle: self.pickle(y_class, y_state)?,
+                    keys: keys.clone(),
+                    changed,
+                    dropped: false,
+                },
+                dropped(x.oid, &x_name, Tid::ZERO, Tid::ZERO, keys, changed),
+            ]);
+        }
         let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
         let x_state = new_bucket_state(&mut self.heap, high, x_new.next);
-        Ok([
+        Ok(vec![
             Written {
                 oid: anchor.child.oid,
                 class: a_name,
@@ -856,6 +963,7 @@ impl<'s> Group<'s> {
                 pickle: self.pickle(a_class, a_state)?,
                 keys: keys.clone(),
                 changed,
+                dropped: false,
             },
             Written {
                 oid: x.oid,
@@ -865,8 +973,73 @@ impl<'s> Group<'s> {
                 pickle: self.pickle(x_class, x_state)?,
                 keys,
                 changed,
+                dropped: false,
             },
         ])
+    }
+
+    /// Takes the lock of `oid`, a bucket of the other side that the rule
+    /// reads and writes. Gives no answer when the transaction stored it,
+    /// or when another transaction holds its lock or waits for it.
+    fn take(&mut self, oid: Oid) -> Step<()> {
+        if self.source.stores(oid) {
+            return no("a new bucket of the other side that the transaction stored");
+        }
+        if !self.source.lock(oid)? {
+            return no("a bucket of the other side that another transaction locks");
+        }
+        Ok(())
+    }
+
+    /// Rule 3 on a root that held its bucket inline, when both sides split
+    /// it: the merged keys go to the two new buckets of the other side,
+    /// `low` and `high`, and the root keeps the committed record. The root
+    /// and the two new buckets of the transaction, `ours`, get no record.
+    #[allow(clippy::too_many_arguments)]
+    fn kept(
+        &mut self,
+        node: &Merging,
+        theirs: Theirs,
+        low: Vec<Value>,
+        high: Vec<Value>,
+        keys: Vec<String>,
+        changed: usize,
+        ours: [Child; 2],
+        names: [String; 2],
+    ) -> Step<Split> {
+        let mut records = vec![dropped(
+            node.oid,
+            &node.name,
+            node.read,
+            node.current,
+            keys.clone(),
+            changed,
+        )];
+        for ((child, current, class, name, next), items) in [(theirs.low, low), (theirs.high, high)]
+        {
+            let state = new_bucket_state(&mut self.heap, items, next);
+            records.push(Written {
+                oid: child.oid,
+                class: name,
+                read: current,
+                current,
+                pickle: self.pickle(class, state)?,
+                keys: keys.clone(),
+                changed,
+                dropped: false,
+            });
+        }
+        for (child, name) in ours.into_iter().zip(names) {
+            records.push(dropped(
+                child.oid,
+                &name,
+                Tid::ZERO,
+                Tid::ZERO,
+                keys.clone(),
+                changed,
+            ));
+        }
+        Ok(Split::Merged { rule: 3, records })
     }
 
     /// Rule 1 on the node `oid`, which the transaction marked read-current
@@ -944,6 +1117,39 @@ struct Merging {
     current: Tid,
 }
 
+/// A new bucket of the other side that rule 3 keeps: the child, the serial
+/// of its current record, its class value and name, and its next bucket.
+type Kept = (Child, Tid, Value, String, Option<Value>);
+
+/// The two new buckets of the other side in a root that held its bucket
+/// inline.
+struct Theirs {
+    low: Kept,
+    high: Kept,
+}
+
+/// Returns the entry of an oid that the transaction stored and that the
+/// merge resolves without a record.
+fn dropped(
+    oid: Oid,
+    class: &str,
+    read: Tid,
+    current: Tid,
+    keys: Vec<String>,
+    changed: usize,
+) -> Written {
+    Written {
+        oid,
+        class: class.to_owned(),
+        read,
+        current,
+        pickle: Vec::new(),
+        keys,
+        changed,
+        dropped: true,
+    }
+}
+
 /// An anchor of a split of the transaction.
 struct Anchor {
     child: Child,
@@ -996,6 +1202,14 @@ mod tests {
 
         fn read_current(&self, oid: Oid) -> bool {
             oid == NODE
+        }
+
+        fn server_writes(&self) -> bool {
+            false
+        }
+
+        fn lock(&self, _: Oid) -> Result<bool> {
+            Ok(false)
         }
     }
 

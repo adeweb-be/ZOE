@@ -724,6 +724,16 @@ impl Session {
             .is_some_and(|accepted| accepted.contains(&negotiation::TRACE_CONTEXT))
     }
 
+    /// Tell if the server accepted `server_writes` from the declaration of
+    /// the client. Only then can the vote of the connection write a record
+    /// that its transaction did not store (ADR 0049).
+    pub(crate) fn server_writes(&self) -> bool {
+        self.registration
+            .get()
+            .and_then(|r| r.extensions.as_deref())
+            .is_some_and(|accepted| accepted.contains(&negotiation::SERVER_WRITES))
+    }
+
     /// Tell if the client registered read-only.
     fn read_only(&self) -> bool {
         self.registration.get().is_some_and(|r| r.read_only)
@@ -1888,6 +1898,7 @@ impl Transaction {
             }
         };
         txn.set_lock_cancel(self.session.lock_cancel.clone());
+        txn.set_server_writes(self.session.server_writes());
         Ok(txn)
     }
 
@@ -4092,6 +4103,22 @@ mod tests {
             args: vec![name],
             context: None,
         }
+    }
+
+    #[test]
+    fn a_declaration_of_server_writes_reaches_the_vote() {
+        let mut declared = declaring("server-writes", false, &["server_writes"]);
+        let info = done(call(&mut declared, "get_info", vec![]));
+        assert_eq!(
+            get(&info, "extensions"),
+            &Value::Array(vec![Value::from("server_writes")])
+        );
+        assert!(declared.session.server_writes());
+        // A stock client declares nothing, and a ZOE client that does not
+        // name the extension does not get it.
+        assert!(!registered("server-writes-stock").session.server_writes());
+        let other = declaring("server-writes-other", false, &["sequences"]);
+        assert!(!other.session.server_writes());
     }
 
     #[test]

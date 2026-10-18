@@ -410,6 +410,18 @@ impl Staging {
         self.in_memory
     }
 
+    /// Take `oid` out of the staging. The bytes of a spilled pickle stay in
+    /// the file, unused.
+    pub(crate) fn remove(&mut self, oid: Oid) {
+        if let Some(Staged {
+            pickle: Pickle::Memory(bytes),
+            ..
+        }) = self.records.remove(&oid)
+        {
+            self.in_memory -= bytes.len();
+        }
+    }
+
     /// Return the number of staged oids.
     pub(crate) fn len(&self) -> usize {
         self.records.len()

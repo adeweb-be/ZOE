@@ -276,8 +276,17 @@ fn new_oid(store: &Store) -> Oid {
 }
 
 /// Begins a transaction that stores `writes`, each with the serial that
-/// it read.
+/// it read, for a client that takes records that it did not store, as the
+/// native client and `zoe.Storage` (ADR 0049).
 fn writing<'s>(store: &'s Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Txn<&'s Store> {
+    let mut txn = stock(store, writes);
+    txn.set_server_writes(true);
+    txn
+}
+
+/// Begins a transaction that stores `writes`, for a client that takes only
+/// the records that it stored, as a stock `ZEO.ClientStorage`.
+fn stock<'s>(store: &'s Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Txn<&'s Store> {
     let mut txn = store.tpc_begin(b"user", b"split", b"").unwrap();
     for (oid, serial, data) in writes {
         txn.store(*oid, *serial, data).unwrap();
@@ -481,8 +490,10 @@ fn both_sides_split_one_bucket_and_the_keys_of_its_range_merge() {
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
     assert_eq!(txn.vote_resolving().unwrap(), []);
+    // The node and X are resolved without a record, and Y is written.
     let resolved = set(&txn.natively_resolved());
-    assert_eq!(resolved, set(&[tree.root, tree.buckets[1], x]));
+    assert_eq!(resolved, set(&[tree.root, tree.buckets[1], x, y]));
+    assert!(txn.wrote_unstored());
     for resolution in txn.resolutions() {
         assert_eq!(
             (resolution.split, resolution.outcome, resolution.applied),
@@ -494,15 +505,61 @@ fn both_sides_split_one_bucket_and_the_keys_of_its_range_merge() {
         lines.iter().all(|line| line.contains("\"split\":3")),
         "{lines:?}"
     );
+    let committed_root = store.load(tree.root).unwrap().1;
+    let tid = txn.finish().unwrap();
+    let (buckets, keys) = walk(&store, tree.root);
+    // The keys at and above the separator of the other side go to its new
+    // bucket, which keeps its place. X gets no place, and no record.
+    assert_eq!(buckets, [tree.buckets[0], tree.buckets[1], y]);
+    assert_eq!(keys, [10, 20, 30, 40, 45, 50, 60, 70]);
+    assert_eq!(
+        store.load(y).unwrap(),
+        (bucket(II, &ints(&[60, 70]), None), tid)
+    );
+    assert!(store.load(x).is_err());
+    // The node keeps the record of the other side.
+    assert_eq!(store.load(tree.root).unwrap().1, committed_root);
+}
+
+#[test]
+fn without_server_writes_a_split_of_both_sides_gives_no_answer() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let x = new_oid(&store);
+    let mut txn = stock(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    let voted = txn.vote_resolving();
+    // The vote goes on as without the rule: ZODB's resolver refuses the
+    // node.
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    assert!(
+        txn.resolutions()
+            .iter()
+            .all(|r| r.outcome != Resolved::Merged)
+    );
+    assert!(store.lock_table_is_empty());
+}
+
+#[test]
+fn without_server_writes_a_split_against_a_change_without_a_split_merges() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    commit(
+        &store,
+        &[(
+            tree.buckets[1],
+            tree.tid,
+            bucket(II, &ints(&[40, 50, 55, 60]), None),
+        )],
+    );
+    let x = new_oid(&store);
+    let mut txn = stock(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    txn.vote().unwrap();
+    assert!(!txn.wrote_unstored());
     txn.finish().unwrap();
     let (buckets, keys) = walk(&store, tree.root);
-    // The keys at and above the separator of the other side go to the new
-    // bucket of the transaction, which takes the place of the other one.
     assert_eq!(buckets, [tree.buckets[0], tree.buckets[1], x]);
-    assert!(!buckets.contains(&y));
-    assert_eq!(keys, [10, 20, 30, 40, 45, 50, 60, 70]);
-    let (data, _) = store.load(x).unwrap();
-    assert_eq!(data, bucket(II, &ints(&[60, 70]), None));
+    assert_eq!(keys, [10, 20, 30, 40, 45, 50, 55, 60]);
 }
 
 #[test]
@@ -696,13 +753,52 @@ fn a_split_of_a_root_that_held_its_bucket_inline_merges() {
         ],
     );
     txn.vote().unwrap();
-    assert_eq!(set(&txn.natively_resolved()), set(&[root, a, x]));
+    assert_eq!(set(&txn.natively_resolved()), set(&[root, a, x, a1, y1]));
     txn.finish().unwrap();
     let (buckets, keys) = walk(&store, root);
-    // The separator of the other side applies.
-    assert_eq!(buckets, [a, x]);
+    // The two new buckets of the other side keep their places, with its
+    // separator. Those of the transaction get no record.
+    assert_eq!(buckets, [a1, y1]);
     assert_eq!(keys, [10, 20, 25, 30, 40]);
-    assert_eq!(store.load(x).unwrap().0, bucket(II, &ints(&[30, 40]), None));
+    assert_eq!(
+        store.load(a1).unwrap().0,
+        bucket(II, &ints(&[10, 20, 25]), Some(y1))
+    );
+    assert_eq!(
+        store.load(y1).unwrap().0,
+        bucket(II, &ints(&[30, 40]), None)
+    );
+    assert!(store.load(a).is_err());
+    assert!(store.load(x).is_err());
+}
+
+#[test]
+fn without_server_writes_a_split_of_an_inline_root_on_both_sides_gives_no_answer() {
+    let store = open(Some("on"));
+    let root = new_oid(&store);
+    let read = commit(
+        &store,
+        &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
+    );
+    let (a1, y1) = (new_oid(&store), new_oid(&store));
+    commit(
+        &store,
+        &[
+            (root, read, leaf_node(II, a1, &[(Key::Int(30), y1)])),
+            (a1, Tid::ZERO, bucket(II, &ints(&[10, 20]), Some(y1))),
+            (y1, Tid::ZERO, bucket(II, &ints(&[30, 40]), None)),
+        ],
+    );
+    let (a, x) = (new_oid(&store), new_oid(&store));
+    let mut txn = stock(
+        &store,
+        &[
+            (root, read, leaf_node(II, a, &[(Key::Int(20), x)])),
+            (a, Tid::ZERO, bucket(II, &ints(&[10]), Some(x))),
+            (x, Tid::ZERO, bucket(II, &ints(&[20, 25, 30]), None)),
+        ],
+    );
+    assert!(matches!(txn.vote(), Err(ZoeError::Conflict { oid }) if oid == root));
 }
 
 #[test]
@@ -1074,12 +1170,12 @@ fn two_levels_of_nodes_merge_node_by_node() {
     );
     txn.check_current_serial(root, tid).unwrap();
     txn.vote().unwrap();
-    assert_eq!(set(&txn.natively_resolved()), set(&[n2, b[3], x]));
+    assert_eq!(set(&txn.natively_resolved()), set(&[n2, b[3], x, y]));
     let rules: BTreeSet<_> = txn.resolutions().iter().map(|r| r.split).collect();
     assert_eq!(rules, BTreeSet::from([Some(1), Some(3)]));
     txn.finish().unwrap();
     let (buckets, keys) = walk(&store, root);
-    assert_eq!(buckets, [b[0], b[1], b[2], b[3], x]);
+    assert_eq!(buckets, [b[0], b[1], b[2], b[3], y]);
     assert_eq!(keys, [10, 20, 30, 40, 50, 60, 70, 75, 80, 90]);
 }
 
@@ -1412,4 +1508,200 @@ fn a_refusal_on_a_bucket_whose_tier_1_is_off_fails_as_without_the_switch() {
     // No update is lost: the store keeps the commit of the other side.
     assert_eq!(store.load(anchor).unwrap(), (other, current));
     assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 50, 60, 70]);
+}
+
+/// The transaction T of the card: it read the tree after the split of the
+/// other side that made `y`, and inserts `key` into `y`, which holds
+/// `keys`. It marks the node read-current, as BTrees does.
+fn insert_into<'s>(
+    store: &'s Store,
+    tree: &Tree,
+    read: Tid,
+    y: Oid,
+    keys: &[i128],
+    key: i128,
+) -> Txn<&'s Store> {
+    let mut ours: Vec<i128> = keys.to_vec();
+    ours.push(key);
+    ours.sort_unstable();
+    let mut txn = writing(store, &[(y, read, bucket(II, &ints(&ours), None))]);
+    txn.check_current_serial(tree.root, read).unwrap();
+    txn
+}
+
+/// Returns the serial of the current record of `oid`.
+fn serial(store: &Store, oid: Oid) -> Tid {
+    store.load(oid).unwrap().1
+}
+
+#[test]
+fn the_insert_into_the_bucket_of_the_other_side_commits() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    // S1 splits the last bucket A into A and Y.
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    // T reads after S1 and inserts 80 into Y.
+    let mut t = insert_into(&store, &tree, s1, y, &[60, 70], 80);
+    // S2 read before S1 and splits A too.
+    let x = new_oid(&store);
+    let mut s2 = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    s2.vote().unwrap();
+    s2.finish().unwrap();
+    // T commits: Y is still in the tree.
+    t.vote().unwrap();
+    t.finish().unwrap();
+    let (buckets, keys) = walk(&store, tree.root);
+    assert_eq!(buckets, [tree.buckets[0], tree.buckets[1], y]);
+    assert_eq!(keys, [10, 20, 30, 40, 45, 50, 60, 70, 80]);
+    assert!(store.load(x).is_err());
+    assert!(store.lock_table_is_empty());
+}
+
+#[test]
+fn a_chain_of_merges_onto_one_bucket_keeps_it() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    let mut t = insert_into(&store, &tree, s1, y, &[60, 70], 80);
+    // S2, S3 and S4 all read before S1, and each splits A.
+    let splits: [(&[i128], &[i128]); 3] = [
+        (&[40, 45], &[50, 60]),
+        (&[40, 50], &[55, 60]),
+        (&[40, 50], &[60, 65]),
+    ];
+    let mut dropped = Vec::new();
+    for (left, right) in splits {
+        let x = new_oid(&store);
+        let mut txn = writing(&store, &split_writes(&tree, 1, x, left, right));
+        txn.vote().unwrap();
+        assert!(txn.wrote_unstored());
+        txn.finish().unwrap();
+        dropped.push(x);
+    }
+    t.vote().unwrap();
+    t.finish().unwrap();
+    let (buckets, keys) = walk(&store, tree.root);
+    assert_eq!(buckets, [tree.buckets[0], tree.buckets[1], y]);
+    assert_eq!(keys, [10, 20, 30, 40, 45, 50, 55, 60, 65, 70, 80]);
+    for x in dropped {
+        assert!(store.load(x).is_err());
+    }
+}
+
+#[test]
+fn a_bucket_of_the_other_side_that_another_transaction_locks_gives_no_answer() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    // Another transaction writes Y without the node, as an undo does, and
+    // holds its lock.
+    let mut other = writing(&store, &[(y, s1, bucket(II, &ints(&[60, 70, 90]), None))]);
+    other.vote().unwrap();
+    let x = new_oid(&store);
+    let mut s2 = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    let voted = s2.vote();
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    assert!(!s2.wrote_unstored());
+    other.finish().unwrap();
+    // The failed vote released the locks that it took, the one of Y too.
+    drop(s2);
+    assert!(store.lock_table_is_empty());
+    assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 50, 60, 70, 90]);
+}
+
+#[test]
+fn shadow_mode_takes_no_lock_of_the_bucket_of_the_other_side() {
+    let store = open(Some("shadow"));
+    let tree = two_buckets(&store);
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    let mut other = writing(&store, &[(y, s1, bucket(II, &ints(&[60, 70, 90]), None))]);
+    other.vote().unwrap();
+    let x = new_oid(&store);
+    let mut s2 = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    assert!(matches!(s2.vote(), Err(ZoeError::Conflict { .. })));
+    // The shadow outcome is the merge, as if the lock were free.
+    let shadow = s2
+        .resolutions()
+        .iter()
+        .find(|r| r.oid == tree.root)
+        .and_then(|r| r.shadow);
+    assert_eq!(shadow, Some(Resolved::Merged));
+    other.finish().unwrap();
+    drop(s2);
+    assert!(store.lock_table_is_empty());
+}
+
+/// Undoes `tid` in one transaction. Returns the outcome; a conflict that
+/// no tier resolves fails the undo.
+fn undo(store: &Store, tid: Tid) -> zoe_core::Result<Tid> {
+    let mut txn = store.tpc_begin(b"user", b"undo", b"").unwrap();
+    let undone = txn.undo(tid)?;
+    if !undone.conflicts.is_empty() {
+        return Err(ZoeError::Protocol("an undo conflict"));
+    }
+    txn.vote()?;
+    txn.finish()
+}
+
+#[test]
+fn an_undo_after_a_merge_of_rule_3_never_passes_with_no_effect() {
+    for server_writes in [true, false] {
+        let store = open(Some("on"));
+        let tree = two_buckets(&store);
+        let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+        let s1 = serial(&store, y);
+        // T inserts 80 into Y and commits.
+        let mut t = insert_into(&store, &tree, s1, y, &[60, 70], 80);
+        t.vote().unwrap();
+        let undone = t.finish().unwrap();
+        // S2 read before S1 and splits A.
+        let x = new_oid(&store);
+        let writes = split_writes(&tree, 1, x, &[40, 45], &[50, 60]);
+        let mut s2 = if server_writes {
+            writing(&store, &writes)
+        } else {
+            stock(&store, &writes)
+        };
+        let merged = s2.vote().and_then(|()| s2.finish());
+        assert_eq!(merged.is_ok(), server_writes);
+        // No bucket left the tree: the undo of T takes effect or fails.
+        match undo(&store, undone) {
+            Ok(_) => {
+                let keys = walk(&store, tree.root).1;
+                assert!(!keys.contains(&80), "{server_writes}: {keys:?}");
+            }
+            Err(error) => assert!(
+                matches!(error, ZoeError::Undo { .. } | ZoeError::Conflict { .. }),
+                "{error:?}"
+            ),
+        }
+        assert!(store.lock_table_is_empty());
+    }
+}
+
+#[test]
+fn an_undo_that_runs_with_the_merge_is_never_lost() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    let mut t = insert_into(&store, &tree, s1, y, &[60, 70], 80);
+    t.vote().unwrap();
+    let undone = t.finish().unwrap();
+    // The undo of T holds the lock of Y while S2 votes.
+    let mut u = store.tpc_begin(b"user", b"undo", b"").unwrap();
+    assert!(u.undo(undone).unwrap().conflicts.is_empty());
+    u.vote().unwrap();
+    let x = new_oid(&store);
+    let mut s2 = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    assert!(matches!(s2.vote(), Err(ZoeError::Conflict { .. })));
+    drop(s2);
+    u.finish().unwrap();
+    let keys = walk(&store, tree.root).1;
+    assert_eq!(keys, [10, 20, 30, 40, 50, 60, 70]);
+    assert!(store.lock_table_is_empty());
 }
