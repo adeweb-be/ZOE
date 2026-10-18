@@ -391,12 +391,10 @@ def _zeo_options(section):
         elif key == "invalidation-queue-size":
             args += ["--invalidation-queue-size", value]
         elif key == "transaction-timeout":
-            # zoe serve closes a connection that sends no frame for longer
-            # than --idle-timeout, and aborts its open transaction. So a
-            # transaction that stays open after its vote past the timeout
-            # loses its connection, as with ZEO. The timeout also closes an
-            # idle connection without a transaction.
-            args.append(f"--idle-timeout={int(value)}")
+            # zoe serve closes the connection of a transaction that stays
+            # open after its vote past the timeout, and aborts it, as ZEO
+            # does. A connection without a voted transaction stays open.
+            args.append(f"--transaction-timeout={int(value)}")
         elif key == "invalidation-age":
             # ZEO takes a float. zoe serve takes whole seconds, so round up.
             # A negative age replays nothing in ZEO, as 0 does here.

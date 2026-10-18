@@ -372,23 +372,30 @@ def test_teardown_restores_the_forker_when_a_kill_fails(tmp_path, monkeypatch):
     assert forker.start_zeo_server is original
 
 
-def test_the_transaction_timeout_closes_an_idle_connection_in_the_log_file(
+def test_the_transaction_timeout_closes_a_voted_transaction_in_the_log_file(
     layer, tmp_path
 ):
     from ZEO.ClientStorage import ClientStorage
+    from ZODB.Connection import TransactionMetaData
 
     addr, stop = layer.start_zeo_server(
         FILESTORAGE, {"transaction_timeout": 1}, log="server.log"
     )
-    assert "--idle-timeout=1" in layer._servers[-1].args
+    args = layer._servers[-1].args
+    assert "--transaction-timeout=1" in args
+    assert not any(arg.startswith("--idle-timeout") for arg in args)
     storage = ClientStorage(addr, wait_timeout=30)
     try:
+        txn = TransactionMetaData()
+        storage.tpc_begin(txn)
+        storage.tpc_vote(txn)
         # zoe serve writes its log lines to the file of the argument log.
         deadline = time.monotonic() + 30
         log = tmp_path / "server.log"
-        while "no frame within the idle timeout" not in log.read_text():
+        while "transaction timeout after the vote" not in log.read_text():
             assert time.monotonic() < deadline, "the connection did not close"
             time.sleep(0.1)
+        storage.tpc_abort(txn)
     finally:
         storage.close()
     stop()
