@@ -1179,7 +1179,11 @@ fn many_fields_of_the_strategy_keys_merge_in_proportion_to_their_record() {
     // One key of each field, and the first fields in the line.
     assert_eq!(resolution.changed, FIELDS);
     assert_eq!(resolution.keys.len(), 20);
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // ThreadSanitizer makes the merge many times slower. `just tsan` sets
+    // TSAN_OPTIONS, so the time bound applies only without the sanitizer.
+    if std::env::var_os("TSAN_OPTIONS").is_none() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
 }
 
 #[test]
