@@ -7,7 +7,8 @@
 //! structure of its value in the old state (`Canon`). A field that one
 //! side changed takes that change; a field that both sides changed to the
 //! same value takes it. A field that both sides changed to different values
-//! takes the strategy of the policy. Coupled fields stay strict.
+//! takes the strategy of the policy. Coupled fields stay strict. The
+//! strategy `keys` merges a dict with the same rules, key by key.
 //!
 //! The merged state is the committed dict with the merged values in place,
 //! then the fields that only the new side added. The record is the class
@@ -18,8 +19,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use zoe_pickle::python::{Canon, Heap, Object, ObjectId, Pickler, Undecided, Value};
+use zoe_pickle::python::{Canon, DictKey, Heap, Object, ObjectId, Pickler, Undecided, Value};
 
+use super::btrees::text;
 use super::policy::{ClassPolicy, Strategy};
 use super::{MAX_KEYS, Merge, Outcome, Reason, Trees, budget};
 
@@ -93,7 +95,7 @@ fn merge_fields(
     let mut all: Vec<Fields> = Vec::with_capacity(3);
     for &state in states {
         let fields = fields_of(heap, state)?;
-        check_shared(heap, &fields)?;
+        check_shared(heap, &fields, "an object that two fields share")?;
         all.push(fields);
     }
     let [old, committed, new] = <[Fields; 3]>::try_from(all).expect("three states");
@@ -131,12 +133,10 @@ fn merge_fields(
             by_new.insert(name);
         }
     }
-    merge.changed = by_new.len();
-    merge.keys = by_new
-        .iter()
-        .take(MAX_KEYS)
-        .map(|name| (*name).clone())
-        .collect();
+    // The keys of the dicts that the strategy `keys` merged or refused, by
+    // field.
+    let mut expanded: HashMap<&str, Noted> = HashMap::new();
+    note(merge, &by_new, &expanded);
     // Coupled fields stay strict: both sides changed the group, and they
     // do not agree on each of its fields.
     for group in &entry.coupled {
@@ -156,35 +156,51 @@ fn merge_fields(
             }
         }
     }
-    // The value of each field after the merge. `None` deletes it.
+    // The value of each field after the merge. `None` deletes it. The block
+    // ends at the first field that does not merge.
     let mut merged: HashMap<&str, Option<Value>> = HashMap::new();
-    for &name in &names {
-        let (c, n) = (committed_map.get(name).copied(), new_map.get(name).copied());
-        let value = match (by_committed.contains(name), by_new.contains(name)) {
-            (_, false) => c,
-            (false, true) => n,
-            (true, true) => match (c, n) {
-                (None, None) => None,
-                (Some(c), Some(n)) if canon.same(heap, c, n).map_err(undecided)? => Some(c),
-                (Some(c), Some(n)) => {
-                    let old = old_map.get(name).copied();
-                    let strategy = entry.strategy(name);
-                    match both_changed(heap, canon, strategy, old, c, n) {
-                        Ok(value) => Some(value),
-                        Err(outcome) => {
-                            merge.fields = vec![name.clone()];
-                            return Err(outcome);
+    let decided: Result<(), Outcome> = 'fields: {
+        for &name in &names {
+            let (c, n) = (committed_map.get(name).copied(), new_map.get(name).copied());
+            let value = match (by_committed.contains(name), by_new.contains(name)) {
+                (_, false) => c,
+                (false, true) => n,
+                (true, true) => match (c, n) {
+                    (None, None) => None,
+                    (Some(c), Some(n)) => match canon.same(heap, c, n) {
+                        Ok(true) => Some(c),
+                        Ok(false) => {
+                            let old = old_map.get(name).copied();
+                            let strategy = entry.strategy(name);
+                            let mut noted = None;
+                            let value = both_changed(heap, canon, strategy, old, c, n, &mut noted);
+                            if let Some(noted) = noted {
+                                expanded.insert(name.as_str(), noted);
+                            }
+                            match value {
+                                Ok(value) => Some(value),
+                                Err(outcome) => {
+                                    merge.fields = vec![name.clone()];
+                                    break 'fields Err(outcome);
+                                }
+                            }
                         }
+                        Err(why) => break 'fields Err(undecided(why)),
+                    },
+                    _ => {
+                        merge.fields = vec![name.clone()];
+                        break 'fields Err(Outcome::Refused(Reason::FieldDeleted));
                     }
-                }
-                _ => {
-                    merge.fields = vec![name.clone()];
-                    return Err(Outcome::Refused(Reason::FieldDeleted));
-                }
-            },
-        };
-        merged.insert(name, value);
-    }
+                },
+            };
+            merged.insert(name, value);
+        }
+        Ok(())
+    };
+    // One note for all the fields, so the work stays linear in the number
+    // of fields. A refusal also shows the keys of the dicts before it.
+    note(merge, &by_new, &expanded);
+    decided?;
     // The committed fields in their order, then the fields that only the
     // new side added, in its order.
     let mut items = Vec::with_capacity(names.len());
@@ -202,6 +218,31 @@ fn merge_fields(
         }
     }
     Ok(heap.new_dict(items))
+}
+
+/// The keys of a dict that the new record changed, added or deleted, as the
+/// strategy `keys` found them.
+struct Noted {
+    /// The number of the keys.
+    changed: usize,
+    /// The text of the first [`MAX_KEYS`] keys, in the order of the model.
+    texts: Vec<String>,
+}
+
+/// Notes in `merge` the fields that the new record changed, in their order.
+/// A field in `expanded` gives the keys of its dict in place of its name.
+fn note(merge: &mut Merge, by_new: &BTreeSet<&String>, expanded: &HashMap<&str, Noted>) {
+    merge.changed = 0;
+    merge.keys.clear();
+    for name in by_new {
+        let (changed, texts) = match expanded.get(name.as_str()) {
+            Some(noted) => (noted.changed, noted.texts.as_slice()),
+            None => (1, std::slice::from_ref(*name)),
+        };
+        merge.changed += changed;
+        let room = MAX_KEYS - merge.keys.len();
+        merge.keys.extend(texts.iter().take(room).cloned());
+    }
 }
 
 /// Returns the fields of a state: a dict whose keys are all str.
@@ -260,16 +301,18 @@ fn parts(heap: &Heap, id: ObjectId) -> Vec<ObjectId> {
     }
 }
 
-/// Gives no answer for a state where two fields hold one mutable object: a
-/// merge that takes the fields from two records would split it in two, and
-/// a change of it through one field would not show through the other. Two
-/// fields may share an immutable value that holds no mutable object.
+/// Gives no answer, with the reason `shared`, for a state where two fields
+/// hold one mutable object: a merge that takes the fields from two records
+/// would split it in two, and a change of it through one field would not
+/// show through the other. Two fields may share an immutable value that
+/// holds no mutable object. The strategy `keys` checks the values of the
+/// keys of a dict in the same way.
 ///
 /// One walk of the state: each object is walked once, under the first field
 /// that reaches it. A second field that reaches it looks only at whether it
 /// holds a mutable object, which `holds` knows once for each object.
-fn check_shared(heap: &Heap, fields: &Fields) -> Result<(), Outcome> {
-    let shared = Outcome::Undecided("an object that two fields share");
+fn check_shared(heap: &Heap, fields: &Fields, shared: &'static str) -> Result<(), Outcome> {
+    let shared = Outcome::Undecided(shared);
     let mut owner: HashMap<ObjectId, usize> = HashMap::new();
     let mut holds: HashMap<ObjectId, bool> = HashMap::new();
     for (field, &(_, value)) in fields.iter().enumerate() {
@@ -330,7 +373,9 @@ fn holds_mutable(heap: &Heap, id: ObjectId, memo: &mut HashMap<ObjectId, bool>) 
 }
 
 /// Merges a field that both sides changed to different values, with its
-/// strategy. `old` is its value in the old state, if it had one.
+/// strategy. `old` is its value in the old state, if it had one. The
+/// strategy `keys` puts into `noted` the keys of the dict that the new
+/// record changed.
 fn both_changed(
     heap: &mut Heap,
     canon: &mut Canon,
@@ -338,6 +383,7 @@ fn both_changed(
     old: Option<Value>,
     committed: Value,
     new: Value,
+    noted: &mut Option<Noted>,
 ) -> Result<Value, Outcome> {
     match strategy {
         Strategy::Strict => Err(Outcome::Refused(Reason::FieldChanged)),
@@ -364,6 +410,7 @@ fn both_changed(
         },
         Strategy::Union => union(heap, canon, old, committed, new),
         Strategy::Append => append(heap, canon, old, committed, new),
+        Strategy::Keys => keys(heap, canon, old, committed, new, noted),
     }
 }
 
@@ -501,4 +548,189 @@ fn append(
     let mut result = committed_items;
     result.extend_from_slice(&new_items[old_items.len()..]);
     Ok(make(heap, kind, result))
+}
+
+/// One dict of the strategy `keys`: its items, the key of each item, and
+/// the place of each key.
+struct Mapping {
+    items: Vec<(Value, Value)>,
+    keys: Vec<DictKey>,
+    places: HashMap<DictKey, usize>,
+}
+
+impl Mapping {
+    /// Returns the dict of `value`, or `None` when `value` is not a dict.
+    /// A key that the model does not keep gives no answer.
+    fn of(heap: &Heap, value: Value) -> Option<Result<Mapping, Outcome>> {
+        let items = heap.dict(value)?.to_vec();
+        let keys: Result<Vec<DictKey>, _> =
+            items.iter().map(|&(key, _)| heap.dict_key(key)).collect();
+        let Ok(keys) = keys else {
+            return Some(Err(Outcome::Undecided(
+                "a key that the strategy keys does not take",
+            )));
+        };
+        let places = keys.iter().cloned().zip(0..).collect();
+        Some(Ok(Mapping {
+            items,
+            keys,
+            places,
+        }))
+    }
+
+    /// Returns the value of `key`, if the dict holds it.
+    fn get(&self, key: &DictKey) -> Option<Value> {
+        self.places.get(key).map(|&place| self.items[place].1)
+    }
+
+    /// Returns the key object of `key`, if the dict holds it.
+    fn key(&self, key: &DictKey) -> Option<Value> {
+        self.places.get(key).map(|&place| self.items[place].0)
+    }
+}
+
+/// The strategy `keys`: the three values are dicts, merged key by key. A key
+/// that only one side changed, added or deleted takes that change; a key
+/// that both sides changed to values of one structure takes that value;
+/// two other changes of one key refuse. The merged dict holds the keys of
+/// the committed dict in its order, then the keys that only the new side
+/// added, in the order of the new dict, each with the key object of its
+/// dict. Puts into `noted` the keys that the new record changed.
+fn keys(
+    heap: &mut Heap,
+    canon: &mut Canon,
+    old: Option<Value>,
+    committed: Value,
+    new: Value,
+    noted: &mut Option<Noted>,
+) -> Result<Value, Outcome> {
+    let not_dicts = Outcome::Undecided("values that the strategy keys does not take");
+    let read = |value: Option<Value>| -> Result<Mapping, Outcome> {
+        let mapping = value
+            .and_then(|value| Mapping::of(heap, value))
+            .ok_or(not_dicts.clone())??;
+        check_shared(
+            heap,
+            &mapping.items,
+            "an object that two keys of a mapping share",
+        )?;
+        Ok(mapping)
+    };
+    let (old, committed, new) = (read(old)?, read(Some(committed))?, read(Some(new))?);
+    // Every key of the three dicts, in the order of the model.
+    let all: BTreeSet<&DictKey> = old
+        .keys
+        .iter()
+        .chain(&committed.keys)
+        .chain(&new.keys)
+        .collect();
+    let changed =
+        |canon: &mut Canon, side: &Mapping, key: &DictKey| match (old.get(key), side.get(key)) {
+            (None, None) => Ok(false),
+            (Some(a), Some(b)) => Ok(!canon.same(heap, a, b).map_err(undecided)?),
+            _ => Ok(true),
+        };
+    let mut by_committed: HashSet<&DictKey> = HashSet::new();
+    let mut by_new: Vec<&DictKey> = Vec::new();
+    for &key in &all {
+        if changed(canon, &committed, key)? {
+            by_committed.insert(key);
+        }
+        if changed(canon, &new, key)? {
+            by_new.push(key);
+        }
+    }
+    *noted = Some(Noted {
+        changed: by_new.len(),
+        texts: by_new
+            .iter()
+            .take(MAX_KEYS)
+            .map(|&key| {
+                let object = new
+                    .key(key)
+                    .or_else(|| old.key(key))
+                    .expect("a changed key");
+                text(heap, object)
+            })
+            .collect(),
+    });
+    let by_new: HashSet<&DictKey> = by_new.into_iter().collect();
+    // The value of each key after the merge. `None` deletes it.
+    let mut merged: HashMap<&DictKey, Option<Value>> = HashMap::with_capacity(all.len());
+    for &key in &all {
+        let (c, n) = (committed.get(key), new.get(key));
+        let value = match (by_committed.contains(key), by_new.contains(key)) {
+            (_, false) => c,
+            (false, true) => n,
+            (true, true) => match (c, n) {
+                (None, None) => None,
+                (Some(c), Some(n)) if canon.same(heap, c, n).map_err(undecided)? => Some(c),
+                (Some(_), Some(_)) => return Err(Outcome::Refused(Reason::KeyChanged)),
+                _ => return Err(Outcome::Refused(Reason::KeyDeleted)),
+            },
+        };
+        merged.insert(key, value);
+    }
+    let mut items = Vec::with_capacity(all.len());
+    for (key, &(object, _)) in committed.keys.iter().zip(&committed.items) {
+        if let Some(&Some(value)) = merged.get(key) {
+            items.push((object, value));
+        }
+    }
+    for (key, &(object, _)) in new.keys.iter().zip(&new.items) {
+        if !committed.places.contains_key(key)
+            && let Some(&Some(value)) = merged.get(key)
+        {
+            items.push((object, value));
+        }
+    }
+    Ok(heap.new_dict(items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns a dict of one key, `key-a`, whose value is a list of `value`.
+    fn dict(heap: &mut Heap, value: i128) -> Value {
+        let key = heap.new_str("key-a");
+        let list = heap.new_list(vec![Value::Int(value)]);
+        heap.new_dict(vec![(key, list)])
+    }
+
+    #[test]
+    fn the_strategy_keys_gives_no_answer_past_its_step_budget() {
+        let mut heap = Heap::with_instances();
+        let (old, committed, new) = (dict(&mut heap, 1), dict(&mut heap, 2), dict(&mut heap, 3));
+        // Each list costs two steps: the first one takes the whole budget.
+        let mut noted = None;
+        let found = keys(
+            &mut heap,
+            &mut Canon::new(2),
+            Some(old),
+            committed,
+            new,
+            &mut noted,
+        );
+        assert_eq!(
+            found,
+            Err(Outcome::Undecided("a merge over its step budget"))
+        );
+        assert!(noted.is_none());
+        // With a larger budget, the merge refuses: key-a changed on both
+        // sides.
+        let found = keys(
+            &mut heap,
+            &mut Canon::new(100),
+            Some(old),
+            committed,
+            new,
+            &mut noted,
+        );
+        assert_eq!(found, Err(Outcome::Refused(Reason::KeyChanged)));
+        assert_eq!(
+            noted.map(|noted| noted.texts),
+            Some(vec!["\"key-a\"".to_owned()])
+        );
+    }
 }

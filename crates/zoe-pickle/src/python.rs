@@ -24,14 +24,15 @@
 //! The model refuses what it does not model, with [`Unsupported`]: an
 //! opaque node, a REDUCE, a Python 2 str, a protocol 0 unicode or list, an
 //! int that does not fit 128 bits, a dict key that is not an int, a str or
-//! bytes, a persistent id of an unknown shape, a container that holds
-//! itself. A caller then leaves the work to Python.
+//! bytes ([`DictKey`]), a persistent id of an unknown shape, a container
+//! that holds itself. A caller then leaves the work to Python.
 //!
 //! A heap of [`Heap::with_instances`] also models the objects of other
 //! classes: an object that NEWOBJ or REDUCE makes, with the state that
-//! BUILD gives it, and a `set` or a `frozenset`. The merges of fields use
-//! such a heap. The merges of BTrees do not: for them, these objects stay
-//! constructs that the model refuses.
+//! BUILD gives it, a `set` or a `frozenset`, and a dict key that is a tuple
+//! of ints, strs and bytes. The merges of fields use such a heap. The
+//! merges of BTrees do not: for them, these values stay constructs that
+//! the model refuses.
 //!
 //! No function here calls itself once per nesting level. The loader, the
 //! comparisons and the pickler use explicit stacks. The objects live in
@@ -177,11 +178,34 @@ enum ReferenceKey {
     MultiOid(String, Vec<u8>),
 }
 
-/// A key of a dict that the model keeps.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum DictKey {
+/// A key of a dict that the model keeps: an int, a str, a bytes, or, in a
+/// heap of [`Heap::with_instances`], a tuple of those. Two keys are one key
+/// of a Python dict when they are equal here. The order is the order of
+/// the variants, then of the values: ints by value, strs by code point,
+/// bytes by byte, and tuples item by item, with the same order for two
+/// items. Python has the same order for two ints, two strs or two bytes,
+/// and for two tuples whose items at each place are of one kind. It has
+/// no order for other pairs. Only the resolution log uses this order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DictKey {
+    /// An int.
     Int(i128),
+    /// A str.
     Str(String),
+    /// A bytes.
+    Bytes(Vec<u8>),
+    /// A tuple of ints, strs and bytes.
+    Tuple(Vec<KeyItem>),
+}
+
+/// An item of a tuple key of a dict.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum KeyItem {
+    /// An int.
+    Int(i128),
+    /// A str.
+    Str(String),
+    /// A bytes.
     Bytes(Vec<u8>),
 }
 
@@ -337,6 +361,11 @@ impl Heap {
     /// Returns a str of `text`, shared as CPython shares it.
     pub fn new_str(&mut self, text: &str) -> Value {
         self.str_object(text)
+    }
+
+    /// Returns a bytes of `data`, shared as CPython shares it.
+    pub fn new_bytes(&mut self, data: &[u8]) -> Value {
+        self.bytes_object(data)
     }
 
     /// Returns a new list of `items`.
@@ -1147,17 +1176,33 @@ impl Heap {
         Ok(items)
     }
 
-    /// Returns the key of a dict key that the model keeps.
-    fn dict_key(&self, key: Value) -> Result<DictKey, Unsupported> {
-        match key {
-            Value::Int(int) => Ok(DictKey::Int(int)),
+    /// Returns the key of `key`, a key of a dict, when the model keeps it:
+    /// an int, a str, a bytes, or, in a heap of [`Heap::with_instances`], a
+    /// tuple of those. A bool and a float are not keys here: Python finds
+    /// them equal to an int.
+    pub fn dict_key(&self, key: Value) -> Result<DictKey, Unsupported> {
+        let other = Unsupported("a dict key of another type");
+        let item = |value: Value| match value {
+            Value::Int(int) => Some(KeyItem::Int(int)),
             Value::Object(id) => match self.get(id) {
-                Object::Str(text) => Ok(DictKey::Str(text.clone())),
-                Object::Bytes(bytes) => Ok(DictKey::Bytes(bytes.clone())),
-                _ => Err(Unsupported("a dict key of another type")),
+                Object::Str(text) => Some(KeyItem::Str(text.clone())),
+                Object::Bytes(bytes) => Some(KeyItem::Bytes(bytes.clone())),
+                _ => None,
             },
-            _ => Err(Unsupported("a dict key of another type")),
+            _ => None,
+        };
+        if let Some(Object::Tuple(items)) = self.object(key) {
+            if !self.instances {
+                return Err(other);
+            }
+            let items: Option<Vec<KeyItem>> = items.iter().map(|&value| item(value)).collect();
+            return items.map(DictKey::Tuple).ok_or(other);
         }
+        Ok(match item(key).ok_or(other)? {
+            KeyItem::Int(int) => DictKey::Int(int),
+            KeyItem::Str(text) => DictKey::Str(text),
+            KeyItem::Bytes(bytes) => DictKey::Bytes(bytes),
+        })
     }
 
     /// Runs `d[key] = value` on the dict of `id` for each pair of `flat`.
@@ -2034,6 +2079,76 @@ mod tests {
         q\x05)\x81q\x06\x8a\x07@\xf3L\xf6^G\x06\x89X\x03\x00\x00\x00UTCq\x07\x87q\x08b\
         X\x07\x00\x00\x00subjectq\tX\x01\x00\x00\x00xq\nX\x01\x00\x00\x00yq\x0b\x86q\x0c\
         X\x04\x00\x00\x00tagsq\rcbuiltins\nset\nq\x0e]q\x0f(K\x01K\x02e\x85q\x10Rq\x11u.";
+
+    #[test]
+    fn a_heap_with_instances_keeps_the_tuple_keys_of_a_dict() {
+        // `{('a', 1): 2, (b'xy',): 3, (): 4}`, as Python 3.13 pickles it.
+        let state = b"\x80\x03}q\x01(X\x01\x00\x00\x00aq\x02K\x01\x86q\x03K\x02\
+            C\x02xyq\x04\x85q\x05K\x03)K\x04u.";
+        let mut heap = Heap::with_instances();
+        let (class, dict) = load(&mut heap, state);
+        assert_eq!(dump(&heap, class, dict), [CLASS, &state[..]].concat());
+        let keys: Vec<DictKey> = heap
+            .dict(dict)
+            .unwrap()
+            .iter()
+            .map(|&(key, _)| heap.dict_key(key).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                DictKey::Tuple(vec![KeyItem::Str("a".to_owned()), KeyItem::Int(1)]),
+                DictKey::Tuple(vec![KeyItem::Bytes(b"xy".to_vec())]),
+                DictKey::Tuple(Vec::new()),
+            ]
+        );
+        // The heap of tier 1 refuses them, and a tuple of a tuple or of a
+        // bool is not a key of the model.
+        let tree = decode_record(&[CLASS, &state[..]].concat()).unwrap();
+        assert_eq!(
+            Heap::new().load(&tree),
+            Err(Unsupported("a dict key of another type"))
+        );
+        for state in [
+            &b"\x80\x03}q\x01X\x01\x00\x00\x00aq\x02\x85q\x03\x85q\x04K\x01s."[..],
+            b"\x80\x03}q\x01X\x01\x00\x00\x00aq\x02\x88\x86q\x03K\x01s.",
+        ] {
+            let tree = decode_record(&[CLASS, state].concat()).unwrap();
+            assert_eq!(
+                Heap::with_instances().load(&tree),
+                Err(Unsupported("a dict key of another type")),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dict_keys_of_one_kind_are_in_the_order_of_python() {
+        let mut keys = vec![
+            DictKey::Str("b".to_owned()),
+            DictKey::Int(10),
+            DictKey::Tuple(vec![KeyItem::Int(1), KeyItem::Int(2)]),
+            DictKey::Str("a".to_owned()),
+            DictKey::Int(-3),
+            DictKey::Tuple(vec![KeyItem::Int(1)]),
+            DictKey::Bytes(b"a".to_vec()),
+            DictKey::Str("\u{e9}".to_owned()),
+        ];
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                DictKey::Int(-3),
+                DictKey::Int(10),
+                DictKey::Str("a".to_owned()),
+                DictKey::Str("b".to_owned()),
+                DictKey::Str("\u{e9}".to_owned()),
+                DictKey::Bytes(b"a".to_vec()),
+                DictKey::Tuple(vec![KeyItem::Int(1)]),
+                DictKey::Tuple(vec![KeyItem::Int(1), KeyItem::Int(2)]),
+            ]
+        );
+    }
 
     #[test]
     fn a_heap_with_instances_loads_objects_and_sets_and_pickles_them_again() {

@@ -263,3 +263,76 @@ def test_a_result_records_the_software_again_when_it_changed(
     path = tmp_path / "result.json"
     path.write_text(json.dumps(result))
     assert report.load(path) == result
+
+
+def test_a_result_holds_the_policy_of_the_runs(tmp_path):
+    policy = {"classes": {"m.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}
+    result = runner.run(
+        log.Log([], []), workdir=tmp_path, stacks=(), speeds=(1,), policy=policy
+    )
+    assert result["policy"] == policy
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(result))
+    assert report.load(path) == result
+    assert report.lines(result)[0] == (
+        "zoe serve runs with a merge policy; its classes: m.Registry"
+    )
+    # Without a policy, the result has none.
+    result = runner.run(log.Log([], []), workdir=tmp_path, stacks=(), speeds=(1,))
+    assert "policy" not in result
+
+
+def test_the_command_refuses_a_policy_that_is_not_valid(tmp_path, capsys):
+    bad = tmp_path / "policy.json"
+    bad.write_text(json.dumps({"classes": {"m.Registry": {"fields": {"data": "x"}}}}))
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--policy", str(bad)]
+    assert command.main(line) == 2
+    assert "is not a merge policy" in capsys.readouterr().err
+
+
+def test_a_run_of_zoe_serve_installs_the_policy_in_its_store(tmp_path):
+    import zoe.policy
+
+    policy = {"classes": {"m.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}
+    with servers.zoe_server(tmp_path) as address:
+        # The oids up to 300 are those of the log.
+        runner.install_policy(servers.client("zoe-native", address), policy, 300)
+        db = ZODB.DB(servers.client("zoe-native", address))
+        try:
+            with db.transaction() as conn:
+                found = zoe.policy.read(conn)
+                oid = conn.root()[zoe.policy.NAME]._p_oid
+        finally:
+            db.close()
+    assert found == {"version": 1, **policy}
+    assert int.from_bytes(oid, "big") > 300
+
+
+def test_a_policy_and_a_timed_transaction_that_writes_the_root_are_refused(
+    tmp_path, capsys
+):
+    # Each transaction of `tids` writes the root.
+    root, [(first, c1), (second, c2)] = tids(tmp_path / "Data.fs", 2)
+    t1 = (root + c1) / 2
+    (tmp_path / "probe").mkdir()
+    request = {"kind": "request", "t": t1, "seconds": c2 - t1 + 0.001, "finishes": 2}
+    (tmp_path / "probe" / "instance0.jsonl").write_text(json.dumps(request) + "\n")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"classes": {}}))
+    line = ["run", "--store", str(tmp_path / "Data.fs"), "--probes"]
+    line += [str(tmp_path / "probe"), "--workdir", str(tmp_path / "work")]
+    line += ["--out", str(tmp_path / "result.json"), "--policy", str(policy)]
+    assert command.main(line) == 2
+    error = capsys.readouterr().err
+    assert f"the timed transaction {first.hex()} writes the root" in error
+    assert not (tmp_path / "result.json").exists()
+    # run refuses it too.
+    starts, _ = log.starts_of_probes(
+        tmp_path / "Data.fs", [tmp_path / "probe" / "instance0.jsonl"]
+    )
+    replayed = log.read_log(tmp_path / "Data.fs", starts)
+    assert runner.root_writes(replayed) == [first, second]
+    with pytest.raises(ValueError, match="writes the root"):
+        runner.run(replayed, workdir=tmp_path, stacks=(), speeds=(1,), policy={})

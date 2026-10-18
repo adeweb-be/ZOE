@@ -4,10 +4,13 @@
     python -m replay report FILE
 
 `run` reads the log of a kept store, replays it, writes the result and
-prints its report. `report` prints the report of a result. Both exit with
+prints its report. With `--policy FILE`, a JSON merge policy of
+`zoe.policy`, each run of `zoe serve` installs it in its store after the
+base. `report` prints the report of a result. Both exit with
 0 when the gate passes and with 1 when it fails. `report` exits with 2
-when FILE is not a result, and `run` when the probe records explain no
-transaction of the store.
+when FILE is not a result, and `run` when the policy is not valid, when a timed
+transaction writes the root with a policy, or when the probe records
+explain no transaction of the store.
 """
 
 import argparse
@@ -54,6 +57,11 @@ def main(argv=None) -> int:
         default=[],
         help="an argument for zoe serve, after its own; repeat it for more",
     )
+    play.add_argument(
+        "--policy",
+        type=Path,
+        help="a JSON merge policy that each run of zoe serve installs after the base",
+    )
     play.add_argument("--workdir", type=Path, required=True)
     play.add_argument("--out", type=Path, required=True)
     show = commands.add_parser("report", help="print the report of a result")
@@ -70,6 +78,16 @@ def main(argv=None) -> int:
         print("\n".join(printed))
         return 0 if printed[-1].startswith("gate passed:") else 1
 
+    policy = None
+    if args.policy is not None:
+        import zoe.policy
+
+        try:
+            policy = zoe.policy.validate(json.loads(args.policy.read_text()))
+        except (OSError, ValueError) as error:
+            message = f"replay: {args.policy} is not a merge policy: {error}"
+            print(message, file=sys.stderr)
+            return 2
     probes = sorted(args.probes.glob("instance*.jsonl"))
     if not probes:
         print(
@@ -93,6 +111,15 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
+    # The root has no resolver: such a transaction would store the root of
+    # the log, without the name of the policy.
+    if policy is not None and (written := runner.root_writes(log)):
+        print(
+            f"replay: --policy: the timed transaction {written[0].hex()} writes the "
+            "root, oid 0, and its record would remove the merge policy from the root",
+            file=sys.stderr,
+        )
+        return 2
     started = time.time()
     result = runner.run(
         log,
@@ -101,6 +128,7 @@ def main(argv=None) -> int:
         speeds=args.speeds,
         repetitions=args.repetitions,
         serve_args=args.zoe_serve_arg,
+        policy=policy,
     )
     result["started"] = started
     result["log"] = {

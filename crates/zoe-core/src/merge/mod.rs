@@ -158,6 +158,12 @@ pub enum Reason {
     /// Tier 2: a field of the strategy `append` that is not an append to
     /// its old value on both sides.
     NotAppend,
+    /// Tier 2, the strategy `keys`: both sides changed a key of a mapping
+    /// to different values.
+    KeyChanged,
+    /// Tier 2, the strategy `keys`: one side deleted a key of a mapping
+    /// that the other side changed.
+    KeyDeleted,
 }
 
 impl Reason {
@@ -197,6 +203,8 @@ impl Reason {
             Reason::FieldDeleted => "Field deleted on one side and changed on the other",
             Reason::Coupled => "Coupled fields changed on both sides",
             Reason::NotAppend => "Field that is not an append to its old value",
+            Reason::KeyChanged => "Key of a mapping changed on both sides",
+            Reason::KeyDeleted => "Key of a mapping deleted on one side and changed on the other",
         }
     }
 }
@@ -223,9 +231,11 @@ pub struct Merge {
     /// The outcome.
     pub outcome: Outcome,
     /// The keys that the new record changed, inserted or deleted, as text,
-    /// in key order: the fields for tier 2. At most [`MAX_KEYS`]; `changed`
-    /// counts them all. With the rules of ADR 0042 in shadow mode, they are
-    /// the keys of the merge of the rules.
+    /// in key order: the fields for tier 2, and the keys of the dict of a
+    /// field that the strategy `keys` merged or refused, in place of that
+    /// field. At most [`MAX_KEYS`]; `changed` counts them all. With the
+    /// rules of ADR 0042 in shadow mode, they are the keys of the merge of
+    /// the rules.
     pub keys: Vec<String>,
     /// The number of keys that the new record changed, inserted or
     /// deleted.
