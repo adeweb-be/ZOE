@@ -28,8 +28,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use zoe_core::{Compression, Oid, Options, Store, Tid};
 
 /// A spawned child keeps a copy of each file descriptor of the test
-/// process until it runs `exec`, the lock of a store too. So each spawn
-/// and each open of a store in this test holds this mutex.
+/// process until `exec` closes them in the child, the lock of a store too.
+/// `Command::spawn` can return before that: the kernel wakes the parent of
+/// a `vfork` before the child closes these copies. So each open of a store
+/// holds this mutex, and each spawn holds it until the child ends.
 static SPAWN: Mutex<()> = Mutex::new(());
 
 fn spawn_lock() -> MutexGuard<'static, ()> {
@@ -66,11 +68,8 @@ fn zoe(args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = {
-        let _spawn = spawn_lock();
-        command.spawn().unwrap()
-    };
-    child.wait_with_output().unwrap()
+    let _spawn = spawn_lock();
+    command.spawn().unwrap().wait_with_output().unwrap()
 }
 
 /// A `PersistentMapping` record whose state holds references to `refs`.

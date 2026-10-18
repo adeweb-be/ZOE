@@ -118,10 +118,13 @@ fn a_stop_closes_only_when_the_send_queue_is_empty() {
     // The server reads the four calls, commits, and fills the socket.
     std::thread::sleep(Duration::from_millis(500));
 
-    let sent = Command::new("kill")
-        .args(["-TERM", &server.pid().to_string()])
-        .status()
-        .unwrap();
+    let sent = {
+        let _spawn = wire::spawn_lock();
+        Command::new("kill")
+            .args(["-TERM", &server.pid().to_string()])
+            .status()
+            .unwrap()
+    };
     assert!(sent.success());
 
     // Another thread of the client sends a heartbeat every 50 ms while the

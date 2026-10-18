@@ -58,10 +58,13 @@ fn record(oid: u64, size: usize) -> Vec<u8> {
 
 /// The clock ticks of `/proc` in one second.
 fn clock_ticks() -> u64 {
-    let output = std::process::Command::new("getconf")
-        .arg("CLK_TCK")
-        .output()
-        .unwrap();
+    let output = {
+        let _spawn = wire::spawn_lock();
+        std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .unwrap()
+    };
     String::from_utf8(output.stdout)
         .unwrap()
         .trim()

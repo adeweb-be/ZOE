@@ -42,10 +42,13 @@ fn get(addr: SocketAddr, path: &str) -> (u16, String) {
 
 #[test]
 fn the_help_names_the_admin_option_and_its_twin() {
-    let output = std::process::Command::new(wire::ZOE)
-        .args(["serve", "--help"])
-        .output()
-        .unwrap();
+    let output = {
+        let _spawn = wire::spawn_lock();
+        std::process::Command::new(wire::ZOE)
+            .args(["serve", "--help"])
+            .output()
+            .unwrap()
+    };
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--admin-listen"));
     assert!(help.contains("ZOE_ADMIN_LISTEN"));

@@ -62,10 +62,13 @@ fn status(conn: &mut Conn, key: &str) -> Value {
 
 #[test]
 fn the_help_names_the_timeout_and_its_twin() {
-    let output = std::process::Command::new(ZOE)
-        .args(["serve", "--help"])
-        .output()
-        .unwrap();
+    let output = {
+        let _spawn = wire::spawn_lock();
+        std::process::Command::new(ZOE)
+            .args(["serve", "--help"])
+            .output()
+            .unwrap()
+    };
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--transaction-timeout"));
     assert!(help.contains("ZOE_TRANSACTION_TIMEOUT"));

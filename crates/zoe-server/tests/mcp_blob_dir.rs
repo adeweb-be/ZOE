@@ -96,10 +96,10 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = {
-            let _spawn = spawn_lock();
-            command.spawn().unwrap()
-        };
+        // The reply to `initialize` comes after `exec`. So the mutex of the
+        // spawns stays held until the end of this call.
+        let _spawn = spawn_lock();
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut session = Session {
@@ -237,7 +237,10 @@ fn without_the_option_verify_is_a_tool_error_for_blobs_elsewhere() {
 
 #[test]
 fn the_help_names_the_option_and_its_twin() {
-    let output = Command::new(ZOE).args(["mcp", "--help"]).output().unwrap();
+    let output = {
+        let _spawn = spawn_lock();
+        Command::new(ZOE).args(["mcp", "--help"]).output().unwrap()
+    };
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--blob-dir"), "{help}");

@@ -28,11 +28,8 @@ fn zoe(args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = {
-        let _spawn = spawn_lock();
-        command.spawn().unwrap()
-    };
-    child.wait_with_output().unwrap()
+    let _spawn = spawn_lock();
+    command.spawn().unwrap().wait_with_output().unwrap()
 }
 
 #[test]

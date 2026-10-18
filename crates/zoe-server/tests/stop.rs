@@ -28,11 +28,7 @@ fn spawn(args: &[&str]) -> (Child, SocketAddr, BufReader<ChildStdout>) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut child = {
-        let _spawn = wire::spawn_lock();
-        command.spawn().unwrap()
-    };
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (child, mut stdout) = wire::spawn_until_output(&mut command);
     loop {
         let mut line = String::new();
         assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "zoe serve stopped");
@@ -78,10 +74,13 @@ fn sigint_stops_the_server_as_sigterm_does() {
     staged.call("ping", vec![]).unwrap();
 
     let started = Instant::now();
-    let sent = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
+    let sent = {
+        let _spawn = wire::spawn_lock();
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+    };
     assert!(sent.success());
     let status = wait(&mut child, Duration::from_secs(20));
     let took = started.elapsed();

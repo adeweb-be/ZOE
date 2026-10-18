@@ -33,9 +33,9 @@ use zoe_core::{Oid, Options, Store, Tid};
 const ZOE: &str = env!("CARGO_BIN_EXE_zoe");
 
 /// A spawned child keeps a copy of each file descriptor of the test
-/// process until its `exec` returns, the lock of a store too. So each open
-/// of a store holds this mutex, and each spawn holds it until the child
-/// ends.
+/// process until `exec` closes them in the child, the lock of a store too.
+/// So each open of a store holds this mutex, and each spawn holds it until
+/// the child ends.
 static SPAWN: Mutex<()> = Mutex::new(());
 
 fn spawn_lock() -> MutexGuard<'static, ()> {

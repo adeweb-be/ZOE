@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -31,7 +31,6 @@ mod wire;
 
 use wire::{
     Conn, MAX, Server, Value, ZOE, begin, commit, fresh_dir, load, new_oids, p64, record, s,
-    spawn_lock,
 };
 
 fn get(addr: SocketAddr, path: &str) -> String {
@@ -173,8 +172,7 @@ fn values_of<'a>(value: &'a serde_json::Value, key: &str, out: &mut Vec<&'a serd
 fn a_long_lock_is_logged_with_its_oid_and_its_client() {
     let dir = fresh_dir("lock-warn");
     let log = dir.join("stderr.log");
-    let mut child = {
-        let _spawn = spawn_lock();
+    let (mut child, mut stdout) = wire::spawn_until_output(
         Command::new(ZOE)
             .args([
                 "serve",
@@ -189,11 +187,8 @@ fn a_long_lock_is_logged_with_its_oid_and_its_client() {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(File::create(&log).unwrap())
-            .spawn()
-            .unwrap()
-    };
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            .stderr(File::create(&log).unwrap()),
+    );
     let addr: SocketAddr = loop {
         let mut line = String::new();
         assert!(
