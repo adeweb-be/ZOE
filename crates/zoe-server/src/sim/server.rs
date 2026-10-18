@@ -92,8 +92,8 @@ impl zoe_client::Runtime for SimRuntime {
 }
 
 /// Return the task that serves the connection `conn` of `client` to the
-/// server of `generation` on `stream`, as the accept loop of `zoe serve` starts
-/// it, with the default bounds of `zoe serve`.
+/// server of `generation` on `stream`, as the accept loop of `zoe serve`
+/// starts it, with the default bounds of `zoe serve`.
 pub(crate) fn accept(
     shared: &Arc<Shared>,
     client: usize,

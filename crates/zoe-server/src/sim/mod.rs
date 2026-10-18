@@ -200,16 +200,20 @@ pub struct Report {
     /// The votes of the split writers that split a bucket and got no
     /// reply: a crash or a lost connection came before the reply.
     pub interrupted_split_votes: usize,
-    /// The locks that the finishes of the acknowledged commits of the split
-    /// writers whose vote wrote an oid that they did not store handed off.
+    /// The locks that finishes handed off, summed over the acknowledged
+    /// commits of the split writers whose vote wrote an oid that the
+    /// commit did not store. In a tree of one node, such a finish hands off
+    /// nothing (ADR 0049, section 12), so a count above 0 is a hand-off of
+    /// the node or of the new bucket of the transaction, or breaks that
+    /// premise.
     pub split_handoffs: usize,
     /// The locks that the finish of an acknowledged commit of a split
     /// writer whose vote resolved oids handed off beyond the records of
     /// its commit, summed over those commits. The finish hands off only
-    /// staged oids, so a hand-off of an oid that the vote dropped makes
-    /// one. It must be 0. The observer of the core gives a count for each
-    /// finish, not the oids: a hand-off of a dropped oid in place of a
-    /// staged one does not count here.
+    /// staged oids, so this is a general bound, and it must be 0. It fires
+    /// only when a finish hands off more locks than its commit has
+    /// records: the observer of the core gives a count for each finish,
+    /// not the oids.
     pub excess_handoffs: usize,
     /// The locks that the finishes of the acknowledged commits of the split
     /// writers handed off. The other hand-offs of `handoffs` are those of

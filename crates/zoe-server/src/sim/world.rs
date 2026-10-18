@@ -614,9 +614,10 @@ pub(crate) fn killed() -> bool {
 }
 
 /// Start a thread of the server generation `generation` for the
-/// connection `conn` of `client`. The thread waits for the baton before it runs `work`. It
-/// waits for its channels on a waiter of the simulation. When `work`
-/// returns, the thread tells the driver that it ended.
+/// connection `conn` of `client`. The thread waits for the baton before
+/// it runs `work`. It waits for its channels on a waiter of the
+/// simulation. When `work` returns, the thread tells the driver that it
+/// ended.
 pub(crate) fn spawn_thread(
     shared: &Arc<Shared>,
     generation: u32,

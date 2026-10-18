@@ -362,8 +362,8 @@ pub(crate) struct Checked {
     /// The oids that acknowledged commits stored and that their votes
     /// resolved without a record.
     pub(crate) dropped: usize,
-    /// The locks that the finishes of the acknowledged commits whose vote
-    /// wrote an oid that they did not store handed off.
+    /// The locks that finishes handed off, summed over the acknowledged
+    /// commits whose vote wrote an oid that the commit did not store.
     pub(crate) split_handoffs: usize,
     /// The locks that the finish of an acknowledged commit whose vote
     /// resolved oids handed off beyond the records of its commit.

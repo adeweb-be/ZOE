@@ -24,8 +24,8 @@
 //! vote dropped them; each transaction of the store reads, a commit that
 //! a crash interrupted and that landed included. The finish of each
 //! acknowledged commit whose vote resolved oids handed off no more locks
-//! than the records of its commit, so it handed off no dropped oid in
-//! addition to them. After the run: no acknowledged commit is lost, no
+//! than the records of its commit, and the finish of each vote that wrote
+//! Y handed off no lock. After the run: no acknowledged commit is lost, no
 //! client read a record older than one that it knew committed, and the
 //! store passes the checks of `zoe verify`. Over the seeds, votes wrote Y,
 //! dropped oids, finishes handed off locks, and crashes or lost
@@ -70,6 +70,15 @@ fn check(seed: u64, report: &Report) {
     assert_eq!(
         report.excess_handoffs, 0,
         "ZOE_SIM_SEED={seed}: a finish handed off more locks than its commit wrote"
+    );
+    // In a tree of one node, the finish of a vote that wrote Y hands off
+    // nothing: every other writer of the bucket or of Y takes the lock of
+    // the node first, and the vote holds it until its commit is durable.
+    // So a hand-off there is of the node or of X, or breaks the premise of
+    // section 12 of ADR 0049.
+    assert_eq!(
+        report.split_handoffs, 0,
+        "ZOE_SIM_SEED={seed}: the finish of a vote that wrote Y handed off a lock"
     );
 }
 
