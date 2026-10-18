@@ -1,6 +1,6 @@
 # 0050. The registry backend: a moved registry keeps its records in a durable namespace of its own
 
-Status: proposed. The checkpoint of ZOE-217 (step 1), revised after its adversarial review on the pull request (#472). It amends ADR 0043: item 2 of "Claude's choices" (the registry backend is not built) and the consequence on a copy through the ZODB iterator. It adds an opt-in backend to `zoe.plone` and a public Python API (`zoe.plone.registry`). It changes no on-disk format, no wire protocol and no code of the core.
+Status: accepted. The checkpoint of ZOE-217 (step 1), revised after its adversarial review on the pull request (#472). The human approved it with the recommendation of each of its 15 questions. It amends ADR 0043: item 2 of "Claude's choices" (the registry backend is not built) and the consequence on a copy through the ZODB iterator. It adds an opt-in backend to `zoe.plone` and a public Python API (`zoe.plone.registry`). It changes no on-disk format, no wire protocol and no code of the core.
 
 This is a new ADR, not an edit of ADR 0043. ADR 0043 is accepted with the answers of the human: the key spaces, the protocol extension, `zoe.kv` and the rules of the namespaces. This ADR changes none of them. It builds a backend of `zoe.plone` on them, as ADR 0047 does for queued indexing. When the human accepts it, the status of ADR 0043 names it, and its item 2 points here.
 
