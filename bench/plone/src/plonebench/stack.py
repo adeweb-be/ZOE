@@ -204,6 +204,10 @@ class Settings:
     # store before the instances start. None writes nothing, so the store
     # keeps the policy of the fixture.
     split_merges: str | None = None
+    # The switch `folder_orders` of the merge policy (ADR 0052): `on`,
+    # `shadow` or `off`, with the tier 2 entry of the class of the folders
+    # of the fixture. None writes nothing.
+    folder_orders: str | None = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -211,20 +215,32 @@ class Settings:
 
 # The modes of the switch `split_merges`.
 SPLIT_MERGES = ("on", "shadow", "off")
+# The modes of the switch `folder_orders`.
+FOLDER_ORDERS = SPLIT_MERGES
+# The class of the folders of the fixture, and the tier 2 entry that the
+# order merge needs for it (ADR 0052, section 5).
+FOLDER_CLASS = "plone.app.contenttypes.content.Folder"
+FOLDER_ENTRY = {
+    "tier2": "on",
+    "default": "strict",
+    "fields": {"modification_date": "max"},
+}
 
 
 def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
-    """Return why the run cannot write the switch `split_merges` of the
-    settings into the store of `config`, or None when it can."""
-    mode = settings.split_merges
-    if mode is None:
-        return None
-    if mode not in SPLIT_MERGES:
-        return f"--split-merges {mode!r} is not one of {', '.join(SPLIT_MERGES)}"
-    if config.server != "zoe" or config.section != "zoeclient":
-        return (
-            f"--split-merges needs a stack of zoe serve with zoedb, not {config.name}"
-        )
+    """Return why the run cannot write the switches `split_merges` and
+    `folder_orders` of the settings into the store of `config`, or None
+    when it can."""
+    for option, mode in (
+        ("--split-merges", settings.split_merges),
+        ("--folder-orders", settings.folder_orders),
+    ):
+        if mode is None:
+            continue
+        if mode not in SPLIT_MERGES:
+            return f"{option} {mode!r} is not one of {', '.join(SPLIT_MERGES)}"
+        if config.server != "zoe" or config.section != "zoeclient":
+            return f"{option} needs a stack of zoe serve with zoedb, not {config.name}"
     return None
 
 
@@ -234,7 +250,7 @@ def campaign_settings(config: StackConfig, settings: Settings) -> Settings:
     mixed stacks runs each of them."""
     if config.server == "zoe" and config.section == "zoeclient":
         return settings
-    return dataclasses.replace(settings, split_merges=None)
+    return dataclasses.replace(settings, split_merges=None, folder_orders=None)
 
 
 def split_merges_policy(current: dict | None, mode: str) -> dict:
@@ -245,6 +261,21 @@ def split_merges_policy(current: dict | None, mode: str) -> dict:
     policy = {key: value for key, value in (current or {}).items() if key != "version"}
     policy.setdefault("classes", {})
     policy["split_merges"] = mode
+    return policy
+
+
+def folder_orders_policy(current: dict | None, mode: str) -> dict:
+    """Return the policy `current`, or none, with the switch
+    `folder_orders` set to `mode` and the tier 2 entry `FOLDER_ENTRY` for
+    `FOLDER_CLASS` (ADR 0052). The other classes and switches stay."""
+    policy = {key: value for key, value in (current or {}).items() if key != "version"}
+    classes = dict(policy.get("classes", {}))
+    entry = dict(classes.get(FOLDER_CLASS, {}))
+    entry.update({"tier2": "on", "default": entry.get("default", "strict")})
+    entry["fields"] = {**entry.get("fields", {}), **FOLDER_ENTRY["fields"]}
+    classes[FOLDER_CLASS] = entry
+    policy["classes"] = classes
+    policy["folder_orders"] = mode
     return policy
 
 

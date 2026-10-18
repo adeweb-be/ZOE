@@ -201,13 +201,16 @@ def run(options: RunOptions) -> Path:
             sample.watch(
                 "server", st.processes["server"].pid, layout["zoe"] / "zoe.redb"
             )
-        if options.settings.split_merges is not None:
-            # The switch commits before the instances start, so every
-            # transaction of the run votes with it. Its client does not
+        switches = (options.settings.split_merges, options.settings.folder_orders)
+        if any(mode is not None for mode in switches):
+            # The switches commit before the instances start, so every
+            # transaction of the run votes with them. Their client does not
             # count in the startup of the stack.
             written = time.time()
             out = st.run_script(
-                "split_merges.py", options.settings.split_merges, name="policy"
+                "split_merges.py",
+                *(mode or "-" for mode in switches),
+                name="policy",
             )
             result["merge_policy"] = json.loads(out.strip().splitlines()[-1])
             result["policy_seconds"] = time.time() - written

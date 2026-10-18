@@ -268,6 +268,47 @@ def test_the_switch_split_merges_goes_into_the_policy_of_the_store():
     assert current["version"] == 3
 
 
+def test_the_switch_folder_orders_goes_into_the_policy_with_the_folder_entry():
+    import argparse
+
+    from plonebench.__main__ import add_run, settings_of
+
+    assert stack.Settings().folder_orders is None
+    parser = argparse.ArgumentParser()
+    add_run(parser)
+    settings = settings_of(
+        parser.parse_args(["--split-merges", "on", "--folder-orders", "on"])
+    )
+    assert settings.folder_orders == "on"
+    assert settings.to_json()["folder_orders"] == "on"
+    assert stack.split_merges_refusal(stack.STACKS["zoe-native-qi"], settings) is None
+    assert "folder-orders" in stack.split_merges_refusal(
+        stack.STACKS["zeo"], stack.Settings(folder_orders="on")
+    )
+    assert stack.split_merges_refusal(
+        stack.STACKS["zoe-native-qi"], stack.Settings(folder_orders="sometimes")
+    )
+    current = {
+        "version": 2,
+        "split_merges": "on",
+        "classes": {stack.FOLDER_CLASS: {"tier2": "shadow", "fields": {"title": "lww"}}},
+    }
+    assert stack.folder_orders_policy(current, "on") == {
+        "split_merges": "on",
+        "folder_orders": "on",
+        "classes": {
+            stack.FOLDER_CLASS: {
+                "tier2": "on",
+                "default": "strict",
+                "fields": {"title": "lww", "modification_date": "max"},
+            }
+        },
+    }
+    # A campaign drops the switch for a stack that does not take it.
+    zeo = stack.campaign_settings(stack.STACKS["zeo"], settings)
+    assert zeo.folder_orders is None and zeo.split_merges is None
+
+
 def test_a_campaign_gives_the_switch_only_to_the_stacks_that_take_it():
     import argparse
 
