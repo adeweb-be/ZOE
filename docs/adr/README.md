@@ -53,3 +53,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0047](0047-queued-indexing.md) | Queued indexing: a save writes its catalog operations to a durable namespace, and one indexer applies them (accepted) |
 | [0048](0048-the-split-merge.md) | The split merge: tier 1 merges the splits of a BTree, and a read-current node lets a split of another child through (accepted) |
 | [0049](0049-the-split-merge-keeps-the-bucket.md) | The split merge keeps the bucket of the committed side: rule 3 writes into it, and a declared client invalidates it (accepted) |
+| [0052](0052-the-order-of-a-folder-merges-at-the-vote.md) | The order of a folder of plone.folder merges at the vote: the order list and its positions change together (proposed) |
