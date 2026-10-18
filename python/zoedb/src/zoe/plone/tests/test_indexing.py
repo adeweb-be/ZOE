@@ -6,6 +6,7 @@ They run with `bin/test -s zoe.plone` of a Plone instance, on the layer of
 uninstalls it at its end.
 """
 
+import itertools
 import json
 import logging
 import shutil
@@ -35,6 +36,7 @@ from Products.CMFCore.CatalogTool import CatalogTool
 from Products.CMFCore.indexing import PortalCatalogProcessor
 from Products.CMFCore.interfaces import IPortalCatalogQueueProcessor
 from Testing.makerequest import makerequest
+from ZODB.FileStorage import FileStorage
 from ZODB.POSException import ConflictError, POSKeyError, StorageError
 from ZODB.serialize import referencesf
 from ZODB.utils import load_current
@@ -43,6 +45,7 @@ from zope.component.hooks import setSite
 from zope.event import notify
 from zope.globalrequest import clearRequest, getRequest, setRequest
 from zope.lifecycleevent import ObjectModifiedEvent
+from zope.processlifetime import DatabaseOpenedWithRoot
 
 import zoe
 import zoe.kv
@@ -140,6 +143,32 @@ def add_second_site(test, name="second"):
     site = app[name]["site"]
     assert aq_base(site.portal_catalog)._p_jar.db() is second
     return site
+
+
+def stop_services(test):
+    """At the end of the test, stop each thread of `indexing._services`
+    and forget the root database, before the databases close."""
+
+    def stop():
+        services = list(indexing._services.values())
+        for service in services:
+            service.stop()
+        for service in services:
+            service.join(TIMEOUT)
+        indexing._services.clear()
+        indexing._root.clear()
+
+    test.addCleanup(stop)
+
+
+def wait_for_empty(*portals):
+    """Wait until the queue of each site of `portals` is empty."""
+    deadline = time.monotonic() + TIMEOUT
+    while time.monotonic() < deadline and any(
+        queue_of(portal).scan(limit=1) for portal in portals
+    ):
+        time.sleep(0.05)
+    transaction.begin()
 
 
 def drain(portal, **kwargs):
@@ -836,6 +865,69 @@ class TestSecondDatabase(IndexingTestCase):
             self.addCleanup(service.stop)
         return services
 
+    def mount(self, name):
+        """Make `/<name of the second database>` the mount point of the
+        database `name` in the configuration of Zope, until the end of the
+        test."""
+        patcher = mock.patch.object(
+            indexing,
+            "_mount_paths",
+            return_value=[(f"/{self.second.database_name}", name)],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def services(self):
+        """Make a thread for each of the two databases, and do not start
+        them. Return the two threads."""
+        root = indexing._Service(self.db, self.db)
+        second = indexing._Service(self.second, self.db)
+        for service in (root, second):
+            indexing._services[id(service._db)] = service
+            self.addCleanup(indexing._services.pop, id(service._db), None)
+        return root, second
+
+    def test_each_thread_finds_the_sites_of_its_own_database(self):
+        self.mount(self.second.database_name)
+        root, second = self.services()
+        second._find_sites()
+        self.assertEqual(second._sites, {self.site.getPhysicalPath()})
+        self.assertEqual(root._sites, set())
+        root._find_sites()
+        self.assertEqual(root._sites, {self.portal.getPhysicalPath()})
+        self.assertEqual(second._sites, {self.site.getPhysicalPath()})
+
+    def test_a_thread_skips_the_mount_points_of_another_database(self):
+        self.mount("another")
+        root, second = self.services()
+        second._find_sites()
+        root._find_sites()
+        self.assertEqual(second._sites, set())
+        self.assertEqual(root._sites, {self.portal.getPhysicalPath()})
+
+    def test_the_event_starts_one_thread_for_each_database(self):
+        self.mount(self.second.database_name)
+        # The keys of both sites, before any thread runs: no commit wakes a
+        # thread, so only the search of the sites finds them.
+        first, second = self.token(), self.token()
+        self.save_in(self.portal, f"Root {first}", create=True)
+        self.save_in(self.site, f"Second {second}", create=True)
+        self.assertEqual(indexing._services, {})
+        stop_services(self)
+        indexing.database_opened(DatabaseOpenedWithRoot(self.db))
+        self.assertEqual(set(indexing._services), {id(self.db), id(self.second)})
+        self.assertEqual(
+            {service._db for service in indexing._services.values()},
+            {self.db, self.second},
+        )
+        wait_for_empty(self.portal, self.site)
+        self.assertEqual(
+            self.search(SearchableText=first), [path_of(self.portal["doc"])]
+        )
+        self.assertEqual(
+            self.site_search(SearchableText=second), [path_of(self.site["doc"])]
+        )
+
     def test_two_sites_in_two_databases_get_two_leases(self):
         threads = self.start_threads()
         self.assertEqual(len({id(thread) for thread in threads}), 2)
@@ -914,6 +1006,85 @@ class TestSecondDatabase(IndexingTestCase):
 
 
 class TestService(IndexingTestCase):
+    def test_a_run_stops_when_another_thread_holds_the_lease(self):
+        portal = self.portal
+        catalog = aq_base(portal.portal_catalog)
+        portal.invokeFactory("Document", "doc", title="Document")
+        transaction.commit()
+        lease = zoe.kv.Namespace(catalog._p_jar, "ephemeral", indexing.LEASE)
+        lease.set(catalog._p_oid, b"another thread", ttl=indexing.LEASE_TTL)
+        transaction.commit()
+        indexer = indexing.Indexer(portal)
+        indexer._lease = b"this thread"
+        self.assertEqual(indexer.run(), 0)
+        transaction.begin()
+        self.assertTrue(queue_of(portal).scan(limit=1))
+        lease.delete(catalog._p_oid)
+        transaction.commit()
+        self.assertGreater(indexer.run(), 0)
+        transaction.begin()
+        self.assertEqual(queue_of(portal).scan(), [])
+        self.assertEqual(lease.get(catalog._p_oid), b"this thread")
+
+    def test_a_root_without_namespaces_starts_only_the_mounted_thread(self):
+        directory = tempfile.mkdtemp(prefix="zoe-plone-root-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        root = ZODB.DB(FileStorage(f"{directory}/Data.fs"), database_name="main")
+        self.addCleanup(root.close)
+        mounted = ZODB.DB(
+            zoe.Storage(f"{directory}/zoe"),
+            databases=root.databases,
+            database_name="mounted",
+        )
+        self.addCleanup(mounted.close)
+        # The threads stop before the databases close.
+        stop_services(self)
+        with mock.patch.object(indexing, "_mount_paths", return_value=[]):
+            indexing.database_opened(DatabaseOpenedWithRoot(root))
+            self.assertEqual(list(indexing._services), [id(mounted)])
+            self.assertIs(indexing._services[id(mounted)]._db, mounted)
+            self.assertIs(indexing._root["db"], root)
+
+    def test_a_failing_site_leaves_the_others_served(self):
+        portal = self.portal
+        db = portal._p_jar.db()
+        portal.invokeFactory("Document", "doc", title="Document")
+        transaction.commit()
+        broken = ("", "broken")
+        calls = []
+        serve = indexing._Service._serve
+
+        def failing(service, path):
+            if path == broken:
+                calls.append(time.monotonic())
+                raise RuntimeError("a broken site")
+            return serve(service, path)
+
+        patcher = mock.patch.object(indexing._Service, "_serve", failing)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        service = indexing._Service(db, db)
+        indexing._services[id(db)] = service
+        stop_services(self)
+        service.add(broken)
+        with self.assertLogs(indexing.logger, logging.ERROR) as logs:
+            service.start()
+            word = self.token()
+            edit(portal["doc"], f"Edited {word}")
+            transaction.commit()
+            wait_for_empty(portal)
+            self.assertEqual(self.search(SearchableText=word), [path_of(portal["doc"])])
+            # Without a pause, the thread tries the broken site every
+            # `POLL` seconds. With it, the pauses double from 0.4 s.
+            time.sleep(2.0)
+            service.stop()
+            service.join(TIMEOUT)
+        self.assertGreaterEqual(len(calls), 2)
+        gaps = [b - a for a, b in itertools.pairwise(calls)]
+        self.assertGreater(min(gaps), indexing.POLL * 1.5)
+        self.assertIn("broken", logs.output[0])
+        self.assertEqual(service._failures[broken][0], len(calls))
+
     def test_the_lease_has_one_holder(self):
         db = self.portal._p_jar.db()
         oid = aq_base(self.portal.portal_catalog)._p_oid
