@@ -10,10 +10,16 @@
 //! the spike on real BTrees is the Python test `test_zoe_split_merges.py`.
 
 use std::collections::BTreeSet;
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Mode, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError};
+use zoe_core::{
+    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, Waiter,
+    ZoeError,
+};
 use zoe_pickle::btrees::{BucketState, TreeState, bucket_state, new_bucket_state, tree_state};
 use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
 
@@ -251,6 +257,12 @@ fn open(mode: Option<&str>) -> Store {
 /// Opens a store whose policy sets `split_merges` to `mode` and the mode of
 /// tier 1 of each class of `tier1`.
 fn open_with(mode: Option<&str>, tier1: &[(&str, &str)]) -> Store {
+    open_on(SystemClock, mode, tier1)
+}
+
+/// Opens a store on `clock` whose policy sets `split_merges` to `mode` and
+/// the mode of tier 1 of each class of `tier1`.
+fn open_on(clock: impl Clock + 'static, mode: Option<&str>, tier1: &[(&str, &str)]) -> Store {
     let options = Options {
         structural_merges: zoe_core::StructuralMerges {
             resolution_log: true,
@@ -258,7 +270,7 @@ fn open_with(mode: Option<&str>, tier1: &[(&str, &str)]) -> Store {
         },
         ..Options::default()
     };
-    let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+    let store = Store::open_full(MemVfs::new(), clock, options).unwrap();
     let oid = new_oid(&store);
     let tid = commit(&store, &[(oid, Tid::ZERO, policy(mode, tier1))]);
     commit(&store, &[(Oid(0), Tid::ZERO, root(oid))]);
@@ -1612,6 +1624,50 @@ fn a_bucket_of_the_other_side_that_another_transaction_locks_gives_no_answer() {
     assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 50, 60, 70, 90]);
 }
 
+/// The reason of rule 3 when the lock of the new bucket of the other side
+/// is not free (ADR 0049, section 9).
+const LOCKED: &str = "a bucket of the other side that another transaction locks";
+
+#[test]
+fn a_failed_lock_of_the_bucket_of_the_other_side_gives_a_line_with_its_reason() {
+    let store = open(Some("on"));
+    let tree = two_buckets(&store);
+    let y = split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let s1 = serial(&store, y);
+    // Another transaction writes Y without the node and holds its lock.
+    let mut other = writing(&store, &[(y, s1, bucket(II, &ints(&[60, 70, 90]), None))]);
+    other.vote().unwrap();
+    let x = new_oid(&store);
+    let mut s2 = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    let voted = s2.vote();
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
+    // The node gets the entry of rule 3, with the outcome `undecided` and
+    // the reason of the failed lock.
+    let found: Vec<_> = s2
+        .resolutions()
+        .iter()
+        .filter(|r| r.oid == tree.root && r.split == Some(3))
+        .map(|r| (r.mode, r.outcome))
+        .collect();
+    assert_eq!(
+        found,
+        [(Mode::On, Resolved::Undecided(LOCKED))],
+        "{:?}",
+        s2.resolutions()
+    );
+    let lines = s2.resolution_log_lines(SystemTime::now(), None);
+    let reason = format!("\"reason\":\"{LOCKED}\"");
+    assert!(
+        lines.iter().any(|line| line.contains("\"split\":3")
+            && line.contains("\"outcome\":\"undecided\"")
+            && line.contains(&reason)),
+        "{lines:?}"
+    );
+    other.finish().unwrap();
+    drop(s2);
+    assert!(store.lock_table_is_empty());
+}
+
 #[test]
 fn shadow_mode_takes_no_lock_of_the_bucket_of_the_other_side() {
     let store = open(Some("shadow"));
@@ -1703,5 +1759,165 @@ fn an_undo_that_runs_with_the_merge_is_never_lost() {
     u.finish().unwrap();
     let keys = walk(&store, tree.root).1;
     assert_eq!(keys, [10, 20, 30, 40, 50, 60, 70]);
+    assert!(store.lock_table_is_empty());
+}
+
+/// A clock of the system that counts the waiters that it gives and the
+/// waits on them. Each wait of the core gets its waiter from the clock of
+/// the store, so the counts tell when a vote waits.
+#[derive(Clone, Default)]
+struct Counting {
+    waiters: Arc<AtomicUsize>,
+    waits: Arc<AtomicUsize>,
+}
+
+impl Clock for Counting {
+    fn now(&self) -> SystemTime {
+        SystemClock.now()
+    }
+
+    fn waiter(&self) -> Arc<dyn Waiter> {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        Arc::new(Counted {
+            inner: SystemClock.waiter(),
+            waits: Arc::clone(&self.waits),
+        })
+    }
+}
+
+struct Counted {
+    inner: Arc<dyn Waiter>,
+    waits: Arc<AtomicUsize>,
+}
+
+impl Waiter for Counted {
+    fn wait(&self, timeout: Duration) {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        self.inner.wait(timeout);
+    }
+
+    fn wake(&self) {
+        self.inner.wake();
+    }
+}
+
+/// A point where the thread of a finish stops while the gate is armed,
+/// until the test opens it.
+#[derive(Default)]
+struct Gate {
+    armed: AtomicBool,
+    held: AtomicBool,
+    open: AtomicBool,
+}
+
+impl Gate {
+    fn pass(&self) {
+        if self.armed.load(Ordering::SeqCst) {
+            self.held.store(true, Ordering::SeqCst);
+            while !self.open.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// An observer that stops the finish after the sync of its batch, and
+/// after the end of its commit in flight, before it releases its locks.
+#[derive(Default)]
+struct Gates {
+    synced: Gate,
+    handed_off: Gate,
+}
+
+impl Observer for Gates {
+    fn batch_synced(&self, _: usize) {
+        self.synced.pass();
+    }
+
+    fn locks_handed_off(&self, _: usize) {
+        self.handed_off.pass();
+    }
+}
+
+fn wait_until(done: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_vote_woken_by_the_end_of_a_commit_in_flight_merges_before_the_holder_releases() {
+    let clock = Counting::default();
+    let store = open_on(clock.clone(), Some("on"), &[]);
+    let gates = Arc::new(Gates::default());
+    assert!(store.set_observer(gates.clone()));
+    let root = new_oid(&store);
+    let read = commit(
+        &store,
+        &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
+    );
+    // S1 splits the inline bucket into two new buckets, and holds the
+    // locks of the root and of both buckets after its vote.
+    let (a1, y1) = (new_oid(&store), new_oid(&store));
+    let mut s1 = writing(
+        &store,
+        &[
+            (root, read, leaf_node(II, a1, &[(Key::Int(30), y1)])),
+            (a1, Tid::ZERO, bucket(II, &ints(&[10, 20]), Some(y1))),
+            (y1, Tid::ZERO, bucket(II, &ints(&[30, 40]), None)),
+        ],
+    );
+    s1.vote().unwrap();
+    // S2 read before S1 and splits the inline bucket too.
+    let (a, x) = (new_oid(&store), new_oid(&store));
+    let writes = [
+        (root, read, leaf_node(II, a, &[(Key::Int(20), x)])),
+        (a, Tid::ZERO, bucket(II, &ints(&[10]), Some(x))),
+        (x, Tid::ZERO, bucket(II, &ints(&[20, 25, 30]), None)),
+    ];
+    let waiters = clock.waiters.load(Ordering::SeqCst);
+    let waits = clock.waits.load(Ordering::SeqCst);
+    thread::scope(|scope| {
+        let store = &store;
+        let second = scope.spawn(move || {
+            let mut s2 = writing(store, &writes);
+            let voted = s2.vote();
+            (voted, s2)
+        });
+        // S2 waits in the queue of the root, so the finish of S1 hands the
+        // root off to it.
+        wait_until(|| clock.waits.load(Ordering::SeqCst) > waits);
+        gates.synced.armed.store(true, Ordering::SeqCst);
+        gates.handed_off.armed.store(true, Ordering::SeqCst);
+        let finish = scope.spawn(move || s1.finish());
+        // S2 has the root and waits for the commit in flight of S1, whose
+        // batch is synced.
+        wait_until(|| {
+            gates.synced.held.load(Ordering::SeqCst)
+                && (clock.waiters.load(Ordering::SeqCst) >= waiters + 2 || second.is_finished())
+        });
+        let woken = clock.waiters.load(Ordering::SeqCst);
+        gates.synced.open.store(true, Ordering::SeqCst);
+        // The end of the commit of S1 wakes S2. S1 stops before it releases
+        // the locks of its two new buckets. Open the gate when S2 voted, or
+        // when S2 waits again: a wait for the release of S1.
+        wait_until(|| gates.handed_off.held.load(Ordering::SeqCst));
+        wait_until(|| second.is_finished() || clock.waiters.load(Ordering::SeqCst) > woken);
+        gates.handed_off.open.store(true, Ordering::SeqCst);
+        finish.join().unwrap().unwrap();
+        let (voted, s2) = second.join().unwrap();
+        // The new buckets of S1 are free once S1 releases them: S2 needs
+        // no `ConflictError`.
+        assert!(voted.is_ok(), "{voted:?}: {:?}", s2.resolutions());
+        assert!(s2.wrote_unstored());
+        s2.finish().unwrap();
+    });
+    let (buckets, keys) = walk(&store, root);
+    assert_eq!(buckets, [a1, y1]);
+    assert_eq!(keys, [10, 20, 25, 30, 40]);
+    assert!(store.load(a).is_err());
+    assert!(store.load(x).is_err());
     assert!(store.lock_table_is_empty());
 }
