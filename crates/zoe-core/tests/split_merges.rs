@@ -1288,3 +1288,26 @@ fn a_delete_by_the_transaction_in_the_range_gives_no_answer() {
         "{resolutions:?}"
     );
 }
+
+#[test]
+fn a_refusal_on_a_bucket_whose_tier_1_is_off_fails_as_without_the_switch() {
+    // Tier 1 runs on the node, and not on its buckets.
+    let store = open_with(Some("on"), &[("BTrees.IIBTree.IIBucket", "off")]);
+    let tree = two_buckets(&store);
+    // The other side inserts 70 into the second bucket, without a split.
+    let other = bucket(II, &ints(&[40, 50, 60, 70]), None);
+    let current = commit(&store, &[(tree.buckets[1], tree.tid, other.clone())]);
+    // The transaction splits it and inserts 70 too.
+    let x = new_oid(&store);
+    let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 50], &[60, 70]));
+    let voted = txn.vote();
+    let anchor = tree.buckets[1];
+    assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == anchor));
+    assert_eq!(txn.conflict_serials(), Some((current, tree.tid)));
+    // The rules and tier 1 leave no entry: the bucket goes to the caller.
+    assert!(txn.resolutions().is_empty(), "{:?}", txn.resolutions());
+    txn.abort();
+    // No update is lost: the store keeps the commit of the other side.
+    assert_eq!(store.load(anchor).unwrap(), (other, current));
+    assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 50, 60, 70]);
+}
