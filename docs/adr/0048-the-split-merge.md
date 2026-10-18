@@ -2,7 +2,7 @@
 
 Status: accepted. The checkpoint of ZOE-219 (step 2). The human approved it with the recommendation of each of the questions at its end, the widened scope fence of question 4 among them. It adds three rules to tier 1, where ZODB's resolver refuses, and a switch of the merge policy. It changes an invariant of the vote: a stale read-current oid can pass. It needs code in the vote (`crates/zoe-core/src/commit/`). After the build, the human approved the order of key references on the values of the range too (section 2, "The order of the keys"). It changes no on-disk format, no pack and no wire protocol.
 
-The amendment of ZOE-225 is **proposed: it waits for the human**. Rule 1 also lets a node through when the other side replaced a child that is not a path child of the transaction (sections 1, 2 and 3), and the vote writes a line of the resolution log for each read-current node that fails it (section 5). Its questions are at the end ("Questions for the human: the amendment of ZOE-225").
+The amendment of ZOE-225 is accepted: the human approved its text with the recommendation of each of its questions. Rule 1 also lets a node through when the other side replaced a child that is not a path child of the transaction (sections 1, 2 and 3), and the vote writes a line of the resolution log for each read-current node that fails it (section 5). Its questions are at the end ("Questions for the human: the amendment of ZOE-225").
 
 ## Context
 
