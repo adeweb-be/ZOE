@@ -607,6 +607,11 @@ bench *args="run":
     if [ "${1:-}" = plone ]; then
         shift
         export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/plone/venv"
+        # Locust loads greenlet, which links libstdc++.so.6. On Linux the
+        # shell gives its directory in ZOE_CXX_LIBS.
+        if [ -n "${ZOE_CXX_LIBS:-}" ]; then
+            export LD_LIBRARY_PATH="$ZOE_CXX_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
         plonebench=(uv run --locked --python 3.13 --project bench/plone)
         if [ "${1:-}" = test ]; then
             shift

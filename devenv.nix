@@ -95,6 +95,13 @@ in
     # The Plone suites switch to Latin-1 locales. The interpreters find
     # every locale in this archive. macOS has its own locales.
     LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+
+    # The C++ runtime of the shell. The wheels of greenlet and gevent, which
+    # Locust loads, link libstdc++.so.6, and the interpreters of the shell
+    # do not find it. `just bench plone` puts it on LD_LIBRARY_PATH. The
+    # shell does not, so that the tools of the host keep their own
+    # libraries.
+    ZOE_CXX_LIBS = lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ];
   };
 
   # Heap and CPU profiles for the spikes. Enter the profile with
