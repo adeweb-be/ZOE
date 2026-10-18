@@ -1590,8 +1590,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                             let entry = split::read_shadow(oid, shadow, read, current, &rules);
                             self.resolutions.push(entry);
                         } else if let Some(&(ref class, why)) = plan.unanswered.get(&oid) {
-                            let entry =
-                                split::read_conflict(oid, class, why, read, current, &rules);
+                            let entry = split::undecided(oid, class, 1, why, read, current, &rules);
                             self.resolutions.push(entry);
                         }
                     }
@@ -1877,6 +1876,27 @@ impl<S: Deref<Target = Store>> Txn<S> {
             }
         });
         let (member, finished) = store.group.finish(store, member, queued);
+        // The transaction takes its staged records and its blobs back, so
+        // `Drop` removes its spill file and its unplaced blob files.
+        if let Some(member) = member {
+            self.staged = member.staged;
+            self.blobs = member.blobs;
+        }
+        // The commit is durable, and it comes after the commit of each
+        // hand-off that the vote got. So the store holds the last commit of
+        // these oids, also when their holder did not settle yet.
+        if finished.is_ok() && !self.handed.is_empty() {
+            store
+                .locks
+                .settle(self.handed.iter().map(|(oid, handoff)| (*oid, handoff)));
+        }
+        // The commit is durable or failed here. The finish releases the
+        // locks that it did not hand off before the end of the commit wakes
+        // the votes that wait for it, so a woken vote finds them free. The
+        // release reads no clock.
+        let mut own = self.locks.take().unwrap_or_default();
+        own.append(&mut self.intents);
+        store.locks.release(&own);
         if let Some(commit) = &commit {
             commit.end(finished.is_ok());
         }
@@ -1890,23 +1910,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 observer.locks_handed_off(locks.len());
             }
         }
-        // The transaction takes its staged records and its blobs back, so
-        // `Drop` removes its spill file and its unplaced blob files.
-        if let Some(member) = member {
-            self.staged = member.staged;
-            self.blobs = member.blobs;
+        if !own.is_empty() {
+            store.guardrails.locks_released(&own, store.clock.now());
         }
         let finished = finished?;
         self.committed = Some(finished.tid);
-        // The commit is durable, and it comes after the commit of each
-        // hand-off that the vote got. So the store holds the last commit of
-        // these oids, also when their holder did not settle yet.
-        if !self.handed.is_empty() {
-            store
-                .locks
-                .settle(self.handed.iter().map(|(oid, handoff)| (*oid, handoff)));
-        }
-        self.release();
         Ok(finished)
     }
 
