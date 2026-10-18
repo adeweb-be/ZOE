@@ -475,12 +475,10 @@ class Indexer:
         # The token of the thread that holds the lease of the site, or
         # None. The transaction of each batch then writes the lease again.
         self._lease = None
-        # The keys that failed in this run, the paths without keys whose
-        # application failed in this run, and the paths whose subtree
-        # search failed in this run.
+        # The keys that failed in this run, and the paths without keys
+        # whose application failed in this run.
         self._skipped = set()
         self._broken = set()
-        self._unexpanded = set()
         # The most batches of one run, or None.
         self._max_batches = None
 
@@ -681,30 +679,18 @@ class Indexer:
         """Add to `entries` each path that the catalog holds below a path
         whose operations reindex only the security indexes, with those
         indexes. Search only below the highest such paths. A search that
-        fails logs an ERROR event, and the run does not expand that path
-        again."""
-        tops = highest(
-            path
-            for path, entry in entries.items()
-            if entry.security and path not in self._unexpanded
-        )
+        fails is a failure of its highest path, so the keys of that path
+        stay in the queue and count the failure."""
+        tops = highest(path for path, entry in entries.items() if entry.security)
         for top in tops:
             idxs = set(entries[top].idxs & SECURITY) or set(SECURITY)
-            try:
-                found = [
+            found = self._guarded(
+                top,
+                lambda top=top: [
                     brain.getPath()
                     for brain in catalog.unrestrictedSearchResults(path=top)
-                ]
-            except TransientError:
-                raise
-            except Exception as error:
-                self._unexpanded.add(top)
-                logger.error(
-                    "queued indexing: the search of the subtree of %s failed: %s",
-                    top,
-                    _text(error),
-                )
-                continue
+                ],
+            )
             for path in found:
                 if path == top or path in self._broken:
                     continue

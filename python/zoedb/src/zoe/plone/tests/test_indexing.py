@@ -546,12 +546,16 @@ class TestFailures(IndexingTestCase):
         self.assertIn("path", json.loads(failed[second])["error"])
         self.assertEqual(indexing.status(self.portal)["failed"], 2)
 
-    def test_a_failing_subtree_search_does_not_stop_the_queue(self):
+    def test_a_failing_subtree_search_keeps_the_keys_of_its_path(self):
+        # Documents have no workflow, so a Document takes the View of its
+        # folder.
         portal = self.portal
         workflow = portal.portal_workflow
+        workflow.setChainForPortalTypes(("Document",), ())
         workflow.setChainForPortalTypes(("Folder",), ("simple_publication_workflow",))
         portal.invokeFactory("Folder", "folder", title="Folder")
-        portal["folder"].invokeFactory("Document", "inner", title="Inner")
+        word = self.token()
+        portal["folder"].invokeFactory("Document", "inner", title=f"Inner {word}")
         workflow.doActionFor(portal["folder"], "publish")
         transaction.commit()
         drain(portal)
@@ -565,13 +569,28 @@ class TestFailures(IndexingTestCase):
                 raise ValueError("a search error of the test")
             return stock(catalog, *args, **kwargs)
 
+        def anonymous():
+            logout()
+            try:
+                brains = portal.portal_catalog.searchResults(SearchableText=word)
+                return [brain.getPath() for brain in brains]
+            finally:
+                login(portal, TEST_USER_NAME)
+
         with (
             mock.patch.object(CatalogTool, "unrestrictedSearchResults", failing),
-            self.assertLogs("zoe.plone.indexing", logging.ERROR) as logs,
+            self.assertLogs("zoe.plone.indexing", logging.WARNING) as logs,
         ):
             drain(portal)
-        self.assertTrue(any("subtree" in line for line in logs.output))
+        self.assertTrue(any("search error" in line for line in logs.output))
+        values = [indexing.decode(value) for _, value in queue_of(portal).scan()]
+        self.assertTrue(values)
+        for value in values:
+            self.assertEqual(value["path"], folder)
+            self.assertEqual(value["failures"], 1)
+        drain(portal)
         self.assertEqual(queue_of(portal).scan(), [])
+        self.assertEqual(anonymous(), [])
         (brain,) = portal.portal_catalog.unrestrictedSearchResults(
             path={"query": folder, "depth": 0}
         )
