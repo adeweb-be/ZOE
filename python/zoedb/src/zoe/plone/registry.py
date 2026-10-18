@@ -21,10 +21,11 @@ process, with or without the option.
   current transaction, then the rows of a cache of the process. The cache
   is labelled with the counter of the marker. Each transaction decodes a
   row once.
-- **A write** stages the row. The first write of a transaction adds 1 to
-  the counter of the registry and of the marker. So it writes the registry
-  object: plone.protect sees the write, and two writes of one registry
-  conflict.
+- **A write** stages the row. The first write of a transaction sets the
+  counter of the registry and of the marker to 1 more than the higher of
+  the counter of the registry and the counter of the stored marker. So it
+  writes the registry object: plone.protect sees the write, and two writes
+  of one registry conflict. After an undo, a counter does not repeat.
 - **A field changed in place** is staged again before the commit and
   before each savepoint. A rollback to a savepoint drops the decoded rows.
 - **The guard** of a stock registry in a store with namespaces calls
@@ -290,7 +291,9 @@ def _state(records):
     if rows is None:
         _fail(records, reason)
     if current is None:
-        current = _transactions[jar] = _Transaction(jar, txn)
+        current = _Transaction(jar, txn)
+        if current.joined:
+            _transactions[jar] = current
     state = current.states[key] = _State(current, records, rows)
     return state
 
@@ -374,12 +377,16 @@ class _State:
         return names
 
     def bump(self):
-        """Count the first write of the transaction: add 1 to the counter
-        of the registry and stage the marker."""
+        """Count the first write of the transaction: stage the marker and
+        the counter of the registry with 1 more than the higher of the
+        counter of the registry and the counter of the stored marker. After
+        an undo the stored marker is higher, so a counter never repeats."""
         records = self.records()
         if records.counter > self.counter:
             return
-        records.counter = self.counter + 1
+        stored = decode_marker(self.namespace.get(MARKER))
+        counter = self.counter if stored is None else max(self.counter, stored[1])
+        records.counter = counter + 1
         self.registry._p_changed = True
         self.namespace.set(MARKER, encode_marker(self.registry._p_oid, records.counter))
 
@@ -439,12 +446,19 @@ class _Transaction:
         # (oid, id) -> _State
         self.states = {}
         self._watching = False
-        txn.join(self)
+        # A transaction that is not active, as in an after-commit hook,
+        # takes no data manager. Its reads then keep no state.
+        try:
+            txn.join(self)
+        except ValueError:
+            self.joined = False
+        else:
+            self.joined = True
 
     def watch_fields(self):
         """Stage the changed fields before the commit and before each
         savepoint of the namespace writes."""
-        if self._watching:
+        if self._watching or not self.joined:
             return
         self._watching = True
         state = next(iter(self.states.values()), None)
@@ -640,8 +654,15 @@ def move(registry):
     namespace = zoe.kv.Namespace(jar, "durable", namespace_name(registry_id))
     for tree in (records._fields, records._values):
         _read_current_tree(jar, tree)
+
+    def seen(obj):
+        if obj._p_jar is jar and obj._p_oid is not None:
+            jar.readCurrent(obj)
+
+    # A field is a persistent object of its own: a change of it in place
+    # during the move makes the commit of the move fail.
     for name, field in records._fields.items():
-        namespace.set(record_key(FIELD, name), dumps(field))
+        namespace.set(record_key(FIELD, name), dumps(field, seen=seen))
     for name, value in records._values.items():
         namespace.set(record_key(VALUE, name), dumps(value))
     namespace.set(MARKER, encode_marker(registry._p_oid, 1))

@@ -246,6 +246,62 @@ class TestRegistryBackend(unittest.TestCase):
             self.assertEqual((registry[TITLE], registry[OTHER]), ("First", "Second"))
             self.assertEqual(aq_base(registry)._records.counter, 3)
 
+    def test_a_write_after_an_undo_never_repeats_a_counter(self):
+        db = self.copy()
+        with opened(db) as (app, manager):
+            backend.move(app[PLONE_SITE_ID].portal_registry)
+            manager.commit()
+        with opened(db) as (app, manager):
+            app[PLONE_SITE_ID].portal_registry[TITLE] = "First write"
+            manager.get().note("the first write")
+            manager.commit()
+        with opened(db) as (app, _):
+            # This read fills the cache with the rows of the first write.
+            self.assertEqual(app[PLONE_SITE_ID].portal_registry[TITLE], "First write")
+        undo_id = next(
+            entry["id"]
+            for entry in db.undoLog(0, 20)
+            if entry["description"] in ("the first write", b"the first write")
+        )
+        manager = transaction.TransactionManager()
+        db.undo(undo_id, manager.get())
+        manager.commit()
+        with opened(db) as (app, manager):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertEqual(aq_base(registry)._records.counter, 1)
+            # The undo gives back no row.
+            self.assertEqual(registry[TITLE], "First write")
+            registry[TITLE] = "Second write"
+            manager.commit()
+            self.assertEqual(aq_base(registry)._records.counter, 3)
+        with opened(db) as (app, _):
+            self.assertEqual(app[PLONE_SITE_ID].portal_registry[TITLE], "Second write")
+
+    def test_a_field_changed_during_a_move_makes_the_move_conflict(self):
+        backend.move(self.registry)
+        with opened(self.db) as (app, manager):
+            records = aq_base(app[PLONE_SITE_ID].portal_registry)._records
+            field = records._fields[TITLE]
+            self.assertNotIsInstance(field, str)
+            field.title = "Changed during the move"
+            manager.commit()
+        with self.assertRaises(ConflictError):
+            transaction.commit()
+        transaction.abort()
+        with opened(self.db) as (app, _):
+            field = app[PLONE_SITE_ID].portal_registry.records[TITLE].field
+            self.assertEqual(field.title, "Changed during the move")
+
+    def test_a_read_in_an_after_commit_hook_joins_nothing(self):
+        registry = self.moved()
+        found = []
+        registry[TITLE] = "Committed"
+        transaction.get().addAfterCommitHook(
+            lambda status: found.append(registry[TITLE])
+        )
+        transaction.commit()
+        self.assertEqual(found, ["Committed"])
+
     def test_a_broken_field_moves_and_moves_back_as_it_is(self):
         name = "zoe.plone.tests.gone"
         gone = GoneField

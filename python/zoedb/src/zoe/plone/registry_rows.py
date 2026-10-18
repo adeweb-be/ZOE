@@ -121,15 +121,19 @@ def _is_field(obj):
 class _Pickler(pickle.Pickler):
     """A pickler that writes each object by value. It refuses a persistent
     object that `is_field` refuses, and writes a broken persistent object as
-    `ZODB.broken.rebuild`."""
+    `ZODB.broken.rebuild`. It gives each persistent object that it writes to
+    `seen`, when `seen` is not None."""
 
-    def __init__(self, file, is_field):
+    def __init__(self, file, is_field, seen):
         super().__init__(file, 3)
         self._is_field = is_field
+        self._seen = seen
 
     def reducer_override(self, obj):
         if isinstance(obj, PersistentBroken):
             obj._p_activate()
+            if self._seen is not None:
+                self._seen(obj)
             cls = type(obj)
             args = (cls.__module__, cls.__name__, *obj.__Broken_newargs__)
             return rebuild, args, obj.__Broken_state__
@@ -141,13 +145,16 @@ class _Pickler(pickle.Pickler):
                 )
             # A ghost gives its state only when it is loaded.
             obj._p_activate()
+            if self._seen is not None:
+                self._seen(obj)
         return NotImplemented
 
 
-def dumps(obj, is_field=_is_field):
-    """Return the pickle of `obj`, by value, with protocol 3."""
+def dumps(obj, is_field=_is_field, seen=None):
+    """Return the pickle of `obj`, by value, with protocol 3. `seen` gets
+    each persistent object of the pickle."""
     file = io.BytesIO()
-    _Pickler(file, is_field).dump(obj)
+    _Pickler(file, is_field, seen).dump(obj)
     return file.getvalue()
 
 
@@ -221,12 +228,7 @@ class Cache:
         with self._lock:
             names = self._entries.get(storage)
             if names is None:
-                names = collections.OrderedDict()
-                try:
-                    self._entries[storage] = names
-                except TypeError:
-                    # A storage without weak references is not cached.
-                    return rows
+                names = self._entries[storage] = collections.OrderedDict()
             entry = names.get(name)
             if entry is None or label > entry[0]:
                 names[name] = (label, rows)
