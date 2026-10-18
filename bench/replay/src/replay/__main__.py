@@ -97,9 +97,7 @@ def main(argv=None) -> int:
         return 2
     starts, matched = replay_log.starts_of_probes(args.store, probes)
     log = replay_log.read_log(args.store, starts)
-    background = sum(
-        t.description in replay_log.BACKGROUND for t in log.transactions
-    )
+    background = sum(t.description in replay_log.BACKGROUND for t in log.transactions)
     print(
         f"replay: {len(log.base)} transactions in the base, "
         f"{len(log.transactions)} timed; starts matched {matched['matched']}, "

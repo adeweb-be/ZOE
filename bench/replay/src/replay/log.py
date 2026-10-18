@@ -12,7 +12,6 @@ from pathlib import Path
 from ZODB.FileStorage import FileStorage
 from ZODB.TimeStamp import TimeStamp
 
-
 # The notes of the transactions of a background job, such as the batches of
 # the indexer of `zoe.plone`. No request makes these transactions.
 BACKGROUND = (b"zoe.plone: indexing queue",)
