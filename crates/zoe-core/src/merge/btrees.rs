@@ -47,7 +47,9 @@ pub(super) fn merge(
 /// is true. Also tells if a rule compared a posting dict or let a
 /// delete of a first key through.
 fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (Outcome, bool) {
-    let mut heap = Heap::new();
+    // The values of a bucket can hold a `DateTime`, a `Message` or
+    // `Missing.Value`, as the metadata of a catalog does.
+    let mut heap = Heap::with_values();
     heap.set_budget(super::budget(trees.len));
     // ZODB's resolver loads the new record, then the old one, then the
     // committed one. A persistent reference takes its persistent id from
