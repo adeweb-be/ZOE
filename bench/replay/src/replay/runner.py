@@ -207,6 +207,14 @@ def copy_base(storage, base: list[Transaction]) -> None:
         storage.tpc_finish(meta)
 
 
+def root_writes(log: Log) -> list[bytes]:
+    """Return the tid of each timed transaction of `log` that writes the
+    root, oid 0. The root has no resolver, so such a transaction stores the
+    root of the log, which does not name the merge policy: a replay with a
+    policy refuses the log."""
+    return [txn.tid for txn in log.transactions if z64 in txn.oids]
+
+
 def install_policy(storage, policy: dict, above: int = 0) -> None:
     """Commit `policy` as the merge policy of the store of `storage`, with
     `zoe.policy.install`, in one transaction of its own. Close `storage`.
@@ -429,13 +437,20 @@ def run(
     stack, in the order of `stacks`. Each run has a new server on a new
     store under `workdir`. `serve_args` go to `zoe serve` after its own
     arguments. Each run of `zoe serve` installs the merge policy `policy`
-    after the base, when it is given, and the result holds it. Return the
+    after the base, when it is given, and the result holds it. A policy and
+    a timed transaction that writes the root raise `ValueError`
+    (`root_writes`). Return the
     result. It records the software before the first run, and again under
     `software_after` when it differs at the end. Raise `ValueError` for a
     speed that is not positive or that comes twice.
     """
     if any(speed <= 0 for speed in speeds) or len(set(speeds)) != len(speeds):
         raise ValueError(f"the speeds must be positive and distinct: {speeds}")
+    if policy is not None and (written := root_writes(log)):
+        raise ValueError(
+            f"the timed transaction {written[0].hex()} writes the root, oid 0, "
+            "and its record would remove the merge policy from the root"
+        )
     # The software of the runs, read before the first one.
     software = servers.software(serve_args)
     workdir = Path(workdir)

@@ -8,8 +8,9 @@ prints its report. With `--policy FILE`, a JSON merge policy of
 `zoe.policy`, each run of `zoe serve` installs it in its store after the
 base. `report` prints the report of a result. Both exit with
 0 when the gate passes and with 1 when it fails. `report` exits with 2
-when FILE is not a result, and `run` when the policy is not valid or the
-probe records explain no transaction of the store.
+when FILE is not a result, and `run` when the policy is not valid, when a timed
+transaction writes the root with a policy, or when the probe records
+explain no transaction of the store.
 """
 
 import argparse
@@ -107,6 +108,15 @@ def main(argv=None) -> int:
     if not log.transactions or not matched["matched"]:
         print(
             "replay: the probe records explain no transaction of the store",
+            file=sys.stderr,
+        )
+        return 2
+    # The root has no resolver: such a transaction would store the root of
+    # the log, without the name of the policy.
+    if policy is not None and (written := runner.root_writes(log)):
+        print(
+            f"replay: --policy: the timed transaction {written[0].hex()} writes the "
+            "root, oid 0, and its record would remove the merge policy from the root",
             file=sys.stderr,
         )
         return 2
