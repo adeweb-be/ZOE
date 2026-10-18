@@ -46,9 +46,8 @@ import zope.interface
 from Acquisition import aq_base
 from BTrees.OOBTree import OOBTree
 from plone.registry.registry import Registry, _Records
-from ZODB.DemoStorage import DemoStorage
-from ZODB.POSException import POSKeyError, ReadConflictError, Unsupported
-from ZODB.utils import load_current, oid_repr
+from ZODB.POSException import ReadConflictError, Unsupported
+from ZODB.utils import oid_repr
 
 import zoe.kv
 from zoe.plone import registry_rows
@@ -250,19 +249,14 @@ def _check(records):
 
 def _changed_in_store(registry):
     """Tell if the store holds a newer serial of `registry` than the
-    connection read. A client of a server asks the server first."""
+    connection read. `history` of a client of a server asks the server, not
+    the cache of the client."""
     storage = registry._p_jar.db().storage
-    base = storage
-    while isinstance(base, DemoStorage):
-        base = base.base
-    ping = getattr(base, "ping", None)
-    if ping is not None:
-        ping()
     try:
-        _data, serial = load_current(storage, registry._p_oid)
-    except POSKeyError:
+        found = storage.history(registry._p_oid, 1)
+    except KeyError:
         return False
-    return serial != registry._p_serial
+    return bool(found) and found[0]["tid"] != registry._p_serial
 
 
 def _fail(records, reason):

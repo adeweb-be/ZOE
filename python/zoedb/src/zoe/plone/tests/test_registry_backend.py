@@ -9,6 +9,7 @@ the backend themselves.
 
 import contextlib
 import shutil
+import sys
 import tempfile
 import unittest
 
@@ -17,7 +18,10 @@ from Acquisition import aq_base
 from BTrees.OOBTree import OOBTree
 from persistent.mapping import PersistentMapping
 from plone.app.testing import PLONE_FUNCTIONAL_TESTING, PLONE_SITE_ID
+from plone.registry.field import TextLine
+from plone.registry.record import Record
 from plone.registry.registry import Registry, _Records
+from ZODB.broken import Broken, PersistentBroken
 from ZODB.DB import DB
 from ZODB.MappingStorage import MappingStorage
 from ZODB.POSException import ConflictError, ReadConflictError, Unsupported
@@ -28,6 +32,11 @@ from zoe.plone.registry_rows import MARKER, decode_marker, dumps, encode_marker
 from zoe.plone.tests.test_concurrent_creations import copy_records
 
 TITLE = "plone.site_title"
+OTHER = "plone.email_from_name"
+
+
+class GoneField(TextLine):
+    """A field whose class a test takes away, as an add-on that is gone."""
 
 
 @contextlib.contextmanager
@@ -209,6 +218,62 @@ class TestRegistryBackend(unittest.TestCase):
         transaction.commit()
         self.assertEqual(aq_base(registry)._p_serial, serial)
         self.assertEqual(aq_base(registry)._records.counter, 1)
+
+    # Conflicts and broken fields.
+
+    def test_two_writes_of_a_moved_registry_conflict_and_the_retry_reads_the_rows(
+        self,
+    ):
+        self.moved()
+        self.assertIn(OTHER, self.registry)
+        with opened(self.db) as (app, manager):
+            first = app[PLONE_SITE_ID].portal_registry
+            first[TITLE] = "First"
+            with opened(self.db) as (other_app, other_manager):
+                other_app[PLONE_SITE_ID].portal_registry[OTHER] = "Second"
+                other_manager.commit()
+            # The two writes change other records, but both write the
+            # registry object.
+            with self.assertRaises(ConflictError):
+                manager.commit()
+        with opened(self.db) as (app, manager):
+            retry = app[PLONE_SITE_ID].portal_registry
+            self.assertEqual(retry[OTHER], "Second")
+            retry[TITLE] = "First"
+            manager.commit()
+        with opened(self.db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertEqual((registry[TITLE], registry[OTHER]), ("First", "Second"))
+            self.assertEqual(aq_base(registry)._records.counter, 3)
+
+    def test_a_broken_field_moves_and_moves_back_as_it_is(self):
+        name = "zoe.plone.tests.gone"
+        gone = GoneField
+        self.registry.records[name] = Record(gone(title="Gone"), "Kept")
+        transaction.commit()
+        module = sys.modules[__name__]
+        del module.GoneField
+        self.addCleanup(setattr, module, "GoneField", gone)
+        with opened(self.db) as (app, manager):
+            registry = app[PLONE_SITE_ID].portal_registry
+            field = aq_base(registry)._records._fields[name]
+            self.assertIsInstance(field, PersistentBroken)
+            backend.move(registry)
+            manager.commit()
+        with opened(self.db) as (app, manager):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertEqual(registry[name], "Kept")
+            self.assertIsInstance(aq_base(registry)._records._fields[name], Broken)
+            backend.move_back(registry)
+            manager.commit()
+        # The class comes back: the field reads as it was.
+        module.GoneField = gone
+        with opened(self.db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            field = registry.records[name].field
+            self.assertIsInstance(field, gone)
+            self.assertEqual(field.title, "Gone")
+            self.assertEqual(registry[name], "Kept")
 
     # The pickler.
 
