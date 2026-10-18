@@ -74,6 +74,9 @@ The run
 - After each run, `check` gets a new client of the store of the run and
   the acknowledged transactions.
 - Each run also runs a read load. This module does not check it.
+- The runner reads `time.monotonic` at the start of a run and before each
+  event. It sleeps with `time.sleep` until the event is due. The test
+  replaces this clock to record the waits of each run.
 
 The result
 ----------
@@ -169,6 +172,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import time
 
 import jsonschema
 import pytest
@@ -182,6 +186,7 @@ from ZODB.TimeStamp import TimeStamp
 from ZODB.utils import get_pickle_metadata, p64
 
 import replay
+from replay import runner
 
 BENCH = pathlib.Path(__file__).resolve().parents[2]
 # One unit of the schedule, in seconds at the speed 1.
@@ -329,6 +334,81 @@ def write_json(path, document):
     return path
 
 
+def schedule(speed):
+    """Return the times of the events of the synthetic log at `speed`, in
+    seconds after its first start, in time order."""
+    return sorted(
+        {t * U / speed for start, commit, _ in TIMED for t in (start, commit)}
+    )
+
+
+@dataclasses.dataclass
+class Waits:
+    """The waits of one run on the clock of the runner."""
+
+    run: dict
+    # The first time that the run reads, the start of its schedule.
+    started: float | None = None
+    # The end of each sleep, in seconds after the start of the run.
+    until: list = dataclasses.field(default_factory=list)
+    # The sum of the delays that the run asks to sleep.
+    waited: float = 0.0
+
+
+class Clock:
+    """The clock of the runner, with a record of the waits of each run.
+
+    A run reads the clock at the start of its schedule. Before each event,
+    it reads the clock again and sleeps until the event is due. So each
+    sleep ends when an event of the schedule is due, and the machine time
+    of the run is not in the delays.
+    """
+
+    def __init__(self):
+        self.runs = []
+        self.last = None
+
+    def play(self, play):
+        """Wrap `_play` of the runner. Each call starts a new record."""
+
+        def recorded(storage, log, speed, run):
+            self.runs.append(Waits(run))
+            return play(storage, log, speed, run)
+
+        return recorded
+
+    def monotonic(self):
+        self.last = time.monotonic()
+        waits = self.runs[-1]
+        if waits.started is None:
+            waits.started = self.last
+        return self.last
+
+    def sleep(self, delay):
+        waits = self.runs[-1]
+        waits.until.append(self.last + delay - waits.started)
+        waits.waited += delay
+        time.sleep(delay)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    def of(self, run):
+        """Return the waits of `run`, an item of a result."""
+        (waits,) = [waits for waits in self.runs if waits.run is run]
+        return waits
+
+
+@pytest.fixture(scope="module")
+def clock():
+    """Record the waits of the runs of this module."""
+    recorder = Clock()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(runner, "time", recorder)
+        patch.setattr(runner, "_play", recorder.play(runner._play))
+        yield recorder
+
+
 @pytest.fixture(scope="module")
 def synthetic(tmp_path_factory):
     return write_log(tmp_path_factory.mktemp("log"))
@@ -340,14 +420,14 @@ def log(synthetic):
 
 
 @pytest.fixture(scope="module")
-def result(log, tmp_path_factory):
+def result(log, clock, tmp_path_factory):
     """Two repetitions of both stacks at the speed 1."""
     workdir = tmp_path_factory.mktemp("work")
     return replay.run(log, speeds=(1,), repetitions=2, workdir=workdir)
 
 
 @pytest.fixture(scope="module")
-def failed(log, tmp_path_factory):
+def failed(log, clock, tmp_path_factory):
     """One run of zoe-native at the speed 4, with a check that fails.
 
     The check runs the check of the replay first, then reports the first
@@ -483,13 +563,26 @@ def test_every_acknowledged_transaction_loads_after_each_run(result):
         assert run["counts"] is True, run
 
 
-def test_a_run_follows_the_schedule_of_its_speed(result, failed):
-    for run in result["runs"]:
-        assert END * U - 0.01 <= run["seconds"] < 2 * END * U, run
-    # At the speed 4, the same schedule takes a quarter of the time.
+def test_a_run_follows_the_schedule_of_its_speed(result, failed, clock):
     done, _calls = failed
-    (run,) = done["runs"]
-    assert END * U / 4 - 0.01 <= run["seconds"] < END * U / 2, run
+    runs = [*result["runs"], *done["runs"]]
+    # At the speed 4, the same schedule takes a quarter of the time.
+    assert [run["speed"] for run in runs] == [1, 1, 1, 1, 4]
+    for run in runs:
+        times = schedule(run["speed"])
+        assert times[-1] == END * U / run["speed"]
+        waits = clock.of(run)
+        # The run does not end before its last event is due. A slow machine
+        # only makes it end later.
+        assert run["seconds"] >= times[-1] - 0.01, run
+        # Each sleep ends when an event of the schedule at this speed is due,
+        # and the sleeps end in time order.
+        for until in waits.until:
+            assert min(abs(until - t) for t in times) < 1e-6, (run, waits.until)
+        assert waits.until == sorted(set(waits.until)), (run, waits.until)
+        # The run sleeps no longer than its schedule. A slow machine only
+        # makes the delays shorter.
+        assert waits.waited <= times[-1] + 1e-6, (run, waits.waited)
 
 
 def test_a_faster_replay_keeps_the_order_of_the_log(failed, synthetic):
