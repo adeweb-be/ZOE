@@ -790,7 +790,7 @@ mod tests {
         let (owned, n, b0, b1, y, read, s1) = after_s1();
         let store = &owned;
         // S2 read before S1 and splits b1: the node keeps the record of S1.
-        let x = new_oid(&store);
+        let x = new_oid(store);
         let mut s2 = store.tpc_begin(b"", b"", b"").unwrap();
         s2.set_server_writes(true);
         for (oid, serial, data) in [
@@ -803,7 +803,7 @@ mod tests {
         s2.vote().unwrap();
         thread::scope(|scope| {
             // T' read after S1, splits b0 and stores the node.
-            let z = new_oid(&store);
+            let z = new_oid(store);
             let other = scope.spawn(move || {
                 let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
                 for (oid, serial, data) in [
@@ -843,7 +843,7 @@ mod tests {
         let store = &owned;
         // S2 read before S1, splits b0 (rule 2) and b1 (rule 3): the node
         // gets a record.
-        let (z, x) = (new_oid(&store), new_oid(&store));
+        let (z, x) = (new_oid(store), new_oid(store));
         let mut s2 = store.tpc_begin(b"", b"", b"").unwrap();
         s2.set_server_writes(true);
         for (oid, serial, data) in [
@@ -859,7 +859,7 @@ mod tests {
         assert!(s2.wrote_unstored());
         thread::scope(|scope| {
             // T' read after S1, and splits y: it stores the node and y.
-            let w = new_oid(&store);
+            let w = new_oid(store);
             let other = scope.spawn(move || {
                 let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
                 txn.set_server_writes(true);

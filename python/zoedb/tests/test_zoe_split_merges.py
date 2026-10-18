@@ -26,7 +26,10 @@ After each round:
 Without the switch, the same rounds raise `ConflictError`.
 
 The test runs in-process on `zoe.Storage`, and through `zoe serve` with the
-native client and with `ZEO.ClientStorage`. In-process, the store closes
+native client and with `ZEO.ClientStorage`. A stock `ZEO.ClientStorage`
+does not declare `server_writes`, so two splits of one bucket raise
+`ConflictError` for it (ADR 0049), and every committed key stays in the
+tree. In-process, the store closes
 for the check of the other process, which opens it read-only.
 """
 
@@ -287,7 +290,7 @@ def run_rounds(mode, switch, tmp_path):
     return rounds, split_lines(log)
 
 
-@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("mode", MODES[:2])
 def test_with_the_split_merge_every_creation_commits_at_the_first_attempt(
     mode, tmp_path
 ):
@@ -321,3 +324,11 @@ def test_in_shadow_mode_the_rounds_raise_conflict_error_and_log_the_rules(tmp_pa
             assert line["split"] == 1 and shadow["reason"], line
         else:
             assert shadow["outcome"] in ("merged", "passed"), line
+
+
+def test_a_stock_client_gets_no_merge_of_two_splits_of_one_bucket(tmp_path):
+    rounds, lines = run_rounds("zeo-client", "on", tmp_path)
+    # Some creations split one bucket from one snapshot: rule 3 gives no
+    # answer for them. The checks of each round pass on every committed key.
+    assert not all(all(outcomes) for outcomes in rounds), rounds
+    assert lines, "the rules ran"
