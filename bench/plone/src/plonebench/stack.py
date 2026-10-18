@@ -104,6 +104,30 @@ STACKS = {
         ),
         backends="locking",
     ),
+    "zoe-native-qi": StackConfig(
+        name="zoe-native-qi",
+        scenario="zoeclient",
+        server="zoe",
+        section="zoeclient",
+        native=True,
+        description=(
+            "zoe-native with queued indexing of zoe.plone: a save writes its "
+            "catalog operations to a durable namespace of the store, and one "
+            "indexer for each site applies them (ADR 0047)"
+        ),
+        differs=(
+            "server: zoe serve (redb store, raw records unless --zoe-compression, "
+            "per-oid locks, group commit)",
+            "client: native Rust client (msgpack M5), extensions sequences, kv "
+            "and trace_context declared",
+            "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
+            "zoe.plone: a save writes no object of the catalog; the indexer of "
+            "the site applies the queue in transactions of its own, and the "
+            "next request of the user who saved waits for it",
+            "conflicts: the client resolves through the vote (tier 3)",
+        ),
+        backends="indexing",
+    ),
     "zoe-asyncio": StackConfig(
         name="zoe-asyncio",
         scenario="zoeclient",
