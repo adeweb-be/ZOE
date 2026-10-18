@@ -18,23 +18,34 @@ use zoe_pickle::btrees::{BucketState, TreeState, bucket_state, new_bucket_state,
 use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
 
 /// A family of BTrees of the tests: the module and the prefix of its
-/// classes.
+/// classes. With `references`, the value of each key is a key reference to
+/// the object whose oid is the key; else it is 1.
 #[derive(Clone, Copy)]
 struct Family {
     module: &'static str,
     prefix: &'static str,
+    references: bool,
 }
 
 /// Keys and values of C ints.
 const II: Family = Family {
     module: "BTrees.IIBTree",
     prefix: "II",
+    references: false,
 };
 
 /// Object keys and int values, as `ids` of the intid utility.
 const OI: Family = Family {
     module: "BTrees.OIBTree",
     prefix: "OI",
+    references: false,
+};
+
+/// Int keys and key references as values, as `refs` of the intid utility.
+const IO: Family = Family {
+    module: "BTrees.IOBTree",
+    prefix: "IO",
+    references: true,
 };
 
 impl Family {
@@ -134,12 +145,16 @@ fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
     pickler.into_bytes()
 }
 
-/// Returns the items of `keys`, each with the value 1.
-fn items(heap: &mut Heap, keys: &[Key]) -> Vec<Value> {
+/// Returns the items of `keys`, each with its value in `family`.
+fn items(heap: &mut Heap, family: Family, keys: &[Key]) -> Vec<Value> {
     let mut items = Vec::new();
     for &k in keys {
         items.push(key(heap, k));
-        items.push(Value::Int(1));
+        let value = match (family.references, k) {
+            (true, Key::Int(int)) => key(heap, Key::Ref(int as u64)),
+            _ => Value::Int(1),
+        };
+        items.push(value);
     }
     items
 }
@@ -149,7 +164,7 @@ fn items(heap: &mut Heap, keys: &[Key]) -> Vec<Value> {
 fn bucket(family: Family, keys: &[Key], next: Option<Oid>) -> Vec<u8> {
     let mut heap = Heap::with_instances();
     let class = heap.new_class(family.module, &family.bucket());
-    let items = items(&mut heap, keys);
+    let items = items(&mut heap, family, keys);
     let next = next.map(|oid| reference(&mut heap, family, oid, &family.bucket()));
     let state = new_bucket_state(&mut heap, items, next);
     record(&heap, class, state)
@@ -181,7 +196,7 @@ fn leaf_node(family: Family, first: Oid, children: &[(Key, Oid)]) -> Vec<u8> {
 fn inline(family: Family, keys: &[Key]) -> Vec<u8> {
     let mut heap = Heap::with_instances();
     let class = heap.new_class(family.module, &family.tree());
-    let items = items(&mut heap, keys);
+    let items = items(&mut heap, family, keys);
     let bucket = new_bucket_state(&mut heap, items, None);
     let inner = heap.new_tuple(vec![bucket]);
     let state = heap.new_tuple(vec![inner]);
@@ -1019,6 +1034,18 @@ fn key_references_of_one_class_order_by_the_oids_of_their_objects() {
         voted.unwrap();
         assert_eq!(keys, [10, 20, 30, 40, 45, 50, 60, 70]);
     }
+}
+
+#[test]
+fn key_references_as_values_compare_by_the_oids_of_their_objects() {
+    let store = open(Some("on"));
+    let tree = tree(&store, IO, &[&ints(&[10, 20, 30]), &ints(&[40, 50, 60])]);
+    split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let x = new_oid(&store);
+    let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
+    txn.vote().unwrap();
+    txn.finish().unwrap();
+    assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 40, 45, 50, 60, 70]);
 }
 
 #[test]

@@ -70,6 +70,7 @@ def test_install_and_read_give_the_policy_back(tmp_path):
         [],
         {"colour": "on"},
         {"posting_dicts": "sometimes"},
+        {"split_merges": "sometimes"},
         {"classes": {"Item": {}}},
         {"classes": {ITEM: {"tier2": "maybe"}}},
         {"classes": {ITEM: {"fields": {"n": "average"}}}},

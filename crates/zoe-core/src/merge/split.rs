@@ -28,7 +28,8 @@
 //! changed by anything but splits, for a delete in a range that they merge,
 //! for two splits of one child on one side, and for a state that the model
 //! does not hold. Two key references of one class compare by the oids of
-//! their objects.
+//! their objects, as keys and as values: `bucket_merge` compares the
+//! values of the keys that both sides kept.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};

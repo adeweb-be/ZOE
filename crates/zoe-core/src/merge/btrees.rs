@@ -321,7 +321,7 @@ impl Merger<'_> {
                     self.ruled.set(true);
                     return Ok(equal);
                 }
-                Ok(self.heap.compare(a, b).map_err(undecided)? == Ordering::Equal)
+                Ok(compare_objects(&*self.heap, self.key_refs, a, b)? == Ordering::Equal)
             }
             // `(K < T) ? -1 : (K > T) ? 1 : 0` of the C floats: a NaN is
             // equal to every value.
@@ -558,6 +558,14 @@ pub(super) fn compare_keys(
     if keys != KeyType::Object {
         return Ok(int(a).cmp(&int(b)));
     }
+    compare_objects(heap, key_refs, a, b)
+}
+
+/// `object_compare` of BTrees on two keys or two values of the type `O`.
+/// With `key_refs`, two key references of one class compare by the oids of
+/// their objects, as their `_get_cmp_keys` does in conflict resolution:
+/// BTrees calls the same comparison for the keys and for the values.
+fn compare_objects(heap: &Heap, key_refs: bool, a: Value, b: Value) -> Result<Ordering, Outcome> {
     if key_refs {
         match (key_reference(heap, a), key_reference(heap, b)) {
             (None, None) => {}
@@ -611,7 +619,8 @@ fn key_reference(heap: &Heap, value: Value) -> Option<Option<(usize, &[u8])>> {
 /// 0048) merges, with the rules of `bucket_merge` and without the rules of
 /// ADR 0042. `old`, `committed` and `new` hold the items of the range on
 /// each side: each key, then its value for a mapping. Two key references
-/// of one class compare by the oids of their objects.
+/// of one class compare by the oids of their objects, as keys and as
+/// values.
 ///
 /// Returns the merged items, the keys that the new side changed and their
 /// number. A key of `old` that a side deleted gives no answer.

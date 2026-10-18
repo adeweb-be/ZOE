@@ -118,12 +118,15 @@ def mechanism_on(test):
     store. So the copy takes a change that the helper commits to the site
     of the layer. `test.addCleanup` undoes a change of the process.
 
-    The card does not name the mechanism. The ADR of the card names it.
-    The builder fills this helper and `mechanism_off`, and only these two,
-    to switch the mechanism that the ADR picks. The human approves a change
-    of these helpers with the ADR. Until then, the helper does nothing and
-    gives no keyword argument.
+    The card does not name the mechanism. The ADR of the card names it:
+    the split merge of ADR 0048. The helper writes the switch
+    `split_merges` into the merge policy of the site of the layer, which
+    the test then copies to its store, and gives no keyword argument.
     """
+    import zoe.policy
+
+    zoe.policy.install(test.layer["portal"]._p_jar, {"classes": {}, "split_merges": "on"})
+    transaction.commit()
     return {}
 
 
@@ -132,9 +135,9 @@ def mechanism_off(test):
     `test`: the site and its store keep the stock behaviour. Return the
     keyword arguments of `zoe.Storage` for the store of the test.
 
-    The test calls it as it calls `mechanism_on`. The builder fills it with
-    `mechanism_on`, and the human approves a change of it with the ADR.
-    Until then, the helper does nothing and gives no keyword argument.
+    The test calls it as it calls `mechanism_on`. Without a merge policy,
+    the store keeps the stock behaviour, so the helper does nothing and
+    gives no keyword argument (ADR 0048).
     """
     return {}
 
