@@ -71,6 +71,15 @@ def test_install_and_read_give_the_policy_back(tmp_path):
         {"colour": "on"},
         {"posting_dicts": "sometimes"},
         {"split_merges": "sometimes"},
+        {"folder_orders": "sometimes"},
+        {
+            "folder_orders": "on",
+            "classes": {policy.ORDER_CLASS: {"tier2": "on"}},
+        },
+        {
+            "folder_orders": "shadow",
+            "classes": {policy.ORDER_CLASS: {"tier2": "shadow"}},
+        },
         {"classes": {"Item": {}}},
         {"classes": {ITEM: {"tier2": "maybe"}}},
         {"classes": {ITEM: {"fields": {"n": "average"}}}},
@@ -87,6 +96,33 @@ def test_install_and_read_give_the_policy_back(tmp_path):
 def test_a_policy_that_breaks_the_rules_raises_value_error(bad):
     with pytest.raises(ValueError):
         policy.validate(bad)
+
+
+def test_folder_orders_is_a_switch_of_the_policy():
+    checked = policy.validate({"folder_orders": "on", "classes": {}})
+    assert checked == {"folder_orders": "on", "classes": {}}
+    # Tier 2 may take a PersistentList only while the order merge is off.
+    for given in (
+        {"folder_orders": "off", "classes": {policy.ORDER_CLASS: {"tier2": "on"}}},
+        {"classes": {policy.ORDER_CLASS: {"tier2": "on"}}},
+        {"folder_orders": "on", "classes": {policy.ORDER_CLASS: {"tier2": "off"}}},
+    ):
+        policy.validate(given)
+
+
+def test_install_and_read_keep_folder_orders(tmp_path):
+    db = ZODB.DB(zoe.Storage(str(tmp_path / "store")))
+    try:
+        with db.transaction() as conn:
+            policy.install(conn, {"folder_orders": "on", "classes": {}})
+        with db.transaction() as conn:
+            assert policy.read(conn) == {
+                "version": 1,
+                "folder_orders": "on",
+                "classes": {},
+            }
+    finally:
+        db.close()
 
 
 def race(storage, setup, first, second, make=None):

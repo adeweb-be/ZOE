@@ -35,9 +35,14 @@ The overrides are a JSON object with these keys, each optional:
 
 - ``tier2``: the mode of the derived entries, ``shadow`` by default, as a
   class merges only after shadow mode showed that its merges are right;
-- ``structural_merges``, ``posting_dicts`` and ``split_merges``: the
-  switches of tier 1; the profile sets none of them, so the split merge of
-  ADR 0048 stays off until an override or `zoe.policy.install` sets it;
+- ``structural_merges``, ``posting_dicts``, ``split_merges`` and
+  ``folder_orders``: the switches of tier 1. The overrides of the profile
+  ``zoe.plone:default`` set ``folder_orders`` to ``on`` (the order merge of
+  ADR 0052, which merges only in a transaction that queues its indexing);
+  they set no other switch, so the split merge of ADR 0048 stays off until
+  an override or `zoe.policy.install` sets it. An override of
+  ``folder_orders`` in the profile of a site wins, as the profiles apply in
+  turn;
 - ``classes``: entries by class name; an entry changes the keys that it
   gives, its ``fields`` add to the derived ones, and its ``coupled`` groups
   add to the derived groups; ``null`` removes the entry of a class. An
