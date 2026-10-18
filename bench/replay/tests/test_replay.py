@@ -1,17 +1,17 @@
-"""Acceptance test of the log replay (B6) and of the gate report of phase 4.
+"""Acceptance test of the log replay (B6) and of its report.
 
 B6 replays the transactions of a store against ZEO and against `zoe serve`,
 and counts the conflicts: raised, resolved natively and resolved in Python.
-The success criterion of the specification is the gate of phase 4: the
-`ConflictError`s that reach Zope on `zoe serve` are at most 10 % of those
-on ZEO.
+The report gives the ratio of the success criterion of the specification:
+the `ConflictError`s that reach Zope on `zoe serve`, as a share of those on
+ZEO, with the target of at most 10 %. It is a measure, not a gate.
 
 The harness is the uv project `bench/replay` (package `replay`), beside
 `bench/plone` and `bench/shootout`. Its commands:
 
     just bench replay               # replay a kept store; write
                                     # target/bench/replay/<started>.json
-    just bench replay report FILE   # print the report and the verdict
+    just bench replay report FILE   # print the report and the ratio
     just bench replay test          # run this module; build `zoe` first
 
 This module drives the interface below. The package `replay` gives each
@@ -112,12 +112,8 @@ The check
   tid of each item in which `storage.loadSerial(oid, tid)` fails for an
   oid, in the order of `acknowledged`.
 
-The gate
---------
-- `verdict(zeo, zoe) -> "pass" | "fail"`. `zeo` and `zoe` are the
-  `ConflictError`s of each stack, as counts or as rates. It passes when
-  `zoe` is at most `LIMIT` (0.1) of `zeo`, 10 % included. When `zeo` is 0,
-  it passes only when `zoe` is 0 too.
+The measure
+-----------
 - `gate(result) -> Gate`. It reads only `speeds` and, in each run,
   `stack`, `speed`, `repetition`, `transactions`, `conflict_errors` and
   `counts`. A `Gate` has:
@@ -128,13 +124,14 @@ The gate
     count, in the order of the runs.
   - `missing`: `(stack, speed)` for each speed of the result and each
     stack of `STACKS`, in that order, without a run that counts.
-  - `verdict`: "pass" when nothing is missing and `verdict` of the two
-    rates passes, else "fail".
+  - `ratio`: the rate of `zoe-native` over the rate of `zeo`; None when a
+    stack has no run that counts, or when `zeo` has no `ConflictError`.
 - `python -m replay report FILE` prints one row per run (a run that does
   not count says `does not count`), the conflicts per 1,000 transactions
-  by class and by path, and, as its last line, `gate passed: ...` or
-  `gate failed: ...`. It exits with 0 when the gate passes, with 1 when it
-  fails, and with 2 when FILE is not a result of the replay.
+  by class and by path, and, as its last line, `success criterion: ...`
+  with the rates, the ratio as a percentage of `zeo` (or `no ratio`) and
+  the target of at most 10 %. It exits with 0 for a result, whatever the
+  ratio, and with 2 when FILE is not a result of the replay.
 
 The synthetic log
 -----------------
@@ -381,7 +378,6 @@ def test_the_constants_of_the_replay():
     assert replay.STACKS == ("zeo", "zoe-native")
     assert replay.SPEEDS == (1, 4, 16)
     assert replay.PATHS == ("native", "python-client", "python-server", "refused")
-    assert replay.LIMIT == 0.1
     expected = BENCH / "schema" / "replay.schema.json"
     assert pathlib.Path(replay.SCHEMA).resolve() == expected.resolve()
 
@@ -556,42 +552,14 @@ def test_a_run_whose_check_fails_does_not_count(failed, synthetic):
     assert gate.excluded == [("zoe-native", 4, 1)]
     assert gate.missing == [("zeo", 4), ("zoe-native", 4)]
     assert gate.rates == {"zeo": None, "zoe-native": None}
-    assert gate.verdict == "fail"
+    assert gate.ratio is None
 
 
-# The verdict.
-
-
-@pytest.mark.parametrize(
-    ("zeo", "zoe", "expected"),
-    [
-        (100, 0, "pass"),
-        (100, 9, "pass"),
-        # Exactly 10 % passes.
-        (100, 10, "pass"),
-        (10, 1, "pass"),
-        (30, 3, "pass"),
-        (50.0, 5.0, "pass"),
-        (100, 11, "fail"),
-        (9, 1, "fail"),
-        (50.0, 5.01, "fail"),
-        (1, 1, "fail"),
-        (1, 2, "fail"),
-        # With no ConflictError on ZEO, only none on zoe serve passes.
-        (0, 0, "pass"),
-        (0, 1, "fail"),
-        (0, 0.5, "fail"),
-    ],
-)
-def test_the_verdict(zeo, zoe, expected):
-    assert replay.verdict(zeo=zeo, zoe=zoe) == expected
-
-
-# The gate.
+# The measure.
 
 
 def run_of(stack, speed, repetition, errors, counts=True, transactions=1000):
-    """Return a run of a result with only the fields that the gate reads,
+    """Return a run of a result with only the fields that the measure reads,
     and the others with values of the right type."""
     return {
         "stack": stack,
@@ -614,7 +582,7 @@ def result_of(*runs, speeds=(1, 4)):
     return {"schema_version": 1, "speeds": list(speeds), "runs": list(runs)}
 
 
-def test_the_gate_passes_when_zoe_serve_has_at_most_10_percent():
+def test_the_ratio_is_the_rate_of_zoe_serve_over_the_rate_of_zeo():
     gate = replay.gate(
         result_of(
             run_of("zeo", 1, 1, 40),
@@ -626,10 +594,10 @@ def test_the_gate_passes_when_zoe_serve_has_at_most_10_percent():
     assert gate.rates == pytest.approx({"zeo": 50.0, "zoe-native": 2.5})
     assert gate.excluded == []
     assert gate.missing == []
-    assert gate.verdict == "pass"
+    assert gate.ratio == pytest.approx(0.05)
 
 
-def test_the_gate_passes_at_exactly_10_percent_and_fails_above():
+def test_the_ratio_at_10_percent_and_above():
     exactly = replay.gate(
         result_of(
             run_of("zeo", 1, 1, 40),
@@ -639,7 +607,7 @@ def test_the_gate_passes_at_exactly_10_percent_and_fails_above():
         )
     )
     assert exactly.rates == pytest.approx({"zeo": 50.0, "zoe-native": 5.0})
-    assert exactly.verdict == "pass"
+    assert exactly.ratio == pytest.approx(0.1)
     above = replay.gate(
         result_of(
             run_of("zeo", 1, 1, 40),
@@ -649,14 +617,14 @@ def test_the_gate_passes_at_exactly_10_percent_and_fails_above():
         )
     )
     assert above.rates == pytest.approx({"zeo": 50.0, "zoe-native": 5.5})
-    assert above.verdict == "fail"
+    assert above.ratio == pytest.approx(0.11)
 
 
 def test_a_run_that_does_not_count_leaves_the_rates():
     # The second run of zoe-native does not count. Without it, zoe-native
-    # has 8 ConflictErrors per 1,000 transactions against 50 on ZEO: 16 %,
-    # and the gate fails. The totals, 8 against 100, give 8 %: the gate
-    # compares the rates, not the totals.
+    # has 8 ConflictErrors per 1,000 transactions against 50 on ZEO: 16 %.
+    # The totals, 8 against 100, give 8 %: the ratio compares the rates,
+    # not the totals.
     gate = replay.gate(
         result_of(
             run_of("zeo", 1, 1, 50),
@@ -669,10 +637,10 @@ def test_a_run_that_does_not_count_leaves_the_rates():
     assert gate.excluded == [("zoe-native", 1, 2)]
     assert gate.missing == []
     assert gate.rates == pytest.approx({"zeo": 50.0, "zoe-native": 8.0})
-    assert gate.verdict == "fail"
+    assert gate.ratio == pytest.approx(0.16)
 
 
-def test_a_speed_without_a_run_that_counts_fails_the_gate():
+def test_a_speed_without_a_run_that_counts_is_missing():
     gate = replay.gate(
         result_of(
             run_of("zeo", 1, 1, 40),
@@ -683,25 +651,27 @@ def test_a_speed_without_a_run_that_counts_fails_the_gate():
     )
     assert gate.excluded == [("zoe-native", 4, 1)]
     assert gate.missing == [("zoe-native", 4)]
-    assert gate.verdict == "fail"
+    # The runs of zoe-native that count raise no ConflictError.
+    assert gate.ratio == 0.0
     absent = replay.gate(result_of(run_of("zeo", 1, 1, 40), speeds=(1,)))
     assert absent.missing == [("zoe-native", 1)]
     assert absent.rates == {"zeo": pytest.approx(40.0), "zoe-native": None}
-    assert absent.verdict == "fail"
+    assert absent.ratio is None
 
 
-def test_with_no_conflict_error_on_zeo_only_none_on_zoe_serve_passes():
+def test_with_no_conflict_error_on_zeo_there_is_no_ratio():
     none = replay.gate(
         result_of(run_of("zeo", 1, 1, 0), run_of("zoe-native", 1, 1, 0), speeds=(1,))
     )
-    assert none.verdict == "pass"
+    assert none.rates == {"zeo": 0.0, "zoe-native": 0.0}
+    assert none.ratio is None
     one = replay.gate(
         result_of(run_of("zeo", 1, 1, 0), run_of("zoe-native", 1, 1, 1), speeds=(1,))
     )
-    assert one.verdict == "fail"
+    assert one.ratio is None
 
 
-def test_the_gate_of_the_synthetic_log_fails(result):
+def test_the_ratio_of_the_synthetic_log(result):
     # Both stacks refuse the same write, so zoe serve has 100 % of the
     # ConflictErrors of ZEO.
     gate = replay.gate(result)
@@ -709,24 +679,27 @@ def test_the_gate_of_the_synthetic_log_fails(result):
     assert gate.rates == pytest.approx({"zeo": rate, "zoe-native": rate})
     assert gate.excluded == []
     assert gate.missing == []
-    assert gate.verdict == "fail"
+    assert gate.ratio == pytest.approx(1.0)
 
 
 # The report.
 
 
-def test_the_report_prints_the_counts_and_the_verdict(result, synthetic, tmp_path):
+def test_the_report_prints_the_counts_and_the_ratio(result, synthetic, tmp_path):
     done = report(write_json(tmp_path / "result.json", result))
-    assert done.returncode == 1, done.stdout + done.stderr
+    assert done.returncode == 0, done.stdout + done.stderr
     for name in synthetic.classes.values():
         assert name in done.stdout, done.stdout
     assert "refused" in done.stdout
     assert "python-server" in done.stdout
     assert "does not count" not in done.stdout
-    assert done.stdout.splitlines()[-1].startswith("gate failed:"), done.stdout
+    last = done.stdout.splitlines()[-1]
+    assert last.startswith("success criterion:"), done.stdout
+    assert "zoe-native at 100.0 % of zeo" in last, done.stdout
+    assert "target at most 10 %" in last, done.stdout
 
 
-def test_the_report_passes_when_zoe_serve_raises_no_conflict_error(
+def test_the_report_gives_0_percent_when_zoe_serve_raises_no_conflict_error(
     result, schema, tmp_path
 ):
     # The real result, with no ConflictError on zoe-native.
@@ -738,19 +711,24 @@ def test_the_report_passes_when_zoe_serve_raises_no_conflict_error(
             paths.pop("refused", None)
         run["conflicts"] = {k: v for k, v in run["conflicts"].items() if v}
     jsonschema.validate(passing, schema)
-    assert replay.gate(passing).verdict == "pass"
+    assert replay.gate(passing).ratio == 0.0
     done = report(write_json(tmp_path / "passing.json", passing))
     assert done.returncode == 0, done.stdout + done.stderr
-    assert done.stdout.splitlines()[-1].startswith("gate passed:"), done.stdout
+    last = done.stdout.splitlines()[-1]
+    assert last.startswith("success criterion:"), done.stdout
+    assert "zoe-native at 0.0 % of zeo" in last, done.stdout
 
 
 def test_the_report_marks_a_run_that_does_not_count(failed, tmp_path):
     done = report(write_json(tmp_path / "failed.json", failed[0]))
-    assert done.returncode == 1, done.stdout + done.stderr
+    assert done.returncode == 0, done.stdout + done.stderr
     rows = [line for line in done.stdout.splitlines() if "does not count" in line]
     assert len(rows) == 1, done.stdout
     assert "zoe-native" in rows[0]
-    assert done.stdout.splitlines()[-1].startswith("gate failed:"), done.stdout
+    last = done.stdout.splitlines()[-1]
+    assert last.startswith("success criterion:"), done.stdout
+    assert "no ratio" in last, done.stdout
+    assert "no run that counts for" in last, done.stdout
 
 
 def test_the_report_refuses_a_file_that_is_not_a_result(tmp_path):

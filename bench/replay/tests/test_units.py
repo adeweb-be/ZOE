@@ -192,7 +192,7 @@ def test_a_run_that_replays_no_transaction_does_not_count():
     found = gate({"speeds": [1], "runs": [run, other]})
     assert found.excluded == [("zeo", 1, 1), ("zoe-native", 1, 1)]
     assert found.missing == [("zeo", 1), ("zoe-native", 1)]
-    assert found.verdict == "fail"
+    assert found.ratio is None
 
 
 def test_speeds_must_be_positive_and_distinct(tmp_path):
