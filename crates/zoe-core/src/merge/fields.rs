@@ -915,6 +915,27 @@ mod tests {
         // The committed side is not an append to the old value.
         let merge = merge_histories(&[CREATED], &[NO_STATE], &[CREATED, PUBLISH]);
         assert_eq!(merge.outcome, Outcome::Refused(Reason::NotAppend));
+        // Its second status changes the state. The check of the state
+        // would refuse with `StateChanged`, but the prefix check runs first.
+        let merge = merge_histories(&[CREATED], &[COMMENT, PUBLISH], &[CREATED, SUBMIT]);
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::NotAppend));
+    }
+
+    #[test]
+    fn a_workflow_that_both_sides_add_refuses() {
+        // The old record has no field for the workflow, and both sides add
+        // its first status.
+        let mut heap = Heap::new();
+        let class = heap.new_class("m", "History");
+        let state = heap.new_dict(Vec::new());
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(class).unwrap();
+        pickler.dump(state).unwrap();
+        let old = pickler.into_bytes();
+        let (committed, new) = (history(&[PUBLISH]), history(&[SUBMIT]));
+        let merge = tier2(&old, &committed, &new, "m.History", &entry(true));
+        assert_eq!(merge.outcome, Outcome::Refused(Reason::NotAppend));
+        assert_eq!(merge.fields, [WORKFLOW]);
     }
 
     #[test]
