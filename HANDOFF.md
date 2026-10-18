@@ -36,8 +36,8 @@ The CI fixes (#422 and the workflows `ad2a0bd`) are merged too.
 - Worktree `/Users/antoineduchene/Projets/ZOE-card-218`, branch `card/ZOE-218`.
 - ADR 0047 is accepted. The first review asked for changes (comment of 10:04 on #444).
 
-**The builder was stopped after it committed the fixes, but before it pushed.**
-- **Local commits,** not on GitHub: `5d16b40`, `8283724`, `845f00d`, `c9c2d32` and `875d6ee`, on top of `c000ed2` (origin). The tree is clean.
+**The builder was stopped after it committed the fixes.**
+- **The fix commits,** pushed at the end of the session: `5d16b40`, `8283724`, `845f00d`, `c9c2d32` and `875d6ee`, on top of `c000ed2`. No one has checked them yet.
 - **Done, according to its handoff:**
   - blocking findings B1 to B4;
   - the ten non-blocking findings;
@@ -47,7 +47,7 @@ The CI fixes (#422 and the workflows `ad2a0bd`) are merged too.
 To do:
 1. Check `git log c000ed2..HEAD` and read `docs/handoffs/ZOE-218.md`.
 2. Run `just check`, `just plone zoe backends`, `just bench plone test` and `just test`.
-3. Push, and post a comment on #444 that lists each review finding with its fix commit.
+3. Post a comment on #444 that lists each review finding with its fix commit.
 4. **Get the human's approval of the ADR 0047 text** that `845f00d` added: the item "Mounted databases" in §4, and in §6 the cookie also expiring after a wait that ran out. The human chose to serve mounted databases but has not read the text.
 5. Re-review the delta `git diff c000ed2 HEAD` with a reviewer agent (`loops/prompts/reviewer.md`).
 6. Squash-merge #444, without CI (see "CI" below).
