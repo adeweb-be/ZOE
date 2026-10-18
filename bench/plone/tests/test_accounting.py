@@ -291,7 +291,9 @@ def test_the_switch_folder_orders_goes_into_the_policy_with_the_folder_entry():
     current = {
         "version": 2,
         "split_merges": "on",
-        "classes": {stack.FOLDER_CLASS: {"tier2": "shadow", "fields": {"title": "lww"}}},
+        "classes": {
+            stack.FOLDER_CLASS: {"tier2": "shadow", "fields": {"title": "lww"}}
+        },
     }
     assert stack.folder_orders_policy(current, "on") == {
         "split_merges": "on",

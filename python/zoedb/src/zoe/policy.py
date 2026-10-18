@@ -235,7 +235,10 @@ def validate(policy):
                 checked["options"] = options
         result["classes"][name] = checked
     order = result["classes"].get(ORDER_CLASS, {})
-    if result.get("folder_orders", "off") != "off" and order.get("tier2", "off") != "off":
+    if (
+        result.get("folder_orders", "off") != "off"
+        and order.get("tier2", "off") != "off"
+    ):
         raise ValueError(
             f"{ORDER_CLASS}: no tier2 while folder_orders is not off, "
             "as tier 2 would merge the order of a folder without its positions"

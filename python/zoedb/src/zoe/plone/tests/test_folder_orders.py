@@ -117,8 +117,8 @@ class TestTheProfile(accept.TestCreationsInOneFolder):
         setRoles(self.layer["portal"], TEST_USER_ID, ["Manager"])
 
     def test_the_profile_switches_folder_orders_on_and_an_override_wins(self):
-        import zoe.policy
         import zoe.plone
+        import zoe.policy
         from zoe.plone import merges
 
         portal = self.layer["portal"]

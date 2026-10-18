@@ -73,7 +73,11 @@ FOLDER = f"{Folder.__module__}.Folder"
 # The policy of the tests: the folder merges its date with `max`.
 POLICY = {
     "classes": {
-        FOLDER: {"tier2": "on", "default": "strict", "fields": {"modification_date": "max"}}
+        FOLDER: {
+            "tier2": "on",
+            "default": "strict",
+            "fields": {"modification_date": "max"},
+        }
     },
     "split_merges": "on",
     "folder_orders": "on",
@@ -258,10 +262,14 @@ class Site:
 
     def __enter__(self):
         if self.mode == "in-process":
-            self.db = ZODB.DB(zoe.Storage(str(self.store), resolution_log=str(self.log)))
+            self.db = ZODB.DB(
+                zoe.Storage(str(self.store), resolution_log=str(self.log))
+            )
             self.target = str(self.store)
             return self
-        self.server = ZoeServer(path=self.store, args=["--resolution-log", str(self.log)])
+        self.server = ZoeServer(
+            path=self.store, args=["--resolution-log", str(self.log)]
+        )
         self.server.__enter__()
         host, port = self.server.address
         if self.mode == "native-client":
@@ -271,7 +279,9 @@ class Site:
         else:
             from ZEO.ClientStorage import ClientStorage
 
-            storage = ClientStorage(self.server.address, storage="1", wait_timeout=TIMEOUT)
+            storage = ClientStorage(
+                self.server.address, storage="1", wait_timeout=TIMEOUT
+            )
         self.db = ZODB.DB(storage)
         self.target = f"zeo:{host}:{port}"
         return self
@@ -310,7 +320,9 @@ def run_rounds(mode, tmp_path, queue=True):
 
 
 @pytest.mark.parametrize("mode", MODES[:2])
-def test_with_the_order_merge_every_creation_commits_at_the_first_attempt(mode, tmp_path):
+def test_with_the_order_merge_every_creation_commits_at_the_first_attempt(
+    mode, tmp_path
+):
     rounds, lines = run_rounds(mode, tmp_path)
     assert all(all(outcomes) for outcomes in rounds), rounds
     parts = {line["order"] for line in lines if line["applied"]}
@@ -412,4 +424,6 @@ def test_a_new_bucket_that_the_merge_renumbers_turns_into_a_ghost(mode, tmp_path
         assert order[-3:] == ["a-first", name(items), name(items + 1)]
         site.check_elsewhere(tmp_path)
     lines = order_lines(site.log)
-    assert any(line["order"] == "pos" and line["read"] == line["committed"] for line in lines), lines
+    assert any(
+        line["order"] == "pos" and line["read"] == line["committed"] for line in lines
+    ), lines
