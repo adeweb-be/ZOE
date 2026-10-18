@@ -362,6 +362,14 @@ pub(crate) struct Checked {
     /// The oids that acknowledged commits stored and that their votes
     /// resolved without a record.
     pub(crate) dropped: usize,
+    /// The locks that the finishes of the acknowledged commits whose vote
+    /// wrote an oid that they did not store handed off.
+    pub(crate) split_handoffs: usize,
+    /// The locks that the finish of an acknowledged commit whose vote
+    /// resolved oids handed off beyond the records of its commit.
+    pub(crate) excess_handoffs: usize,
+    /// The locks that the finishes of the acknowledged commits handed off.
+    pub(crate) acked_handoffs: usize,
 }
 
 /// Walk the tree of the node `root` in `store`. Return its buckets and its
@@ -434,13 +442,18 @@ fn walk(store: &Store, root: u64) -> Result<(BTreeSet<u64>, Vec<i128>), String> 
 ///   the chain of the next buckets correct;
 /// - the tree holds the key of each acknowledged commit of a writer;
 /// - each bucket with a current record is in the tree;
+/// - each transaction of the store reads, with its index keys and its
+///   records: a commit that a crash interrupted and that landed included;
 /// - for each acknowledged commit of a writer whose vote resolved oids,
 ///   the transaction index of its tid lists each stored oid that the vote
 ///   did not resolve and each oid that the vote wrote and the transaction
 ///   did not store, and no other oid than the stored and resolved ones;
 ///   each resolved oid that the index does not list has no record at that
 ///   tid; and when the vote wrote an oid that the transaction did not
-///   store, the index does not list the new bucket of the transaction.
+///   store, the index lists neither the node nor the new bucket of the
+///   transaction. In this tree, rule 2 never runs with rule 3, so such a
+///   vote never gives the node a record. The finish of such a commit
+///   handed off no more locks than the records of the commit.
 pub(crate) fn check(store: &Store, root: u64, acked: &[Acked]) -> Checked {
     let mut checked = Checked::default();
     let (buckets, keys) = match walk(store, root) {
@@ -460,6 +473,20 @@ pub(crate) fn check(store: &Store, root: u64, acked: &[Acked]) -> Checked {
                 commit.key, acked.tid
             ));
         }
+    }
+    match store.iterator(None, None) {
+        Ok(transactions) => {
+            for transaction in transactions {
+                if let Err(error) = transaction {
+                    checked
+                        .faults
+                        .push(format!("a transaction does not read: {error}"));
+                }
+            }
+        }
+        Err(error) => checked
+            .faults
+            .push(format!("the transactions do not read: {error}")),
     }
     let mut next = None;
     loop {
@@ -490,10 +517,11 @@ pub(crate) fn check(store: &Store, root: u64, acked: &[Acked]) -> Checked {
         }
     }
     for acked in acked {
-        if let Some(commit) = &acked.tree
-            && !commit.resolved.is_empty()
-        {
-            check_index(store, acked.tid, commit, &mut checked);
+        if let Some(commit) = &acked.tree {
+            checked.acked_handoffs += commit.handed_off;
+            if !commit.resolved.is_empty() {
+                check_index(store, acked.tid, commit, &mut checked);
+            }
         }
     }
     checked.keys = Some(keys);
@@ -574,7 +602,15 @@ fn check_index(store: &Store, tid: u64, commit: &TreeCommit, checked: &mut Check
                 ));
             }
         }
+        if listed.contains(&commit.node) {
+            faults.push(format!(
+                "the index of {tid:016x} lists the node {}, which rule 3 dropped",
+                commit.node
+            ));
+        }
+        checked.split_handoffs += commit.handed_off;
     }
+    checked.excess_handoffs += commit.handed_off.saturating_sub(listed.len());
 }
 
 #[cfg(test)]
@@ -602,13 +638,22 @@ mod tests {
         txn.finish().unwrap().0
     }
 
-    fn acked(tid: u64, key: i128, stored: &[u64], created: &[u64], resolved: &[u64]) -> Acked {
+    fn acked(
+        root: u64,
+        tid: u64,
+        key: i128,
+        stored: &[u64],
+        created: &[u64],
+        resolved: &[u64],
+    ) -> Acked {
         Acked {
             tid,
             records: Vec::new(),
             blobs: Vec::new(),
             tree: Some(Box::new(TreeCommit {
                 key,
+                node: root,
+                handed_off: 0,
                 stored: stored.to_vec(),
                 created: created.to_vec(),
                 resolved: resolved.to_vec(),
@@ -663,13 +708,13 @@ mod tests {
     #[test]
     fn the_planted_tree_passes_and_a_missing_key_fails() {
         let (store, root) = planted();
-        let checked = check(&store, root, &[acked(1, 40, &[], &[], &[])]);
+        let checked = check(&store, root, &[acked(root, 1, 40, &[], &[], &[])]);
         assert_eq!(checked.faults, Vec::<String>::new());
         assert_eq!(
             checked.keys.unwrap().into_iter().collect::<Vec<_>>(),
             [10, 20, 30, 40]
         );
-        let faults = check(&store, root, &[acked(1, 100, &[], &[], &[])]).faults;
+        let faults = check(&store, root, &[acked(root, 1, 100, &[], &[], &[])]).faults;
         assert_eq!(faults.len(), 1, "{faults:?}");
         assert!(faults[0].contains("key 100"), "{faults:?}");
     }
@@ -720,7 +765,11 @@ mod tests {
                 (b, bucket_of(&[30, 40], None)),
             ],
         );
-        let checked = check(&store, root, &[acked(tid, 25, &stored, &[x], &resolved)]);
+        let checked = check(
+            &store,
+            root,
+            &[acked(root, tid, 25, &stored, &[x], &resolved)],
+        );
         assert_eq!(checked.faults, Vec::<String>::new());
         assert_eq!(checked.dropped, 2);
         // A commit that holds X too breaks the rule.
@@ -738,12 +787,65 @@ mod tests {
                 (b, bucket_of(&[30, 40], None)),
             ],
         );
-        let faults = check(&store, root, &[acked(tid, 25, &stored, &[x], &resolved)]).faults;
-        assert_eq!(faults.len(), 1, "{faults:?}");
-        assert!(faults[0].contains("rule 3 dropped"), "{faults:?}");
+        let faults = check(
+            &store,
+            root,
+            &[acked(root, tid, 25, &stored, &[x], &resolved)],
+        )
+        .faults;
+        assert_eq!(faults.len(), 2, "{faults:?}");
+        assert!(
+            faults[0].contains(&format!("new bucket {x},")),
+            "{faults:?}"
+        );
+        assert!(faults[1].contains(&format!("node {root},")), "{faults:?}");
         // An index that lacks a stored oid that the vote did not resolve,
-        // and lists an oid that the transaction did not write.
-        let faults = check(&store, root, &[acked(tid, 25, &[a, 77], &[], &[b])]).faults;
-        assert_eq!(faults.len(), 3, "{faults:?}");
+        // and lists oids that the transaction did not write: the node and
+        // X. The node in the index of a vote that wrote B is a fault too.
+        let faults = check(&store, root, &[acked(root, tid, 25, &[a, 77], &[], &[b])]).faults;
+        assert_eq!(faults.len(), 4, "{faults:?}");
+    }
+
+    #[test]
+    fn a_transaction_that_does_not_read_fails() {
+        let (store, root) = planted();
+        let node = node(&store.load(Oid(root)).unwrap().0).unwrap();
+        let a = node.first;
+        let tid = commit(
+            &store,
+            &[(a, bucket_of(&[10, 20, 25], Some(node.children[0].1)))],
+        );
+        store.remove_index_key_for_test(Tid(tid), Oid(a)).unwrap();
+        let faults = check(&store, root, &[]).faults;
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(
+            faults[0].contains("a transaction does not read"),
+            "{faults:?}"
+        );
+    }
+
+    #[test]
+    fn a_vote_that_wrote_y_needs_y_in_the_index() {
+        let (store, root) = planted();
+        let node = node(&store.load(Oid(root)).unwrap().0).unwrap();
+        let (a, b) = (node.first, node.children[0].1);
+        let x = store.new_oid().unwrap().0;
+        // The vote wrote B, the bucket of the other side, but the commit
+        // holds A alone.
+        let tid = commit(&store, &[(a, bucket_of(&[10, 20, 25], Some(b)))]);
+        let mut written = acked(root, tid, 25, &[root, a, x], &[x], &[root, a, x, b]);
+        let checked = check(&store, root, std::slice::from_ref(&written));
+        assert_eq!(checked.faults.len(), 1, "{:?}", checked.faults);
+        assert!(
+            checked.faults[0].contains(&format!("does not list the written oid {b}")),
+            "{:?}",
+            checked.faults
+        );
+        // A finish that handed off more locks than the records of its
+        // commit handed off a dropped oid.
+        written.tree.as_mut().unwrap().handed_off = 3;
+        let checked = check(&store, root, &[written]);
+        assert_eq!(checked.excess_handoffs, 2);
+        assert_eq!(checked.split_handoffs, 3);
     }
 }

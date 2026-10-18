@@ -197,13 +197,13 @@ conformance only=pythons *tests="zoedb/tests/conformance":
 # store and the blob caches go to TMPDIR: 10,000 rounds need about 3 GB
 # there. The simulated kill loop (`tests/simulated_kill_loop.rs` of
 # zoe-server, in release) crashes the simulated server with a power loss
-# at each phase of a commit. Then the split writers of
-# `tests/simulated_split_merges.rs` run for as many seeds: they split one
-# BTree with the split merge on, and the driver checks the tree after
+# at each phase of a commit, for `seeds` seeds. Then the split writers of
+# `tests/simulated_split_merges.rs` run for `split_seeds` seeds: they split
+# one BTree with the split merge on, and the driver checks the tree after
 # each recovery. A failing seed prints `ZOE_SIM_SEED=<seed>`, and
 # `ZOE_SIM_SEED` runs that seed alone. `just test` runs both with their
 # default seeds, and does not collect the process kill loop.
-crash runs="200" seed="" seeds="200":
+crash runs="200" seed="" seeds="200" split_seeds="200":
     #!/usr/bin/env bash
     set -euo pipefail
     seed="{{ seed }}"
@@ -221,10 +221,11 @@ crash runs="200" seed="" seeds="200":
     if [ "$status" -ne 0 ]; then
         echo "just crash: the kill loop failed. Run it again with: just crash {{ runs }} $seed" >&2
     fi
-    for test in simulated_kill_loop simulated_split_merges; do
-        echo "just crash: $test, {{ seeds }} seeds"
+    for run in "simulated_kill_loop {{ seeds }}" "simulated_split_merges {{ split_seeds }}"; do
+        read -r test count <<<"$run"
+        echo "just crash: $test, $count seeds"
         simulated=0
-        ZOE_SIM_SEEDS="{{ seeds }}" cargo test --release --locked -p zoe-server \
+        ZOE_SIM_SEEDS="$count" cargo test --release --locked -p zoe-server \
             --test "$test" || simulated=$?
         if [ "$simulated" -ne 0 ]; then
             echo "just crash: $test failed. Run the seed that it names with:" \

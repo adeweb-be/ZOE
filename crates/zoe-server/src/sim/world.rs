@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -138,12 +138,16 @@ pub(crate) struct Acked {
 pub(crate) struct TreeCommit {
     /// The key that the transaction inserted.
     pub(crate) key: i128,
+    /// The node of the tree.
+    pub(crate) node: u64,
     /// The oids that the transaction stored.
     pub(crate) stored: Vec<u64>,
     /// The new bucket that the transaction stored, when it split one.
     pub(crate) created: Vec<u64>,
     /// The oids that the vote resolved.
     pub(crate) resolved: Vec<u64>,
+    /// The locks that the finish handed off.
+    pub(crate) handed_off: usize,
 }
 
 impl TreeCommit {
@@ -228,6 +232,9 @@ pub(crate) struct State {
     /// The votes of the split writers that split a bucket and got no
     /// reply.
     pub(crate) interrupted_split_votes: usize,
+    /// The locks that the finishes on each connection handed off, by the
+    /// id of the connection, since its client took the count.
+    pub(crate) handed: BTreeMap<u64, usize>,
 }
 
 /// What the pools of a run delivered, and the counts of their holds.
@@ -375,6 +382,9 @@ impl State {
             dropped: 0,
             interrupted_split_finishes: self.interrupted_split_finishes,
             interrupted_split_votes: self.interrupted_split_votes,
+            split_handoffs: 0,
+            excess_handoffs: 0,
+            acked_handoffs: 0,
             handoffs: 0,
             syncs: 0,
             synced_commits: 0,
@@ -463,6 +473,7 @@ impl Shared {
                 tree_root: None,
                 interrupted_split_finishes: 0,
                 interrupted_split_votes: 0,
+                handed: BTreeMap::new(),
             }),
             ready: Ready::default(),
             permits: IdSet::default(),
@@ -542,6 +553,9 @@ pub(crate) fn sleep(shared: &Arc<Shared>, delay: Duration) -> Sleep {
 struct BatonContext {
     id: u64,
     generation: u32,
+    /// The connection of the server that the thread serves.
+    conn: Option<u64>,
+    shared: Weak<Shared>,
     /// The driver told the thread that its process is dead.
     killed: Cell<bool>,
     yields: mpsc::Sender<(u64, Why)>,
@@ -579,6 +593,19 @@ pub(crate) fn thread_generation() -> Option<u32> {
     BATON.with_borrow(|context| context.as_ref().map(|context| context.generation))
 }
 
+/// Note that a finish on the thread that calls it handed off `locks`
+/// locks, for the connection of the thread. A thread that is not of the
+/// simulation, or that serves no connection, notes nothing.
+pub(crate) fn handed_off(locks: usize) {
+    let target = BATON.with_borrow(|context| {
+        let context = context.as_ref()?;
+        Some((context.conn?, context.shared.upgrade()?))
+    });
+    if let Some((conn, shared)) = target {
+        *shared.lock().handed.entry(conn).or_default() += locks;
+    }
+}
+
 /// Tell if the driver told the thread that calls it that its process is
 /// dead. From then on, the thread gives the baton back no more: each of
 /// its waits ends at once.
@@ -586,16 +613,18 @@ pub(crate) fn killed() -> bool {
     BATON.with_borrow(|context| context.as_ref().is_some_and(|context| context.killed.get()))
 }
 
-/// Start a thread of the server generation `generation` for a connection
-/// of `client`. The thread waits for the baton before it runs `work`. It
+/// Start a thread of the server generation `generation` for the
+/// connection `conn` of `client`. The thread waits for the baton before it runs `work`. It
 /// waits for its channels on a waiter of the simulation. When `work`
 /// returns, the thread tells the driver that it ended.
 pub(crate) fn spawn_thread(
     shared: &Arc<Shared>,
     generation: u32,
     client: Option<usize>,
+    conn: Option<u64>,
     work: Box<dyn FnOnce() + Send>,
 ) {
+    let weak = Arc::downgrade(shared);
     let mut state = shared.lock();
     state.next_thread += 1;
     let id = state.next_thread;
@@ -616,6 +645,8 @@ pub(crate) fn spawn_thread(
             let context = BatonContext {
                 id,
                 generation,
+                conn,
+                shared: weak,
                 killed: Cell::new(false),
                 yields,
                 resume,

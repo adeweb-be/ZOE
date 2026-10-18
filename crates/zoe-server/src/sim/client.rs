@@ -95,6 +95,8 @@ pub(crate) struct SimClient {
     pub(crate) hot_length: bool,
     /// The client declares `server_writes` and inserts into the tree.
     pub(crate) split_merges: bool,
+    /// The connection of the client, when it is a split writer.
+    pub(crate) conn: Option<u64>,
 }
 
 impl SimClient {
@@ -165,6 +167,12 @@ impl SimClient {
             match connected {
                 Ok(client) => {
                     self.trace("registered");
+                    if self.split_merges {
+                        // The connect made the newest conn of this client.
+                        let state = self.shared.lock();
+                        let mine = state.conns.iter().filter(|(_, c)| c.client == self.id);
+                        self.conn = mine.map(|(id, _)| *id).max();
+                    }
                     return Some(client);
                 }
                 Err(error) => self.trace(&format!("does not connect: {error}")),
@@ -397,6 +405,9 @@ impl SimClient {
             writes.push((new, Tid::ZERO, tree::bucket_record(&right)));
             created.push(new);
         }
+        let conn = self.conn.expect("a split writer knows its connection");
+        // The hand-offs of an earlier finish on the connection do not count.
+        self.shared.lock().handed.remove(&conn);
         let user = format!("c{}", self.id);
         let mut txn = match client.begin(user.as_bytes(), b"", b"").await {
             Ok(txn) => txn,
@@ -425,8 +436,10 @@ impl SimClient {
                 return lost(error);
             }
         };
-        let commit = TreeCommit {
+        let mut commit = TreeCommit {
             key,
+            node: root,
+            handed_off: 0,
             stored: writes.iter().map(|(oid, _, _)| *oid).collect(),
             created,
             resolved,
@@ -441,6 +454,8 @@ impl SimClient {
         self.reach(phase::LOCKED);
         match txn.finish().await {
             Ok(tid) => {
+                // The finish notes its hand-offs before it replies.
+                commit.handed_off = self.shared.lock().handed.remove(&conn).unwrap_or(0);
                 let records = writes
                     .into_iter()
                     .filter(|(oid, _, _)| !commit.resolved.contains(oid))

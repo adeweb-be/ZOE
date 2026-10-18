@@ -47,6 +47,7 @@ use client::SimClient;
 use disk::{Cache, DATABASE, SimClock, SimVfs};
 use pool::SimPoolClient;
 use rng::Rng;
+pub(crate) use world::handed_off;
 use world::{
     Baton, NetFault, Owner, PlannedCrash, Resume, Shared, Task, TaskWaker, Timer, Wait, Why, phase,
 };
@@ -199,6 +200,21 @@ pub struct Report {
     /// The votes of the split writers that split a bucket and got no
     /// reply: a crash or a lost connection came before the reply.
     pub interrupted_split_votes: usize,
+    /// The locks that the finishes of the acknowledged commits of the split
+    /// writers whose vote wrote an oid that they did not store handed off.
+    pub split_handoffs: usize,
+    /// The locks that the finish of an acknowledged commit of a split
+    /// writer whose vote resolved oids handed off beyond the records of
+    /// its commit, summed over those commits. The finish hands off only
+    /// staged oids, so a hand-off of an oid that the vote dropped makes
+    /// one. It must be 0. The observer of the core gives a count for each
+    /// finish, not the oids: a hand-off of a dropped oid in place of a
+    /// staged one does not count here.
+    pub excess_handoffs: usize,
+    /// The locks that the finishes of the acknowledged commits of the split
+    /// writers handed off. The other hand-offs of `handoffs` are those of
+    /// finishes whose reply did not come.
+    pub acked_handoffs: usize,
     /// The locks that the finishes of the server handed to the vote at the
     /// head of their queues (ADR 0044), over every server process of the
     /// run.
@@ -468,6 +484,7 @@ impl Driver {
                         blobs: self.plan.blobs,
                         hot_length: self.plan.hot_length,
                         split_merges: self.plan.split_merges,
+                        conn: None,
                     }
                     .run(),
                 ),
@@ -501,6 +518,9 @@ impl Driver {
         report.tree_faults = std::mem::take(&mut self.tree_faults);
         report.tree_faults.extend(checked.faults);
         report.dropped = checked.dropped;
+        report.split_handoffs = checked.split_handoffs;
+        report.excess_handoffs = checked.excess_handoffs;
+        report.acked_handoffs = checked.acked_handoffs;
         report.tree_checks = self.tree_checks;
         report.handoffs = self.handoffs;
         (report.syncs, report.synced_commits) = self.syncs;
