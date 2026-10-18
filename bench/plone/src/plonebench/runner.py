@@ -280,6 +280,10 @@ def run(options: RunOptions) -> Path:
 
 
 def _counters(config: stack.StackConfig, settings: stack.Settings) -> dict:
+    # Call this only outside the measured windows. The admin port of zoe
+    # serve answers with send(), which wchar does not count, but the sampler
+    # subtracts its socket bytes. Inside a window, the store bytes are then
+    # too low.
     counters = {"t": time.time(), "status": servers.server_status(settings.server_port)}
     if config.server == "zoe":
         try:

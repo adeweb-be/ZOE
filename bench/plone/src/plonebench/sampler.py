@@ -84,8 +84,10 @@ def read_process(pid: int) -> dict | None:
 
 
 def read_sockets(pid: int) -> dict[int, int] | None:
-    """Return the bytes that each TCP socket of process `pid` sent, by the
-    inode of the socket. `ss` gives the counters."""
+    """Return the bytes that the process `pid` gave to each of its TCP
+    sockets, by the inode of the socket: `bytes_sent` of `ss -i` without
+    the retransmitted bytes (`bytes_retrans`), plus the bytes still in the
+    send queue (`notsent`). `ss` omits a counter that is 0."""
     inodes = set()
     try:
         for fd in os.listdir(f"/proc/{pid}/fd"):
@@ -109,14 +111,24 @@ def read_sockets(pid: int) -> dict[int, int] | None:
         inode = re.search(r"\bino:(\d+)", line)
         if inode is None or int(inode.group(1)) not in inodes:
             continue
-        count = re.search(r"\bbytes_sent:(\d+)", line)
-        sent[int(inode.group(1))] = int(count.group(1)) if count else 0
+        sent[int(inode.group(1))] = (
+            _counter(line, "bytes_sent")
+            - _counter(line, "bytes_retrans")
+            + _counter(line, "notsent")
+        )
     return sent
+
+
+def _counter(line: str, name: str) -> int:
+    found = re.search(rf"\b{name}:(\d+)", line)
+    return int(found.group(1)) if found else 0
 
 
 def read_other_files(pid: int, store_dir: Path) -> int | None:
     """Return the summed size of the regular files that process `pid` holds
     open for writing outside `store_dir`: its logs and its resolution log."""
+    # The links in /proc name the real paths.
+    store_dir = store_dir.resolve()
     seen = set()
     total = 0
     try:
@@ -185,10 +197,11 @@ def store_counters(
     if other is not None:
         result["other_files_bytes"] = other
     if appends:
+        # None marks a store that the server appends to, without its size.
         try:
             result["store_file_bytes"] = os.stat(store).st_size
         except OSError:
-            pass
+            result["store_file_bytes"] = None
     return result
 
 
@@ -371,9 +384,10 @@ def _store_bytes(a: dict, b: dict) -> int | None:
             return None
         return b[key] - a[key]
 
-    appended = growth("store_file_bytes")
-    if appended is not None:
-        return appended
+    # A store that the server only appends to counts by its size alone:
+    # its wchar holds the writes to Data.fs.tmp too.
+    if "store_file_bytes" in a or "store_file_bytes" in b:
+        return growth("store_file_bytes")
     written, sent, other = (
         growth(key) for key in ("wchar", "socket_bytes_sent", "other_files_bytes")
     )

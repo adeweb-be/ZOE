@@ -3,6 +3,7 @@
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 
@@ -95,3 +96,72 @@ def test_the_sampler_reads_the_store_counters_of_a_server(tmp_path):
     assert processes["server"]["store_file_bytes"] == 1234
     assert "other_files_bytes" in processes["server"]
     assert "store_file_bytes" not in processes["locust"]
+
+
+@linux
+def test_the_sent_bytes_leave_out_retransmits_and_add_the_queue(monkeypatch):
+    with socket.socket() as sock:
+        inode = os.fstat(sock.fileno()).st_ino
+        line = (
+            f"ESTAB 0 0 127.0.0.1:1 127.0.0.1:2 ino:{inode} sk:1 <-> cubic "
+            "bytes_sent:1000 bytes_retrans:100 bytes_acked:900 notsent:50"
+        )
+        monkeypatch.setattr(
+            sampler.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, line, ""),
+        )
+        assert sampler.read_sockets(os.getpid()) == {inode: 950}
+
+
+@linux
+def test_other_files_skip_a_store_behind_a_symlink(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with open(link / "zoe.redb", "wb") as data:
+        before = sampler.read_other_files(os.getpid(), link)
+        data.write(b"d" * 5000)
+        data.flush()
+        assert sampler.read_other_files(os.getpid(), link) == before
+
+
+def test_zeo_store_bytes_need_the_size_of_data_fs_at_both_ends():
+    def server(**counters):
+        return {
+            "cpu": 0.0,
+            "user": 0.0,
+            "system": 0.0,
+            "threads": 1,
+            "rss": 0,
+            "run_delay": 0.0,
+            **counters,
+        }
+
+    samples = [
+        {
+            "t": float(t),
+            "cpu": {"user": 0.0},
+            "disk": None,
+            "processes": {"server": entry},
+        }
+        for t, entry in enumerate(
+            [
+                server(
+                    wchar=0,
+                    socket_bytes_sent=0,
+                    other_files_bytes=0,
+                    store_file_bytes=None,
+                ),
+                server(
+                    wchar=900,
+                    socket_bytes_sent=100,
+                    other_files_bytes=0,
+                    store_file_bytes=500,
+                ),
+            ]
+        )
+    ]
+    result = sampler.summarize(samples, 0.0, 1.0)["processes"]["server"]
+    assert "store_write_bytes" not in result
