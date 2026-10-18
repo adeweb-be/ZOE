@@ -25,7 +25,7 @@
 
   <!-- The guard of a stock registry, with or without the registry backend:
        in a store with namespaces, a registry calls readCurrent on the
-       roots of its trees when code reads its records. A move writes these
+       roots of its trees when code reads its records. A move empties these
        roots, so a write that began before a move conflicts (ADR 0050). -->
   <zcml:customAction handler=".registry.install_guard" />
 

@@ -277,6 +277,29 @@ class TestRegistryBackend(unittest.TestCase):
         with opened(db) as (app, _):
             self.assertEqual(app[PLONE_SITE_ID].portal_registry[TITLE], "Second write")
 
+    def test_an_undo_of_a_move_gives_back_the_stock_trees(self):
+        db = self.copy()
+        with opened(db) as (app, manager):
+            registry = app[PLONE_SITE_ID].portal_registry
+            values = {name: registry[name] for name in registry.records.keys()}
+            backend.move(registry)
+            manager.get().note("the move")
+            manager.commit()
+        undo_id = next(
+            entry["id"]
+            for entry in db.undoLog(0, 20)
+            if entry["description"] in ("the move", b"the move")
+        )
+        manager = transaction.TransactionManager()
+        db.undo(undo_id, manager.get())
+        manager.commit()
+        with opened(db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertNotIsInstance(aq_base(registry)._records, backend.MovedRecords)
+            self.assertEqual(
+                {name: registry[name] for name in registry.records.keys()}, values
+            )
+
     def test_a_field_changed_during_a_move_makes_the_move_conflict(self):
         backend.move(self.registry)
         with opened(self.db) as (app, manager):
@@ -382,6 +405,27 @@ class TestRegistryBackend(unittest.TestCase):
                 registry.zoe_test_mtime = 1
                 other_manager.commit()
             manager.commit()
+
+    def test_a_write_that_races_a_move_conflicts_with_the_split_merge_on(self):
+        # Rule 1 of the split merge lets a read-current node through when
+        # the other side changed it only by splits and replacements. A new
+        # record writes under both roots.
+        import zoe.policy
+
+        zoe.policy.install(self.portal._p_jar, {"classes": {}, "split_merges": "on"})
+        transaction.commit()
+        db = self.copy()
+        name = "zoe.plone.tests.added"
+        with opened(db) as (app, manager):
+            records = app[PLONE_SITE_ID].portal_registry.records
+            records[name] = Record(TextLine(title="Added"), "Added before the move")
+            with opened(db) as (mover, mover_manager):
+                backend.move(mover[PLONE_SITE_ID].portal_registry)
+                mover_manager.commit()
+            with self.assertRaises(ConflictError):
+                manager.commit()
+        with opened(db) as (app, _):
+            self.assertNotIn(name, app[PLONE_SITE_ID].portal_registry)
 
     def small_registry(self):
         """Store a registry of one record, whose trees keep their keys in

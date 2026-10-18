@@ -30,7 +30,7 @@ process, with or without the option.
   before each savepoint. A rollback to a savepoint drops the decoded rows.
 - **The guard** of a stock registry in a store with namespaces calls
   `readCurrent` on the roots of its trees when code reads its records, and
-  the move writes those roots. So a write that began before a move
+  the move empties those roots. So a write that began before a move
   conflicts, and a write of an attribute of the registry object does not.
   `configure.zcml` installs the guard whenever `zoe.plone` loads.
 
@@ -166,7 +166,7 @@ def _holds_its_bucket(tree):
 def _read_current(registry, records):
     """Call `readCurrent` on the roots of `_fields` and `_values` of the
     stock `records` of `registry`, when it is in a store with namespaces.
-    A move writes these roots, so a write that began before the move
+    A move empties these roots, so a write that began before the move
     conflicts. A write of an attribute of the registry object does not.
 
     A root that keeps its own keys is written by each write of a record,
@@ -679,14 +679,9 @@ def move(registry):
         )
     registry_id = registry_rows.new_id()
     namespace = zoe.kv.Namespace(jar, "durable", namespace_name(registry_id))
-    for tree in (records._fields, records._values):
+    trees = (records._fields, records._values)
+    for tree in trees:
         _read_current_tree(jar, tree)
-        # The guard calls readCurrent on a root with children, so the move
-        # writes it. A root that keeps its own keys stays: the guard reads
-        # the registry object then, and the readCurrent of the move on the
-        # root finds a write of a record.
-        if tree._p_jar is jar and not _holds_its_bucket(tree):
-            tree._p_changed = True
 
     def seen(obj):
         if obj._p_jar is jar and obj._p_oid is not None:
@@ -699,6 +694,15 @@ def move(registry):
     for name, value in records._values.items():
         namespace.set(record_key(VALUE, name), dumps(value))
     namespace.set(MARKER, encode_marker(registry._p_oid, 1))
+    # The guard calls readCurrent on a root with children, so the move
+    # empties it. An empty root is not a change by splits, so the split
+    # merge lets no write through it. The buckets stay as they are. A root
+    # that keeps its own keys stays: the guard reads the registry object
+    # then, and the readCurrent of the move on the root finds a write of a
+    # record.
+    for tree in trees:
+        if tree._p_jar is jar and not _holds_its_bucket(tree):
+            tree.clear()
     registry._records = MovedRecords(registry, registry_id, 1)
 
 
