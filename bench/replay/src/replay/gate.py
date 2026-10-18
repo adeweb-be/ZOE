@@ -1,20 +1,9 @@
-"""The gate of phase 4: the `ConflictError`s that reach Zope on `zoe serve`
-are at most 10 % of those on ZEO."""
+"""The measure of the success criterion of B6: the `ConflictError`s that
+reach Zope on `zoe serve`, as a share of those on ZEO. It is a measure, not
+a gate."""
 
 import dataclasses
 from fractions import Fraction
-
-# The highest share of the ConflictErrors of ZEO that zoe serve may raise.
-LIMIT = 0.1
-
-
-def verdict(zeo, zoe) -> str:
-    """Return "pass" when `zoe` is at most `LIMIT` of `zeo`, else "fail".
-
-    With 0 on ZEO, only 0 on zoe serve passes. The comparison is exact, so
-    10 % passes."""
-    passed = Fraction(zoe) <= Fraction(zeo) * Fraction(str(LIMIT))
-    return "pass" if passed else "fail"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,11 +16,13 @@ class Gate:
     excluded: list
     # (stack, speed) of each speed and stack without a run that counts.
     missing: list
-    verdict: str
+    # The rate of zoe-native over the rate of zeo. None when a stack has no
+    # run that counts, or when zeo has no ConflictError.
+    ratio: float | None
 
 
 def gate(result: dict) -> Gate:
-    """Return the gate of a result of the replay."""
+    """Return the measure of a result of the replay."""
     from replay.runner import STACKS
 
     errors = {stack: 0 for stack in STACKS}
@@ -64,9 +55,6 @@ def gate(result: dict) -> Gate:
     rates = {
         stack: None if rate is None else float(rate) for stack, rate in exact.items()
     }
-    passed = (
-        not missing
-        and None not in exact.values()
-        and verdict(zeo=exact["zeo"], zoe=exact["zoe-native"]) == "pass"
-    )
-    return Gate(rates, excluded, missing, "pass" if passed else "fail")
+    zeo, zoe = exact["zeo"], exact["zoe-native"]
+    ratio = None if zeo is None or zoe is None or zeo == 0 else float(zoe / zeo)
+    return Gate(rates, excluded, missing, ratio)

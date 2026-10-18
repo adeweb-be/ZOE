@@ -192,7 +192,15 @@ def run(options: RunOptions) -> Path:
     try:
         t0 = time.time()
         st.start_server()
-        sample.watch("server", st.processes["server"].pid)
+        # FileStorage only appends to Data.fs. zoe serve writes pages of
+        # zoe.redb in place.
+        layout = stack.store_layout(store, config)
+        if config.server == "zeo":
+            sample.watch("server", st.processes["server"].pid, layout["data_fs"], True)
+        else:
+            sample.watch(
+                "server", st.processes["server"].pid, layout["zoe"] / "zoe.redb"
+            )
         if options.settings.split_merges is not None:
             # The switch commits before the instances start, so every
             # transaction of the run votes with it. Its client does not
@@ -272,6 +280,10 @@ def run(options: RunOptions) -> Path:
 
 
 def _counters(config: stack.StackConfig, settings: stack.Settings) -> dict:
+    # Call this only outside the measured windows. The admin port of zoe
+    # serve answers with send(), which wchar does not count, but the sampler
+    # subtracts its socket bytes. Inside a window, the store bytes are then
+    # too low.
     counters = {"t": time.time(), "status": servers.server_status(settings.server_port)}
     if config.server == "zoe":
         try:

@@ -10,9 +10,11 @@
 //! Three rules decide the records of one node in the vote:
 //!
 //! 1. A node that the transaction marked read-current and did not store
-//!    passes when the other side changed it only by splits and split no
-//!    child that the transaction stored or marked read-current
-//!    ([`read_node`]).
+//!    passes when the other side changed it only by splits and
+//!    replacements, and split or replaced no child that the transaction
+//!    stored or marked read-current ([`read_node`]). A replacement is a new
+//!    child in the place of a child that is not the first one, with the
+//!    same separator and the same separator after it.
 //! 2. The splits of different children merge: the merged node is the
 //!    committed node with the new children of the transaction right after
 //!    their anchors ([`written_node`]).
@@ -27,9 +29,9 @@
 //!
 //! The rules write only records that the transaction stored. They read the
 //! records through a [`Source`]. They give no answer for a node that
-//! changed by anything but splits, for a delete in a range that they merge,
-//! for two splits of one child on one side, and for a state that the model
-//! does not hold. Two key references of one class compare by the oids of
+//! changed by anything but splits (rule 1 also takes replacements), for a
+//! delete in a range that they merge, for two splits of one child on one
+//! side, and for a state that the model does not hold. Two key references of one class compare by the oids of
 //! their objects, as keys and as values: `bucket_merge` compares the
 //! values of the keys that both sides kept.
 
@@ -415,6 +417,19 @@ impl<'s> Group<'s> {
     /// after another new child of the same anchor. Returns `None` when
     /// `after` changed otherwise.
     fn splits(&self, before: &Node, after: &Node) -> Step<Option<BTreeMap<usize, Vec<Child>>>> {
+        Ok(self
+            .changes(before, after, false)?
+            .map(|changes| changes.added))
+    }
+
+    /// Returns the splits and the replacements of `after` against `before`,
+    /// as [`Group::splits`] does. With `replace`, a new child can take the
+    /// place of a child of `before` that is not the first one, with the
+    /// same separator. The child after it must then have the separator of
+    /// the child after the replaced one, or neither has a child after it:
+    /// so no new child comes right after a replacement. Returns `None` when
+    /// `after` changed otherwise.
+    fn changes(&self, before: &Node, after: &Node, replace: bool) -> Step<Option<Changes>> {
         if before.first_oid != after.first_oid {
             return Ok(None);
         }
@@ -425,32 +440,54 @@ impl<'s> Group<'s> {
         {
             return Ok(None);
         }
-        let mut added: BTreeMap<usize, Vec<Child>> = BTreeMap::new();
+        let mut changes = Changes::default();
         let mut next = 0;
         for (index, child) in before.children.iter().enumerate() {
             let Some(other) = after.children.get(next) else {
                 return Ok(None);
             };
             if other.oid != child.oid {
-                return Ok(None);
+                // Only a new child can replace a child, and never the
+                // first child.
+                if !replace || index == 0 || known.contains(&other.oid) {
+                    return Ok(None);
+                }
+                changes.replaced.insert(index);
             }
-            let same = match (child.separator, other.separator) {
-                (None, None) => true,
-                (Some(a), Some(b)) => self.compare(a, b)? == Ordering::Equal,
-                _ => false,
-            };
-            if !same {
+            if !self.same_separator(child.separator, other.separator)? {
                 return Ok(None);
             }
             next += 1;
+            // With replacements, a new child with the separator of the next
+            // child of `before` replaces that child: it is not a split.
+            let replaceable = match before.children.get(index + 1) {
+                Some(following) if replace => following.separator,
+                _ => None,
+            };
             while let Some(new) = after.children.get(next)
                 && !known.contains(&new.oid)
             {
-                added.entry(index).or_default().push(*new);
+                if replaceable.is_some() && self.same_separator(replaceable, new.separator)? {
+                    break;
+                }
+                if changes.replaced.contains(&index) {
+                    return Ok(None);
+                }
+                changes.added.entry(index).or_default().push(*new);
                 next += 1;
             }
         }
-        Ok((next == after.children.len()).then_some(added))
+        Ok((next == after.children.len()).then_some(changes))
+    }
+
+    /// Tells if two separators are the same: both absent, or two keys that
+    /// compare equal.
+    fn same_separator(&self, a: Option<Value>, b: Option<Value>) -> Step<bool> {
+        Ok(match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => self.compare(a, b)? == Ordering::Equal,
+            _ => false,
+        })
     }
 
     /// Merges the range of one bucket with the rules of `bucket_merge`, and
@@ -851,14 +888,17 @@ impl<'s> Group<'s> {
         else {
             return no("a node that holds its bucket inline");
         };
-        let Some(theirs) = self.splits(&old, &committed)? else {
-            return no("a node that the other side changed by more than splits");
+        let Some(theirs) = self.changes(&old, &committed, true)? else {
+            return no("a node that the other side changed by more than splits and replacements");
         };
         let mut path = 0;
         for (index, child) in old.children.iter().enumerate() {
             if self.source.stores(child.oid) || self.source.read_current(child.oid) {
-                if theirs.contains_key(&index) {
+                if theirs.added.contains_key(&index) {
                     return no("a path child that the other side split");
+                }
+                if theirs.replaced.contains(&index) {
+                    return no("a path child that the other side replaced");
                 }
                 path += 1;
             }
@@ -868,6 +908,15 @@ impl<'s> Group<'s> {
         }
         Ok(Split::Passed)
     }
+}
+
+/// How a node changed against an older record of it.
+#[derive(Default)]
+struct Changes {
+    /// The new children of each split, by the index of their anchor.
+    added: BTreeMap<usize, Vec<Child>>,
+    /// The indexes of the replaced children.
+    replaced: BTreeSet<usize>,
 }
 
 /// The merged items of the range of a bucket, cut at a separator.
@@ -904,4 +953,145 @@ struct Anchor {
     record: Vec<u8>,
     /// The serial and the pickle of the current record.
     current: (Tid, Vec<u8>),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use zoe_pickle::python::{Heap, Pickler, Value};
+
+    use super::{Source, Split, read_node};
+    use crate::error::Result;
+    use crate::types::{Oid, Tid};
+
+    const NODE: Oid = Oid(1);
+    const READ: Tid = Tid(1);
+    const CURRENT: Tid = Tid(2);
+
+    /// The records of rule 1: the node as the transaction read it and as
+    /// it is now, and the children that the transaction stored.
+    struct Records {
+        old: Vec<u8>,
+        committed: Vec<u8>,
+        stored: BTreeSet<Oid>,
+    }
+
+    impl Source for Records {
+        fn staged(&self, _: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
+            Ok(None)
+        }
+
+        fn stores(&self, oid: Oid) -> bool {
+            self.stored.contains(&oid)
+        }
+
+        fn current(&self, oid: Oid) -> Result<Option<(Tid, Vec<u8>)>> {
+            Ok((oid == NODE).then(|| (CURRENT, self.committed.clone())))
+        }
+
+        fn at(&self, oid: Oid, serial: Tid) -> Result<Option<Vec<u8>>> {
+            Ok((oid == NODE && serial == READ).then(|| self.old.clone()))
+        }
+
+        fn read_current(&self, oid: Oid) -> bool {
+            oid == NODE
+        }
+    }
+
+    /// Returns a reference to the `IIBucket` `oid`.
+    fn reference(heap: &mut Heap, oid: u64) -> Value {
+        let bytes = heap.new_bytes(&oid.to_be_bytes());
+        let class = heap.new_class("BTrees.IIBTree", "IIBucket");
+        let data = heap.new_tuple(vec![bytes, class]);
+        heap.new_reference(data).unwrap()
+    }
+
+    /// Returns the record of an `IIBTree` whose children are the buckets
+    /// `first`, then each separator and its bucket.
+    fn node(first: u64, children: &[(i128, u64)]) -> Vec<u8> {
+        let mut heap = Heap::new();
+        let class = heap.new_class("BTrees.IIBTree", "IIBTree");
+        let mut items = vec![reference(&mut heap, first)];
+        for &(separator, oid) in children {
+            items.push(Value::Int(separator));
+            items.push(reference(&mut heap, oid));
+        }
+        let children = heap.new_tuple(items);
+        let first = reference(&mut heap, first);
+        let state = heap.new_tuple(vec![children, first]);
+        let mut pickler = Pickler::new(&heap);
+        pickler.dump(class).unwrap();
+        pickler.dump(state).unwrap();
+        pickler.into_bytes()
+    }
+
+    /// Runs rule 1 on a node of the buckets 10, 11, 12 and 13, with the
+    /// separators 30, 50 and 70, that the other side changed into
+    /// `committed`. The transaction stored the last bucket.
+    fn rule_1(committed: Vec<u8>) -> Split {
+        let records = Records {
+            old: node(10, &[(30, 11), (50, 12), (70, 13)]),
+            committed,
+            stored: BTreeSet::from([Oid(13)]),
+        };
+        read_node(&records, NODE, READ).unwrap()
+    }
+
+    #[test]
+    fn a_replacement_beside_a_split_passes() {
+        // The other side splits 10 and replaces 11 by 21.
+        let committed = node(10, &[(20, 20), (30, 21), (50, 12), (70, 13)]);
+        assert_eq!(rule_1(committed), Split::Passed);
+    }
+
+    #[test]
+    fn two_replacements_side_by_side_pass() {
+        let committed = node(10, &[(30, 21), (50, 22), (70, 13)]);
+        assert_eq!(rule_1(committed), Split::Passed);
+    }
+
+    #[test]
+    fn a_replaced_path_child_gives_no_answer() {
+        let committed = node(10, &[(30, 11), (50, 12), (70, 23)]);
+        assert_eq!(
+            rule_1(committed),
+            Split::Undecided("a path child that the other side replaced")
+        );
+    }
+
+    #[test]
+    fn a_new_first_child_gives_no_answer() {
+        let committed = node(20, &[(30, 11), (50, 12), (70, 13)]);
+        assert!(matches!(rule_1(committed), Split::Undecided(_)));
+    }
+
+    #[test]
+    fn a_replacement_followed_by_a_split_of_it_gives_no_answer() {
+        // 21 replaces 11, and 22 comes right after it: the separator after
+        // 21 is 40, not 50.
+        let committed = node(10, &[(30, 21), (40, 22), (50, 12), (70, 13)]);
+        assert!(matches!(rule_1(committed), Split::Undecided(_)));
+    }
+
+    #[test]
+    fn a_replaced_last_child_followed_by_a_new_child_gives_no_answer() {
+        // 23 replaces 13, the last child, and 24 comes right after it.
+        let committed = node(10, &[(30, 11), (50, 12), (70, 23), (80, 24)]);
+        let records = Records {
+            old: node(10, &[(30, 11), (50, 12), (70, 13)]),
+            committed,
+            stored: BTreeSet::from([Oid(11)]),
+        };
+        assert!(matches!(
+            read_node(&records, NODE, READ).unwrap(),
+            Split::Undecided(_)
+        ));
+    }
+
+    #[test]
+    fn a_new_child_with_another_separator_gives_no_answer() {
+        let committed = node(10, &[(25, 21), (50, 12), (70, 13)]);
+        assert!(matches!(rule_1(committed), Split::Undecided(_)));
+    }
 }

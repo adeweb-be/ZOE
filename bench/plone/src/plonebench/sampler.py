@@ -6,6 +6,11 @@ for a CPU. For the machine: the CPU times and the counters of the disk
 under the store. The samples go to a JSON lines file; `summarize` turns a
 window of them into deltas.
 
+For the server, on Linux, the sampler also reads the counters of the bytes
+that it writes to its store (`store_counters`). `summarize` turns them into
+`store_write_bytes`. The kernel counter `write_bytes` charges whole
+page-cache folios, so it can be many times the bytes that reach a store.
+
 On Linux the values come from /proc: the run delay of schedstat, steal
 time, and the flushes of /proc/diskstats. On macOS they come from
 `proc_pid_rusage` (the runnable time stands for the run delay) and psutil.
@@ -18,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -70,10 +76,133 @@ def read_process(pid: int) -> dict | None:
         "rss": rss * PAGE,
         "read_bytes": io.get("read_bytes"),
         "write_bytes": io.get("write_bytes"),
+        "wchar": io.get("wchar"),
         "voluntary": switches.get("voluntary_ctxt_switches"),
         "involuntary": switches.get("nonvoluntary_ctxt_switches"),
         "run_delay": delay / 1e9,
     }
+
+
+def read_sockets(pid: int) -> dict[int, int] | None:
+    """Return the bytes that the process `pid` gave to each of its TCP
+    sockets, by the inode of the socket: `bytes_sent` of `ss -i` without
+    the retransmitted bytes (`bytes_retrans`), plus the bytes still in the
+    send queue (`notsent`). `ss` omits a counter that is 0."""
+    inodes = set()
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inodes.add(int(link[len("socket:[") : -1]))
+        out = subprocess.run(
+            ["ss", "-H", "-t", "-n", "-i", "-e", "-O"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    sent = {}
+    for line in out.splitlines():
+        inode = re.search(r"\bino:(\d+)", line)
+        if inode is None or int(inode.group(1)) not in inodes:
+            continue
+        sent[int(inode.group(1))] = (
+            _counter(line, "bytes_sent")
+            - _counter(line, "bytes_retrans")
+            + _counter(line, "notsent")
+        )
+    return sent
+
+
+def _counter(line: str, name: str) -> int:
+    found = re.search(rf"\b{name}:(\d+)", line)
+    return int(found.group(1)) if found else 0
+
+
+def read_other_files(pid: int, store_dir: Path) -> int | None:
+    """Return the summed size of the regular files that process `pid` holds
+    open for writing outside `store_dir`: its logs and its resolution log."""
+    # The links in /proc name the real paths.
+    store_dir = store_dir.resolve()
+    seen = set()
+    total = 0
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            path = os.readlink(f"/proc/{pid}/fd/{fd}")
+            with open(f"/proc/{pid}/fdinfo/{fd}") as file:
+                flags = next(
+                    int(line.split()[1], 8)
+                    for line in file
+                    if line.startswith("flags:")
+                )
+            info = os.stat(f"/proc/{pid}/fd/{fd}")
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
+        if flags & os.O_ACCMODE == os.O_RDONLY or not stat.S_ISREG(info.st_mode):
+            continue
+        if Path(path).is_relative_to(store_dir):
+            continue
+        if (info.st_dev, info.st_ino) in seen:
+            continue
+        seen.add((info.st_dev, info.st_ino))
+        total += info.st_size
+    return total
+
+
+class SentBytes:
+    """The bytes that the TCP sockets of one process sent, as a counter
+    that only grows.
+
+    `ss` gives the bytes of the open sockets only. When a socket closes,
+    this counter keeps the bytes that the last sample saw. The bytes that
+    the socket sent after that sample are lost: at most one interval of one
+    connection. The connections of the Zope instances stay open for the
+    whole run."""
+
+    def __init__(self):
+        self.last: dict[int, int] = {}
+        self.closed = 0
+
+    def update(self, sockets: dict[int, int]) -> int:
+        for inode, sent in self.last.items():
+            now = sockets.get(inode)
+            # A smaller count is a new socket on a reused inode.
+            if now is None or now < sent:
+                self.closed += sent
+        self.last = dict(sockets)
+        return self.closed + sum(sockets.values())
+
+
+def store_counters(
+    pid: int, store: Path, appends: bool, sent: SentBytes
+) -> dict[str, int]:
+    """Return the counters of the bytes that the server `pid` writes to its
+    store, on Linux: the bytes that its TCP sockets sent, the size of its
+    files outside the directory of the store file `store`, and, for a store
+    that the server only appends to (`appends`), the size of `store`."""
+    result = {}
+    sockets = read_sockets(pid)
+    if sockets is not None:
+        result["socket_bytes_sent"] = sent.update(sockets)
+    other = read_other_files(pid, store.parent)
+    if other is not None:
+        result["other_files_bytes"] = other
+    if appends:
+        # None marks a store that the server appends to, without its size.
+        try:
+            result["store_file_bytes"] = os.stat(store).st_size
+        except OSError:
+            result["store_file_bytes"] = None
+    return result
 
 
 def read_cpu() -> dict:
@@ -136,11 +265,24 @@ class Sampler:
         self.disk = disk
         self.interval = interval
         self.pids: dict[str, int] = {}
+        self.stores: dict[str, tuple[Path, bool, SentBytes]] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="sampler")
 
-    def watch(self, name: str, pid: int) -> None:
+    def watch(
+        self, name: str, pid: int, store: Path | None = None, appends: bool = False
+    ) -> None:
+        """Sample process `pid` under `name`. For a server, `store` is its
+        store file, and `appends` says that the server only appends to it."""
+        if store is not None and not DARWIN:
+            self.stores[name] = (store, appends, SentBytes())
         self.pids[name] = pid
+
+    def read(self, name: str, pid: int) -> dict | None:
+        entry = read_process(pid)
+        if entry is not None and name in self.stores:
+            entry.update(store_counters(pid, *self.stores[name]))
+        return entry
 
     def start(self) -> None:
         self._thread.start()
@@ -155,7 +297,7 @@ class Sampler:
             "cpu": read_cpu(),
             "disk": read_disk(self.disk),
             "processes": {
-                name: read_process(pid) for name, pid in list(self.pids.items())
+                name: self.read(name, pid) for name, pid in list(self.pids.items())
             },
         }
 
@@ -178,7 +320,13 @@ def load(path: Path) -> list[dict]:
 def summarize(samples: list[dict], start: float, end: float) -> dict:
     """Return the deltas of the counters between the first sample at or
     after `start` and the last sample at or before `end`, and the peaks of
-    the gauges in the window."""
+    the gauges in the window.
+
+    `store_write_bytes` of a process is the bytes that it wrote to its
+    store: the growth of `store_file_bytes` for a store that the server
+    only appends to, else the growth of `wchar` minus the growth of
+    `socket_bytes_sent` and of `other_files_bytes`. Without these counters
+    it is absent, never 0."""
     window = [s for s in samples if start <= s["t"] <= end]
     if len(window) < 2:
         return {"seconds": 0.0, "samples": len(window)}
@@ -214,14 +362,38 @@ def summarize(samples: list[dict], start: float, end: float) -> dict:
         for key in (
             "read_bytes",
             "write_bytes",
+            "wchar",
+            "socket_bytes_sent",
+            "other_files_bytes",
             "voluntary",
             "involuntary",
             "switches",
         ):
             if a.get(key) is not None and b.get(key) is not None:
                 entry[key] = b[key] - a[key]
+        store = _store_bytes(a, b)
+        if store is not None:
+            entry["store_write_bytes"] = store
         result["processes"][name] = entry
     return result
+
+
+def _store_bytes(a: dict, b: dict) -> int | None:
+    def growth(key):
+        if a.get(key) is None or b.get(key) is None:
+            return None
+        return b[key] - a[key]
+
+    # A store that the server only appends to counts by its size alone:
+    # its wchar holds the writes to Data.fs.tmp too.
+    if "store_file_bytes" in a or "store_file_bytes" in b:
+        return growth("store_file_bytes")
+    written, sent, other = (
+        growth(key) for key in ("wchar", "socket_bytes_sent", "other_files_bytes")
+    )
+    if written is None or sent is None or other is None:
+        return None
+    return written - sent - other
 
 
 class _Darwin:

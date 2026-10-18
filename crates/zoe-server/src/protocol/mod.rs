@@ -157,14 +157,20 @@ pub(crate) struct NamedStorage {
     /// True when the clients share the blob directory of the store, so
     /// that `storeBlobShared` is accepted.
     shared_blob_dir: bool,
-    /// True when the server closes a connection that stays silent, so
-    /// that an open transaction cannot hold its locks forever.
+    /// True when the server closes a connection that stays silent, or a
+    /// voted transaction that stays open, so that an open transaction
+    /// cannot hold its locks forever.
     timeout: bool,
     /// The resolution log of the server, if `--resolution-log` names one.
     resolution_log: Option<Arc<ResolutionLog>>,
     /// The longest time that a session holds intent locks without a
     /// `tpc_begin` (ADR 0045).
     pub(crate) intent_hold: std::time::Duration,
+    /// The longest time that a transaction stays open after a vote that
+    /// passed, as the `transaction-timeout` of ZEO. Past it, the server
+    /// closes the connection, and the transaction aborts. `None` closes
+    /// no connection for this reason.
+    pub(crate) transaction_timeout: Option<Duration>,
 }
 
 impl NamedStorage {
@@ -187,6 +193,7 @@ impl NamedStorage {
             timeout: false,
             resolution_log: None,
             intent_hold: session::INTENT_HOLD,
+            transaction_timeout: None,
         }
     }
 
@@ -220,11 +227,19 @@ impl NamedStorage {
         self
     }
 
-    /// Mark that the server closes a connection that stays silent when
-    /// `timeout` is true. The status then gives `timeout-thread-is-alive`
+    /// Mark that the server closes a connection that stays silent, or the
+    /// connection of a voted transaction that stays open, when `timeout`
+    /// is true. The status then gives `timeout-thread-is-alive`
     /// true, as a ZEO server with a transaction timeout does.
     pub(crate) fn timeout(mut self, timeout: bool) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Close the connection of a transaction that stays open for longer
+    /// than `timeout` after a vote that passed. `None` turns it off.
+    pub(crate) fn transaction_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.transaction_timeout = timeout;
         self
     }
 

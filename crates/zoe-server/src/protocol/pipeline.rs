@@ -394,15 +394,43 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, comp
     let (compressor, runtime) = compress;
     let mut transaction =
         Transaction::new(Arc::clone(session)).compressing(compressor, Arc::clone(&runtime));
+    // The time on the clock of the runtime when the open transaction
+    // passed its vote, while the transaction timeout is on.
+    let mut voted_at: Option<Duration> = None;
     loop {
-        // Intent locks without a `tpc_begin` last at most a bound.
-        let within = transaction.intent_hold_left().map(|left| (left, &*runtime));
+        // Intent locks without a `tpc_begin` last at most a bound. A voted
+        // transaction stays open at most the transaction timeout.
+        let voted_left = transaction
+            .voted_timeout()
+            .zip(voted_at)
+            .map(|(timeout, at)| timeout.saturating_sub(runtime.now().saturating_sub(at)));
+        let within = match (transaction.intent_hold_left(), voted_left) {
+            (Some(intent), Some(voted)) => Some(intent.min(voted)),
+            (intent, voted) => intent.or(voted),
+        };
+        let next = lane.next(transaction.is_open(), within.map(|left| (left, &*runtime)));
+        if let (Some(timeout), Some(at)) = (transaction.voted_timeout(), voted_at)
+            && !matches!(next, Next::End)
+            && runtime.now().saturating_sub(at) >= timeout
+        {
+            // As ZEO's server does, close the connection. The calls that
+            // wait do not run, and the drop of the transaction aborts it
+            // and releases its locks.
+            let _entered = session.span(peer).entered();
+            tracing::error!(
+                seconds = timeout.as_secs(),
+                "transaction timeout after the vote: closing the connection"
+            );
+            lane.stop();
+            session.outbox().close();
+            break;
+        }
         let (
             mut call,
             Ticket {
                 slot: _slot, room, ..
             },
-        ) = match lane.next(transaction.is_open(), within) {
+        ) = match next {
             Next::Call(next) => *next,
             Next::Late => {
                 if transaction
@@ -423,6 +451,10 @@ fn run_lane(session: &Arc<Session>, lane: &Lane, ended: &Ended, peer: &str, comp
         let _entered = session.span(peer).entered();
         let _request = session.request(&call).entered();
         let outcome = transaction.call(&mut call);
+        voted_at = match transaction.voted_timeout() {
+            Some(_) => voted_at.or_else(|| Some(runtime.now())),
+            None => None,
+        };
         if !Reply::new(room).send(&call, outcome, session.outbox()) {
             lane.stop();
             ended.end();

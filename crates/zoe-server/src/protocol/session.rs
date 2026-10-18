@@ -547,6 +547,9 @@ struct Open {
     /// The undo ids that `undoa` queued, in order. The first vote stages
     /// their undos.
     undos: Vec<Value>,
+    /// True after a vote that passed: the transaction holds its locks
+    /// until it ends. The transaction timeout counts from then.
+    voted: bool,
 }
 
 impl Open {
@@ -1580,6 +1583,16 @@ impl Transaction {
         self.open.is_some() || self.holds_intents()
     }
 
+    /// Return the transaction timeout of the storage when the open
+    /// transaction passed a vote, or `None`.
+    pub(crate) fn voted_timeout(&self) -> Option<Duration> {
+        if self.open.as_ref().is_some_and(|open| open.voted) {
+            self.session.storage.transaction_timeout
+        } else {
+            None
+        }
+    }
+
     /// Tell if the session holds intent locks.
     fn holds_intents(&self) -> bool {
         self.intents
@@ -1762,6 +1775,7 @@ impl Transaction {
                 jobs: Vec::new(),
                 of_get: args.get(3).is_some_and(of_get),
                 undos: Vec::new(),
+                voted: false,
             });
         }
         Ok(Value::Nil)
@@ -2076,6 +2090,7 @@ impl Transaction {
                 native: merged,
                 conflicts,
             }) => {
+                open.voted = true;
                 open.listed = conflicts.len() as u64;
                 // A vote that passes counts the conflicts that the client
                 // resolved and the oids that tier 1 merged. A first vote

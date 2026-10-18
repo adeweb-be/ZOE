@@ -860,7 +860,109 @@ fn a_read_current_node_whose_path_child_split_gives_no_answer() {
     txn.check_current_serial(tree.buckets[1], tree.tid).unwrap();
     let voted = txn.vote();
     assert!(matches!(voted, Err(ZoeError::ReadConflict { oid }) if oid == tree.root));
-    assert!(txn.resolutions().is_empty());
+    // The vote gives one entry for the node: rule 1 gives no answer, and
+    // says why.
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (resolution.oid, resolution.split, resolution.applied),
+        (tree.root, Some(1), false)
+    );
+    assert!(
+        matches!(resolution.outcome, Resolved::Undecided(why) if !why.is_empty()),
+        "{resolution:?}"
+    );
+}
+
+#[test]
+fn in_shadow_mode_a_read_conflict_tells_why_rule_1_gives_no_answer() {
+    let store = open(Some("shadow"));
+    let tree = two_buckets(&store);
+    split(&store, &tree, 1, &[40, 50], &[60, 70]);
+    let other = new_oid(&store);
+    let mut txn = writing(&store, &[(other, Tid::ZERO, inline(II, &ints(&[1])))]);
+    txn.check_current_serial(tree.root, tree.tid).unwrap();
+    txn.check_current_serial(tree.buckets[1], tree.tid).unwrap();
+    let voted = txn.vote();
+    assert!(matches!(voted, Err(ZoeError::ReadConflict { oid }) if oid == tree.root));
+    let [resolution] = txn.resolutions() else {
+        panic!("{:?}", txn.resolutions());
+    };
+    assert_eq!(
+        (resolution.mode, resolution.split, resolution.applied),
+        (Mode::Shadow, Some(1), false)
+    );
+    assert!(
+        matches!(resolution.shadow, Some(Resolved::Undecided(why)) if !why.is_empty()),
+        "{resolution:?}"
+    );
+    let line = &txn.resolution_log_lines(SystemTime::now(), None)[0];
+    assert!(
+        line.contains("\"shadow\":{\"outcome\":\"undecided\""),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_stored_bucket_before_a_replaced_child_refuses_with_reason_0() {
+    let store = open(Some("on"));
+    let tree = tree(
+        &store,
+        II,
+        &[&ints(&[10, 20]), &ints(&[30, 40]), &ints(&[50, 60])],
+    );
+    let [a, y, b] = tree.buckets[..] else {
+        panic!("three buckets");
+    };
+    // The other side replaces `y` by `x`, as a merge of rule 3 writes it,
+    // and writes `a` with its new next bucket.
+    let x = new_oid(&store);
+    let current = commit(
+        &store,
+        &[
+            (
+                tree.root,
+                tree.tid,
+                leaf_node(II, a, &[(Key::Int(30), x), (Key::Int(50), b)]),
+            ),
+            (a, tree.tid, bucket(II, &ints(&[10, 20]), Some(x))),
+            (x, Tid::ZERO, bucket(II, &ints(&[30, 35, 40]), Some(b))),
+        ],
+    );
+    // The transaction inserts 15 into `a`, which still names `y`, and marks
+    // the root read-current. The vote checks `a` first.
+    let mut txn = writing(
+        &store,
+        &[(a, tree.tid, bucket(II, &ints(&[10, 15, 20]), Some(y)))],
+    );
+    txn.check_current_serial(tree.root, tree.tid).unwrap();
+    let voted = txn.vote();
+    assert!(
+        matches!(voted, Err(ZoeError::Conflict { oid }) if oid == a),
+        "{voted:?}"
+    );
+    assert_eq!(txn.conflict_serials(), Some((current, tree.tid)));
+    let refusal = txn
+        .resolutions()
+        .iter()
+        .find(|r| r.oid == a)
+        .unwrap_or_else(|| panic!("{:?}", txn.resolutions()));
+    assert_eq!(
+        (refusal.outcome, refusal.applied),
+        (Resolved::Refused(Reason::BTrees(0)), true)
+    );
+    // The plan of the vote finds that rule 1 lets the root through, but
+    // the vote fails on `a` first: the entry of the root is not applied.
+    assert!(
+        txn.resolutions()
+            .iter()
+            .all(|r| r.oid != tree.root || !r.applied),
+        "{:?}",
+        txn.resolutions()
+    );
+    txn.abort();
+    assert_eq!(walk(&store, tree.root).1, [10, 20, 30, 35, 40, 50, 60]);
 }
 
 #[test]

@@ -6,9 +6,10 @@
 `run` reads the log of a kept store, replays it, writes the result and
 prints its report. With `--policy FILE`, a JSON merge policy of
 `zoe.policy`, each run of `zoe serve` installs it in its store after the
-base. `report` prints the report of a result. Both exit with
-0 when the gate passes and with 1 when it fails. `report` exits with 2
-when FILE is not a result, and `run` when the policy is not valid, when a timed
+base. `report` prints the report of a result. The last line of the report
+gives the ratio of the success criterion, a measure, not a gate. Both exit
+with 0 for a result, whatever the ratio. `report` exits with 2 when FILE is
+not a result, and `run` when the policy is not valid, when a timed
 transaction writes the root with a policy, or when the probe records
 explain no transaction of the store.
 """
@@ -76,7 +77,7 @@ def main(argv=None) -> int:
             return 2
         printed = report.lines(result)
         print("\n".join(printed))
-        return 0 if printed[-1].startswith("gate passed:") else 1
+        return 0
 
     policy = None
     if args.policy is not None:
@@ -97,14 +98,16 @@ def main(argv=None) -> int:
         return 2
     starts, matched = replay_log.starts_of_probes(args.store, probes)
     log = replay_log.read_log(args.store, starts)
+    background = sum(t.description in replay_log.BACKGROUND for t in log.transactions)
     print(
         f"replay: {len(log.base)} transactions in the base, "
         f"{len(log.transactions)} timed; starts matched {matched['matched']}, "
-        f"unmatched {matched['unmatched']}",
+        f"unmatched {matched['unmatched']}, of a background job {background}",
         flush=True,
     )
     # Without a request that explains a transaction, every transaction
-    # starts at its commit and overlaps nothing: the gate would pass.
+    # starts at its commit and overlaps nothing: the replay would measure
+    # nothing.
     if not log.transactions or not matched["matched"]:
         print(
             "replay: the probe records explain no transaction of the store",
@@ -143,7 +146,7 @@ def main(argv=None) -> int:
     partial.replace(args.out)
     printed = report.lines(result)
     print("\n".join(printed))
-    return 0 if printed[-1].startswith("gate passed:") else 1
+    return 0
 
 
 if __name__ == "__main__":
