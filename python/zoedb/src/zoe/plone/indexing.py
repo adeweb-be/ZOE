@@ -972,14 +972,14 @@ class _Service(threading.Thread):
         self._held.clear()
 
     def run(self):
-        found = 0.0
+        found = None
         while not self._stopping:
             self._event.wait(POLL)
             self._event.clear()
             if self._stopping:
                 break
             try:
-                if time.monotonic() - found > SITES_EVERY:
+                if found is None or time.monotonic() - found > SITES_EVERY:
                     self._find_sites()
                     found = time.monotonic()
                 for path in list(self._sites):
