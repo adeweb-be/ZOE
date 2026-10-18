@@ -31,8 +31,8 @@ process, with or without the option.
 - **The guard** of a stock registry in a store with namespaces calls
   `readCurrent` on the roots of its trees when code reads its records, and
   the move writes those roots. So a write that began before a move
-  conflicts, and a write of an attribute of the registry object does not. `configure.zcml` installs the guard
-  whenever `zoe.plone` loads.
+  conflicts, and a write of an attribute of the registry object does not.
+  `configure.zcml` installs the guard whenever `zoe.plone` loads.
 
 `move_back(registry)` puts the records back into new `OOBTree`s and deletes
 the rows. `copy_rows(source, copy)` gives a copy of a moved registry the
