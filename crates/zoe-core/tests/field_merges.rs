@@ -1138,3 +1138,42 @@ fn an_undo_merges_a_mapping_key_by_key_and_refuses_a_key_changed_later() {
         Err(ZoeError::Undo { oid: Some(found), .. }) if found == oid
     ));
 }
+
+/// The entry of a class whose fields all merge key by key.
+const ALL_KEYS: Entry = &[
+    ("tier2", Setting::Text("on")),
+    ("default", Setting::Text("keys")),
+];
+
+/// Returns the record of a state with `fields` dict fields: field `n`
+/// holds the dict that `dict` gives for `n`.
+fn dict_fields(fields: usize, dict: impl Fn(&mut Heap, usize) -> Value) -> Vec<u8> {
+    built(|heap| {
+        (0..fields)
+            .map(|n| (heap.new_str(&format!("field-{n:05}")), dict(heap, n)))
+            .collect()
+    })
+}
+
+#[test]
+fn many_fields_of_the_strategy_keys_merge_in_proportion_to_their_record() {
+    const FIELDS: usize = 20_000;
+    let with = |key: Option<&'static str>| {
+        dict_fields(FIELDS, move |heap, _| match key {
+            Some(key) => {
+                let key = heap.new_str(key);
+                heap.new_dict(vec![(key, Value::Int(1))])
+            }
+            None => heap.new_dict(Vec::new()),
+        })
+    };
+    let (base, committed, new) = (with(None), with(Some("xx")), with(Some("yy")));
+    let started = std::time::Instant::now();
+    let (resolution, merged) = mapping_conflict(ALL_KEYS, &base, &committed, &new);
+    assert_eq!(resolution.outcome, Resolved::Merged);
+    assert!(merged.is_some());
+    // One key of each field, and the first fields in the line.
+    assert_eq!(resolution.changed, FIELDS);
+    assert_eq!(resolution.keys.len(), 20);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}

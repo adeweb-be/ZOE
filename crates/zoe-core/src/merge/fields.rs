@@ -155,41 +155,51 @@ fn merge_fields(
             }
         }
     }
-    // The value of each field after the merge. `None` deletes it.
+    // The value of each field after the merge. `None` deletes it. The block
+    // ends at the first field that does not merge.
     let mut merged: HashMap<&str, Option<Value>> = HashMap::new();
-    for &name in &names {
-        let (c, n) = (committed_map.get(name).copied(), new_map.get(name).copied());
-        let value = match (by_committed.contains(name), by_new.contains(name)) {
-            (_, false) => c,
-            (false, true) => n,
-            (true, true) => match (c, n) {
-                (None, None) => None,
-                (Some(c), Some(n)) if canon.same(heap, c, n).map_err(undecided)? => Some(c),
-                (Some(c), Some(n)) => {
-                    let old = old_map.get(name).copied();
-                    let strategy = entry.strategy(name);
-                    let mut noted = None;
-                    let merged = both_changed(heap, canon, strategy, old, c, n, &mut noted);
-                    if let Some(noted) = noted {
-                        expanded.insert(name.as_str(), noted);
-                        note(merge, &by_new, &expanded);
-                    }
-                    match merged {
-                        Ok(value) => Some(value),
-                        Err(outcome) => {
-                            merge.fields = vec![name.clone()];
-                            return Err(outcome);
+    let decided: Result<(), Outcome> = 'fields: {
+        for &name in &names {
+            let (c, n) = (committed_map.get(name).copied(), new_map.get(name).copied());
+            let value = match (by_committed.contains(name), by_new.contains(name)) {
+                (_, false) => c,
+                (false, true) => n,
+                (true, true) => match (c, n) {
+                    (None, None) => None,
+                    (Some(c), Some(n)) => match canon.same(heap, c, n) {
+                        Ok(true) => Some(c),
+                        Ok(false) => {
+                            let old = old_map.get(name).copied();
+                            let strategy = entry.strategy(name);
+                            let mut noted = None;
+                            let value = both_changed(heap, canon, strategy, old, c, n, &mut noted);
+                            if let Some(noted) = noted {
+                                expanded.insert(name.as_str(), noted);
+                            }
+                            match value {
+                                Ok(value) => Some(value),
+                                Err(outcome) => {
+                                    merge.fields = vec![name.clone()];
+                                    break 'fields Err(outcome);
+                                }
+                            }
                         }
+                        Err(why) => break 'fields Err(undecided(why)),
+                    },
+                    _ => {
+                        merge.fields = vec![name.clone()];
+                        break 'fields Err(Outcome::Refused(Reason::FieldDeleted));
                     }
-                }
-                _ => {
-                    merge.fields = vec![name.clone()];
-                    return Err(Outcome::Refused(Reason::FieldDeleted));
-                }
-            },
-        };
-        merged.insert(name, value);
-    }
+                },
+            };
+            merged.insert(name, value);
+        }
+        Ok(())
+    };
+    // One note for all the fields, so the work stays linear in the number
+    // of fields. A refusal also shows the keys of the dicts before it.
+    note(merge, &by_new, &expanded);
+    decided?;
     // The committed fields in their order, then the fields that only the
     // new side added, in its order.
     let mut items = Vec::with_capacity(names.len());
