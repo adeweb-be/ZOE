@@ -7,11 +7,11 @@ example in the environment of the Python tests:
 
 A seed is a conflict of three records of a persistent object, as ZODB
 writes them: a flag byte (the three low bits pick the default strategy, 0
-strict, 1 lww, 2 max, 3 sum, 4 union, 5 append; bit 3 couples the fields
-`a` and `b`), the lengths of the old and of the committed record, each as
-2 bytes big-endian, then the old, the committed and the new record. Two
-seeds hold a record of a merge policy and a record of a root that names
-it. All data is synthetic.
+strict, 1 lww, 2 max, 3 sum, 4 union, 5 append, 6 keys; bit 3 couples the
+fields `a` and `b`), the lengths of the old and of the committed record,
+each as 2 bytes big-endian, then the old, the committed and the new
+record. Two seeds hold a record of a merge policy and a record of a root
+that names it. All data is synthetic.
 """
 
 import struct
@@ -26,7 +26,7 @@ from zoe.policy import MergePolicy
 
 HERE = Path(__file__).resolve().parent / "fields"
 
-STRICT, LWW, MAX, SUM, UNION, APPEND = range(6)
+STRICT, LWW, MAX, SUM, UNION, APPEND, KEYS = range(7)
 COUPLED = 8
 
 
@@ -124,6 +124,12 @@ SEEDS = {
     ),
     "coupled": seed(COUPLED, BASE, changed(a=5), changed(b=6)),
     "set": seed(STRICT, BASE, changed(set={2, 1}), changed(title="t-2")),
+    "keys": seed(
+        KEYS,
+        changed(data={"x": 1, "y": 2, (1, "z"): 3}),
+        changed(data={"x": 4, "y": 2, (1, "z"): 3}),
+        changed(data={"x": 1, "y": 2, "w": 5}),
+    ),
 }
 
 

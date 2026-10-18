@@ -3,8 +3,8 @@
 //!
 //! An input is three records and a flag: a byte whose three low bits pick
 //! the default strategy of the class (0 strict, 1 lww, 2 max, 3 sum, 4
-//! union, 5 append, else strict) and whose bit 3 couples the fields `a`
-//! and `b`, then the lengths of the old and of the committed record, each
+//! union, 5 append, 6 keys, else strict) and whose bit 3 couples the
+//! fields `a` and `b`, then the lengths of the old and of the committed record, each
 //! as 2 bytes big-endian, then the old, the committed and the new record.
 //! Each record also goes to the readers of the policy and of the root. A
 //! panic fails the run, and so does a merged record that does not decode.
@@ -35,6 +35,7 @@ fuzz_target!(|data: &[u8]| {
         3 => Strategy::Sum,
         4 => Strategy::Union,
         5 => Strategy::Append,
+        6 => Strategy::Keys,
         _ => Strategy::Strict,
     };
     let coupled = if flags & 8 != 0 {
