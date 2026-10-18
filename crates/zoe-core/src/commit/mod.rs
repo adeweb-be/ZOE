@@ -950,8 +950,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// Return what tiers 1 and 2 did in the undos of the transaction, then
     /// in the last vote that took the locks: one entry for each three-way
     /// merge of an undo, and one for each stale written oid of the vote, of
-    /// a class of a tier whose mode is not `Off`, in oid order. The vote that comes
-    /// after `vote_resolving` keeps the entries of `vote_resolving`.
+    /// a class of a tier whose mode is not `Off`, in oid order. With the
+    /// split merge, the vote also gives one entry for each stale
+    /// read-current node that rule 1 lets through, and one for the
+    /// read-current node on which it fails when rule 1 gives no answer for
+    /// it. The vote that comes after `vote_resolving` keeps the entries of
+    /// `vote_resolving`.
     pub fn resolutions(&self) -> &[Resolution] {
         &self.resolutions
     }

@@ -9,9 +9,10 @@
 //! In mode `on`, the vote stages the records of each merge over the serials
 //! of the committed records, lets each node of rule 1 pass, and fails on a
 //! refusal. The plan keeps the reason of each stale read-current node for
-//! which rule 1 gives no answer, for the entry of a read conflict. In mode `shadow`, the vote goes on as without the rules, and
-//! the entries of the stale oids of the plan carry the outcome of the
-//! rules. A commit with no conflict makes no plan.
+//! which rule 1 gives no answer, for the entry of a read conflict. In mode
+//! `shadow`, the vote goes on as without the rules, and the entries of the
+//! stale oids of the plan carry the outcome of the rules. A commit with no
+//! conflict makes no plan.
 //!
 //! Before the rules read the store, the plan waits until each commit in
 //! flight of a hand-off is durable or failed: the rules read records that
@@ -46,7 +47,9 @@ pub(super) struct Plan {
     /// The node of a refusal, with its current serial and the serial that
     /// the transaction read: the vote fails on it.
     pub(super) refused: Option<(Oid, Tid, Tid)>,
-    /// In mode `shadow`, what the rules give for each stale oid of a node.
+    /// In mode `shadow`, what the rules give for each stale oid of a node,
+    /// and for each stale read-current node: rule 1 lets it through or
+    /// gives no answer.
     pub(super) shadows: BTreeMap<Oid, Shadow>,
     /// In mode `on`, the stale read-current nodes for which rule 1 gives no
     /// answer: the class of each one and the reason.

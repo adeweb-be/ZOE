@@ -30,9 +30,8 @@
 //! The rules write only records that the transaction stored. They read the
 //! records through a [`Source`]. They give no answer for a node that
 //! changed by anything but splits (rule 1 also takes replacements), for a
-//! delete in a range that they merge,
-//! for two splits of one child on one side, and for a state that the model
-//! does not hold. Two key references of one class compare by the oids of
+//! delete in a range that they merge, for two splits of one child on one
+//! side, and for a state that the model does not hold. Two key references of one class compare by the oids of
 //! their objects, as keys and as values: `bucket_merge` compares the
 //! values of the keys that both sides kept.
 
@@ -1073,6 +1072,21 @@ mod tests {
         // 21 is 40, not 50.
         let committed = node(10, &[(30, 21), (40, 22), (50, 12), (70, 13)]);
         assert!(matches!(rule_1(committed), Split::Undecided(_)));
+    }
+
+    #[test]
+    fn a_replaced_last_child_followed_by_a_new_child_gives_no_answer() {
+        // 23 replaces 13, the last child, and 24 comes right after it.
+        let committed = node(10, &[(30, 11), (50, 12), (70, 23), (80, 24)]);
+        let records = Records {
+            old: node(10, &[(30, 11), (50, 12), (70, 13)]),
+            committed,
+            stored: BTreeSet::from([Oid(11)]),
+        };
+        assert!(matches!(
+            read_node(&records, NODE, READ).unwrap(),
+            Split::Undecided(_)
+        ));
     }
 
     #[test]
