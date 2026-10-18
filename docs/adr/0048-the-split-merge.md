@@ -1,6 +1,6 @@
 # 0048. The split merge: tier 1 merges the splits of a BTree, and a read-current node lets a split of another child through
 
-Status: proposed. The checkpoint of ZOE-219 (step 2). It adds three rules to tier 1, where ZODB's resolver refuses, and a switch of the merge policy. It changes an invariant of the vote: a stale read-current oid can pass. It needs code in the vote (`crates/zoe-core/src/commit/`), which is outside the scope fence of the card. It changes no on-disk format, no pack and no wire protocol. The questions at the end wait for the human.
+Status: accepted. The checkpoint of ZOE-219 (step 2). The human approved it with the recommendation of each of the questions at its end, the widened scope fence of question 4 among them. It adds three rules to tier 1, where ZODB's resolver refuses, and a switch of the merge policy. It changes an invariant of the vote: a stale read-current oid can pass. It needs code in the vote (`crates/zoe-core/src/commit/`). It changes no on-disk format, no pack and no wire protocol.
 
 ## Context
 
