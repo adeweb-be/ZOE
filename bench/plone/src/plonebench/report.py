@@ -110,13 +110,12 @@ def summarize(results: list[dict]) -> dict:
                 for k in per[0].get("resources", {}).get("processes", {})
                 if k.startswith("instance")
             ]
-            server_disk = [
-                s.get("resources", {})
-                .get("processes", {})
-                .get("server", {})
-                .get("write_bytes")
+            server = [
+                s.get("resources", {}).get("processes", {}).get("server", {})
                 for s in per
             ]
+            server_disk = [p.get("write_bytes") for p in server]
+            server_store = [p.get("store_write_bytes") for p in server]
             ok_ops = [s["all"]["outcomes"]["ok"] for s in per]
             entry = {
                 "step": index,
@@ -189,6 +188,12 @@ def summarize(results: list[dict]) -> dict:
                     [
                         (w / 1024 / ok) if w is not None and ok else None
                         for w, ok in zip(server_disk, ok_ops, strict=True)
+                    ]
+                ),
+                "store_write_kb_per_op": _median(
+                    [
+                        (w / 1024 / ok) if w is not None and ok else None
+                        for w, ok in zip(server_store, ok_ops, strict=True)
                     ]
                 ),
                 "zope_busy": _median(
@@ -352,6 +357,11 @@ def build(runs: list[Path]) -> tuple[str, dict]:
             f"think time {first['think']}; "
             f"client retries {first['client_retries']}; each step trimmed by "
             f"{first['trim_seconds']} s",
+            "- Server writes: store KB written/op is the bytes that the server "
+            "gives to the write calls of its store files, without blobs: the "
+            "growth of Data.fs on zeo, and on zoe serve wchar without the bytes "
+            "of its TCP sockets and of its other files. Server page cache KB/op "
+            "is write_bytes of the kernel, which charges whole page-cache folios.",
             "",
         ]
     scenarios = sorted({v["scenario"] for v in summary.values()})
@@ -378,10 +388,11 @@ def build(runs: list[Path]) -> tuple[str, dict]:
             "| stack | users | ok ops/s (min–max) | p50 ms | p95 ms | p99 ms | "
             "failed | "
             "1st-try ok | srv att/op | conflicts/1k | exhausted | Zope CPU ms/op | "
-            "server CPU ms/op | server KB written/op | Locust CPU | verified |",
+            "server CPU ms/op | store KB written/op | server page cache KB/op | "
+            "Locust CPU | verified |",
             "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
             "---: | ---: | "
-            "---: | ---: | ---: | --- |",
+            "---: | ---: | ---: | ---: | --- |",
         ]
         for row in rows:
             verdict = ",".join(sorted(set(row["verification"])))
@@ -400,6 +411,7 @@ def build(runs: list[Path]) -> tuple[str, dict]:
                     f"{step['exhausted']} | "
                     f"{_num(step['zope_cpu_ms_per_op'], 1)} | "
                     f"{_num(step['server_cpu_ms_per_op'], 2)} | "
+                    f"{_num(step['store_write_kb_per_op'], 1)} | "
                     f"{_num(step['server_write_kb_per_op'], 1)} | "
                     f"{_pct(step['locust_cpu_share'])} | "
                     f"{verdict} (n={step['repetitions']}) |"
@@ -453,7 +465,8 @@ def timeline(runs: list[Path], bucket: float) -> str:
     """Return, for each run, the successful operations per second and the
     p50 and p95 of their latency in buckets of `bucket` seconds from the
     start of the measured window, and the CPU of each process and the
-    bytes the server wrote in each bucket."""
+    bytes the server wrote to its store and to the page cache in each
+    bucket."""
     from plonebench import sampler
 
     lines = []
@@ -470,8 +483,8 @@ def timeline(runs: list[Path], bucket: float) -> str:
             f"### {result['run_id']}",
             "",
             "| from s | ok ops/s | p50 ms | p95 ms | failed | server CPU | "
-            "Zope CPU | server MB written |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "Zope CPU | store MB written | server page cache MB |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         t = start
         while t < end:
@@ -485,11 +498,13 @@ def timeline(runs: list[Path], bucket: float) -> str:
                 v["cpu_share"] or 0 for k, v in res.items() if k.startswith("inst")
             )
             server = res.get("server", {})
+            store = server.get("store_write_bytes")
             written = server.get("write_bytes")
             lines.append(
                 f"| {t - start:.0f} | {len(ok) / bucket:.1f} | {_ms(lat['p50'])} | "
                 f"{_ms(lat['p95'])} | {len(chosen) - len(ok)} | "
                 f"{_pct(server.get('cpu_share'))} | {_pct(zope)} | "
+                f"{'–' if store is None else f'{store / 2**20:.1f}'} | "
                 f"{'–' if written is None else f'{written / 2**20:.1f}'} |"
             )
             t += bucket
