@@ -25,13 +25,22 @@ pub(crate) struct Extension {
 /// element, a map with the W3C `traceparent` of the client.
 pub(crate) const TRACE_CONTEXT: &str = "trace_context";
 
+/// The extension that lets the vote of the connection write a record that
+/// its transaction did not store (ADR 0049). It adds no method: the client
+/// promises that, when the reply of its `vote` lists an oid that its
+/// transaction did not store, it ends the current entry of that oid in its
+/// cache, and gives every Connection of its process one invalidation with
+/// every oid of the commit before it publishes the tid.
+pub(crate) const SERVER_WRITES: &str = "server_writes";
+
 /// The extensions that the server serves. `sequences` adds
 /// `sequence_next(name)`, the next value of a sequence of the store (F29).
 /// `lock_intent` adds `lock_intent(oids)` and `unlock_intent()`, the early
 /// write-intent locks of the session (F7, ADR 0045). `kv` adds the calls
 /// of the KV namespaces (F31, ADR 0043): three reads, and two writes in
 /// the transaction of the connection. `trace_context` adds the trace
-/// context of a call.
+/// context of a call. `server_writes` lets the split merge write the new
+/// bucket of the other side in the vote of the connection.
 pub(crate) const SERVED: &[Extension] = &[
     Extension {
         name: "sequences",
@@ -47,6 +56,10 @@ pub(crate) const SERVED: &[Extension] = &[
     },
     Extension {
         name: TRACE_CONTEXT,
+        methods: &[],
+    },
+    Extension {
+        name: SERVER_WRITES,
         methods: &[],
     },
 ];

@@ -385,6 +385,9 @@ pub(crate) struct Storage {
     sweeper: Mutex<Option<Sweeper>>,
     /// The resolution log (ADR 0042), if `resolution_log` names one.
     resolution_log: Option<Arc<ResolutionLog>>,
+    /// True when the database of the storage gives each Connection the
+    /// oids of a commit that the vote wrote without a store (ADR 0049).
+    server_writes: AtomicBool,
 }
 
 /// The resolution log of ADR 0042: a file of JSON lines, one for each
@@ -686,6 +689,7 @@ impl Storage {
             published: Published::new(last),
             sweeper: Mutex::new(None),
             resolution_log,
+            server_writes: AtomicBool::new(false),
         };
         let store = storage.opened(py)?;
         let ephemeral = py.detach(move || store.has_ephemeral_namespaces().unwrap_or(false));
@@ -1126,12 +1130,14 @@ impl Storage {
         let description = text(&transaction.getattr("description")?)?;
         let extension = text(&transaction.getattr("extension_bytes")?)?;
         let store = self.opened(py)?;
+        let server_writes = self.server_writes.load(Ordering::Acquire);
         let txn = py
             .detach(move || {
                 let mut txn = match tid {
                     None => Txn::begin(store, &user, &description, &extension),
                     Some(tid) => Txn::begin_restore(store, tid, &user, &description, &extension)?,
                 };
+                txn.set_server_writes(server_writes);
                 // An owner whose lock waits on another thread has no locks
                 // to give yet: the transaction begins without them.
                 if let Some(owner) = intents
@@ -1530,6 +1536,37 @@ impl Storage {
             warn_log_failure(py, &error);
         }
         voted
+    }
+
+    /// Tell the votes of the later transactions whether the database takes
+    /// records that a transaction did not store (ADR 0049). The Python
+    /// class sets it from `registerDB`.
+    #[pyo3(name = "_set_server_writes")]
+    fn set_server_writes(&self, on: bool) {
+        self.server_writes.store(on, Ordering::Release);
+    }
+
+    /// Return every oid that the commit of `transaction` writes, when its
+    /// last vote wrote a record that the transaction did not store. Else
+    /// `None`, also for a transaction that this storage does not know.
+    #[pyo3(name = "_unstored_commit")]
+    fn unstored_commit<'py>(
+        &self,
+        py: Python<'py>,
+        transaction: &Bound<'py, PyAny>,
+    ) -> Option<Vec<Bound<'py, PyBytes>>> {
+        let key = transaction.as_ptr() as usize;
+        let entry = self.table().entries.get(&key).cloned()?;
+        let oids = py
+            .detach(|| {
+                entry.with(|txn| {
+                    Ok(txn
+                        .wrote_unstored()
+                        .then(|| txn.staged_oids().collect::<Vec<_>>()))
+                })
+            })
+            .ok()??;
+        Some(oids.into_iter().map(|oid| p64(py, oid.0)).collect())
     }
 
     /// Return the oids that tier 1 of the core merged in the last vote of

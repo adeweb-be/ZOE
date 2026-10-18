@@ -1563,6 +1563,20 @@ impl NativeTransaction {
         Ok(p64(py, tid.0))
     }
 
+    /// Return every oid of the commit that holds the turn, when its vote
+    /// listed as resolved an oid that the transaction did not store: the
+    /// server wrote that oid (ADR 0049), or it is an oid of an undo. The
+    /// caller gives them to every Connection of the process in one
+    /// invalidation before the callback of `tpc_finish`. Else `None`.
+    fn unstored_commit<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyBytes>>> {
+        let oids = py.detach(|| {
+            lock(&self.turn)
+                .as_ref()
+                .and_then(|turn| turn.unstored_commit().map(<[Oid]>::to_vec))
+        })?;
+        Some(oids.into_iter().map(|oid| p64(py, oid.0)).collect())
+    }
+
     /// End the turn of the commit: the callback of `tpc_finish` ran. The
     /// pool then delivers the tid and goes on. Without a turn, do nothing.
     fn done(&self, py: Python<'_>) -> PyResult<()> {

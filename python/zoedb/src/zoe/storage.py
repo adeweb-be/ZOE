@@ -419,13 +419,43 @@ class Storage(_zoe.Storage, ConflictResolvingStorage):
         self._pack(stop.raw())
 
     def registerDB(self, wrapper):
-        """Accept the database. The storage sends it no invalidations.
+        """Accept the database.
 
         Only this process writes the store, and ZODB gets the
         invalidations of each commit from the `tpc_finish` callback. The
         conflict resolution takes the record transforms of the database.
+
+        With a ZODB `MVCCAdapter`, the vote can write a record that the
+        transaction did not store (ADR 0049): `tpc_finish` then gives every
+        Connection every oid of the commit in one invalidation. Another
+        database, as the one of a `ZEO.StorageServer`, does not get such
+        records.
         """
         super().registerDB(wrapper)
+        from ZODB.mvccadapter import MVCCAdapter
+
+        self._server_writes_db = wrapper if isinstance(wrapper, MVCCAdapter) else None
+        self._set_server_writes(self._server_writes_db is not None)
+
+    def tpc_finish(self, transaction, func=None):
+        """Commit `transaction` and return its tid. Call `func` with the
+        tid before ZODB can see the commit.
+
+        When the vote wrote a record that the transaction did not store,
+        every Connection first gets every oid of the commit in one
+        invalidation (ADR 0049).
+        """
+        oids = self._unstored_commit(transaction)
+        db = getattr(self, "_server_writes_db", None)
+        if oids is None or db is None:
+            return super().tpc_finish(transaction, func)
+
+        def published(tid):
+            db.invalidate(tid, oids)
+            if func is not None:
+                func(tid)
+
+        return super().tpc_finish(transaction, published)
 
     def supportsUndo(self):
         """Return True: the storage undoes transactions."""

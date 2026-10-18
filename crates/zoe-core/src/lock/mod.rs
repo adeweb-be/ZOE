@@ -572,6 +572,29 @@ impl LockManager {
         }
     }
 
+    /// Take the exclusive lock of `oid` only when it is free: no request
+    /// holds it, no request waits for it, and its entry carries no
+    /// hand-off. Else take nothing and return `None`.
+    ///
+    /// The call never waits, so a vote can take it after locks of greater
+    /// oids (ADR 0049): it adds no wait out of oid order, and it never
+    /// passes a request that waits. A free lock without a hand-off means
+    /// that the store holds the last commit of `oid`. The lock keeps the
+    /// time of `clock`, which the call reads without the mutex.
+    pub(crate) fn try_exclusive(&self, oid: Oid, clock: &dyn Clock) -> Option<Held> {
+        let since = clock.now();
+        let mut table = self.table();
+        if table
+            .entries
+            .get(&oid)
+            .is_some_and(|entry| !entry.is_unused())
+        {
+            return None;
+        }
+        table.entries.entry(oid).or_default().take(Mode::Exclusive);
+        Some(Held { oid, since })
+    }
+
     /// Return the oids of `oids` whose queue has an exclusive request at
     /// its head. The caller holds the exclusive lock of each oid of `oids`.
     pub(crate) fn contended(&self, oids: impl Iterator<Item = Oid>) -> Vec<Oid> {
@@ -1514,6 +1537,90 @@ mod tests {
                 });
             }
         });
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn try_exclusive_takes_a_free_lock_only() {
+        let locks = LockManager::default();
+        let clock = SystemClock;
+        let held = locks.try_exclusive(Oid(5), &clock).expect("a free lock");
+        assert_eq!(held.oid, Oid(5));
+        // A held lock is not free, in either mode.
+        assert!(locks.try_exclusive(Oid(5), &clock).is_none());
+        let shared = locks
+            .acquire(&[(Oid(6), Shared)], LONG, &clock)
+            .unwrap()
+            .keep();
+        assert!(locks.try_exclusive(Oid(6), &clock).is_none());
+        locks.release(&[held]);
+        locks.release(&shared);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn try_exclusive_refuses_a_lock_with_a_waiter() {
+        let locks = Arc::new(LockManager::default());
+        let clock = SystemClock;
+        let first = locks
+            .acquire(&[(Oid(7), Exclusive)], LONG, &clock)
+            .unwrap()
+            .keep();
+        let waiter = {
+            let locks = Arc::clone(&locks);
+            thread::spawn(move || {
+                let held = locks
+                    .acquire(&[(Oid(7), Exclusive)], LONG, &SystemClock)
+                    .unwrap()
+                    .keep();
+                locks.release(&held);
+            })
+        };
+        until_waiting(&locks, Oid(7), 1);
+        assert!(locks.try_exclusive(Oid(7), &clock).is_none());
+        locks.release(&first);
+        waiter.join().unwrap();
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn try_exclusive_refuses_an_entry_with_a_hand_off() {
+        let locks = Arc::new(LockManager::default());
+        let clock = SystemClock;
+        let mut holder = locks
+            .acquire(&[(Oid(8), Exclusive)], LONG, &clock)
+            .unwrap()
+            .keep();
+        let (sender, receiver) = mpsc::channel();
+        let owner = {
+            let locks = Arc::clone(&locks);
+            thread::spawn(move || {
+                let mut got = locks
+                    .acquire(&[(Oid(8), Exclusive)], LONG, &SystemClock)
+                    .unwrap();
+                let handoffs = got.handoffs();
+                let held = got.keep();
+                // The new owner releases before the holder is durable: the
+                // entry keeps the hand-off.
+                locks.release(&held);
+                sender.send(handoffs).unwrap();
+            })
+        };
+        until_waiting(&locks, Oid(8), 1);
+        let handoff = Arc::new(Handoff {
+            commit: Arc::new(InFlight::new(b"", b"")),
+            record: Vec::new(),
+        });
+        let handed = locks.hand_off(vec![(Oid(8), Arc::clone(&handoff))], &mut holder);
+        assert_eq!(handed.len(), 1);
+        owner.join().unwrap();
+        assert_eq!(receiver.recv().unwrap().len(), 1);
+        // No request holds the lock, but the store may not hold the last
+        // commit of the oid yet.
+        assert!(locks.try_exclusive(Oid(8), &clock).is_none());
+        locks.settle([(Oid(8), &handoff)]);
+        let held = locks.try_exclusive(Oid(8), &clock).expect("a settled lock");
+        locks.release(&[held]);
         assert!(locks.is_empty());
     }
 }

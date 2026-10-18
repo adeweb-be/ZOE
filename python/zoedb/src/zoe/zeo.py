@@ -486,8 +486,12 @@ _MB = 1024**2
 _NOT_BUILT = {}
 
 # The extensions that the native client declares: those of the client of
-# ZEO.
-_NATIVE_EXTENSIONS = EXTENSIONS
+# ZEO, and `server_writes` (ADR 0049). With it, the vote of the server can
+# write a record that the transaction did not store, and the finish gives
+# every Connection of the process every oid of the commit. The asyncio
+# client does not keep that promise, so it does not declare it.
+_SERVER_WRITES = "server_writes"
+_NATIVE_EXTENSIONS = (*EXTENSIONS, _SERVER_WRITES)
 
 # The protocols of a server for which a `ClientStorage` without `native`
 # takes the asyncio client of ZEO inside: the pickle protocol of a stock
@@ -1801,6 +1805,14 @@ class _NativeClientStorage(ClientStorage):
             tid = native.finish()
             self._local.delivering = True
             try:
+                # The server wrote an oid that the transaction did not
+                # store: every Connection gets every oid of the commit in
+                # one invalidation, before `lastTransaction()` gives the
+                # tid. Two calls would let a Connection see a part of the
+                # commit.
+                oids = native.unstored_commit()
+                if oids is not None and self._db is not None:
+                    self._db.invalidate(tid, oids)
                 f(tid)
             finally:
                 self._local.delivering = False
