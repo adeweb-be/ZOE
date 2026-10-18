@@ -199,9 +199,53 @@ class Settings:
     # (`--compression`): `none`, `zstd` or `zstd:LEVEL`. None gives no
     # option, so the server keeps the default of the store: raw records.
     zoe_compression: str | None = None
+    # The switch `split_merges` of the merge policy (ADR 0048): `on`,
+    # `shadow` or `off`. The run writes it into the merge policy of the
+    # store before the instances start. None writes nothing, so the store
+    # keeps the policy of the fixture.
+    split_merges: str | None = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
+
+
+# The modes of the switch `split_merges`.
+SPLIT_MERGES = ("on", "shadow", "off")
+
+
+def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
+    """Return why the run cannot write the switch `split_merges` of the
+    settings into the store of `config`, or None when it can."""
+    mode = settings.split_merges
+    if mode is None:
+        return None
+    if mode not in SPLIT_MERGES:
+        return f"--split-merges {mode!r} is not one of {', '.join(SPLIT_MERGES)}"
+    if config.server != "zoe" or config.section != "zoeclient":
+        return (
+            f"--split-merges needs a stack of zoe serve with zoedb, not {config.name}"
+        )
+    return None
+
+
+def campaign_settings(config: StackConfig, settings: Settings) -> Settings:
+    """Return the settings of a run of `config` in a campaign: without the
+    switch `split_merges` when the stack does not take it, so a campaign of
+    mixed stacks runs each of them."""
+    if config.server == "zoe" and config.section == "zoeclient":
+        return settings
+    return dataclasses.replace(settings, split_merges=None)
+
+
+def split_merges_policy(current: dict | None, mode: str) -> dict:
+    """Return the policy that `zoe.policy.install` takes: the policy
+    `current`, as `zoe.policy.read` gives it, or none, with the switch
+    `split_merges` set to `mode`. The classes and the other switches of the
+    policy stay; `install` sets the version."""
+    policy = {key: value for key, value in (current or {}).items() if key != "version"}
+    policy.setdefault("classes", {})
+    policy["split_merges"] = mode
+    return policy
 
 
 def serve_options(settings: Settings) -> list[str]:

@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! {"version": 3, "structural_merges": "on", "posting_dicts": "on",
+//!  "split_merges": "on",
 //!  "classes": {"module.Class": {"tier1": "shadow", "tier2": "on",
 //!              "default": "strict", "fields": {"field": "max", "data": "keys"},
 //!              "coupled": [["start", "end"]]}}}
@@ -12,7 +13,9 @@
 //!
 //! [`Rules`] gives the settings of a vote: a switch of the policy wins
 //! over the key of the store, and a switch that the policy does not give
-//! keeps the value of the key.
+//! keeps the value of the key. `split_merges`, the switch of the split
+//! merge (ADR 0048), has no key of the store: without it in the policy,
+//! the split merge is off.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -114,6 +117,8 @@ pub struct Policy {
     pub structural_merges: Option<Mode>,
     /// The mode of the rules of ADR 0042, if the policy gives one.
     pub posting_dicts: Option<Mode>,
+    /// The mode of the split merge of ADR 0048, if the policy gives one.
+    pub split_merges: Option<Mode>,
     /// The entry of each class, by its `module.name`.
     pub classes: BTreeMap<String, ClassPolicy>,
 }
@@ -131,6 +136,7 @@ impl Policy {
             version: 0,
             structural_merges: None,
             posting_dicts: None,
+            split_merges: None,
             classes: BTreeMap::new(),
         };
         let mut version = None;
@@ -147,6 +153,7 @@ impl Policy {
                 },
                 "structural_merges" => policy.structural_merges = Some(mode(&heap, value)?),
                 "posting_dicts" => policy.posting_dicts = Some(mode(&heap, value)?),
+                "split_merges" => policy.split_merges = Some(mode(&heap, value)?),
                 "classes" => {
                     let entries = str_dict(&heap, value).ok_or("classes that are not a dict")?;
                     for (name, entry) in entries {
@@ -169,6 +176,7 @@ impl Policy {
     pub fn has_shadow(&self) -> bool {
         self.structural_merges == Some(Mode::Shadow)
             || self.posting_dicts == Some(Mode::Shadow)
+            || self.split_merges == Some(Mode::Shadow)
             || self.classes.values().any(|entry| {
                 entry.tier1 == Some(Mode::Shadow) || (entry.tier2 == Mode::Shadow && !entry.blocked)
             })
@@ -235,6 +243,15 @@ impl Rules<'_> {
         self.policy
             .and_then(|policy| policy.posting_dicts)
             .unwrap_or(self.config.posting_dicts)
+    }
+
+    /// Returns the mode of the split merge of ADR 0048: the `split_merges`
+    /// of the policy, else `Off`. The rules of the split merge run only
+    /// where the mode of tier 1 of the class is not `Off` too.
+    pub fn split_merges(&self) -> Mode {
+        self.policy
+            .and_then(|policy| policy.split_merges)
+            .unwrap_or(Mode::Off)
     }
 
     /// Returns the entry of the class `module.name` when tier 2 runs on it:
@@ -479,6 +496,7 @@ mod tests {
             let items = vec![
                 (text(heap, "version"), Value::Int(3)),
                 (text(heap, "posting_dicts"), text(heap, "shadow")),
+                (text(heap, "split_merges"), text(heap, "on")),
                 (text(heap, "classes"), classes),
             ];
             heap.new_dict(items)
@@ -486,6 +504,7 @@ mod tests {
         let policy = Policy::read(&record).unwrap();
         assert_eq!(policy.version, 3);
         assert_eq!(policy.posting_dicts, Some(Mode::Shadow));
+        assert_eq!(policy.split_merges, Some(Mode::On));
         assert!(policy.has_shadow());
         let entry = &policy.classes["m.Document"];
         assert_eq!(entry.tier2, Mode::On);
@@ -501,6 +520,7 @@ mod tests {
             policy: Some(&policy),
         };
         assert_eq!(rules.posting_dicts(), Mode::Shadow);
+        assert_eq!(rules.split_merges(), Mode::On);
         assert_eq!(rules.tier1_mode("BTrees.IOBTree.IOBucket"), Mode::On);
         assert!(rules.tier2("m.Document").is_some());
         assert!(rules.tier2("m.Other").is_none());
@@ -541,6 +561,7 @@ mod tests {
         for (key, value) in [
             ("version", "x"),
             ("posting_dicts", "sometimes"),
+            ("split_merges", "sometimes"),
             ("colour", "on"),
         ] {
             let record = record(|heap| {
@@ -561,6 +582,7 @@ mod tests {
             version: 1,
             structural_merges: Some(Mode::Shadow),
             posting_dicts: None,
+            split_merges: None,
             classes: BTreeMap::new(),
         };
         let class = "BTrees.Length.Length";
@@ -592,5 +614,7 @@ mod tests {
         };
         assert_eq!(none.tier1_mode(class), Mode::Off);
         assert_eq!(none.posting_dicts(), Mode::Off);
+        // Without a policy, the split merge is off.
+        assert_eq!(none.split_merges(), Mode::Off);
     }
 }

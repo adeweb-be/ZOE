@@ -136,6 +136,9 @@ def run(options: RunOptions) -> Path:
         raise SystemExit(
             f"plonebench: no fixture {options.fixture}: run `just bench plone prepare`"
         )
+    refusal = stack.split_merges_refusal(config, options.settings)
+    if refusal is not None:
+        raise SystemExit(f"plonebench: {refusal}")
     missing = stack.missing_prerequisites(config)
     if missing:
         raise SystemExit(
@@ -190,6 +193,17 @@ def run(options: RunOptions) -> Path:
         t0 = time.time()
         st.start_server()
         sample.watch("server", st.processes["server"].pid)
+        if options.settings.split_merges is not None:
+            # The switch commits before the instances start, so every
+            # transaction of the run votes with it. Its client does not
+            # count in the startup of the stack.
+            written = time.time()
+            out = st.run_script(
+                "split_merges.py", options.settings.split_merges, name="policy"
+            )
+            result["merge_policy"] = json.loads(out.strip().splitlines()[-1])
+            result["policy_seconds"] = time.time() - written
+            t0 += result["policy_seconds"]
         sample.start()
         st.start_instances()
         for name, process in st.processes.items():

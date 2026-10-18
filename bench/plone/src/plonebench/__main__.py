@@ -39,6 +39,8 @@ def settings_of(args) -> stack.Settings:
         zeo_fsync=args.zeo_fsync,
         zoe_cache_size=args.zoe_cache_size,
         zoe_compression=args.zoe_compression,
+        # Only `run` and `campaign` take the switch.
+        split_merges=getattr(args, "split_merges", None),
         base_port=defaults.base_port + args.port_offset,
         server_port=defaults.server_port + args.port_offset,
         admin_port=defaults.admin_port + args.port_offset,
@@ -113,11 +115,25 @@ def add_run(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--label", default="")
     add_settings(parser)
+    parser.add_argument(
+        "--split-merges",
+        choices=stack.SPLIT_MERGES,
+        default=stack.Settings().split_merges,
+        help="write the switch split_merges of the merge policy (ADR 0048) "
+        "into the store before the instances start; a stack of zoe serve "
+        "with zoedb only, and `campaign` gives it only to such stacks. By "
+        "default the store keeps the policy of the fixture",
+    )
 
 
 def options_of(
-    args, stack_name: str, scenario: str, repetition: int
+    args, stack_name: str, scenario: str, repetition: int, campaign: bool = False
 ) -> runner.RunOptions:
+    settings = settings_of(args)
+    if campaign:
+        # A campaign gives the switch only to the stacks that take it. The
+        # result of each run records its settings.
+        settings = stack.campaign_settings(stack.STACKS[stack_name], settings)
     return runner.RunOptions(
         stack=stack_name,
         scenario=scenario,
@@ -132,7 +148,7 @@ def options_of(
         keep_store=args.keep_store,
         verify=not args.no_verify,
         label=args.label,
-        settings=settings_of(args),
+        settings=settings,
     )
 
 
@@ -211,7 +227,8 @@ def main(argv: list[str] | None = None) -> int:
                 order = stacks if rep % 2 == 0 else list(reversed(stacks))
                 for name in order:
                     try:
-                        run_dir = runner.run(options_of(args, name, scenario, rep))
+                        options = options_of(args, name, scenario, rep, campaign=True)
+                        run_dir = runner.run(options)
                         if args.list:
                             with open(args.list, "a") as file:
                                 file.write(f"{run_dir}\n")

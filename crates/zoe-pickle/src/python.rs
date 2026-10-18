@@ -495,6 +495,16 @@ impl Heap {
         }
     }
 
+    /// Returns the persistent reference of the persistent id `data`, as
+    /// BINPERSID of the unpickler gives it: the reference that the heap has
+    /// for its identity, or a new one. `data` takes the forms of ZODB's
+    /// `serialize.py`, such as the tuple `(oid, class)`. Only the feature
+    /// `testing` builds it: tests use it to build records.
+    #[cfg(feature = "testing")]
+    pub fn new_reference(&mut self, data: Value) -> Result<Value, Unsupported> {
+        self.reference_of(data)
+    }
+
     /// Returns the persistent reference of the persistent id `data`: the
     /// reference that the heap has for its identity, or a new one.
     fn reference_of(&mut self, data: Value) -> Result<Value, Unsupported> {

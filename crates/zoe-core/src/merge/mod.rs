@@ -30,12 +30,19 @@
 //! resolution log, then the merge runs again without them, and that
 //! outcome ends the conflict. See `posting.rs` and `btrees.rs`.
 //!
+//! The split merge (ADR 0048, `split.rs`) is a merge where ZODB's resolver
+//! refuses too: it merges the splits of a BTree node with the buckets that
+//! a transaction split, and lets a read-current node through when another
+//! transaction split another of its children. The switch `split_merges`
+//! of the merge policy switches it, and it is off by default.
+//!
 //! No Python runs here.
 
 mod btrees;
 mod fields;
 pub mod policy;
 mod posting;
+pub(crate) mod split;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -397,6 +404,11 @@ pub struct Resolution {
     /// For a refusal of tier 2, the field whose strategy refused, or the
     /// coupled group. Empty otherwise.
     pub fields: Vec<String>,
+    /// The rule of the split merge (ADR 0048) that gave the outcome or the
+    /// shadow outcome: 1, 2 or 3. `None` for the other merges. An outcome
+    /// `Merged` of rule 1 is a read-current oid that passed: the vote
+    /// wrote nothing for it.
+    pub split: Option<u8>,
 }
 
 /// What a tier gave for a conflict, without the merged record.
@@ -474,18 +486,22 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     field("tier", resolution.tier.to_string());
     field("mode", json(resolution.mode.as_str()));
     field("policy", version(resolution.policy));
-    let (outcome, code, reason) = resolution.outcome.json_parts();
+    let (outcome, code, reason) = resolution.outcome.json_parts(resolution.split);
     field("outcome", outcome);
     field("code", code);
     field("reason", reason);
     let shadow = resolution.shadow.map_or_else(
         || "null".to_owned(),
         |shadow| {
-            let (outcome, code, reason) = shadow.json_parts();
+            let (outcome, code, reason) = shadow.json_parts(resolution.split);
             format!("{{\"outcome\":{outcome},\"code\":{code},\"reason\":{reason}}}")
         },
     );
     field("shadow", shadow);
+    // Only a line of the split merge has the field.
+    if let Some(rule) = resolution.split {
+        field("split", rule.to_string());
+    }
     field("applied", resolution.applied.to_string());
     field("undo", resolution.undo.to_string());
     let keys: Vec<String> = resolution.keys.iter().map(|key| json(key)).collect();
@@ -589,6 +605,7 @@ impl Resolution {
             read,
             shadow: merge.shadow.as_ref().map(Resolved::of),
             fields: merge.fields.clone(),
+            split: None,
         }
     }
 }
@@ -603,9 +620,11 @@ impl Resolved {
     }
 
     /// Returns the name, the code of BTrees and the reason of the outcome,
-    /// as JSON values.
-    fn json_parts(self) -> (String, String, String) {
+    /// as JSON values. `split` is the rule of the split merge, if any: a
+    /// merge of rule 1 is `passed`.
+    fn json_parts(self, split: Option<u8>) -> (String, String, String) {
         let (outcome, code, reason) = match self {
+            Resolved::Merged if split == Some(1) => ("passed", None, None),
             Resolved::Merged => ("merged", None, None),
             Resolved::Refused(reason) => ("refused", reason.code(), Some(reason.message())),
             Resolved::Undecided(why) => ("undecided", None, Some(why)),

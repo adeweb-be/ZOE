@@ -80,6 +80,7 @@ fn merge_once(trees: &Trees, class: Class, rules: bool, merge: &mut Merge) -> (O
                 rules,
                 posting: rules && posting::applies(family),
                 first_key: false,
+                key_refs: false,
                 ruled: Cell::new(false),
                 items: Vec::new(),
                 keys: Vec::new(),
@@ -188,6 +189,9 @@ struct Merger<'h> {
     /// True when a rule compared or merged a posting dict, or let a delete
     /// of a first key through.
     ruled: Cell<bool>,
+    /// True when the merge orders key references by the oids of their
+    /// objects: the split merge of ADR 0048.
+    key_refs: bool,
     /// The keys and the values of the merged bucket, in order.
     items: Vec<Value>,
     /// The keys that the new record changed, as text, at most `MAX_KEYS`.
@@ -303,10 +307,7 @@ impl Merger<'_> {
 
     /// `TEST_KEY_SET_OR`: compares two keys.
     fn compare_keys(&self, a: Value, b: Value) -> Result<Ordering, Outcome> {
-        match self.family.keys {
-            KeyType::Object => self.heap.compare(a, b).map_err(undecided),
-            _ => Ok(int(a).cmp(&int(b))),
-        }
+        compare_keys(&*self.heap, self.family.keys, self.key_refs, a, b)
     }
 
     /// `TEST_VALUE(a, b) == 0`: tells if two values are equal for the
@@ -320,7 +321,7 @@ impl Merger<'_> {
                     self.ruled.set(true);
                     return Ok(equal);
                 }
-                Ok(self.heap.compare(a, b).map_err(undecided)? == Ordering::Equal)
+                Ok(compare_objects(&*self.heap, self.key_refs, a, b)? == Ordering::Equal)
             }
             // `(K < T) ? -1 : (K > T) ? 1 : 0` of the C floats: a NaN is
             // equal to every value.
@@ -541,6 +542,169 @@ impl Merger<'_> {
             return Err(refuse(10));
         }
         Ok(())
+    }
+}
+
+/// `TEST_KEY_SET_OR`: compares two keys of the type `keys`. With
+/// `key_refs`, two key references of one class compare by the oids of
+/// their objects (ADR 0048).
+pub(super) fn compare_keys(
+    heap: &Heap,
+    keys: KeyType,
+    key_refs: bool,
+    a: Value,
+    b: Value,
+) -> Result<Ordering, Outcome> {
+    if keys != KeyType::Object {
+        return Ok(int(a).cmp(&int(b)));
+    }
+    compare_objects(heap, key_refs, a, b)
+}
+
+/// `object_compare` of BTrees on two keys or two values of the type `O`.
+/// With `key_refs`, two key references of one class compare by the oids of
+/// their objects, as their `_get_cmp_keys` does in conflict resolution:
+/// BTrees calls the same comparison for the keys and for the values.
+fn compare_objects(heap: &Heap, key_refs: bool, a: Value, b: Value) -> Result<Ordering, Outcome> {
+    if key_refs {
+        match (key_reference(heap, a), key_reference(heap, b)) {
+            (None, None) => {}
+            (Some(Some((p, x))), Some(Some((q, y)))) if p == q => return Ok(x.cmp(y)),
+            _ => {
+                return Err(Outcome::Undecided(
+                    "key references that the order of key references does not take",
+                ));
+            }
+        }
+    }
+    heap.compare(a, b).map_err(undecided)
+}
+
+/// The classes of key references whose order the split merge knows. Their
+/// `_get_cmp_keys` compares two references of one class, in conflict
+/// resolution, by the oids of their objects when neither object names a
+/// database.
+const KEY_REFERENCES: [(&str, &str); 2] = [
+    ("five.intid.keyreference", "KeyReferenceToPersistent"),
+    ("zope.keyreference.persistent", "KeyReferenceToPersistent"),
+];
+
+/// Returns `None` when `value` is not an object of a class of
+/// [`KEY_REFERENCES`]. Else returns the index of its class and the oid of
+/// its object, or `Some(None)` when the order does not take it: its state
+/// holds no `object`, or that object is not a reference to an oid of the
+/// same database.
+fn key_reference(heap: &Heap, value: Value) -> Option<Option<(usize, &[u8])>> {
+    let instance = heap.instance(value)?;
+    let class = heap.class(instance.class)?;
+    let index = KEY_REFERENCES.iter().position(|&known| known == class)?;
+    let object = instance
+        .state
+        .and_then(|state| heap.dict(state))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|&&(key, _)| heap.str(key) == Some("object"))
+                .map(|&(_, object)| object)
+        });
+    let reference = object.and_then(|object| heap.reference(object));
+    Some(
+        reference
+            .filter(|reference| reference.database.is_none() && !reference.weak)
+            .map(|reference| (index, &reference.oid[..])),
+    )
+}
+
+/// Merges the items of the range of a bucket that the split merge (ADR
+/// 0048) merges, with the rules of `bucket_merge` and without the rules of
+/// ADR 0042. `old`, `committed` and `new` hold the items of the range on
+/// each side: each key, then its value for a mapping. Two key references
+/// of one class compare by the oids of their objects, as keys and as
+/// values.
+///
+/// Returns the merged items, the keys that the new side changed and their
+/// number. A key of `old` that a side deleted gives no answer.
+pub(super) fn merge_range(
+    heap: &mut Heap,
+    family: Family,
+    mapping: bool,
+    old: &[Value],
+    committed: &[Value],
+    new: &[Value],
+) -> Result<(Vec<Value>, Vec<String>, usize), Outcome> {
+    let mut merger = Merger {
+        heap,
+        family,
+        mapping,
+        rules: false,
+        posting: false,
+        first_key: false,
+        ruled: Cell::new(false),
+        key_refs: true,
+        items: Vec::new(),
+        keys: Vec::new(),
+        changed: 0,
+    };
+    let old = merger.range(old)?;
+    let committed = merger.range(committed)?;
+    let new = merger.range(new)?;
+    for side in [&committed, &new] {
+        if merger.deletes(&old, side)? {
+            return Err(Outcome::Undecided(
+                "a delete in a range that a split merges",
+            ));
+        }
+    }
+    merger.bucket_merge(&old, &committed, &new)?;
+    Ok((merger.items, merger.keys, merger.changed))
+}
+
+impl Merger<'_> {
+    /// Reads the items of a range as a bucket without a next bucket.
+    fn range(&self, items: &[Value]) -> Result<Bucket, Outcome> {
+        let untaken = Outcome::Undecided("a key or a value that the family does not take");
+        let mut bucket = Bucket {
+            keys: Vec::new(),
+            values: Vec::new(),
+            next: None,
+        };
+        if self.mapping {
+            if !items.len().is_multiple_of(2) {
+                return Err(Outcome::Undecided("a bucket state of another shape"));
+            }
+            for &[key, value] in items.as_chunks::<2>().0 {
+                let key = self.family.keys.stored(key).ok_or(untaken.clone())?;
+                let value = self.family.values.stored(value).ok_or(untaken.clone())?;
+                bucket.keys.push(key);
+                bucket.values.push(value);
+            }
+        } else {
+            for &key in items {
+                let key = self.family.keys.stored(key).ok_or(untaken.clone())?;
+                bucket.keys.push(key);
+            }
+        }
+        Ok(bucket)
+    }
+
+    /// Tells if `side` lacks a key of `old`. Both hold their keys in
+    /// ascending order.
+    fn deletes(&self, old: &Bucket, side: &Bucket) -> Result<bool, Outcome> {
+        let mut next = 0;
+        for &key in &old.keys {
+            while next < side.keys.len()
+                && self.compare_keys(side.keys[next], key)? == Ordering::Less
+            {
+                next += 1;
+            }
+            if next == side.keys.len()
+                || self.compare_keys(side.keys[next], key)? != Ordering::Equal
+            {
+                return Ok(true);
+            }
+            next += 1;
+        }
+        Ok(false)
     }
 }
 

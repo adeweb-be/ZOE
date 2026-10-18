@@ -35,7 +35,9 @@ The overrides are a JSON object with these keys, each optional:
 
 - ``tier2``: the mode of the derived entries, ``shadow`` by default, as a
   class merges only after shadow mode showed that its merges are right;
-- ``structural_merges`` and ``posting_dicts``: the switches of tier 1;
+- ``structural_merges``, ``posting_dicts`` and ``split_merges``: the
+  switches of tier 1; the profile sets none of them, so the split merge of
+  ADR 0048 stays off until an override or `zoe.policy.install` sets it;
 - ``classes``: entries by class name; an entry changes the keys that it
   gives, its ``fields`` add to the derived ones, and its ``coupled`` groups
   add to the derived groups; ``null`` removes the entry of a class. An
@@ -162,12 +164,7 @@ def apply_overrides(policy, overrides, derived=frozenset(), blocked=frozenset())
     Raise `ValueError` for overrides of another form."""
     if type(overrides) is not dict:
         raise ValueError("the overrides are a JSON object")
-    unknown = set(overrides) - {
-        "tier2",
-        "structural_merges",
-        "posting_dicts",
-        "classes",
-    }
+    unknown = set(overrides) - {"tier2", "classes", *merge_policy.SWITCHES}
     if unknown:
         raise ValueError(f"the overrides have no key {sorted(map(str, unknown))[0]!r}")
     classes = overrides.get("classes", {})
@@ -177,7 +174,7 @@ def apply_overrides(policy, overrides, derived=frozenset(), blocked=frozenset())
         raise ValueError("the classes of the overrides are a JSON object")
     result = {key: value for key, value in policy.items() if key != "classes"}
     result["classes"] = {name: dict(entry) for name, entry in policy["classes"].items()}
-    for switch in ("structural_merges", "posting_dicts"):
+    for switch in merge_policy.SWITCHES:
         if overrides.get(switch) is not None:
             result[switch] = overrides[switch]
     mode = overrides.get("tier2")

@@ -11,6 +11,11 @@ plain values only, so the core reads it in Rust, in-process and in
 - ``structural_merges`` and ``posting_dicts``, optional: the mode of tier 1
   and of the rules of ADR 0042, ``on``, ``shadow`` or ``off``; they win over
   the keys of the same names of the store;
+- ``split_merges``, optional: the mode of the split merge of ADR 0048,
+  ``on``, ``shadow`` or ``off``. It merges the splits of the nodes of
+  BTrees where ZODB's resolver refuses, in the classes where tier 1 runs.
+  The store has no key of this name: without the switch, the split merge
+  is off;
 - ``classes``: a dict of class names (``module.Class``) to their entries.
 
 The entry of a class has these keys, each optional:
@@ -60,7 +65,7 @@ MODES = ("on", "shadow", "off")
 #: The strategies of a field.
 STRATEGIES = ("strict", "lww", "max", "sum", "union", "append", "keys")
 #: The keys of a policy that `install` takes, besides ``classes``.
-SWITCHES = ("structural_merges", "posting_dicts")
+SWITCHES = ("structural_merges", "posting_dicts", "split_merges")
 #: The keys of the entry of a class.
 ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled", "blocked")
 
@@ -69,7 +74,7 @@ class MergePolicy(persistent.Persistent):
     """The merge policy of a store. Write it with `install`.
 
     Its attributes are ``version``, ``classes`` and, when the policy gives
-    them, ``structural_merges`` and ``posting_dicts``.
+    them, ``structural_merges``, ``posting_dicts`` and ``split_merges``.
     """
 
     def __init__(self):
@@ -104,8 +109,9 @@ def _strategy(value, where):
 def validate(policy):
     """Return a copy of `policy` with plain values only, or raise
     `ValueError` when it breaks the rules of a policy. `policy` is a dict
-    with the key ``classes`` and, optionally, ``structural_merges`` and
-    ``posting_dicts``. ``version`` is not part of it: `install` sets it.
+    with the key ``classes`` and, optionally, ``structural_merges``,
+    ``posting_dicts`` and ``split_merges``. ``version`` is not part of it:
+    `install` sets it.
 
     Each text must be a plain `str`, and the copy holds the constants of
     `MODES` and `STRATEGIES`, so the core reads every value."""

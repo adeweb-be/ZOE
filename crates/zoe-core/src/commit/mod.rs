@@ -15,7 +15,11 @@
 //! `Length`, and tier 2 on each stale written oid of a class that the
 //! merge policy marks mergeable: it stores the merged record over the
 //! committed one, or fails on a refusal, or leaves the conflict as it is.
-//! `resolutions` tells what the tiers did. The vote after
+//! `resolutions` tells what the tiers did. When the merge policy switches
+//! on the split merge (ADR 0048, `split.rs`), the first conflict of the
+//! vote also runs its rules on the nodes of BTrees: it stages the records
+//! of the node, of the bucket and of the new bucket that the transaction
+//! split, and lets a read-current node through. The vote after
 //! `vote_resolving` compares each merge of shadow mode with the
 //! resolution that the caller stored, and `verifications` tells what it
 //! found.
@@ -69,6 +73,7 @@ mod encoded;
 mod group;
 mod intent;
 mod observer;
+mod split;
 mod staging;
 mod undo;
 
@@ -148,6 +153,10 @@ pub struct Txn<S: Deref<Target = Store>> {
     /// The oids that `vote_resolving` gave as conflicts. The set is empty
     /// except between that call and the next vote.
     resolving: BTreeSet<Oid>,
+    /// The stale read-current oids that rule 1 of the split merge let
+    /// through in the last vote that took the locks. The vote after
+    /// `vote_resolving` lets them through too: their shared locks are held.
+    passed: BTreeSet<Oid>,
     /// The current serial and the read serial of the stale oid that failed
     /// the last vote.
     conflict: Option<(Tid, Tid)>,
@@ -260,6 +269,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             read_current: BTreeMap::new(),
             locks: None,
             resolving: BTreeSet::new(),
+            passed: BTreeSet::new(),
             conflict: None,
             stored_bytes: 0,
             began,
@@ -904,8 +914,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// with a serial other than `Tid::ZERO`, and its committed record holds
     /// a pickle. Any other stale written oid fails the vote with
     /// `Conflict`. Then a stale read-current oid fails the vote with
-    /// `ReadConflict`: a read-current oid is never resolved. A failed vote
-    /// releases every lock that it took.
+    /// `ReadConflict`, unless rule 1 of the split merge lets it through: a
+    /// read-current oid is never resolved. A failed vote releases every
+    /// lock that it took.
     ///
     /// After a list of conflicts, the transaction keeps its locks and is
     /// not voted. For each oid of the list, the caller stores the resolved
@@ -1037,9 +1048,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// locks and passed. Their staged records hold the merged records, over
     /// the serial of the committed records.
     pub fn natively_resolved(&self) -> Vec<Oid> {
+        // A node that rule 1 of the split merge let through has no merged
+        // record: the transaction did not store it.
         self.resolutions[self.undo_resolutions..]
             .iter()
-            .filter(|resolution| resolution.applied && resolution.outcome == Resolved::Merged)
+            .filter(|resolution| {
+                resolution.applied
+                    && resolution.outcome == Resolved::Merged
+                    && resolution.split != Some(1)
+            })
             .map(|resolution| resolution.oid)
             .collect()
     }
@@ -1146,6 +1163,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.resolutions.truncate(self.undo_resolutions);
             self.shadows.clear();
             self.verifications.clear();
+            self.passed.clear();
         }
         let checked = self
             .check_undone()
@@ -1159,6 +1177,16 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 } => {
                     self.stage_merged(merged, stored_bytes)?;
                     self.onto.extend(onto);
+                    // A node that rule 1 let through counts once the vote
+                    // passes.
+                    for resolution in &mut self.resolutions[self.undo_resolutions..] {
+                        if resolution.split == Some(1)
+                            && resolution.outcome == Resolved::Merged
+                            && self.passed.contains(&resolution.oid)
+                        {
+                            resolution.applied = true;
+                        }
+                    }
                     Ok(Check::Passed {
                         conflicts,
                         merged: Vec::new(),
@@ -1261,6 +1289,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // The first conflict reads the merge policy. A vote without a
         // conflict reads nothing.
         let mut policy: Option<Option<Arc<Policy>>> = None;
+        // The first conflict of a vote that takes the locks makes the plan
+        // of the split merge (ADR 0048).
+        let mut plan: Option<split::Plan> = None;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
@@ -1332,6 +1363,37 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 {
                     return Ok(Check::Failed(stale));
                 }
+                if native {
+                    if policy.is_none() {
+                        policy = Some(self.store.merge_policy()?);
+                    }
+                    if plan.is_none() {
+                        let rules = Rules {
+                            config: &self.store.structural_merges,
+                            policy: policy.as_ref().and_then(Option::as_deref),
+                        };
+                        let mut made = self.split_plan(&rules, stored_bytes)?;
+                        let refused = adopt(
+                            &mut made,
+                            &mut self.resolutions,
+                            &mut self.passed,
+                            &mut self.lock_waited,
+                            &mut merged,
+                            &mut stored_bytes,
+                        );
+                        if let Some(stale) = refused {
+                            return Ok(Check::Failed(stale));
+                        }
+                        plan = Some(made);
+                    }
+                    // The split merge staged the merged record of the oid.
+                    if plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.covered.contains(&oid))
+                    {
+                        continue;
+                    }
+                }
                 // Only a conflict reads its committed record. A deletion
                 // has an empty pickle and is never resolved. A record that
                 // is gone since the serials were read is a pack of it:
@@ -1341,9 +1403,6 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     _ => return Ok(Check::Failed(stale)),
                 };
                 let resolved = if native {
-                    if policy.is_none() {
-                        policy = Some(self.store.merge_policy()?);
-                    }
                     let rules = Rules {
                         config: &self.store.structural_merges,
                         policy: policy.as_ref().and_then(Option::as_deref),
@@ -1356,6 +1415,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 if let Some((mode, version, merge)) = resolved {
                     let mut resolution =
                         Resolution::of(oid, mode, version, &merge, current, staged.serial);
+                    // In shadow mode, the entry tells what the split merge
+                    // gives for the oid.
+                    if let Some(shadow) = plan.as_ref().and_then(|plan| plan.shadows.get(&oid))
+                        && resolution.shadow.is_none()
+                    {
+                        resolution.shadow = Some(shadow.outcome);
+                        resolution.split = Some(shadow.rule);
+                    }
                     if let (merge::Mode::Shadow, Outcome::Merged(pickle)) = (mode, &merge.outcome) {
                         self.shadows.insert(
                             oid,
@@ -1417,14 +1484,47 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     }));
                 }
                 let current = serial.unwrap_or(Tid::ZERO);
-                if current != read {
-                    return Ok(Check::Failed(Stale {
-                        oid,
-                        current: Some(current),
-                        read,
-                        read_only: true,
-                    }));
+                if current == read || self.passed.contains(&oid) {
+                    continue;
                 }
+                if native {
+                    if policy.is_none() {
+                        policy = Some(self.store.merge_policy()?);
+                    }
+                    let rules = Rules {
+                        config: &self.store.structural_merges,
+                        policy: policy.as_ref().and_then(Option::as_deref),
+                    };
+                    if plan.is_none() {
+                        let mut made = self.split_plan(&rules, stored_bytes)?;
+                        let refused = adopt(
+                            &mut made,
+                            &mut self.resolutions,
+                            &mut self.passed,
+                            &mut self.lock_waited,
+                            &mut merged,
+                            &mut stored_bytes,
+                        );
+                        if let Some(stale) = refused {
+                            return Ok(Check::Failed(stale));
+                        }
+                        plan = Some(made);
+                        // Rule 1 of the split merge lets the node through.
+                        if self.passed.contains(&oid) {
+                            continue;
+                        }
+                    }
+                    if let Some(shadow) = plan.as_ref().and_then(|plan| plan.shadows.get(&oid)) {
+                        let entry = split::read_shadow(oid, shadow, read, current, &rules);
+                        self.resolutions.push(entry);
+                    }
+                }
+                return Ok(Check::Failed(Stale {
+                    oid,
+                    current: Some(current),
+                    read,
+                    read_only: true,
+                }));
             }
         }
         Ok(Check::Passed {
@@ -1513,6 +1613,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
                         });
                     }
                 }
+                // The split merge can merge a split that tier 1 refuses, once
+                // the store holds the commit in flight: wait for it.
+                Outcome::Refused(merge::Reason::BTrees(0 | 11))
+                    if rules.split_merges() != merge::Mode::Off => {}
                 Outcome::Refused(_) => {
                     resolution.applied = true;
                     return Ok(Handed::Failed {
@@ -1964,6 +2068,33 @@ enum Handed {
 /// The number of oids whose current serials the vote reads in one backend
 /// read.
 const READ_CHUNK: usize = 256;
+
+/// Takes a plan of the split merge into the check of a vote: its entries,
+/// the nodes that rule 1 lets through, its wait for commits in flight, its
+/// records and the transaction size with them. Returns the stale node of a
+/// refusal, which fails the vote.
+fn adopt(
+    plan: &mut split::Plan,
+    resolutions: &mut Vec<Resolution>,
+    passed: &mut BTreeSet<Oid>,
+    waited: &mut Option<Duration>,
+    merged: &mut Vec<(Oid, Tid, Vec<u8>)>,
+    stored_bytes: &mut u64,
+) -> Option<Stale> {
+    resolutions.append(&mut plan.resolutions);
+    passed.extend(plan.passed.iter().copied());
+    if let Some(total) = waited {
+        *total += plan.waited;
+    }
+    merged.append(&mut plan.records);
+    *stored_bytes = plan.stored_bytes;
+    plan.refused.map(|(oid, current, read)| Stale {
+        oid,
+        current: Some(current),
+        read,
+        read_only: false,
+    })
+}
 
 /// The most records of the history of an oid that a line of the resolution
 /// log reads to find the committed record. Other commits can come after
