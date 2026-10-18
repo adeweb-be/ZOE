@@ -642,7 +642,9 @@ impl<'s> Group<'s> {
             }
             Tree::Node(committed) => {
                 if !self.source.server_writes() {
-                    return no("a bucket that the other side split, for a client without server_writes");
+                    return no(
+                        "a bucket that the other side split, for a client without server_writes",
+                    );
                 }
                 let [c, y] = committed.children[..] else {
                     return no("two splits of one bucket by the other side");
@@ -688,7 +690,16 @@ impl<'s> Group<'s> {
             (node.oid, &node.name),
         )?;
         if let Some(theirs) = theirs {
-            return self.kept(node, theirs, low, high, keys, changed, [a, x], [a_name, x_name]);
+            return self.kept(
+                node,
+                theirs,
+                low,
+                high,
+                keys,
+                changed,
+                [a, x],
+                [a_name, x_name],
+            );
         }
         let a_state = new_bucket_state(&mut self.heap, low, a_new.next);
         let x_state = new_bucket_state(&mut self.heap, high, None);
@@ -783,7 +794,9 @@ impl<'s> Group<'s> {
             };
             rule = 3;
             if y.is_some() && !self.source.server_writes() {
-                return no("a bucket that the other side split, for a client without server_writes");
+                return no(
+                    "a bucket that the other side split, for a client without server_writes",
+                );
             }
             let anchor = Anchor {
                 child: *anchor,
@@ -815,7 +828,10 @@ impl<'s> Group<'s> {
             let (keys, changed) = records.first().map_or((Vec::new(), 0), |record: &Written| {
                 (record.keys.clone(), record.changed)
             });
-            records.insert(0, dropped(node.oid, &node.name, node.read, node.current, keys, changed));
+            records.insert(
+                0,
+                dropped(node.oid, &node.name, node.read, node.current, keys, changed),
+            );
         } else if node.current != node.read {
             let mut items = Vec::with_capacity(merged.len() * 2);
             for child in &merged {

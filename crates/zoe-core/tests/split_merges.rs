@@ -512,7 +512,10 @@ fn both_sides_split_one_bucket_and_the_keys_of_its_range_merge() {
     // bucket, which keeps its place. X gets no place, and no record.
     assert_eq!(buckets, [tree.buckets[0], tree.buckets[1], y]);
     assert_eq!(keys, [10, 20, 30, 40, 45, 50, 60, 70]);
-    assert_eq!(store.load(y).unwrap(), (bucket(II, &ints(&[60, 70]), None), tid));
+    assert_eq!(
+        store.load(y).unwrap(),
+        (bucket(II, &ints(&[60, 70]), None), tid)
+    );
     assert!(store.load(x).is_err());
     // The node keeps the record of the other side.
     assert_eq!(store.load(tree.root).unwrap().1, committed_root);
@@ -529,7 +532,11 @@ fn without_server_writes_a_split_of_both_sides_gives_no_answer() {
     // The vote goes on as without the rule: ZODB's resolver refuses the
     // node.
     assert!(matches!(voted, Err(ZoeError::Conflict { oid }) if oid == tree.root));
-    assert!(txn.resolutions().iter().all(|r| r.outcome != Resolved::Merged));
+    assert!(
+        txn.resolutions()
+            .iter()
+            .all(|r| r.outcome != Resolved::Merged)
+    );
     assert!(store.lock_table_is_empty());
 }
 
@@ -757,7 +764,10 @@ fn a_split_of_a_root_that_held_its_bucket_inline_merges() {
         store.load(a1).unwrap().0,
         bucket(II, &ints(&[10, 20, 25]), Some(y1))
     );
-    assert_eq!(store.load(y1).unwrap().0, bucket(II, &ints(&[30, 40]), None));
+    assert_eq!(
+        store.load(y1).unwrap().0,
+        bucket(II, &ints(&[30, 40]), None)
+    );
     assert!(store.load(a).is_err());
     assert!(store.load(x).is_err());
 }

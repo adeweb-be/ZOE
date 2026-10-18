@@ -53,7 +53,9 @@ class Opened:
         self.server.__enter__()
         address = self.server.address
         if mode == "native-client":
-            storage = zoe.testing.native_client(address, storage="1", wait_timeout=TIMEOUT)
+            storage = zoe.testing.native_client(
+                address, storage="1", wait_timeout=TIMEOUT
+            )
         elif mode == "native-client-without-cache":
             storage = zoe.testing.native_client(
                 address, storage="1", wait_timeout=TIMEOUT, cache_size=0
@@ -252,7 +254,9 @@ def undo_of(db, description):
     """Undo the last transaction whose description is `description`.
     Return True when the undo committed."""
     entry = next(
-        e for e in db.undoLog(0, 50) if e["description"] in (description, description.encode())
+        e
+        for e in db.undoLog(0, 50)
+        if e["description"] in (description, description.encode())
     )
     try:
         db.undo(entry["id"])
@@ -263,7 +267,9 @@ def undo_of(db, description):
     return True
 
 
-@pytest.mark.parametrize("opened", ("in-process", "native-client", "zeo-client"), indirect=True)
+@pytest.mark.parametrize(
+    "opened", ("in-process", "native-client", "zeo-client"), indirect=True
+)
 def test_an_undo_after_the_merge_never_passes_with_no_effect(opened):
     db = opened.db
     last = full_tree(db)

@@ -164,6 +164,13 @@ The human approved this section with the rest of this ADR.
 
 **A correction of section 7 of ADR 0048.** Its text, "An undo of a transaction whose tree records changed later fails with `UndoError`, as in ZODB", was wrong for a bucket that the rule 3 of ADR 0048 took out of the tree: after S2 replaced Y with X, an undo of T, which wrote only Y, found the record of T current on Y, passed, and had no effect on the tree, since the key of T stayed in X. With this ADR no merge takes a bucket out of the tree, so the case is gone for every client. The text of section 7 of ADR 0048 becomes: "An undo of a transaction that wrote into a bucket never passes with no effect: no merge of rule 3 takes a bucket out of the tree (ADR 0049). When a later commit wrote that bucket, the undo meets that record: tier 1 or the client resolves it, or it fails with `UndoError`, as in ZODB." Records that a store got from the rule 3 of ADR 0048 before this ADR keep their replaced buckets: an undo of a transaction that wrote into one of them still has no effect on the tree.
 
+### 12. Notes of the build
+
+- The finish hands off only the oids that it stages (ADR 0044), and an oid resolved without a record leaves the staging when the vote passes. So the finish never hands it off, with no change of the lock manager but `LockManager::try_exclusive`, the call that never waits.
+- A failed call for the lock of Y, and a transaction without the flag, give no line of their own: rule 3 gives no answer, and the vote goes on as without the rule, with the lines of tier 1 for the node. The reason of section 9 and the `debug` event are not built.
+- The pool of the native client marks a transaction whose vote listed an oid that it did not store. Its turn then gives the oids of the commit from the invalidation of the listener (`Turn::unstored_commit`), and `zoe.zeo.ClientStorage` calls `invalidate(tid, oids)` of the database with them before `f(tid)`. The oids of an undo take the same path: the Connections get them twice, which changes nothing.
+- `zoe.Storage` sets the flag in `registerDB` when its database is a ZODB `MVCCAdapter`. Its `tpc_finish` (in Python) reads every oid of the commit before the finish (`_unstored_commit`) and calls `invalidate(tid, oids)` before the callback.
+
 ## Consequences
 
 - A transaction that inserted into a bucket that a split merge of another transaction had to replace commits. On the logs of the spike, an estimate (the runs did not have the rule): 18 of the 28 `ConflictError`s of `create-spread` on `zoe-native-qi` go, 9.6 per 1,000 operations instead of 27.0.

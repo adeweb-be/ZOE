@@ -584,7 +584,11 @@ impl LockManager {
     pub(crate) fn try_exclusive(&self, oid: Oid, clock: &dyn Clock) -> Option<Held> {
         let since = clock.now();
         let mut table = self.table();
-        if table.entries.get(&oid).is_some_and(|entry| !entry.is_unused()) {
+        if table
+            .entries
+            .get(&oid)
+            .is_some_and(|entry| !entry.is_unused())
+        {
             return None;
         }
         table.entries.entry(oid).or_default().take(Mode::Exclusive);
