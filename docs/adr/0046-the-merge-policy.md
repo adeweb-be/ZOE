@@ -168,7 +168,7 @@ ZODB gives `PersistentMapping` no `_p_resolveConflict`, so ZODB refuses each con
 
 ### 12. The option `state` of `append`: a history that refuses two changes of state from one state (ZOE-214)
 
-Status of this section: proposed. The rule and the option are a decision of the human, recorded on the card (#436). The human reviews this text before the build. Claude's choices are points 14 to 21 of "Questions for the human".
+Status of this section: accepted. The rule and the option are a decision of the human, recorded on the card (#436). The human then approved this text with the recommendation of each of points 14 to 21 of "Questions for the human", which are Claude's choices.
 
 DCWorkflow keeps the history of an object in `workflow_history`: a mapping of workflow id to the tuple of its statuses. A status is a dict. It holds the state of the object after the transition, under the state variable of the workflow (`review_state` in every workflow of Plone). The last status of a workflow gives the state of the object in that workflow. DCWorkflow treats two transitions that change the state from one state as exclusive: the second one starts from a state that is no longer the state of the object.
 
