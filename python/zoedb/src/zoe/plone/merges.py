@@ -37,12 +37,12 @@ takes the lowest of them (``off``, then ``shadow``, then ``on``), so an
 site that raises its own mode raises the policy when no other site asks
 for less (`lowest_mode`). A mode for the whole database goes through the
 overrides of a site: an ``off`` that `zoe.policy.install` writes lasts
-only until the next `update_policy` of a site that asks for more, which
-replaces it with a warning; a rise of the lowest mode of the sites logs at
-INFO (`log_rise`). `update_policy` also drops the mode of a site
-that is gone (`gone_sites`): a removed site, or the old path of a renamed
-or moved site, which gives its mode under its new path at its own next
-update. A change of a Dexterity type derives the policy again
+only until the next `update_policy` at which the lowest mode of the sites
+is higher, which replaces it with a warning; a rise of the lowest mode of
+the sites logs at INFO (`log_rise`). `update_policy` also drops the mode of
+a site that is gone (`gone_sites`): a removed site, or the old path of a
+renamed or moved site, which gives its mode under its new path at its own
+next update. A change of a Dexterity type derives the policy again
 (`fti_modified`).
 
 The overrides are a JSON object with these keys, each optional:
@@ -440,9 +440,10 @@ def log_rise(site, stored, before, lowest, switch="folder_orders"):
     """Log that the update of the site of the path `site` raises the switch
     `switch` from `stored`, the mode of the policy of the database, to
     `lowest`, the new lowest mode of the sites. `before` is the lowest mode
-    of the sites before the update, or None. Log a warning when `stored` is
-    lower than `before`: no site asked for it, as when `zoe.policy.install`
-    wrote it. Else log at INFO: a site raised its mode, or a site is gone.
+    of the sites before the update, or None when no site had a mode. Log a
+    warning when `stored` is lower than `before`, or when `before` is None:
+    no site asked for it, as when `zoe.policy.install` wrote it. Else log at
+    INFO: a site raised its mode, or a site is gone.
     Log nothing when `stored` is None or not lower than `lowest`."""
     if stored is None or LOWER.index(stored) >= LOWER.index(lowest):
         return
@@ -470,9 +471,11 @@ def gone_sites(site, modes, path):
     """Return the paths of `modes`, other than `path`, whose site is gone.
     A site is gone when the walk of its path from the Zope root of `site`
     stops at an object of the database of `site` that holds no item of the
-    next id. Keep a path when the walk cannot tell: it stops at an object of
-    another database (a mount point), it meets an object that is not a
-    container, or it fails."""
+    next id. In a container with a tree of items (a BTreeFolder2), `has_key`
+    of the tree confirms the missing item. Keep a path when the walk cannot
+    tell: it stops at an object of another database (a mount point), it
+    meets an object that is not a container, or it fails, as on a record
+    that does not load. A `ConflictError` goes to the caller."""
     from Acquisition import aq_base
     from ZODB.POSException import ConflictError
 
@@ -491,6 +494,12 @@ def gone_sites(site, modes, path):
             for name in other.split("/")[1:]:
                 found = current._getOb(name, missing)
                 if found is missing:
+                    # `_getOb` of a BTreeFolder2 reads a record of its tree
+                    # that does not load (`POSKeyError`) as a missing item.
+                    # `has_key` of the tree raises it, so the walk fails.
+                    tree = getattr(aq_base(current), "_tree", None)
+                    if tree is not None and tree.has_key(name):
+                        break
                     jar = getattr(aq_base(current), "_p_jar", None)
                     if jar is not None and jar.db() is database:
                         gone.append(other)
@@ -506,7 +515,10 @@ def gone_sites(site, modes, path):
 def update_policy(site):
     """Derive the policy of `site`, apply the overrides of each profile,
     compose it with the policy of the database and write it. Return its new
-    version."""
+    version. Before it composes each switch of `SITE_SWITCHES` and the
+    ``tier2`` of each class of `SITE_CLASSES`, drop the modes of the sites
+    that are gone (`gone_sites`), record the mode of `site` (`lowest_mode`),
+    and log a rise of the mode of the policy of the database (`log_rise`)."""
     derived = derive(site)
     names = set(derived["classes"])
     # The classes that the derivation blocks stay blocked through the
