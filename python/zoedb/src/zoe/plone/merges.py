@@ -76,6 +76,11 @@ other derived entries stay in shadow mode. An add-on container class keeps
 its derived entry in shadow mode, until the overrides of its site switch it
 on. A blocked container class stays blocked. A later profile of the site
 lowers the container classes with its key ``tier2`` or with their entries.
+The sites of a database compose the ``tier2`` of the container classes
+(`SITE_CLASSES`) as they compose the switches of `SITE_SWITCHES`: the
+policy takes the lowest latest mode of the sites, so an import of the
+profile on one site does not raise a container class over the lower mode
+of another site.
 On a site with no type of a container class, the override adds the entry
 ``{"tier2": "on"}``, with no fields and no coupled groups. The profile
 ``zoe.plone:uninstall`` changes no switch and no entry.
@@ -129,6 +134,16 @@ SITE_SWITCHES = {
 #: The name of the root of the database that keeps the modes of
 #: ``folder_orders``.
 SITE_MODES = SITE_SWITCHES["folder_orders"]
+#: The Dexterity container classes of stock Plone 6.1, whose entries the
+#: overrides of the profile ``zoe.plone:default`` switch on.
+CONTAINERS = (
+    "plone.app.contenttypes.content.Folder",
+    "Products.CMFPlone.Portal.PloneSite",
+)
+#: The classes whose ``tier2`` the sites of a database compose to the
+#: lowest, each with the name of the root of the database that keeps the
+#: latest mode that each site asked for, by the path of the site.
+SITE_CLASSES = {name: f"zoe.plone.tier2:{name}" for name in CONTAINERS}
 #: The attribute of the site that keeps the overrides of each profile.
 SITE_OVERRIDES = "_zoe_merge_overrides"
 
@@ -510,18 +525,38 @@ def update_policy(site):
 
     path = "/".join(site.getPhysicalPath())
     stored = merge_policy.read(connection)
-    for switch, name in SITE_SWITCHES.items():
+    database = stored or {}
+
+    def lowest_of_sites(name, mode, kept, label):
+        # Record the mode of this site in the root `name` and return the
+        # lowest mode of the sites, as `lowest_mode` does.
         modes = root.get(name)
         if modes is None:
             modes = root[name] = PersistentMapping()
         before = min(modes.values(), key=LOWER.index) if modes else None
         for gone in gone_sites(site, modes, path):
-            logger.info("%s is gone: the database drops its mode of %s", gone, switch)
+            logger.info("%s is gone: the database drops its mode of %s", gone, label)
             del modes[gone]
-        lowest = lowest_mode(modes, path, policy.get(switch), switch)
+        lowest = lowest_mode(modes, path, mode, label)
+        if lowest is not None:
+            log_rise(path, kept, before, lowest, label)
+        return lowest
+
+    for switch, name in SITE_SWITCHES.items():
+        lowest = lowest_of_sites(name, policy.get(switch), database.get(switch), switch)
         if lowest is not None:
             policy[switch] = lowest
-            log_rise(path, (stored or {}).get(switch), before, lowest, switch)
+    for klass, name in SITE_CLASSES.items():
+        # A site without an entry for the class asks for no mode, and the
+        # composition keeps the entry of the database.
+        entry = policy["classes"].get(klass)
+        if entry is None:
+            lowest_of_sites(name, None, None, klass)
+            continue
+        kept = database.get("classes", {}).get(klass, {}).get("tier2")
+        lowest = lowest_of_sites(name, entry.get("tier2"), kept, klass)
+        if lowest is not None:
+            entry["tier2"] = lowest
     composed = settle(stored, policy, removed)
     version = merge_policy.install(connection, composed)
     logger.info(

@@ -690,3 +690,10 @@ def test_two_changes_of_state_of_a_history_conflict_in_process(tmp_path):
     outcomes, actions = transitions(tmp_path, [publish, submit])
     assert outcomes == ["committed", "conflict"]
     assert actions == ["create", "publish"]
+
+
+def test_the_sites_compose_the_tier2_of_the_containers_of_the_profile():
+    assert set(merges.CONTAINERS) == set(CONTAINERS)
+    assert set(merges.SITE_CLASSES) == set(profile_overrides()["classes"])
+    names = [*merges.SITE_SWITCHES.values(), *merges.SITE_CLASSES.values()]
+    assert len(set(names)) == len(names)
