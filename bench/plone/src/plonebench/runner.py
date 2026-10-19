@@ -67,6 +67,10 @@ class RunOptions:
     settings: stack.Settings = field(default_factory=stack.Settings)
     out: Path | None = None
     seed: int = 1
+    # A GenericSetup profile, such as `zoe.plone:default`, that a client of
+    # the run imports into each site of the store before the instances
+    # start. None imports nothing.
+    profile: str | None = None
 
 
 def locust_command(
@@ -122,9 +126,20 @@ def run_locust(
         process = subprocess.Popen(
             command, env=env, stdout=out, stderr=subprocess.STDOUT
         )
-        if sample is not None:
-            sample.watch("locust", process.pid)
-        code = process.wait()
+        try:
+            if sample is not None:
+                sample.watch("locust", process.pid)
+            code = process.wait()
+        except BaseException:
+            # An interrupt stops Locust too, so that it sends no load to the
+            # next run.
+            process.terminate()
+            try:
+                process.wait(30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
     return code, started
 
 
@@ -137,6 +152,8 @@ def run(options: RunOptions) -> Path:
             f"plonebench: no fixture {options.fixture}: run `just bench plone prepare`"
         )
     refusal = stack.split_merges_refusal(config, options.settings)
+    if refusal is None and options.profile is not None:
+        refusal = stack.profile_refusal(config)
     if refusal is not None:
         raise SystemExit(f"plonebench: {refusal}")
     missing = stack.missing_prerequisites(config)
@@ -215,7 +232,20 @@ def run(options: RunOptions) -> Path:
             result["merge_policy"] = json.loads(out.strip().splitlines()[-1])
             result["policy_seconds"] = time.time() - written
             t0 += result["policy_seconds"]
-        if config.member_properties:
+        if options.profile is not None:
+            # The import commits before the instances start, as the switches
+            # do. Its import steps write the merge policy and move the
+            # properties of the members and groups, so member_properties.py
+            # does not run.
+            written = time.time()
+            out = st.run_script("profile.py", options.profile, name="profile")
+            lines = out.strip().splitlines()
+            result["profile"] = options.profile
+            result["member_properties"] = json.loads(lines[-2])
+            result["merge_policy"] = json.loads(lines[-1])
+            result["profile_seconds"] = time.time() - written
+            t0 += result["profile_seconds"]
+        elif config.member_properties:
             # The move commits before the instances start, as the switches
             # do.
             written = time.time()
