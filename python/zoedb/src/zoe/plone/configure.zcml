@@ -91,7 +91,7 @@
       name="uninstall"
       title="ZOE (uninstall)"
       directory="profiles/uninstall"
-      description="Removes the behaviour zoe.plone.history from the types and gives each workflow history back as a PersistentMapping."
+      description="Removes the behaviour zoe.plone.history from the types, gives each workflow history back as a PersistentMapping, and switches off for this site the merges that the profile default switched on: folder_orders, split_merges and the tier 2 entries of the stock container classes."
       provides="Products.GenericSetup.interfaces.EXTENSION"
       />
   <genericsetup:importStep
