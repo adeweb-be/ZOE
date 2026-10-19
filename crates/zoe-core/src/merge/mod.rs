@@ -36,10 +36,16 @@
 //! transaction split another of its children. The switch `split_merges`
 //! of the merge policy switches it, and it is off by default.
 //!
+//! The order merge (ADR 0052, `order.rs`) merges the order list of a
+//! folder of plone.folder and renumbers the positions beside it. The
+//! switch `folder_orders` of the merge policy switches it, and it is off
+//! by default.
+//!
 //! No Python runs here.
 
 mod btrees;
 mod fields;
+pub(crate) mod order;
 pub mod policy;
 mod posting;
 pub(crate) mod split;
@@ -175,6 +181,9 @@ pub enum Reason {
     /// the committed side appended does not keep the state of the old
     /// value.
     StateChanged,
+    /// The order merge (ADR 0052): both sides added the same id to the
+    /// order of a folder.
+    OrderSameId,
 }
 
 impl Reason {
@@ -217,6 +226,7 @@ impl Reason {
             Reason::KeyChanged => "Key of a mapping changed on both sides",
             Reason::KeyDeleted => "Key of a mapping deleted on one side and changed on the other",
             Reason::StateChanged => "State changed by a status of the committed side",
+            Reason::OrderSameId => "An id that both sides added",
         }
     }
 }
@@ -414,6 +424,10 @@ pub struct Resolution {
     /// `Merged` of rule 1 is a read-current oid that passed: the vote
     /// wrote nothing for it.
     pub split: Option<u8>,
+    /// The part of the order merge (ADR 0052) that the record is: `list`
+    /// for the order list of a folder, `pos` for a record of its
+    /// positions. `None` for the other merges.
+    pub order: Option<&'static str>,
 }
 
 /// What a tier gave for a conflict, without the merged record.
@@ -506,6 +520,10 @@ pub fn log_line(resolution: &Resolution, context: &LogContext<'_>) -> String {
     // Only a line of the split merge has the field.
     if let Some(rule) = resolution.split {
         field("split", rule.to_string());
+    }
+    // Only a line of the order merge has the field.
+    if let Some(part) = resolution.order {
+        field("order", json(part));
     }
     field("applied", resolution.applied.to_string());
     field("undo", resolution.undo.to_string());
@@ -611,6 +629,7 @@ impl Resolution {
             shadow: merge.shadow.as_ref().map(Resolved::of),
             fields: merge.fields.clone(),
             split: None,
+            order: None,
         }
     }
 }

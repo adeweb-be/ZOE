@@ -21,3 +21,4 @@ A spike is a card that explores an unknown and ends in a written finding, with n
 | [split-merge-replaced-bucket.md](split-merge-replaced-bucket.md) | How often does a split merge take out of the tree a bucket that another transaction inserted into, in which order do the commits come, and what removes the case? |
 | [catalog-metadata.md](catalog-metadata.md) | Which values do the metadata buckets of a catalog hold, how do they pickle, which comparisons does BTrees make on them in a merge, and what must tier 1 model to merge them as ZODB does? |
 | [zope-sessions.md](zope-sessions.md) | Does Plone 6.1, or an add-on of a Plone 6.1 site, write a Zope session on a standard site, and where does Plone keep the data that a session kept before? |
+| [folder-order.md](folder-order.md) | What does a creation write to a folder of plone.folder and to its order, which conflicts appear once each record merges, and which merge keeps the order list and its positions in agreement? |

@@ -16,6 +16,13 @@ plain values only, so the core reads it in Rust, in-process and in
   BTrees where ZODB's resolver refuses, in the classes where tier 1 runs.
   The store has no key of this name: without the switch, the split merge
   is off;
+- ``folder_orders``, optional: the mode of the order merge of ADR 0052,
+  ``on``, ``shadow`` or ``off``. It merges two appends to the order of a
+  folder of plone.folder and renumbers its positions. Its companions are
+  queued indexing (ADR 0047) and ``split_merges``. The store has no key of this name:
+  without the switch, the order merge is off. While it is not ``off``, a
+  policy cannot give ``persistent.list.PersistentList`` a ``tier2`` other
+  than ``off``: tier 2 would merge an order without its positions;
 - ``classes``: a dict of class names (``module.Class``) to their entries.
 
 The entry of a class has these keys, each optional:
@@ -77,7 +84,10 @@ MODES = ("on", "shadow", "off")
 #: The strategies of a field.
 STRATEGIES = ("strict", "lww", "max", "sum", "union", "append", "keys")
 #: The keys of a policy that `install` takes, besides ``classes``.
-SWITCHES = ("structural_merges", "posting_dicts", "split_merges")
+SWITCHES = ("structural_merges", "posting_dicts", "split_merges", "folder_orders")
+#: The class of the order of a folder, which tier 2 never merges while
+#: ``folder_orders`` is not ``off``.
+ORDER_CLASS = "persistent.list.PersistentList"
 #: The keys of the entry of a class.
 ENTRY_KEYS = ("tier1", "tier2", "default", "fields", "coupled", "blocked", "options")
 #: The options that each strategy takes.
@@ -88,7 +98,8 @@ class MergePolicy(persistent.Persistent):
     """The merge policy of a store. Write it with `install`.
 
     Its attributes are ``version``, ``classes`` and, when the policy gives
-    them, ``structural_merges``, ``posting_dicts`` and ``split_merges``.
+    them, ``structural_merges``, ``posting_dicts``, ``split_merges`` and
+    ``folder_orders``.
     """
 
     def __init__(self):
@@ -152,8 +163,10 @@ def validate(policy):
     """Return a copy of `policy` with plain values only, or raise
     `ValueError` when it breaks the rules of a policy. `policy` is a dict
     with the key ``classes`` and, optionally, ``structural_merges``,
-    ``posting_dicts`` and ``split_merges``. ``version`` is not part of it:
-    `install` sets it.
+    ``posting_dicts``, ``split_merges`` and ``folder_orders``. ``version``
+    is not part of it: `install` sets it. While ``folder_orders`` is not
+    ``off``, an entry of `ORDER_CLASS` with a ``tier2`` other than ``off``
+    is an error.
 
     Each text must be a plain `str`, and the copy holds the constants of
     `MODES` and `STRATEGIES`, so the core reads every value."""
@@ -220,6 +233,15 @@ def validate(policy):
             if options:
                 checked["options"] = options
         result["classes"][name] = checked
+    order = result["classes"].get(ORDER_CLASS, {})
+    if (
+        result.get("folder_orders", "off") != "off"
+        and order.get("tier2", "off") != "off"
+    ):
+        raise ValueError(
+            f"{ORDER_CLASS}: no tier2 while folder_orders is not off, "
+            "as tier 2 would merge the order of a folder without its positions"
+        )
     return result
 
 

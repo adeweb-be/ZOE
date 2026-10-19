@@ -459,6 +459,7 @@ fn entry(record: &Written, rule: u8, rules: &Rules<'_>) -> Resolution {
         shadow: None,
         fields: Vec::new(),
         split: Some(rule),
+        order: None,
     }
 }
 
@@ -489,6 +490,7 @@ fn refusal(
         shadow: None,
         fields: Vec::new(),
         split: Some(rule),
+        order: None,
     }
 }
 
@@ -522,6 +524,7 @@ pub(super) fn undecided(
         shadow: None,
         fields: Vec::new(),
         split: Some(rule),
+        order: None,
     }
 }
 
@@ -551,6 +554,7 @@ pub(super) fn read_shadow(
         shadow: Some(shadow.outcome),
         fields: Vec::new(),
         split: Some(shadow.rule),
+        order: None,
     }
 }
 

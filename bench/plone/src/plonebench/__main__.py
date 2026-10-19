@@ -41,6 +41,7 @@ def settings_of(args) -> stack.Settings:
         zoe_compression=args.zoe_compression,
         # Only `run` and `campaign` take the switch.
         split_merges=getattr(args, "split_merges", None),
+        folder_orders=getattr(args, "folder_orders", None),
         base_port=defaults.base_port + args.port_offset,
         server_port=defaults.server_port + args.port_offset,
         admin_port=defaults.admin_port + args.port_offset,
@@ -123,6 +124,15 @@ def add_run(parser: argparse.ArgumentParser) -> None:
         "into the store before the instances start; a stack of zoe serve "
         "with zoedb only, and `campaign` gives it only to such stacks. By "
         "default the store keeps the policy of the fixture",
+    )
+    parser.add_argument(
+        "--folder-orders",
+        choices=stack.FOLDER_ORDERS,
+        default=stack.Settings().folder_orders,
+        help="write the switch folder_orders of the merge policy (ADR 0052), "
+        "with the tier 2 entry of the class of the folders, into the store "
+        "before the instances start; a stack of zoe serve with zoedb only, "
+        "and `campaign` gives it only to such stacks",
     )
 
 

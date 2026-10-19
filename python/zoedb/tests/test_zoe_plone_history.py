@@ -413,6 +413,36 @@ def test_two_sites_in_one_database_compose():
     assert merges.compose(None, new)["classes"]["m.Odd"] == {"tier2": "on"}
 
 
+def test_folder_orders_takes_the_lowest_latest_mode_of_the_sites(caplog):
+    modes = {}
+    assert merges.lowest_mode(modes, "/a", "off") == "off"
+    # The second site imports the profile: the off of the first site lasts,
+    # with a warning.
+    with caplog.at_level("WARNING", logger="zoe.plone"):
+        assert merges.lowest_mode(modes, "/b", "on") == "off"
+    assert "/b asks for folder_orders on" in caplog.text
+    # The first site raises its own mode: its new mode replaces its earlier
+    # one.
+    assert merges.lowest_mode(modes, "/a", "on") == "on"
+    assert modes == {"/a": "on", "/b": "on"}
+
+
+def test_one_site_that_raises_folder_orders_raises_it():
+    modes = {}
+    assert merges.lowest_mode(modes, "/site", "shadow") == "shadow"
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert merges.lowest_mode(modes, "/site", None) is None
+
+
+def test_the_other_switches_take_the_new_value():
+    stored = {"version": 2, "split_merges": "on", "classes": {}}
+    assert (
+        merges.compose(stored, {"classes": {}, "split_merges": "off"})["split_merges"]
+        == "off"
+    )
+    assert merges.compose(stored, {"classes": {}})["split_merges"] == "on"
+
+
 class Mode(enum.StrEnum):
     ON = "on"
 

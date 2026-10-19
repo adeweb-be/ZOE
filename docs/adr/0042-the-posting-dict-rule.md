@@ -87,7 +87,7 @@ Each result of tier 1 (merged, refused, or no answer, in mode `on` or `shadow`) 
 - A site that does not set the key gets the merges of BTrees and nothing more.
 - A refusal of the rule is a conflict as today: Zope retries the request.
 - The resolution log can grow without bound; rotation is the operator's (copytruncate works, because each write appends).
-- Tier 1 gives the bytes of ZODB's resolver for every merge but those of the rules here and of the split merge of ADR 0048: under the switch `split_merges` of the merge policy, tier 1 merges the splits of the nodes of BTrees, and the buckets that a side split, where ZODB's resolver refuses. Where that switch is on, tier 1 is no longer byte for byte ZODB's resolver, and its tests check the merged trees instead of the bytes. A store without the switch keeps the merges of this ADR and nothing more.
+- Tier 1 gives the bytes of ZODB's resolver for every merge but those of the rules here and of the split merge of ADR 0048: under the switch `split_merges` of the merge policy, tier 1 merges the splits of the nodes of BTrees, and the buckets that a side split, where ZODB's resolver refuses. Where that switch is on, tier 1 is no longer byte for byte ZODB's resolver, and its tests check the merged trees instead of the bytes. The order merge of ADR 0052, under the switch `folder_orders`, merges the order list of a folder of plone.folder, which ZODB does not resolve, and renumbers its positions. A store without these switches keeps the merges of this ADR and nothing more.
 
 ## Alternatives
 

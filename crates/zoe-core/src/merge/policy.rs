@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! {"version": 3, "structural_merges": "on", "posting_dicts": "on",
-//!  "split_merges": "on",
+//!  "split_merges": "on", "folder_orders": "on",
 //!  "classes": {"module.Class": {"tier1": "shadow", "tier2": "on",
 //!              "default": "strict", "fields": {"field": "max", "data": "keys"},
 //!              "coupled": [["start", "end"]],
@@ -16,7 +16,8 @@
 //! over the key of the store, and a switch that the policy does not give
 //! keeps the value of the key. `split_merges`, the switch of the split
 //! merge (ADR 0048), has no key of the store: without it in the policy,
-//! the split merge is off.
+//! the split merge is off. The same holds for `folder_orders`, the switch
+//! of the order merge (ADR 0052).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -124,6 +125,8 @@ pub struct Policy {
     pub posting_dicts: Option<Mode>,
     /// The mode of the split merge of ADR 0048, if the policy gives one.
     pub split_merges: Option<Mode>,
+    /// The mode of the order merge of ADR 0052, if the policy gives one.
+    pub folder_orders: Option<Mode>,
     /// The entry of each class, by its `module.name`.
     pub classes: BTreeMap<String, ClassPolicy>,
 }
@@ -142,6 +145,7 @@ impl Policy {
             structural_merges: None,
             posting_dicts: None,
             split_merges: None,
+            folder_orders: None,
             classes: BTreeMap::new(),
         };
         let mut version = None;
@@ -159,6 +163,7 @@ impl Policy {
                 "structural_merges" => policy.structural_merges = Some(mode(&heap, value)?),
                 "posting_dicts" => policy.posting_dicts = Some(mode(&heap, value)?),
                 "split_merges" => policy.split_merges = Some(mode(&heap, value)?),
+                "folder_orders" => policy.folder_orders = Some(mode(&heap, value)?),
                 "classes" => {
                     let entries = str_dict(&heap, value).ok_or("classes that are not a dict")?;
                     for (name, entry) in entries {
@@ -182,6 +187,7 @@ impl Policy {
         self.structural_merges == Some(Mode::Shadow)
             || self.posting_dicts == Some(Mode::Shadow)
             || self.split_merges == Some(Mode::Shadow)
+            || self.folder_orders == Some(Mode::Shadow)
             || self.classes.values().any(|entry| {
                 entry.tier1 == Some(Mode::Shadow) || (entry.tier2 == Mode::Shadow && !entry.blocked)
             })
@@ -256,6 +262,16 @@ impl Rules<'_> {
     pub fn split_merges(&self) -> Mode {
         self.policy
             .and_then(|policy| policy.split_merges)
+            .unwrap_or(Mode::Off)
+    }
+
+    /// Returns the mode of the order merge of ADR 0052: the
+    /// `folder_orders` of the policy, else `Off`. The merge renumbers the
+    /// records of the positions of a folder only where the mode of tier 1
+    /// of their class is not `Off` too.
+    pub fn folder_orders(&self) -> Mode {
+        self.policy
+            .and_then(|policy| policy.folder_orders)
             .unwrap_or(Mode::Off)
     }
 
@@ -521,6 +537,7 @@ mod tests {
                 (text(heap, "version"), Value::Int(3)),
                 (text(heap, "posting_dicts"), text(heap, "shadow")),
                 (text(heap, "split_merges"), text(heap, "on")),
+                (text(heap, "folder_orders"), text(heap, "shadow")),
                 (text(heap, "classes"), classes),
             ];
             heap.new_dict(items)
@@ -529,6 +546,7 @@ mod tests {
         assert_eq!(policy.version, 3);
         assert_eq!(policy.posting_dicts, Some(Mode::Shadow));
         assert_eq!(policy.split_merges, Some(Mode::On));
+        assert_eq!(policy.folder_orders, Some(Mode::Shadow));
         assert!(policy.has_shadow());
         let entry = &policy.classes["m.Document"];
         assert_eq!(entry.tier2, Mode::On);
@@ -545,6 +563,7 @@ mod tests {
         };
         assert_eq!(rules.posting_dicts(), Mode::Shadow);
         assert_eq!(rules.split_merges(), Mode::On);
+        assert_eq!(rules.folder_orders(), Mode::Shadow);
         assert_eq!(rules.tier1_mode("BTrees.IOBTree.IOBucket"), Mode::On);
         assert!(rules.tier2("m.Document").is_some());
         assert!(rules.tier2("m.Other").is_none());
@@ -702,6 +721,7 @@ mod tests {
             structural_merges: Some(Mode::Shadow),
             posting_dicts: None,
             split_merges: None,
+            folder_orders: None,
             classes: BTreeMap::new(),
         };
         let class = "BTrees.Length.Length";
@@ -734,7 +754,8 @@ mod tests {
         };
         assert_eq!(none.tier1_mode(class), Mode::Off);
         assert_eq!(none.posting_dicts(), Mode::Off);
-        // Without a policy, the split merge is off.
+        // Without a policy, the split merge and the order merge are off.
         assert_eq!(none.split_merges(), Mode::Off);
+        assert_eq!(none.folder_orders(), Mode::Off);
     }
 }

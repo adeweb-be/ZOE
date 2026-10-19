@@ -73,6 +73,7 @@ mod encoded;
 mod group;
 mod intent;
 mod observer;
+mod order;
 mod split;
 mod staging;
 mod undo;
@@ -1351,6 +1352,9 @@ impl<S: Deref<Target = Store>> Txn<S> {
         // The first conflict of a vote that takes the locks makes the plan
         // of the split merge (ADR 0048).
         let mut plan: Option<split::Plan> = None;
+        // The first conflict of a written oid also makes the plan of the
+        // order merge (ADR 0052).
+        let mut orders: Option<order::Plan> = None;
         // One backend read serves a chunk of oids. The chunk bounds the
         // committed records in memory.
         let staged: Vec<_> = self.staged.iter().collect();
@@ -1457,6 +1461,33 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     {
                         continue;
                     }
+                    if orders.is_none() {
+                        let rules = Rules {
+                            config: &self.store.structural_merges,
+                            policy: policy.as_ref().and_then(Option::as_deref),
+                        };
+                        let made = self.order_plan(&rules)?;
+                        if let Some((oid, current, read, entry)) = &made.refused {
+                            self.resolutions.push(entry.clone());
+                            return Ok(Check::Failed(Stale {
+                                oid: *oid,
+                                current: Some(*current),
+                                read: *read,
+                                read_only: false,
+                            }));
+                        }
+                        orders = Some(made);
+                    }
+                    if let Some(orders) = &orders {
+                        // The vote stages the merged order after the
+                        // check of every serial.
+                        if orders.covers(oid) {
+                            continue;
+                        }
+                        if let Some(entry) = orders.lines.get(&oid) {
+                            self.resolutions.push(entry.clone());
+                        }
+                    }
                 }
                 // Only a conflict reads its committed record. A deletion
                 // has an empty pickle and is never resolved. A record that
@@ -1466,7 +1497,11 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     Some(record) if record.tid == current && !record.data.is_empty() => record,
                     _ => return Ok(Check::Failed(stale)),
                 };
-                let resolved = if native {
+                // Tier 2 never merges the order of a folder.
+                let order = orders
+                    .as_ref()
+                    .is_some_and(|orders| orders.known.contains(&oid));
+                let resolved = if native && !order {
                     let rules = Rules {
                         config: &self.store.structural_merges,
                         policy: policy.as_ref().and_then(Option::as_deref),
@@ -1601,6 +1636,38 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     read,
                     read_only: true,
                 }));
+            }
+        }
+        // The order merge renumbers the records of the positions that the
+        // vote stages, then adds the merged lists.
+        if let Some(orders) = &orders
+            && !orders.merges.is_empty()
+        {
+            let current = policy.clone().flatten();
+            let failed = self.finish_orders(
+                orders,
+                current.as_deref(),
+                &mut merged,
+                &onto,
+                &mut stored_bytes,
+            )?;
+            if let Some((oid, current, read)) = failed {
+                let stale = Stale {
+                    oid,
+                    current: Some(current),
+                    read,
+                    read_only: false,
+                };
+                if !resolve {
+                    return Ok(Check::Failed(stale));
+                }
+                // The caller gets the order with its committed record.
+                match self.store.backend.load_before(oid, Tid::MAX)? {
+                    Some(record) if record.tid == current && !record.data.is_empty() => {
+                        conflicts.push((oid, record));
+                    }
+                    _ => return Ok(Check::Failed(stale)),
+                }
             }
         }
         Ok(Check::Passed {
@@ -1764,17 +1831,32 @@ impl<S: Deref<Target = Store>> Txn<S> {
     /// its staged pickle in a transaction of `stored_bytes`, or `None` when
     /// the pickle breaks `max-record-size` or `max-transaction-size`.
     fn merged_size(&self, oid: Oid, pickle: &[u8], stored_bytes: u64) -> Option<u64> {
+        self.merged_size_replacing(oid, pickle, stored_bytes, None)
+    }
+
+    /// Return the transaction size after `pickle` replaces a pickle of
+    /// `oid` of `replaced` bytes in a transaction of `stored_bytes`, as
+    /// `merged_size` does. `None` for `replaced` is the staged pickle of
+    /// `oid`; a merge that a later merge replaces gives its own length.
+    fn merged_size_replacing(
+        &self,
+        oid: Oid,
+        pickle: &[u8],
+        stored_bytes: u64,
+        replaced: Option<u64>,
+    ) -> Option<u64> {
         if self.is_restore() {
             return Some(stored_bytes);
         }
         let guardrails = &self.store.guardrails;
         let size = pickle.len() as u64;
         guardrails.check(SizeLimit::Record, oid, size).ok()?;
-        let staged = self
-            .staged
-            .record(oid)
-            .map_or(0, |staged| staged.pickle_len() as u64);
-        let total = stored_bytes.saturating_sub(staged).saturating_add(size);
+        let replaced = replaced.unwrap_or_else(|| {
+            self.staged
+                .record(oid)
+                .map_or(0, |staged| staged.pickle_len() as u64)
+        });
+        let total = stored_bytes.saturating_sub(replaced).saturating_add(size);
         guardrails.check(SizeLimit::Transaction, oid, total).ok()?;
         Some(total)
     }
@@ -3617,6 +3699,27 @@ mod tests {
         assert!(matches!(after, Err(ZoeError::Protocol(_))), "{after:?}");
         txn.finish().unwrap();
         assert_eq!(store.load(Oid(1)).unwrap(), (b"a".to_vec(), first));
+    }
+
+    #[test]
+    fn a_merge_that_replaces_a_merge_counts_the_length_of_the_first_merge() {
+        let store = Store::open_vfs(MemVfs::new()).unwrap();
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        let oid = Oid(1);
+        txn.store(oid, Tid::ZERO, b"0123456789").unwrap();
+        // Another record of 100 bytes counts in the transaction too.
+        txn.store(Oid(2), Tid::ZERO, &[b'x'; 100]).unwrap();
+        let staged = txn.stored_bytes;
+        assert_eq!(staged, 110);
+        // A first merge of 4 bytes replaces the staged pickle of 10 bytes.
+        let first = txn.merged_size(oid, b"abcd", staged).unwrap();
+        assert_eq!(first, 104);
+        // A second merge of 6 bytes replaces the first one, not the
+        // staged pickle: 100 + 6.
+        let second = txn
+            .merged_size_replacing(oid, b"abcdef", first, Some(4))
+            .unwrap();
+        assert_eq!(second, 106);
     }
 
     #[test]
