@@ -434,6 +434,66 @@ def test_one_site_that_raises_folder_orders_raises_it():
     assert merges.lowest_mode(modes, "/site", None) is None
 
 
+class Writes(dict):
+    """A mapping that counts its writes."""
+
+    writes = 0
+
+    def __setitem__(self, key, value):
+        self.writes += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.writes += 1
+        super().__delitem__(key)
+
+    def pop(self, *args):
+        self.writes += 1
+        return super().pop(*args)
+
+
+def test_folder_orders_writes_the_modes_only_on_a_change():
+    modes = Writes()
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert modes.writes == 1
+    # The same mode, and no mode for a site that has none, write nothing.
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert merges.lowest_mode(modes, "/other", None) == "on"
+    assert modes.writes == 1
+    assert merges.lowest_mode(modes, "/site", "shadow") == "shadow"
+    assert merges.lowest_mode(modes, "/site", None) is None
+    assert modes.writes == 3
+    assert modes == {}
+
+
+def test_a_rise_from_a_mode_that_no_site_asks_for_logs_a_warning(caplog):
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        # The sites asked for on, and `zoe.policy.install` wrote off.
+        merges.log_rise("/site", "off", "on", "on")
+        # No site gave a mode before the update.
+        merges.log_rise("/site", "shadow", None, "on")
+    assert [record.levelname for record in caplog.records] == ["WARNING"] * 2
+    assert "raises folder_orders from off" in caplog.records[0].getMessage()
+
+
+def test_a_rise_of_the_lowest_mode_of_the_sites_logs_at_info(caplog):
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        # A site raised its mode, or a gone site left: the stored mode was
+        # the lowest mode of the sites.
+        merges.log_rise("/site", "off", "off", "on")
+        merges.log_rise("/site", "shadow", "shadow", "on")
+    assert [record.levelname for record in caplog.records] == ["INFO"] * 2
+    assert "raises folder_orders from off to on" in caplog.records[0].getMessage()
+
+
+def test_no_rise_logs_nothing(caplog):
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        merges.log_rise("/site", None, "off", "on")
+        merges.log_rise("/site", "on", "on", "on")
+        merges.log_rise("/site", "on", "off", "shadow")
+    assert caplog.records == []
+
+
 def test_the_other_switches_take_the_new_value():
     stored = {"version": 2, "split_merges": "on", "classes": {}}
     assert (
