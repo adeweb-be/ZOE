@@ -777,11 +777,20 @@ function timeAxis() {
     options: {
       bounds: "data",
       afterDataLimits(scale) {
-        const span = scale.max - scale.min;
+        // The limits come from the points. Chart.js widens a span of 0 by
+        // years, so one point gets a window of one day around it.
+        const times = scale.chart.data.datasets.flatMap((set) => set.data.map((point) => point.x));
+        if (!times.length) return;
+        let low = Math.min(...times);
+        let high = Math.max(...times);
+        if (low === high) {
+          low -= DAY / 2;
+          high += DAY / 2;
+        }
         const gaps = Math.min(4, Math.max(1, Math.floor(scale.width / 100) - 1));
-        step = TIME_STEPS.find((candidate) => span / candidate <= gaps) ?? TIME_STEPS.at(-1);
-        scale.min -= step / 2;
-        scale.max += step / 2;
+        step = TIME_STEPS.find((candidate) => (high - low) / candidate <= gaps) ?? TIME_STEPS.at(-1);
+        scale.min = low - step / 2;
+        scale.max = high + step / 2;
       },
       afterBuildTicks(scale) {
         const ticks = [];
