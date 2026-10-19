@@ -546,3 +546,69 @@ def test_a_file_of_the_page_that_differs_from_head_gives_a_warning(
     ) in out.err
     assert "main.js" not in out.err
     assert (checkout / "index.html").read_text() == "<html>changed</html>\n"
+
+
+@needs_git
+def test_a_temporary_file_of_another_run_stays_as_it_is(checkout, capsys):
+    target = checkout / layout.published_path(sample("client"))
+    target.parent.mkdir(parents=True)
+    stale = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    stale.write_text("a file of another run\n")
+
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    assert code == 0, out.err
+    assert target.read_bytes() == (DATA / "client.json").read_bytes()
+    assert stale.read_text() == "a file of another run\n"
+
+
+@needs_git
+def test_a_stopped_run_leaves_no_temporary_file(checkout, capsys, monkeypatch):
+    replace = os.replace
+
+    def stop(source, target):
+        if pathlib.Path(target).name == "index.json":
+            raise KeyboardInterrupt
+        replace(source, target)
+
+    monkeypatch.setattr(os, "replace", stop)
+    with pytest.raises(KeyboardInterrupt):
+        run(capsys, DATA / "native.json", checkout=checkout)
+    monkeypatch.undo()
+
+    assert not list(checkout.rglob("*.tmp"))
+    assert not (checkout / "index.json").exists()
+
+
+@needs_git
+def test_a_file_of_the_page_deleted_in_the_working_tree_is_not_copied(
+    page, checkout, capsys
+):
+    git(
+        page.parents[1],
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        "the page",
+    )
+    (page / "app" / "main.js").unlink()
+    (checkout / "app").mkdir()
+    (checkout / "app" / "main.js").write_text("// the copy of the checkout\n")
+
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    assert code == 0, out.err
+    assert (
+        "publish: warning: bench/dashboard/app/main.js is deleted in the working "
+        f"tree; publish does not copy it, and {checkout} keeps any copy that it "
+        "holds"
+    ) in out.err
+    assert "main.js differs from HEAD" not in out.err
+    assert (checkout / "app" / "main.js").read_text() == "// the copy of the checkout\n"

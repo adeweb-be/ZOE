@@ -24,6 +24,7 @@ outside the checkout.
 import contextlib
 import json
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -117,12 +118,18 @@ def publish(sources: list[str], checkout: str, main: str = MAIN) -> int:
             )
         return 1
 
-    for name in _page_changes():
-        print(
-            f"publish: warning: {name} differs from HEAD; {checkout} gets the "
-            "file of the working tree",
-            file=sys.stderr,
-        )
+    for name, deleted in _page_changes():
+        if deleted:
+            message = (
+                f"{name} is deleted in the working tree; publish does not copy "
+                f"it, and {checkout} keeps any copy that it holds"
+            )
+        else:
+            message = (
+                f"{name} differs from HEAD; {checkout} gets the file of the "
+                "working tree"
+            )
+        print(f"publish: warning: {message}", file=sys.stderr)
     # The files that change, index.json last.
     writes = [
         (relative, data)
@@ -157,24 +164,29 @@ def publish(sources: list[str], checkout: str, main: str = MAIN) -> int:
 
 def _replace(path: Path, data: bytes) -> None:
     """Write data to path through a temporary file beside it. So path holds
-    its old bytes or data, never a part of data. Remove the temporary file
-    when a step fails."""
+    its old bytes or data, never a part of data. The temporary file has a
+    random name, so publish never opens or removes a file of another run.
+    When a step fails or the run stops, remove the temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    created = False
     try:
         with open(temporary, "xb") as file:
+            created = True
             file.write(data)
         os.replace(temporary, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            temporary.unlink(missing_ok=True)
+    except BaseException:
+        if created:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
         raise
 
 
-def _page_changes() -> list[str]:
+def _page_changes() -> list[tuple[str, bool]]:
     """Return the files of bench/dashboard/ that git tracks and that differ
-    from HEAD. publish copies the files of the working tree, so it warns
-    about each of them."""
+    from HEAD, each with True when the working tree does not hold it.
+    publish copies the files of the working tree, so it warns about each
+    of them."""
     if not DASHBOARD.is_dir():
         return []
     repository = DASHBOARD.parents[1]
@@ -190,12 +202,12 @@ def _page_changes() -> list[str]:
     )
     if not listed:
         return []
-    names = []
+    names: list[tuple[str, bool]] = []
     fields = iter(listed.split("\0"))
     for field in fields:
         if len(field) < 4:
             continue
-        names.append(field[3:])
+        names.append((field[3:], not (repository / field[3:]).exists()))
         # A rename or a copy gives the old path in the next field.
         if "R" in field[:2] or "C" in field[:2]:
             next(fields, None)
