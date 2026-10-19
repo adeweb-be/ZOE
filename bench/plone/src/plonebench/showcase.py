@@ -110,9 +110,11 @@ MAX_LOAD = 8.0
 # The estimates in seconds, from runs on the reference machine.
 BUILD_SECONDS = {"zoe": 60, "plone-zeo": 35, "plone-zoeclient": 35}
 PREPARE_SECONDS = {"small": 90, "medium": 343}
-# The time of a B5 run outside its warmup and its steps: the copy of the
-# store, the start, the verification and the stop.
-B5_SECONDS = {"small": 240, "medium": 270}
+# A B5 run takes its warmup and its steps, a fixed time (the copy of the
+# store, the start and the stop), and a time for each second of warmup and
+# steps (the drain of the queue and the verification of the operations).
+B5_SECONDS = {"small": 15, "medium": 45}
+B5_SECONDS_PER_SECOND = 1.25
 SUMMARY_SECONDS = 5
 NATIVE_SECONDS = 300
 CLIENT_SECONDS = 180
@@ -244,8 +246,8 @@ def estimate(run: dict) -> int:
             return 0
         return PREPARE_SECONDS[run["preset"]]
     if kind == "b5":
-        steps = run["step_seconds"] * len(run["users"])
-        return round(run["warmup_seconds"] + steps + B5_SECONDS[run["preset"]])
+        load = run["warmup_seconds"] + run["step_seconds"] * len(run["users"])
+        return round(B5_SECONDS[run["preset"]] + (1 + B5_SECONDS_PER_SECOND) * load)
     if kind == "summary":
         return SUMMARY_SECONDS
     if kind == "native":
