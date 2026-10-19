@@ -177,10 +177,10 @@ def restore(storage, key):
     """Give the value of `key` in `storage` back as a dict, when it has the
     class. Return True when the value changed.
 
-    The move retires the `PrincipalProperties`: it writes it with the one
+    The restore retires the `PrincipalProperties`: it writes it with the one
     item `{RETIRED: None}`, a state that tier 2 does not take. So a
     transaction that writes the old properties from the same snapshot
-    conflicts with the move, whichever commits first, and its retry sees
+    conflicts with the restore, whichever commits first, and its retry sees
     the dict."""
     value = storage.get(key)
     if not isinstance(value, PrincipalProperties):
