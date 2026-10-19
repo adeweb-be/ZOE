@@ -253,7 +253,8 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # against a `zoe serve` on a new store, which it starts and stops, and
 # `just plone filestorage suites` runs them on the stock storages of
 # plone.testing. `just plone zoe backends` runs the suite of plone.locking
-# on the locking backend of zoe.plone, with the tests of zoe.plone.
+# on the locking backend of zoe.plone, with the tests of zoe.plone; it
+# builds the `zoe` binary first, for the tests that start `zoe serve`.
 # `just plone <scenario> creators THREADS ITEMS SEED` creates a Plone site,
 # sets the counter of portal_uidgenerator to SEED, and runs
 # plone/creators.py: THREADS threads that create ITEMS Documents each. Its
@@ -490,9 +491,12 @@ plone scenario="zoe" command="start" *args:
             # The suite of plone.locking, unchanged, on the locking backend
             # of zoe.plone, with the tests of zoe.plone: the layer of
             # zoe.plone.testing installs the backends that
-            # ZOE_PLONE_BACKENDS names.
+            # ZOE_PLONE_BACKENDS names. The tests that start `zoe serve`
+            # run the `zoe` binary of this build.
             set -- {{ args }}
-            ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
+            cargo build --locked -p zoe-server --bin zoe
+            ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe" \
+                ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
                 -s plone.locking -s zoe.plone "$@"
             ;;
         creators)

@@ -4,7 +4,8 @@ back, `copy_rows` and `reset`.
 
 They run with `bin/test -s zoe.plone` of a Plone instance, on the layer of
 `zoe.plone.testing`, as `just plone zoe backends` runs them. They install
-the backend themselves.
+the backend themselves. The tests through `zoe serve` need the `zoe` binary
+of `zoe.testing.ZoeServer.binary()`.
 """
 
 import contextlib
@@ -23,6 +24,7 @@ from plone.registry.record import Record
 from plone.registry.registry import Registry, _Records
 from ZODB.broken import Broken, PersistentBroken
 from ZODB.DB import DB
+from ZODB.FileStorage import FileStorage
 from ZODB.MappingStorage import MappingStorage
 from ZODB.POSException import ConflictError, ReadConflictError, Unsupported
 
@@ -33,6 +35,7 @@ from zoe.plone.tests.test_concurrent_creations import copy_records
 
 TITLE = "plone.site_title"
 OTHER = "plone.email_from_name"
+TIMEOUT = 30
 
 
 class GoneField(TextLine):
@@ -51,6 +54,34 @@ def opened(db):
     finally:
         manager.abort()
         connection.close()
+
+
+class Wrapper:
+    """A stand-in of a wrapper of a storage: it keeps the storage in
+    `storage`, as zc.beforestorage does, and passes each call to it."""
+
+    def __init__(self, storage):
+        self.storage = storage
+
+    def __getattr__(self, name):
+        return getattr(self.storage, name)
+
+
+def buckets(tree):
+    """Return the number of buckets of the `OOBTree` `tree`: 1 for a tree
+    that keeps its keys in its root."""
+    tree._p_activate()
+    state = tree.__getstate__()
+    if state is None or len(state) == 1:
+        return 1
+    count = 0
+    bucket = state[1]
+    while bucket is not None:
+        count += 1
+        bucket._p_activate()
+        state = bucket.__getstate__()
+        bucket = state[1] if len(state) > 1 else None
+    return count
 
 
 def namespace(registry):
@@ -170,6 +201,79 @@ class TestRegistryBackend(unittest.TestCase):
             )
             self.assertTrue(app[PLONE_SITE_ID].portal_registry[TITLE])
 
+    def served_copy(self):
+        """Copy the site to a new `zoe.Storage`, move its registry there and
+        commit. Return the path of the store, closed."""
+        import zoe
+
+        directory = tempfile.mkdtemp(prefix="zoe-registry-served-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = f"{directory}/zoe"
+        storage = zoe.Storage(path)
+        try:
+            copy_records(self.db.storage, storage)
+        except BaseException:
+            storage.close()
+            raise
+        db = DB(storage)
+        try:
+            with opened(db) as (app, manager):
+                backend.move(app[PLONE_SITE_ID].portal_registry)
+                manager.commit()
+        finally:
+            db.close()
+        return path
+
+    def test_a_move_back_through_zoe_serve_raises_a_read_conflict(self):
+        # The probe asks the server for the serial of the registry, on the
+        # native client and on the asyncio client of ZEO.
+        import zoe.zeo
+        from zoe.testing import ZoeServer
+
+        path = self.served_copy()
+        with ZoeServer(path) as server:
+            dbs = {}
+            # With server_sync, a new transaction of the reader waits for
+            # the invalidation of the move back.
+            for native in (True, False):
+                storage = zoe.zeo.ClientStorage(
+                    server.address,
+                    storage="1",
+                    wait_timeout=TIMEOUT,
+                    server_sync=True,
+                    native=native,
+                )
+                dbs[native] = DB(storage)
+                self.addCleanup(dbs[native].close)
+            for native in (True, False):
+                reader_db, mover_db = dbs[native], dbs[not native]
+                with self.subTest(reader_native=native):
+                    with opened(mover_db) as (app, manager):
+                        registry = app[PLONE_SITE_ID].portal_registry
+                        backend.move(registry)
+                        manager.commit()
+                    with opened(reader_db) as (app, manager):
+                        # The snapshot of the reader holds the moved
+                        # registry. It reads no record yet.
+                        reader = app[PLONE_SITE_ID].portal_registry
+                        aq_base(reader)._p_activate()
+                        self.assertIsInstance(
+                            aq_base(reader)._records, backend.MovedRecords
+                        )
+                        with opened(mover_db) as (other, other_manager):
+                            backend.move_back(other[PLONE_SITE_ID].portal_registry)
+                            other_manager.commit()
+                        with self.assertRaises(ReadConflictError):
+                            reader[TITLE]
+                        manager.abort()
+                        # The retry reads the stock registry.
+                        registry = app[PLONE_SITE_ID].portal_registry
+                        self.assertIsInstance(aq_base(registry)._records, _Records)
+                        self.assertNotIsInstance(
+                            aq_base(registry)._records, backend.MovedRecords
+                        )
+                        self.assertTrue(registry[TITLE])
+
     # The data manager.
 
     def test_a_rollback_to_a_savepoint_drops_a_decoded_value(self):
@@ -209,6 +313,38 @@ class TestRegistryBackend(unittest.TestCase):
         with opened(self.db) as (app, _):
             field = app[PLONE_SITE_ID].portal_registry.records[TITLE].field
             self.assertEqual(field.title, "Changed again")
+
+    def test_a_write_after_a_rollback_that_staged_a_field_raises_the_counter_once(
+        self,
+    ):
+        registry = self.moved()
+        transaction.commit()
+        # The connection joins before the backend, so the savepoint of the
+        # backend stages the field and the counter after the savepoint of
+        # the connection.
+        self.portal.zoe_test_attribute = "Joined first"
+        registry.records[TITLE].field.title = "Changed in place"
+        savepoint = transaction.savepoint()
+        savepoint.rollback()
+        self.assertEqual(aq_base(registry)._records.counter, 1)
+        registry[OTHER] = "Written after the rollback"
+        transaction.commit()
+        # The write takes the counter of the staged marker, 2, and adds 1.
+        # The commit adds nothing more.
+        self.assertEqual(aq_base(registry)._records.counter, 3)
+        self.assertEqual(decode_marker(namespace(registry).get(MARKER))[1], 3)
+        with opened(self.db) as (app, _):
+            other = app[PLONE_SITE_ID].portal_registry
+            self.assertEqual(other.records[TITLE].field.title, "Changed in place")
+            self.assertEqual(other[OTHER], "Written after the rollback")
+
+    def test_a_move_and_a_read_in_one_transaction_commit_the_counter_1(self):
+        backend.move(self.registry)
+        # The read decodes a field, so the before-commit hook runs.
+        self.assertTrue(self.registry.records[TITLE].field.title)
+        transaction.commit()
+        self.assertEqual(aq_base(self.registry)._records.counter, 1)
+        self.assertEqual(decode_marker(namespace(self.registry).get(MARKER))[1], 1)
 
     def test_a_read_writes_nothing(self):
         registry = self.moved()
@@ -427,6 +563,98 @@ class TestRegistryBackend(unittest.TestCase):
         with opened(db) as (app, _):
             self.assertNotIn(name, app[PLONE_SITE_ID].portal_registry)
 
+    def split_merge_copy(self):
+        """Turn the split merge on, and copy the site to a new
+        `zoe.Storage` with a resolution log. Check that the split merge
+        runs on its registry. Return its database."""
+        import json
+
+        import zoe.policy
+
+        zoe.policy.install(self.portal._p_jar, {"classes": {}, "split_merges": "on"})
+        transaction.commit()
+        directory = tempfile.mkdtemp(prefix="zoe-registry-log-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        log = f"{directory}/resolution.log"
+        db = self.copy(resolution_log=log)
+        # Two writes from one snapshot split two buckets in two ranges of
+        # names. Rule 2 of the split merge merges the second commit. With
+        # the split merge off, it conflicts.
+        with opened(db) as (app, manager):
+            first = self.add_records_that_split_a_bucket(
+                app[PLONE_SITE_ID].portal_registry, "aaa.zoe.tests.split"
+            )
+            with opened(db) as (other, other_manager):
+                second = self.add_records_that_split_a_bucket(
+                    other[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.split"
+                )
+                other_manager.commit()
+            manager.commit()
+        with opened(db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            for name in first + second:
+                self.assertEqual(registry[name], name)
+        with open(log) as file:
+            lines = [json.loads(line) for line in file if line.strip()]
+        merged = [
+            line for line in lines if line["outcome"] == "merged" and "split" in line
+        ]
+        self.assertTrue(merged, "the split merge merged nothing")
+        return db
+
+    def add_records_that_split_a_bucket(self, registry, prefix):
+        """Add records to `registry` with names that start with `prefix`,
+        until a bucket of each tree splits. Return their names."""
+        records = registry.records
+        trees = (records._fields, records._values)
+        before = [buckets(tree) for tree in trees]
+        names = [f"{prefix}.{index:03d}" for index in range(40)]
+        for name in names:
+            records[name] = Record(TextLine(title="Split"), name)
+        for tree, count in zip(trees, before, strict=True):
+            self.assertGreater(buckets(tree), count, "no bucket split")
+        return names
+
+    def test_a_write_that_splits_a_bucket_and_races_a_move_conflicts(self):
+        # The split merge on: the writer stores the roots that it split,
+        # and the move emptied them. That is not a change by splits.
+        db = self.split_merge_copy()
+        with opened(db) as (app, manager):
+            names = self.add_records_that_split_a_bucket(
+                app[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.race"
+            )
+            with opened(db) as (mover, mover_manager):
+                backend.move(mover[PLONE_SITE_ID].portal_registry)
+                mover_manager.commit()
+            with self.assertRaises(ConflictError):
+                manager.commit()
+        with opened(db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertIsInstance(aq_base(registry)._records, backend.MovedRecords)
+            for name in names:
+                self.assertNotIn(name, registry)
+
+    def test_a_write_that_splits_a_bucket_during_a_move_makes_the_move_conflict(
+        self,
+    ):
+        # The split merge on: the move read each node and bucket current,
+        # and stores the roots that the writer split.
+        db = self.split_merge_copy()
+        with opened(db) as (mover, mover_manager):
+            backend.move(mover[PLONE_SITE_ID].portal_registry)
+            with opened(db) as (app, manager):
+                names = self.add_records_that_split_a_bucket(
+                    app[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.race"
+                )
+                manager.commit()
+            with self.assertRaises(ConflictError):
+                mover_manager.commit()
+        with opened(db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            self.assertNotIsInstance(aq_base(registry)._records, backend.MovedRecords)
+            for name in names:
+                self.assertEqual(registry[name], name)
+
     def small_registry(self):
         """Store a registry of one record, whose trees keep their keys in
         their roots, at the Zope root. Return it."""
@@ -509,14 +737,14 @@ class TestRegistryBackend(unittest.TestCase):
         )
         self.assertEqual(rows.scan(), [])
 
-    def copy(self):
-        """Copy the records of the site to a new `zoe.Storage`. Return its
-        database."""
+    def copy(self, **options):
+        """Copy the records of the site to a new `zoe.Storage`, opened with
+        `options`. Return its database."""
         import zoe
 
         directory = tempfile.mkdtemp(prefix="zoe-registry-copy-")
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe")
+        storage = zoe.Storage(f"{directory}/zoe", **options)
         try:
             copy_records(self.db.storage, storage)
         except BaseException:
@@ -596,6 +824,97 @@ class TestRegistryBackend(unittest.TestCase):
             manager.commit()
         with opened(db) as (app, _):
             self.assertIn(TITLE, app[PLONE_SITE_ID].portal_registry)
+
+    def test_reset_goes_on_for_a_storage_opened_directly(self):
+        # A FileStorage has no namespaces and is no ZEO client: it holds
+        # no rows, so reset goes on.
+        self.moved()
+        directory = tempfile.mkdtemp(prefix="zoe-registry-file-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        storage = FileStorage(f"{directory}/Data.fs")
+        try:
+            copy_records(self.db.storage, storage)
+        except BaseException:
+            storage.close()
+            raise
+        db = DB(storage)
+        self.addCleanup(db.close)
+        with opened(db) as (app, manager):
+            copy = app[PLONE_SITE_ID].portal_registry
+            with self.assertRaises(Unsupported):
+                copy[TITLE]
+            backend.reset(copy)
+            manager.commit()
+        with opened(db) as (app, _):
+            records = aq_base(app[PLONE_SITE_ID].portal_registry)._records
+            self.assertNotIsInstance(records, backend.MovedRecords)
+            self.assertEqual(len(records), 0)
+
+    def served_copy_without_rows(self):
+        """Move the registry of the site, and copy the site without its rows
+        to a new `zoe.Storage`. Return the path of the store, closed."""
+        import zoe
+
+        self.moved()
+        directory = tempfile.mkdtemp(prefix="zoe-registry-norows-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = f"{directory}/zoe"
+        storage = zoe.Storage(path)
+        try:
+            copy_records(self.db.storage, storage)
+        finally:
+            storage.close()
+        return path
+
+    def test_reset_goes_on_for_a_zoe_zeo_client_with_kv(self):
+        # The client reads the rows, so the check is the answer: the copy
+        # has no rows.
+        import zoe.zeo
+        from zoe.testing import ZoeServer
+
+        with ZoeServer(self.served_copy_without_rows()) as server:
+            db = DB(
+                zoe.zeo.ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
+            )
+            self.addCleanup(db.close)
+            with opened(db) as (app, manager):
+                copy = app[PLONE_SITE_ID].portal_registry
+                with self.assertRaises(Unsupported):
+                    copy[TITLE]
+                backend.reset(copy)
+                manager.commit()
+            with opened(db) as (app, _):
+                records = aq_base(app[PLONE_SITE_ID].portal_registry)._records
+                self.assertNotIsInstance(records, backend.MovedRecords)
+
+    def test_reset_refuses_a_stock_zeo_client_under_a_wrapper(self):
+        from ZEO.ClientStorage import ClientStorage
+        from ZODB.DemoStorage import DemoStorage
+
+        from zoe.testing import ZoeServer
+
+        wrappers = {
+            "DemoStorage": lambda base: DemoStorage(base=base),
+            "a stand-in": Wrapper,
+        }
+        with ZoeServer(self.served_copy_without_rows()) as server:
+            for name, wrap in wrappers.items():
+                with self.subTest(wrapper=name):
+                    stock = ClientStorage(
+                        server.address, storage="1", wait_timeout=TIMEOUT
+                    )
+                    db = DB(wrap(stock))
+                    try:
+                        with opened(db) as (app, _):
+                            copy = app[PLONE_SITE_ID].portal_registry
+                            with self.assertRaises(Unsupported):
+                                backend.reset(copy)
+                            self.assertIsInstance(
+                                aq_base(copy)._records, backend.MovedRecords
+                            )
+                    finally:
+                        db.close()
+                        stock.close()
 
     def test_reset_refuses_a_registry_that_reads_its_rows(self):
         registry = self.moved()
