@@ -1,0 +1,383 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "arch": "x86_64",
+    "disk": null
+  },
+  "python": {
+    "implementation": "cpython",
+    "version": "3.13.9",
+    "free_threaded": false,
+    "compiler": "GCC 14.2.0"
+  },
+  "software": {
+    "zodbshootout": "0.8.0",
+    "ZODB": "6.0.1",
+    "ZEO": "6.0.0",
+    "zoedb": "0.1.0",
+    "zoe": "zoe 0.1.0"
+  },
+  "run": {
+    "started": "2026-01-02T01:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "seconds": 48.5,
+    "dirty": false
+  },
+  "rule": {
+    "min_pairs": 10,
+    "max_pairs": 100,
+    "max_seconds": 10.0,
+    "level": 0.99,
+    "batch_seconds": 0.02,
+    "max_transactions": 20
+  },
+  "cells": [
+    {
+      "mode": "threads",
+      "concurrency": 16,
+      "object_size": 1024,
+      "objects_per_transaction": 100,
+      "workers": {
+        "zeo": [
+          {
+            "gil_enabled": true,
+            "gil_enabled_by": []
+          }
+        ],
+        "zoe-native": [
+          {
+            "gil_enabled": true,
+            "gil_enabled_by": []
+          }
+        ]
+      },
+      "scenarios": [
+        {
+          "name": "add",
+          "transactions": 4,
+          "pairs": [
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.008,
+                "zoe-native": 0.004
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0081,
+                "zoe-native": 0.0041
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0082,
+                "zoe-native": 0.0042
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.008,
+                "zoe-native": 0.0043
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0081,
+                "zoe-native": 0.004
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0082,
+                "zoe-native": 0.0041
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.008,
+                "zoe-native": 0.0042
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0081,
+                "zoe-native": 0.0043
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0082,
+                "zoe-native": 0.004
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.008,
+                "zoe-native": 0.0041
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0081,
+                "zoe-native": 0.0042
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0082,
+                "zoe-native": 0.0043
+              }
+            }
+          ]
+        },
+        {
+          "name": "update",
+          "transactions": 4,
+          "pairs": [
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.005,
+                "zoe-native": 0.01
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0051,
+                "zoe-native": 0.0102
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0052,
+                "zoe-native": 0.0104
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.005,
+                "zoe-native": 0.0106
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0051,
+                "zoe-native": 0.01
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0052,
+                "zoe-native": 0.0102
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.005,
+                "zoe-native": 0.0104
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0051,
+                "zoe-native": 0.0106
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0052,
+                "zoe-native": 0.01
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.005,
+                "zoe-native": 0.0102
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0051,
+                "zoe-native": 0.0104
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0052,
+                "zoe-native": 0.0106
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "threads",
+      "concurrency": 1,
+      "object_size": 102400,
+      "objects_per_transaction": 10,
+      "workers": {
+        "zeo": [
+          {
+            "gil_enabled": true,
+            "gil_enabled_by": []
+          }
+        ],
+        "zoe-native": [
+          {
+            "gil_enabled": true,
+            "gil_enabled_by": []
+          }
+        ]
+      },
+      "scenarios": [
+        {
+          "name": "read_cold",
+          "transactions": 6,
+          "pairs": [
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.003,
+                "zoe-native": 0.0036
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0042,
+                "zoe-native": 0.0031
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0025,
+                "zoe-native": 0.004
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0039,
+                "zoe-native": 0.0029
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0031,
+                "zoe-native": 0.0037
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0044,
+                "zoe-native": 0.003
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0027,
+                "zoe-native": 0.0041
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0036,
+                "zoe-native": 0.0032
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0033,
+                "zoe-native": 0.0028
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0041,
+                "zoe-native": 0.0035
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0029,
+                "zoe-native": 0.0039
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.0038,
+                "zoe-native": 0.0033
+              }
+            }
+          ]
+        },
+        {
+          "name": "read_hot",
+          "transactions": 20,
+          "pairs": [
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.0006,
+                "zoe-native": 0.0002
+              }
+            },
+            {
+              "first": "zoe-native",
+              "seconds": {
+                "zeo": 0.00062,
+                "zoe-native": 0.00021
+              }
+            },
+            {
+              "first": "zeo",
+              "seconds": {
+                "zeo": 0.00061,
+                "zoe-native": 0.0002
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
