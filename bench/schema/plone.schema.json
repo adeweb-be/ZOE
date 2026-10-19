@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/adeweb-be/ZOE/main/bench/schema/plone.schema.json",
+  "title": "ZOE Plone end-to-end benchmark summary",
+  "description": "The summary of one campaign of the Plone end-to-end benchmark (B5, ADR 0054): the runs of one fixture, at one commit, on one machine, with one set of settings, which `just bench plone report --json` writes. Results are numbers about a synthetic corpus, never data. It holds no host name, user name, path or password. A number that its counter does not give is null, never 0.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine", "python", "software", "run", "fixture", "settings", "stacks", "scenarios", "steps", "runs"],
+  "$defs": {
+    "number": { "description": "A number, or null when its counter does not give it.", "type": ["number", "null"], "minimum": 0 },
+    "switch": { "description": "A switch of the merge policy, or null when the run did not write it.", "enum": ["on", "shadow", "off", null] }
+  },
+  "properties": {
+    "schema_version": {
+      "description": "The version of this schema. A change that a reader of the previous version cannot read increments it.",
+      "const": 1
+    },
+    "machine": {
+      "description": "The machine that ran the campaign. It holds no host name, user name or path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "cpu", "logical_cpus", "memory_bytes", "os", "kernel", "core_kinds", "cpu_pinning", "durability", "store_disk"],
+      "properties": {
+        "name": {
+          "description": "A stable name for the machine, used as a path segment in the results repository.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "cpu": { "description": "The CPU model.", "type": "string", "minLength": 1 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "type": ["integer", "null"], "minimum": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "kernel": { "description": "The kernel release.", "type": "string", "minLength": 1 },
+        "core_kinds": {
+          "description": "The physical cores of each kind of an Apple CPU, keyed by kind; null elsewhere.",
+          "type": ["object", "null"],
+          "additionalProperties": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "cpu_pinning": { "description": "How the processes are pinned to CPUs, such as taskset.", "type": "string", "minLength": 1 },
+        "durability": {
+          "description": "How each server makes a commit durable, keyed by server.",
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "store_disk": {
+          "description": "The disk that holds the stores of the runs.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rotational", "filesystem"],
+          "properties": {
+            "rotational": { "type": ["boolean", "null"] },
+            "filesystem": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "python": {
+      "description": "The Python build of the Plone instances.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "version", "free_threaded", "gil_enabled"],
+      "properties": {
+        "implementation": { "description": "sys.implementation.name, for example cpython.", "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+        "free_threaded": { "description": "True for a build without the GIL, such as 3.14t.", "type": "boolean" },
+        "gil_enabled": { "description": "sys._is_gil_enabled() in an interpreter of the instances, or null when it is not known.", "type": ["boolean", "null"] }
+      }
+    },
+    "software": {
+      "description": "The version of each egg of the instances, of zoedb, of zoe serve and of Locust, keyed by name. A version that the runs did not record is absent.",
+      "type": "object",
+      "required": ["Plone", "ZODB", "ZEO"],
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started", "commit", "dirty"],
+      "properties": {
+        "started": { "description": "When the first run of the campaign started, in UTC.", "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "commit": { "description": "The ZOE commit of the runs, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "dirty": { "description": "True when a run had a tree with changes that the commit does not hold; null when a run has no record of its tree; else false.", "type": ["boolean", "null"] }
+      }
+    },
+    "fixture": {
+      "description": "The synthetic site of every run of the campaign.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "preset", "objects", "catalog_entries", "spec"],
+      "properties": {
+        "name": { "description": "The name of the fixture, used as a path segment in the results repository.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "preset": { "description": "The preset whose SiteSpec equals the spec of the fixture, else custom.", "enum": ["small", "medium", "large", "custom"] },
+        "objects": { "description": "The content objects of the site, from the equivalence of its stores.", "type": "integer", "minimum": 0 },
+        "catalog_entries": { "description": "The entries of the catalog, from the equivalence of its stores.", "type": "integer", "minimum": 0 },
+        "spec": {
+          "description": "The SiteSpec of the fixture: numbers and lists of numbers.",
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "number" },
+              { "type": "array", "items": { "type": "number" } }
+            ]
+          }
+        }
+      }
+    },
+    "settings": {
+      "description": "The settings of every run of the campaign: the constants of the stacks without the ports and the switches, and the options of a run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instances", "threads", "zodb_cache_objects", "pool_size", "client_cache", "server_cpus", "zope_cpus", "locust_cpus", "probe", "zeo_fsync", "zoe_cache_size", "zoe_compression", "warmup_seconds", "warmup_users", "trim_seconds", "think", "client_retries"],
+      "properties": {
+        "instances": { "description": "The Zope instances.", "type": "integer", "minimum": 1 },
+        "threads": { "description": "The request threads of each instance.", "type": "integer", "minimum": 1 },
+        "zodb_cache_objects": { "description": "The objects in the cache of each ZODB connection.", "type": "integer", "minimum": 0 },
+        "pool_size": { "description": "The ZODB connections of each instance.", "type": "integer", "minimum": 1 },
+        "client_cache": { "description": "The storage client cache of each instance.", "type": "string" },
+        "server_cpus": { "description": "The CPUs of the server, as a taskset list.", "type": "string" },
+        "zope_cpus": { "description": "The CPUs of each instance, as taskset lists.", "type": "array", "items": { "type": "string" } },
+        "locust_cpus": { "description": "The CPUs of Locust, as a taskset list.", "type": "string" },
+        "probe": { "description": "True when the WSGI probe ran in the instances.", "type": "boolean" },
+        "zeo_fsync": { "description": "How the ZEO server syncs a commit on macOS.", "enum": ["full", "plain"] },
+        "zoe_cache_size": { "description": "The --cache-size of zoe serve, or null for the default of the store.", "type": ["string", "null"] },
+        "zoe_compression": { "description": "The --compression of zoe serve, or null for the default of the store.", "type": ["string", "null"] },
+        "warmup_seconds": { "type": "number", "minimum": 0 },
+        "warmup_users": { "type": "integer", "minimum": 0 },
+        "trim_seconds": { "description": "The seconds left out at the start of each step.", "type": "number", "minimum": 0 },
+        "think": { "description": "The min,max seconds between the operations of a user.", "type": "string" },
+        "client_retries": { "description": "The retries that Locust gives a failed write.", "type": "integer", "minimum": 0 }
+      }
+    },
+    "stacks": {
+      "description": "One entry per stack, in the order of the report.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "description", "server", "client", "native", "switches", "merge_policy"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": { "type": "string", "minLength": 1 },
+          "server": { "description": "The server: zeo (runzeo with a FileStorage) or zoe (zoe serve).", "enum": ["zeo", "zoe"] },
+          "client": { "description": "The storage section of zope.conf.", "enum": ["zeoclient", "zoeclient"] },
+          "native": { "description": "The key native of <zoeclient>, or null when the section does not have it.", "type": ["boolean", "null"] },
+          "switches": {
+            "description": "What the stack turns on.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["backends", "member_properties", "split_merges", "folder_orders"],
+            "properties": {
+              "backends": { "description": "The backends of zoe.plone that the instances install.", "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "member_properties": { "description": "True when the properties of the members and groups are records of zoe.plone (ADR 0046).", "type": "boolean" },
+              "split_merges": { "$ref": "#/$defs/switch" },
+              "folder_orders": { "$ref": "#/$defs/switch" }
+            }
+          },
+          "merge_policy": { "description": "The merge policy that the runs of the stack recorded, or null.", "type": ["object", "null"] }
+        }
+      }
+    },
+    "scenarios": {
+      "description": "One entry per scenario.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "description", "interface", "mix", "background"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": { "type": "string", "minLength": 1 },
+          "interface": { "description": "ui, rest or both.", "type": "array", "items": { "type": "string" } },
+          "mix": { "description": "The weight of each role.", "type": "object", "additionalProperties": { "type": "number", "minimum": 0 } },
+          "background": { "description": "The background roles, one user each.", "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "steps": {
+      "description": "One entry per scenario, stack and step: the numbers that the report prints, over the repetitions of the step.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scenario", "stack", "step", "users", "seconds", "repetitions", "operations", "ok_per_second", "p50_seconds", "p95_seconds", "p99_seconds", "p99_reliable", "failure_rate", "first_attempt_share", "conflicts_per_1000_ops", "exhausted", "zope_cpu_ms_per_op", "server_cpu_ms_per_op", "store_write_kb_per_op", "objects_loaded_per_second", "objects_stored_per_second"],
+        "properties": {
+          "scenario": { "type": "string" },
+          "stack": { "type": "string" },
+          "step": { "description": "The index of the step in the run.", "type": "integer", "minimum": 0 },
+          "users": { "type": "integer", "minimum": 1 },
+          "seconds": { "description": "The measured seconds of one repetition of the step, after the trim.", "type": "number", "minimum": 0 },
+          "repetitions": { "type": "integer", "minimum": 1 },
+          "operations": { "description": "The operations of every repetition.", "type": "integer", "minimum": 0 },
+          "ok_per_second": {
+            "description": "The successful operations per second: the median, the lowest and the highest of the repetitions.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["median", "min", "max"],
+            "properties": {
+              "median": { "$ref": "#/$defs/number" },
+              "min": { "$ref": "#/$defs/number" },
+              "max": { "$ref": "#/$defs/number" }
+            }
+          },
+          "p50_seconds": { "description": "The latency of a successful operation, pooled over the repetitions.", "$ref": "#/$defs/number" },
+          "p95_seconds": { "$ref": "#/$defs/number" },
+          "p99_seconds": { "$ref": "#/$defs/number" },
+          "p99_reliable": { "description": "True when the p99 comes from 200 operations or more.", "type": "boolean" },
+          "failure_rate": { "$ref": "#/$defs/number" },
+          "first_attempt_share": { "description": "The operations that succeeded at their first attempt, as a share of all.", "$ref": "#/$defs/number" },
+          "conflicts_per_1000_ops": { "description": "The ConflictErrors that the probe counts, per 1,000 operations.", "$ref": "#/$defs/number" },
+          "exhausted": { "description": "The requests whose retries of the publisher ran out.", "type": "integer", "minimum": 0 },
+          "zope_cpu_ms_per_op": { "description": "The CPU of the instances per successful operation, in milliseconds.", "$ref": "#/$defs/number" },
+          "server_cpu_ms_per_op": { "description": "The CPU of the server per successful operation, in milliseconds.", "$ref": "#/$defs/number" },
+          "store_write_kb_per_op": { "description": "The KB that the server gives to the write calls of its store, per successful operation.", "$ref": "#/$defs/number" },
+          "objects_loaded_per_second": { "description": "The loadBefore calls that the probe counts for the operations of the step, over its seconds: the median of the repetitions.", "$ref": "#/$defs/number" },
+          "objects_stored_per_second": { "description": "The store calls that the probe counts for the operations of the step, over its seconds: the median of the repetitions.", "$ref": "#/$defs/number" }
+        }
+      }
+    },
+    "runs": {
+      "description": "One entry per run, in the order of their start. A run without the numbers of its steps, such as a run that failed, has no entry in steps.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "scenario", "stack", "repetition", "verification", "violations"],
+        "properties": {
+          "id": { "description": "The run id: its start, its scenario, its stack and its repetition.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+          "scenario": { "type": "string" },
+          "stack": { "type": "string" },
+          "repetition": { "type": "integer", "minimum": 0 },
+          "verification": { "description": "The verdict of the verification of the run, or not run.", "enum": ["pass", "fail", "not run"] },
+          "violations": { "description": "The violations that the verification found, or null when it did not run.", "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    }
+  }
+}
