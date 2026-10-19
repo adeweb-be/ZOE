@@ -37,13 +37,14 @@ WAIT_TIMEOUT = 120
 # For each client: its module, its class, the other modules that its open
 # and its calls import, and the arguments that select it.
 CLIENT_CLASSES = {
-    # ZEO imports msgpack in its handshake, and asyncio encodes the host
-    # with the idna codec when it connects. The native client imports
-    # zoe.zodb when it opens. A warm round would count these imports.
+    # ZEO imports msgpack in its handshake, asyncio encodes the host with
+    # the idna codec when it connects, and the first commit of ZEO encodes
+    # with latin-1. The native client imports zoe.zodb when it opens. A
+    # round would count these imports.
     ZEO_CLIENT: (
         "ZEO.ClientStorage",
         "ClientStorage",
-        ("msgpack", "encodings.idna"),
+        ("msgpack", "encodings.idna", "encodings.latin_1"),
         {},
     ),
     NATIVE_CLIENT: (
@@ -83,13 +84,13 @@ def client_class(spec: dict):
 def check_no_imports(before: set[str]) -> None:
     """Fail when a module was imported after `before` was taken.
 
-    A warm round calls this at the end of its clock: an import inside the
+    Each round calls this at the end of its clock: an import inside the
     clock would count in the time of one client only.
     """
     imported = sorted(set(sys.modules) - before)
     if imported:
         raise RuntimeError(
-            "the clock of a warm round covers imports: " + ", ".join(imported)
+            "the clock of a round covers imports: " + ", ".join(imported)
         )
 
 
@@ -208,8 +209,7 @@ def run_threads(spec: dict) -> dict:
     for thread in threads:
         thread.join()
     end, cpu_end = time.monotonic(), cpu()
-    if warm:
-        check_no_imports(modules)
+    check_no_imports(modules)
     storage.close()
     if any(t is None for t in times):
         raise RuntimeError("a worker thread failed")
@@ -233,8 +233,7 @@ def _process(spec: dict, worker: int, barrier, queue) -> None:
             storage = open_client(spec, worker, opener)
         times = work(spec, storage, worker, prepared)
         end, cpu_end = time.monotonic(), cpu()
-        if warm:
-            check_no_imports(modules)
+        check_no_imports(modules)
         storage.close()
         queue.put((worker, start, end, cpu_end - cpu_start, times, None))
     except BaseException as error:
