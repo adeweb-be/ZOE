@@ -434,6 +434,38 @@ def test_one_site_that_raises_folder_orders_raises_it():
     assert merges.lowest_mode(modes, "/site", None) is None
 
 
+class Writes(dict):
+    """A mapping that counts its writes."""
+
+    writes = 0
+
+    def __setitem__(self, key, value):
+        self.writes += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.writes += 1
+        super().__delitem__(key)
+
+    def pop(self, *args):
+        self.writes += 1
+        return super().pop(*args)
+
+
+def test_folder_orders_writes_the_modes_only_on_a_change():
+    modes = Writes()
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert modes.writes == 1
+    # The same mode, and no mode for a site that has none, write nothing.
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert merges.lowest_mode(modes, "/other", None) == "on"
+    assert modes.writes == 1
+    assert merges.lowest_mode(modes, "/site", "shadow") == "shadow"
+    assert merges.lowest_mode(modes, "/site", None) is None
+    assert modes.writes == 3
+    assert modes == {}
+
+
 def test_the_other_switches_take_the_new_value():
     stored = {"version": 2, "split_merges": "on", "classes": {}}
     assert (
