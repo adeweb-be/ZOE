@@ -51,6 +51,10 @@ class StackConfig:
     # The backends of zoe.plone that the instances install, for
     # ZOE_PLONE_BACKENDS in zope.conf; empty for none.
     backends: str = ""
+    # True when the run moves the properties of the members and groups of
+    # the site into records of zoe.plone, with their tier 2 entry, before
+    # the instances start (ADR 0046, section 9).
+    member_properties: bool = False
 
 
 STACKS = {
@@ -127,6 +131,36 @@ STACKS = {
             "conflicts: the client resolves through the vote (tier 3)",
         ),
         backends="indexing",
+    ),
+    "zoe-native-qi-kv": StackConfig(
+        name="zoe-native-qi-kv",
+        scenario="zoeclient",
+        server="zoe",
+        section="zoeclient",
+        native=True,
+        description=(
+            "zoe-native-qi with the locking backend of zoe.plone (ADR 0043) "
+            "and the properties of the members and groups in records of "
+            "zoe.plone, which merge a login at the vote (ADR 0046)"
+        ),
+        differs=(
+            "server: zoe serve (redb store, raw records unless --zoe-compression, "
+            "per-oid locks, group commit)",
+            "client: native Rust client (msgpack M5), extensions sequences, kv "
+            "and trace_context declared",
+            "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
+            "zoe.plone: a save writes no object of the catalog; the indexer of "
+            "the site applies the queue in transactions of its own, and the "
+            "next request of the user who saved waits for it",
+            "zoe.plone: the locks of edit forms live in the ephemeral namespace "
+            "of the store, so a lock writes no object",
+            "zoe.plone: the properties of each member and group are a record "
+            "of their own, so two logins do not conflict on the property "
+            "sheet of PAS",
+            "conflicts: the client resolves through the vote (tier 3)",
+        ),
+        backends="indexing,locking",
+        member_properties=True,
     ),
     "zoe-asyncio": StackConfig(
         name="zoe-asyncio",
