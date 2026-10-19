@@ -495,12 +495,300 @@ def test_no_rise_logs_nothing(caplog):
 
 
 def test_the_other_switches_take_the_new_value():
-    stored = {"version": 2, "split_merges": "on", "classes": {}}
+    stored = {"version": 2, "posting_dicts": "on", "classes": {}}
     assert (
-        merges.compose(stored, {"classes": {}, "split_merges": "off"})["split_merges"]
+        merges.compose(stored, {"classes": {}, "posting_dicts": "off"})["posting_dicts"]
         == "off"
     )
-    assert merges.compose(stored, {"classes": {}})["split_merges"] == "on"
+    assert merges.compose(stored, {"classes": {}})["posting_dicts"] == "on"
+
+
+def test_the_sites_compose_folder_orders_and_split_merges():
+    assert set(merges.SITE_SWITCHES) == {"folder_orders", "split_merges"}
+    assert merges.SITE_MODES == merges.SITE_SWITCHES["folder_orders"]
+    assert len(set(merges.SITE_SWITCHES.values())) == 2
+
+
+def test_lowest_mode_names_its_switch(caplog):
+    modes = {}
+    assert merges.lowest_mode(modes, "/a", "off", "split_merges") == "off"
+    with caplog.at_level("WARNING", logger="zoe.plone"):
+        assert merges.lowest_mode(modes, "/b", "on", "split_merges") == "off"
+    assert "/b asks for split_merges on" in caplog.text
+
+
+FOLDER = "plone.app.contenttypes.content.Folder"
+SITE_ROOT = "Products.CMFPlone.Portal.PloneSite"
+DOCUMENT = "plone.app.contenttypes.content.Document"
+ADDON = "m.AddonFolder"
+CONTAINERS = (FOLDER, SITE_ROOT)
+
+
+def profile_overrides(name="default"):
+    """Return the overrides of the profile ``zoe.plone:<name>``."""
+    import importlib.resources
+    import json
+
+    path = importlib.resources.files("zoe.plone") / "profiles" / name
+    return json.loads((path / merges.OVERRIDES).read_text())
+
+
+def uninstall_overrides():
+    """Return the overrides of the profile ``zoe.plone:uninstall``."""
+    return profile_overrides("uninstall")
+
+
+def stock_derived(blocked=()):
+    """Return a derived policy of a stock site with an add-on container
+    class, as `merges.derive` gives it, and the names of its classes."""
+    typed = [
+        (name, {"title"}, [(opaque, set())] if name in blocked else [], {})
+        for name in (FOLDER, SITE_ROOT, DOCUMENT, ADDON)
+    ]
+    classes = merges.class_entries(typed)
+    return {"classes": classes}, set(classes)
+
+
+def test_the_profile_switches_on_the_stock_containers_and_the_split_merge():
+    derived, names = stock_derived()
+    result, removed = merges.apply_overrides(derived, profile_overrides(), names)
+    assert removed == set()
+    assert result["folder_orders"] == "on"
+    assert result["split_merges"] == "on"
+    for name in CONTAINERS:
+        assert result["classes"][name] == {
+            **derived["classes"][name],
+            "tier2": "on",
+        }
+        assert result["classes"][name]["fields"] == {"modification_date": "max"}
+    # The other classes, an add-on container among them, keep shadow.
+    assert result["classes"][DOCUMENT] == derived["classes"][DOCUMENT]
+    assert result["classes"][ADDON] == derived["classes"][ADDON]
+    assert result["classes"][DOCUMENT]["tier2"] == "shadow"
+
+
+def test_the_profile_keeps_a_blocked_container_blocked(caplog):
+    derived, names = stock_derived(blocked={FOLDER})
+    result, _ = merges.apply_overrides(
+        derived, profile_overrides(), names, blocked={FOLDER}
+    )
+    assert result["classes"][FOLDER] == {"tier2": "off", "blocked": True}
+    assert result["classes"][SITE_ROOT]["tier2"] == "on"
+    assert f"{FOLDER} stays blocked" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "later, expected",
+    [
+        ({"tier2": "shadow"}, {FOLDER: "shadow", SITE_ROOT: "shadow"}),
+        ({"tier2": "on"}, {FOLDER: "on", SITE_ROOT: "on", DOCUMENT: "on"}),
+        ({"classes": {FOLDER: {"tier2": "off"}}}, {FOLDER: "off", SITE_ROOT: "on"}),
+    ],
+)
+def test_a_later_profile_sets_the_mode_of_the_containers(later, expected):
+    derived, names = stock_derived()
+    policy_ = derived
+    for overrides in (profile_overrides(), later):
+        policy_, _ = merges.apply_overrides(policy_, overrides, names)
+    found = {name: policy_["classes"][name]["tier2"] for name in expected}
+    assert found == expected
+
+
+def test_a_later_profile_switches_the_split_merge_off():
+    derived, names = stock_derived()
+    policy_ = derived
+    for overrides in (profile_overrides(), {"split_merges": "off"}):
+        policy_, _ = merges.apply_overrides(policy_, overrides, names)
+    assert policy_["split_merges"] == "off"
+    assert policy_["folder_orders"] == "on"
+
+
+def test_the_profile_changes_derived_containers_only():
+    overrides = profile_overrides()
+    names = {SITE_ROOT, DOCUMENT}
+    for profile in (merges.PROFILE, "profile-" + merges.PROFILE, merges.UNINSTALL):
+        found = merges.profile_overrides(profile, overrides, names, set())
+        assert set(found["classes"]) == {SITE_ROOT}
+        assert found["split_merges"] == overrides["split_merges"]
+    # A blocked container loses the entry of the profile too.
+    found = merges.profile_overrides(
+        merges.PROFILE, overrides, {FOLDER, SITE_ROOT}, {FOLDER}
+    )
+    assert set(found["classes"]) == {SITE_ROOT}
+    # The overrides of another profile stay as they are.
+    assert merges.profile_overrides("site:default", overrides, set(), set()) is (
+        overrides
+    )
+    assert set(overrides["classes"]) == set(CONTAINERS)
+
+
+def test_the_profile_and_the_uninstall_replace_each_other_in_place():
+    kept = {}
+    merges.keep_overrides(kept, merges.PROFILE, {"folder_orders": "on"})
+    merges.keep_overrides(kept, "site:default", {"tier2": "shadow"})
+    merges.keep_overrides(kept, merges.UNINSTALL, {"folder_orders": "off"})
+    assert list(kept.items()) == [
+        (merges.UNINSTALL, {"folder_orders": "off"}),
+        ("site:default", {"tier2": "shadow"}),
+    ]
+    merges.keep_overrides(kept, merges.PROFILE, {"folder_orders": "on"})
+    assert list(kept) == [merges.PROFILE, "site:default"]
+    merges.keep_overrides(kept, "site:default", {})
+    assert list(kept) == [merges.PROFILE, "site:default"]
+
+
+GROUP = [["effective", "effective_date", "expiration_date", "expires"]]
+
+
+def derived_entry():
+    return {
+        "tier2": "shadow",
+        "default": "strict",
+        "fields": {"modification_date": "max"},
+        "coupled": GROUP,
+    }
+
+
+STOCK = {FOLDER: derived_entry(), SITE_ROOT: derived_entry(), DOCUMENT: derived_entry()}
+
+
+class FakeSite:
+    """A site of a test of `update_policy`, with the classes that its
+    derivation gives and the overrides that it keeps."""
+
+    def __init__(self, connection, path, classes=STOCK, **overrides):
+        self._p_jar = connection
+        self.path = path
+        self.classes = classes
+        self.overrides = overrides or {merges.PROFILE: profile_overrides()}
+
+    def getPhysicalPath(self):
+        return ("", self.path)
+
+
+@pytest.fixture
+def connection(monkeypatch):
+    monkeypatch.setattr(
+        merges,
+        "derive",
+        lambda site: {"classes": {k: dict(v) for k, v in site.classes.items()}},
+    )
+    monkeypatch.setattr(
+        merges, "site_overrides", lambda site, create=False: site.overrides
+    )
+    db = ZODB.DB(None)
+    connection = db.open()
+    yield connection
+    transaction.abort()
+    db.close()
+
+
+def update(site):
+    merges.update_policy(site)
+    transaction.commit()
+
+
+def stored_classes(connection):
+    return policy.read(connection)["classes"]
+
+
+def test_a_site_without_a_container_type_adds_no_entry(connection):
+    site = FakeSite(connection, "c", {SITE_ROOT: derived_entry()})
+    update(site)
+    assert FOLDER not in stored_classes(connection)
+    assert stored_classes(connection)[SITE_ROOT]["tier2"] == "on"
+    # The database keeps no root of modes for the class.
+    assert merges.SITE_CLASSES[FOLDER] not in connection.root()
+
+
+def test_a_site_that_removes_a_container_asks_for_off(connection, caplog):
+    a = FakeSite(connection, "a")
+    b = FakeSite(connection, "b")
+    update(a)
+    update(b)
+    b.overrides["site:default"] = {"classes": {FOLDER: None}}
+    update(b)
+    assert FOLDER not in stored_classes(connection)
+    with caplog.at_level("WARNING", logger="zoe.plone"):
+        update(a)
+    # The update of the other site does not switch the class on again.
+    assert stored_classes(connection)[FOLDER]["tier2"] == "off"
+    assert stored_classes(connection)[FOLDER]["coupled"] == GROUP
+    assert f"/a asks for tier2 of {FOLDER} on" in caplog.text
+
+
+def test_an_upgrade_logs_the_rise_of_a_container_at_info(connection, caplog):
+    site = FakeSite(connection, "a", **{merges.PROFILE: {"folder_orders": "on"}})
+    update(site)
+    assert stored_classes(connection)[FOLDER]["tier2"] == "shadow"
+    site.overrides = {merges.PROFILE: profile_overrides()}
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        update(site)
+    assert stored_classes(connection)[FOLDER]["tier2"] == "on"
+    rises = [r for r in caplog.records if f"raises tier2 of {FOLDER}" in r.message]
+    assert [r.levelname for r in rises] == ["INFO"]
+
+
+def test_an_off_of_install_for_a_container_logs_a_warning(connection, caplog):
+    site = FakeSite(connection, "a", **{merges.PROFILE: {"folder_orders": "on"}})
+    update(site)
+    written = policy.read(connection)
+    del written["version"]
+    written["classes"][FOLDER]["tier2"] = "off"
+    policy.install(connection, written)
+    transaction.commit()
+    site.overrides = {merges.PROFILE: profile_overrides()}
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        update(site)
+    rises = [r for r in caplog.records if f"raises tier2 of {FOLDER}" in r.message]
+    assert [r.levelname for r in rises] == ["WARNING"]
+
+
+def test_a_blocked_container_logs_no_warning_and_no_rise(connection, caplog):
+    blocked = {**STOCK, FOLDER: {"tier2": "off", "blocked": True}}
+    d = FakeSite(connection, "d", blocked)
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        update(d)
+        update(d)
+    assert stored_classes(connection)[FOLDER] == {"tier2": "off", "blocked": True}
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # The mode of the blocked site goes; another site asks for on. The
+    # class stays blocked, and no line reports a rise.
+    del connection.root()[merges.SITE_CLASSES[FOLDER]]["/d"]
+    transaction.commit()
+    caplog.clear()
+    with caplog.at_level("INFO", logger="zoe.plone"):
+        update(FakeSite(connection, "e"))
+    assert stored_classes(connection)[FOLDER]["blocked"] is True
+    assert f"raises tier2 of {FOLDER}" not in caplog.text
+
+
+def test_an_uninstall_switches_off_what_the_profile_switched_on(connection):
+    a = FakeSite(connection, "a")
+    b = FakeSite(connection, "b")
+    update(a)
+    update(b)
+    merges.keep_overrides(a.overrides, merges.UNINSTALL, uninstall_overrides())
+    assert list(a.overrides) == [merges.UNINSTALL]
+    update(a)
+    found = policy.read(connection)
+    assert found["folder_orders"] == found["split_merges"] == "off"
+    assert {name: found["classes"][name]["tier2"] for name in CONTAINERS} == {
+        FOLDER: "off",
+        SITE_ROOT: "off",
+    }
+    assert found["classes"][DOCUMENT]["tier2"] == "shadow"
+    # An update of the other site keeps them off.
+    update(b)
+    found = policy.read(connection)
+    assert found["folder_orders"] == found["split_merges"] == "off"
+    assert found["classes"][FOLDER]["tier2"] == "off"
+    # The site installs the profile again: it asks for on again.
+    merges.keep_overrides(a.overrides, merges.PROFILE, profile_overrides())
+    update(a)
+    found = policy.read(connection)
+    assert found["folder_orders"] == found["split_merges"] == "on"
+    assert found["classes"][FOLDER]["tier2"] == "on"
 
 
 class Mode(enum.StrEnum):
@@ -581,3 +869,10 @@ def test_two_changes_of_state_of_a_history_conflict_in_process(tmp_path):
     outcomes, actions = transitions(tmp_path, [publish, submit])
     assert outcomes == ["committed", "conflict"]
     assert actions == ["create", "publish"]
+
+
+def test_the_sites_compose_the_tier2_of_the_containers_of_the_profile():
+    assert set(merges.CONTAINERS) == set(CONTAINERS)
+    assert set(merges.SITE_CLASSES) == set(profile_overrides()["classes"])
+    names = [*merges.SITE_SWITCHES.values(), *merges.SITE_CLASSES.values()]
+    assert len(set(names)) == len(names)

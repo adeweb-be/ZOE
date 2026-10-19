@@ -1,1 +1,8 @@
-{"folder_orders": "on"}
+{
+  "folder_orders": "on",
+  "split_merges": "on",
+  "classes": {
+    "plone.app.contenttypes.content.Folder": {"tier2": "on"},
+    "Products.CMFPlone.Portal.PloneSite": {"tier2": "on"}
+  }
+}
