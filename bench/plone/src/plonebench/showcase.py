@@ -56,7 +56,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from plonebench import corpus, fixture, runner, stack
+from plonebench import corpus, environment, fixture, runner, stack
 
 ROOT = stack.REPO / "target" / "bench" / "showcase"
 LOCK = stack.REPO / "target" / "bench" / "bench.lock"
@@ -353,13 +353,12 @@ def commit_of() -> str | None:
 
 
 def dirty_of() -> bool | None:
-    """Tell if the tree differs from its commit, as the B5 runs record it.
-    None when git cannot tell."""
-    out = _git("status", "--porcelain", "--untracked-files=no", empty="")
-    return None if out is None else bool(out)
+    """Tell if the tree differs from the commit of the showcase, as the B5
+    runs record it. None when the tree is no record of that commit."""
+    return environment.dirty()
 
 
-def _git(*args: str, empty: str | None = None) -> str | None:
+def _git(*args: str) -> str | None:
     try:
         out = subprocess.run(
             ["git", *args], cwd=stack.REPO, capture_output=True, text=True
@@ -368,7 +367,7 @@ def _git(*args: str, empty: str | None = None) -> str | None:
         return None
     if out.returncode:
         return None
-    return out.stdout.strip() or empty
+    return out.stdout.strip() or None
 
 
 def _option(key: str, value) -> str:
