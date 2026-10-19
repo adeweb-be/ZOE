@@ -1580,8 +1580,12 @@ fn wait_until(done: impl Fn() -> bool) {
 #[test]
 fn a_record_of_the_positions_merged_onto_a_commit_in_flight_gives_no_answer() {
     let clock = Counting::default();
-    // Without the split merge, whose plan waits for a commit in flight
-    // before it reads the store, tier 1 merges onto the commit in flight.
+    // Tier 1 merges onto the commit in flight when no plan waits for it
+    // first. That is the case without the split merge, as here. With the
+    // split merge, its plan waits for a commit in flight before it reads
+    // the store, but a handed record of the positions whose oid is lower
+    // than the first stale oid can merge before that wait. In both cases
+    // the guards of the order merge give no answer.
     let store = open_on(
         clock.clone(),
         Settings {
