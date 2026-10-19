@@ -562,7 +562,7 @@ class TestRegistryBackend(unittest.TestCase):
         names = [f"zoe.plone.tests.split.{index:03d}" for index in range(40)]
         for name in names:
             records[name] = Record(TextLine(title="Split"), name)
-        for tree, count in zip(trees, before):
+        for tree, count in zip(trees, before, strict=True):
             self.assertGreater(buckets(tree), count, "no bucket split")
         return names
 
