@@ -38,14 +38,20 @@ WAIT_TIMEOUT = 120
 # and its calls import, and the arguments that select it.
 CLIENT_CLASSES = {
     # ZEO imports msgpack in its handshake, and asyncio encodes the host
-    # with the idna codec when it connects. A warm round would count both.
+    # with the idna codec when it connects. The native client imports
+    # zoe.zodb when it opens. A warm round would count these imports.
     ZEO_CLIENT: (
         "ZEO.ClientStorage",
         "ClientStorage",
         ("msgpack", "encodings.idna"),
         {},
     ),
-    NATIVE_CLIENT: ("zoe.zeo", "ClientStorage", ("zoe._zoe",), {"native": True}),
+    NATIVE_CLIENT: (
+        "zoe.zeo",
+        "ClientStorage",
+        ("zoe._zoe", "zoe.zodb"),
+        {"native": True},
+    ),
 }
 # The modules that the calls of both clients import.
 CALL_MODULES = ("ZODB.utils", "ZODB.Connection")
