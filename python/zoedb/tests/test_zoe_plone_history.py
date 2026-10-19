@@ -413,18 +413,34 @@ def test_two_sites_in_one_database_compose():
     assert merges.compose(None, new)["classes"]["m.Odd"] == {"tier2": "on"}
 
 
-def test_each_switch_takes_the_lower_mode_of_two_sites():
-    site_a = {"classes": {}, "folder_orders": "off", "split_merges": "on"}
-    site_b = {"classes": {}, "folder_orders": "on", "split_merges": "shadow"}
-    stored = merges.compose(None, site_a)
-    # The profile of the second site switches the order merge on: the off
-    # of the first site lasts.
-    stored = merges.compose(stored, site_b)
-    assert stored["folder_orders"] == "off"
-    assert stored["split_merges"] == "shadow"
-    # A switch that one site does not give keeps the mode of the other.
-    assert merges.compose(stored, {"classes": {}})["folder_orders"] == "off"
-    assert merges.compose(None, site_b)["folder_orders"] == "on"
+def test_folder_orders_takes_the_lowest_latest_mode_of_the_sites(caplog):
+    modes = {}
+    assert merges.lowest_mode(modes, "/a", "off") == "off"
+    # The second site imports the profile: the off of the first site lasts,
+    # with a warning.
+    with caplog.at_level("WARNING", logger="zoe.plone"):
+        assert merges.lowest_mode(modes, "/b", "on") == "off"
+    assert "/b asks for folder_orders on" in caplog.text
+    # The first site raises its own mode: its new mode replaces its earlier
+    # one.
+    assert merges.lowest_mode(modes, "/a", "on") == "on"
+    assert modes == {"/a": "on", "/b": "on"}
+
+
+def test_one_site_that_raises_folder_orders_raises_it():
+    modes = {}
+    assert merges.lowest_mode(modes, "/site", "shadow") == "shadow"
+    assert merges.lowest_mode(modes, "/site", "on") == "on"
+    assert merges.lowest_mode(modes, "/site", None) is None
+
+
+def test_the_other_switches_take_the_new_value():
+    stored = {"version": 2, "split_merges": "on", "classes": {}}
+    assert (
+        merges.compose(stored, {"classes": {}, "split_merges": "off"})["split_merges"]
+        == "off"
+    )
+    assert merges.compose(stored, {"classes": {}})["split_merges"] == "on"
 
 
 class Mode(enum.StrEnum):

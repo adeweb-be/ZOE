@@ -189,16 +189,22 @@ def setup(conn, items):
         folder.__annotations__[POS_KEY][name(number)] = number
 
 
-def one_round(db, start):
+def one_round(db, start, splits=None):
     """Run one round on `db` from the item number `start`. Return the
-    outcome of each transaction: True when it committed."""
+    outcome of each transaction: True when it committed. When `splits` is
+    a list, add to it, for each transaction, whether it split a bucket of
+    the positions."""
     managers = [transaction.TransactionManager() for _ in range(CREATORS)]
     conns = [db.open(transaction_manager=manager) for manager in managers]
     try:
         for manager in managers:
             manager.begin()
         for turn, conn in enumerate(conns):
+            pos = conn.root()["folder"].__annotations__[POS_KEY]
+            before = buckets(pos)
             create(conn, name(start + turn))
+            if splits is not None:
+                splits.append(buckets(pos) > before)
         outcomes = []
         for manager in managers:
             try:
@@ -296,18 +302,22 @@ class Site:
             self.server.__exit__(*exc)
 
 
-def run_rounds(mode, tmp_path):
+def run_rounds(mode, tmp_path, splits=None):
     """Run the rounds in `mode` from a folder a few items below the inline
     limit of its positions. Return the outcomes of each round and the lines
-    of the order merge."""
+    of the order merge. When `splits` is a list, add to it, for each round,
+    whether each transaction split a bucket of the positions."""
     rounds = []
     with Site(mode, tmp_path) as site:
         start = inline_limit() - 3
         with site.db.transaction() as conn:
             setup(conn, start)
         for _ in range(ROUNDS):
-            outcomes = one_round(site.db, start)
+            split = []
+            outcomes = one_round(site.db, start, split)
             rounds.append(outcomes)
+            if splits is not None:
+                splits.append(split)
             start += CREATORS
             site.check_elsewhere(tmp_path)
     return rounds, order_lines(site.log)
@@ -324,10 +334,17 @@ def test_with_the_order_merge_every_creation_commits_at_the_first_attempt(
 
 
 def test_a_stock_client_merges_but_where_both_sides_split_one_bucket(tmp_path):
-    rounds, lines = run_rounds("zeo-client", tmp_path)
-    # The rounds after the first fill one inline bucket from one snapshot:
-    # both sides split it, and rule 3 gives no answer without
-    # `server_writes`. The other creations merge their order.
+    splits = []
+    rounds, lines = run_rounds("zeo-client", tmp_path, splits)
+    # The first round fills the inline bucket of the positions past its
+    # limit without a split: every creation merges its order.
+    assert all(rounds[0]), rounds
+    # Later, each creation of a round splits the same bucket from one
+    # snapshot, and rule 3 gives no answer without `server_writes`. Each
+    # ConflictError falls in such a round.
+    for outcomes, split in zip(rounds, splits, strict=True):
+        if not all(outcomes):
+            assert all(split), (rounds, splits)
     assert not all(all(outcomes) for outcomes in rounds), rounds
     assert any(line["order"] == "list" and line["applied"] for line in lines), lines
 

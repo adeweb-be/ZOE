@@ -3707,17 +3707,19 @@ mod tests {
         let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
         let oid = Oid(1);
         txn.store(oid, Tid::ZERO, b"0123456789").unwrap();
+        // Another record of 100 bytes counts in the transaction too.
+        txn.store(Oid(2), Tid::ZERO, &[b'x'; 100]).unwrap();
         let staged = txn.stored_bytes;
-        assert_eq!(staged, 10);
-        // A first merge of 4 bytes replaces the staged pickle.
+        assert_eq!(staged, 110);
+        // A first merge of 4 bytes replaces the staged pickle of 10 bytes.
         let first = txn.merged_size(oid, b"abcd", staged).unwrap();
-        assert_eq!(first, 4);
+        assert_eq!(first, 104);
         // A second merge of 6 bytes replaces the first one, not the
-        // staged pickle.
+        // staged pickle: 100 + 6.
         let second = txn
             .merged_size_replacing(oid, b"abcdef", first, Some(4))
             .unwrap();
-        assert_eq!(second, 6);
+        assert_eq!(second, 106);
     }
 
     #[test]

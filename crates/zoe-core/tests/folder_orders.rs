@@ -13,9 +13,16 @@
 //! positions are `{id: index}` of the order.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use zoe_core::vfs::MemVfs;
-use zoe_core::{Mode, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError};
+use zoe_core::{
+    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, Waiter,
+    ZoeError,
+};
 use zoe_pickle::btrees::{TreeState, bucket_state, new_bucket_state, tree_state};
 use zoe_pickle::python::{Heap, Object, Pickler, Value};
 
@@ -151,12 +158,15 @@ struct Settings<'a> {
     /// A tier 2 entry for `persistent.list.PersistentList` that appends
     /// to `data`, in this mode.
     list_tier2: Option<&'a str>,
+    /// The switch `split_merges`.
+    split_merges: bool,
 }
 
 const ON: Settings<'static> = Settings {
     folder_orders: Some("on"),
     bucket_tier1: None,
     list_tier2: None,
+    split_merges: true,
 };
 
 /// The record of a policy: the split merge on, the folder class merges
@@ -193,8 +203,10 @@ fn policy(settings: Settings<'_>) -> Vec<u8> {
     let mut items = vec![
         (s(&mut heap, "version"), Value::Int(1)),
         (s(&mut heap, "classes"), classes),
-        (s(&mut heap, "split_merges"), s(&mut heap, "on")),
     ];
+    if settings.split_merges {
+        items.push((s(&mut heap, "split_merges"), s(&mut heap, "on")));
+    }
     if let Some(mode) = settings.folder_orders {
         items.push((s(&mut heap, "folder_orders"), s(&mut heap, mode)));
     }
@@ -203,6 +215,10 @@ fn policy(settings: Settings<'_>) -> Vec<u8> {
 }
 
 fn open(settings: Settings<'_>) -> Store {
+    open_on(SystemClock, settings)
+}
+
+fn open_on(clock: impl Clock + 'static, settings: Settings<'_>) -> Store {
     let options = Options {
         structural_merges: zoe_core::StructuralMerges {
             resolution_log: true,
@@ -210,7 +226,7 @@ fn open(settings: Settings<'_>) -> Store {
         },
         ..Options::default()
     };
-    let store = Store::open_full(MemVfs::new(), SystemClock, options).unwrap();
+    let store = Store::open_full(MemVfs::new(), clock, options).unwrap();
     let oid = new_oid(&store);
     let mut txn = store.tpc_begin(b"user", b"policy", b"").unwrap();
     txn.store(oid, Tid::ZERO, &policy(settings)).unwrap();
@@ -1480,18 +1496,152 @@ fn a_rename_on_create_on_the_committed_side_in_buckets_gives_no_answer() {
     let site = site(&store, &ids(0..6), Some(3));
     let old = snap(&store, site);
     commit(&store, &rename_on_create(&store, site, &old, "renamed"));
-    // The rebuild gave the root new children: the vote fails on the root
-    // that the transaction marked read-current, or on the order.
+    // The rebuild gave the root new children: rule 1 of the split merge
+    // gives no answer, and the vote fails on the root that the transaction
+    // marked read-current.
     let mut txn = begin(&store, &create(site, &old, &[id(6)]), true);
-    assert!(
-        matches!(
-            txn.vote(),
-            Err(ZoeError::Conflict { .. } | ZoeError::ReadConflict { .. })
-        ),
-        "the vote passed"
-    );
+    match txn.vote() {
+        Err(ZoeError::ReadConflict { oid }) => assert_eq!(oid, site.pos),
+        other => panic!("expected a read conflict on the positions, got {other:?}"),
+    }
     drop(txn);
     let mut expected = ids(0..6);
     expected.push("renamed".to_owned());
     assert_eq!(assert_agrees(&store, site), expected);
+}
+
+// A commit in flight.
+
+/// A clock of the system that counts the waits on the waiters that it
+/// gives, so a test tells when a vote waits.
+#[derive(Clone, Default)]
+struct Counting {
+    waits: Arc<AtomicUsize>,
+}
+
+impl Clock for Counting {
+    fn now(&self) -> SystemTime {
+        SystemClock.now()
+    }
+
+    fn waiter(&self) -> Arc<dyn Waiter> {
+        Arc::new(Counted {
+            inner: SystemClock.waiter(),
+            waits: Arc::clone(&self.waits),
+        })
+    }
+}
+
+struct Counted {
+    inner: Arc<dyn Waiter>,
+    waits: Arc<AtomicUsize>,
+}
+
+impl Waiter for Counted {
+    fn wait(&self, timeout: Duration) {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        self.inner.wait(timeout);
+    }
+
+    fn wake(&self) {
+        self.inner.wake();
+    }
+}
+
+/// An observer that stops the finish after the sync of its batch, while
+/// the gate is armed, until the test opens it. The commit of that finish
+/// stays in flight.
+#[derive(Default)]
+struct Gate {
+    armed: AtomicBool,
+    held: AtomicBool,
+    open: AtomicBool,
+}
+
+impl Observer for Gate {
+    fn batch_synced(&self, _: usize) {
+        if self.armed.load(Ordering::SeqCst) {
+            self.held.store(true, Ordering::SeqCst);
+            while !self.open.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn wait_until(done: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_record_of_the_positions_merged_onto_a_commit_in_flight_gives_no_answer() {
+    let clock = Counting::default();
+    // Without the split merge, whose plan waits for a commit in flight
+    // before it reads the store, tier 1 merges onto the commit in flight.
+    let store = open_on(
+        clock.clone(),
+        Settings {
+            split_merges: false,
+            ..ON
+        },
+    );
+    let gate = Arc::new(Gate::default());
+    assert!(store.set_observer(gate.clone()));
+    let site = site(&store, &ids(0..3), None);
+    let old = snap(&store, site);
+    // The other side appends, so the order of the creation is stale.
+    commit(&store, &create(site, &old, &[id(3)]));
+    // A transaction writes the positions without the order, from the
+    // current snapshot, and holds their lock after its vote.
+    let now = snap(&store, site);
+    let Pos::Inline(items) = &now.pos else {
+        panic!("inline positions")
+    };
+    let mut items = items.clone();
+    items.push(("zz".to_owned(), 9));
+    let mut holder = begin(
+        &store,
+        &[Write::Store(site.pos, now.pos_serial, pos_inline(&items))],
+        true,
+    );
+    holder.vote().unwrap();
+    let writes = create(site, &old, &[id(4)]);
+    let waits = clock.waits.load(Ordering::SeqCst);
+    thread::scope(|scope| {
+        let store = &store;
+        let creation = scope.spawn(move || {
+            let mut txn = begin(store, &writes, true);
+            let voted = txn.vote();
+            (voted, txn.resolutions().to_vec())
+        });
+        // The creation waits for the lock of the positions, so the finish
+        // of the holder hands it off, and stops with its commit in flight.
+        wait_until(|| clock.waits.load(Ordering::SeqCst) > waits);
+        gate.armed.store(true, Ordering::SeqCst);
+        let finish = scope.spawn(move || holder.finish());
+        // Open the gate when the creation voted, or when it waits again,
+        // so that a wrong path does not hang the test.
+        let waited = clock.waits.load(Ordering::SeqCst);
+        wait_until(|| {
+            creation.is_finished()
+                || (gate.held.load(Ordering::SeqCst)
+                    && clock.waits.load(Ordering::SeqCst) > waited + 1)
+        });
+        gate.open.store(true, Ordering::SeqCst);
+        finish.join().unwrap().unwrap();
+        let (voted, entries) = creation.join().unwrap();
+        match voted {
+            Err(ZoeError::Conflict { oid }) => assert_eq!(oid, site.order),
+            other => panic!("expected a conflict on the order, got {other:?}"),
+        }
+        assert_eq!(
+            list_entry(&entries, site).unwrap().outcome,
+            Resolved::Undecided("a record of the positions merged onto a commit in flight")
+        );
+    });
+    assert!(store.lock_table_is_empty());
 }
