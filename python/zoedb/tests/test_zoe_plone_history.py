@@ -467,12 +467,121 @@ def test_folder_orders_writes_the_modes_only_on_a_change():
 
 
 def test_the_other_switches_take_the_new_value():
-    stored = {"version": 2, "split_merges": "on", "classes": {}}
+    stored = {"version": 2, "posting_dicts": "on", "classes": {}}
     assert (
-        merges.compose(stored, {"classes": {}, "split_merges": "off"})["split_merges"]
+        merges.compose(stored, {"classes": {}, "posting_dicts": "off"})["posting_dicts"]
         == "off"
     )
-    assert merges.compose(stored, {"classes": {}})["split_merges"] == "on"
+    assert merges.compose(stored, {"classes": {}})["posting_dicts"] == "on"
+
+
+def test_the_sites_compose_folder_orders_and_split_merges():
+    assert set(merges.SITE_SWITCHES) == {"folder_orders", "split_merges"}
+    assert merges.SITE_MODES == merges.SITE_SWITCHES["folder_orders"]
+    assert len(set(merges.SITE_SWITCHES.values())) == 2
+
+
+def test_lowest_mode_names_its_switch(caplog):
+    modes = {}
+    assert merges.lowest_mode(modes, "/a", "off", "split_merges") == "off"
+    with caplog.at_level("WARNING", logger="zoe.plone"):
+        assert merges.lowest_mode(modes, "/b", "on", "split_merges") == "off"
+    assert "/b asks for split_merges on" in caplog.text
+
+
+FOLDER = "plone.app.contenttypes.content.Folder"
+SITE_ROOT = "Products.CMFPlone.Portal.PloneSite"
+DOCUMENT = "plone.app.contenttypes.content.Document"
+ADDON = "m.AddonFolder"
+CONTAINERS = (FOLDER, SITE_ROOT)
+
+
+def profile_overrides():
+    """Return the overrides of the profile ``zoe.plone:default``."""
+    import importlib.resources
+    import json
+
+    path = importlib.resources.files("zoe.plone") / "profiles" / "default"
+    return json.loads((path / merges.OVERRIDES).read_text())
+
+
+def stock_derived(blocked=()):
+    """Return a derived policy of a stock site with an add-on container
+    class, as `merges.derive` gives it, and the names of its classes."""
+    typed = [
+        (name, {"title"}, [(opaque, set())] if name in blocked else [], {})
+        for name in (FOLDER, SITE_ROOT, DOCUMENT, ADDON)
+    ]
+    classes = merges.class_entries(typed)
+    return {"classes": classes}, set(classes)
+
+
+def test_the_profile_switches_on_the_stock_containers_and_the_split_merge():
+    derived, names = stock_derived()
+    result, removed = merges.apply_overrides(derived, profile_overrides(), names)
+    assert removed == set()
+    assert result["folder_orders"] == "on"
+    assert result["split_merges"] == "on"
+    for name in CONTAINERS:
+        assert result["classes"][name] == {
+            **derived["classes"][name],
+            "tier2": "on",
+        }
+        assert result["classes"][name]["fields"] == {"modification_date": "max"}
+    # The other classes, an add-on container among them, keep shadow.
+    assert result["classes"][DOCUMENT] == derived["classes"][DOCUMENT]
+    assert result["classes"][ADDON] == derived["classes"][ADDON]
+    assert result["classes"][DOCUMENT]["tier2"] == "shadow"
+
+
+def test_the_profile_keeps_a_blocked_container_blocked(caplog):
+    derived, names = stock_derived(blocked={FOLDER})
+    result, _ = merges.apply_overrides(
+        derived, profile_overrides(), names, blocked={FOLDER}
+    )
+    assert result["classes"][FOLDER] == {"tier2": "off", "blocked": True}
+    assert result["classes"][SITE_ROOT]["tier2"] == "on"
+    assert f"{FOLDER} stays blocked" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "later, expected",
+    [
+        ({"tier2": "shadow"}, {FOLDER: "shadow", SITE_ROOT: "shadow"}),
+        ({"tier2": "on"}, {FOLDER: "on", SITE_ROOT: "on", DOCUMENT: "on"}),
+        ({"classes": {FOLDER: {"tier2": "off"}}}, {FOLDER: "off", SITE_ROOT: "on"}),
+    ],
+)
+def test_a_later_profile_sets_the_mode_of_the_containers(later, expected):
+    derived, names = stock_derived()
+    policy_ = derived
+    for overrides in (profile_overrides(), later):
+        policy_, _ = merges.apply_overrides(policy_, overrides, names)
+    found = {name: policy_["classes"][name]["tier2"] for name in expected}
+    assert found == expected
+
+
+def test_a_later_profile_switches_the_split_merge_off():
+    derived, names = stock_derived()
+    policy_ = derived
+    for overrides in (profile_overrides(), {"split_merges": "off"}):
+        policy_, _ = merges.apply_overrides(policy_, overrides, names)
+    assert policy_["split_merges"] == "off"
+    assert policy_["folder_orders"] == "on"
+
+
+def test_the_profile_on_a_site_without_a_container_type_adds_a_bare_entry():
+    derived, names = stock_derived()
+    del derived["classes"][FOLDER]
+    names.discard(FOLDER)
+    result, _ = merges.apply_overrides(derived, profile_overrides(), names)
+    # No fields: each field, `modification_date` too, is strict.
+    assert result["classes"][FOLDER] == {"tier2": "on"}
+    # The composition with a site that derives the class adds its fields.
+    other, _ = merges.apply_overrides(stock_derived()[0], profile_overrides())
+    composed = merges.compose(other, result)
+    assert composed["classes"][FOLDER]["fields"] == {"modification_date": "max"}
+    assert composed["classes"][FOLDER]["tier2"] == "on"
 
 
 class Mode(enum.StrEnum):

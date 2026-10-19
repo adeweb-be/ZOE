@@ -28,14 +28,15 @@ the overrides of each profile in turn, composes the result with the policy
 in the database, and writes it with `zoe.policy.install`. The composition
 keeps the classes of other sites of the database: the coupled groups of a
 class are the union of both, its fields take both, a blocked class stays
-blocked, and the other keys take the new value. The switch
-``folder_orders``, the one switch that a profile sets, is the exception:
-the database keeps the latest mode that each site asked for, and the
-policy takes the lowest of them (``off``, then ``shadow``, then ``on``),
-so an ``off`` of one site lasts when another site imports the profile,
-and a site that raises its own mode raises the policy when no other site
-asks for less (`lowest_mode`). A mode for the whole database goes through
-the overrides of a site: an ``off`` that `zoe.policy.install` writes lasts
+blocked, and the other keys take the new value. The switches of
+`SITE_SWITCHES`, ``folder_orders`` and ``split_merges``, the switches that
+the profile ``zoe.plone:default`` sets, are the exception: for each, the
+database keeps the latest mode that each site asked for, and the policy
+takes the lowest of them (``off``, then ``shadow``, then ``on``), so an
+``off`` of one site lasts when another site imports the profile, and a
+site that raises its own mode raises the policy when no other site asks
+for less (`lowest_mode`). A mode for the whole database goes through the
+overrides of a site: an ``off`` that `zoe.policy.install` writes lasts
 only until the next `update_policy` of a site that asks for more, which
 replaces it with a warning. `update_policy` also drops the mode of a site
 that is gone (`gone_sites`): a removed site, or the old path of a renamed
@@ -47,17 +48,11 @@ The overrides are a JSON object with these keys, each optional:
 
 - ``tier2``: the mode of the derived entries, ``shadow`` by default, as a
   class merges only after shadow mode showed that its merges are right;
+  it sets the mode of every derived class, the container classes too;
 - ``structural_merges``, ``posting_dicts``, ``split_merges`` and
-  ``folder_orders``: the switches of tier 1. The overrides of the profile
-  ``zoe.plone:default`` set ``folder_orders`` to ``on`` (the order merge of
-  ADR 0052); they set no other switch, so the split merge of ADR 0048
-  stays off until an override or `zoe.policy.install` sets it. The profile
-  alone merges no order: its derived entries stay in shadow mode, the
-  record of a folder conflicts before its order, and ``split_merges`` is
-  off. A site gets the order merge once its overrides switch on the entries
-  of its container classes, and ``split_merges`` where the positions of a
-  folder split. An override of ``folder_orders`` in a later profile of a
-  site replaces the mode of that site; the policy of the database takes the
+  ``folder_orders``: the switches of tier 1. An override of
+  ``folder_orders`` or ``split_merges`` in a later profile of a site
+  replaces the mode of that site; the policy of the database takes the
   lowest mode of its sites;
 - ``classes``: entries by class name; an entry changes the keys that it
   gives, its ``fields`` add to the derived ones, and its ``coupled`` groups
@@ -66,6 +61,23 @@ The overrides are a JSON object with these keys, each optional:
   several: it can neither remove it, nor switch it on, nor give it
   ``"blocked": false``; the class stays blocked, and the import logs a
   warning.
+
+The overrides of the profile ``zoe.plone:default`` set ``folder_orders``
+and ``split_merges`` to ``on``, and switch on the entries of the two
+Dexterity container classes of stock Plone 6.1:
+``plone.app.contenttypes.content.Folder`` and
+``Products.CMFPlone.Portal.PloneSite``. These entries keep their derived
+fields, so ``modification_date`` takes ``max``. So the profile alone gives
+the order merge of ADR 0052 on a stock site: a creation in a folder
+changes only ``modification_date`` of the folder. This is an exception to
+shadow mode first, for these two classes only (ADR 0046, section 9). The
+other derived entries stay in shadow mode. An add-on container class keeps
+its derived entry in shadow mode, until the overrides of its site switch it
+on. A blocked container class stays blocked. A later profile of the site
+lowers the container classes with its key ``tier2`` or with their entries.
+On a site with no type of a container class, the override adds the entry
+``{"tier2": "on"}``, with no fields and no coupled groups. The profile
+``zoe.plone:uninstall`` changes no switch and no entry.
 
 Only `derive`, `site_overrides` and `gone_sites` (Acquisition),
 `update_policy`, `profile_of`, `fti_modified` (zope.component.hooks) and
@@ -106,11 +118,16 @@ DEFAULT_MODE = "shadow"
 FIELDS = {"modification_date": "max"}
 #: The modes of a switch, from the lowest.
 LOWER = ("off", "shadow", "on")
-#: The switch whose mode the sites of a database compose to the lowest.
-SITE_SWITCH = "folder_orders"
-#: The name of the root of the database that keeps, for `SITE_SWITCH`, the
-#: latest mode that each site asked for, by the path of the site.
-SITE_MODES = "zoe.plone.folder_orders"
+#: The switches whose modes the sites of a database compose to the lowest,
+#: each with the name of the root of the database that keeps the latest
+#: mode that each site asked for, by the path of the site.
+SITE_SWITCHES = {
+    "folder_orders": "zoe.plone.folder_orders",
+    "split_merges": "zoe.plone.split_merges",
+}
+#: The name of the root of the database that keeps the modes of
+#: ``folder_orders``.
+SITE_MODES = SITE_SWITCHES["folder_orders"]
 #: The attribute of the site that keeps the overrides of each profile.
 SITE_OVERRIDES = "_zoe_merge_overrides"
 
@@ -373,13 +390,13 @@ def site_overrides(site, create=False):
     return kept
 
 
-def lowest_mode(modes, site, mode):
-    """Record `mode`, the latest mode of `SITE_SWITCH` that the site of the
-    path `site` asks for, in `modes`, a mapping of site path to mode, and
-    return the lowest mode of every site. `None` for `mode` removes the
-    site. Return `None` when no site gives a mode. Log a warning when the
-    mode of another site is lower than `mode`. Change `modes` only when the
-    mode of the site changes."""
+def lowest_mode(modes, site, mode, switch="folder_orders"):
+    """Record `mode`, the latest mode of the switch `switch` that the site
+    of the path `site` asks for, in `modes`, a mapping of site path to
+    mode, and return the lowest mode of every site. `None` for `mode`
+    removes the site. Return `None` when no site gives a mode. Log a
+    warning when the mode of another site is lower than `mode`. Change
+    `modes` only when the mode of the site changes."""
     # Write `modes` only on a change, so that an update that changes no
     # mode does not store the mapping again.
     if mode is None:
@@ -395,7 +412,7 @@ def lowest_mode(modes, site, mode):
         logger.warning(
             "%s asks for %s %s, and the database keeps %s for %s",
             site,
-            SITE_SWITCH,
+            switch,
             mode,
             lowest,
             ", ".join(lower),
@@ -460,29 +477,31 @@ def update_policy(site):
     root = connection.root()
     from persistent.mapping import PersistentMapping
 
-    modes = root.get(SITE_MODES)
-    if modes is None:
-        modes = root[SITE_MODES] = PersistentMapping()
     path = "/".join(site.getPhysicalPath())
-    for gone in gone_sites(site, modes, path):
-        logger.info("%s is gone: the database drops its mode of %s", gone, SITE_SWITCH)
-        del modes[gone]
-    lowest = lowest_mode(modes, path, policy.get(SITE_SWITCH))
     stored = merge_policy.read(connection)
-    if lowest is not None:
-        policy[SITE_SWITCH] = lowest
+    for switch, name in SITE_SWITCHES.items():
+        modes = root.get(name)
+        if modes is None:
+            modes = root[name] = PersistentMapping()
+        for gone in gone_sites(site, modes, path):
+            logger.info("%s is gone: the database drops its mode of %s", gone, switch)
+            del modes[gone]
+        lowest = lowest_mode(modes, path, policy.get(switch), switch)
+        if lowest is None:
+            continue
+        policy[switch] = lowest
         # The policy of the database can hold a lower mode than its sites
         # ask for now: a mode that `zoe.policy.install` wrote, or the mode
         # of a site that raised its mode or is gone. The update replaces
         # it, with a warning.
-        kept = (stored or {}).get(SITE_SWITCH)
+        kept = (stored or {}).get(switch)
         if kept is not None and LOWER.index(kept) < LOWER.index(lowest):
             logger.warning(
                 "%s raises %s from %s, the mode of the policy of the database, "
                 "to %s, the lowest mode of its sites: a mode for the whole "
                 "database goes in the overrides of a site",
                 path,
-                SITE_SWITCH,
+                switch,
                 kept,
                 lowest,
             )
