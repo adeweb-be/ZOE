@@ -164,13 +164,18 @@ def index_entries(root: Path, extra: dict[str, dict] | None = None) -> list[dict
     return entries
 
 
-def write_entries(root: Path, entries: list[dict]) -> Path:
-    """Write index.json of version 2 with entries."""
-    index = root / "index.json"
-    index.write_text(
+def index_text(entries: list[dict]) -> str:
+    """Return the text of index.json of version 2 with entries."""
+    return (
         json.dumps({"index_version": INDEX_VERSION, "results": entries}, indent=2)
         + "\n"
     )
+
+
+def write_entries(root: Path, entries: list[dict]) -> Path:
+    """Write index.json of version 2 with entries."""
+    index = root / "index.json"
+    index.write_text(index_text(entries))
     return index
 
 

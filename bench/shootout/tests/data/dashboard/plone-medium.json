@@ -1,0 +1,889 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "core_kinds": null,
+    "cpu_pinning": "taskset",
+    "durability": {
+      "zeo": "fsync(2) in FileStorage",
+      "zoe": "fdatasync(2)"
+    },
+    "store_disk": {
+      "rotational": false,
+      "filesystem": "ext4"
+    }
+  },
+  "python": {
+    "implementation": "cpython",
+    "version": "3.13.9",
+    "free_threaded": false,
+    "gil_enabled": true
+  },
+  "software": {
+    "Plone": "6.1.3",
+    "Products.CMFPlone": "6.1.3",
+    "Zope": "5.13",
+    "ZODB": "6.0.1",
+    "ZEO": "6.0.0",
+    "zoedb": "0.1.0",
+    "zoe": "zoe 0.1.0",
+    "locust": "2.46.7"
+  },
+  "run": {
+    "started": "2026-01-02T03:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "dirty": false
+  },
+  "fixture": {
+    "name": "medium-8ecaa36fc3c4",
+    "preset": "medium",
+    "objects": 3796,
+    "catalog_entries": 3652,
+    "spec": {
+      "seed": 1,
+      "sections": 8,
+      "depth": 3,
+      "fanout": 3,
+      "documents": 10,
+      "news": 3,
+      "files": 1,
+      "file_sizes": [
+        16384,
+        131072,
+        1048576
+      ],
+      "paragraphs": [
+        3,
+        8
+      ],
+      "words": [
+        40,
+        120
+      ],
+      "vocabulary": 2000,
+      "private": 0.2,
+      "pending": 0.1,
+      "editors": 48,
+      "members": 32,
+      "hot": 4,
+      "shared": 48
+    }
+  },
+  "settings": {
+    "instances": 2,
+    "threads": 2,
+    "zodb_cache_objects": 30000,
+    "pool_size": 7,
+    "client_cache": "128MB",
+    "server_cpus": "0",
+    "zope_cpus": [
+      "1",
+      "2"
+    ],
+    "locust_cpus": "3",
+    "probe": true,
+    "zeo_fsync": "plain",
+    "zoe_cache_size": null,
+    "zoe_compression": null,
+    "warmup_seconds": 60.0,
+    "warmup_users": 8,
+    "trim_seconds": 5.0,
+    "think": "0,0",
+    "client_retries": 0
+  },
+  "stacks": [
+    {
+      "name": "zeo",
+      "description": "ZEO 6 server (runzeo, FileStorage) and ZEO.ClientStorage",
+      "server": "zeo",
+      "client": "zeoclient",
+      "native": null,
+      "switches": {
+        "backends": [],
+        "member_properties": false,
+        "split_merges": null,
+        "folder_orders": null
+      },
+      "merge_policy": null
+    },
+    {
+      "name": "zoe-native-qi-kv",
+      "description": "zoe-native-qi with the locking backend of zoe.plone (ADR 0043) and the properties of the members and groups in records of zoe.plone, which merge a login at the vote (ADR 0046)",
+      "server": "zoe",
+      "client": "zoeclient",
+      "native": true,
+      "switches": {
+        "backends": [
+          "indexing",
+          "locking"
+        ],
+        "member_properties": true,
+        "split_merges": "on",
+        "folder_orders": "on"
+      },
+      "merge_policy": {
+        "version": 3,
+        "classes": {
+          "plone.app.contenttypes.content.Folder": {
+            "tier2": "on",
+            "default": "strict",
+            "fields": {
+              "modification_date": "max"
+            }
+          },
+          "zoe.plone.properties.PrincipalProperties": {
+            "tier2": "on",
+            "default": "strict",
+            "fields": {
+              "login_time": "max",
+              "last_login_time": "max"
+            }
+          }
+        },
+        "split_merges": "on",
+        "folder_orders": "on"
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "browse",
+      "description": "rendered pages: folders, documents, news, files, breadcrumbs; anonymous and logged-in members",
+      "interface": [
+        "ui"
+      ],
+      "mix": {
+        "browse_anon": 1,
+        "browse_member": 1
+      },
+      "background": []
+    },
+    {
+      "name": "edit",
+      "description": "the edit form of Plone on Documents, each user its own Documents",
+      "interface": [
+        "ui"
+      ],
+      "mix": {
+        "edit": 1
+      },
+      "background": []
+    },
+    {
+      "name": "create-spread",
+      "description": "the add form of Plone, each user in folders of its own section",
+      "interface": [
+        "ui"
+      ],
+      "mix": {
+        "create_spread": 1
+      },
+      "background": []
+    }
+  ],
+  "steps": [
+    {
+      "scenario": "browse",
+      "stack": "zeo",
+      "step": 0,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 1836,
+      "ok_per_second": {
+        "median": 61.2,
+        "min": 61.2,
+        "max": 61.2
+      },
+      "p50_seconds": 0.058,
+      "p95_seconds": 0.121,
+      "p99_seconds": 0.188,
+      "p99_reliable": true,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 14.0,
+      "server_cpu_ms_per_op": 1.5,
+      "store_write_kb_per_op": 0.0,
+      "objects_loaded_per_second": 950.0,
+      "objects_stored_per_second": 0.0
+    },
+    {
+      "scenario": "browse",
+      "stack": "zeo",
+      "step": 1,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 3552,
+      "ok_per_second": {
+        "median": 118.4,
+        "min": 118.4,
+        "max": 118.4
+      },
+      "p50_seconds": 0.068,
+      "p95_seconds": 0.171,
+      "p99_seconds": 0.278,
+      "p99_reliable": true,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 15.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 0.0,
+      "objects_loaded_per_second": 1900.0,
+      "objects_stored_per_second": 0.0
+    },
+    {
+      "scenario": "browse",
+      "stack": "zoe-native-qi-kv",
+      "step": 0,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 1995,
+      "ok_per_second": {
+        "median": 66.5,
+        "min": 66.5,
+        "max": 66.5
+      },
+      "p50_seconds": 0.058,
+      "p95_seconds": 0.121,
+      "p99_seconds": 0.188,
+      "p99_reliable": true,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 14.0,
+      "server_cpu_ms_per_op": 1.5,
+      "store_write_kb_per_op": 0.0,
+      "objects_loaded_per_second": 950.0,
+      "objects_stored_per_second": 0.0
+    },
+    {
+      "scenario": "browse",
+      "stack": "zoe-native-qi-kv",
+      "step": 1,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 3957,
+      "ok_per_second": {
+        "median": 131.9,
+        "min": 131.9,
+        "max": 131.9
+      },
+      "p50_seconds": 0.068,
+      "p95_seconds": 0.171,
+      "p99_seconds": 0.278,
+      "p99_reliable": true,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 15.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 0.0,
+      "objects_loaded_per_second": 1900.0,
+      "objects_stored_per_second": 0.0
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 0,
+      "users": 1,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 63,
+      "ok_per_second": {
+        "median": 2.1,
+        "min": 2.1,
+        "max": 2.1
+      },
+      "p50_seconds": 0.2,
+      "p95_seconds": 0.32,
+      "p99_seconds": 0.38,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 86.1,
+      "objects_stored_per_second": 12.6
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 1,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 179,
+      "ok_per_second": {
+        "median": 5.9,
+        "min": 5.9,
+        "max": 5.9
+      },
+      "p50_seconds": 0.285,
+      "p95_seconds": 0.456,
+      "p99_seconds": 0.541,
+      "p99_reliable": false,
+      "failure_rate": 0.011,
+      "first_attempt_share": 0.88,
+      "conflicts_per_1000_ops": 120.5,
+      "exhausted": 2,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 241.9,
+      "objects_stored_per_second": 35.4
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 2,
+      "users": 8,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 227,
+      "ok_per_second": {
+        "median": 7.4,
+        "min": 7.4,
+        "max": 7.4
+      },
+      "p50_seconds": 0.454,
+      "p95_seconds": 0.726,
+      "p99_seconds": 0.863,
+      "p99_reliable": false,
+      "failure_rate": 0.022,
+      "first_attempt_share": 0.83,
+      "conflicts_per_1000_ops": 180.2,
+      "exhausted": 5,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 303.4,
+      "objects_stored_per_second": 44.4
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 3,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 275,
+      "ok_per_second": {
+        "median": 8.8,
+        "min": 8.8,
+        "max": 8.8
+      },
+      "p50_seconds": 0.764,
+      "p95_seconds": 1.222,
+      "p99_seconds": 1.452,
+      "p99_reliable": false,
+      "failure_rate": 0.04,
+      "first_attempt_share": 0.77,
+      "conflicts_per_1000_ops": 260.7,
+      "exhausted": 11,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 360.8,
+      "objects_stored_per_second": 52.8
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 4,
+      "users": 32,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 272,
+      "ok_per_second": {
+        "median": 8.1,
+        "min": 8.1,
+        "max": 8.1
+      },
+      "p50_seconds": 1.659,
+      "p95_seconds": 2.654,
+      "p99_seconds": 3.152,
+      "p99_reliable": false,
+      "failure_rate": 0.107,
+      "first_attempt_share": 0.66,
+      "conflicts_per_1000_ops": 410.3,
+      "exhausted": 29,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 332.1,
+      "objects_stored_per_second": 48.6
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 0,
+      "users": 1,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 69,
+      "ok_per_second": {
+        "median": 2.3,
+        "min": 2.3,
+        "max": 2.3
+      },
+      "p50_seconds": 0.183,
+      "p95_seconds": 0.293,
+      "p99_seconds": 0.348,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 94.3,
+      "objects_stored_per_second": 13.8
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 1,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 243,
+      "ok_per_second": {
+        "median": 8.1,
+        "min": 8.1,
+        "max": 8.1
+      },
+      "p50_seconds": 0.207,
+      "p95_seconds": 0.331,
+      "p99_seconds": 0.393,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 332.1,
+      "objects_stored_per_second": 48.6
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 2,
+      "users": 8,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 348,
+      "ok_per_second": {
+        "median": 11.6,
+        "min": 11.6,
+        "max": 11.6
+      },
+      "p50_seconds": 0.29,
+      "p95_seconds": 0.464,
+      "p99_seconds": 0.551,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 475.6,
+      "objects_stored_per_second": 69.6
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 3,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 426,
+      "ok_per_second": {
+        "median": 14.2,
+        "min": 14.2,
+        "max": 14.2
+      },
+      "p50_seconds": 0.473,
+      "p95_seconds": 0.757,
+      "p99_seconds": 0.899,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 0.999,
+      "conflicts_per_1000_ops": 1.2,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 582.2,
+      "objects_stored_per_second": 85.2
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 4,
+      "users": 32,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 450,
+      "ok_per_second": {
+        "median": 15.0,
+        "min": 15.0,
+        "max": 15.0
+      },
+      "p50_seconds": 0.896,
+      "p95_seconds": 1.434,
+      "p99_seconds": 1.702,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 0.996,
+      "conflicts_per_1000_ops": 3.5,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 24.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 615.0,
+      "objects_stored_per_second": 90.0
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "step": 0,
+      "users": 1,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 48,
+      "ok_per_second": {
+        "median": 1.6,
+        "min": 1.6,
+        "max": 1.6
+      },
+      "p50_seconds": 0.263,
+      "p95_seconds": 0.421,
+      "p99_seconds": 0.5,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 65.6,
+      "objects_stored_per_second": 22.4
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "step": 1,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 136,
+      "ok_per_second": {
+        "median": 4.4,
+        "min": 4.4,
+        "max": 4.4
+      },
+      "p50_seconds": 0.382,
+      "p95_seconds": 0.611,
+      "p99_seconds": 0.726,
+      "p99_reliable": false,
+      "failure_rate": 0.029,
+      "first_attempt_share": 0.79,
+      "conflicts_per_1000_ops": 210.0,
+      "exhausted": 4,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 180.4,
+      "objects_stored_per_second": 61.6
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "step": 2,
+      "users": 8,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 168,
+      "ok_per_second": {
+        "median": 5.2,
+        "min": 5.2,
+        "max": 5.2
+      },
+      "p50_seconds": 0.646,
+      "p95_seconds": 1.034,
+      "p99_seconds": 1.227,
+      "p99_reliable": false,
+      "failure_rate": 0.071,
+      "first_attempt_share": 0.68,
+      "conflicts_per_1000_ops": 330.4,
+      "exhausted": 12,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 213.2,
+      "objects_stored_per_second": 72.8
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "step": 3,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 196,
+      "ok_per_second": {
+        "median": 5.5,
+        "min": 5.5,
+        "max": 5.5
+      },
+      "p50_seconds": 1.222,
+      "p95_seconds": 1.955,
+      "p99_seconds": 2.322,
+      "p99_reliable": false,
+      "failure_rate": 0.158,
+      "first_attempt_share": 0.55,
+      "conflicts_per_1000_ops": 480.9,
+      "exhausted": 31,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 225.5,
+      "objects_stored_per_second": 77.0
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "step": 4,
+      "users": 32,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 221,
+      "ok_per_second": {
+        "median": 4.9,
+        "min": 4.9,
+        "max": 4.9
+      },
+      "p50_seconds": 2.743,
+      "p95_seconds": 4.389,
+      "p99_seconds": 5.212,
+      "p99_reliable": false,
+      "failure_rate": 0.335,
+      "first_attempt_share": 0.43,
+      "conflicts_per_1000_ops": 610.2,
+      "exhausted": 74,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 200.9,
+      "objects_stored_per_second": 68.6
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "step": 0,
+      "users": 1,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 51,
+      "ok_per_second": {
+        "median": 1.7,
+        "min": 1.7,
+        "max": 1.7
+      },
+      "p50_seconds": 0.247,
+      "p95_seconds": 0.395,
+      "p99_seconds": 0.469,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 69.7,
+      "objects_stored_per_second": 23.8
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "step": 1,
+      "users": 4,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 186,
+      "ok_per_second": {
+        "median": 6.2,
+        "min": 6.2,
+        "max": 6.2
+      },
+      "p50_seconds": 0.271,
+      "p95_seconds": 0.434,
+      "p99_seconds": 0.515,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 254.2,
+      "objects_stored_per_second": 86.8
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "step": 2,
+      "users": 8,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 303,
+      "ok_per_second": {
+        "median": 10.1,
+        "min": 10.1,
+        "max": 10.1
+      },
+      "p50_seconds": 0.333,
+      "p95_seconds": 0.533,
+      "p99_seconds": 0.633,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 0.998,
+      "conflicts_per_1000_ops": 2.1,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 414.1,
+      "objects_stored_per_second": 141.4
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "step": 3,
+      "users": 16,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 403,
+      "ok_per_second": {
+        "median": 13.4,
+        "min": 13.4,
+        "max": 13.4
+      },
+      "p50_seconds": 0.501,
+      "p95_seconds": 0.802,
+      "p99_seconds": 0.952,
+      "p99_reliable": false,
+      "failure_rate": 0.002,
+      "first_attempt_share": 0.995,
+      "conflicts_per_1000_ops": 4.8,
+      "exhausted": 1,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 549.4,
+      "objects_stored_per_second": 187.6
+    },
+    {
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "step": 4,
+      "users": 32,
+      "seconds": 30.0,
+      "repetitions": 1,
+      "operations": 446,
+      "ok_per_second": {
+        "median": 14.8,
+        "min": 14.8,
+        "max": 14.8
+      },
+      "p50_seconds": 0.908,
+      "p95_seconds": 1.453,
+      "p99_seconds": 1.725,
+      "p99_reliable": false,
+      "failure_rate": 0.004,
+      "first_attempt_share": 0.99,
+      "conflicts_per_1000_ops": 9.6,
+      "exhausted": 2,
+      "zope_cpu_ms_per_op": 41.0,
+      "server_cpu_ms_per_op": 1.0,
+      "store_write_kb_per_op": 18.0,
+      "objects_loaded_per_second": 606.8,
+      "objects_stored_per_second": 207.2
+    }
+  ],
+  "runs": [
+    {
+      "id": "20260102T030000Z-browse-zeo-r0",
+      "scenario": "browse",
+      "stack": "zeo",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260102T030500Z-browse-zoe-native-qi-kv-r0",
+      "scenario": "browse",
+      "stack": "zoe-native-qi-kv",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260102T031000Z-edit-zeo-r0",
+      "scenario": "edit",
+      "stack": "zeo",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260102T031500Z-edit-zoe-native-qi-kv-r0",
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260102T032000Z-create-spread-zeo-r0",
+      "scenario": "create-spread",
+      "stack": "zeo",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260102T032500Z-create-spread-zoe-native-qi-kv-r0",
+      "scenario": "create-spread",
+      "stack": "zoe-native-qi-kv",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    }
+  ]
+}

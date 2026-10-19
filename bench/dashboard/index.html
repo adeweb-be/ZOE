@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZOE benchmarks</title>
+<meta name="description" content="The published benchmark results of ZOE against ZEO 6: the Plone end-to-end benchmark, the native gate, the client benchmark and zodbshootout.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232a78d6'/%3E%3Cpath d='M3 12l3-4 3 2 4-6' stroke='%23fff' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha512-CQBWl4fJHWbryGE+Pc7UAxWMUMNMWzWxF4SQo9CgkJIN1kx6djDQZjh3Y8SZ1d+6I+1zze6Z7kHXO7q3UyZAWw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f3f0;
+    --panel: #fcfcfb;
+    --text: #0b0b0b;
+    --text-2: #52514e;
+    --muted: #66655f;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.12);
+    --accent: #1c5cab;
+    --chip: #ecebe6;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+    --series-6: #008300;
+    --series-7: #6250d6;
+    --series-8: #e34948;
+    --series-other: #898781;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0d0d0d;
+      --panel: #1a1a19;
+      --text: #f0efec;
+      --text-2: #c3c2b7;
+      --muted: #a3a29a;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.12);
+      --accent: #86b6ef;
+      --chip: #262624;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
+      --series-6: #008300;
+      --series-7: #9085e9;
+      --series-8: #e66767;
+      --series-other: #898781;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d0d0d;
+    --panel: #1a1a19;
+    --text: #f0efec;
+    --text-2: #c3c2b7;
+    --muted: #a3a29a;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.12);
+    --accent: #86b6ef;
+    --chip: #262624;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+    --series-other: #898781;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.2rem; margin: 0 0 4px; }
+  h3 { font-size: 1.05rem; margin: 0; }
+  h4 { font-size: 0.95rem; margin: 20px 0 8px; }
+  h5 { font-size: 0.85rem; margin: 16px 0 4px; color: var(--text-2); }
+  p { margin: 0 0 8px; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
+  code { overflow-wrap: anywhere; }
+  pre {
+    margin: 8px 0; padding: 12px; overflow: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .lead { color: var(--text-2); max-width: 70ch; }
+  .toc { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 12px 0 16px; font-size: 0.9rem; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin-bottom: 24px;
+  }
+  .controls label, .pick {
+    display: flex; flex-direction: column; gap: 4px; min-width: 0;
+    font-size: 0.8rem; color: var(--text-2);
+  }
+  .controls label { flex: 1 1 160px; }
+  select {
+    font: inherit; font-size: 0.9rem; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+    width: 100%; max-width: 100%;
+  }
+  .family { margin: 0 0 40px; }
+  .family > .note { color: var(--text-2); max-width: 80ch; }
+  .group {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; margin: 16px 0; min-width: 0;
+  }
+  .group-head {
+    display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between;
+    gap: 8px 16px; margin-bottom: 8px;
+  }
+  .group-head .pick { flex: 0 1 380px; }
+  .meta { color: var(--text-2); font-size: 0.9rem; overflow-wrap: anywhere; }
+  .desc { color: var(--text-2); font-size: 0.9rem; margin: 0 0 6px; }
+  .note { font-size: 0.85rem; color: var(--text-2); margin-top: 12px; }
+  .empty {
+    border: 1px dashed var(--border); border-radius: 8px; padding: 24px 16px;
+    text-align: center; color: var(--text-2); margin: 16px 0;
+  }
+  .stacks { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  .stack { border-left: 3px solid var(--border); padding-left: 12px; min-width: 0; }
+  .stack-name { font-weight: 600; }
+  .chips { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips li {
+    background: var(--chip); border-radius: 999px; padding: 2px 10px;
+    font-size: 0.8rem; overflow-wrap: anywhere;
+  }
+  details { margin: 8px 0; }
+  summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; }
+  details pre { max-height: 22rem; }
+  .method { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 8px; }
+  .kv { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 2px 16px; margin: 0; font-size: 0.85rem; }
+  .kv dt { color: var(--text-2); overflow-wrap: anywhere; }
+  .kv dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+  .kv .kv { font-size: 1em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 16px; margin-bottom: 16px; }
+  figure.card {
+    margin: 0; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; min-width: 0;
+  }
+  figure.card figcaption { font-size: 0.9rem; font-weight: 600; margin-bottom: 6px; }
+  .chart { position: relative; height: 240px; }
+  .chart .note { padding-top: 96px; text-align: center; }
+  .table-wrap {
+    overflow-x: auto; margin: 8px 0 16px; max-width: 100%;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  }
+  table {
+    border-collapse: separate; border-spacing: 0; width: 100%;
+    font-size: 0.8rem; font-variant-numeric: tabular-nums;
+  }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--grid); text-align: right; vertical-align: top; }
+  thead th {
+    color: var(--text-2); font-weight: 600; vertical-align: bottom;
+    white-space: normal; min-width: 3.5em; max-width: 7.5em; line-height: 1.3;
+  }
+  td { white-space: nowrap; }
+  th:first-child, td:first-child, th.text, td.text { text-align: left; }
+  tbody th[scope="row"], thead th:first-child {
+    position: sticky; left: 0; z-index: 1; background: var(--panel);
+    white-space: nowrap; font-weight: 600; min-width: 0; max-width: none;
+  }
+  tr.group-row th {
+    text-align: left; font-weight: 600; color: var(--text);
+    background: var(--chip); border-bottom: 1px solid var(--grid);
+  }
+  tr.group-row th span {
+    position: sticky; left: 10px; display: inline-block;
+    white-space: normal; max-width: calc(100vw - 100px);
+  }
+  td .sub { display: block; font-size: 0.75rem; color: var(--muted); }
+  @media (max-width: 480px) {
+    th, td { padding: 6px; }
+  }
+  td .ratio { color: var(--text-2); }
+  .swatch {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 6px; vertical-align: baseline;
+  }
+  .tag + .tag::before { content: ", "; color: var(--text-2); font-weight: 400; }
+  .reproduce { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .reproduce pre { background: var(--bg); }
+  footer { margin-top: 24px; font-size: 0.85rem; color: var(--text-2); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>ZOE benchmarks</h1>
+    <p class="lead">The published results of ZOE, the Zope Object Engine, against ZEO 6. Each table shows the numbers of one result document. The page rounds them to three significant digits, scales their units (seconds to milliseconds, shares to percent) and computes the ratio of each B5 number to zeo; the documents hold the full values. The results are numbers from a synthetic corpus.</p>
+    <nav class="toc" aria-label="Sections">
+      <a href="#plone">Plone end-to-end</a>
+      <a href="#native">Native gate</a>
+      <a href="#client">Client benchmark</a>
+      <a href="#shootout">zodbshootout</a>
+      <a href="#reproduce">Reproduce</a>
+    </nav>
+  </header>
+
+  <div class="controls" id="controls" hidden>
+    <label>Machine <select id="machine"></select></label>
+    <label>Python <select id="python"></select></label>
+  </div>
+
+  <div id="status" class="empty">Loading the results…</div>
+  <noscript><div class="empty">This page needs JavaScript to read the results.</div></noscript>
+
+  <section class="family" id="plone" hidden>
+    <h2>Plone end-to-end (B5)</h2>
+    <p class="note">Locust against a Plone site: each simulated user waits for its response before its next operation. Each stack runs the same Plone on the same machine. One result per fixture.</p>
+    <div id="plone-body"></div>
+  </section>
+
+  <section class="family" id="native" hidden>
+    <h2>Native gate</h2>
+    <p class="note">zoe serve through the native client (zoe-native) against ZEO 6 through ZEO.ClientStorage (zeo), in alternating batches of the same work.</p>
+    <div id="native-body"></div>
+  </section>
+
+  <section class="family" id="client" hidden>
+    <h2>Client benchmark</h2>
+    <p class="note">ZEO.ClientStorage and the native client, zoe.zeo.ClientStorage, through the storage API and without ZODB, against the same servers.</p>
+    <div id="client-body"></div>
+  </section>
+
+  <section class="family" id="shootout" hidden>
+    <h2>zodbshootout</h2>
+    <p class="note">Each line is one storage; each point is one full run on the chosen machine and Python build. Click a point to open its ZOE commit.</p>
+    <div class="controls" id="shootout-controls">
+      <label>Cell <select id="cell"></select></label>
+      <label>Metric <select id="metric">
+        <option value="ops_per_second">objects per second</option>
+        <option value="p50_seconds">p50 per transaction (ms)</option>
+        <option value="p99_seconds">p99 per transaction (ms)</option>
+      </select></label>
+    </div>
+    <div id="shootout-body"></div>
+  </section>
+
+  <section class="family" id="reproduce">
+    <h2>Reproduce</h2>
+    <div class="reproduce">
+      <p>In a checkout of the ZOE repository, inside <code>devenv shell</code>, one command runs the published set on one machine: B5 on the fixtures <code>small</code> and <code>medium</code> with the stacks <code>zeo</code> and <code>zoe-native-qi-kv</code>, the native gate and the client benchmark. It resumes after a stop.</p>
+      <pre><code>just bench showcase --plan    # each run of the set and its estimate; runs nothing
+just bench showcase           # writes target/bench/showcase/&lt;started&gt;/</code></pre>
+      <p>zodbshootout runs on its own: <code>just bench</code> writes <code>target/bench/results</code>. Then <code>just bench publish</code> checks each document and copies it into a checkout of the results repository, with this page:</p>
+      <pre><code>just bench publish target/bench/showcase/&lt;started&gt; CHECKOUT</code></pre>
+      <p>It takes only a full run of a clean tree at a commit of <code>main</code>, and for B5 only verified runs. It never commits and never pushes. The harness and what it measures: <a href="https://github.com/adeweb-be/ZOE/blob/main/bench/README.md">bench/README.md</a>.</p>
+    </div>
+  </section>
+
+  <footer>
+    Results: <a href="https://github.com/adeweb-be/zoe-bench-results">adeweb-be/zoe-bench-results</a>.
+    Harness, schemas and the source of this page: <a href="https://github.com/adeweb-be/ZOE/tree/main/bench">bench/ in the ZOE repository</a>.
+  </footer>
+</main>
+
+<script type="module">
+import { load, BASELINE, COLUMNS, CURVES } from "./data.js";
+
+const COMMIT_URL = "https://github.com/adeweb-be/ZOE/commit/";
+const DASH = "–";
+const FAMILIES = ["plone", "native", "client", "shootout"];
+// The colour slot of each stack and storage. A colour follows its name.
+const SLOT = {
+  "zoe-native": 1,
+  zeo: 2,
+  zoe: 3,
+  filestorage: 4,
+  relstorage: 5,
+  "zoe-server": 6,
+  "zoe-native-qi-kv": 7,
+  "relstorage-hf": 8,
+};
+// The header and the scale of each number of a B5 row.
+const B5 = {
+  ok_per_second: ["ok operations / s", 1],
+  p50_seconds: ["p50 (ms)", 1000],
+  p95_seconds: ["p95 (ms)", 1000],
+  p99_seconds: ["p99 (ms)", 1000],
+  conflicts_per_1000_ops: ["Conflict|Errors / 1,000 ops", 1],
+  first_attempt_share: ["first-attempt successes (%)", 100],
+  exhausted: ["exhausted retries", 1],
+  zope_cpu_ms_per_op: ["Zope CPU (ms / op)", 1],
+  server_cpu_ms_per_op: ["server CPU (ms / op)", 1],
+  store_write_kb_per_op: ["store written (KB / op)", 1],
+  objects_loaded_per_second: ["objects loaded / s", 1],
+  objects_stored_per_second: ["objects stored / s", 1],
+};
+const CURVE_METRICS = {
+  ok_per_second: ["successful operations per second", "ok operations / s"],
+  conflicts_per_1000_ops: ["ConflictErrors per 1,000 operations", "per 1,000 operations"],
+};
+const SHOOTOUT_ORDER = ["add", "update", "read_cold", "read_warm", "read_hot"];
+const SHOOTOUT_METRICS = {
+  ops_per_second: ["objects per second", 1],
+  p50_seconds: ["p50 per transaction (ms)", 1000],
+  p99_seconds: ["p99 per transaction (ms)", 1000],
+};
+
+const state = { model: null, byPath: new Map(), charts: [], pending: [], picked: new Map() };
+const $ = (id) => document.getElementById(id);
+
+// Make an element. A child that is null or false is left out.
+function h(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props ?? {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") node.className = value;
+    else node.setAttribute(key, value === true ? "" : value);
+  }
+  node.append(...children.flat(Infinity).filter((child) => child !== null && child !== undefined && child !== false));
+  return node;
+}
+
+async function read(path) {
+  const response = await fetch(path, path === "index.json" ? { cache: "no-cache" } : {});
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  return response.json();
+}
+
+function readStored(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function writeStored(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* the browser can block storage */ }
+}
+
+// Numbers: three significant digits, whole numbers from 1,000 up.
+const significant = new Intl.NumberFormat("en", { maximumSignificantDigits: 3 });
+const whole = new Intl.NumberFormat("en", { maximumFractionDigits: 0 });
+const exact = new Intl.NumberFormat("en", { maximumFractionDigits: 6 });
+const three = new Intl.NumberFormat("en", { minimumSignificantDigits: 3, maximumSignificantDigits: 3 });
+function num(value, scale = 1) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DASH;
+  const scaled = value * scale;
+  return Math.abs(scaled) >= 1000 ? whole.format(scaled) : significant.format(scaled);
+}
+// A ratio keeps three significant digits, so 1.0017 shows as 1.00, not 1.
+function ratioText(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DASH;
+  return Math.abs(value) >= 1000 ? whole.format(value) : three.format(value);
+}
+function bytes(value) {
+  if (typeof value !== "number") return DASH;
+  if (value >= 1048576 && value % 1048576 === 0) return `${num(value / 1048576)} MiB`;
+  if (value >= 1024 && value % 1024 === 0) return `${num(value / 1024)} KiB`;
+  return `${exact.format(value)} B`;
+}
+function when(iso) {
+  return typeof iso === "string" ? iso.replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC") : DASH;
+}
+function short(commit) {
+  return commit ? commit.slice(0, 12) : DASH;
+}
+function commitLink(commit) {
+  return commit ? h("a", { href: COMMIT_URL + commit }, h("code", {}, short(commit))) : DASH;
+}
+function pythonName(python) {
+  if (!python) return DASH;
+  const name = python.implementation === "cpython" ? "CPython" : python.implementation;
+  return `${name} ${python.version}${python.free_threaded ? " free-threaded" : ""}`;
+}
+function css(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+function token(name) {
+  return SLOT[name] ? `--series-${SLOT[name]}` : "--series-other";
+}
+function color(name) {
+  return css(token(name));
+}
+function swatch(name) {
+  const mark = h("span", { class: "swatch", "aria-hidden": "true" });
+  mark.style.background = `var(${token(name)})`;
+  return mark;
+}
+function stackName(name) {
+  return [swatch(name), h("code", {}, name)];
+}
+// A header. A | in the label marks a place where the line can break.
+function header(label, props = {}) {
+  const parts = label.split("|");
+  return h("th", { scope: "col", ...props }, parts.flatMap((part, at) => (at ? [h("wbr"), part] : [part])));
+}
+function wrap(table) {
+  return h("div", { class: "table-wrap" }, table);
+}
+// A verdict is plain text.
+function verdictTag(verdict) {
+  return h("span", { class: "tag" }, verdict ?? DASH);
+}
+
+// A value of a method block: a list of keys and values, nested for an
+// object.
+function plain(value, special = {}, key = null) {
+  if (key !== null && special[key]) return special[key](value);
+  if (value === null || value === undefined) return DASH;
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  if (typeof value === "number") return exact.format(value);
+  if (Array.isArray(value)) {
+    if (!value.length) return "none";
+    if (value.every((item) => item === null || typeof item !== "object")) {
+      return value.map((item) => plain(item)).join(", ");
+    }
+    return h("pre", {}, JSON.stringify(value, null, 2));
+  }
+  if (typeof value === "object") return kv(value);
+  return String(value);
+}
+function kv(object, special = {}) {
+  const list = h("dl", { class: "kv" });
+  for (const [key, value] of Object.entries(object ?? {})) {
+    list.append(h("dt", {}, key), h("dd", {}, plain(value, special, key)));
+  }
+  return list;
+}
+
+// Charts. A chart is made after its canvas is in the page.
+function chartCard(title, label, config, fallback) {
+  const canvas = h("canvas", { role: "img", "aria-label": label });
+  state.pending.push([canvas, config, fallback]);
+  return h("figure", { class: "card" }, h("figcaption", {}, title), h("div", { class: "chart" }, canvas));
+}
+function flush() {
+  state.charts = state.charts.filter((chart) => {
+    if (chart.canvas && chart.canvas.isConnected) return true;
+    chart.destroy();
+    return false;
+  });
+  const pending = state.pending.splice(0);
+  for (const [canvas, config, fallback] of pending) {
+    if (!canvas.isConnected) continue;
+    if (typeof Chart === "undefined") {
+      canvas.replaceWith(h("p", { class: "note" }, `The chart library did not load. ${fallback}`));
+      continue;
+    }
+    state.charts.push(new Chart(canvas, config));
+  }
+}
+function dataset(name, data) {
+  const stroke = color(name);
+  return {
+    label: name, data, borderColor: stroke, backgroundColor: stroke,
+    borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, tension: 0,
+  };
+}
+function chartOptions({ x, yTitle, yScale = 1, tooltip, interaction, onClick }) {
+  const muted = css("--muted");
+  const grid = css("--grid");
+  const axis = css("--axis");
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction,
+    scales: {
+      x: {
+        type: "linear",
+        ...x.options,
+        title: x.title ? { display: true, text: x.title, color: muted } : undefined,
+        ticks: { color: muted, ...x.ticks },
+        grid: { color: grid },
+        border: { color: axis },
+      },
+      y: {
+        beginAtZero: true,
+        title: { display: true, text: yTitle, color: muted },
+        ticks: { color: muted, callback: (value) => num(value, yScale) },
+        grid: { color: grid },
+        border: { color: axis },
+      },
+    },
+    plugins: {
+      legend: { labels: { color: css("--text-2"), boxWidth: 10, boxHeight: 10 } },
+      tooltip,
+    },
+    onClick,
+  };
+}
+
+function documentsOf(family) {
+  return state.model.documents.filter((document) => document.family === family);
+}
+function groupsOf(family, machine, python) {
+  return state.model.selection.filter(
+    (group) => group.family === family && group.machine === machine && group.python === python,
+  );
+}
+function empty(family) {
+  const text = documentsOf(family).length
+    ? "No result of this family for this machine and Python build."
+    : "No result of this family is published yet.";
+  return h("div", { class: "empty" }, text);
+}
+function runLine(document) {
+  const run = document.method.run ?? {};
+  const plone = document.family === "plone" ? `Plone ${document.method.software?.Plone ?? DASH} on ` : "";
+  return h("p", { class: "meta" },
+    "Machine ", h("strong", {}, document.machine),
+    ` · ${plone}${pythonName(document.method.python)} · commit `, commitLink(run.commit),
+    ` · started ${when(run.started)}`);
+}
+function methodBlock(document) {
+  const method = document.method;
+  const parts = [
+    h("h5", {}, "Machine"),
+    kv(method.machine, { memory_bytes: (value) => (typeof value === "number" ? `${num(value / 2 ** 30)} GiB` : DASH) }),
+    h("h5", {}, "Python"), kv(method.python),
+    h("h5", {}, "Software"), kv(method.software),
+    h("h5", {}, "Run"), kv(method.run, { started: when, commit: commitLink }),
+  ];
+  if (method.rule) parts.push(h("h5", {}, "Rule"), kv(method.rule));
+  if (method.fixture) parts.push(h("h5", {}, "Fixture"), kv(method.fixture));
+  if (method.settings) parts.push(h("h5", {}, "Settings"), kv(method.settings));
+  if (method.scenarios) {
+    const scenarios = Object.fromEntries(method.scenarios.map(({ name, ...rest }) => [name, rest]));
+    parts.push(h("h5", {}, "Scenarios"), kv(scenarios));
+  }
+  return h("details", { class: "method" }, h("summary", {}, "Method: the machine, the software and the run"), parts);
+}
+
+// One block per group of documents: the latest document, and a selector of
+// the earlier ones.
+function groupBlock(group, title, render) {
+  const key = JSON.stringify([group.family, group.machine, group.python, group.fixture]);
+  const paths = [group.latest, ...group.earlier];
+  const select = h("select", { "aria-label": `Run of ${title}` });
+  paths.forEach((path, at) => {
+    const document = state.byPath.get(path);
+    const label = `${at === 0 ? "latest · " : ""}${when(document.started)} · ${short(document.commit)}`;
+    select.append(new Option(label, path));
+  });
+  const chosen = state.picked.get(key);
+  select.value = paths.includes(chosen) ? chosen : group.latest;
+  select.disabled = paths.length < 2;
+  const body = h("div", {}, render(state.byPath.get(select.value)));
+  select.addEventListener("change", () => {
+    state.picked.set(key, select.value);
+    body.replaceChildren(render(state.byPath.get(select.value)));
+    flush();
+  });
+  const head = h("div", { class: "group-head" },
+    h("h3", {}, title),
+    h("label", { class: "pick" }, "Run", select));
+  return h("article", { class: "group" }, head, body);
+}
+
+// What a stack of B5 turns on, from the document.
+function turnsOn(stack) {
+  const items = [`server: ${stack.server === "zoe" ? "zoe serve" : stack.server}`];
+  let client = `client: <${stack.client}>`;
+  if (stack.native === true) client += " native";
+  if (stack.native === false) client += " not native";
+  items.push(client);
+  const switches = stack.switches ?? {};
+  if (switches.backends?.length) items.push(`zoe.plone backends: ${switches.backends.join(", ")}`);
+  if (switches.member_properties) items.push("member properties: records of zoe.plone");
+  if (switches.split_merges) items.push(`split merges: ${switches.split_merges}`);
+  if (switches.folder_orders) items.push(`folder orders: ${switches.folder_orders}`);
+  if (stack.merge_policy) items.push("merge policy");
+  return items;
+}
+function stackList(stacks) {
+  return h("ul", { class: "stacks" }, stacks.map((stack) => h("li", { class: "stack" },
+    h("div", { class: "stack-name" }, stackName(stack.name)),
+    h("p", { class: "desc" }, stack.description),
+    h("ul", { class: "chips", "aria-label": `What ${stack.name} turns on` },
+      turnsOn(stack).map((item) => h("li", {}, item))),
+    stack.merge_policy
+      ? h("details", {}, h("summary", {}, `The merge policy of ${stack.name}`),
+        h("pre", {}, JSON.stringify(stack.merge_policy, null, 2)))
+      : null)));
+}
+function usersChart(document, scenario, metric) {
+  const [title, unit] = CURVE_METRICS[metric];
+  const datasets = document.series
+    .filter((series) => series.scenario === scenario)
+    .map((series) => dataset(series.stack, series.points.map((point) => ({ x: point.users, y: point[metric] }))));
+  return chartCard(`${scenario}: ${title}`, `${scenario}: ${title} against users, one line per stack`, {
+    type: "line",
+    data: { datasets },
+    options: chartOptions({
+      x: { title: "users", ticks: { precision: 0 } },
+      yTitle: unit,
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+      tooltip: {
+        callbacks: {
+          title: (items) => `${items[0].raw.x} users`,
+          label: (item) => `${item.dataset.label}: ${num(item.raw.y)}`,
+        },
+      },
+    }),
+  }, "The tables below hold the same numbers.");
+}
+function b5Cell(row, column, base) {
+  const scale = B5[column][1];
+  const value = row.values[column];
+  let text = num(value, scale);
+  const rough = column === "p99_seconds" && value !== null;
+  if (rough && row.p99_reliable === false) text = `~${text}`;
+  const cell = h("td", {}, h("span", {}, text));
+  const range = row.range ?? {};
+  if (column === "ok_per_second" && range.min !== null && range.max !== null && range.min !== range.max) {
+    cell.append(h("span", { class: "sub" }, `${num(range.min)}–${num(range.max)}`));
+  }
+  if (row.stack !== BASELINE && row.ratios[column] !== null) {
+    const mark = rough && (row.p99_reliable === false || base?.p99_reliable === false) ? "~" : "";
+    cell.append(h("span", { class: "sub ratio" }, `${mark}×${ratioText(row.ratios[column])}`));
+  }
+  return cell;
+}
+function scenarioTable(document, scenario) {
+  const tables = document.tables.filter((table) => table.scenario === scenario.name);
+  if (!tables.length) return null;
+  const head = h("thead", {}, h("tr", {},
+    h("th", { scope: "col" }, "stack"),
+    header("verification", { class: "text" }),
+    COLUMNS.map((column) => header(B5[column][0]))));
+  const bodies = tables.map((table) => {
+    const base = table.rows.find((row) => row.stack === BASELINE);
+    return h("tbody", {},
+      h("tr", { class: "group-row" }, h("th", { scope: "rowgroup", colspan: COLUMNS.length + 2 },
+        h("span", {}, `${table.users} ${table.users === 1 ? "user" : "users"} · step ${table.step}`))),
+      table.rows.map((row) => h("tr", {},
+        h("th", { scope: "row" }, stackName(row.stack)),
+        h("td", { class: "text" }, row.verification.length ? row.verification.map(verdictTag) : DASH),
+        COLUMNS.map((column) => b5Cell(row, column, base)))));
+  });
+  return h("section", {},
+    h("h4", {}, h("code", {}, scenario.name)),
+    scenario.description ? h("p", { class: "desc" }, scenario.description) : null,
+    wrap(h("table", {}, head, bodies)));
+}
+function ploneDocument(document) {
+  const method = document.method;
+  const fixture = method.fixture ?? {};
+  const curves = CURVES.filter((scenario) => document.series.some((series) => series.scenario === scenario));
+  return h("div", {},
+    runLine(document),
+    h("p", { class: "meta" },
+      `Fixture ${fixture.name}: preset ${fixture.preset}, ${num(fixture.objects)} objects, `,
+      `${num(fixture.catalog_entries)} catalog entries.`),
+    h("h4", {}, "Stacks and what they turn on"),
+    stackList(method.stacks ?? []),
+    curves.length
+      ? [h("h4", {}, "Users against the rate and the conflicts"),
+        curves.map((scenario) => h("div", { class: "pair" },
+          usersChart(document, scenario, "ok_per_second"),
+          usersChart(document, scenario, "conflicts_per_1000_ops")))]
+      : null,
+    h("p", { class: "note" },
+      "One table per scenario, one group of rows per step. ok operations / s is the median of the repetitions, with their range below it when they differ. ",
+      "Below each number of a stack other than zeo: its ratio, the number of the stack divided by the number of zeo in the same step. ",
+      "For ok operations / s and first-attempt successes, a larger number is better; for latency, ConflictErrors, exhausted retries, CPU and store KB written, a smaller number is better. ",
+      "The objects loaded and stored per second show the work of the storage. ~ marks a p99 of fewer than 200 operations, and a ratio of such a p99."),
+    (method.scenarios ?? []).map((scenario) => scenarioTable(document, scenario)),
+    methodBlock(document));
+}
+function renderPlone(machine, python) {
+  const groups = groupsOf("plone", machine, python);
+  $("plone-body").replaceChildren(...(groups.length
+    ? groups.map((group) => groupBlock(group, `Fixture ${group.fixture}`, ploneDocument))
+    : [empty("plone")]));
+}
+
+function nativeDocument(document) {
+  const rule = document.method.rule ?? {};
+  const head = h("thead", {}, h("tr", {},
+    h("th", { scope: "col" }, "scenario"),
+    h("th", { scope: "col" }, "ratio t(zeo) / t(zoe-native)"),
+    h("th", { scope: "col" }, "low"),
+    h("th", { scope: "col" }, "high"),
+    h("th", { scope: "col" }, "verdict")));
+  const bodies = [];
+  let last = null;
+  for (const cell of document.cells) {
+    const key = JSON.stringify([cell.mode, cell.concurrency, cell.object_size, cell.objects_per_transaction]);
+    if (key !== last) {
+      last = key;
+      const label = `${cell.mode} · ${cell.concurrency} ${cell.concurrency === 1 ? "worker" : "workers"} · `
+        + `${bytes(cell.object_size)} objects · ${cell.objects_per_transaction} objects / transaction`;
+      bodies.push(h("tbody", {}, h("tr", { class: "group-row" },
+        h("th", { scope: "rowgroup", colspan: 5 }, h("span", {}, label)))));
+    }
+    bodies.at(-1).append(h("tr", {},
+      h("th", { scope: "row" }, h("code", {}, cell.scenario)),
+      h("td", {}, ratioText(cell.ratio)),
+      h("td", {}, ratioText(cell.low)),
+      h("td", {}, ratioText(cell.high)),
+      h("td", {}, verdictTag(cell.verdict))));
+  }
+  return h("div", {},
+    runLine(document),
+    h("p", { class: "note" },
+      "The ratio is the time of zeo divided by the time of zoe-native for the same work, as the geometric mean over the pairs of a scenario: above 1, zoe-native is faster; below 1, zeo is faster. ",
+      `low and high bound its interval at the level of the rule (${num(rule.level, 100)} %). `,
+      `With at least ${num(rule.min_pairs)} pairs, a scenario passes when low is above 1 and fails when high is below 1; else it is undecided. `,
+      "These are the numbers of the document. A dash marks a number that the document does not hold."),
+    document.cells.length ? wrap(h("table", {}, head, bodies)) : h("div", { class: "empty" }, "This result holds no cell."),
+    methodBlock(document));
+}
+function renderNative(machine, python) {
+  const groups = groupsOf("native", machine, python);
+  $("native-body").replaceChildren(...(groups.length
+    ? groups.map((group) => groupBlock(group, `${group.machine} · ${group.python}`, nativeDocument))
+    : [empty("native")]));
+}
+
+const text = (value) => value ?? DASH;
+const CLIENT_COLUMNS = [
+  ["server", "server", text, "text"],
+  ["mode", "mode", text, "text"],
+  ["concurrency", "workers", (value) => num(value)],
+  ["workload", "workload", text, "text"],
+  ["record_size", "record size", bytes],
+  ["calls_per_second", "calls / s", (value) => num(value)],
+  ["p50_seconds", "p50 (ms)", (value) => num(value, 1000)],
+  ["p99_seconds", "p99 (ms)", (value) => num(value, 1000)],
+  ["client_cpu_per_object_seconds", "client CPU (µs / object)", (value) => num(value, 1e6)],
+  ["rounds", "rounds", (value) => num(value)],
+  ["spread", "spread (%)", (value) => num(value, 100)],
+];
+function clientDocument(document) {
+  const head = h("thead", {}, h("tr", {},
+    h("th", { scope: "col" }, "client"),
+    CLIENT_COLUMNS.map(([, label, , kind]) => h("th", { scope: "col", class: kind }, label))));
+  const body = h("tbody", {}, document.rows.map((row) => h("tr", {},
+    h("th", { scope: "row" }, h("code", {}, row.client)),
+    CLIENT_COLUMNS.map(([key, , format, kind]) => h("td", { class: kind }, format(row[key]))))));
+  return h("div", {},
+    runLine(document),
+    h("p", { class: "note" },
+      "A call is one loadBefore, or one commit of 100 records. calls / s is the median of the rounds. ",
+      "The spread is the highest minus the lowest calls / s of the rounds, over their median."),
+    document.rows.length ? wrap(h("table", {}, head, body)) : h("div", { class: "empty" }, "This result holds no row."),
+    methodBlock(document));
+}
+function renderClient(machine, python) {
+  const groups = groupsOf("client", machine, python);
+  $("client-body").replaceChildren(...(groups.length
+    ? groups.map((group) => groupBlock(group, `${group.machine} · ${group.python}`, clientDocument))
+    : [empty("client")]));
+}
+
+const HOUR = 3600000;
+const DAY = 24 * HOUR;
+// The steps of a time axis, from an hour to a year.
+const TIME_STEPS = [HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY, 91 * DAY, 182 * DAY, 364 * DAY];
+// A time axis in UTC. Its ticks fall on whole steps of the list above,
+// one for each 100 pixels of the axis or fewer, at most five. A tick shows
+// the hour when the step is shorter than a day.
+function timeAxis() {
+  let step = DAY;
+  const label = (value) => {
+    const stamp = when(new Date(value).toISOString());
+    return step < DAY ? stamp.slice(5, 16) : stamp.slice(0, 10);
+  };
+  return {
+    title: "start of the run (UTC)",
+    options: {
+      bounds: "data",
+      afterDataLimits(scale) {
+        // The limits come from the points. Chart.js widens a span of 0 by
+        // years, so one point gets a window of one day around it.
+        const times = scale.chart.data.datasets.flatMap((set) => set.data.map((point) => point.x));
+        if (!times.length) return;
+        let low = Math.min(...times);
+        let high = Math.max(...times);
+        if (low === high) {
+          low -= DAY / 2;
+          high += DAY / 2;
+        }
+        const gaps = Math.min(4, Math.max(1, Math.floor(scale.width / 100) - 1));
+        step = TIME_STEPS.find((candidate) => (high - low) / candidate <= gaps) ?? TIME_STEPS.at(-1);
+        scale.min = low - step / 2;
+        scale.max = high + step / 2;
+      },
+      afterBuildTicks(scale) {
+        const ticks = [];
+        for (let value = Math.ceil(scale.min / step) * step; value <= scale.max; value += step) {
+          ticks.push({ value });
+        }
+        scale.ticks = ticks;
+      },
+    },
+    ticks: { maxRotation: 0, callback: label },
+  };
+}
+function cellKey(chart) {
+  return JSON.stringify([chart.mode, chart.concurrency, chart.object_size]);
+}
+function cellLabel(key) {
+  const [mode, concurrency, size] = JSON.parse(key);
+  return `${mode} · ${concurrency} ${concurrency === 1 ? "worker" : "workers"} · ${bytes(size)}`;
+}
+function scenarioRank(name) {
+  const at = SHOOTOUT_ORDER.indexOf(name);
+  return at < 0 ? SHOOTOUT_ORDER.length : at;
+}
+function renderShootout(machine, python) {
+  const charts = state.model.shootout.filter((chart) => chart.machine === machine && chart.python === python);
+  const body = $("shootout-body");
+  $("shootout-controls").hidden = !charts.length;
+  if (!charts.length) {
+    body.replaceChildren(empty("shootout"));
+    return;
+  }
+  const cells = [...new Set(charts.map(cellKey))].sort((a, b) => {
+    const [ma, ca, sa] = JSON.parse(a);
+    const [mb, cb, sb] = JSON.parse(b);
+    return ma.localeCompare(mb) || sa - sb || ca - cb;
+  });
+  const cellSelect = $("cell");
+  const wanted = cellSelect.value || readStored("zoe-bench-cell");
+  cellSelect.replaceChildren(...cells.map((key) => new Option(cellLabel(key), key)));
+  if (cells.includes(wanted)) cellSelect.value = wanted;
+  const metric = $("metric").value;
+  writeStored("zoe-bench-cell", cellSelect.value);
+  writeStored("zoe-bench-metric", metric);
+  const [metricLabel, scale] = SHOOTOUT_METRICS[metric];
+
+  const shown = charts
+    .filter((chart) => cellKey(chart) === cellSelect.value)
+    .sort((a, b) => scenarioRank(a.scenario) - scenarioRank(b.scenario) || a.scenario.localeCompare(b.scenario));
+  const storages = [...new Set(shown.flatMap((chart) => chart.lines.map((line) => line.storage)))].sort();
+  const cards = shown.map((chart) => {
+    const datasets = chart.lines
+      .slice()
+      .sort((a, b) => a.storage.localeCompare(b.storage))
+      .map((line) => dataset(line.storage, line.points.map((point) => ({
+        x: Date.parse(point.started), y: point[metric], commit: point.commit,
+      }))));
+    return chartCard(chart.scenario, `${chart.scenario}: ${metricLabel} per storage over the runs`, {
+      type: "line",
+      data: { datasets },
+      options: chartOptions({
+        x: timeAxis(),
+        yTitle: metricLabel,
+        yScale: scale,
+        interaction: { mode: "nearest", intersect: true },
+        tooltip: {
+          callbacks: {
+            title: (items) => when(new Date(items[0].raw.x).toISOString()),
+            label: (item) => `${item.dataset.label}: ${num(item.raw.y, scale)}`,
+            footer: (items) => (items[0].raw.commit ? `commit ${short(items[0].raw.commit)}` : ""),
+          },
+        },
+        onClick: (_event, elements, chartObject) => {
+          if (!elements.length) return;
+          const point = chartObject.data.datasets[elements[0].datasetIndex].data[elements[0].index];
+          if (point.commit) window.open(COMMIT_URL + point.commit, "_blank", "noopener");
+        },
+      }),
+    }, "The table below holds only the latest run of each storage.");
+  });
+
+  // The table view: the last run of each storage.
+  const head = h("thead", {}, h("tr", {},
+    h("th", { scope: "col" }, "storage"),
+    shown.map((chart) => h("th", { scope: "col" }, chart.scenario))));
+  const rows = h("tbody", {}, storages.map((storage) => h("tr", {},
+    h("th", { scope: "row" }, stackName(storage)),
+    shown.map((chart) => {
+      const line = chart.lines.find((item) => item.storage === storage);
+      const point = line?.points.at(-1);
+      return h("td", {}, point ? num(point[metric], scale) : DASH);
+    }))));
+
+  const documents = documentsOf("shootout")
+    .filter((document) => document.machine === machine && document.python === python);
+  const latest = documents.at(-1);
+  const runs = h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", { scope: "col" }, "storage"),
+      h("th", { scope: "col" }, "started"),
+      h("th", { scope: "col" }, "commit"))),
+    h("tbody", {}, documents.slice().reverse().map((document) => h("tr", {},
+      h("th", { scope: "row" }, stackName(document.stacks[0])),
+      h("td", {}, when(document.started)),
+      h("td", {}, commitLink(document.commit))))));
+
+  body.replaceChildren(
+    h("div", { class: "grid" }, cards),
+    h("h4", {}, `The latest run of each storage: ${metricLabel}`),
+    wrap(h("table", {}, head, rows)),
+    h("details", { class: "method" },
+      h("summary", {}, "Method: the machine, the software and the runs"),
+      h("h5", {}, "Machine"), kv(latest.method.machine, {
+        memory_bytes: (value) => (typeof value === "number" ? `${num(value / 2 ** 30)} GiB` : DASH),
+      }),
+      h("h5", {}, "Python"), kv(latest.method.python),
+      h("h5", {}, "Software of the latest run"), kv(latest.method.software),
+      h("h5", {}, "Runs, newest first"), wrap(runs)));
+}
+
+function fillSelect(select, values, wanted) {
+  select.replaceChildren(...values.map((value) => new Option(value, value)));
+  if (values.includes(wanted)) select.value = wanted;
+}
+function refreshPythons() {
+  const machine = $("machine").value;
+  const pythons = [...new Set(state.model.documents
+    .filter((document) => document.machine === machine)
+    .map((document) => document.python))].sort();
+  fillSelect($("python"), pythons, $("python").value || readStored("zoe-bench-python"));
+}
+function render() {
+  const machine = $("machine").value;
+  const python = $("python").value;
+  writeStored("zoe-bench-machine", machine);
+  writeStored("zoe-bench-python", python);
+  renderPlone(machine, python);
+  renderNative(machine, python);
+  renderClient(machine, python);
+  renderShootout(machine, python);
+  flush();
+}
+
+async function main() {
+  try {
+    state.model = await load(read);
+  } catch (error) {
+    $("status").textContent = `The results could not be read (${error.message}).`;
+    return;
+  }
+  const documents = state.model.documents;
+  if (!documents.length) {
+    $("status").textContent = "No results are published yet.";
+    return;
+  }
+  state.byPath = new Map(documents.map((document) => [document.path, document]));
+  $("status").remove();
+  $("controls").hidden = false;
+  for (const family of FAMILIES) $(family).hidden = false;
+  fillSelect($("machine"), [...new Set(documents.map((document) => document.machine))].sort(),
+    readStored("zoe-bench-machine"));
+  const metric = readStored("zoe-bench-metric");
+  if (metric && SHOOTOUT_METRICS[metric]) $("metric").value = metric;
+  refreshPythons();
+  $("machine").addEventListener("change", () => { refreshPythons(); render(); });
+  $("python").addEventListener("change", render);
+  const redrawShootout = () => { renderShootout($("machine").value, $("python").value); flush(); };
+  $("cell").addEventListener("change", redrawShootout);
+  $("metric").addEventListener("change", redrawShootout);
+  // The colours of the charts come from the tokens of the scheme.
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  render();
+}
+
+main();
+</script>
+</body>
+</html>

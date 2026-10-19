@@ -6,8 +6,11 @@ of each file that it writes in the checkout, and the new index. When one
 check fails, it prints each reason, exits with 1 and writes nothing. Else
 it copies the bytes of each document to its path in the layout, copies
 the page of bench/dashboard/ when it exists, and writes index.json of
-version 2 from the whole tree. It never runs git in the checkout, never
-commits and never pushes.
+version 2 from the whole tree, last. Each file goes to a temporary name
+beside it, then replaces its path, so a file holds its old bytes or its
+new bytes. When a write fails, publish prints the files that it wrote
+and exits with 3. It never runs git in the checkout, never commits and
+never pushes.
 
 A document is publishable when it is of a known family and valid against
 the schema of its family, when it is not a quick run, when its commit is on
@@ -18,8 +21,10 @@ verification, and when its path is free in the checkout. No file that
 outside the checkout.
 """
 
+import contextlib
 import json
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -113,20 +118,100 @@ def publish(sources: list[str], checkout: str, main: str = MAIN) -> int:
             )
         return 1
 
-    for target, data in copies:
-        path = root / target
-        if not (path.is_file() and path.read_bytes() == data):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-    for relative, data in pages:
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-    index = layout.write_entries(root, entries)
+    for name, deleted in _page_changes():
+        if deleted:
+            message = (
+                f"{name} is deleted in the working tree; publish does not copy "
+                f"it, and {checkout} keeps any copy that it holds"
+            )
+        else:
+            message = (
+                f"{name} differs from HEAD; {checkout} gets the file of the "
+                "working tree"
+            )
+        print(f"publish: warning: {message}", file=sys.stderr)
+    # The files that change, index.json last.
+    writes = [
+        (relative, data)
+        for relative, data in dict(copies + pages).items()
+        if not ((root / relative).is_file() and (root / relative).read_bytes() == data)
+    ]
+    writes.append(("index.json", layout.index_text(entries).encode()))
+    written: list[str] = []
+    for relative, data in writes:
+        try:
+            _replace(root / relative, data)
+        except OSError as error:
+            print(
+                f"publish: {checkout}: cannot write {relative}: "
+                f"{error.strerror or error}",
+                file=sys.stderr,
+            )
+            for name in written:
+                print(f"publish: wrote {root / name}", file=sys.stderr)
+            print(
+                f"publish: wrote {len(written)} of {len(writes)} files in "
+                f"{checkout}; index.json is not written",
+                file=sys.stderr,
+            )
+            return 3
+        written.append(relative)
     for target in dict.fromkeys(target for target, _ in copies):
         print(root / target)
-    print(index)
+    print(root / "index.json")
     return 0
+
+
+def _replace(path: Path, data: bytes) -> None:
+    """Write data to path through a temporary file beside it. So path holds
+    its old bytes or data, never a part of data. The temporary file has a
+    random name, so publish never opens or removes a file of another run.
+    When a step fails or the run stops, remove the temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    created = False
+    try:
+        with open(temporary, "xb") as file:
+            created = True
+            file.write(data)
+        os.replace(temporary, path)
+    except BaseException:
+        if created:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
+
+
+def _page_changes() -> list[tuple[str, bool]]:
+    """Return the files of bench/dashboard/ that git tracks and that differ
+    from HEAD, each with True when the working tree does not hold it.
+    publish copies the files of the working tree, so it warns about each
+    of them."""
+    if not DASHBOARD.is_dir():
+        return []
+    repository = DASHBOARD.parents[1]
+    base = DASHBOARD.relative_to(repository).as_posix()
+    listed = _git(
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=no",
+        "--",
+        base,
+        cwd=repository,
+    )
+    if not listed:
+        return []
+    names: list[tuple[str, bool]] = []
+    fields = iter(listed.split("\0"))
+    for field in fields:
+        if len(field) < 4:
+            continue
+        names.append((field[3:], not (repository / field[3:]).exists()))
+        # A rename or a copy gives the old path in the next field.
+        if "R" in field[:2] or "C" in field[:2]:
+            next(fields, None)
+    return names
 
 
 def _path_problem(root: Path, relative: str, checkout: str) -> str | None:

@@ -6,6 +6,7 @@ benchmark.
 """
 
 import json
+import os
 import pathlib
 import subprocess
 
@@ -456,3 +457,158 @@ def test_a_directory_that_is_a_symbolic_link_stops_the_publish(
     assert code == 1
     assert "results/shootout/reference is a symbolic link" in out.err
     assert snapshot(checkout) == before
+
+
+@needs_git
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_a_failed_write_names_the_files_written_and_exits_with_3(checkout, capsys):
+    # The client document goes first. The shootout document then cannot
+    # make its directory.
+    locked = checkout / "results" / "shootout"
+    locked.mkdir(parents=True)
+    locked.chmod(0o555)
+    try:
+        code, out = run(
+            capsys, DATA / "client.json", DATA / "shootout.json", checkout=checkout
+        )
+    finally:
+        locked.chmod(0o755)
+
+    client = layout.published_path(sample("client"))
+    shootout = layout.published_path(sample("shootout"))
+    assert code == 3
+    assert f"publish: {checkout}: cannot write {shootout}: Permission denied" in out.err
+    assert f"publish: wrote {checkout / client}" in out.err
+    assert "index.json is not written" in out.err
+    assert out.out == ""
+    assert (checkout / client).read_bytes() == (DATA / "client.json").read_bytes()
+    assert not (checkout / "index.json").exists()
+    assert not list(checkout.rglob("*.tmp"))
+
+
+@needs_git
+def test_the_index_goes_last_and_a_failed_write_leaves_no_temporary_file(
+    checkout, capsys, monkeypatch
+):
+    old = json.dumps({"index_version": 1, "results": []}, indent=2) + "\n"
+    (checkout / "index.json").write_text(old)
+    replace = os.replace
+
+    def full(source, target):
+        if pathlib.Path(target).name == "index.json":
+            raise OSError(28, "No space left on device")
+        replace(source, target)
+
+    monkeypatch.setattr(os, "replace", full)
+    code, out = run(capsys, DATA / "native.json", checkout=checkout)
+    monkeypatch.undo()
+
+    native = layout.published_path(sample("native"))
+    assert code == 3
+    assert "cannot write index.json: No space left on device" in out.err
+    assert f"publish: wrote {checkout / native}" in out.err
+    # Every other file is in place, and index.json keeps its old bytes.
+    assert (checkout / native).read_bytes() == (DATA / "native.json").read_bytes()
+    assert (checkout / "index.json").read_text() == old
+    assert not list(checkout.rglob("*.tmp"))
+
+
+@needs_git
+def test_a_file_of_the_page_that_differs_from_head_gives_a_warning(
+    page, checkout, capsys
+):
+    git(
+        page.parents[1],
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        "the page",
+    )
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+    assert code == 0, out.err
+    assert "warning" not in out.err
+
+    (page / "index.html").write_text("<html>changed</html>\n")
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    # publish copies the file of the working tree, and says so.
+    assert code == 0, out.err
+    assert (
+        "publish: warning: bench/dashboard/index.html differs from HEAD; "
+        f"{checkout} gets the file of the working tree"
+    ) in out.err
+    assert "main.js" not in out.err
+    assert (checkout / "index.html").read_text() == "<html>changed</html>\n"
+
+
+@needs_git
+def test_a_temporary_file_of_another_run_stays_as_it_is(checkout, capsys):
+    target = checkout / layout.published_path(sample("client"))
+    target.parent.mkdir(parents=True)
+    stale = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    stale.write_text("a file of another run\n")
+
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    assert code == 0, out.err
+    assert target.read_bytes() == (DATA / "client.json").read_bytes()
+    assert stale.read_text() == "a file of another run\n"
+
+
+@needs_git
+def test_a_stopped_run_leaves_no_temporary_file(checkout, capsys, monkeypatch):
+    replace = os.replace
+
+    def stop(source, target):
+        if pathlib.Path(target).name == "index.json":
+            raise KeyboardInterrupt
+        replace(source, target)
+
+    monkeypatch.setattr(os, "replace", stop)
+    with pytest.raises(KeyboardInterrupt):
+        run(capsys, DATA / "native.json", checkout=checkout)
+    monkeypatch.undo()
+
+    assert not list(checkout.rglob("*.tmp"))
+    assert not (checkout / "index.json").exists()
+
+
+@needs_git
+def test_a_file_of_the_page_deleted_in_the_working_tree_is_not_copied(
+    page, checkout, capsys
+):
+    git(
+        page.parents[1],
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        "the page",
+    )
+    (page / "app" / "main.js").unlink()
+    (checkout / "app").mkdir()
+    (checkout / "app" / "main.js").write_text("// the copy of the checkout\n")
+
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    assert code == 0, out.err
+    assert (
+        "publish: warning: bench/dashboard/app/main.js is deleted in the working "
+        f"tree; publish does not copy it, and {checkout} keeps any copy that it "
+        "holds"
+    ) in out.err
+    assert "main.js differs from HEAD" not in out.err
+    assert (checkout / "app" / "main.js").read_text() == "// the copy of the checkout\n"
