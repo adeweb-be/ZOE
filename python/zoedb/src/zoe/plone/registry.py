@@ -28,6 +28,9 @@ process, with or without the option.
   of one registry conflict. After an undo, a counter does not repeat.
 - **A field changed in place** is staged again before the commit and
   before each savepoint. A rollback to a savepoint drops the decoded rows.
+  A rollback can keep the staged rows and give back the registry with its
+  old counter. So before the commit, a transaction with staged rows and
+  the old counter raises the counter.
 - **The guard** of a stock registry in a store with namespaces calls
   `readCurrent` on the roots of its trees when code reads its records, and
   the move empties those roots. So a write that began before a move
@@ -38,7 +41,9 @@ process, with or without the option.
 the rows. `copy_rows(source, copy)` gives a copy of a moved registry the
 rows of its source, under a new id. `reset(registry)` gives a copy whose
 source is gone empty `OOBTree`s: the import of the profiles of the site
-then gives back the records with their default values.
+then gives back the records with their default values. On a ZEO client
+without namespaces, `reset` raises `Unsupported`: the client cannot read
+the rows that the server can hold.
 """
 
 import weakref
@@ -48,6 +53,7 @@ import zope.interface
 from Acquisition import aq_base
 from BTrees.OOBTree import OOBTree
 from plone.registry.registry import Registry, _Records
+from ZODB.DemoStorage import DemoStorage
 from ZODB.POSException import ReadConflictError, Unsupported
 from ZODB.utils import oid_repr
 
@@ -386,6 +392,14 @@ class _State:
     def contains(self, key):
         return key in self.decoded or self.raw(key) is not None
 
+    def staged(self):
+        """Return the writes of the namespace in the transaction, as a dict
+        of key to value, None for a delete."""
+        writes = self.namespace._staged(create=False)
+        if writes is None:
+            return {}
+        return writes.of("durable", self.namespace.name)
+
     def sorted_names(self, kind):
         """Return the names of the records of `kind`, sorted."""
         names = self.names.get(kind)
@@ -405,14 +419,25 @@ class _State:
 
     def bump(self):
         """Count the first write of the transaction: stage the marker and
-        the counter of the registry with 1 more than the higher of the
-        counter of the registry and the counter of the stored marker. After
-        an undo the stored marker is higher, so a counter never repeats."""
+        the counter of the registry with 1 more than the highest of the
+        counter of the registry, the counter of the staged marker and the
+        counter of the stored marker. After an undo the stored marker is
+        higher, so a counter never repeats. After a rollback to a savepoint
+        the staged marker can be higher than the registry."""
         records = self.records()
         if records.counter > self.counter:
             return
-        stored = decode_marker(self.namespace.get(MARKER))
-        counter = self.counter if stored is None else max(self.counter, stored[1])
+        name = self.namespace.name
+        markers = [self.namespace._storage.kv_get("durable", name, MARKER)]
+        writes = self.namespace._staged(create=False)
+        if writes is not None:
+            found, staged = writes.find("durable", name, MARKER)
+            if found:
+                markers.append(staged)
+        counter = self.counter
+        for marker in map(decode_marker, markers):
+            if marker is not None:
+                counter = max(counter, marker[1])
         records.counter = counter + 1
         self.registry._p_changed = True
         self.namespace.set(MARKER, encode_marker(self.registry._p_oid, records.counter))
@@ -450,6 +475,14 @@ class _State:
                 self.namespace.set(key, data)
                 self.fields[key] = data
 
+    def count_staged(self):
+        """Raise the counter when the transaction staged rows and the
+        counter of the registry is not raised. A rollback to a savepoint
+        can keep the rows that the savepoint staged and give back the
+        registry with its old counter."""
+        if self.records().counter <= self.counter and self.staged():
+            self.bump()
+
     def forget(self):
         """Drop the decoded rows, as a rollback does."""
         self.decoded.clear()
@@ -464,6 +497,8 @@ class _Transaction:
     It joins the transaction as a data manager that writes nothing itself.
     A rollback to a savepoint drops the decoded rows. Before the commit and
     before each savepoint, it stages the fields that changed in place.
+    Before the commit, it also raises the counter of a registry with staged
+    rows and the old counter.
     """
 
     def __init__(self, jar, txn):
@@ -492,11 +527,16 @@ class _Transaction:
         if state is not None:
             writes = state.namespace._staged(create=True)
             writes.flush_before_savepoint(self.write_back)
-        self.transaction.addBeforeCommitHook(self.write_back)
+        self.transaction.addBeforeCommitHook(self.before_commit)
 
     def write_back(self):
         for state in list(self.states.values()):
             state.write_back()
+
+    def before_commit(self):
+        for state in list(self.states.values()):
+            state.write_back()
+            state.count_staged()
 
     def _end(self):
         self.states.clear()
@@ -793,11 +833,25 @@ def copy_rows(source, copy):
     copy._records = MovedRecords(copy, registry_id, counter)
 
 
+def _on_zeo_client(registry):
+    """Tell if the storage of `registry`, or the base of a `DemoStorage`
+    over it, is a ZEO client."""
+    try:
+        from ZEO.ClientStorage import ClientStorage
+    except ImportError:
+        return False
+    storage = registry._p_jar.db().storage
+    while isinstance(storage, DemoStorage):
+        storage = storage.base
+    return isinstance(storage, ClientStorage)
+
+
 def reset(registry):
     """Give the moved `registry`, a copy whose source is gone, new empty
     `OOBTree`s. The caller commits, then imports the registry step of each
     profile of the site. A registry that passes the check raises
-    `ValueError`: it moves back instead."""
+    `ValueError`: it moves back instead. A registry on a ZEO client without
+    namespaces raises `Unsupported`: the server can hold its rows."""
     _need_install("reset")
     registry = _bare(registry)
     records = registry._records
@@ -805,4 +859,15 @@ def reset(registry):
         raise ValueError(f"{_describe(registry)} is not moved")
     if _passes(records):
         raise ValueError(f"{_describe(registry)} reads its rows: move it back")
+    if (
+        registry._p_jar is not None
+        and _on_zeo_client(registry)
+        and not _has_namespaces(registry._p_jar)
+    ):
+        raise Unsupported(
+            f"{_describe(registry)} is on a ZEO client without KV namespaces:"
+            " it cannot tell if the server holds the rows. To reset it, open"
+            " the storage directly (a FileStorage, or a zoe.Storage). To read"
+            " it, use zoe.zeo.ClientStorage with a zoe serve that accepts kv"
+        )
     registry._records = _Records(registry)
