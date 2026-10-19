@@ -5,6 +5,7 @@
     python -m plonebench campaign --stacks zeo,zoe-native --scenarios edit --reps 3
     python -m plonebench report RUN_DIR... [--out FILE.md] [--json FILE.json]
     python -m plonebench serve --stack zoe-native
+    python -m plonebench showcase [--plan [--json]] [--dir DIR] ...
 
 `just bench plone ...` runs it in the environment of bench/plone.
 """
@@ -134,16 +135,28 @@ def add_run(parser: argparse.ArgumentParser) -> None:
         "before the instances start; a stack of zoe serve with zoedb only, "
         "and `campaign` gives it only to such stacks",
     )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="import this GenericSetup profile, such as zoe.plone:default, "
+        "into each site of the store before the instances start, as the owner "
+        "of a site does; a stack of zoe serve with zoedb only, and `campaign` "
+        "gives it only to such stacks",
+    )
 
 
 def options_of(
     args, stack_name: str, scenario: str, repetition: int, campaign: bool = False
 ) -> runner.RunOptions:
     settings = settings_of(args)
+    profile = args.profile
     if campaign:
-        # A campaign gives the switch only to the stacks that take it. The
-        # result of each run records its settings.
-        settings = stack.campaign_settings(stack.STACKS[stack_name], settings)
+        # A campaign gives the switch and the profile only to the stacks
+        # that take them. The result of each run records them.
+        config = stack.STACKS[stack_name]
+        settings = stack.campaign_settings(config, settings)
+        if stack.profile_refusal(config) is not None:
+            profile = None
     return runner.RunOptions(
         stack=stack_name,
         scenario=scenario,
@@ -159,10 +172,17 @@ def options_of(
         verify=not args.no_verify,
         label=args.label,
         settings=settings,
+        profile=profile,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["showcase"]:
+        # The showcase has options of its own (`plonebench.showcase`).
+        from plonebench import showcase
+
+        return showcase.main(argv[1:])
     parser = argparse.ArgumentParser(prog="plonebench")
     commands = parser.add_subparsers(dest="command", required=True)
 

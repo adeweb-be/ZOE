@@ -278,6 +278,14 @@ def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
     return None
 
 
+def profile_refusal(config: StackConfig) -> str | None:
+    """Return why a run of `config` cannot import a profile of `zoe.plone`
+    into its store, or None when it can."""
+    if config.server != "zoe" or config.section != "zoeclient":
+        return f"--profile needs a stack of zoe serve with zoedb, not {config.name}"
+    return None
+
+
 def campaign_settings(config: StackConfig, settings: Settings) -> Settings:
     """Return the settings of a run of `config` in a campaign: without the
     switch `split_merges` when the stack does not take it, so a campaign of

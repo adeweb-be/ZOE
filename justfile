@@ -609,10 +609,23 @@ plone scenario="zoe" command="start" *args:
 # client runs, and builds `zoe` in release first.
 # `just bench replay report FILE` prints the report of a result, and
 # `just bench replay test` runs the tests of the replay.
+# `just bench showcase` runs the publishable set on this machine: the
+# builds, the fixtures, the B5 runs of `small` and `medium` on `zeo` and
+# `zoe-native-qi-kv`, one B5 summary for each fixture, and the native gate
+# and the client benchmark on CPython 3.13 and 3.14t. It writes
+# target/bench/showcase/<started>/, which `just bench publish` takes, and
+# resumes a directory that `--dir` gives. `--plan` prints the runs and
+# their estimates and runs nothing. It builds nothing before it starts:
+# the builds are the first runs of the set.
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
     set -- {{ args }}
+    # `just bench showcase OPTIONS` stands for `just bench plone showcase
+    # OPTIONS`.
+    if [ "${1:-}" = showcase ]; then
+        set -- plone "$@"
+    fi
     if [ "${1:-}" = plone ]; then
         shift
         export UV_PROJECT_ENVIRONMENT="{{ justfile_directory() }}/target/bench/plone/venv"
