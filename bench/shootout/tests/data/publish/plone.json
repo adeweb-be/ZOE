@@ -1,0 +1,247 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "core_kinds": null,
+    "cpu_pinning": "taskset",
+    "durability": {"zeo": "fsync(2) in FileStorage", "zoe": "fdatasync(2)"},
+    "store_disk": {"rotational": false, "filesystem": "ext4"}
+  },
+  "python": {
+    "implementation": "cpython",
+    "version": "3.13.9",
+    "free_threaded": false,
+    "gil_enabled": true
+  },
+  "software": {
+    "Plone": "6.1.3",
+    "Products.CMFPlone": "6.1.3",
+    "Zope": "5.13",
+    "ZODB": "6.0.1",
+    "ZEO": "6.0.0",
+    "zoedb": "0.1.0",
+    "zoe": "zoe 0.1.0",
+    "locust": "2.46.7"
+  },
+  "run": {
+    "started": "2026-01-01T03:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "dirty": false
+  },
+  "fixture": {
+    "name": "small-ba01ff255313",
+    "preset": "small",
+    "objects": 412,
+    "catalog_entries": 398,
+    "spec": {
+      "seed": 1,
+      "sections": 4,
+      "depth": 2,
+      "fanout": 3,
+      "documents": 8,
+      "news": 2,
+      "files": 1,
+      "file_sizes": [16384, 131072, 1048576],
+      "paragraphs": [3, 8],
+      "words": [40, 120],
+      "vocabulary": 2000,
+      "private": 0.2,
+      "pending": 0.1,
+      "editors": 48,
+      "members": 32,
+      "hot": 4,
+      "shared": 48
+    }
+  },
+  "settings": {
+    "instances": 2,
+    "threads": 2,
+    "zodb_cache_objects": 30000,
+    "pool_size": 7,
+    "client_cache": "128MB",
+    "server_cpus": "0",
+    "zope_cpus": ["1", "2"],
+    "locust_cpus": "3",
+    "probe": true,
+    "zeo_fsync": "plain",
+    "zoe_cache_size": null,
+    "zoe_compression": null,
+    "warmup_seconds": 60.0,
+    "warmup_users": 8,
+    "trim_seconds": 5.0,
+    "think": "0,0",
+    "client_retries": 0
+  },
+  "stacks": [
+    {
+      "name": "zeo",
+      "description": "ZEO 6 server (runzeo, FileStorage) and ZEO.ClientStorage",
+      "server": "zeo",
+      "client": "zeoclient",
+      "native": null,
+      "switches": {
+        "backends": [],
+        "member_properties": false,
+        "split_merges": null,
+        "folder_orders": null
+      },
+      "merge_policy": null
+    },
+    {
+      "name": "zoe-native-qi-kv",
+      "description": "zoe-native-qi with the locking backend of zoe.plone (ADR 0043) and the properties of the members and groups in records of zoe.plone, which merge a login at the vote (ADR 0046)",
+      "server": "zoe",
+      "client": "zoeclient",
+      "native": true,
+      "switches": {
+        "backends": ["indexing", "locking"],
+        "member_properties": true,
+        "split_merges": "on",
+        "folder_orders": "on"
+      },
+      "merge_policy": {
+        "version": 3,
+        "classes": {
+          "plone.app.contenttypes.content.Folder": {
+            "tier2": "on",
+            "default": "strict",
+            "fields": {"modification_date": "max"}
+          },
+          "zoe.plone.properties.PrincipalProperties": {
+            "tier2": "on",
+            "default": "strict",
+            "fields": {"login_time": "max", "last_login_time": "max"}
+          }
+        },
+        "split_merges": "on",
+        "folder_orders": "on"
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "edit",
+      "description": "the edit form of Plone on Documents, each user its own Documents",
+      "interface": ["ui"],
+      "mix": {"edit": 1},
+      "background": []
+    }
+  ],
+  "steps": [
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 0,
+      "users": 4,
+      "seconds": 15.0,
+      "repetitions": 1,
+      "operations": 90,
+      "ok_per_second": {"median": 5.8, "min": 5.8, "max": 5.8},
+      "p50_seconds": 0.228,
+      "p95_seconds": 0.381,
+      "p99_seconds": 0.388,
+      "p99_reliable": false,
+      "failure_rate": 0.033,
+      "first_attempt_share": 0.867,
+      "conflicts_per_1000_ops": 133.3,
+      "exhausted": 3,
+      "zope_cpu_ms_per_op": 23.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 6.0,
+      "objects_loaded_per_second": 240.0,
+      "objects_stored_per_second": 36.0
+    },
+    {
+      "scenario": "edit",
+      "stack": "zeo",
+      "step": 1,
+      "users": 16,
+      "seconds": 15.0,
+      "repetitions": 1,
+      "operations": 135,
+      "ok_per_second": {"median": 8.7, "min": 8.7, "max": 8.7},
+      "p50_seconds": 0.962,
+      "p95_seconds": 1.495,
+      "p99_seconds": 1.59,
+      "p99_reliable": false,
+      "failure_rate": 0.037,
+      "first_attempt_share": 0.852,
+      "conflicts_per_1000_ops": 148.1,
+      "exhausted": 5,
+      "zope_cpu_ms_per_op": 23.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 360.0,
+      "objects_stored_per_second": 54.0
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 0,
+      "users": 4,
+      "seconds": 15.0,
+      "repetitions": 1,
+      "operations": 120,
+      "ok_per_second": {"median": 8.0, "min": 8.0, "max": 8.0},
+      "p50_seconds": 0.24,
+      "p95_seconds": 0.375,
+      "p99_seconds": 0.397,
+      "p99_reliable": false,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 23.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 6.0,
+      "objects_loaded_per_second": 240.0,
+      "objects_stored_per_second": 32.0
+    },
+    {
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "step": 1,
+      "users": 16,
+      "seconds": 15.0,
+      "repetitions": 1,
+      "operations": 210,
+      "ok_per_second": {"median": 14.0, "min": 14.0, "max": 14.0},
+      "p50_seconds": 0.893,
+      "p95_seconds": 1.553,
+      "p99_seconds": 1.589,
+      "p99_reliable": true,
+      "failure_rate": 0.0,
+      "first_attempt_share": 1.0,
+      "conflicts_per_1000_ops": 0.0,
+      "exhausted": 0,
+      "zope_cpu_ms_per_op": 23.0,
+      "server_cpu_ms_per_op": 2.0,
+      "store_write_kb_per_op": 7.0,
+      "objects_loaded_per_second": 420.0,
+      "objects_stored_per_second": 56.0
+    }
+  ],
+  "runs": [
+    {
+      "id": "20260101T030000Z-edit-zeo-r0",
+      "scenario": "edit",
+      "stack": "zeo",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    },
+    {
+      "id": "20260101T030500Z-edit-zoe-native-qi-kv-r0",
+      "scenario": "edit",
+      "stack": "zoe-native-qi-kv",
+      "repetition": 0,
+      "verification": "pass",
+      "violations": 0
+    }
+  ]
+}
