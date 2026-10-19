@@ -83,7 +83,7 @@ def published_path(document: dict) -> str | None:
     elif kind == "plone":
         parts.append(document["fixture"]["name"])
     parts.append(f"{_stem(document['run'])}.json")
-    if not all(SEGMENT.match(part) for part in parts):
+    if not all(SEGMENT.fullmatch(part) for part in parts):
         return None
     return "/".join(["results", kind, *parts])
 
@@ -129,22 +129,51 @@ def entry(path: str, document: dict) -> dict:
     }
 
 
-def write_index(root: Path) -> Path:
-    """Write index.json of version 2 from every document under results/.
-    It does not read the old index, so it reads a tree of either version."""
+def index_entries(root: Path, extra: dict[str, dict] | None = None) -> list[dict]:
+    """Return the entries of index.json of version 2: every document under
+    results/ of root, and the documents of extra by their path, oldest
+    first. A document of extra takes the place of the file at its path. It
+    does not read the old index, so it reads a tree of either version.
+
+    Raise ValueError when a file under results/ is not a document that
+    the index can read, or when a path there is a symbolic link."""
+    extra = extra or {}
+    documents = dict(extra)
+    for path in sorted((root / "results").rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"{relative} is a symbolic link")
+        if relative in extra or path.suffix != ".json" or not path.is_file():
+            continue
+        try:
+            documents[relative] = json.loads(path.read_text())
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError(f"{relative} is not a JSON document") from None
     entries = []
-    for path in sorted((root / "results").rglob("*.json")):
-        if path.is_file():
-            relative = path.relative_to(root).as_posix()
-            try:
-                document = json.loads(path.read_text())
-            except ValueError:
-                raise ValueError(f"{relative} is not a JSON document") from None
-            entries.append(entry(relative, document))
+    for relative, document in documents.items():
+        try:
+            found = entry(relative, document)
+            if not isinstance(found["started"], str):
+                raise TypeError("started")
+        except (KeyError, TypeError, AttributeError, IndexError):
+            raise ValueError(
+                f"{relative} is not a document that the index can read"
+            ) from None
+        entries.append(found)
     entries.sort(key=lambda e: (e["started"], e["path"]))
+    return entries
+
+
+def write_entries(root: Path, entries: list[dict]) -> Path:
+    """Write index.json of version 2 with entries."""
     index = root / "index.json"
     index.write_text(
         json.dumps({"index_version": INDEX_VERSION, "results": entries}, indent=2)
         + "\n"
     )
     return index
+
+
+def write_index(root: Path) -> Path:
+    """Write index.json of version 2 from every document under results/."""
+    return write_entries(root, index_entries(root))
