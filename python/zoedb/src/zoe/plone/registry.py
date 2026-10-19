@@ -29,8 +29,8 @@ process, with or without the option.
 - **A field changed in place** is staged again before the commit and
   before each savepoint. A rollback to a savepoint drops the decoded rows.
   A rollback can keep the staged rows and give back the registry with its
-  old counter. So before the commit, a transaction with staged rows and
-  the old counter raises the counter.
+  old counter. So before the commit, a transaction with staged rows, the
+  old counter and a staged marker of another counter raises the counter.
 - **The guard** of a stock registry in a store with namespaces calls
   `readCurrent` on the roots of its trees when code reads its records, and
   the move empties those roots. So a write that began before a move
@@ -53,7 +53,6 @@ import zope.interface
 from Acquisition import aq_base
 from BTrees.OOBTree import OOBTree
 from plone.registry.registry import Registry, _Records
-from ZODB.DemoStorage import DemoStorage
 from ZODB.POSException import ReadConflictError, Unsupported
 from ZODB.utils import oid_repr
 
@@ -476,12 +475,21 @@ class _State:
                 self.fields[key] = data
 
     def count_staged(self):
-        """Raise the counter when the transaction staged rows and the
-        counter of the registry is not raised. A rollback to a savepoint
-        can keep the rows that the savepoint staged and give back the
-        registry with its old counter."""
-        if self.records().counter <= self.counter and self.staged():
-            self.bump()
+        """Raise the counter when the transaction staged rows, the counter
+        of the registry is not raised, and the staged marker holds another
+        counter. A rollback to a savepoint can keep the rows that the
+        savepoint staged and give back the registry with its old counter. A
+        move or `copy_rows` stages a marker with the counter of the
+        registry, so its counter stays."""
+        records = self.records()
+        if records.counter > self.counter or not self.staged():
+            return
+        writes = self.namespace._staged(create=False)
+        found, data = writes.find("durable", self.namespace.name, MARKER)
+        marker = decode_marker(data) if found else None
+        if marker is not None and marker[1] == records.counter:
+            return
+        self.bump()
 
     def forget(self):
         """Drop the decoded rows, as a rollback does."""
@@ -833,17 +841,44 @@ def copy_rows(source, copy):
     copy._records = MovedRecords(copy, registry_id, counter)
 
 
-def _on_zeo_client(registry):
-    """Tell if the storage of `registry`, or the base of a `DemoStorage`
-    over it, is a ZEO client."""
+# The attributes that hold the storage under a wrapper: `base` of a
+# `DemoStorage` and of zc.zlibstorage, `storage` of zc.beforestorage, the
+# storage of `ZODB.blob.BlobStorage`, and `_storage` of other wrappers.
+_WRAPPED = ("base", "storage", "_storage", "_BlobStorage__storage")
+
+
+def _layers(storage):
+    """Yield `storage` and each storage that a wrapper over it holds in an
+    attribute of `_WRAPPED`."""
+    todo = [storage]
+    seen = set()
+    while todo:
+        layer = todo.pop()
+        if id(layer) in seen:
+            continue
+        seen.add(id(layer))
+        yield layer
+        for name in _WRAPPED:
+            try:
+                inner = getattr(layer, name, None)
+            except Exception:
+                continue
+            # A storage loads records. A name or a path does not.
+            if inner is not None and callable(getattr(inner, "load", None)):
+                todo.append(inner)
+
+
+def _zeo_client_without_kv(storage):
+    """Tell if `storage`, or a storage under a wrapper of it, is a ZEO
+    client without KV namespaces."""
     try:
         from ZEO.ClientStorage import ClientStorage
     except ImportError:
         return False
-    storage = registry._p_jar.db().storage
-    while isinstance(storage, DemoStorage):
-        storage = storage.base
-    return isinstance(storage, ClientStorage)
+    return any(
+        isinstance(layer, ClientStorage) and not zoe.kv._has_namespaces(layer)
+        for layer in _layers(storage)
+    )
 
 
 def reset(registry):
@@ -851,7 +886,8 @@ def reset(registry):
     `OOBTree`s. The caller commits, then imports the registry step of each
     profile of the site. A registry that passes the check raises
     `ValueError`: it moves back instead. A registry on a ZEO client without
-    namespaces raises `Unsupported`: the server can hold its rows."""
+    namespaces, also under a wrapper, raises `Unsupported`: the server can
+    hold its rows."""
     _need_install("reset")
     registry = _bare(registry)
     records = registry._records
@@ -859,15 +895,13 @@ def reset(registry):
         raise ValueError(f"{_describe(registry)} is not moved")
     if _passes(records):
         raise ValueError(f"{_describe(registry)} reads its rows: move it back")
-    if (
-        registry._p_jar is not None
-        and _on_zeo_client(registry)
-        and not _has_namespaces(registry._p_jar)
-    ):
+    jar = registry._p_jar
+    if jar is not None and _zeo_client_without_kv(jar.db().storage):
         raise Unsupported(
             f"{_describe(registry)} is on a ZEO client without KV namespaces:"
-            " it cannot tell if the server holds the rows. To reset it, open"
-            " the storage directly (a FileStorage, or a zoe.Storage). To read"
-            " it, use zoe.zeo.ClientStorage with a zoe serve that accepts kv"
+            " it cannot tell if the server holds the rows. To reset it, stop"
+            " the ZEO server and open the storage directly (a FileStorage, or"
+            " a zoe.Storage). To read it, use zoe.zeo.ClientStorage with a"
+            " zoe serve that accepts kv"
         )
     registry._records = _Records(registry)

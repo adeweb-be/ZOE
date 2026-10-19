@@ -56,6 +56,17 @@ def opened(db):
         connection.close()
 
 
+class Wrapper:
+    """A stand-in of a wrapper of a storage: it keeps the storage in
+    `storage`, as zc.beforestorage does, and passes each call to it."""
+
+    def __init__(self, storage):
+        self.storage = storage
+
+    def __getattr__(self, name):
+        return getattr(self.storage, name)
+
+
 def buckets(tree):
     """Return the number of buckets of the `OOBTree` `tree`: 1 for a tree
     that keeps its keys in its root."""
@@ -327,6 +338,14 @@ class TestRegistryBackend(unittest.TestCase):
             self.assertEqual(other.records[TITLE].field.title, "Changed in place")
             self.assertEqual(other[OTHER], "Written after the rollback")
 
+    def test_a_move_and_a_read_in_one_transaction_commit_the_counter_1(self):
+        backend.move(self.registry)
+        # The read decodes a field, so the before-commit hook runs.
+        self.assertTrue(self.registry.records[TITLE].field.title)
+        transaction.commit()
+        self.assertEqual(aq_base(self.registry)._records.counter, 1)
+        self.assertEqual(decode_marker(namespace(self.registry).get(MARKER))[1], 1)
+
     def test_a_read_writes_nothing(self):
         registry = self.moved()
         serial = aq_base(registry)._p_serial
@@ -546,20 +565,50 @@ class TestRegistryBackend(unittest.TestCase):
 
     def split_merge_copy(self):
         """Turn the split merge on, and copy the site to a new
-        `zoe.Storage`. Return its database."""
+        `zoe.Storage` with a resolution log. Check that the split merge
+        runs on its registry. Return its database."""
+        import json
+
         import zoe.policy
 
         zoe.policy.install(self.portal._p_jar, {"classes": {}, "split_merges": "on"})
         transaction.commit()
-        return self.copy()
+        directory = tempfile.mkdtemp(prefix="zoe-registry-log-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        log = f"{directory}/resolution.log"
+        db = self.copy(resolution_log=log)
+        # Two writes from one snapshot split two buckets in two ranges of
+        # names. Rule 2 of the split merge merges the second commit. With
+        # the split merge off, it conflicts.
+        with opened(db) as (app, manager):
+            first = self.add_records_that_split_a_bucket(
+                app[PLONE_SITE_ID].portal_registry, "aaa.zoe.tests.split"
+            )
+            with opened(db) as (other, other_manager):
+                second = self.add_records_that_split_a_bucket(
+                    other[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.split"
+                )
+                other_manager.commit()
+            manager.commit()
+        with opened(db) as (app, _):
+            registry = app[PLONE_SITE_ID].portal_registry
+            for name in first + second:
+                self.assertEqual(registry[name], name)
+        with open(log) as file:
+            lines = [json.loads(line) for line in file if line.strip()]
+        merged = [
+            line for line in lines if line["outcome"] == "merged" and "split" in line
+        ]
+        self.assertTrue(merged, "the split merge merged nothing")
+        return db
 
-    def add_records_that_split_a_bucket(self, registry):
-        """Add records to `registry` in one range of names, until a bucket of
-        each tree splits. Return their names."""
+    def add_records_that_split_a_bucket(self, registry, prefix):
+        """Add records to `registry` with names that start with `prefix`,
+        until a bucket of each tree splits. Return their names."""
         records = registry.records
         trees = (records._fields, records._values)
         before = [buckets(tree) for tree in trees]
-        names = [f"zoe.plone.tests.split.{index:03d}" for index in range(40)]
+        names = [f"{prefix}.{index:03d}" for index in range(40)]
         for name in names:
             records[name] = Record(TextLine(title="Split"), name)
         for tree, count in zip(trees, before, strict=True):
@@ -572,7 +621,7 @@ class TestRegistryBackend(unittest.TestCase):
         db = self.split_merge_copy()
         with opened(db) as (app, manager):
             names = self.add_records_that_split_a_bucket(
-                app[PLONE_SITE_ID].portal_registry
+                app[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.race"
             )
             with opened(db) as (mover, mover_manager):
                 backend.move(mover[PLONE_SITE_ID].portal_registry)
@@ -595,7 +644,7 @@ class TestRegistryBackend(unittest.TestCase):
             backend.move(mover[PLONE_SITE_ID].portal_registry)
             with opened(db) as (app, manager):
                 names = self.add_records_that_split_a_bucket(
-                    app[PLONE_SITE_ID].portal_registry
+                    app[PLONE_SITE_ID].portal_registry, "zoe.plone.tests.race"
                 )
                 manager.commit()
             with self.assertRaises(ConflictError):
@@ -688,14 +737,14 @@ class TestRegistryBackend(unittest.TestCase):
         )
         self.assertEqual(rows.scan(), [])
 
-    def copy(self):
-        """Copy the records of the site to a new `zoe.Storage`. Return its
-        database."""
+    def copy(self, **options):
+        """Copy the records of the site to a new `zoe.Storage`, opened with
+        `options`. Return its database."""
         import zoe
 
         directory = tempfile.mkdtemp(prefix="zoe-registry-copy-")
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        storage = zoe.Storage(f"{directory}/zoe")
+        storage = zoe.Storage(f"{directory}/zoe", **options)
         try:
             copy_records(self.db.storage, storage)
         except BaseException:
@@ -800,6 +849,72 @@ class TestRegistryBackend(unittest.TestCase):
             records = aq_base(app[PLONE_SITE_ID].portal_registry)._records
             self.assertNotIsInstance(records, backend.MovedRecords)
             self.assertEqual(len(records), 0)
+
+    def served_copy_without_rows(self):
+        """Move the registry of the site, and copy the site without its rows
+        to a new `zoe.Storage`. Return the path of the store, closed."""
+        import zoe
+
+        self.moved()
+        directory = tempfile.mkdtemp(prefix="zoe-registry-norows-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = f"{directory}/zoe"
+        storage = zoe.Storage(path)
+        try:
+            copy_records(self.db.storage, storage)
+        finally:
+            storage.close()
+        return path
+
+    def test_reset_goes_on_for_a_zoe_zeo_client_with_kv(self):
+        # The client reads the rows, so the check is the answer: the copy
+        # has no rows.
+        import zoe.zeo
+        from zoe.testing import ZoeServer
+
+        with ZoeServer(self.served_copy_without_rows()) as server:
+            db = DB(
+                zoe.zeo.ClientStorage(server.address, storage="1", wait_timeout=TIMEOUT)
+            )
+            self.addCleanup(db.close)
+            with opened(db) as (app, manager):
+                copy = app[PLONE_SITE_ID].portal_registry
+                with self.assertRaises(Unsupported):
+                    copy[TITLE]
+                backend.reset(copy)
+                manager.commit()
+            with opened(db) as (app, _):
+                records = aq_base(app[PLONE_SITE_ID].portal_registry)._records
+                self.assertNotIsInstance(records, backend.MovedRecords)
+
+    def test_reset_refuses_a_stock_zeo_client_under_a_wrapper(self):
+        from ZEO.ClientStorage import ClientStorage
+        from ZODB.DemoStorage import DemoStorage
+
+        from zoe.testing import ZoeServer
+
+        wrappers = {
+            "DemoStorage": lambda base: DemoStorage(base=base),
+            "a stand-in": Wrapper,
+        }
+        with ZoeServer(self.served_copy_without_rows()) as server:
+            for name, wrap in wrappers.items():
+                with self.subTest(wrapper=name):
+                    stock = ClientStorage(
+                        server.address, storage="1", wait_timeout=TIMEOUT
+                    )
+                    db = DB(wrap(stock))
+                    try:
+                        with opened(db) as (app, _):
+                            copy = app[PLONE_SITE_ID].portal_registry
+                            with self.assertRaises(Unsupported):
+                                backend.reset(copy)
+                            self.assertIsInstance(
+                                aq_base(copy)._records, backend.MovedRecords
+                            )
+                    finally:
+                        db.close()
+                        stock.close()
 
     def test_reset_refuses_a_registry_that_reads_its_rows(self):
         registry = self.moved()
