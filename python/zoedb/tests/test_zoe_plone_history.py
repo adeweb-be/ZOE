@@ -637,6 +637,19 @@ def test_the_profile_and_the_uninstall_replace_each_other_in_place():
     assert list(kept) == [merges.PROFILE, "site:default"]
 
 
+def test_a_prefixed_profile_id_is_the_same_profile():
+    kept = {}
+    merges.keep_overrides(kept, "profile-" + merges.PROFILE, {"folder_orders": "on"})
+    merges.keep_overrides(kept, "site:default", {"tier2": "shadow"})
+    merges.keep_overrides(kept, merges.UNINSTALL, {"folder_orders": "off"})
+    assert list(kept.items()) == [
+        (merges.UNINSTALL, {"folder_orders": "off"}),
+        ("site:default", {"tier2": "shadow"}),
+    ]
+    merges.keep_overrides(kept, "profile-" + merges.UNINSTALL, {})
+    assert list(kept) == [merges.UNINSTALL, "site:default"]
+
+
 GROUP = [["effective", "effective_date", "expiration_date", "expires"]]
 
 
