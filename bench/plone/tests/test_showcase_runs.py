@@ -5,6 +5,8 @@ and of the client benchmark, and the retry of a B5 run."""
 import dataclasses
 import json
 import pathlib
+import shutil
+import subprocess
 
 import pytest
 
@@ -143,3 +145,24 @@ def test_a_directory_of_other_options_names_them(tmp_path):
     why = showcase.refusal(tmp_path, "c" * 40, other)
     assert "--zope-cpus 1;3 (not --zope-cpus 1;2)" in why
     assert "commit" in showcase.refusal(tmp_path, "d" * 40, OPTIONS)
+
+
+def test_the_recipe_passes_each_argument_unchanged(tmp_path):
+    """`just bench showcase` gives each argument to the showcase as it is:
+    a `;` and a space do not split it."""
+    just = shutil.which("just")
+    assert just, "run the tests inside `devenv shell`: `just` is not on PATH"
+    directory = tmp_path / "a b"
+    result = subprocess.run(
+        [just, "bench", "showcase", "--plan", "--json", "--zope-cpus", "2;4"]
+        + ["--dir", str(directory)],
+        cwd=stack.REPO,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(result.stdout)
+    assert document["directory"] == str(directory)
+    assert document["options"]["zope_cpus"] == ["2", "4"]
+    assert not directory.exists()

@@ -272,9 +272,13 @@ crash runs="200" seed="" seeds="200" split_seeds="200":
 # admin user as user:password. Without it, the recipe makes a random
 # password once, in target/plone/admin. The instance listens on 127.0.0.1,
 # on the port ZOE_PLONE_PORT or 8080.
+[positional-arguments]
 plone scenario="zoe" command="start" *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    # just gives the arguments of the recipe as positional arguments, each
+    # unchanged: the scenario, the command, then the arguments that follow.
+    args=("${@:3}")
     if [ ! -f "plone/{{ scenario }}.cfg" ]; then
         echo "just plone: unknown scenario {{ scenario }}. Use filestorage, zeo, zoe, zeoclient, zoeclient or zeoclient-mount." >&2
         exit 2
@@ -483,7 +487,7 @@ plone scenario="zoe" command="start" *args:
                     --path "$store" --listen 127.0.0.1:0
                 export ZOE_PLONE_ZEO_ADDRESS="$address"
             fi
-            set -- {{ args }}
+            set -- "${args[@]}"
             "$target/{{ scenario }}/bin/test" -s Products.CMFPlone \
                 -s plone.app.contenttypes -s plone.restapi "$@"
             ;;
@@ -493,7 +497,7 @@ plone scenario="zoe" command="start" *args:
             # zoe.plone.testing installs the backends that
             # ZOE_PLONE_BACKENDS names. The tests that start `zoe serve`
             # run the `zoe` binary of this build.
-            set -- {{ args }}
+            set -- "${args[@]}"
             cargo build --locked -p zoe-server --bin zoe
             ZOE_BINARY="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug/zoe" \
                 ZOE_PLONE_BACKENDS=locking "$target/{{ scenario }}/bin/test" \
@@ -502,7 +506,7 @@ plone scenario="zoe" command="start" *args:
         creators)
             # The creators script runs in the instance with the storage of
             # the scenario, after a new site. The instance must not run.
-            set -- {{ args }}
+            set -- "${args[@]}"
             if [ "$#" -ne 3 ]; then
                 echo "just plone: use just plone {{ scenario }} creators THREADS ITEMS SEED." >&2
                 exit 2
@@ -533,7 +537,7 @@ plone scenario="zoe" command="start" *args:
             # the scenario, after a new site: the merge policy of zoe.plone
             # and its append-only workflow history. The instance must not
             # run.
-            set -- {{ args }}
+            set -- "${args[@]}"
             if [ "$#" -ne 1 ]; then
                 echo "just plone: use just plone {{ scenario }} history THREADS." >&2
                 exit 2
@@ -622,10 +626,12 @@ plone scenario="zoe" command="start" *args:
 # resumes a directory that `--dir` gives. `--plan` prints the runs and
 # their estimates and runs nothing. It builds nothing before it starts:
 # the builds are the first runs of the set.
+[positional-arguments]
 bench *args="run":
     #!/usr/bin/env bash
     set -euo pipefail
-    set -- {{ args }}
+    # just gives the arguments of the recipe as positional arguments, each
+    # unchanged, such as `--zope-cpus "1;3"` or a path with a space.
     # `just bench showcase OPTIONS` stands for `just bench plone showcase
     # OPTIONS`.
     if [ "${1:-}" = showcase ]; then
