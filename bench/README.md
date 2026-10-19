@@ -21,6 +21,8 @@ This directory holds the reference baseline: a harness that runs [zodbshootout](
 | `just bench index DIR` | rewrites `index.json` of a results tree |
 | `just bench gate DIR` | the parity gate of phase 2: `zoe-server` against `zeo` in each cell of a results tree but `read_hot` (see [The gate](#the-gate)) |
 | `just bench plone COMMAND` | the Plone end-to-end benchmark: Locust against a Plone site on ZEO and on ZOE (see [The Plone end-to-end benchmark](#the-plone-end-to-end-benchmark)) |
+| `just bench showcase` | the publishable set in one command: the builds, B5 on `small` and `medium`, a B5 summary per fixture, the native gate and the client benchmark on CPython 3.13 and 3.14t; writes `target/bench/showcase/<started>/` (see [The showcase](#the-showcase)) |
+| `just bench showcase --plan` | each run of the set with its estimate; runs nothing |
 
 The bench project takes `python/zoedb` as an editable path source, as the uv workspace of the Python tests does. So the harness runs the Python code of the tree. uv builds the extension with maturin in the release profile, and the cache keys in `python/zoedb/pyproject.toml` tell uv to build it again when the Rust code changes.
 
@@ -175,7 +177,7 @@ just bench plone test                          # the tests of the harness
 | `zoe-asyncio` | `zoe serve` | `<zoeclient>` with `native false`; `zoedb[plone]` | ZEO's asyncio client with the ZOE extensions: the sequence without the native client |
 | `zoe-stock` | `zoe serve` | `<zeoclient>`: stock `ZEO.ClientStorage` over M5, no zoedb | the server alone, with no client extension |
 
-On `zoe serve` every client resolves conflicts through the vote (tier 3), after the structural merges of tier 1 in the server. `--split-merges on` (or `shadow`, `off`) writes the switch `split_merges` of the merge policy (ADR 0048) into the store of a run of a stack of `zoe serve` with zoedb, through a client of its own, before the instances start; the policy keeps its classes and its other switches, and `result.json` records the policy in `merge_policy`. Without the option, the store keeps the policy of the fixture. `--folder-orders on` (or `shadow`, `off`) writes the switch `folder_orders` of the order merge (ADR 0052) the same way, with the tier 2 entry of `plone.app.contenttypes.content.Folder` that merges `modification_date` with `max`; a run of the mechanism of ADR 0052 takes `--split-merges on --folder-orders on`. `zoe serve` writes raw records by default (ADR 0041); `--zoe-compression zstd` (or `zstd:LEVEL`) gives it `--compression`, and the result records it. FileStorage has no compression, so a run with zstd is a compression experiment of its own. The records of the fixture keep the compression of the `zoe convert` that prepared it: raw since ADR 0041, zstd before (see the fixture below).
+On `zoe serve` every client resolves conflicts through the vote (tier 3), after the structural merges of tier 1 in the server. `--split-merges on` (or `shadow`, `off`) writes the switch `split_merges` of the merge policy (ADR 0048) into the store of a run of a stack of `zoe serve` with zoedb, through a client of its own, before the instances start; the policy keeps its classes and its other switches, and `result.json` records the policy in `merge_policy`. Without the option, the store keeps the policy of the fixture. `--folder-orders on` (or `shadow`, `off`) writes the switch `folder_orders` of the order merge (ADR 0052) the same way, with the tier 2 entry of `plone.app.contenttypes.content.Folder` that merges `modification_date` with `max`; a run of the mechanism of ADR 0052 takes `--split-merges on --folder-orders on`. `--profile zoe.plone:default` imports that profile into each site of the store of a run of a stack of `zoe serve` with zoedb, through a client of its own (`inzope/profile.py`), before the instances start, as the owner of a site does: its import steps write the merge policy of the site and move the properties of the members and groups, so `member_properties.py` does not run. `result.json` records the profile in `profile`, the moves in `member_properties` and the policy in `merge_policy`. A campaign gives the switches and the profile only to the stacks that take them. `zoe serve` writes raw records by default (ADR 0041); `--zoe-compression zstd` (or `zstd:LEVEL`) gives it `--compression`, and the result records it. FileStorage has no compression, so a run with zstd is a compression experiment of its own. The records of the fixture keep the compression of the `zoe convert` that prepared it: raw since ADR 0041, zstd before (see the fixture below).
 
 **The ports.** The instances listen on 18080 and up, the server on 18100 and its admin port on 18199. `--port-offset N` adds N to each of them, so two runs share one machine: an offset of 200 or more keeps the ports of the two runs apart, and the harness refuses to start when one of its ports is in use. The two runs also share the CPUs, so their times do not compare.
 
@@ -227,6 +229,52 @@ just bench replay test                                   # the tests of the repl
 **The counts.** Each run counts the conflicts by class (`module.name` of the record) and by path: `native` (`zoe serve` resolved it), `python-client` (the resolver of ZODB in the replay), `python-server` (the resolver of ZODB in the ZEO server) or `refused` (the commit raised `ConflictError`). A vote that fails hides the conflicts that it resolved before its refusal, on both stacks, so a count by path holds the conflicts of the votes that pass and the refused oid of each vote that fails (`docs/spikes/log-replay.md`). After the run, a new client loads every record of every acknowledged transaction at its tid; a run in which one does not load does not count.
 
 **The measure** (`replay/gate.py`). `ConflictError`s per 1,000 transactions over the runs of each stack that count, and the ratio of the success criterion: the rate of `zoe-native` over the rate of `zeo`. There is no ratio when a stack has no run that counts, or when `zeo` has no `ConflictError`. `just bench replay report FILE` prints one row per run, the conflicts per 1,000 transactions by class and by path, and, as its last line, the rates, the ratio as a percentage of `zeo` and the target of at most 10 %, with each speed that has no run that counts for a stack. It exits with 0 for a result, whatever the ratio, and with 2 when FILE is not a result. `python -m replay run` exits with 0 after its runs, whatever the ratio, and with 2 when it refuses the log: no probe records, probe records that explain no transaction of the store, a merge policy that is not valid, or a timed transaction that writes the root with a policy. `just bench replay RUN` gives these codes, and exits with 1 before the replay when RUN kept no FileStorage, when RUN has no probe records, or when the interpreter of the zoeclient instance is missing. A run that replays no transaction does not count. A result is `target/bench/replay/<started>.json`, valid against `bench/schema/replay.schema.json`.
+
+## The showcase
+
+`just bench showcase` runs the publishable set on one machine, in one repetition, and leaves a directory that `just bench publish` takes (ADR 0054). The set is a decision of the human. Run nothing else beside it.
+
+```sh
+just bench showcase --plan                    # each run and its estimate; runs nothing
+just bench showcase                           # a new directory target/bench/showcase/<started>/
+just bench showcase --dir target/bench/showcase/<started>    # resume it
+touch target/bench/showcase/<started>/STOP    # stop after the current run
+just bench publish target/bench/showcase/<started> CHECKOUT
+```
+
+**The set**, in the order of its runs:
+
+1. The builds: the release `zoe` binary (or the file that `ZOE_BINARY` names), `just plone zeo build` and `just plone zoeclient build`. The recipe builds nothing before the showcase starts, so no build runs between two measurements.
+2. For `small`, then `medium`: the fixture, which `prepare` builds only when it is missing; the B5 runs of the fixture; then the B5 summary of the fixture (`report --json`).
+   - `small`: `browse`, `catalog` and `mixed` at 4 and 16 users; `edit` and `create-spread` at 1, 4, 8, 16 and 32 users, the curve of the dashboard; `contention-folder`, `contention-fields` and `contention-same` at 4 and 16 users.
+   - `medium`: `browse`, `catalog`, `edit`, `create-spread` and `mixed` at 4 and 16 users.
+
+   Each scenario runs on `zeo` and on `zoe-native-qi-kv`, one after the other, and the stack that goes first changes from one scenario to the next. Each run keeps its verification.
+3. The native gate (`just bench native`) and the client benchmark (`just bench client`), each on CPython 3.13 and on 3.14t. They run in the environment of `bench/shootout`, not in the one of `bench/plone`, with the `zoe` binary of the build, the commit of the showcase and `ZOE_BENCH_MACHINE`, so every document names the same machine and commit.
+
+**The ZOE stack.** Before the instances of a run of `zoe-native-qi-kv` start, a client of the run imports the profile `zoe.plone:default` into the copy of the store (`--profile`, above). So the stack runs with the merge policy that a new site gets from the profile: the split merge and the order merge of a folder on, tier 2 on for `plone.app.contenttypes.content.Folder` and `Products.CMFPlone.Portal.PloneSite` with `modification_date: max`, and for `zoe.plone.properties.PrincipalProperties`, and the entries that the profile derives for the other types in shadow mode. The result records the policy in `merge_policy`, and the B5 summary in `stacks[].merge_policy`. The harness writes no switch, so `split_merges` and `folder_orders` of the `switches` of the stack are null: the policy tells what is on. `zeo` imports nothing.
+
+**The options of the set.** `--fixtures small,medium`; `--step-seconds 60`, `--warmup 60` and `--trim 5`, the defaults of `run`; `--client-objects 1000`, the `--objects` of the client benchmark; and the pinning of each B5 run, for both stacks: `--server-cpus 0`, `--zope-cpus "1;3"` and `--locust-cpus 6`. On the reference machine these CPUs are on separate physical cores, so each Zope instance has a core of its own (a decision of the human); the settings of each result record the pinning. A directory records these options and its commit: `ZOE_BENCH_COMMIT`, else `git rev-parse HEAD`. A start with another commit or other options of the set exits with 2 and runs nothing. `--max-load` and `--port-offset` are not options of the set, so a start with other values resumes the directory.
+
+**A start** runs the runs that are not done, in the order of the plan, one at a time. For each run, it holds an exclusive `flock(2)` on `ZOE_BENCH_LOCK` (`target/bench/bench.lock` by default), so that a benchmark that takes the same lock does not run beside it, and it waits while the 1-minute load average is `--max-load` (8) or more. After the run, a file `STOP` in the directory ends the showcase with exit 0; a `STOP` that exists when a start begins goes away. On Linux, `systemd-inhibit` keeps the machine awake until the showcase ends; when it is missing or refuses, the showcase warns and goes on. A tree that differs from its commit gives a warning too: the runs go on, and `publish` refuses their documents.
+
+**Failures.** A failed build or `prepare` stops the showcase at once. A failed B5 run, native gate, client benchmark or summary stays to do, and the showcase goes on with the next run, but not with the summary of a fixture whose B5 runs are not all done. The exit code is 0 when no run failed, 1 when a run failed, and 2 when the directory belongs to another commit or other options. A later start runs only what is to do. A native gate or a client benchmark that writes its result ended well, also when it exits with 1: the report gives the verdict. A B5 run whose verification fails ended well too: the log and the summary give its verdict, and `publish` refuses the summary.
+
+**The directory.**
+
+| Path | Holds |
+| --- | --- |
+| `showcase.log` | one line for each start and end of a run, with the verdict of each B5 run |
+| `summary-<preset>.json`, `native-<python>.json`, `client-<python>.json` | the documents that `just bench publish` takes: only these are `*.json` files directly in the directory |
+| `summary-<preset>.md` | the report of the B5 runs of a fixture |
+| `logs/<id>.log` | the output of each run |
+| `runs/<id>/` | the directory of each B5 run |
+| `failed/<id>-<started>/` | the directory of an earlier attempt of a B5 run |
+| `state/` | the commit and the options of the set, and one file for each run that ended well |
+
+**The plan.** `--plan` prints one line for each run: its id, its state (`todo` or `done`), its estimate and what it does, then the total of the runs to do. `--json` prints the same plan as one JSON document: `directory`, `commit`, `dirty`, `options`, `estimate_seconds` and `runs`; each run has `id`, `kind` (`build`, `prepare`, `b5`, `summary`, `native` or `client`), `state`, `estimate_seconds` and the fields of its kind. The plan runs nothing, writes nothing and takes no lock. The state of a run depends only on the directory, so the plan of a new directory shows every run to do; the run of a `prepare` whose fixture exists only finds it. The whole set takes about 4 hours on the reference machine.
+
+**The tests.** `just bench plone test bench/plone/tests/test_showcase.py` checks the plan, the resume, `STOP`, the lock and the failures, with a fake runner, and runs no benchmark. `ZOE_BENCH_SHOWCASE_SMOKE=1 just bench plone test bench/plone/tests/test_showcase_smoke.py` runs the set on `small` alone, with steps of 5 s, no warmup, a trim of 1 s and 50 client objects, from a clean tree, then publishes the directory into an empty checkout and reads it: about 100 minutes, and the CPUs of the machine. `ZOE_BENCH_SHOWCASE_PORT_OFFSET` gives the B5 runs a `--port-offset`.
 
 ## The results repository
 
