@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::builder::BoolishValueParser;
 use clap::{ArgAction, ArgGroup, Args};
-use zoe_convert::Report;
+use zoe_convert::{ClassRecord, Report, records_of_classes};
 use zoe_core::{DurableRow, Options, Store};
 
 use super::{Failure, blob_dir_failure, open_with_blobs, store_failure};
@@ -32,6 +32,18 @@ const MARKER_LAYOUT: u8 = 1;
 
 /// The number of durable rows that one read of the walk gives.
 const ROW_CHUNK: usize = 1024;
+
+/// The classes of `zoe.plone` whose records a client without `zoedb`
+/// loads as broken objects (ADR 0046, section 9). The profile
+/// `zoe.plone:uninstall` gives the stock values back for each of them. A
+/// new class of this kind joins the list.
+const PLONE_CLASSES: &[&str] = &[
+    "zoe.plone.properties.PrincipalProperties",
+    "zoe.plone.history.WorkflowHistory",
+];
+
+/// The number of oids of each class that a message names.
+const NAMED_OIDS: usize = 5;
 
 /// A moved registry that a marker row shows.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +71,63 @@ impl MovedRegistry {
             namespace: row.name.clone(),
             oid,
         })
+    }
+}
+
+/// The current records of one class of `PLONE_CLASSES` in a store.
+#[derive(Debug, PartialEq, Eq)]
+struct PloneClass {
+    /// The class, `module.name`.
+    class: String,
+    /// The number of its current records.
+    count: usize,
+    /// The first `NAMED_OIDS` oids of its records, in oid order.
+    oids: Vec<u64>,
+}
+
+impl PloneClass {
+    /// Return the classes of `records`, in the order of `PLONE_CLASSES`.
+    fn of(records: &[ClassRecord]) -> Vec<Self> {
+        PLONE_CLASSES
+            .iter()
+            .filter_map(|class| {
+                let oids: Vec<u64> = records
+                    .iter()
+                    .filter(|record| record.class == *class)
+                    .map(|record| record.oid.0)
+                    .collect();
+                (!oids.is_empty()).then(|| Self {
+                    class: (*class).to_owned(),
+                    count: oids.len(),
+                    oids: oids.into_iter().take(NAMED_OIDS).collect(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for PloneClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let oids: Vec<String> = self.oids.iter().map(|oid| format!("{oid:#018x}")).collect();
+        write!(
+            f,
+            "{}: {} ({})",
+            self.class,
+            records(self.count),
+            oids.join(", ")
+        )?;
+        if self.count > self.oids.len() {
+            write!(f, " and {} more", self.count - self.oids.len())?;
+        }
+        Ok(())
+    }
+}
+
+/// Return the count `count` of records, as text.
+fn records(count: usize) -> String {
+    match count {
+        1 => "1 record".to_owned(),
+        n => format!("{n} records"),
     }
 }
 
@@ -124,14 +193,17 @@ pub(super) struct ConvertArgs {
     #[arg(long, env = "ZOE_DATA_FS_BLOB_DIR", value_name = "DIR")]
     data_fs_blob_dir: Option<PathBuf>,
 
-    /// Convert a store that holds a moved registry of zoe.plone into a
-    /// Data.fs anyway.
+    /// Convert a store that holds a moved registry of zoe.plone, or records
+    /// of the classes of zoe.plone, into a Data.fs anyway.
     ///
     /// Without it, --to-data-fs refuses such a store and writes nothing: a
     /// Data.fs holds no namespace, so the registry of the copy raises
-    /// Unsupported on each request. Move each registry back first. With
-    /// --force, the command converts and writes a warning that names each
-    /// registry. With --force=false the command refuses, also when the twin
+    /// Unsupported on each request, and a client without zoedb loads the
+    /// records of the classes of zoe.plone (the properties of the members
+    /// and groups, the workflow histories) as broken objects. Move each
+    /// registry back, and import the profile zoe.plone:uninstall, first.
+    /// With --force, the command converts and writes a warning that names
+    /// each registry and each class. With --force=false the command refuses, also when the twin
     /// forces. With --from-data-fs it has no effect.
     #[arg(
         long,
@@ -186,7 +258,7 @@ fn from_data_fs(
     let title = format!("{} into the store {}", data_fs.display(), path.display());
     // A conversion that does not verify fails, also when the report does
     // not go out.
-    let written = write_report(out, &title, &report, &[]);
+    let written = write_report(out, &title, &report, &[], &[]);
     verified(&report)?;
     Ok(written?)
 }
@@ -217,8 +289,9 @@ fn check_data_fs(data_fs: &Path) -> Result<(), Failure> {
 /// Convert the store in `path`, with its blob files in `blob_dir`, into
 /// the `Data.fs` `data_fs` and the blob directory `data_fs_blobs`.
 ///
-/// A store that holds a moved registry fails before the conversion
-/// writes anything, unless `force` is true.
+/// A store that holds a moved registry, or current records of the classes
+/// of `PLONE_CLASSES`, fails before the conversion writes anything, unless
+/// `force` is true.
 fn to_data_fs(
     path: &Path,
     blob_dir: Option<&Path>,
@@ -235,8 +308,20 @@ fn to_data_fs(
     let store = open_with_blobs(path, blob_dir)?;
     // The guard runs before the conversion, so a refusal writes nothing.
     let moved = moved_registries(&store).map_err(|e| store_failure(path, e))?;
-    if !moved.is_empty() && !force {
-        return Err(Failure::Message(refusal(path, &moved)));
+    let classes = records_of_classes(&store, PLONE_CLASSES)
+        .map(|records| PloneClass::of(&records))
+        .map_err(|e| store_failure(path, e))?;
+    if !force {
+        let mut refusals = Vec::new();
+        if !moved.is_empty() {
+            refusals.push(refusal(path, &moved));
+        }
+        if !classes.is_empty() {
+            refusals.push(class_refusal(path, &classes));
+        }
+        if !refusals.is_empty() {
+            return Err(Failure::Message(refusals.join("\n")));
+        }
     }
     let report = zoe_convert::to_datafs(&store, data_fs, data_fs_blobs)
         .map_err(|e| convert_failure(path, e))?;
@@ -247,9 +332,12 @@ fn to_data_fs(
     if !moved.is_empty() {
         eprintln!("{}", forced_warning(&moved));
     }
+    if !classes.is_empty() {
+        eprintln!("{}", forced_class_warning(&classes));
+    }
     // A conversion that does not verify fails, also when the report does
     // not go out.
-    let written = write_report(out, &title, &report, &moved);
+    let written = write_report(out, &title, &report, &moved, &classes);
     verified(&report)?;
     Ok(written?)
 }
@@ -291,6 +379,44 @@ fn refusal(path: &Path, moved: &[MovedRegistry]) -> String {
          commit, then convert. Or give --force (ZOE_FORCE) to convert anyway.",
     );
     message
+}
+
+/// Return the message of the refusal of the store in `path`, which holds
+/// current records of the classes `classes` of `zoe.plone`.
+fn class_refusal(path: &Path, classes: &[PloneClass]) -> String {
+    let total: usize = classes.iter().map(|class| class.count).sum();
+    let mut message = format!(
+        "{}: the store holds {} of the classes of zoe.plone. A client without zoedb \
+         loads them as broken objects, so a site of the copy cannot read the \
+         properties of its members and groups, or its workflow histories:",
+        path.display(),
+        records(total)
+    );
+    for class in classes {
+        message.push_str("\n  ");
+        message.push_str(&class.to_string());
+    }
+    message.push_str(
+        "\nImport the profile zoe.plone:uninstall on each site of the store first: it \
+         gives the stock values back. Then convert. Or give --force (ZOE_FORCE) to \
+         convert anyway.",
+    );
+    message
+}
+
+/// Return the warning of a forced conversion of a store that holds current
+/// records of the classes `classes` of `zoe.plone`.
+fn forced_class_warning(classes: &[PloneClass]) -> String {
+    let named: Vec<String> = classes
+        .iter()
+        .map(|class| format!("{} ({})", class.class, records(class.count)))
+        .collect();
+    format!(
+        "warning: --force: the Data.fs holds records of the classes of zoe.plone: {}. \
+         A client without zoedb loads them as broken objects. Import the profile \
+         zoe.plone:uninstall on each site of the store, then convert again.",
+        named.join(", ")
+    )
 }
 
 /// Return the warning of a forced conversion of a store that holds the
@@ -347,12 +473,14 @@ fn convert_failure(path: &Path, error: zoe_convert::Error) -> Failure {
 /// The line `problems` gives the number of problems. One line for each
 /// kind with a problem follows, with its count and no cap. Then come the
 /// lines of the capped list. A forced conversion of a store with the moved
-/// registries `moved` gives them before the line `problems`.
+/// registries `moved`, or with records of the classes `classes`, gives them
+/// before the line `problems`.
 fn write_report(
     out: &mut dyn Write,
     title: &str,
     report: &Report,
     moved: &[MovedRegistry],
+    classes: &[PloneClass],
 ) -> std::io::Result<()> {
     writeln!(out, "Converted {title}")?;
     writeln!(out, "  transactions  {}", report.transactions)?;
@@ -375,6 +503,15 @@ fn write_report(
             count(moved)
         )?;
         writeln!(out, "  {}", forced_warning(moved))?;
+    }
+    if !classes.is_empty() {
+        let total: usize = classes.iter().map(|class| class.count).sum();
+        writeln!(
+            out,
+            "  zoe.plone     {} of its classes, converted with --force",
+            records(total)
+        )?;
+        writeln!(out, "  {}", forced_class_warning(classes))?;
     }
     writeln!(out, "  problems      {}", report.problem_count())?;
     let width = report
@@ -409,7 +546,13 @@ mod tests {
 
     use zoe_core::DurableRow;
 
-    use super::{MovedRegistry, forced_warning, left_out_warning, refusal};
+    use zoe_convert::ClassRecord;
+    use zoe_core::Oid;
+
+    use super::{
+        MovedRegistry, PloneClass, class_refusal, forced_class_warning, forced_warning,
+        left_out_warning, refusal,
+    };
 
     /// The name of the namespace of a registry.
     const NAMESPACE: &str = "zoe.plone.registry:0123456789abcdef0123456789abcdef";
@@ -500,5 +643,49 @@ mod tests {
         }
         assert!(message.contains("move_back"), "{message}");
         assert!(message.contains("--force (ZOE_FORCE)"), "{message}");
+    }
+
+    #[test]
+    fn the_refusal_of_the_classes_names_each_class_and_its_first_oids() {
+        let properties = "zoe.plone.properties.PrincipalProperties";
+        let history = "zoe.plone.history.WorkflowHistory";
+        let mut records: Vec<ClassRecord> = (1..=7)
+            .map(|oid| ClassRecord {
+                oid: Oid(oid),
+                class: properties.to_owned(),
+            })
+            .collect();
+        records.push(ClassRecord {
+            oid: Oid(0x2a),
+            class: history.to_owned(),
+        });
+        let classes = PloneClass::of(&records);
+        assert_eq!(classes.len(), 2);
+        assert_eq!((classes[0].count, classes[0].oids.len()), (7, 5));
+        let message = class_refusal(Path::new("/srv/store"), &classes);
+        assert!(message.contains("holds 8 records"), "{message}");
+        assert!(
+            message.contains(&format!("{properties}: 7 records")),
+            "{message}"
+        );
+        assert!(
+            message.contains("0x0000000000000005) and 2 more"),
+            "{message}"
+        );
+        assert!(!message.contains("0x0000000000000006"), "{message}");
+        assert!(
+            message.contains(&format!("{history}: 1 record (0x000000000000002a)")),
+            "{message}"
+        );
+        assert!(message.contains("zoe.plone:uninstall"), "{message}");
+        assert!(message.contains("--force (ZOE_FORCE)"), "{message}");
+        let warning = forced_class_warning(&classes);
+        assert!(warning.starts_with("warning: --force: "), "{warning}");
+        assert!(
+            warning.contains(&format!("{properties} (7 records)")),
+            "{warning}"
+        );
+        assert!(warning.contains("zoe.plone:uninstall"), "{warning}");
+        assert!(PloneClass::of(&[]).is_empty());
     }
 }

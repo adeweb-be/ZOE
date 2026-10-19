@@ -13,6 +13,9 @@
 //! [`verify`] checks a store without Python: the checksums of its frames,
 //! its blob files, its persistent references and its classes.
 //!
+//! [`records_of_classes`] finds the current records of some classes, from
+//! their class pickles, without Python.
+//!
 //! [`backup`] writes a dump of a store into a backup directory: a full
 //! dump the first time, then the transactions after the last dump, with
 //! their blobs and the ends of the sequences. [`restore`] rebuilds the
@@ -25,6 +28,7 @@ use zoe_core::{Tid, ZoeError};
 
 mod backup;
 mod blobs;
+mod classes;
 mod datafs;
 mod filestorage;
 mod to_datafs;
@@ -32,6 +36,7 @@ mod verify;
 mod writer;
 
 pub use backup::{Backup, BackupCheck, Restored, backup, restore, verify_backup};
+pub use classes::{ClassRecord, records_of_classes};
 pub use datafs::from_datafs;
 pub use to_datafs::to_datafs;
 pub use verify::{

@@ -38,6 +38,8 @@ Converters between `Data.fs`, RelStorage and ZOE stores. Specification: "Loupe",
 
 ## ZOE to `Data.fs`
 
+- `records_of_classes` finds the current records of a list of classes, for the guard of `zoe convert --to-data-fs`. It walks the record keys in chunks of 1,024 keys, reads the newest record of each oid, and decodes its class pickle with `zoe_pickle::decode_class_name`. It decodes the state only of a record of a listed class, and leaves out a retired record: a dict state of one item whose key is the int 0. A deletion has no current record. A record that does not decode is left out: the conversion and `verify` report it. No unpickler runs.
+
 - The writer writes what FileStorage's `restore` writes. The file starts with the magic `FS30`. Each transaction of the store becomes one transaction record with the status ` ` and its tid, user, description and extension bytes unchanged. All numbers are big-endian.
 - A transaction record is the tid (8 bytes), the length (8), the status (1), the lengths of the user, the description and the extension (2 each), these three fields, the data records, and the length again (8). The length counts from the tid to the end of the last data record.
 - A field longer than 65535 bytes does not fit in its 2 bytes. The conversion then fails with `TooLong`, as FileStorage refuses such a transaction.
