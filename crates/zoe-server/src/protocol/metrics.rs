@@ -249,6 +249,8 @@ impl zoe_core::Observer for Metrics {
     fn locks_handed_off(&self, locks: usize) {
         self.lock_handoffs
             .fetch_add(locks as u64, Ordering::Relaxed);
+        #[cfg(feature = "sim")]
+        crate::sim::handed_off(locks);
     }
 
     fn intent_locks_acquired(&self, locks: usize, wait: Duration) {

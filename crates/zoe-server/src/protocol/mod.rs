@@ -27,7 +27,7 @@ mod invalidation;
 mod iteration;
 mod message;
 pub(crate) mod metrics;
-mod negotiation;
+pub(crate) mod negotiation;
 mod outbox;
 mod pipeline;
 mod resolution;
@@ -171,6 +171,10 @@ pub(crate) struct NamedStorage {
     /// closes the connection, and the transaction aborts. `None` closes
     /// no connection for this reason.
     pub(crate) transaction_timeout: Option<Duration>,
+    /// True when the store is on a `MemVfs` of the simulator, so it has no
+    /// directory to measure.
+    #[cfg(feature = "sim")]
+    in_memory: bool,
 }
 
 impl NamedStorage {
@@ -194,6 +198,8 @@ impl NamedStorage {
             resolution_log: None,
             intent_hold: session::INTENT_HOLD,
             transaction_timeout: None,
+            #[cfg(feature = "sim")]
+            in_memory: false,
         }
     }
 
@@ -209,6 +215,14 @@ impl NamedStorage {
     #[cfg(feature = "sim")]
     pub(crate) fn started_at(mut self, start: SystemTime) -> Self {
         self.stats = Arc::new(Stats::new(start));
+        self
+    }
+
+    /// Mark the store as one on a `MemVfs` of the simulator. Its size is
+    /// then 0, so `get_info` answers without a store directory.
+    #[cfg(feature = "sim")]
+    pub(crate) fn in_memory(mut self) -> Self {
+        self.in_memory = true;
         self
     }
 
@@ -268,6 +282,10 @@ impl NamedStorage {
     /// Return the size of the files in the store directory, in bytes, as
     /// `zoe.Storage.getSize` gives it. The blob directory is not counted.
     fn size(&self) -> io::Result<u64> {
+        #[cfg(feature = "sim")]
+        if self.in_memory {
+            return Ok(0);
+        }
         let mut size = 0;
         for entry in fs::read_dir(&self.path)? {
             let metadata = entry?.metadata()?;

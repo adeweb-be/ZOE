@@ -31,7 +31,7 @@ serve = [
 fuzz = ["serve"]
 # The deterministic simulator `zoe_server::sim`. Only the dev-dependency
 # below turns it on, so only test builds have it.
-sim = ["serve", "dep:redb", "dep:zoe-client"]
+sim = ["serve", "dep:redb", "dep:zoe-client", "dep:zoe-pickle"]
 
 [[bin]]
 name = "zoe"
@@ -61,6 +61,7 @@ tracing-subscriber = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 zoe-client = { workspace = true, optional = true }
 zoe-mcp = { workspace = true, optional = true }
+zoe-pickle = { workspace = true, optional = true }
 
 [dev-dependencies]
 rmpv.workspace = true

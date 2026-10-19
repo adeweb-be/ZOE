@@ -30,7 +30,7 @@ use super::world::{self, Resume, Shared, State, Why};
 pub(crate) const DATABASE: &str = "zoe.redb";
 
 /// The wall-clock time when a run starts: 2026-01-01T00:00:00Z.
-const START: Duration = Duration::from_secs(1_767_225_600);
+pub(crate) const START: Duration = Duration::from_secs(1_767_225_600);
 
 /// The simulated clock.
 #[derive(Clone)]
