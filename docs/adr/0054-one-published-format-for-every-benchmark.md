@@ -26,6 +26,7 @@ The decisions of the human, on the card:
 - On B5, ZOE is the stack `zoe-native-qi-kv`, labelled with what it turns on, beside `zeo`.
 - Nothing goes to the public repository without the approval of the human of that push.
 - The three questions of the planner, in section 7.
+- The result of the native gate holds the outcome of each scenario of each cell, so the dashboard computes nothing (section 8).
 
 ## Decision
 
@@ -167,6 +168,18 @@ Each number of `steps` is the number that `report` prints, in the unit of its na
 1. **A document with no record of its tree is refused.** A run in the container of CI has no `.git`, so it records `dirty` as null, and `publish` refuses it. A publication from CI gets a card of its own. The alternative, to accept null when `ZOE_BENCH_COMMIT` names the commit, as CI sets it, is refused.
 2. **A part of the native gate is publishable.** A run with `--cell` or `--scenario`, or a client run with other `--objects`, holds fewer cells or rows, and its document shows them. `publish` takes it as it is. The alternative, to refuse a native run without the 30 cells of the gate set, is refused.
 3. **The commit of main is a check with git.** `publish` runs `git merge-base --is-ancestor` against `origin/main`, and `--main REF` names another branch. The alternative, no check and a check of the commit by the human before the push, is refused.
+
+### 8. The outcome of a scenario of the native gate
+
+A decision of the human, on ZOE-245: each scenario entry of a cell of a result of the native gate holds its outcome, beside its pairs. So a reader of the result, such as the dashboard, does not apply the rule again.
+
+| Key | Holds |
+| --- | --- |
+| `ratio` | the geometric mean of the ratios `t_zeo / t_zoe` of the pairs, as `shootout.native.decide` gives it |
+| `low`, `high` | the bounds of its interval at the level of the rule, as `decide` gives them |
+| `verdict` | `pass`, `fail`, or null when the scenario is undecided |
+
+A value that is not finite is null: `high` with fewer than 2 pairs, for example. `just bench native` writes the four keys with the rule of the run. They are optional in `native.schema.json`, so a result without them stays valid. `just bench native report` applies the rule of the result to the pairs again, and its verdict agrees with the keys.
 
 ## Consequences
 
