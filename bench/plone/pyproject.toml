@@ -20,6 +20,8 @@ dependencies = [
     "msgpack>=1",
     # The sampler reads the machine CPU and the disk counters on macOS.
     "psutil>=7",
+    # `report --json` validates its summary against bench/schema.
+    "jsonschema>=4",
 ]
 
 [dependency-groups]
