@@ -13,7 +13,7 @@ Each round runs in a fresh process. The native client imports ZEO too,
 so the processes of both clients load ZEO and ZODB. Each process imports
 its client and the modules of the calls before the clock starts. So the
 clock of a warm round covers the open of the client and the verification
-of its cache, and no import.
+of its cache. The clock of no round covers an import.
 """
 
 import functools
@@ -209,10 +209,11 @@ def run_threads(spec: dict) -> dict:
     for thread in threads:
         thread.join()
     end, cpu_end = time.monotonic(), cpu()
+    if any(t is None for t in times):
+        storage.close()
+        raise RuntimeError("a worker thread failed")
     check_no_imports(modules)
     storage.close()
-    if any(t is None for t in times):
-        raise RuntimeError("a worker thread failed")
     return _result(
         spec, start, end, cpu_end - cpu_start, [t for ts in times for t in ts]
     )
