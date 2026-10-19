@@ -38,7 +38,8 @@ site that raises its own mode raises the policy when no other site asks
 for less (`lowest_mode`). A mode for the whole database goes through the
 overrides of a site: an ``off`` that `zoe.policy.install` writes lasts
 only until the next `update_policy` of a site that asks for more, which
-replaces it with a warning. `update_policy` also drops the mode of a site
+replaces it with a warning; a rise of the lowest mode of the sites logs at
+INFO (`log_rise`). `update_policy` also drops the mode of a site
 that is gone (`gone_sites`): a removed site, or the old path of a renamed
 or moved site, which gives its mode under its new path at its own next
 update. A change of a Dexterity type derives the policy again
@@ -420,6 +421,36 @@ def lowest_mode(modes, site, mode, switch="folder_orders"):
     return lowest
 
 
+def log_rise(site, stored, before, lowest, switch="folder_orders"):
+    """Log that the update of the site of the path `site` raises the switch
+    `switch` from `stored`, the mode of the policy of the database, to
+    `lowest`, the new lowest mode of the sites. `before` is the lowest mode
+    of the sites before the update, or None. Log a warning when `stored` is
+    lower than `before`: no site asked for it, as when `zoe.policy.install`
+    wrote it. Else log at INFO: a site raised its mode, or a site is gone.
+    Log nothing when `stored` is None or not lower than `lowest`."""
+    if stored is None or LOWER.index(stored) >= LOWER.index(lowest):
+        return
+    if before is None or LOWER.index(stored) < LOWER.index(before):
+        logger.warning(
+            "%s raises %s from %s, the mode of the policy of the database "
+            "that no site asks for, to %s, the lowest mode of its sites: a "
+            "mode for the whole database goes in the overrides of a site",
+            site,
+            switch,
+            stored,
+            lowest,
+        )
+    else:
+        logger.info(
+            "%s raises %s from %s to %s, the lowest mode of the sites",
+            site,
+            switch,
+            stored,
+            lowest,
+        )
+
+
 def gone_sites(site, modes, path):
     """Return the paths of `modes`, other than `path`, whose site is gone.
     A site is gone when the walk of its path from the Zope root of `site`
@@ -483,28 +514,14 @@ def update_policy(site):
         modes = root.get(name)
         if modes is None:
             modes = root[name] = PersistentMapping()
+        before = min(modes.values(), key=LOWER.index) if modes else None
         for gone in gone_sites(site, modes, path):
             logger.info("%s is gone: the database drops its mode of %s", gone, switch)
             del modes[gone]
         lowest = lowest_mode(modes, path, policy.get(switch), switch)
-        if lowest is None:
-            continue
-        policy[switch] = lowest
-        # The policy of the database can hold a lower mode than its sites
-        # ask for now: a mode that `zoe.policy.install` wrote, or the mode
-        # of a site that raised its mode or is gone. The update replaces
-        # it, with a warning.
-        kept = (stored or {}).get(switch)
-        if kept is not None and LOWER.index(kept) < LOWER.index(lowest):
-            logger.warning(
-                "%s raises %s from %s, the mode of the policy of the database, "
-                "to %s, the lowest mode of its sites: a mode for the whole "
-                "database goes in the overrides of a site",
-                path,
-                switch,
-                kept,
-                lowest,
-            )
+        if lowest is not None:
+            policy[switch] = lowest
+            log_rise(path, (stored or {}).get(switch), before, lowest, switch)
     composed = settle(stored, policy, removed)
     version = merge_policy.install(connection, composed)
     logger.info(
