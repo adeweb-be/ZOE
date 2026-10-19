@@ -70,20 +70,29 @@ Dexterity container classes of stock Plone 6.1:
 ``Products.CMFPlone.Portal.PloneSite``. These entries keep their derived
 fields, so ``modification_date`` takes ``max``. So the profile alone gives
 the order merge of ADR 0052 on a stock site: a creation in a folder
-changes only ``modification_date`` of the folder. This is an exception to
-shadow mode first, for these two classes only (ADR 0046, section 9). The
-other derived entries stay in shadow mode. An add-on container class keeps
-its derived entry in shadow mode, until the overrides of its site switch it
-on. A blocked container class stays blocked. A later profile of the site
-lowers the container classes with its key ``tier2`` or with their entries.
-The sites of a database compose the ``tier2`` of the container classes
-(`SITE_CLASSES`) as they compose the switches of `SITE_SWITCHES`: the
-policy takes the lowest latest mode of the sites, so an import of the
-profile on one site does not raise a container class over the lower mode
-of another site.
-On a site with no type of a container class, the override adds the entry
-``{"tier2": "on"}``, with no fields and no coupled groups. The profile
-``zoe.plone:uninstall`` changes no switch and no entry.
+changes only ``modification_date`` of the folder. Two edits of other
+fields of these classes merge too, under the derived groups and the
+default ``strict``. This is an exception to shadow mode first, for these
+two classes only (ADR 0046, section 9). The other derived entries stay in
+shadow mode. An add-on container class keeps its derived entry in shadow
+mode, until the overrides of its site switch it on. The profile changes
+derived entries only: `profile_overrides` removes its entry of a container
+class that the site has no type of, or that the derivation blocks. A later
+profile of the site lowers the container classes with its key ``tier2`` or
+with their entries. The sites of a database compose the ``tier2`` of the
+container classes (`SITE_CLASSES`) as they compose the switches of
+`SITE_SWITCHES`: the policy takes the lowest latest mode of the sites, so
+an import of the profile on one site does not raise a container class over
+the lower mode of another site. A site whose overrides remove a container
+class (``null``) asks for ``off``.
+
+The overrides of the profile ``zoe.plone:uninstall`` set ``folder_orders``,
+``split_merges`` and the entries of the container classes to ``off``. They
+replace the overrides of ``zoe.plone:default`` that the site keeps, at the
+same place (`keep_overrides`), and an import of ``zoe.plone:default``
+replaces them again. So a site that uninstalls `zoe.plone` asks for
+``off``, and the policy of the database is ``off`` while the database keeps
+the mode of that site.
 
 Only `derive`, `site_overrides` and `gone_sites` (Acquisition),
 `update_policy`, `profile_of`, `fti_modified` (zope.component.hooks) and
@@ -140,6 +149,13 @@ CONTAINERS = (
     "plone.app.contenttypes.content.Folder",
     "Products.CMFPlone.Portal.PloneSite",
 )
+#: The profile whose overrides switch on the switches of `SITE_SWITCHES`
+#: and the entries of `CONTAINERS`.
+PROFILE = "zoe.plone:default"
+#: The profile whose overrides switch them off for its site.
+UNINSTALL = "zoe.plone:uninstall"
+#: The profiles whose kept overrides replace each other.
+REPLACES = {PROFILE: UNINSTALL, UNINSTALL: PROFILE}
 #: The classes whose ``tier2`` the sites of a database compose to the
 #: lowest, each with the name of the root of the database that keeps the
 #: latest mode that each site asked for, by the path of the site.
@@ -512,6 +528,27 @@ def gone_sites(site, modes, path):
     return gone
 
 
+def profile_overrides(profile, overrides, names, blocked):
+    """Return the overrides `overrides` of the profile id `profile` for a
+    site whose derivation gives the classes `names` and blocks the classes
+    `blocked`. For the profiles `PROFILE` and `UNINSTALL`, remove the entry
+    of each class of `CONTAINERS` that the derivation does not give or
+    blocks: these profiles change derived entries only. Return other
+    overrides as they are."""
+    if profile.removeprefix("profile-") not in REPLACES:
+        return overrides
+    classes = overrides.get("classes") or {}
+    skip = {
+        name
+        for name in classes
+        if name in CONTAINERS and (name not in names or name in blocked)
+    }
+    if not skip:
+        return overrides
+    kept = {name: entry for name, entry in classes.items() if name not in skip}
+    return {**overrides, "classes": kept}
+
+
 def update_policy(site):
     """Derive the policy of `site`, apply the overrides of each profile,
     compose it with the policy of the database and write it. Return its new
@@ -528,7 +565,8 @@ def update_policy(site):
     }
     policy = {"classes": {**derived["classes"], **history.policy()["classes"]}}
     removed = set()
-    for overrides in (site_overrides(site) or {}).values():
+    for profile, overrides in (site_overrides(site) or {}).items():
+        overrides = profile_overrides(profile, overrides, names, blocked)
         policy, gone = apply_overrides(policy, overrides, names, blocked)
         removed = (removed | gone) - set(policy["classes"])
     connection = site._p_jar
@@ -539,13 +577,24 @@ def update_policy(site):
     stored = merge_policy.read(connection)
     database = stored or {}
 
-    def lowest_of_sites(name, mode, kept, label):
+    def lowest_of_sites(name, mode, kept, label, fresh_default=False):
         # Record the mode of this site in the root `name` and return the
-        # lowest mode of the sites, as `lowest_mode` does.
+        # lowest mode of the sites, as `lowest_mode` does. Create the root
+        # only to record a mode.
         modes = root.get(name)
         if modes is None:
+            if mode is None:
+                return None
             modes = root[name] = PersistentMapping()
-        before = min(modes.values(), key=LOWER.index) if modes else None
+            if fresh_default and kept == DEFAULT_MODE:
+                # The stored mode is the derived default of an earlier
+                # update, not a mode for the whole database: log its rise
+                # at INFO.
+                before = kept
+            else:
+                before = None
+        else:
+            before = min(modes.values(), key=LOWER.index) if modes else None
         for gone in gone_sites(site, modes, path):
             logger.info("%s is gone: the database drops its mode of %s", gone, label)
             del modes[gone]
@@ -559,14 +608,20 @@ def update_policy(site):
         if lowest is not None:
             policy[switch] = lowest
     for klass, name in SITE_CLASSES.items():
-        # A site without an entry for the class asks for no mode, and the
-        # composition keeps the entry of the database.
+        label = f"tier2 of {klass}"
         entry = policy["classes"].get(klass)
         if entry is None:
-            lowest_of_sites(name, None, None, klass)
+            # A site that removes the class asks for off, so that the update
+            # of another site does not switch it on again. A site without
+            # an entry for the class asks for no mode, and the composition
+            # keeps the entry of the database.
+            lowest_of_sites(name, "off" if klass in removed else None, None, label)
             continue
-        kept = database.get("classes", {}).get(klass, {}).get("tier2")
-        lowest = lowest_of_sites(name, entry.get("tier2"), kept, klass)
+        old = database.get("classes", {}).get(klass, {})
+        # A rise of a blocked class does not happen: the composition keeps
+        # it blocked.
+        kept = None if old.get("blocked") else old.get("tier2")
+        lowest = lowest_of_sites(name, entry.get("tier2"), kept, label, True)
         if lowest is not None:
             entry["tier2"] = lowest
     composed = settle(stored, policy, removed)
@@ -596,6 +651,24 @@ def profile_of(context):
     return path
 
 
+def keep_overrides(kept, profile, overrides):
+    """Keep `overrides` under the profile id `profile` in `kept`, the
+    overrides that a site keeps. The overrides of `PROFILE` and `UNINSTALL`
+    replace each other at the same place, so the overrides of the later
+    profiles of the site still apply after them."""
+    other = REPLACES.get(profile)
+    if other is None or other not in kept:
+        kept[profile] = overrides
+        return
+    items = [
+        (profile, overrides) if key == other else (key, value)
+        for key, value in kept.items()
+        if key != profile
+    ]
+    kept.clear()
+    kept.update(items)
+
+
 def import_merge_policy(context):
     """The import step: when the profile holds `OVERRIDES`, keep its
     overrides in the site under its profile id, then `update_policy`."""
@@ -606,7 +679,7 @@ def import_merge_policy(context):
     # Refuse overrides of another form before the site keeps them.
     apply_overrides({"classes": {}}, overrides)
     site = context.getSite()
-    site_overrides(site, create=True)[profile_of(context)] = overrides
+    keep_overrides(site_overrides(site, create=True), profile_of(context), overrides)
     update_policy(site)
 
 
