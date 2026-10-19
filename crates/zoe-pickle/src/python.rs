@@ -3014,4 +3014,19 @@ mod tests {
         let (class, value) = load(&mut heap, state);
         assert_eq!(dump(&heap, class, value), [CLASS, &state[..]].concat());
     }
+
+    #[test]
+    fn an_empty_message_keeps_the_shared_empty_str() {
+        // `(Message(''), '')`, as ZODB 6 writes it with Python 3.13. ZODB's
+        // resolver pickles it again to the same bytes. `Message.__reduce__`
+        // gives the shared empty str, so the second `''` is a memo get.
+        let mut heap = Heap::with_values();
+        let state = b"\x80\x03czope.i18nmessageid.message\nMessage\nq\x01(X\x00\x00\x00\x00q\x02\
+            NNNNNNtq\x03Rq\x04h\x02\x86q\x05.";
+        let (class, value) = load(&mut heap, state);
+        let items = heap.tuple(value).unwrap().to_vec();
+        assert_eq!(dump(&heap, class, value), [CLASS, &state[..]].concat());
+        let args = heap.instance(items[0]).unwrap().args;
+        assert_eq!(heap.tuple(args).unwrap()[0], items[1]);
+    }
 }
