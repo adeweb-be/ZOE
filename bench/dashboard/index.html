@@ -182,9 +182,12 @@
   }
   tr.group-row th span {
     position: sticky; left: 10px; display: inline-block;
-    white-space: normal; max-width: calc(100vw - 80px);
+    white-space: normal; max-width: calc(100vw - 100px);
   }
   td .sub { display: block; font-size: 0.75rem; color: var(--muted); }
+  @media (max-width: 480px) {
+    th, td { padding: 6px; }
+  }
   td .ratio { color: var(--text-2); }
   .swatch {
     display: inline-block; width: 10px; height: 10px; border-radius: 2px;
@@ -760,8 +763,9 @@ const HOUR = 3600000;
 const DAY = 24 * HOUR;
 // The steps of a time axis, from an hour to a year.
 const TIME_STEPS = [HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY, 91 * DAY, 182 * DAY, 364 * DAY];
-// A time axis in UTC. Its ticks fall on whole steps of the list above, at
-// most five. A tick shows the hour when the step is shorter than a day.
+// A time axis in UTC. Its ticks fall on whole steps of the list above,
+// one for each 100 pixels of the axis or fewer, at most five. A tick shows
+// the hour when the step is shorter than a day.
 function timeAxis() {
   let step = DAY;
   const label = (value) => {
@@ -774,7 +778,8 @@ function timeAxis() {
       bounds: "data",
       afterDataLimits(scale) {
         const span = scale.max - scale.min;
-        step = TIME_STEPS.find((candidate) => span / candidate <= 4) ?? TIME_STEPS.at(-1);
+        const gaps = Math.min(4, Math.max(1, Math.floor(scale.width / 100) - 1));
+        step = TIME_STEPS.find((candidate) => span / candidate <= gaps) ?? TIME_STEPS.at(-1);
         scale.min -= step / 2;
         scale.max += step / 2;
       },
