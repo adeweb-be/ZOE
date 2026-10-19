@@ -2,11 +2,16 @@
 a child command, the profile of a B5 run, the result of the native gate
 and of the client benchmark, and the retry of a B5 run."""
 
+import contextlib
 import dataclasses
 import json
+import os
 import pathlib
 import shutil
+import signal
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -30,6 +35,43 @@ def entry(kind, **fields):
         if run["kind"] == kind and all(run.get(k) == v for k, v in fields.items()):
             return run
     raise AssertionError(f"no entry {kind} {fields}")
+
+
+@pytest.fixture(autouse=True)
+def lock(tmp_path, monkeypatch):
+    """Give each test a bench lock of its own."""
+    monkeypatch.setenv("ZOE_BENCH_LOCK", str(tmp_path / "bench.lock"))
+
+
+def start(directory, execute, *options):
+    argv = ["--dir", str(directory), "--max-load", "1000", *OPTIONS_ARGV, *options]
+    return showcase.main(argv, execute=execute)
+
+
+OPTIONS_ARGV = [
+    "--fixtures",
+    "small",
+    "--step-seconds",
+    "5",
+    "--warmup",
+    "0",
+    "--trim",
+    "1",
+    "--client-objects",
+    "50",
+]
+
+
+def gone(pid, timeout=10.0):
+    """Tell if the process `pid` ends within `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def test_a_child_command_gets_no_environment_of_bench_plone(monkeypatch):
@@ -85,7 +127,7 @@ def test_a_result_that_the_run_writes_is_a_run_that_ended_well(
 
     monkeypatch.setattr(showcase.Execute, "command", command)
     (tmp_path / "state").mkdir()
-    showcase.Execute(OPTIONS, 0, "c" * 40)(run, tmp_path)
+    assert showcase.Execute(OPTIONS, 0, "c" * 40)(run, tmp_path) == {"exit": code}
 
     (argv, env), *_ = calls
     assert argv[:3] == ["just", "bench", kind]
@@ -108,7 +150,7 @@ def test_a_run_without_its_result_failed(tmp_path, monkeypatch):
 def test_a_b5_run_keeps_the_directory_of_an_earlier_attempt(tmp_path, monkeypatch):
     run = entry("b5", stack="zoe-native-qi-kv", scenario="edit")
     earlier = tmp_path / "runs" / run["id"]
-    earlier.mkdir(parents=True)
+    (earlier / "store").mkdir(parents=True)
     (earlier / "result.json").write_text('{"error": "an earlier attempt"}')
     seen = []
 
@@ -122,7 +164,7 @@ def test_a_b5_run_keeps_the_directory_of_an_earlier_attempt(tmp_path, monkeypatc
     monkeypatch.setattr(runner, "run", fake_run)
     note = showcase.Execute(OPTIONS, 460, "c" * 40)(run, tmp_path)
 
-    assert note == "verification pass"
+    assert note == {"verdict": "pass"}
     (options,) = seen
     assert options.out == earlier
     assert options.profile == "zoe.plone:default"
@@ -133,6 +175,8 @@ def test_a_b5_run_keeps_the_directory_of_an_earlier_attempt(tmp_path, monkeypatc
     (failed,) = (tmp_path / "failed").iterdir()
     assert failed.name.startswith(run["id"] + "-")
     assert "an earlier attempt" in (failed / "result.json").read_text()
+    # Only the last attempt keeps a copy of the store.
+    assert not (failed / "store").exists()
 
 
 def test_a_directory_of_other_options_names_them(tmp_path):
@@ -166,3 +210,115 @@ def test_the_recipe_passes_each_argument_unchanged(tmp_path):
     assert document["directory"] == str(directory)
     assert document["options"]["zope_cpus"] == ["2", "4"]
     assert not directory.exists()
+
+
+def test_an_interrupt_stops_locust(tmp_path):
+    seen = []
+
+    class Sample:
+        def watch(self, name, pid):
+            seen.append(pid)
+            raise KeyboardInterrupt
+
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with pytest.raises(KeyboardInterrupt):
+        runner.run_locust(command, dict(os.environ), tmp_path / "locust.log", Sample())
+    (pid,) = seen
+    assert gone(pid)
+
+
+def test_a_child_command_leaves_no_process_behind(tmp_path):
+    pidfile = tmp_path / "pid"
+    command = ["bash", "-c", f"sleep 300 & echo $! > {pidfile}"]
+    log = tmp_path / "child.log"
+
+    code = showcase.Execute(OPTIONS, 0, None).command(command, log, dict(os.environ))
+
+    assert code == 0
+    assert gone(int(pidfile.read_text()))
+
+
+def test_sighup_stops_the_current_run_as_sigterm_does(tmp_path):
+    before = signal.getsignal(signal.SIGHUP)
+    handlers = []
+
+    def execute(run, directory):
+        handlers.append(
+            (signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGTERM))
+        )
+        (pathlib.Path(directory) / "STOP").touch()
+
+    assert start(tmp_path / "showcase", execute) == 0
+    assert handlers == [(showcase._interrupt, showcase._interrupt)]
+    assert signal.getsignal(signal.SIGHUP) == before
+
+
+def test_the_end_counts_the_verdicts_and_publishes_only_a_pass(tmp_path):
+    directory = tmp_path / "showcase"
+    unverified = "b5-small-edit-zeo"
+
+    def execute(run, directory):
+        if run["id"] == unverified:
+            return {"verdict": "fail"}
+        if run["kind"] == "b5":
+            return {"verdict": "pass"}
+        if run["id"] == "native-3.13":
+            return {"exit": 1}
+        if run["kind"] in ("native", "client"):
+            return {"exit": 0}
+        return None
+
+    assert start(directory, execute) == 0
+    text = (directory / "showcase.log").read_text()
+    assert "0 failed, 0 to do; 1 B5 runs not verified pass; 1 native gates not met" in (
+        text
+    )
+    assert f"done {unverified} in 0 s: verification fail" in text
+    assert "exit 1, a cell does not pass the gate" in text
+    assert "to publish" not in text
+
+    # A failed verification stays done: no start runs it again.
+    calls = []
+    assert start(directory, lambda run, directory: calls.append(run["id"])) == 0
+    assert calls == []
+
+
+def test_two_starts_on_one_directory_never_run_a_run_twice(tmp_path, monkeypatch):
+    directory = tmp_path / "showcase"
+    calls = []
+    held = showcase.bench_lock
+
+    @contextlib.contextmanager
+    def contended(log):
+        if calls == ["build-zoe"]:
+            # Another start ends the next run while this one waits for the
+            # lock.
+            (directory / "state" / "build-plone-zeo.done").write_text("{}")
+        with held(log):
+            yield
+
+    monkeypatch.setattr(showcase, "bench_lock", contended)
+    assert start(directory, lambda run, directory: calls.append(run["id"])) == 0
+    assert calls[:2] == ["build-zoe", "build-plone-zoeclient"]
+    assert "skip build-plone-zeo: another start ran it" in (
+        (directory / "showcase.log").read_text()
+    )
+
+
+def test_a_resume_warns_when_the_zoe_binary_changed(tmp_path, monkeypatch):
+    binary = tmp_path / "zoe"
+    binary.write_bytes(b"one build")
+    monkeypatch.setenv("ZOE_BINARY", str(binary))
+    directory = tmp_path / "showcase"
+
+    def first(run, directory):
+        (pathlib.Path(directory) / "STOP").touch()
+
+    assert start(directory, first) == 0
+    record = json.loads((directory / "state" / "build-zoe.done").read_text())
+    assert len(record["zoe_sha256"]) == 64
+
+    binary.write_bytes(b"another build")
+    assert start(directory, lambda run, directory: None) == 0
+    text = (directory / "showcase.log").read_text()
+    assert "warning: the zoe binary changed since build-zoe ran" in text

@@ -126,9 +126,20 @@ def run_locust(
         process = subprocess.Popen(
             command, env=env, stdout=out, stderr=subprocess.STDOUT
         )
-        if sample is not None:
-            sample.watch("locust", process.pid)
-        code = process.wait()
+        try:
+            if sample is not None:
+                sample.watch("locust", process.pid)
+            code = process.wait()
+        except BaseException:
+            # An interrupt stops Locust too, so that it sends no load to the
+            # next run.
+            process.terminate()
+            try:
+                process.wait(30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
     return code, started
 
 

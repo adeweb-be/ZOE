@@ -46,6 +46,8 @@ import argparse
 import contextlib
 import dataclasses
 import fcntl
+import glob
+import hashlib
 import json
 import os
 import shutil
@@ -669,19 +671,24 @@ def main(
         log("removed the STOP of an earlier start")
     log(f"to stop after the current run: touch {stop}")
 
+    check_provenance(document, directory, log)
     awake = keep_awake(log)
+    # SIGTERM, and SIGHUP when the terminal closes, stop the current run as
+    # Ctrl-C does.
+    previous = {}
     try:
-        previous = signal.signal(signal.SIGTERM, _interrupt)
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, _interrupt)
     except ValueError:  # not the main thread
-        previous = None
+        pass
     try:
         return _run(document, directory, execute, args.max_load, log)
     except KeyboardInterrupt:
         log("interrupted: the current run stays to do")
         return 130
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         release(awake)
 
 
@@ -698,24 +705,21 @@ def _run(
     failed = []
     ran = 0
     for run in document["runs"]:
-        if run["state"] == "done":
+        if done(directory, run["id"]) or _waits(run, directory, log):
             continue
-        if run["kind"] == "summary":
-            missing = [id_ for id_ in run["runs"] if not done(directory, id_)]
-            if missing:
-                log(
-                    f"skip {run['id']}: {len(missing)} B5 runs of "
-                    f"{run['fixture']} are to do"
-                )
-                continue
         with bench_lock(log):
+            # Another start on the same directory can end a run while this
+            # one waits for the lock.
+            if done(directory, run["id"]):
+                log(f"skip {run['id']}: another start ran it")
+                continue
             if not wait_for_load(max_load, stop, log):
                 break
             started = time.time()
             log(f"run {run['id']}: {describe(run)}")
             ran += 1
             try:
-                note = execute(run, directory)
+                outcome = execute(run, directory)
             except (Exception, SystemExit) as error:
                 seconds = time.time() - started
                 failed.append(run["id"])
@@ -728,12 +732,13 @@ def _run(
                     break
             else:
                 seconds = time.time() - started
+                record = dict(outcome) if isinstance(outcome, dict) else {}
+                record.update(provenance(run))
                 stack.write_json(
                     directory / "state" / f"{run['id']}.done",
-                    {"started": started, "seconds": round(seconds, 1)},
+                    {"started": started, "seconds": round(seconds, 1), **record},
                 )
-                text = f"done {run['id']} in {duration(seconds)}"
-                log(text + (f": {note}" if isinstance(note, str) else ""))
+                log(f"done {run['id']} in {duration(seconds)}{_told(run, record)}")
         if stop.exists():
             stop.unlink()
             log(f"STOP: the showcase stops after {run['id']}")
@@ -741,26 +746,142 @@ def _run(
     if stop.exists():
         stop.unlink()
         log("STOP: the showcase stops")
-    left = sum(not done(directory, run["id"]) for run in document["runs"])
-    log(f"end: {ran} runs, {len(failed)} failed, {left} to do")
-    if left == 0:
+    records = {run["id"]: record_of(directory, run["id"]) for run in document["runs"]}
+    left = sum(record is None for record in records.values())
+    unverified = [
+        run["id"]
+        for run in document["runs"]
+        if run["kind"] == "b5"
+        and records[run["id"]] is not None
+        and records[run["id"]].get("verdict", "pass") != "pass"
+    ]
+    unmet = [
+        run["id"]
+        for run in document["runs"]
+        if run["kind"] == "native"
+        and records[run["id"]] is not None
+        and records[run["id"]].get("exit") == 1
+    ]
+    log(
+        f"end: {ran} runs, {len(failed)} failed, {left} to do; "
+        f"{len(unverified)} B5 runs not verified pass; "
+        f"{len(unmet)} native gates not met"
+    )
+    for id_ in unverified:
+        # A failed verification is a result: no start runs it again.
+        log(
+            f"{id_} did not pass its verification: `just bench publish` "
+            "refuses the summary of its fixture"
+        )
+    if left == 0 and not unverified:
         log(f"to publish: just bench publish {directory} CHECKOUT")
     return 1 if failed else 0
 
 
-def _stop_group(process: subprocess.Popen, timeout: float = 120.0) -> None:
-    """Stop the process group of `process`: SIGTERM, then SIGKILL when it
-    does not end in `timeout` seconds."""
+def _waits(run: dict, directory: Path, log: Log) -> bool:
+    """Tell if `run` is the summary of a fixture whose B5 runs are not all
+    done."""
+    if run["kind"] != "summary":
+        return False
+    missing = [id_ for id_ in run["runs"] if not done(directory, id_)]
+    if missing:
+        log(f"skip {run['id']}: {len(missing)} B5 runs of {run['fixture']} are to do")
+    return bool(missing)
+
+
+def _told(run: dict, record: dict) -> str:
+    """Return what the log says of a run that ended well."""
+    parts = []
+    if "verdict" in record:
+        parts.append(f"verification {record['verdict']}")
+    if "exit" in record:
+        text = f"exit {record['exit']}"
+        if run["kind"] == "native" and record["exit"] == 1:
+            text += ", a cell does not pass the gate"
+        parts.append(text)
+    for key in PROVENANCE:
+        if record.get(key):
+            parts.append(f"{key} {record[key][:12]}")
+    return ": " + ", ".join(parts) if parts else ""
+
+
+def record_of(directory: Path, id_: str) -> dict | None:
+    """Return the record of a run that ended well in `directory`, or None."""
+    path = directory / "state" / f"{id_}.done"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except ValueError:
+        return {}
+
+
+# What a build or a prepare leaves for the runs after it.
+PROVENANCE = {
+    "zoe_sha256": "the zoe binary",
+    "zoedb_sha256": "the zoedb extension of the Plone instances",
+    "converted_at": "the commit that converted the fixture",
+}
+
+
+def provenance(run: dict) -> dict:
+    """Return what a build or a prepare leaves for the runs after it: the
+    sha256 of the zoe binary, the sha256 of the zoedb extension of the Plone
+    instances, or the commit that converted the fixture."""
+    if run["kind"] == "build" and run["target"] == "zoe":
+        return {"zoe_sha256": _sha256(stack.zoe_binary())}
+    if run["kind"] == "build" and run["target"] == "plone-zoeclient":
+        found = sorted(glob.glob(str(stack.PLONE / "zoedb" / "zoe" / "_zoe*.so")))
+        return {"zoedb_sha256": _sha256(Path(found[0])) if found else None}
+    if run["kind"] == "prepare":
+        path = fixture.fixture_dir(run["fixture"]) / "equivalence.json"
+        try:
+            return {"converted_at": json.loads(path.read_text()).get("converted_at")}
+        except (OSError, ValueError):
+            return {"converted_at": None}
+    return {}
+
+
+def check_provenance(document: dict, directory: Path, log: Log) -> None:
+    """Warn when a build or a fixture changed since its run in `directory`:
+    the runs of this start then use another binary or another fixture."""
+    for run in document["runs"]:
+        record = record_of(directory, run["id"])
+        if not record:
+            continue
+        for key, value in provenance(run).items():
+            if key in record and record[key] != value:
+                log(
+                    f"warning: {PROVENANCE[key]} changed since {run['id']} ran "
+                    f"in this directory ({record[key]}, now {value}): the runs "
+                    "of this start use the new one"
+                )
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        with open(path, "rb") as file:
+            return hashlib.file_digest(file, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+def _stop_group(process: subprocess.Popen, timeout: float = 60.0) -> None:
+    """Stop each process of the group of `process`: SIGTERM, then SIGKILL
+    for what is left after `timeout` seconds."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
             return
-        try:
-            process.wait(timeout)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
 
 
 def child_environment(commit: str | None, **extra: str) -> dict[str, str]:
@@ -815,7 +936,8 @@ class Execute:
 
     def command(self, command: list[str], log: Path, env: dict[str, str]) -> int:
         """Run `command` in a process group of its own, and return its exit
-        code. An interrupt stops the whole group, then goes on."""
+        code. When it ends, or on an interrupt, stop what is left of its
+        group, so that no process of the run survives it."""
         with open(log, "a") as out:
             out.write(f"$ {' '.join(command)}\n")
             out.flush()
@@ -830,9 +952,8 @@ class Execute:
             )
             try:
                 return process.wait()
-            except BaseException:
+            finally:
                 _stop_group(process)
-                raise
 
     @contextlib.contextmanager
     def inprocess(self, log: Path):
@@ -871,11 +992,13 @@ class Execute:
             spec = corpus.PRESETS[run["preset"]]
             fixture.prepare(spec, run["fixture"], self.settings)
 
-    def b5(self, run: dict, directory: Path) -> str:
+    def b5(self, run: dict, directory: Path) -> dict:
         out = directory / "runs" / run["id"]
         if out.exists():
             # An earlier attempt failed or stopped. Keep its files for the
-            # diagnosis.
+            # diagnosis, but not its copy of the store, so that failures
+            # do not fill the disk.
+            shutil.rmtree(out / "store", ignore_errors=True)
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             failed = directory / "failed" / f"{run['id']}-{stamp}"
             failed.parent.mkdir(parents=True, exist_ok=True)
@@ -895,8 +1018,7 @@ class Execute:
         with self.inprocess(self.log(run, directory)):
             runner.run(options)
         result = json.loads((out / "result.json").read_text())
-        verdict = result.get("verification", {}).get("verdict", "not run")
-        return f"verification {verdict}"
+        return {"verdict": result.get("verification", {}).get("verdict", "not run")}
 
     def summary(self, run: dict, directory: Path) -> None:
         from plonebench import __main__ as cli
@@ -915,14 +1037,14 @@ class Execute:
             raise RuntimeError(f"report exited with {code}")
         partial.replace(document)
 
-    def native(self, run: dict, directory: Path) -> None:
-        self.shootout(run, directory, ["just", "bench", "native"])
+    def native(self, run: dict, directory: Path) -> dict:
+        return self.shootout(run, directory, ["just", "bench", "native"])
 
-    def client(self, run: dict, directory: Path) -> None:
+    def client(self, run: dict, directory: Path) -> dict:
         command = ["just", "bench", "client", "--objects", str(run["objects"])]
-        self.shootout(run, directory, command)
+        return self.shootout(run, directory, command)
 
-    def shootout(self, run: dict, directory: Path, command: list[str]) -> None:
+    def shootout(self, run: dict, directory: Path, command: list[str]) -> dict:
         """Run the native gate or the client benchmark in the environment
         of bench/shootout, on the Python of the run. A run that writes its
         result ended well, also when it exits with 1: the verdict is the
@@ -939,3 +1061,4 @@ class Execute:
         if code not in (0, 1) or not partial.exists():
             raise RuntimeError(f"{' '.join(command[:3])} exited with {code}")
         partial.replace(directory / f"{run['id']}.json")
+        return {"exit": code}
