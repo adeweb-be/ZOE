@@ -95,11 +95,11 @@ A document is publishable when each of these holds:
 3. `run.commit` is not null, and it is on the branch REF: `git merge-base --is-ancestor COMMIT REF` succeeds in the ZOE repository of the harness. REF is `origin/main`, unless `--main` gives another (section 7, decision 3).
 4. `run.dirty` is false. True is a run of a dirty tree. An absent key or null is no record of a clean tree (section 7, decision 1).
 5. For `plone`: the verification of each run of `runs` is `pass`.
-6. Its path in the checkout is free or holds the same bytes, and no other document of the same publish goes to that path with other bytes. Each part of the path is a name: a letter or a digit, then letters, digits, `.`, `_` or `-`. So a document never writes outside `results/` of the checkout.
+6. Its path in the checkout is free or holds the same bytes, and no other document of the same publish goes to that path with other bytes. Each part of the path is a name: a letter or a digit, then letters, digits, `.`, `_` or `-`. No part of the path in the checkout is a symbolic link or a file that is not a directory, and the path, when it exists, is a regular file. So a document never writes outside `results/` of the checkout.
 
 A document holds the cells, the rows or the steps that its run made: a run of a part of the native gate (`--cell`, `--scenario`), or a client run with other `--objects`, is publishable as it is (section 7, decision 2).
 
-So that rule 4 has evidence, the harness of zodbshootout, the native gate and the client benchmark record `run.dirty` as B5 and the replay do: true when `git status --porcelain --untracked-files=no` lists a change, false when it lists none, null when git fails. The three schemas get `run.dirty` as an optional key of type boolean or null. So each document that validates today stays valid.
+So that rule 4 has evidence, the harness of zodbshootout, the native gate and the client benchmark record `run.dirty` as B5 and the replay do: true when `git status --porcelain --untracked-files=no` lists a change, false when it lists none, null when git fails. It is null too when `ZOE_BENCH_COMMIT` names another commit than the tree: the tree is then no record of that commit. The three schemas get `run.dirty` as an optional key of type boolean or null. So each document that validates today stays valid.
 
 ### 5. `just bench publish`
 
@@ -114,10 +114,10 @@ It runs `python -m shootout publish` in the environment of `bench/shootout`, whi
 
 The command:
 
-1. reads and checks every document (section 4). When one is not publishable, it prints each reason of each document, exits with 1 and writes nothing;
+1. checks everything before it writes: every document (section 4), the path of each file of the page of step 3 and of `index.json` (no symbolic link, no part that is a file, a regular file when it exists), and the new index: the entries of the tree of CHECKOUT and of the new documents. A file under `results/` that the index cannot read (not JSON, or not a document of the family of its directory) and a symbolic link there stop the publish. When a check fails, it prints each reason, exits with 1 and writes nothing;
 2. copies the bytes of each document to its path in CHECKOUT. A path that holds the same bytes stays as it is;
-3. copies each file of `bench/dashboard/` to the same relative path in CHECKOUT, when that directory exists (ZOE-245);
-4. writes `index.json` of version 2 from the whole tree of CHECKOUT (section 3);
+3. copies each file of `bench/dashboard/` that git tracks to the same relative path in CHECKOUT, when that directory exists (ZOE-245). It leaves out the dotfiles, `__pycache__` and the symbolic links. A file of the page that goes under `results/` or to `index.json` stops the publish;
+4. writes `index.json` of version 2 (section 3) with the entries of step 1;
 5. prints the path of each document in CHECKOUT, then the path of `index.json`, and exits with 0.
 
 It writes nothing outside CHECKOUT. It never runs git in CHECKOUT, never commits and never pushes.
@@ -128,7 +128,7 @@ It writes nothing outside CHECKOUT. It never runs git in CHECKOUT, never commits
 | 1 | a document is not publishable; CHECKOUT is unchanged, byte for byte |
 | 2 | a usage error: CHECKOUT is not a directory, a SRC does not exist or holds no document, REF is not a commit, or argparse refuses the arguments; CHECKOUT is unchanged |
 
-A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, where SRC is the path of the document as the command line gave it, or the path of the file in a directory SRC. The last line is `publish: refused N of M documents; nothing changed in CHECKOUT`.
+A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, where SRC is the path of the document as the command line gave it, or the path of the file in a directory SRC. The last line is `publish: refused N of M documents; nothing changed in CHECKOUT`. When every document is publishable but CHECKOUT or the page stops the publish, the lines are `publish: CHECKOUT: REASON` and `publish: FILE: REASON`, and the last line is `publish: CHECKOUT cannot take the documents; nothing changed in CHECKOUT`.
 
 | Rule | REASON |
 | --- | --- |
@@ -137,13 +137,13 @@ A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, whe
 | 3 | `no commit`; `commit COMMIT12 is not on REF` |
 | 4 | `a run of a dirty tree`; `no record of a clean tree` |
 | 5 | `the verification of run RUN is VERDICT`, for each run that did not pass |
-| 6 | `PATH exists in CHECKOUT with other content`; `another document goes to PATH`; `its path in the layout holds a part that is not a name` |
+| 6 | `PATH exists in CHECKOUT with other content`; `another document goes to PATH`; `its path in the layout holds a part that is not a name`; `PATH passes through a symbolic link in CHECKOUT`; `PATH passes through a file in CHECKOUT`; `PATH exists in CHECKOUT and is not a file` |
 
 A usage error prints `publish: CHECKOUT is not a directory`, `publish: SRC does not exist`, `publish: SRC holds no document` or `publish: REF is not a commit of the ZOE repository`, with the path or the name. REF that git cannot read is a usage error, so that a missing `origin/main` does not read as a commit that is not on it.
 
 ### 6. The B5 summary
 
-`just bench plone report RUN... --json FILE` writes one document per campaign: the runs of one fixture. It validates the document against `bench/schema/plone.schema.json` before it writes it, so `bench/plone` gets `jsonschema` as a dependency. The runs of one document share one fixture, one commit, one machine name and the `settings` of the table below. When they do not, `report` prints the key and its values on stderr, exits with 2 and writes no FILE. The Markdown report keeps its behaviour. The document holds no host name, user name, path or password: no `zope_conf`, no traceback and no message of a check of the verification.
+`just bench plone report RUN... --json FILE` writes one document per campaign: the runs of one fixture. It validates the document against `bench/schema/plone.schema.json` before it writes it, so `bench/plone` gets `jsonschema` as a dependency. The runs of one document share one fixture, one commit, one machine name, one Python of the instances (its implementation, its major and minor version, and whether it is free-threaded) and the `settings` of the table below. When they do not, `report` prints the key and its values on stderr, exits with 2 and writes no FILE. The Markdown report keeps its behaviour: `report` writes it before it makes the summary, also when it refuses the summary. The document holds no host name, user name, path or password: no `zope_conf`, no traceback and no message of a check of the verification.
 
 Every object of the schema has `additionalProperties: false`, except the maps: `software`, `machine.durability`, `machine.core_kinds`, `fixture.spec`, `scenarios[].mix` and `stacks[].merge_policy`. `bench/shootout/tests/data/publish/plone.json` is a valid document. A number that its counter does not give is null, never 0.
 
@@ -161,7 +161,7 @@ Every object of the schema has `additionalProperties: false`, except the maps: `
 | `steps` | one per scenario, stack and step: `scenario`, `stack`, `step`, `users`, `seconds` (the measured seconds of one repetition of the step, after the trim), `repetitions`, `operations`, `ok_per_second` (`median`, `min`, `max`), `p50_seconds`, `p95_seconds`, `p99_seconds` (pooled over the repetitions), `p99_reliable`, `failure_rate`, `first_attempt_share`, `conflicts_per_1000_ops`, `exhausted`, `zope_cpu_ms_per_op`, `server_cpu_ms_per_op`, `store_write_kb_per_op`, `objects_loaded_per_second`, `objects_stored_per_second` |
 | `runs` | one per run, in the order of their start: `id` (the run id), `scenario`, `stack`, `repetition`, `verification` (`pass`, `fail`, or `not run` for a run without a verdict), `violations` (or null) |
 
-Each number of `steps` is the number that `report` prints, in the unit of its name. `objects_loaded_per_second` is the median, over the repetitions, of the `loadBefore` calls that the probe counts for the operations of the step (`loads` of `all.server` of the step), divided by the seconds of the step. `objects_stored_per_second` is the same for `stores`. A run without the numbers of its steps, such as a run that failed, is in `runs` and has no row in `steps`.
+Each number of `steps` is the number that `report` computes, in the unit of its name. `objects_loaded_per_second` is the median, over the repetitions, of the `loadBefore` calls that the probe counts for the operations of the step (`loads` of `all.server` of the step), divided by the seconds of the step. `objects_stored_per_second` is the same for `stores`. A run without the numbers of its steps, such as a run that failed, is in `runs` and has no row in `steps`.
 
 ### 7. The decisions of the human on the questions of the planner
 
