@@ -13,11 +13,16 @@ The set:
 - B5 on `medium`, on the same stacks: `browse`, `catalog`, `edit`,
   `create-spread` and `mixed` at 4 and 16 users;
 - one B5 summary for each fixture (`report --json`, ADR 0054);
-- the native gate and the client benchmark.
+- the native gate and the client benchmark, each on CPython 3.13 and on
+  3.14t.
 
-The stack `zoe-native-qi-kv` runs with the switches `split_merges` and
-`folder_orders` on, as the profile `zoe.plone:default` gives them. The
-stack `zeo` runs with no switch.
+Before the instances of a run of `zoe-native-qi-kv` start, a script in
+the interpreter of the zoeclient instance imports the profile
+`zoe.plone:default` into the copy of the store, as the owner of a site
+does. The result records the policy that the import gives. The stack
+`zeo` imports no profile and runs with no switch. Both stacks run on
+separate physical cores of the reference machine: the server on CPU 0,
+the instances on CPUs 1 and 3, Locust on CPU 6.
 
 `python -m plonebench showcase [OPTIONS]` calls
 `plonebench.showcase.main(OPTIONS)`. `just bench showcase OPTIONS` runs it
@@ -31,8 +36,10 @@ in the environment of bench/plone and builds nothing first. The options:
   `target/bench/showcase/<started>/`.
 - `--fixtures small,medium` (the default), `--step-seconds 60`,
   `--warmup 60` and `--trim 5` (the defaults of `just bench plone run`),
-  `--client-objects N` (the `--objects` of the client benchmark). These
-  are the options of the set. DIR records them, with the commit.
+  `--client-objects N` (the `--objects` of the client benchmark), and
+  `--server-cpus 0`, `--zope-cpus "1;3"` and `--locust-cpus 6` (the
+  pinning of each B5 run). These are the options of the set. DIR records
+  them, with the commit.
 - `--max-load L` (8 by default): before each run, wait while the
   1-minute load average is L or more. `--port-offset N` goes to each B5
   run. These two are not options of the set.
@@ -53,9 +60,13 @@ Each ENTRY has `id` (unique, stable, a file name), `kind`, `state`
 - `build`: `target`, one of `zoe`, `plone-zeo` and `plone-zoeclient`;
 - `prepare`, `summary`: `fixture` (the fixture name) and `preset`;
 - `b5`: `fixture`, `preset`, `stack`, `scenario`, `users` (the users of
-  each step), `step_seconds`, `warmup_seconds`, `trim_seconds`, and
-  `switches` in the shape of the B5 summary (ADR 0054);
-- `native`, `client`: nothing more.
+  each step), `step_seconds`, `warmup_seconds`, `trim_seconds`,
+  `pinning` (`server_cpus`, `zope_cpus` as a list, `locust_cpus`, as in
+  the settings of the B5 summary), `profile` (`zoe.plone:default`, or
+  null for no profile), and `switches` in the shape of the B5 summary
+  (ADR 0054);
+- `native`, `client`: `python`, the interpreter of the run: `3.13` or
+  `3.14t`.
 
 The state of an entry depends only on DIR: an entry is `done` when it
 ended well in DIR. The showcase runs the entries to do in the order of
@@ -111,20 +122,20 @@ SET = {
         "mixed": TWO,
     },
 }
-SWITCHES = {
-    "zeo": {
-        "backends": [],
-        "member_properties": False,
-        "split_merges": None,
-        "folder_orders": None,
-    },
-    "zoe-native-qi-kv": {
-        "backends": ["indexing", "locking"],
-        "member_properties": True,
-        "split_merges": "on",
-        "folder_orders": "on",
-    },
+# The switches of `zeo`. The profile gives the policy of the ZOE stack, so
+# the test reads only its backends.
+ZEO_SWITCHES = {
+    "backends": [],
+    "member_properties": False,
+    "split_merges": None,
+    "folder_orders": None,
 }
+BACKENDS = {"zeo": [], "zoe-native-qi-kv": ["indexing", "locking"]}
+PROFILE = {"zeo": None, "zoe-native-qi-kv": "zoe.plone:default"}
+# A decision of the human: separate physical cores on the reference
+# machine, for both stacks.
+PINNING = {"server_cpus": "0", "zope_cpus": ["1", "3"], "locust_cpus": "6"}
+PYTHONS = {"3.13", "3.14t"}
 KINDS = {"build", "prepare", "b5", "summary", "native", "client"}
 
 
@@ -291,7 +302,11 @@ def check_set(document, presets, step_seconds=60, warmup=60, trim=5):
     assert len(b5) == len(wanted)
     for run in b5:
         assert run["fixture"] == fixture_name(run["preset"])
-        assert run["switches"] == SWITCHES[run["stack"]], run
+        assert run["switches"]["backends"] == BACKENDS[run["stack"]], run
+        if run["stack"] == "zeo":
+            assert run["switches"] == ZEO_SWITCHES, run
+        assert run["profile"] == PROFILE[run["stack"]], run
+        assert run["pinning"] == PINNING, run
         assert run["step_seconds"] == step_seconds
         assert run["warmup_seconds"] == warmup
         assert run["trim_seconds"] == trim
@@ -325,8 +340,9 @@ def check_set(document, presets, step_seconds=60, warmup=60, trim=5):
         presets_of_kind = {run["preset"] for run in runs if run["kind"] == kind}
         assert presets_of_kind == set(presets)
 
-    assert [run["kind"] for run in runs].count("native") >= 1
-    assert [run["kind"] for run in runs].count("client") >= 1
+    for kind in ("native", "client"):
+        pythons = [run["python"] for run in runs if run["kind"] == kind]
+        assert sorted(pythons) == sorted(PYTHONS), (kind, pythons)
 
 
 def test_the_plan_lists_every_run_of_the_set_and_writes_nothing():

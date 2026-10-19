@@ -3,21 +3,25 @@
 It runs the set on the fixture `small` alone, with short steps: the
 builds, the fixture when it is missing, the 16 B5 runs of `small` on
 `zeo` and on `zoe-native-qi-kv` (5 s a step, no warmup, 1 s of trim),
-the B5 summary of `small`, the native gate and the client benchmark with
-50 objects for each worker. Then `just bench publish --main HEAD` takes
-the directory of the showcase into an empty checkout, and the test reads
-what it published:
+the B5 summary of `small`, and the native gate and the client benchmark
+(50 objects for each worker), each on CPython 3.13 and on 3.14t. Then
+`just bench publish --main HEAD` takes the directory of the showcase into
+an empty checkout, and the test reads what it published:
 
 - one B5 summary of `small`, with the two stacks, the scenarios of the
-  set and the users of each step;
-- the stack `zoe-native-qi-kv` with the merge policy that a new site gets
-  from the profile `zoe.plone:default`: `split_merges` and
-  `folder_orders` on, and tier 2 on for the two container classes of
-  stock Plone and for `PrincipalProperties`;
+  set, the users of each step and the pinning on separate physical
+  cores;
+- the stack `zoe-native-qi-kv` with the merge policy that the import of
+  the profile `zoe.plone:default` gives: `split_merges` and
+  `folder_orders` on; tier 2 on for the two container classes of stock
+  Plone, with `modification_date: max`, and for `PrincipalProperties`;
+  and the entries that the profile derives in shadow mode for the other
+  types. The test does not pin the whole derived policy;
 - every B5 run verified `pass`;
-- a result of the native gate and a result of the client benchmark.
+- a result of the native gate and a result of the client benchmark for
+  each of the two interpreters.
 
-It takes about 90 minutes and the CPUs of the machine. Run nothing else
+It takes about 100 minutes and the CPUs of the machine. Run nothing else
 beside it. It needs a clean tree at a commit of HEAD, because
 `just bench publish` refuses a run of a dirty tree:
 
@@ -143,27 +147,30 @@ def test_a_short_showcase_on_small_gives_a_tree_that_publish_takes(tmp_path):
     name = fixture.default_name(corpus.PRESETS["small"], "small")
     plone = [entry for entry in index["results"] if entry["family"] == "plone"]
     assert [entry["fixture"] for entry in plone] == [name]
-    assert families.count("native") >= 1
-    assert families.count("client") >= 1
     assert set(families) == {"plone", "native", "client"}
+    for family in ("native", "client"):
+        pythons = sorted(
+            entry["python"] for entry in index["results"] if entry["family"] == family
+        )
+        assert pythons == ["cp313", "cp314t"], (family, pythons)
 
     summary = json.loads((checkout / plone[0]["path"]).read_text())
     assert summary["fixture"]["name"] == name
     assert summary["fixture"]["preset"] == "small"
     assert summary["settings"]["warmup_seconds"] == 0
     assert summary["settings"]["trim_seconds"] == 1
+    # A decision of the human: separate physical cores, for both stacks.
+    assert summary["settings"]["server_cpus"] == "0"
+    assert summary["settings"]["zope_cpus"] == ["1", "3"]
+    assert summary["settings"]["locust_cpus"] == "6"
 
     stacks = {entry["name"]: entry for entry in summary["stacks"]}
     assert sorted(stacks) == STACKS
     assert stacks["zeo"]["merge_policy"] is None
     zoe = stacks["zoe-native-qi-kv"]
-    assert zoe["switches"] == {
-        "backends": ["indexing", "locking"],
-        "member_properties": True,
-        "split_merges": "on",
-        "folder_orders": "on",
-    }
+    assert zoe["switches"]["backends"] == ["indexing", "locking"]
     policy = zoe["merge_policy"]
+    assert policy is not None, "the result records no policy of the ZOE stack"
     assert policy["split_merges"] == "on"
     assert policy["folder_orders"] == "on"
     for name_of_class in (*CONTAINERS, PROPERTIES):
@@ -173,6 +180,14 @@ def test_a_short_showcase_on_small_gives_a_tree_that_publish_takes(tmp_path):
     for name_of_class in CONTAINERS:
         fields = policy["classes"][name_of_class].get("fields", {})
         assert fields.get("modification_date") == "max", (name_of_class, fields)
+    # The profile derives an entry for each other Dexterity type, in shadow
+    # mode.
+    shadow = [
+        name_of_class
+        for name_of_class, entry in policy["classes"].items()
+        if entry.get("tier2") == "shadow"
+    ]
+    assert shadow, "the policy has no derived entry in shadow mode"
 
     assert {scenario["name"] for scenario in summary["scenarios"]} == set(SMALL)
     for scenario, users in SMALL.items():
