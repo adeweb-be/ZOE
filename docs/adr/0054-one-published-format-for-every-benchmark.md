@@ -117,8 +117,10 @@ The command:
 1. checks everything before it writes: every document (section 4), the path of each file of the page of step 3 and of `index.json` (no symbolic link, no part that is a file, a regular file when it exists), and the new index: the entries of the tree of CHECKOUT and of the new documents. A file under `results/` that the index cannot read (not JSON, or not a document of the family of its directory) and a symbolic link there stop the publish. When a check fails, it prints each reason, exits with 1 and writes nothing;
 2. copies the bytes of each document to its path in CHECKOUT. A path that holds the same bytes stays as it is;
 3. copies each file of `bench/dashboard/` that git tracks to the same relative path in CHECKOUT, when that directory exists (ZOE-245). It leaves out the dotfiles, `__pycache__` and the symbolic links. A file of the page that goes under `results/` or to `index.json` stops the publish;
-4. writes `index.json` of version 2 (section 3) with the entries of step 1;
+4. writes `index.json` of version 2 (section 3) with the entries of step 1, after every other file;
 5. prints the path of each document in CHECKOUT, then the path of `index.json`, and exits with 0.
+
+Steps 2 to 4 write each file to a temporary name beside it, then replace its path, so a file holds its old bytes or its new bytes. When a write fails after the checks of step 1, such as in a read-only directory or on a full disk, the command removes the temporary file, prints `publish: CHECKOUT: cannot write PATH: ERROR`, a line `publish: wrote FILE` for each file that it wrote, and `publish: wrote N of M files in CHECKOUT; index.json is not written`, and exits with 3. Step 3 copies the files of the working tree. For each tracked file of `bench/dashboard/` that differs from the commit (`git status --porcelain --untracked-files=no`), the command prints `publish: warning: FILE differs from HEAD; CHECKOUT gets the file of the working tree` on stderr, and goes on.
 
 It writes nothing outside CHECKOUT. It never runs git in CHECKOUT, never commits and never pushes.
 
@@ -127,6 +129,7 @@ It writes nothing outside CHECKOUT. It never runs git in CHECKOUT, never commits
 | 0 | every document is in CHECKOUT, and `index.json` is of version 2 |
 | 1 | a document is not publishable; CHECKOUT is unchanged, byte for byte |
 | 2 | a usage error: CHECKOUT is not a directory, a SRC does not exist or holds no document, REF is not a commit, or argparse refuses the arguments; CHECKOUT is unchanged |
+| 3 | every check passed, but a write failed; CHECKOUT holds the files that the command names, and its `index.json` is not written |
 
 A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, where SRC is the path of the document as the command line gave it, or the path of the file in a directory SRC. The last line is `publish: refused N of M documents; nothing changed in CHECKOUT`. When every document is publishable but CHECKOUT or the page stops the publish, the lines are `publish: CHECKOUT: REASON` and `publish: FILE: REASON`, and the last line is `publish: CHECKOUT cannot take the documents; nothing changed in CHECKOUT`.
 
