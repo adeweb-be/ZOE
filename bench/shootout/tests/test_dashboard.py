@@ -34,9 +34,13 @@ Pages serves the checkout. It has no build step:
   - `native`: `cells`, one per cell and scenario, in the order of the
     document: `mode`, `concurrency`, `object_size`,
     `objects_per_transaction`, `scenario`, `ratio`, `low`, `high` and
-    `verdict` (`pass`, `fail` or `undecided`). The ratio, the interval and
-    the verdict are the values of `shootout.native.decide` on the pairs and
-    the rule of the document, as `just bench native report` gives them.
+    `verdict`. `just bench native` writes the result of each scenario in
+    the document: `ratio`, `low` and `high` (a number or null) and
+    `verdict` (`pass`, `fail`, or null when undecided). In the model,
+    `ratio`, `low` and `high` are the numbers of the document, or null when
+    the document does not hold them. `verdict` is `pass`, `fail`,
+    `undecided` when the document holds null, or null when the document
+    does not hold the key. The page shows a dash for null.
   - `client`: `rows`, the rows of the document, in its order.
 
   `shootout`: the charts of zodbshootout, one per machine, Python build,
@@ -44,25 +48,43 @@ Pages serves the checkout. It has no build step:
   `python`, `mode`, `concurrency`, `object_size`, `scenario` and `lines`:
   one line per storage, with `storage` and `points`, one point per
   document, in the order of `started`, with `started`, `commit`,
-  `ops_per_second`, `p50_seconds` and `p99_seconds`.
+  `ops_per_second`, `p50_seconds` and `p99_seconds`. The charts show every
+  run.
+
+  `selection`: the documents of the tables, for the selectors of the page.
+  One group per family `native`, `client` and `plone`, machine, Python
+  build and, for `plone`, fixture. A group holds `family`, `machine`,
+  `python`, `fixture` (null except for `plone`), `latest` (the path of
+  the newest document of the group) and `earlier` (the paths of the other
+  documents, newest first). The newest document has the latest `started`,
+  then the last path. The page shows the latest document of a group, and
+  a selector gives the earlier ones.
 
 The model holds no number that a document does not hold, except the ratios
-of the B5 rows and the ratio, the interval and the verdict of a cell of the
-native gate. The page requests only cdnjs, at a pinned version, and its own
-files. A link to a repository on GitHub is not a request. `index.html` loads
-`data.js`, fits the width of a phone, has a dark mode, and says how to
-reproduce the results (`just bench showcase`).
+of the B5 rows. The page requests only cdnjs, at a pinned version, and its
+own files. A link to a repository on GitHub is not a request. `index.html`
+loads `data.js`, fits the width of a phone, has a dark mode, and says how
+to reproduce the results (`just bench showcase`).
 
 The test publishes the sample documents of `tests/data/publish`, one of
 each family, and the documents of `tests/data/dashboard` into an empty
 checkout with `just bench publish --main HEAD`. Then it runs `data.js` of
 the checkout under node, which devenv gives (`dashboard_model.mjs`). The
-documents of `tests/data/dashboard` give a second run of zeo and a run of
-zoe-native for the charts of zodbshootout, the native gate on a second
-Python build with a pass, a fail and two undecided scenarios, and B5 on
-`medium` with the curves of `edit` and `create-spread` at 1, 4, 8, 16 and
-32 users. They hold numbers about a synthetic corpus, and the first commit
-of the repository. The test runs no benchmark.
+documents of `tests/data/dashboard` give:
+
+- a second run of zeo and a run of zoe-native, for the charts of
+  zodbshootout;
+- the native gate on a second Python build, with the result of each
+  scenario: a pass, a fail and two undecided scenarios. The sample of the
+  native gate in `tests/data/publish` has no result, so its cells show a
+  dash;
+- a second run of the client benchmark, so a group has an earlier
+  document;
+- B5 on `medium`, with the curves of `edit` and `create-spread` at 1, 4,
+  8, 16 and 32 users.
+
+They hold numbers about a synthetic corpus, and the first commit of the
+repository. The test runs no benchmark.
 """
 
 import json
@@ -88,6 +110,9 @@ DRIVER = TESTS / "dashboard_model.mjs"
 FAMILIES = ("shootout", "native", "client", "plone")
 BASELINE = "zeo"
 CURVES = ("edit", "create-spread")
+# The families of the tables. The page shows the latest document of each
+# group, and a selector gives the earlier ones.
+SELECTED = ("native", "client", "plone")
 # The numbers of a row of a B5 table, by their name in a step.
 COLUMNS = (
     "ok_per_second",
@@ -199,6 +224,10 @@ def close(got, expected):
 
 def value(step, name):
     return step["ok_per_second"]["median"] if name == "ok_per_second" else step[name]
+
+
+def finite(number):
+    return number if math.isfinite(number) else None
 
 
 def ratio(number, base):
@@ -382,32 +411,41 @@ def test_the_native_gate_gives_each_cell_its_ratio_interval_and_verdict(page, do
         expected = []
         for cell in source["cells"]:
             for scenario in cell["scenarios"]:
-                v = native.decide(
-                    native.ratios(scenario["pairs"]), rule["level"], rule["min_pairs"]
-                )
-                expected.append(
-                    (
-                        {
-                            "mode": cell["mode"],
-                            "concurrency": cell["concurrency"],
-                            "object_size": cell["object_size"],
-                            "objects_per_transaction": cell["objects_per_transaction"],
-                            "scenario": scenario["name"],
-                            "verdict": v.verdict or "undecided",
-                        },
-                        v,
+                where = (document["path"], cell["mode"], scenario["name"])
+                if "verdict" in scenario:
+                    # The result in the document is the result of the rule
+                    # of the gate on the pairs.
+                    v = native.decide(
+                        native.ratios(scenario["pairs"]),
+                        rule["level"],
+                        rule["min_pairs"],
                     )
+                    for name in ("ratio", "low", "high"):
+                        assert close(scenario[name], finite(getattr(v, name))), where
+                    assert scenario["verdict"] == v.verdict, where
+                    verdict = scenario["verdict"] or "undecided"
+                else:
+                    verdict = None
+                expected.append(
+                    {
+                        "mode": cell["mode"],
+                        "concurrency": cell["concurrency"],
+                        "object_size": cell["object_size"],
+                        "objects_per_transaction": cell["objects_per_transaction"],
+                        "scenario": scenario["name"],
+                        "ratio": scenario.get("ratio"),
+                        "low": scenario.get("low"),
+                        "high": scenario.get("high"),
+                        "verdict": verdict,
+                    }
                 )
         cells = document["cells"]
         assert len(cells) == len(expected), document["path"]
-        for got, (keys, v) in zip(cells, expected, strict=True):
-            where = (document["path"], keys)
-            assert holds(got, keys), (where, got)
-            assert close(got["ratio"], v.ratio), (where, got["ratio"], v.ratio)
-            assert close(got["low"], v.low), (where, got["low"], v.low)
-            assert close(got["high"], v.high), (where, got["high"], v.high)
+        for got, keys in zip(cells, expected, strict=True):
+            assert holds(got, keys), (document["path"], keys, got)
             verdicts.add(got["verdict"])
-    assert verdicts == {"pass", "fail", "undecided"}
+    # A document without the results gives null: the page shows a dash.
+    assert verdicts == {"pass", "fail", "undecided", None}
 
 
 def test_the_client_benchmark_gives_each_row(page, docs):
@@ -468,22 +506,34 @@ def test_zodbshootout_charts_each_cell_against_the_start_of_the_run(page, index,
     assert any(len(line["points"]) == 2 for c in charts.values() for line in c["lines"])
 
 
+def test_the_selection_gives_the_latest_document_of_each_group(page, index):
+    groups = {}
+    for entry in index["results"]:
+        if entry["family"] in SELECTED:
+            key = (entry["family"], entry["machine"], entry["python"], entry["fixture"])
+            groups.setdefault(key, []).append(entry)
+    selection = {
+        (g["family"], g["machine"], g["python"], g["fixture"]): g
+        for g in page["model"]["selection"]
+    }
+    assert set(selection) == set(groups)
+    for key, members in groups.items():
+        members.sort(key=lambda e: (e["started"], e["path"]))
+        newest = [e["path"] for e in reversed(members)]
+        assert selection[key]["latest"] == newest[0], key
+        assert selection[key]["earlier"] == newest[1:], key
+    # Two runs of the client benchmark give a group with an earlier document.
+    assert any(group["earlier"] for group in selection.values())
+
+
 def test_the_model_holds_no_number_that_a_document_does_not_hold(page, docs, index):
     held = {number for _, number in numbers(index)}
     for document in docs.values():
         held.update(number for _, number in numbers(document))
 
     def derived(keys):
-        # The ratios of a B5 row, and the statistics of a cell of the
-        # native gate. The tests above check them against the documents.
-        if keys and keys[-1] == "ratios":
-            return True
-        return (
-            len(keys) == 5
-            and keys[0] == "documents"
-            and keys[2] == "cells"
-            and keys[4] in ("ratio", "low", "high")
-        )
+        # The ratios of a B5 row. The test of the tables checks them.
+        return bool(keys) and keys[-1] == "ratios"
 
     invented = [
         (keys, number)
