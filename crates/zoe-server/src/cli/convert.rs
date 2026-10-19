@@ -398,8 +398,10 @@ fn class_refusal(path: &Path, classes: &[PloneClass]) -> String {
     }
     message.push_str(
         "\nImport the profile zoe.plone:uninstall on each site of the store first: it \
-         gives the stock values back. Then convert. Or give --force (ZOE_FORCE) to \
-         convert anyway.",
+         gives the stock values back. Then pack the store with zoe pack, with its GC, \
+         at a time after the uninstall: the pack removes the records that no object \
+         references, such as those of a deleted member or of deleted content. Then \
+         convert. Or give --force (ZOE_FORCE) to convert anyway.",
     );
     message
 }
@@ -414,7 +416,8 @@ fn forced_class_warning(classes: &[PloneClass]) -> String {
     format!(
         "warning: --force: the Data.fs holds records of the classes of zoe.plone: {}. \
          A client without zoedb loads them as broken objects. Import the profile \
-         zoe.plone:uninstall on each site of the store, then convert again.",
+         zoe.plone:uninstall on each site of the store, pack it with zoe pack, then \
+         convert again.",
         named.join(", ")
     )
 }
@@ -678,6 +681,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("zoe.plone:uninstall"), "{message}");
+        assert!(message.contains("zoe pack"), "{message}");
         assert!(message.contains("--force (ZOE_FORCE)"), "{message}");
         let warning = forced_class_warning(&classes);
         assert!(warning.starts_with("warning: --force: "), "{warning}");

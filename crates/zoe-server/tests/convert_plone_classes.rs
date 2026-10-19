@@ -12,14 +12,17 @@
 //! `zoe.plone:uninstall`. `--force` (twin `ZOE_FORCE`) converts anyway and
 //! warns. The uninstall gives the stock values back and retires each
 //! record of the classes: it writes the state `{0: None}` or `{0: ()}`. A
-//! store after the uninstall converts.
+//! store after the uninstall converts. The guard matches by class, so the
+//! record of a deleted principal, which no object references, refuses
+//! until `zoe pack` removes it. A store with a moved registry too gets
+//! both refusals in one message.
 //!
 //! The test writes the records directly. It needs no Python and no Plone.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use zoe_core::{Oid, Store, Tid};
+use zoe_core::{Flavour, Oid, Store, Tid};
 
 mod common;
 
@@ -58,6 +61,25 @@ fn s(path: &Path) -> &str {
 /// the arguments `extra` and the variables `env`. No other `ZOE_*`
 /// variable reaches it.
 fn convert(store: &Path, target: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    let (data_fs, blobs) = (target.join("Data.fs"), target.join("blobs"));
+    let mut args: Vec<String> = [
+        "convert",
+        "--to-data-fs",
+        s(&data_fs),
+        "--data-fs-blob-dir",
+        s(&blobs),
+        "--path",
+        s(store),
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    zoe(&args, env)
+}
+
+/// Run `zoe` with the arguments `args` and the variables `env`. No other
+/// `ZOE_*` variable reaches it.
+fn zoe(args: &[String], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(ZOE);
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("ZOE_") {
@@ -65,16 +87,7 @@ fn convert(store: &Path, target: &Path, extra: &[&str], env: &[(&str, &str)]) ->
         }
     }
     command
-        .args([
-            "convert",
-            "--to-data-fs",
-            s(&target.join("Data.fs")),
-            "--data-fs-blob-dir",
-            s(&target.join("blobs")),
-            "--path",
-            s(store),
-        ])
-        .args(extra)
+        .args(args)
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -255,6 +268,100 @@ fn a_store_after_the_uninstall_converts() {
         !stdout(&output).contains("zoe.plone"),
         "{}",
         stdout(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Return a pickle of a root `PersistentMapping` that refers to `oid`.
+fn root_referring_to(oid: Oid) -> Vec<u8> {
+    let mut data = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.".to_vec();
+    data.extend_from_slice(b"\x80\x03}X\x04\x00\x00\x00data}X\x01\x00\x00\x00s(C\x08");
+    data.extend_from_slice(&oid.0.to_be_bytes());
+    data.extend_from_slice(b"cBTrees.OOBTree\nOOBTree\ntQss.");
+    data
+}
+
+#[test]
+fn the_record_of_a_deleted_principal_refuses_until_a_pack() {
+    let dir = fresh_dir("pack");
+    let store_dir = dir.join("zoe");
+    // The tree of the sheet holds dicts after the uninstall. The record of
+    // a principal that the site deleted before stays, with no reference.
+    let sheet = Oid(0x10);
+    {
+        let store = common::open(&store_dir);
+        commit(
+            &store,
+            &[
+                (Oid(0), root_referring_to(sheet)),
+                (sheet, pickle("BTrees.OOBTree.OOBTree", b"N")),
+                (MEMBER, pickle(PROPERTIES, LIVE)),
+            ],
+        );
+    }
+    let target = dir.join("before");
+    std::fs::create_dir_all(&target).unwrap();
+    let output = convert(&store_dir, &target, &[], &[]);
+    assert_exit(&output, 1, "convert a store with an unreachable record");
+    let message = stderr(&output);
+    assert!(
+        message.contains(&format!("{PROPERTIES}: 1 record (0x000000000000002a)"))
+            && message.contains("zoe pack"),
+        "{message}"
+    );
+
+    // A pack as of now, with its GC, removes the record.
+    let pack = zoe(
+        &["pack", "--path", s(&store_dir), "--days", "0"].map(String::from),
+        &[],
+    );
+    assert_exit(&pack, 0, "zoe pack");
+    let target = dir.join("after");
+    std::fs::create_dir_all(&target).unwrap();
+    let output = convert(&store_dir, &target, &[], &[]);
+    assert_exit(&output, 0, "convert after the pack");
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_moved_registry_and_records_of_the_classes_refuse_in_one_message() {
+    let dir = fresh_dir("both");
+    let store_dir = dir.join("zoe");
+    {
+        let store = store_with_plone_classes(&store_dir);
+        let mut marker = vec![1];
+        marker.extend_from_slice(&0x2c4u64.to_be_bytes());
+        marker.extend_from_slice(&1u64.to_be_bytes());
+        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
+        txn.kv_set(
+            Flavour::Durable,
+            "zoe.plone.registry:0123456789abcdef0123456789abcdef",
+            b"m",
+            &marker,
+            None,
+        )
+        .unwrap();
+        txn.vote().unwrap();
+        txn.finish().unwrap();
+    }
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let output = convert(&store_dir, &target, &[], &[]);
+    assert_exit(&output, 1, "convert a store with both");
+    let message = stderr(&output);
+    // The refusal of the registry comes first, then the one of the
+    // classes, each with its way out.
+    let registry = message.find("move_back").expect("no registry refusal");
+    let classes = message.find(PROPERTIES).expect("no class refusal");
+    assert!(message.starts_with("zoe convert:"), "{message}");
+    assert!(registry < classes, "{message}");
+    assert!(message.contains("0x00000000000002c4"), "{message}");
+    assert!(message.contains("zoe.plone:uninstall"), "{message}");
+    assert!(
+        data_fs_files(&target).is_empty(),
+        "{:?}",
+        data_fs_files(&target)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
