@@ -647,7 +647,10 @@ def test_a_prefixed_profile_id_is_the_same_profile():
         ("site:default", {"tier2": "shadow"}),
     ]
     merges.keep_overrides(kept, "profile-" + merges.UNINSTALL, {})
-    assert list(kept) == [merges.UNINSTALL, "site:default"]
+    assert list(kept.items()) == [
+        (merges.UNINSTALL, {}),
+        ("site:default", {"tier2": "shadow"}),
+    ]
 
 
 GROUP = [["effective", "effective_date", "expiration_date", "expires"]]
