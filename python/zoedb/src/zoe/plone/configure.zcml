@@ -29,6 +29,11 @@
        roots, so a write that began before a move conflicts (ADR 0050). -->
   <zcml:customAction handler=".registry.install_guard" />
 
+  <!-- The mutable property sheet of PlonePAS: a read of the properties of
+       a principal writes nothing, and a write on a sheet whose values the
+       profile moved stores a PrincipalProperties. -->
+  <zcml:customAction handler=".properties.install" />
+
   <!-- Queued indexing, when its backend is installed: the thread of the
        indexer of each database, the wait of a request for the save of its
        user, and the status of the queue of a site. -->
@@ -78,20 +83,21 @@
       handler=".merges.fti_modified"
       />
 
-  <!-- The profile writes the merge policy of the site into the store, and
-       moves the workflow histories of the objects with the behaviour. -->
+  <!-- The profile writes the merge policy of the site into the store,
+       moves the workflow histories of the objects with the behaviour, and
+       moves the properties of the members and groups. -->
   <genericsetup:registerProfile
       name="default"
       title="ZOE"
       directory="profiles/default"
-      description="Writes the merge policy of the site into the ZOE store, from its Dexterity types, and moves the workflow histories of the objects with the behaviour zoe.plone.history."
+      description="Writes the merge policy of the site into the ZOE store, from its Dexterity types, moves the workflow histories of the objects with the behaviour zoe.plone.history, and keeps the properties of each member and group in a record of its own."
       provides="Products.GenericSetup.interfaces.EXTENSION"
       />
   <genericsetup:registerProfile
       name="uninstall"
       title="ZOE (uninstall)"
       directory="profiles/uninstall"
-      description="Removes the behaviour zoe.plone.history from the types, gives each workflow history back as a PersistentMapping, and switches off for this site the merges that the profile default switched on: folder_orders, split_merges and the tier 2 entries of the stock container classes."
+      description="Removes the behaviour zoe.plone.history from the types, gives each workflow history back as a PersistentMapping, gives the properties of each member and group back as a dict, and switches off for this site the merges that the profile default switched on: folder_orders, split_merges and the tier 2 entries of the stock container classes."
       provides="Products.GenericSetup.interfaces.EXTENSION"
       />
   <genericsetup:importStep
@@ -107,6 +113,13 @@
       description="Moves the workflow histories of the objects with the behaviour zoe.plone.history, when the profile holds zoe-plone-history.txt."
       handler=".history.import_histories">
     <depends name="typeinfo" />
+  </genericsetup:importStep>
+  <genericsetup:importStep
+      name="zoe.plone.properties"
+      title="ZOE member properties"
+      description="Gives the properties of each member and group of the mutable property sheets a record of its own, when the profile holds zoe-plone-properties.txt, and gives them back as dicts, when it holds zoe-plone-uninstall.txt."
+      handler=".properties.import_properties">
+    <depends name="zoe.plone.merge_policy" />
   </genericsetup:importStep>
   <genericsetup:importStep
       name="zoe.plone.uninstall"
