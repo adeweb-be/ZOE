@@ -93,7 +93,11 @@ replace the overrides of ``zoe.plone:default`` that the site keeps, at the
 same place (`keep_overrides`), and an import of ``zoe.plone:default``
 replaces them again. So a site that uninstalls `zoe.plone` asks for
 ``off``, and the policy of the database is ``off`` while the database keeps
-the mode of that site.
+the mode of that site. While it keeps that ``off``, each update of another
+site that asks for a higher mode logs one warning for each switch and
+container class that the site asked ``off`` for: up to four. Remove that
+site, or import ``zoe.plone:default`` there again, to stop them, unless a
+later profile of that site asks for less.
 
 Only `derive`, `site_overrides` and `gone_sites` (Acquisition),
 `update_policy`, `profile_of`, `fti_modified` (zope.component.hooks) and
@@ -662,7 +666,9 @@ def keep_overrides(kept, profile, overrides):
     """Keep `overrides` under the profile id `profile` in `kept`, the
     overrides that a site keeps. The overrides of `PROFILE` and `UNINSTALL`
     replace each other at the same place, so the overrides of the later
-    profiles of the site still apply after them."""
+    profiles of the site still apply after them. A ``profile-`` prefix of
+    `profile` is not part of the id, as in `profile_overrides`."""
+    profile = profile.removeprefix("profile-")
     other = REPLACES.get(profile)
     if other is None or other not in kept:
         kept[profile] = overrides
