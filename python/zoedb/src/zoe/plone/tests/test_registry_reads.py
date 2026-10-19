@@ -15,6 +15,9 @@ import transaction
 from Acquisition import aq_base
 from BTrees.OOBTree import OOBTree
 from plone.app.testing import PLONE_FUNCTIONAL_TESTING
+from plone.registry.field import TextLine
+from plone.registry.record import Record
+from plone.registry.registry import Registry
 
 from zoe.plone import registry as backend
 from zoe.plone.registry_rows import FIELD, dumps, loads, record_key
@@ -69,6 +72,9 @@ class TestRegistryReads(unittest.TestCase):
                             getattr(view, method)(key)
                     else:
                         self.assertEqual(getattr(view, method)(key), expected)
+            # A range with no name at or above `min` compares no `max`.
+            above = names[-1] + "z"
+            self.assertEqual(view.keys(above, 1), list(tree.keys(above, 1)))
 
     # A row that is not a new pickle of its object.
 
@@ -157,4 +163,48 @@ class TestRegistryReads(unittest.TestCase):
         jar = registry._p_jar
         for tree in (registry._records._fields, registry._records._values):
             self.assertIn(tree._p_oid, jar._readCurrent)
+        transaction.abort()
+
+    def small_registry(self):
+        """Store a registry of one record, whose trees keep their keys in
+        their roots, at the Zope root, and commit. Return it."""
+        app = self.layer["app"]
+        app.zoe_small_registry = small = Registry()
+        small.records["zoe.small"] = Record(TextLine(title="Small"), "Stored")
+        transaction.commit()
+        self.assertTrue(backend._holds_its_bucket(small.records._values))
+        transaction.commit()
+        return small
+
+    def test_the_guard_reads_the_registry_again_after_a_rollback_past_its_write(
+        self,
+    ):
+        small = self.small_registry()
+        jar = small._p_jar
+        small.records  # noqa: B018
+        self.assertIn(small._p_oid, jar._readCurrent)
+        savepoint = transaction.savepoint()
+        small.zoe_test_mtime = 1
+        transaction.savepoint()
+        # The savepoint stored the registry, so it is not read current.
+        self.assertNotIn(small._p_oid, jar._readCurrent)
+        savepoint.rollback()
+        self.assertNotIn(small._p_oid, jar._readCurrent)
+        small.records  # noqa: B018
+        self.assertIn(small._p_oid, jar._readCurrent)
+        transaction.abort()
+
+    def test_the_guard_reads_the_registry_when_btrees_read_its_roots_first(self):
+        small = self.small_registry()
+        jar = small._p_jar
+        stock = small._records
+        # An insert of a key that is there changes no tree, but BTrees
+        # reads the root current.
+        for tree in (stock._fields, stock._values):
+            tree.insert("zoe.small", None)
+            self.assertIn(tree._p_oid, jar._readCurrent)
+            self.assertFalse(tree._p_changed)
+        self.assertNotIn(small._p_oid, jar._readCurrent)
+        small.records  # noqa: B018
+        self.assertIn(small._p_oid, jar._readCurrent)
         transaction.abort()

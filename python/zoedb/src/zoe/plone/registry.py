@@ -98,6 +98,11 @@ _transactions = weakref.WeakKeyDictionary()
 # Whether the storage of each database has namespaces.
 _namespaces = weakref.WeakKeyDictionary()
 
+# The checks of the guard in the current transaction of each connection:
+# `(transaction, {registry oid: (oid of _fields, oid of _values, whole)})`.
+# `whole` tells if the guard read the registry object current too.
+_guarded = weakref.WeakKeyDictionary()
+
 
 def installed():
     """Tell if the backend is installed."""
@@ -180,20 +185,38 @@ def _read_current(registry, records):
     trees that the move left. So for such a root, the guard calls
     `readCurrent` on the registry object too, which the move writes.
 
-    When the transaction read both roots current already and changed
-    neither, the guard returns at once. It then loads no tree and reads no
-    state. Only a change of a root in the transaction can make a root keep
-    its own keys."""
+    The guard returns at once when it checked the same roots in the
+    current transaction, the roots are still read current and unchanged,
+    and the registry object is still read current or changed, if the check
+    read it. It then loads no tree and reads no state. A savepoint that
+    stores an object takes it out of the objects read current, and a
+    rollback does not put it back. So after such a rollback, the guard
+    checks again."""
     jar = registry._p_jar
-    if jar is None or registry._p_oid is None:
+    oid = registry._p_oid
+    if jar is None or oid is None:
         return
     trees = (records._fields, records._values)
     read = jar._readCurrent
-    if all(
-        tree._p_jar is jar and tree._p_oid in read and not tree._p_changed
-        for tree in trees
-    ):
-        return
+    try:
+        txn = jar.transaction_manager.get()
+    except transaction.interfaces.NoTransaction:
+        txn = None
+    guarded = _guarded.get(jar)
+    if guarded is not None and guarded[0] is txn and txn is not None:
+        checked = guarded[1].get(oid)
+        if (
+            checked is not None
+            and all(
+                tree._p_jar is jar
+                and tree._p_oid == checked[index]
+                and tree._p_oid in read
+                and not tree._p_changed
+                for index, tree in enumerate(trees)
+            )
+            and (not checked[2] or oid in read or registry._p_changed)
+        ):
+            return
     if not _has_namespaces(jar):
         return
     whole = False
@@ -210,6 +233,11 @@ def _read_current(registry, records):
             whole = True
     if whole and registry._p_oid not in jar._readCurrent:
         jar.readCurrent(registry)
+    if txn is None:
+        return
+    if guarded is None or guarded[0] is not txn:
+        guarded = _guarded[jar] = (txn, {})
+    guarded[1][oid] = (trees[0]._p_oid, trees[1]._p_oid, whole)
 
 
 # The moved records.
@@ -680,9 +708,13 @@ class _View:
 
     def _range(self, min, max):
         """Return the sorted names and the slice of the names from `min` to
-        `max`, both included. A bisect finds each end."""
+        `max`, both included. A bisect finds each end. When no name is at
+        or above `min`, the range is empty and `max` is not compared, as an
+        `OOBTree` does."""
         names = self._state().sorted_names(self._kind)
         start = 0 if min is None else bisect.bisect_left(names, min)
+        if start == len(names):
+            return names, start, start
         stop = len(names) if max is None else bisect.bisect_right(names, max)
         return names, start, stop
 
