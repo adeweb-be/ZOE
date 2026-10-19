@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "arch": "x86_64",
+    "disk": null
+  },
+  "python": {
+    "implementation": "cpython",
+    "version": "3.13.9",
+    "free_threaded": false,
+    "compiler": "GCC 14.2.0"
+  },
+  "gil_enabled_by": [],
+  "software": {
+    "ZEO": "6.0.0",
+    "zoedb": "0.1.0",
+    "zoe": "zoe 0.1.0"
+  },
+  "run": {
+    "started": "2026-01-01T02:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "objects": 1000,
+    "commits": 20,
+    "dirty": false
+  },
+  "rows": [
+    {
+      "client": "ZEO.ClientStorage",
+      "server": "zoe-serve",
+      "mode": "threads",
+      "concurrency": 1,
+      "workload": "cold",
+      "record_size": 1024,
+      "calls_per_second": 8000.0,
+      "p50_seconds": 0.00012,
+      "p99_seconds": 0.0003,
+      "client_cpu_per_object_seconds": 0.0001,
+      "rounds": 3,
+      "spread": 0.05
+    },
+    {
+      "client": "zoe.zeo.ClientStorage",
+      "server": "zoe-serve",
+      "mode": "threads",
+      "concurrency": 1,
+      "workload": "cold",
+      "record_size": 1024,
+      "calls_per_second": 16000.0,
+      "p50_seconds": 0.00006,
+      "p99_seconds": 0.00015,
+      "client_cpu_per_object_seconds": 0.00004,
+      "rounds": 3,
+      "spread": 0.04
+    },
+    {
+      "client": "zoe.zeo.ClientStorage",
+      "server": "zoe-serve",
+      "mode": "threads",
+      "concurrency": 1,
+      "workload": "commit",
+      "record_size": 1024,
+      "calls_per_second": 300.0,
+      "p50_seconds": 0.003,
+      "p99_seconds": 0.006,
+      "client_cpu_per_object_seconds": 0.00002,
+      "rounds": 3,
+      "spread": 0.08
+    }
+  ]
+}

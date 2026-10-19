@@ -158,6 +158,24 @@ def ratios(pairs: list[dict]) -> list[float]:
     return [p["seconds"][BASELINE] / p["seconds"][STORAGE] for p in pairs]
 
 
+def outcome(pairs: list[dict]) -> dict:
+    """Return the verdict of the pairs of a scenario for its entry in the
+    result: the ratio and its interval as `decide` gives them, None for a
+    value that is not finite, and the verdict. So a reader of the result
+    does not apply the rule again."""
+    v = decide(ratios(pairs), LEVEL, MIN_PAIRS)
+
+    def finite(value: float) -> float | None:
+        return value if math.isfinite(value) else None
+
+    return {
+        "ratio": finite(v.ratio),
+        "low": finite(v.low),
+        "high": finite(v.high),
+        "verdict": v.verdict,
+    }
+
+
 def run(
     cells=CELLS,
     scenarios=SCENARIOS,
@@ -189,6 +207,7 @@ def run(
         "run": {
             "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "commit": environment.commit(),
+            "dirty": environment.dirty(),
             "seconds": round(time.monotonic() - clock, 3),
         },
         "rule": {
@@ -222,6 +241,7 @@ def _cell(cell: Cell, scenarios, directory: Path, out: TextIO) -> dict:
             transactions, pairs = _pairs(groups, cell, scenario, admin)
             entries.append(
                 {"name": scenario, "transactions": transactions, "pairs": pairs}
+                | outcome(pairs)
             )
             print(
                 _row(cell, cell.objects, scenario, pairs, MIN_PAIRS, LEVEL)[0],

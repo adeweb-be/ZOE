@@ -68,9 +68,33 @@ def commit() -> str | None:
     """Return the commit of the repository that the harness runs from."""
     if value := os.environ.get("ZOE_BENCH_COMMIT"):
         return value
+    return _git("rev-parse", "HEAD") or None
+
+
+def dirty() -> bool | None:
+    """Return true when the tree of the harness holds changes that its
+    commit does not, false when it holds none, and None when git fails, as
+    in a tree with no .git. Return None also when ZOE_BENCH_COMMIT names
+    another commit than the tree: the tree is then no record of that
+    commit."""
+    head = _git("rev-parse", "HEAD")
+    if not head:
+        return None
+    named = os.environ.get("ZOE_BENCH_COMMIT")
+    if named and not head.startswith(named.lower()):
+        return None
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    if status is None:
+        return None
+    return bool(status)
+
+
+def _git(*args: str) -> str | None:
+    """Run git in the tree of the harness. Return its output without the
+    spaces at its ends, or None when it fails."""
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *args],
             capture_output=True,
             text=True,
             check=True,
@@ -78,7 +102,7 @@ def commit() -> str | None:
         )
     except (OSError, subprocess.CalledProcessError):
         return None
-    return out.stdout.strip() or None
+    return out.stdout.strip()
 
 
 def _cpu_model() -> str:

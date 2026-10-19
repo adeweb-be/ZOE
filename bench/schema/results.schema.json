@@ -71,7 +71,8 @@
         "quick": { "description": "True for the quick set of the pull-request gate, false for the full nightly set.", "type": "boolean" },
         "set": { "description": "The set of the run: quick or full.", "enum": ["quick", "full"] },
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
-        "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" }
+        "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "dirty": { "description": "True when the tree of the harness held changes that the commit does not; false when it held none; null when git fails. Optional: results without it stay valid, but only false is publishable (ADR 0054).", "type": ["boolean", "null"] }
       }
     },
     "scenarios": {

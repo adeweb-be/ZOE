@@ -1,0 +1,737 @@
+{
+ "schema": "plonebench-result/1",
+ "run_id": "20260101T000500Z-edit-zoe-native-qi-kv-r0",
+ "label": "",
+ "started": 1767225900.0,
+ "stack": {
+  "stack": {
+   "name": "zoe-native-qi-kv",
+   "scenario": "zoeclient",
+   "server": "zoe",
+   "section": "zoeclient",
+   "native": true,
+   "description": "zoe-native-qi with the locking backend of zoe.plone (ADR 0043) and the properties of the members and groups in records of zoe.plone, which merge a login at the vote (ADR 0046)",
+   "differs": [
+    "server: zoe serve (redb store, raw records unless --zoe-compression, per-oid locks, group commit)",
+    "client: native Rust client (msgpack M5), extensions sequences, kv and trace_context declared",
+    "zoe.plone: portal_uidgenerator takes its ids from a store sequence",
+    "zoe.plone: a save writes no object of the catalog; the indexer of the site applies the queue in transactions of its own, and the next request of the user who saved waits for it",
+    "zoe.plone: the locks of edit forms live in the ephemeral namespace of the store, so a lock writes no object",
+    "zoe.plone: the properties of each member and group are a record of their own, so two logins do not conflict on the property sheet of PAS",
+    "conflicts: the client resolves through the vote (tier 3)"
+   ],
+   "backends": "indexing,locking",
+   "member_properties": true
+  },
+  "settings": {
+   "instances": 2,
+   "threads": 2,
+   "zodb_cache_objects": 30000,
+   "pool_size": 7,
+   "client_cache": "128MB",
+   "server_cpus": "0",
+   "zope_cpus": [
+    "1",
+    "2"
+   ],
+   "locust_cpus": "3",
+   "base_port": 18080,
+   "server_port": 18100,
+   "admin_port": 18199,
+   "probe": true,
+   "zeo_fsync": "plain",
+   "zoe_cache_size": null,
+   "zoe_compression": null,
+   "split_merges": "on",
+   "folder_orders": "on"
+  },
+  "zope_conf": "%define INSTANCEHOME /nonexistent/target/plone/zoeclient/parts/instance\ninstancehome $INSTANCEHOME\n%define CLIENTHOME /nonexistent/runs/var\n"
+ },
+ "scenario": {
+  "name": "edit",
+  "description": "the edit form of Plone on Documents, each user its own Documents",
+  "mix": {
+   "edit": 1
+  },
+  "background": [],
+  "roles": [
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit",
+   "edit"
+  ],
+  "interface": [
+   "ui"
+  ]
+ },
+ "steps": [
+  [
+   4,
+   20.0
+  ],
+  [
+   16,
+   20.0
+  ]
+ ],
+ "warmup_seconds": 60.0,
+ "warmup_users": 8,
+ "trim_seconds": 5.0,
+ "think": "0,0",
+ "client_retries": 0,
+ "repetition": 0,
+ "fixture": {
+  "name": "small-ba01ff255313",
+  "spec": {
+   "seed": 1,
+   "sections": 4,
+   "depth": 2,
+   "fanout": 3,
+   "documents": 8,
+   "news": 2,
+   "files": 1,
+   "file_sizes": [
+    16384,
+    131072,
+    1048576
+   ],
+   "paragraphs": [
+    3,
+    8
+   ],
+   "words": [
+    40,
+    120
+   ],
+   "vocabulary": 2000,
+   "private": 0.2,
+   "pending": 0.1,
+   "editors": 48,
+   "members": 32,
+   "hot": 4,
+   "shared": 48
+  },
+  "equivalence": {
+   "equivalent": true,
+   "objects": 412,
+   "catalog_entries": 398,
+   "differences": [],
+   "build_seconds": 90.0,
+   "converted_at": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+   "store_bytes": {
+    "filestorage": 52428800,
+    "blobstorage": 10485760,
+    "zoe": 48234496
+   }
+  }
+ },
+ "environment": {
+  "machine": {
+   "os": "Linux",
+   "cpu": "Synthetic CPU",
+   "logical_cpus": 8,
+   "core_kinds": null,
+   "memory_bytes": 17179869184,
+   "kernel": "6.0.0",
+   "cgroup": {},
+   "cpu_pinning": "taskset",
+   "store_disk": {
+    "device": "nvme0n1",
+    "device_rotational": false,
+    "filesystem": "ext4"
+   },
+   "durability": {
+    "zeo": "fsync(2) in FileStorage",
+    "zoe": "fdatasync(2)"
+   }
+  },
+  "software": {
+   "zope_python": {
+    "version": "3.13.9",
+    "free_threaded": false,
+    "gil_enabled": true
+   },
+   "runner_python": "3.13.9",
+   "eggs": {
+    "BTrees": "6.1",
+    "Plone": "6.1.3",
+    "Products.CMFPlone": "6.1.3",
+    "ZEO": "6.0.0",
+    "ZODB": "6.0.1",
+    "Zope": "5.13",
+    "msgpack": "1.1.0",
+    "persistent": "6.1",
+    "plone.restapi": "9.13.0",
+    "zodbpickle": "4.2"
+   },
+   "zoedb": "0.1.0",
+   "zoe": "zoe 0.1.0",
+   "locust": "2.46.7"
+  },
+  "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+  "dirty": false
+ },
+ "workload_model": "closed: each user waits for its response before its next operation, so a slower server lowers the offered rate",
+ "exclusions": [],
+ "merge_policy": {
+  "version": 3,
+  "classes": {
+   "plone.app.contenttypes.content.Folder": {
+    "tier2": "on",
+    "default": "strict",
+    "fields": {
+     "modification_date": "max"
+    }
+   },
+   "zoe.plone.properties.PrincipalProperties": {
+    "tier2": "on",
+    "default": "strict",
+    "fields": {
+     "login_time": "max",
+     "last_login_time": "max"
+    }
+   }
+  },
+  "split_merges": "on",
+  "folder_orders": "on"
+ },
+ "policy_seconds": 0.5,
+ "member_properties": {
+  "moved": {
+   "Plone": 81
+  }
+ },
+ "properties_seconds": 0.7,
+ "startup_seconds": 12.0,
+ "locust_exit": 0,
+ "measured": {
+  "start": 1767225900.0,
+  "end": 1767225940.0
+ },
+ "server": {
+  "status_before": {
+   "conflicts": 0
+  },
+  "status_after": {
+   "conflicts": 0
+  },
+  "status_delta": {
+   "conflicts": 0,
+   "conflicts_resolved": 0
+  }
+ },
+ "stop_codes": {
+  "instance0": 0,
+  "instance1": 0,
+  "server": 0
+ },
+ "verification": {
+  "verdict": "pass",
+  "violations": 0,
+  "checks": {},
+  "seconds": 3.0,
+  "observed_paths": 40,
+  "content_objects": 412,
+  "catalog_entries": 398
+ },
+ "ended": 1767225960.0,
+ "steps_results": [
+  {
+   "step": 0,
+   "users": 4,
+   "seconds": 15.0,
+   "window": [
+    1767225905.0,
+    1767225920.0
+   ],
+   "all": {
+    "operations": 120,
+    "outcomes": {
+     "ok": 120,
+     "failed": 0,
+     "ambiguous": 0,
+     "rejected": 0
+    },
+    "ok_per_second": 8.0,
+    "failure_rate": 0.0,
+    "first_attempt_ok": 120,
+    "eventual_ok": 120,
+    "client_attempts": 120,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 1.0,
+    "latency_ok": {
+     "count": 120,
+     "mean": 0.22574167251586913,
+     "p50": 0.24000000953674316,
+     "p95": 0.3753499984741211,
+     "p99": 0.3970000743865967,
+     "max": 0.3989999294281006,
+     "p99_reliable": false
+    },
+    "latency_all": {
+     "count": 120,
+     "mean": 0.22574167251586913,
+     "p50": 0.24000000953674316,
+     "p95": 0.3753499984741211,
+     "p99": 0.3970000743865967,
+     "max": 0.3989999294281006,
+     "p99_reliable": false
+    },
+    "server": {
+     "requests": 120,
+     "attempts": 120,
+     "retries": 0,
+     "loads": 3600,
+     "load_bytes": 3240000,
+     "stores": 480,
+     "store_bytes": 576000,
+     "votes": 120,
+     "finishes": 120,
+     "aborts": 0,
+     "resolved": 0,
+     "resolve_failed": 0,
+     "seconds": 27.089000000000002,
+     "cpu": 9.029300000000001,
+     "commit_seconds": 0.0,
+     "load_seconds": 0.0,
+     "vote_seconds": 0.0,
+     "finish_seconds": 0.0,
+     "resolve_seconds": 0.0,
+     "conflict_classes": {},
+     "resolve_reasons": {}
+    }
+   },
+   "writes": {
+    "operations": 120,
+    "outcomes": {
+     "ok": 120,
+     "failed": 0,
+     "ambiguous": 0,
+     "rejected": 0
+    },
+    "ok_per_second": 8.0,
+    "failure_rate": 0.0,
+    "first_attempt_ok": 120,
+    "eventual_ok": 120,
+    "client_attempts": 120,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 1.0,
+    "latency_ok": {
+     "count": 120,
+     "mean": 0.22574167251586913,
+     "p50": 0.24000000953674316,
+     "p95": 0.3753499984741211,
+     "p99": 0.3970000743865967,
+     "max": 0.3989999294281006,
+     "p99_reliable": false
+    },
+    "latency_all": {
+     "count": 120,
+     "mean": 0.22574167251586913,
+     "p50": 0.24000000953674316,
+     "p95": 0.3753499984741211,
+     "p99": 0.3970000743865967,
+     "max": 0.3989999294281006,
+     "p99_reliable": false
+    },
+    "server": {
+     "requests": 120,
+     "attempts": 120,
+     "retries": 0,
+     "loads": 3600,
+     "load_bytes": 3240000,
+     "stores": 480,
+     "store_bytes": 576000,
+     "votes": 120,
+     "finishes": 120,
+     "aborts": 0,
+     "resolved": 0,
+     "resolve_failed": 0,
+     "seconds": 27.089000000000002,
+     "cpu": 9.029300000000001,
+     "commit_seconds": 0.0,
+     "load_seconds": 0.0,
+     "vote_seconds": 0.0,
+     "finish_seconds": 0.0,
+     "resolve_seconds": 0.0,
+     "conflict_classes": {},
+     "resolve_reasons": {}
+    }
+   },
+   "kinds": {
+    "edit": {
+     "operations": 120,
+     "outcomes": {
+      "ok": 120,
+      "failed": 0,
+      "ambiguous": 0,
+      "rejected": 0
+     },
+     "ok_per_second": 8.0,
+     "failure_rate": 0.0,
+     "first_attempt_ok": 120,
+     "eventual_ok": 120,
+     "client_attempts": 120,
+     "requests_per_op": 2.0,
+     "server_attempts_per_op": 1.0,
+     "latency_ok": {
+      "count": 120,
+      "mean": 0.22574167251586913,
+      "p50": 0.24000000953674316,
+      "p95": 0.3753499984741211,
+      "p99": 0.3970000743865967,
+      "max": 0.3989999294281006,
+      "p99_reliable": false
+     },
+     "latency_all": {
+      "count": 120,
+      "mean": 0.22574167251586913,
+      "p50": 0.24000000953674316,
+      "p95": 0.3753499984741211,
+      "p99": 0.3970000743865967,
+      "max": 0.3989999294281006,
+      "p99_reliable": false
+     },
+     "server": {
+      "requests": 120,
+      "attempts": 120,
+      "retries": 0,
+      "loads": 3600,
+      "load_bytes": 3240000,
+      "stores": 480,
+      "store_bytes": 576000,
+      "votes": 120,
+      "finishes": 120,
+      "aborts": 0,
+      "resolved": 0,
+      "resolve_failed": 0,
+      "seconds": 27.089000000000002,
+      "cpu": 9.029300000000001,
+      "commit_seconds": 0.0,
+      "load_seconds": 0.0,
+      "vote_seconds": 0.0,
+      "finish_seconds": 0.0,
+      "resolve_seconds": 0.0,
+      "conflict_classes": {},
+      "resolve_reasons": {}
+     }
+    }
+   },
+   "zope_busy": {
+    "instance0": 0.8443333333333332,
+    "instance1": 0.9615999999999999
+   },
+   "resources": {
+    "processes": {
+     "instance0": {
+      "cpu_seconds": 1.44,
+      "cpu_share": 0.4
+     },
+     "instance1": {
+      "cpu_seconds": 1.32,
+      "cpu_share": 0.4
+     },
+     "server": {
+      "cpu_seconds": 0.24,
+      "cpu_share": 0.1,
+      "write_bytes": 4915200,
+      "store_write_bytes": 737280
+     },
+     "locust": {
+      "cpu_seconds": 1.0,
+      "cpu_share": 0.05
+     }
+    }
+   }
+  },
+  {
+   "step": 1,
+   "users": 16,
+   "seconds": 15.0,
+   "window": [
+    1767225925.0,
+    1767225940.0
+   ],
+   "all": {
+    "operations": 210,
+    "outcomes": {
+     "ok": 210,
+     "failed": 0,
+     "ambiguous": 0,
+     "rejected": 0
+    },
+    "ok_per_second": 14.0,
+    "failure_rate": 0.0,
+    "first_attempt_ok": 210,
+    "eventual_ok": 210,
+    "client_attempts": 210,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 1.0,
+    "latency_ok": {
+     "count": 210,
+     "mean": 0.9226809581120808,
+     "p50": 0.8925000429153442,
+     "p95": 1.5530001044273376,
+     "p99": 1.5890999364852905,
+     "max": 1.5970001220703125,
+     "p99_reliable": true
+    },
+    "latency_all": {
+     "count": 210,
+     "mean": 0.9226809581120808,
+     "p50": 0.8925000429153442,
+     "p95": 1.5530001044273376,
+     "p99": 1.5890999364852905,
+     "max": 1.5970001220703125,
+     "p99_reliable": true
+    },
+    "server": {
+     "requests": 210,
+     "attempts": 210,
+     "retries": 0,
+     "loads": 6300,
+     "load_bytes": 5670000,
+     "stores": 840,
+     "store_bytes": 1008000,
+     "votes": 210,
+     "finishes": 210,
+     "aborts": 0,
+     "resolved": 0,
+     "resolve_failed": 0,
+     "seconds": 193.76300000000018,
+     "cpu": 64.5857,
+     "commit_seconds": 0.0,
+     "load_seconds": 0.0,
+     "vote_seconds": 0.0,
+     "finish_seconds": 0.0,
+     "resolve_seconds": 0.0,
+     "conflict_classes": {},
+     "resolve_reasons": {}
+    }
+   },
+   "writes": {
+    "operations": 210,
+    "outcomes": {
+     "ok": 210,
+     "failed": 0,
+     "ambiguous": 0,
+     "rejected": 0
+    },
+    "ok_per_second": 14.0,
+    "failure_rate": 0.0,
+    "first_attempt_ok": 210,
+    "eventual_ok": 210,
+    "client_attempts": 210,
+    "requests_per_op": 2.0,
+    "server_attempts_per_op": 1.0,
+    "latency_ok": {
+     "count": 210,
+     "mean": 0.9226809581120808,
+     "p50": 0.8925000429153442,
+     "p95": 1.5530001044273376,
+     "p99": 1.5890999364852905,
+     "max": 1.5970001220703125,
+     "p99_reliable": true
+    },
+    "latency_all": {
+     "count": 210,
+     "mean": 0.9226809581120808,
+     "p50": 0.8925000429153442,
+     "p95": 1.5530001044273376,
+     "p99": 1.5890999364852905,
+     "max": 1.5970001220703125,
+     "p99_reliable": true
+    },
+    "server": {
+     "requests": 210,
+     "attempts": 210,
+     "retries": 0,
+     "loads": 6300,
+     "load_bytes": 5670000,
+     "stores": 840,
+     "store_bytes": 1008000,
+     "votes": 210,
+     "finishes": 210,
+     "aborts": 0,
+     "resolved": 0,
+     "resolve_failed": 0,
+     "seconds": 193.76300000000018,
+     "cpu": 64.5857,
+     "commit_seconds": 0.0,
+     "load_seconds": 0.0,
+     "vote_seconds": 0.0,
+     "finish_seconds": 0.0,
+     "resolve_seconds": 0.0,
+     "conflict_classes": {},
+     "resolve_reasons": {}
+    }
+   },
+   "kinds": {
+    "edit": {
+     "operations": 210,
+     "outcomes": {
+      "ok": 210,
+      "failed": 0,
+      "ambiguous": 0,
+      "rejected": 0
+     },
+     "ok_per_second": 14.0,
+     "failure_rate": 0.0,
+     "first_attempt_ok": 210,
+     "eventual_ok": 210,
+     "client_attempts": 210,
+     "requests_per_op": 2.0,
+     "server_attempts_per_op": 1.0,
+     "latency_ok": {
+      "count": 210,
+      "mean": 0.9226809581120808,
+      "p50": 0.8925000429153442,
+      "p95": 1.5530001044273376,
+      "p99": 1.5890999364852905,
+      "max": 1.5970001220703125,
+      "p99_reliable": true
+     },
+     "latency_all": {
+      "count": 210,
+      "mean": 0.9226809581120808,
+      "p50": 0.8925000429153442,
+      "p95": 1.5530001044273376,
+      "p99": 1.5890999364852905,
+      "max": 1.5970001220703125,
+      "p99_reliable": true
+     },
+     "server": {
+      "requests": 210,
+      "attempts": 210,
+      "retries": 0,
+      "loads": 6300,
+      "load_bytes": 5670000,
+      "stores": 840,
+      "store_bytes": 1008000,
+      "votes": 210,
+      "finishes": 210,
+      "aborts": 0,
+      "resolved": 0,
+      "resolve_failed": 0,
+      "seconds": 193.76300000000018,
+      "cpu": 64.5857,
+      "commit_seconds": 0.0,
+      "load_seconds": 0.0,
+      "vote_seconds": 0.0,
+      "finish_seconds": 0.0,
+      "resolve_seconds": 0.0,
+      "conflict_classes": {},
+      "resolve_reasons": {}
+     }
+    }
+   },
+   "zope_busy": {
+    "instance0": 6.5818,
+    "instance1": 6.335733333333333
+   },
+   "resources": {
+    "processes": {
+     "instance0": {
+      "cpu_seconds": 2.52,
+      "cpu_share": 0.4
+     },
+     "instance1": {
+      "cpu_seconds": 2.31,
+      "cpu_share": 0.4
+     },
+     "server": {
+      "cpu_seconds": 0.42,
+      "cpu_share": 0.1,
+      "write_bytes": 8601600,
+      "store_write_bytes": 1505280
+     },
+     "locust": {
+      "cpu_seconds": 1.0,
+      "cpu_share": 0.05
+     }
+    }
+   }
+  }
+ ],
+ "resources": {
+  "processes": {}
+ },
+ "logins": {
+  "operations": 0,
+  "outcomes": {
+   "ok": 0,
+   "failed": 0,
+   "ambiguous": 0,
+   "rejected": 0
+  },
+  "ok_per_second": 0.0,
+  "failure_rate": null,
+  "first_attempt_ok": 0,
+  "eventual_ok": 0,
+  "client_attempts": 0,
+  "requests_per_op": null,
+  "server_attempts_per_op": null,
+  "latency_ok": {
+   "count": 0,
+   "mean": null,
+   "p50": null,
+   "p95": null,
+   "p99": null,
+   "max": null,
+   "p99_reliable": false
+  },
+  "latency_all": {
+   "count": 0,
+   "mean": null,
+   "p50": null,
+   "p95": null,
+   "p99": null,
+   "max": null,
+   "p99_reliable": false
+  },
+  "server": {
+   "conflict_classes": {},
+   "resolve_reasons": {}
+  }
+ },
+ "probe": {
+  "requests": 330,
+  "requests_without_op": 0,
+  "server_totals": {
+   "requests": 330,
+   "attempts": 330,
+   "retries": 0,
+   "loads": 9900,
+   "load_bytes": 8910000,
+   "stores": 1320,
+   "store_bytes": 1584000,
+   "votes": 330,
+   "finishes": 330,
+   "aborts": 0,
+   "resolved": 0,
+   "resolve_failed": 0,
+   "seconds": 220.85200000000012,
+   "cpu": 73.615,
+   "commit_seconds": 0.0,
+   "load_seconds": 0.0,
+   "vote_seconds": 0.0,
+   "finish_seconds": 0.0,
+   "resolve_seconds": 0.0,
+   "conflict_classes": {},
+   "resolve_reasons": {}
+  },
+  "client_cache": {}
+ }
+}

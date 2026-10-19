@@ -194,7 +194,13 @@ def main(argv: list[str] | None = None) -> int:
     report = commands.add_parser("report", help="compare runs")
     report.add_argument("runs", nargs="+", type=Path)
     report.add_argument("--out", type=Path)
-    report.add_argument("--json", type=Path)
+    report.add_argument(
+        "--json",
+        type=Path,
+        help="write the summary of the campaign, valid against "
+        "bench/schema/plone.schema.json; the runs must share one fixture, "
+        "commit, machine and settings",
+    )
     report.add_argument(
         "--timeline",
         type=float,
@@ -254,13 +260,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeline:
             print(report_module.timeline(args.runs, args.timeline))
             return 0
-        text, data = report_module.build(args.runs)
+        text, _ = report_module.build(args.runs)
         if args.out:
             args.out.write_text(text)
         else:
             print(text)
         if args.json:
-            args.json.write_text(json.dumps(data, indent=1))
+            # A refusal of the summary writes no summary. The Markdown report
+            # stays.
+            from plonebench import summary
+
+            try:
+                document = summary.document(report_module.load(args.runs))
+            except summary.NotOneCampaign as error:
+                print(f"plonebench report: {error}", file=sys.stderr)
+                return 2
+            except summary.jsonschema.ValidationError as error:
+                print(
+                    "plonebench report: the summary is not valid against "
+                    f"{summary.SCHEMA.name}: {error.message}",
+                    file=sys.stderr,
+                )
+                return 1
+            args.json.write_text(json.dumps(document, indent=2) + "\n")
         return 0
     if args.command == "serve":
         name = args.fixture or default_fixture()

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "storage": "zeo",
+  "machine": {
+    "name": "reference",
+    "cpu": "Synthetic CPU",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "Linux",
+    "kernel": "6.0.0",
+    "arch": "x86_64",
+    "disk": {"model": "Synthetic NVMe", "rotational": false}
+  },
+  "python": {
+    "implementation": "cpython",
+    "version": "3.13.9",
+    "free_threaded": false,
+    "compiler": "GCC 14.2.0"
+  },
+  "software": {
+    "zodbshootout": "0.8.0",
+    "pyperf": "2.3.0",
+    "ZODB": "6.0.1",
+    "ZEO": "6.0.0",
+    "persistent": "6.1",
+    "BTrees": "6.1",
+    "zodbpickle": "4.2",
+    "transaction": "5.0"
+  },
+  "run": {
+    "quick": false,
+    "set": "full",
+    "started": "2026-01-01T00:00:00Z",
+    "commit": "d939b3f580637ba1f457c9041a12b2f26b0a5273",
+    "dirty": false
+  },
+  "scenarios": [
+    {
+      "name": "add",
+      "mode": "threads",
+      "concurrency": 1,
+      "object_size": 1024,
+      "objects_per_transaction": 100,
+      "samples": 20,
+      "ops_per_second": 25000.0,
+      "mean_seconds": 0.004,
+      "p50_seconds": 0.0039,
+      "p99_seconds": 0.0052,
+      "workers": [
+        {"gil_enabled": true, "gil_enabled_by": []},
+        {"gil_enabled": true, "gil_enabled_by": []}
+      ]
+    },
+    {
+      "name": "read_cold",
+      "mode": "processes",
+      "concurrency": 4,
+      "object_size": 1024,
+      "objects_per_transaction": 100,
+      "samples": 20,
+      "ops_per_second": 40000.0,
+      "mean_seconds": 0.01,
+      "p50_seconds": 0.0098,
+      "p99_seconds": 0.0131
+    }
+  ]
+}

@@ -34,6 +34,13 @@ def sysctl(name: str) -> str | None:
     return out.stdout.strip() or None
 
 
+def slug(text: str) -> str:
+    """Return the CPU model as a machine name, as the harness of zodbshootout
+    does: intel-core-ultra-7-155h."""
+    text = re.sub(r"\((r|tm)\)", "", text.lower())
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "unknown"
+
+
 def cpu_model() -> str:
     if sys.platform == "darwin":
         return sysctl("machdep.cpu.brand_string") or "unknown"
@@ -124,12 +131,19 @@ def cgroup_limits() -> dict:
 
 def eggs() -> dict[str, str]:
     """The versions of the eggs that the buildout scenarios share."""
-    versions = {}
+    found: dict[str, set[str]] = {}
     for path in stack.egg_paths("*.egg"):
         match = re.match(r"^(.+?)-([^-]+)-py", path.name)
         if match and match.group(1) in EGGS:
-            versions[match.group(1)] = match.group(2)
-    return dict(sorted(versions.items()))
+            found.setdefault(match.group(1), set()).add(match.group(2))
+    # The eggs directory can hold two versions of one egg. Take the
+    # highest, so the record does not depend on the order of the files.
+    return {name: max(found[name], key=_version_key) for name in sorted(found)}
+
+
+def _version_key(version: str) -> tuple:
+    """Order versions by their numbers, then by their text."""
+    return [int(number) for number in re.findall(r"\d+", version)], version
 
 
 def zoedb_version() -> str | None:
@@ -161,12 +175,38 @@ def git(*args: str) -> str | None:
         return None
 
 
+def dirty() -> bool | None:
+    """True when the tree holds changes that the commit does not, false
+    when it holds none, None when git fails. None also when
+    ZOE_BENCH_COMMIT names another commit than the tree: the tree is then
+    no record of that commit."""
+    head = git("rev-parse", "HEAD")
+    if not head:
+        return None
+    named = os.environ.get("ZOE_BENCH_COMMIT")
+    if named and not head.startswith(named.lower()):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=stack.REPO,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    return bool(out.stdout.strip())
+
+
 def zope_python() -> dict:
     """The interpreter of the Plone instances, and its GIL."""
     python = stack.PLONE / "venv" / "bin" / "python"
     code = (
         "import sys, sysconfig, json; "
-        "print(json.dumps({'version': sys.version.split()[0], "
+        "print(json.dumps({'implementation': sys.implementation.name, "
+        "'version': sys.version.split()[0], "
         "'free_threaded': bool(sysconfig.get_config_var('Py_GIL_DISABLED')), "
         "'gil_enabled': getattr(sys, '_is_gil_enabled', lambda: True)()}))"
     )
@@ -201,6 +241,9 @@ def record(store_dir: Path, zeo_fsync: str = "plain") -> dict:
         locust_version = None
     return {
         "machine": {
+            # The name of the machine in the results repository. None when
+            # ZOE_BENCH_MACHINE is not set: the summary then gives a name.
+            "name": os.environ.get("ZOE_BENCH_MACHINE") or None,
             "os": platform.system(),
             "cpu": cpu_model(),
             "logical_cpus": os.cpu_count(),
@@ -225,5 +268,5 @@ def record(store_dir: Path, zeo_fsync: str = "plain") -> dict:
             "locust": locust_version,
         },
         "commit": os.environ.get("ZOE_BENCH_COMMIT") or git("rev-parse", "HEAD"),
-        "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        "dirty": dirty(),
     }
