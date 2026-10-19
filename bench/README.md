@@ -272,7 +272,7 @@ just bench publish --main HEAD summary.json ../zoe-bench-results    # the runs o
 3. its commit is on REF: `git merge-base --is-ancestor COMMIT REF` succeeds in the ZOE repository of the harness. REF is `origin/main`, unless `--main` names another, such as `HEAD` on a card branch;
 4. `run.dirty` is false. A run of a dirty tree is refused, and so is a run with no record of its tree (no `run.dirty`, or null, as a run in the container of the Dagger function `bench`);
 5. for `plone`, the verification of each run passed;
-6. its path in CHECKOUT is free or holds the same bytes, and no other document of the same publish goes there with other bytes.
+6. its path in CHECKOUT is free or holds the same bytes, and no other document of the same publish goes there with other bytes. Each part of the path is a name (a letter or a digit, then letters, digits, `.`, `_` or `-`), so a document never writes outside `results/`.
 
 A partial run is publishable as it is: a run of the native gate with `--cell` or `--scenario`, or a client run with other `--objects`, holds fewer cells or rows, and its document shows them.
 

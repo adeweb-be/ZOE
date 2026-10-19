@@ -7,12 +7,31 @@ benchmark.
 
 import json
 import pathlib
+import subprocess
 
 import pytest
 
 from shootout import layout, publish
 
 DATA = pathlib.Path(__file__).parent / "data" / "publish"
+
+
+def _has_git() -> bool:
+    try:
+        done = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+            cwd=publish.REPOSITORY,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return done.returncode == 0
+
+
+# publish checks the commit of a document with git. A tree with no .git,
+# such as the container of the Dagger function bench, cannot.
+needs_git = pytest.mark.skipif(not _has_git(), reason="the tree has no git history")
 
 
 @pytest.fixture
@@ -36,6 +55,7 @@ def run(capsys, *sources, checkout, main="HEAD"):
     return code, capsys.readouterr()
 
 
+@needs_git
 def test_a_file_that_is_not_json_is_refused(tmp_path, checkout, capsys):
     source = tmp_path / "broken.json"
     source.write_text("{")
@@ -48,6 +68,7 @@ def test_a_file_that_is_not_json_is_refused(tmp_path, checkout, capsys):
     assert list(checkout.iterdir()) == []
 
 
+@needs_git
 @pytest.mark.parametrize(
     "document",
     [{"run": {}}, {**sample("shootout"), "rows": []}, ["a", "list"]],
@@ -62,6 +83,7 @@ def test_a_document_of_no_known_family_is_refused(document, tmp_path, checkout, 
     assert f"publish: {source}: not a document of a known family" in out.err
 
 
+@needs_git
 def test_a_document_that_is_not_valid_names_its_schema(tmp_path, checkout, capsys):
     document = sample("native")
     del document["rule"]
@@ -74,6 +96,7 @@ def test_a_document_that_is_not_valid_names_its_schema(tmp_path, checkout, capsy
     assert "'rule' is a required property" in out.err
 
 
+@needs_git
 def test_a_document_without_a_commit_is_refused(tmp_path, checkout, capsys):
     document = sample("shootout")
     document["run"]["commit"] = None
@@ -85,6 +108,7 @@ def test_a_document_without_a_commit_is_refused(tmp_path, checkout, capsys):
     assert f"publish: {source}: no commit" in out.err
 
 
+@needs_git
 def test_each_reason_of_a_document_has_its_line(tmp_path, checkout, capsys):
     document = sample("shootout")
     document["run"]["quick"] = True
@@ -98,6 +122,7 @@ def test_each_reason_of_a_document_has_its_line(tmp_path, checkout, capsys):
     assert f"publish: {source}: no record of a clean tree" in out.err
 
 
+@needs_git
 def test_a_path_with_other_content_is_refused(tmp_path, checkout, capsys):
     target = checkout / layout.published_path(sample("client"))
     target.parent.mkdir(parents=True)
@@ -111,6 +136,7 @@ def test_a_path_with_other_content_is_refused(tmp_path, checkout, capsys):
     assert not (checkout / "index.json").exists()
 
 
+@needs_git
 def test_two_documents_for_one_path_are_refused(tmp_path, checkout, capsys):
     document = sample("native")
     document["run"]["seconds"] = 1.0
@@ -123,6 +149,7 @@ def test_two_documents_for_one_path_are_refused(tmp_path, checkout, capsys):
     assert list(checkout.iterdir()) == []
 
 
+@needs_git
 def test_the_same_document_twice_is_published_once(checkout, capsys):
     code, out = run(capsys, DATA / "native.json", DATA, checkout=checkout)
 
@@ -136,6 +163,7 @@ def test_the_same_document_twice_is_published_once(checkout, capsys):
     ]
 
 
+@needs_git
 def test_a_part_of_the_path_that_is_not_a_name_is_refused(tmp_path, checkout, capsys):
     # The schema of zodbshootout takes any name of an implementation.
     document = sample("shootout")
