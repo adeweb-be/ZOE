@@ -280,9 +280,23 @@ A partial run is publishable as it is: a run of the native gate with `--cell` or
 
 ## The dashboard
 
-The dashboard is the GitHub Pages site of the results repository, <https://adeweb-be.github.io/zoe-bench-results/>: one static page, `index.html`, with no build step. It reads `index.json`, then the result documents it lists. For each machine and Python build, it plots `ops_per_second` and `p99_seconds` of each scenario and cell against the start of the run, with one line per storage. A point links to its commit. The quick cells are a subset of the full cells, so a regression gate can compare a quick run with the last ten full runs on the same machine.
+The dashboard is the GitHub Pages site of the results repository, <https://adeweb-be.github.io/zoe-bench-results/>. Its source is [`dashboard/`](dashboard/), and `just bench publish` copies each of its files into the checkout:
 
-The page lives in the results repository, not in this directory.
+| File | Holds |
+| --- | --- |
+| `index.html` | the page: one static page with no build step. It renders the tables and the charts, and loads Chart.js from cdnjs at a pinned version |
+| `data.js` | a plain ES module with no access to the DOM: `load(read)` reads `index.json` of version 2, then each document of the index, and gives the data of the page |
+| `README.md` | the README of the results repository: the layout, `index.json` of version 2 and the page |
+
+The page requests only cdnjs and its own files. A selector of the machine and of the Python build applies to every section. For each family of tables, the page shows the latest document (for B5, the latest of each fixture), and a selector gives the earlier ones:
+
+- **B5.** Each stack with what it turns on, from the summary: the server, the client, the backends of `zoe.plone`, the switches and the merge policy. One table per scenario, with one group of rows per step and one row per stack: the numbers of the step, the verdicts of the verification, and below each number of a stack other than `zeo` its ratio to `zeo` in the same step. For `edit` and `create-spread`, the users against the ok operations per second and against the `ConflictError`s per 1,000 operations.
+- **The native gate.** Each cell and scenario with `ratio`, `low`, `high` and `verdict` as the result holds them, and a dash for a result without them.
+- **The client benchmark.** Each row.
+- **zodbshootout.** For each cell, `ops_per_second`, `p50_seconds` or `p99_seconds` of each scenario against the start of the run, over every run, with one line per storage. A point links to its commit. The quick cells are a subset of the full cells, so a regression gate can compare a quick run with the last ten full runs on the same machine.
+- **The method** of each document: the machine, Python, the software, the commit, and for B5 the fixture with its object counts, the settings and the scenarios; and how to reproduce the results with `just bench showcase` and `just bench publish`.
+
+The page computes no number that a document does not hold, except the ratio of a number of a B5 step to the number of `zeo` in the same step. `bench/shootout/tests/test_dashboard.py` publishes the samples of `bench/shootout/tests/data/publish` and `bench/shootout/tests/data/dashboard` into an empty checkout, runs `data.js` under node, and compares its data with the documents. It also checks the requests and the dark mode of the page. A test cannot live in `dashboard/`, because `publish` copies each file of that directory.
 
 ## The reference machine
 
