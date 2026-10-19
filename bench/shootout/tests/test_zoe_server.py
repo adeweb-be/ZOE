@@ -74,8 +74,8 @@ def test_the_configuration_is_a_zeoclient_of_zoe_serve(tmp_path):
         db = ZODB.config.databaseFromString(text)
         try:
             assert isinstance(db.storage, ClientStorage)
-            # It is zoe serve: get_info says that undo is not supported.
-            assert db.storage.supportsUndo() is False
+            # zoe serve supports undo: its get_info says so.
+            assert db.storage.supportsUndo() is True
             with db.transaction() as connection:
                 connection.root()["value"] = 1
         finally:
