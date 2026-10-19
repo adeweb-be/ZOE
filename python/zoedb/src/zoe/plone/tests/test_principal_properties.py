@@ -96,7 +96,9 @@ class TestPrincipalProperties(unittest.TestCase):
         self.assertIn(MEMBER, [entry["userid"] for entry in found])
         found = self.portal.portal_membership.searchForMembers(name="Member One")
         self.assertIn(MEMBER, [member.getId() for member in found])
-        self.assertEqual(api.group.get(groupname=GROUP).getProperty("title"), "Group One")
+        self.assertEqual(
+            api.group.get(groupname=GROUP).getProperty("title"), "Group One"
+        )
         # plone.restapi and plone.app.users read each property through
         # `getProperty` of the member.
         user = api.user.get(username=MEMBER)

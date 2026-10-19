@@ -32,7 +32,11 @@ def test_the_properties_are_a_mapping_whose_state_is_the_mapping():
     props.update({"isGroup": False})
     assert props.setdefault("login_time", 1) == 1
     del props["email"]
-    assert props.__getstate__() == {"fullname": "One", "isGroup": False, "login_time": 1}
+    assert props.__getstate__() == {
+        "fullname": "One",
+        "isGroup": False,
+        "login_time": 1,
+    }
     # A copy is a plain dict: it is no new record.
     assert type(props.copy()) is dict
     assert props.copy() == props.__getstate__()

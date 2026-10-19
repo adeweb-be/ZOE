@@ -17,9 +17,8 @@ import json
 import transaction
 import zoe.policy
 from Products.CMFCore.interfaces import ISiteRoot
-from zope.component.hooks import setSite
-
 from zoe.plone import properties
+from zope.component.hooks import setSite
 
 moved = {}
 for site in app.objectValues():  # noqa: F821

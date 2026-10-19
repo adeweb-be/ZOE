@@ -245,9 +245,7 @@ def import_properties(context):
         moved = sum(move_properties(sheet) for sheet in sheets(context.getSite()))
         logger.info("moved the properties of %d principals", moved)
     if context.readDataFile(UNINSTALL) is not None:
-        restored = sum(
-            restore_properties(sheet) for sheet in sheets(context.getSite())
-        )
+        restored = sum(restore_properties(sheet) for sheet in sheets(context.getSite()))
         logger.info("restored the properties of %d principals", restored)
 
 
