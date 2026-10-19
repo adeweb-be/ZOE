@@ -19,8 +19,6 @@
     --axis: #c3c2b7;
     --border: rgba(11, 11, 11, 0.12);
     --accent: #1c5cab;
-    --good: #006300;
-    --bad: #b42323;
     --chip: #ecebe6;
     --series-1: #2a78d6;
     --series-2: #eb6834;
@@ -44,8 +42,6 @@
       --axis: #383835;
       --border: rgba(255, 255, 255, 0.12);
       --accent: #86b6ef;
-      --good: #4cc24c;
-      --bad: #f08080;
       --chip: #262624;
       --series-1: #3987e5;
       --series-2: #d95926;
@@ -69,8 +65,6 @@
     --axis: #383835;
     --border: rgba(255, 255, 255, 0.12);
     --accent: #86b6ef;
-    --good: #4cc24c;
-    --bad: #f08080;
     --chip: #262624;
     --series-1: #3987e5;
     --series-2: #d95926;
@@ -155,6 +149,7 @@
   .kv dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
   .kv .kv { font-size: 1em; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 16px; margin-bottom: 16px; }
   figure.card {
     margin: 0; background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; padding: 12px; min-width: 0;
@@ -168,12 +163,12 @@
   }
   table {
     border-collapse: separate; border-spacing: 0; width: 100%;
-    font-size: 0.85rem; font-variant-numeric: tabular-nums;
+    font-size: 0.8rem; font-variant-numeric: tabular-nums;
   }
-  th, td { padding: 6px 10px; border-bottom: 1px solid var(--grid); text-align: right; vertical-align: top; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--grid); text-align: right; vertical-align: top; }
   thead th {
     color: var(--text-2); font-weight: 600; vertical-align: bottom;
-    white-space: normal; min-width: 6.5em; max-width: 9em; line-height: 1.3;
+    white-space: normal; min-width: 3.5em; max-width: 7.5em; line-height: 1.3;
   }
   td { white-space: nowrap; }
   th:first-child, td:first-child, th.text, td.text { text-align: left; }
@@ -195,10 +190,6 @@
     display: inline-block; width: 10px; height: 10px; border-radius: 2px;
     margin-right: 6px; vertical-align: baseline;
   }
-  .tag { font-weight: 600; }
-  .tag.good { color: var(--good); }
-  .tag.bad { color: var(--bad); }
-  .tag.none { color: var(--text-2); }
   .tag + .tag::before { content: ", "; color: var(--text-2); font-weight: 400; }
   .reproduce { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
   .reproduce pre { background: var(--bg); }
@@ -209,7 +200,7 @@
 <main>
   <header>
     <h1>ZOE benchmarks</h1>
-    <p class="lead">The published results of ZOE, the Zope Object Engine, against ZEO 6. Each table shows the numbers of one result document as the document holds them. The results are numbers from a synthetic corpus.</p>
+    <p class="lead">The published results of ZOE, the Zope Object Engine, against ZEO 6. Each table shows the numbers of one result document. The page rounds them to three significant digits, scales their units (seconds to milliseconds, shares to percent) and computes the ratio of each B5 number to zeo; the documents hold the full values. The results are numbers from a synthetic corpus.</p>
     <nav class="toc" aria-label="Sections">
       <a href="#plone">Plone end-to-end</a>
       <a href="#native">Native gate</a>
@@ -229,7 +220,7 @@
 
   <section class="family" id="plone" hidden>
     <h2>Plone end-to-end (B5)</h2>
-    <p class="note">Locust against a Plone 6.1 site: each simulated user waits for its response before its next operation. Each stack runs the same Plone on the same machine. One result per fixture.</p>
+    <p class="note">Locust against a Plone site: each simulated user waits for its response before its next operation. Each stack runs the same Plone on the same machine. One result per fixture.</p>
     <div id="plone-body"></div>
   </section>
 
@@ -300,7 +291,7 @@ const B5 = {
   p50_seconds: ["p50 (ms)", 1000],
   p95_seconds: ["p95 (ms)", 1000],
   p99_seconds: ["p99 (ms)", 1000],
-  conflicts_per_1000_ops: ["ConflictErrors / 1,000 ops", 1],
+  conflicts_per_1000_ops: ["Conflict|Errors / 1,000 ops", 1],
   first_attempt_share: ["first-attempt successes (%)", 100],
   exhausted: ["exhausted retries", 1],
   zope_cpu_ms_per_op: ["Zope CPU (ms / op)", 1],
@@ -400,13 +391,17 @@ function swatch(name) {
 function stackName(name) {
   return [swatch(name), h("code", {}, name)];
 }
+// A header. A | in the label marks a place where the line can break.
+function header(label, props = {}) {
+  const parts = label.split("|");
+  return h("th", { scope: "col", ...props }, parts.flatMap((part, at) => (at ? [h("wbr"), part] : [part])));
+}
 function wrap(table) {
   return h("div", { class: "table-wrap" }, table);
 }
+// A verdict is plain text.
 function verdictTag(verdict) {
-  if (verdict === null || verdict === undefined) return h("span", { class: "tag none" }, DASH);
-  const kind = verdict === "pass" ? "good" : verdict === "undecided" ? "none" : "bad";
-  return h("span", { class: `tag ${kind}` }, verdict);
+  return h("span", { class: "tag" }, verdict ?? DASH);
 }
 
 // A value of a method block: a list of keys and values, nested for an
@@ -435,9 +430,9 @@ function kv(object, special = {}) {
 }
 
 // Charts. A chart is made after its canvas is in the page.
-function chartCard(title, label, config) {
+function chartCard(title, label, config, fallback) {
   const canvas = h("canvas", { role: "img", "aria-label": label });
-  state.pending.push([canvas, config]);
+  state.pending.push([canvas, config, fallback]);
   return h("figure", { class: "card" }, h("figcaption", {}, title), h("div", { class: "chart" }, canvas));
 }
 function flush() {
@@ -447,10 +442,10 @@ function flush() {
     return false;
   });
   const pending = state.pending.splice(0);
-  for (const [canvas, config] of pending) {
+  for (const [canvas, config, fallback] of pending) {
     if (!canvas.isConnected) continue;
     if (typeof Chart === "undefined") {
-      canvas.replaceWith(h("p", { class: "note" }, "The chart library did not load. The tables hold the same numbers."));
+      canvas.replaceWith(h("p", { class: "note" }, `The chart library did not load. ${fallback}`));
       continue;
     }
     state.charts.push(new Chart(canvas, config));
@@ -513,9 +508,10 @@ function empty(family) {
 }
 function runLine(document) {
   const run = document.method.run ?? {};
+  const plone = document.family === "plone" ? `Plone ${document.method.software?.Plone ?? DASH} on ` : "";
   return h("p", { class: "meta" },
     "Machine ", h("strong", {}, document.machine),
-    ` · ${pythonName(document.method.python)} · commit `, commitLink(run.commit),
+    ` · ${plone}${pythonName(document.method.python)} · commit `, commitLink(run.commit),
     ` · started ${when(run.started)}`);
 }
 function methodBlock(document) {
@@ -608,20 +604,22 @@ function usersChart(document, scenario, metric) {
         },
       },
     }),
-  });
+  }, "The tables below hold the same numbers.");
 }
-function b5Cell(row, column) {
+function b5Cell(row, column, base) {
   const scale = B5[column][1];
   const value = row.values[column];
   let text = num(value, scale);
-  if (column === "p99_seconds" && row.p99_reliable === false && value !== null) text = `~${text}`;
+  const rough = column === "p99_seconds" && value !== null;
+  if (rough && row.p99_reliable === false) text = `~${text}`;
   const cell = h("td", {}, h("span", {}, text));
   const range = row.range ?? {};
   if (column === "ok_per_second" && range.min !== null && range.max !== null && range.min !== range.max) {
     cell.append(h("span", { class: "sub" }, `${num(range.min)}–${num(range.max)}`));
   }
   if (row.stack !== BASELINE && row.ratios[column] !== null) {
-    cell.append(h("span", { class: "sub ratio" }, `×${ratioText(row.ratios[column])}`));
+    const mark = rough && (row.p99_reliable === false || base?.p99_reliable === false) ? "~" : "";
+    cell.append(h("span", { class: "sub ratio" }, `${mark}×${ratioText(row.ratios[column])}`));
   }
   return cell;
 }
@@ -630,15 +628,18 @@ function scenarioTable(document, scenario) {
   if (!tables.length) return null;
   const head = h("thead", {}, h("tr", {},
     h("th", { scope: "col" }, "stack"),
-    COLUMNS.map((column) => h("th", { scope: "col" }, B5[column][0])),
-    h("th", { scope: "col" }, "verification")));
-  const bodies = tables.map((table) => h("tbody", {},
-    h("tr", { class: "group-row" }, h("th", { scope: "rowgroup", colspan: COLUMNS.length + 2 },
-      h("span", {}, `${table.users} users · step ${table.step}`))),
-    table.rows.map((row) => h("tr", {},
-      h("th", { scope: "row" }, stackName(row.stack)),
-      COLUMNS.map((column) => b5Cell(row, column)),
-      h("td", {}, row.verification.length ? row.verification.map(verdictTag) : DASH)))));
+    header("verification", { class: "text" }),
+    COLUMNS.map((column) => header(B5[column][0]))));
+  const bodies = tables.map((table) => {
+    const base = table.rows.find((row) => row.stack === BASELINE);
+    return h("tbody", {},
+      h("tr", { class: "group-row" }, h("th", { scope: "rowgroup", colspan: COLUMNS.length + 2 },
+        h("span", {}, `${table.users} ${table.users === 1 ? "user" : "users"} · step ${table.step}`))),
+      table.rows.map((row) => h("tr", {},
+        h("th", { scope: "row" }, stackName(row.stack)),
+        h("td", { class: "text" }, row.verification.length ? row.verification.map(verdictTag) : DASH),
+        COLUMNS.map((column) => b5Cell(row, column, base)))));
+  });
   return h("section", {},
     h("h4", {}, h("code", {}, scenario.name)),
     scenario.description ? h("p", { class: "desc" }, scenario.description) : null,
@@ -657,14 +658,15 @@ function ploneDocument(document) {
     stackList(method.stacks ?? []),
     curves.length
       ? [h("h4", {}, "Users against the rate and the conflicts"),
-        h("div", { class: "grid" }, curves.flatMap((scenario) => [
+        curves.map((scenario) => h("div", { class: "pair" },
           usersChart(document, scenario, "ok_per_second"),
-          usersChart(document, scenario, "conflicts_per_1000_ops"),
-        ]))]
+          usersChart(document, scenario, "conflicts_per_1000_ops")))]
       : null,
     h("p", { class: "note" },
       "One table per scenario, one group of rows per step. ok operations / s is the median of the repetitions, with their range below it when they differ. ",
-      "Below each number of a stack other than zeo: its ratio to the number of zeo in the same step. ~ marks a p99 of fewer than 200 operations."),
+      "Below each number of a stack other than zeo: its ratio, the number of the stack divided by the number of zeo in the same step. ",
+      "For ok operations / s and first-attempt successes, a larger number is better; for latency, ConflictErrors, exhausted retries, CPU and store KB written, a smaller number is better. ",
+      "The objects loaded and stored per second show the work of the storage. ~ marks a p99 of fewer than 200 operations, and a ratio of such a p99."),
     (method.scenarios ?? []).map((scenario) => scenarioTable(document, scenario)),
     methodBlock(document));
 }
@@ -704,9 +706,9 @@ function nativeDocument(document) {
   return h("div", {},
     runLine(document),
     h("p", { class: "note" },
-      "The ratio is the geometric mean of t(zeo) / t(zoe-native) over the pairs of a scenario: above 1, zoe-native is faster. ",
+      "The ratio is the time of zeo divided by the time of zoe-native for the same work, as the geometric mean over the pairs of a scenario: above 1, zoe-native is faster; below 1, zeo is faster. ",
       `low and high bound its interval at the level of the rule (${num(rule.level, 100)} %). `,
-      `A scenario passes when low is above 1 after at least ${num(rule.min_pairs)} pairs, and fails when high is below 1; else it is undecided. `,
+      `With at least ${num(rule.min_pairs)} pairs, a scenario passes when low is above 1 and fails when high is below 1; else it is undecided. `,
       "These are the numbers of the document. A dash marks a number that the document does not hold."),
     document.cells.length ? wrap(h("table", {}, head, bodies)) : h("div", { class: "empty" }, "This result holds no cell."),
     methodBlock(document));
@@ -754,11 +756,38 @@ function renderClient(machine, python) {
     : [empty("client")]));
 }
 
-// A tick of a time axis: the date, and the hour when the axis spans less
-// than four days.
-function timeTick(value) {
-  const stamp = when(new Date(value).toISOString());
-  return this.max - this.min < 4 * 86400000 ? stamp.slice(5, 16) : stamp.slice(0, 10);
+const HOUR = 3600000;
+const DAY = 24 * HOUR;
+// The steps of a time axis, from an hour to a year.
+const TIME_STEPS = [HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY, 91 * DAY, 182 * DAY, 364 * DAY];
+// A time axis in UTC. Its ticks fall on whole steps of the list above, at
+// most five. A tick shows the hour when the step is shorter than a day.
+function timeAxis() {
+  let step = DAY;
+  const label = (value) => {
+    const stamp = when(new Date(value).toISOString());
+    return step < DAY ? stamp.slice(5, 16) : stamp.slice(0, 10);
+  };
+  return {
+    title: "start of the run (UTC)",
+    options: {
+      bounds: "data",
+      afterDataLimits(scale) {
+        const span = scale.max - scale.min;
+        step = TIME_STEPS.find((candidate) => span / candidate <= 4) ?? TIME_STEPS.at(-1);
+        scale.min -= step / 2;
+        scale.max += step / 2;
+      },
+      afterBuildTicks(scale) {
+        const ticks = [];
+        for (let value = Math.ceil(scale.min / step) * step; value <= scale.max; value += step) {
+          ticks.push({ value });
+        }
+        scale.ticks = ticks;
+      },
+    },
+    ticks: { maxRotation: 0, callback: label },
+  };
 }
 function cellKey(chart) {
   return JSON.stringify([chart.mode, chart.concurrency, chart.object_size]);
@@ -808,7 +837,7 @@ function renderShootout(machine, python) {
       type: "line",
       data: { datasets },
       options: chartOptions({
-        x: { ticks: { maxTicksLimit: 4, callback: timeTick } },
+        x: timeAxis(),
         yTitle: metricLabel,
         yScale: scale,
         interaction: { mode: "nearest", intersect: true },
@@ -825,7 +854,7 @@ function renderShootout(machine, python) {
           if (point.commit) window.open(COMMIT_URL + point.commit, "_blank", "noopener");
         },
       }),
-    });
+    }, "The table below holds only the latest run of each storage.");
   });
 
   // The table view: the last run of each storage.

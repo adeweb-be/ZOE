@@ -54,10 +54,12 @@ const METHOD = {
 
 export async function load(read) {
   const index = await read("index.json");
-  // An index of version 1 has no family: its documents are of zodbshootout.
+  // An entry of an index of version 1 has no family and no stacks: its
+  // document is of zodbshootout, and its storage is its stack.
   const entries = (index.results ?? []).map((entry) => ({
     ...entry,
     family: entry.family ?? "shootout",
+    stacks: entry.stacks ?? (entry.storage === undefined ? [] : [entry.storage]),
   }));
   const sources = await Promise.all(entries.map((entry) => read(entry.path)));
   const documents = entries.map((entry, at) => describe(entry, sources[at]));
