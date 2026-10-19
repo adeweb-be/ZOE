@@ -215,6 +215,16 @@ def run(options: RunOptions) -> Path:
             result["merge_policy"] = json.loads(out.strip().splitlines()[-1])
             result["policy_seconds"] = time.time() - written
             t0 += result["policy_seconds"]
+        if config.member_properties:
+            # The move commits before the instances start, as the switches
+            # do.
+            written = time.time()
+            out = st.run_script("member_properties.py", name="properties")
+            lines = out.strip().splitlines()
+            result["member_properties"] = json.loads(lines[-2])
+            result["merge_policy"] = json.loads(lines[-1])
+            result["properties_seconds"] = time.time() - written
+            t0 += result["properties_seconds"]
         sample.start()
         st.start_instances()
         for name, process in st.processes.items():

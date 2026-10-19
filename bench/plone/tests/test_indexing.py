@@ -2,6 +2,7 @@
 the report of the indexer."""
 
 import json
+from pathlib import Path
 
 from plonebench import report, runner, stack
 
@@ -21,6 +22,19 @@ def test_the_stack_installs_the_backend():
     assert config.backends == "indexing"
     assert config.server == "zoe"
     assert config.native is True
+
+
+def test_the_stack_with_both_backends_moves_the_member_properties():
+    config = stack.STACKS["zoe-native-qi-kv"]
+    assert config.backends.split(",") == ["indexing", "locking"]
+    assert config.member_properties is True
+    assert (config.server, config.section, config.native) == ("zoe", "zoeclient", True)
+    conf = stack.zope_conf(config, stack.Settings(), Path("/home"), "instance0")
+    assert "ZOE_PLONE_BACKENDS indexing,locking" in conf
+    # No other stack moves the properties.
+    others = [name for name, other in stack.STACKS.items() if other.member_properties]
+    assert others == ["zoe-native-qi-kv"]
+    assert "zoe-native-qi-kv" in report.STACK_ORDER
 
 
 def test_the_runner_waits_for_an_empty_queue(tmp_path, monkeypatch):

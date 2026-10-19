@@ -1,1 +1,1 @@
-This file marks the profile zoe.plone:uninstall for its import step zoe.plone.uninstall.
+This file marks the profile zoe.plone:uninstall for its import steps zoe.plone.uninstall and zoe.plone.properties.

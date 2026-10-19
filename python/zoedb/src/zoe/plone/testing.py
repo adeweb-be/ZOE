@@ -12,7 +12,8 @@ stack does not change, so the suites run unchanged.
 
 `ZOE_PLONE_BACKENDS` names the backends of `zoe.plone` that the suites run
 on, separated by commas: `locking`, `indexing` or `registry`. `install`
-installs them, and the guard of a stock registry (ADR 0050), which an
+installs them, the guard of a stock registry (ADR 0050) and the patch of
+the mutable property sheet of PlonePAS (ADR 0046, section 9), which an
 instance installs through `configure.zcml`.
 The suites of Plone run without `indexing`: they search the catalog right
 after a change, in the same transaction. The tests of queued indexing
@@ -115,12 +116,14 @@ def install(zeo=None):
     as `host:port`, it is a ZEO client of the `zoe serve` at that address
     (`ZOE_SERVE`). Return the layer.
     """
-    from zoe.plone import backends_from_environment, registry
+    from zoe.plone import backends_from_environment, properties, registry
 
     backends_from_environment()
     # plone.app.testing loads no ZCML of zoe.plone, so the layer installs
-    # the guard of a stock registry, as configure.zcml does in an instance.
+    # the guard of a stock registry and the patch of the mutable property
+    # sheet, as configure.zcml does in an instance.
     registry.install_guard()
+    properties.install()
     if zeo is None:
         layer = ZOE_STORAGE
     else:

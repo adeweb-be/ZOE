@@ -21,6 +21,7 @@ STACK_ORDER = [
     "zoe-native",
     "zoe-native-kv",
     "zoe-native-qi",
+    "zoe-native-qi-kv",
     "zoe-asyncio",
     "zoe-stock",
 ]

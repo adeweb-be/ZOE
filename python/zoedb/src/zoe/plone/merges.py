@@ -18,7 +18,8 @@ Dexterity type, by the name that its records give it
   object both change it; every other field takes `strict`.
 
 A class that several types use takes the groups of all of them. The policy
-also holds the entry of `zoe.plone.history.WorkflowHistory`.
+also holds the entries of `zoe.plone.history.WorkflowHistory` and of
+`zoe.plone.properties.PrincipalProperties`, both on.
 
 The import step `import_merge_policy` runs for each profile that holds the
 file `zoe-merge-policy.json`, the overrides of that profile. The site keeps
@@ -105,7 +106,7 @@ import os
 import types
 
 from zoe import policy as merge_policy
-from zoe.plone import history
+from zoe.plone import history, properties
 
 __all__ = [
     "DEFAULT_MODE",
@@ -563,7 +564,13 @@ def update_policy(site):
     blocked = {
         name for name, entry in derived["classes"].items() if entry.get("blocked")
     }
-    policy = {"classes": {**derived["classes"], **history.policy()["classes"]}}
+    policy = {
+        "classes": {
+            **derived["classes"],
+            **history.policy()["classes"],
+            **properties.policy()["classes"],
+        }
+    }
     removed = set()
     for profile, overrides in (site_overrides(site) or {}).items():
         overrides = profile_overrides(profile, overrides, names, blocked)
