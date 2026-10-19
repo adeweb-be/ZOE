@@ -81,7 +81,8 @@
       "properties": {
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
         "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
-        "seconds": { "description": "The wall time of the run.", "type": "number", "minimum": 0 }
+        "seconds": { "description": "The wall time of the run.", "type": "number", "minimum": 0 },
+        "dirty": { "description": "True when the tree of the harness held changes that the commit does not; false when it held none; null when git fails. Optional: results without it stay valid, but only false is publishable (ADR 0054).", "type": ["boolean", "null"] }
       }
     },
     "rule": {
@@ -151,7 +152,11 @@
                       }
                     }
                   }
-                }
+                },
+                "ratio": { "description": "The geometric mean of the ratios t_zeo / t_zoe of the pairs, as the rule gives it; null when it is not finite. Optional: results without it stay valid.", "type": ["number", "null"] },
+                "low": { "description": "The low bound of the interval of the rule at its level; null when it is not finite. Optional.", "type": ["number", "null"] },
+                "high": { "description": "The high bound of the interval of the rule at its level; null when it is not finite, as with fewer than 2 pairs. Optional.", "type": ["number", "null"] },
+                "verdict": { "description": "pass when the low bound is above 1, fail when the high bound is below 1, after at least min_pairs pairs; null when the scenario is undecided. Optional.", "enum": ["pass", "fail", null] }
               }
             }
           }

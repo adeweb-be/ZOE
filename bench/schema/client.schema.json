@@ -86,7 +86,8 @@
         "started": { "description": "When the run started, in UTC.", "type": "string", "format": "date-time" },
         "commit": { "description": "The ZOE commit of the harness, or null when it is not known.", "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
         "objects": { "description": "The objects that each worker loads in a cold or warm round.", "type": "integer", "minimum": 1 },
-        "commits": { "description": "The commits of 100 records that each worker makes in a commit round. Optional: results without it stay valid.", "type": "integer", "minimum": 1 }
+        "commits": { "description": "The commits of 100 records that each worker makes in a commit round. Optional: results without it stay valid.", "type": "integer", "minimum": 1 },
+        "dirty": { "description": "True when the tree of the harness held changes that the commit does not; false when it held none; null when git fails. Optional: results without it stay valid, but only false is publishable (ADR 0054).", "type": ["boolean", "null"] }
       }
     },
     "rows": {

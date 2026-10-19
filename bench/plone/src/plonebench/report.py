@@ -82,6 +82,15 @@ def cpu_per_op(step: dict, names) -> float | None:
     return total / ok if ok else None
 
 
+def _per_second(step: dict, calls: str) -> float | None:
+    """The storage calls that the probe counts for the operations of a
+    step, over the seconds of the step. None without the probe."""
+    count = step["all"]["server"].get(calls)
+    if count is None or not step["seconds"]:
+        return None
+    return count / step["seconds"]
+
+
 def summarize(results: list[dict]) -> dict:
     groups = defaultdict(list)
     for result in results:
@@ -121,6 +130,7 @@ def summarize(results: list[dict]) -> dict:
             entry = {
                 "step": index,
                 "users": users,
+                "seconds": _median([s["seconds"] for s in per]),
                 "repetitions": len(per),
                 "operations": ops,
                 "ok_per_second": {
@@ -199,6 +209,12 @@ def summarize(results: list[dict]) -> dict:
                 ),
                 "zope_busy": _median(
                     [sum(s.get("zope_busy", {}).values()) for s in per]
+                ),
+                "objects_loaded_per_second": _median(
+                    [_per_second(s, "loads") for s in per]
+                ),
+                "objects_stored_per_second": _median(
+                    [_per_second(s, "stores") for s in per]
                 ),
                 "conflict_classes": _merge(
                     [s["all"]["server"]["conflict_classes"] for s in per]

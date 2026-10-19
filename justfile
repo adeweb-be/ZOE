@@ -581,6 +581,11 @@ plone scenario="zoe" command="start" *args:
 # and `native` build `zoe` in release for the storages zoe-server and
 # zoe-native, unless ZOE_BINARY names a binary.
 # `just bench test FILE...` runs only the tests of those files.
+# `just bench index DIR` rewrites index.json of version 2 of a results
+# tree, and `just bench publish [--main REF] SRC... CHECKOUT` copies the
+# result documents of every family into a checkout of the results
+# repository (ADR 0054). It refuses what is not publishable, never commits
+# and never pushes. Neither builds anything.
 # `just bench client` runs the client benchmark: ZEO.ClientStorage against
 # the native client, through the storage API, against zoe serve and a ZEO
 # server. It writes target/bench/client/<started>.json and prints the

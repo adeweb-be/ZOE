@@ -55,4 +55,4 @@ One record per decision taken in the specification, numbered. Each record gives 
 | [0049](0049-the-split-merge-keeps-the-bucket.md) | The split merge keeps the bucket of the committed side: rule 3 writes into it, and a declared client invalidates it (accepted) |
 | [0050](0050-the-registry-backend.md) | The registry backend: a moved registry keeps its records in a durable namespace of its own (accepted) |
 | [0052](0052-the-order-of-a-folder-merges-at-the-vote.md) | The order of a folder of plone.folder merges at the vote: the order list and its positions change together (accepted) |
-| [0054](0054-one-published-format-for-every-benchmark.md) | One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish` (proposed) |
+| [0054](0054-one-published-format-for-every-benchmark.md) | One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish` |

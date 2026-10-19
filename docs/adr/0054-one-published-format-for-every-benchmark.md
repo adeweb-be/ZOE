@@ -1,6 +1,6 @@
 # 0054. One published format for every benchmark: one layout, the index of version 2, the B5 summary and `just bench publish`
 
-Status: proposed. The planner of ZOE-243 wrote it from the decisions of the human on the card. The human confirms it, with an answer to each question at its end. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository.
+Status: accepted. The planner of ZOE-243 wrote it from the decisions of the human on the card. The human accepted it with the recommendation of each of its three questions, which section 7 records as decisions. It changes no on-disk format, no wire protocol and no public Python API. It changes the output of `just bench plone report --json` and the layout of the results repository.
 
 ## Context
 
@@ -25,6 +25,8 @@ The decisions of the human, on the card:
 - The page shows every result as plain tables, with no headline section (ZOE-245).
 - On B5, ZOE is the stack `zoe-native-qi-kv`, labelled with what it turns on, beside `zeo`.
 - Nothing goes to the public repository without the approval of the human of that push.
+- The three questions of the planner, in section 7.
+- The result of the native gate holds the outcome of each scenario of each cell, so the dashboard computes nothing (section 8).
 
 ## Decision
 
@@ -90,10 +92,12 @@ A document is publishable when each of these holds:
 
 1. It is JSON, of a known family, and valid against the schema of its family.
 2. It is not a quick run: for `shootout`, `run.quick` is false and `run.set` is not `quick`. The other families have no quick set.
-3. `run.commit` is not null, and it is on the branch REF: `git merge-base --is-ancestor COMMIT REF` succeeds in the ZOE repository of the harness. REF is `origin/main`, unless `--main` gives another.
-4. `run.dirty` is false. True is a run of a dirty tree. An absent key or null is no record of a clean tree.
+3. `run.commit` is not null, and it is on the branch REF: `git merge-base --is-ancestor COMMIT REF` succeeds in the ZOE repository of the harness. REF is `origin/main`, unless `--main` gives another (section 7, decision 3).
+4. `run.dirty` is false. True is a run of a dirty tree. An absent key or null is no record of a clean tree (section 7, decision 1).
 5. For `plone`: the verification of each run of `runs` is `pass`.
-6. Its path in the checkout is free or holds the same bytes, and no other document of the same publish goes to that path with other bytes.
+6. Its path in the checkout is free or holds the same bytes, and no other document of the same publish goes to that path with other bytes. Each part of the path is a name: a letter or a digit, then letters, digits, `.`, `_` or `-`. So a document never writes outside `results/` of the checkout.
+
+A document holds the cells, the rows or the steps that its run made: a run of a part of the native gate (`--cell`, `--scenario`), or a client run with other `--objects`, is publishable as it is (section 7, decision 2).
 
 So that rule 4 has evidence, the harness of zodbshootout, the native gate and the client benchmark record `run.dirty` as B5 and the replay do: true when `git status --porcelain --untracked-files=no` lists a change, false when it lists none, null when git fails. The three schemas get `run.dirty` as an optional key of type boolean or null. So each document that validates today stays valid.
 
@@ -122,7 +126,7 @@ It writes nothing outside CHECKOUT. It never runs git in CHECKOUT, never commits
 | --- | --- |
 | 0 | every document is in CHECKOUT, and `index.json` is of version 2 |
 | 1 | a document is not publishable; CHECKOUT is unchanged, byte for byte |
-| 2 | a usage error: CHECKOUT is not a directory, a SRC does not exist or holds no document, or argparse refuses the arguments; CHECKOUT is unchanged |
+| 2 | a usage error: CHECKOUT is not a directory, a SRC does not exist or holds no document, REF is not a commit, or argparse refuses the arguments; CHECKOUT is unchanged |
 
 A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, where SRC is the path of the document as the command line gave it, or the path of the file in a directory SRC. The last line is `publish: refused N of M documents; nothing changed in CHECKOUT`.
 
@@ -133,9 +137,9 @@ A refusal prints one line on stderr for each reason, `publish: SRC: REASON`, whe
 | 3 | `no commit`; `commit COMMIT12 is not on REF` |
 | 4 | `a run of a dirty tree`; `no record of a clean tree` |
 | 5 | `the verification of run RUN is VERDICT`, for each run that did not pass |
-| 6 | `PATH exists in CHECKOUT with other content`; `another document goes to PATH` |
+| 6 | `PATH exists in CHECKOUT with other content`; `another document goes to PATH`; `its path in the layout holds a part that is not a name` |
 
-A usage error prints `publish: CHECKOUT is not a directory`, `publish: SRC does not exist` or `publish: SRC holds no document`, with the path.
+A usage error prints `publish: CHECKOUT is not a directory`, `publish: SRC does not exist`, `publish: SRC holds no document` or `publish: REF is not a commit of the ZOE repository`, with the path or the name. REF that git cannot read is a usage error, so that a missing `origin/main` does not read as a commit that is not on it.
 
 ### 6. The B5 summary
 
@@ -146,8 +150,8 @@ Every object of the schema has `additionalProperties: false`, except the maps: `
 | Key | Holds |
 | --- | --- |
 | `schema_version` | 1 |
-| `machine` | `name`: the name that the runs recorded, else `ZOE_BENCH_MACHINE`, else the CPU model as a slug, as the harness of zodbshootout does; `cpu`; `logical_cpus`; `memory_bytes` (or null); `os`; `kernel`; `core_kinds` (or null); `cpu_pinning`; `durability` (a text for each server); `store_disk`: `rotational` and `filesystem`, each or null |
-| `python` | the interpreter of the Plone instances: `implementation` (`cpython` when the runs did not record it), `version`, `free_threaded`, `gil_enabled` (or null) |
+| `machine` | `name`: the name that the runs recorded (a run records `ZOE_BENCH_MACHINE` when it is set), else `ZOE_BENCH_MACHINE` of the report, else the CPU model of the runs as a slug, as the harness of zodbshootout does; `cpu`; `logical_cpus`; `memory_bytes` (or null); `os`; `kernel`; `core_kinds` (or null); `cpu_pinning`; `durability` (a text for each server); `store_disk`: `rotational` and `filesystem`, each or null |
+| `python` | the interpreter of the Plone instances: `implementation` (a run records it; `cpython` when the runs did not record it), `version`, `free_threaded`, `gil_enabled` (or null) |
 | `software` | a version for each name: the eggs of the runs, `zoedb`, `zoe` and `locust`. A version that the runs did not record is absent. `Plone`, `ZODB` and `ZEO` are required |
 | `run` | `started`: the first start of the runs, `YYYY-MM-DDTHH:MM:SSZ`; `commit` (or null); `dirty`: true when a run had a dirty tree, null when a run has no record, else false |
 | `fixture` | `name`; `preset`: `small`, `medium` or `large` when the spec of the fixture equals the spec of that preset, else `custom`; `objects` and `catalog_entries` from the equivalence of the fixture; `spec`: the `SiteSpec`, numbers and lists of numbers |
@@ -159,10 +163,28 @@ Every object of the schema has `additionalProperties: false`, except the maps: `
 
 Each number of `steps` is the number that `report` prints, in the unit of its name. `objects_loaded_per_second` is the median, over the repetitions, of the `loadBefore` calls that the probe counts for the operations of the step (`loads` of `all.server` of the step), divided by the seconds of the step. `objects_stored_per_second` is the same for `stores`. A run without the numbers of its steps, such as a run that failed, is in `runs` and has no row in `steps`.
 
+### 7. The decisions of the human on the questions of the planner
+
+1. **A document with no record of its tree is refused.** A run in the container of CI has no `.git`, so it records `dirty` as null, and `publish` refuses it. A publication from CI gets a card of its own. The alternative, to accept null when `ZOE_BENCH_COMMIT` names the commit, as CI sets it, is refused.
+2. **A part of the native gate is publishable.** A run with `--cell` or `--scenario`, or a client run with other `--objects`, holds fewer cells or rows, and its document shows them. `publish` takes it as it is. The alternative, to refuse a native run without the 30 cells of the gate set, is refused.
+3. **The commit of main is a check with git.** `publish` runs `git merge-base --is-ancestor` against `origin/main`, and `--main REF` names another branch. The alternative, no check and a check of the commit by the human before the push, is refused.
+
+### 8. The outcome of a scenario of the native gate
+
+A decision of the human, on ZOE-245: each scenario entry of a cell of a result of the native gate holds its outcome, beside its pairs. So a reader of the result, such as the dashboard, does not apply the rule again.
+
+| Key | Holds |
+| --- | --- |
+| `ratio` | the geometric mean of the ratios `t_zeo / t_zoe` of the pairs, as `shootout.native.decide` gives it |
+| `low`, `high` | the bounds of its interval at the level of the rule, as `decide` gives them |
+| `verdict` | `pass`, `fail`, or null when the scenario is undecided |
+
+A value that is not finite is null: `high` with fewer than 2 pairs, for example. `just bench native` writes the four keys with the rule of the run. They are optional in `native.schema.json`, so a result without them stays valid. `just bench native report` applies the rule of the result to the pairs again, and its verdict agrees with the keys.
+
 ## Consequences
 
 - One command fills a checkout of the results repository with every family. The human reviews the change of the checkout, then commits and pushes it.
-- A document of today, without `run.dirty`, stays valid but is not publishable. A run in the container of the Dagger function `bench`, which has no `.git`, records `dirty` as null, so it is not publishable either (question 1).
+- A document of today, without `run.dirty`, stays valid but is not publishable. A run in the container of the Dagger function `bench`, which has no `.git`, records `dirty` as null, so it is not publishable either (section 7, decision 1). A B5 run records `dirty` as null when git fails, as the other harnesses do.
 - `publish` needs git and the history of REF in the ZOE repository. On a card branch, `--main HEAD` accepts the runs of the branch; ZOE-244 checks its tree that way.
 - The tree of the harness of zodbshootout, `just bench gate` and the Dagger function `bench` do not change.
 - `report --json` writes the document of section 6 in place of the internal summary.
@@ -178,8 +200,3 @@ Each number of `steps` is the number that `report` prints, in the unit of its na
 - **Know the family from the path of SRC, or from the first schema that validates.** A document can be anywhere, and a document that no schema validates then has no reason to give.
 - **Accept a document with no record of its tree.** A run of a dirty tree then passes for a clean one.
 
-## Questions for the human
-
-1. **A document with no record of its tree is refused.** A run in the container of CI has no `.git`, so it records `dirty` as null. Recommendation: refuse it; a publication from CI gets a card of its own. Alternative: accept null when `ZOE_BENCH_COMMIT` names the commit, as CI sets it.
-2. **A part of the native gate is publishable.** A run with `--cell` or `--scenario`, or a client run with other `--objects`, holds fewer cells or rows, and its document shows them. Recommendation: publish it as it is. Alternative: refuse a native run without the 30 cells of the gate set.
-3. **The commit of main is a check with git.** `publish` runs `git merge-base --is-ancestor` against `origin/main`, and `--main REF` names another branch. Recommendation: yes. Alternative: no check, and the human checks the commit before the push.

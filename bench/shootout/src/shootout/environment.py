@@ -81,6 +81,23 @@ def commit() -> str | None:
     return out.stdout.strip() or None
 
 
+def dirty() -> bool | None:
+    """Return true when the tree of the harness holds changes that its
+    commit does not, false when it holds none, and None when git fails, as
+    in a tree with no .git."""
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=Path(__file__).parent,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(out.stdout.strip())
+
+
 def _cpu_model() -> str:
     try:
         cpuinfo = Path("/proc/cpuinfo").read_text()
