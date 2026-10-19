@@ -131,12 +131,19 @@ def cgroup_limits() -> dict:
 
 def eggs() -> dict[str, str]:
     """The versions of the eggs that the buildout scenarios share."""
-    versions = {}
+    found: dict[str, set[str]] = {}
     for path in stack.egg_paths("*.egg"):
         match = re.match(r"^(.+?)-([^-]+)-py", path.name)
         if match and match.group(1) in EGGS:
-            versions[match.group(1)] = match.group(2)
-    return dict(sorted(versions.items()))
+            found.setdefault(match.group(1), set()).add(match.group(2))
+    # The eggs directory can hold two versions of one egg. Take the
+    # highest, so the record does not depend on the order of the files.
+    return {name: max(found[name], key=_version_key) for name in sorted(found)}
+
+
+def _version_key(version: str) -> tuple:
+    """Order versions by their numbers, then by their text."""
+    return [int(number) for number in re.findall(r"\d+", version)], version
 
 
 def zoedb_version() -> str | None:
@@ -170,7 +177,15 @@ def git(*args: str) -> str | None:
 
 def dirty() -> bool | None:
     """True when the tree holds changes that the commit does not, false
-    when it holds none, None when git fails."""
+    when it holds none, None when git fails. None also when
+    ZOE_BENCH_COMMIT names another commit than the tree: the tree is then
+    no record of that commit."""
+    head = git("rev-parse", "HEAD")
+    if not head:
+        return None
+    named = os.environ.get("ZOE_BENCH_COMMIT")
+    if named and not head.startswith(named.lower()):
+        return None
     try:
         out = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=no"],

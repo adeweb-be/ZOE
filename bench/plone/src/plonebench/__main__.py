@@ -260,8 +260,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeline:
             print(report_module.timeline(args.runs, args.timeline))
             return 0
+        text, _ = report_module.build(args.runs)
+        if args.out:
+            args.out.write_text(text)
+        else:
+            print(text)
         if args.json:
-            # Make the summary first, so a refusal writes no file.
+            # A refusal of the summary writes no summary. The Markdown report
+            # stays.
             from plonebench import summary
 
             try:
@@ -276,12 +282,6 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        text, _ = report_module.build(args.runs)
-        if args.out:
-            args.out.write_text(text)
-        else:
-            print(text)
-        if args.json:
             args.json.write_text(json.dumps(document, indent=2) + "\n")
         return 0
     if args.command == "serve":
