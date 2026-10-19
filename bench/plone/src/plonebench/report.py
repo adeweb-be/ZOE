@@ -351,7 +351,13 @@ def build(runs: list[Path]) -> tuple[str, dict]:
         first = results[0]
         lines += [
             f"- Runs: {len(results)}; commit {env.get('commit', '?')[:12]}"
-            + (" (dirty tree)" if env.get("dirty") else ""),
+            + (
+                " (dirty tree)"
+                if env.get("dirty")
+                else " (tree unknown)"
+                if env.get("dirty") is None
+                else ""
+            ),
             f"- Machine: {env['machine']['cpu']}, "
             f"{env['machine']['logical_cpus']} logical CPUs, "
             f"{(env['machine']['memory_bytes'] or 0) / 2**30:.0f} GiB, kernel "

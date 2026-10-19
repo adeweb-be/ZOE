@@ -2,7 +2,7 @@
 that `just bench publish` copies into the results repository (ADR 0054).
 
 One document holds the runs of one fixture, at one commit, on one machine,
-with one set of settings. It validates against
+with one Python of the instances and one set of settings. It validates against
 bench/schema/plone.schema.json. It holds no host name, user name, path or
 password: it takes only the keys below from each `result.json`.
 """
@@ -49,7 +49,8 @@ RUN_SETTINGS = (
 
 
 class NotOneCampaign(Exception):
-    """The runs do not share one fixture, commit, machine or settings."""
+    """The runs do not share one fixture, commit, machine, Python or
+    settings."""
 
 
 def document(results: list[dict]) -> dict:
@@ -63,6 +64,7 @@ def document(results: list[dict]) -> dict:
     fixture = _shared(results, "fixture", lambda r: r["fixture"]["name"])
     commit = _shared(results, "commit", lambda r: r["environment"].get("commit"))
     machine = _shared(results, "machine", _machine_name)
+    _shared(results, "python", _python_build)
     settings = {
         key: _shared(results, f"settings.{key}", lambda r, key=key: _settings(r)[key])
         for key in STACK_SETTINGS + RUN_SETTINGS
@@ -119,6 +121,17 @@ def _machine_name(result: dict) -> str:
         machine.get("name")
         or os.environ.get("ZOE_BENCH_MACHINE")
         or slug(machine["cpu"])
+    )
+
+
+def _python_build(result: dict) -> str:
+    """The Python build of the instances of a run, such as cpython 3.13 or
+    cpython 3.14t: its implementation, its major and minor version and
+    whether it is free-threaded."""
+    python = _python(result)
+    version = ".".join(str(python["version"]).split(".")[:2])
+    return (
+        f"{python['implementation']} {version}{'t' if python['free_threaded'] else ''}"
     )
 
 
