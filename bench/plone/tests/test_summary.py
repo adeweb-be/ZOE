@@ -140,6 +140,26 @@ def test_a_step_without_the_probe_has_no_objects_per_second(results):
     assert {step["objects_stored_per_second"] for step in steps} == {None}
 
 
+def test_a_store_write_a_little_below_0_is_valid(results):
+    # The sampler reads wchar and the socket bytes one after the other. On a
+    # step that writes almost nothing, the difference can be below 0.
+    server = results[1]["steps_results"][0]["resources"]["processes"]["server"]
+    server["store_write_bytes"] = -1186
+
+    steps = summary.document(results)["steps"]
+
+    row = next(s for s in steps if s["stack"] == "zoe-native-qi-kv" and s["step"] == 0)
+    assert -0.1 < row["store_write_kb_per_op"] < 0
+
+
+def test_another_number_below_0_is_not_valid(results):
+    server = results[1]["steps_results"][0]["resources"]["processes"]["server"]
+    server["cpu_seconds"] = -1.0
+
+    with pytest.raises(summary.jsonschema.ValidationError, match="minimum of 0"):
+        summary.document(results)
+
+
 def test_no_run_is_a_refusal():
     with pytest.raises(summary.NotOneCampaign, match="no run"):
         summary.document([])

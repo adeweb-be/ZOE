@@ -212,7 +212,7 @@
           "exhausted": { "description": "The requests whose retries of the publisher ran out.", "type": "integer", "minimum": 0 },
           "zope_cpu_ms_per_op": { "description": "The CPU of the instances per successful operation, in milliseconds.", "$ref": "#/$defs/number" },
           "server_cpu_ms_per_op": { "description": "The CPU of the server per successful operation, in milliseconds.", "$ref": "#/$defs/number" },
-          "store_write_kb_per_op": { "description": "The KB that the server gives to the write calls of its store, per successful operation.", "$ref": "#/$defs/number" },
+          "store_write_kb_per_op": { "description": "The KB that the server gives to the write calls of its store, per successful operation, or null when its counters do not give it. On zoe serve it is the growth of wchar minus the growth of the bytes of its TCP sockets and of its other files. The sampler reads the write counter and the socket counter one after the other, so on a step that writes almost nothing the value can fall a little below 0.", "type": ["number", "null"] },
           "objects_loaded_per_second": { "description": "The loadBefore calls that the probe counts for the operations of the step, over its seconds: the median of the repetitions.", "$ref": "#/$defs/number" },
           "objects_stored_per_second": { "description": "The store calls that the probe counts for the operations of the step, over its seconds: the median of the repetitions.", "$ref": "#/$defs/number" }
         }
