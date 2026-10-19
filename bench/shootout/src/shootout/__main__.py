@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jsonschema
 
-from shootout import client, gate, native, run
+from shootout import client, gate, native, publish, run
 from shootout.layout import result_path, write_index
 from shootout.storages import STORAGES
 
@@ -56,9 +56,31 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     index_cmd = commands.add_parser(
-        "index", help="rewrite index.json of a results tree"
+        "index",
+        help="rewrite index.json of a results tree, of version 2 (ADR 0054)",
     )
     index_cmd.add_argument("root", type=Path)
+
+    publish_cmd = commands.add_parser(
+        "publish",
+        help="copy result documents into a checkout of the results repository "
+        "and rewrite its index.json; it never commits and never pushes",
+    )
+    publish_cmd.add_argument(
+        "--main",
+        default=publish.MAIN,
+        metavar="REF",
+        help="the branch that holds the commit of each document (default: %(default)s)",
+    )
+    publish_cmd.add_argument(
+        "sources",
+        nargs="+",
+        metavar="SRC",
+        help="a document, or a directory whose *.json files are documents",
+    )
+    publish_cmd.add_argument(
+        "checkout", metavar="CHECKOUT", help="a checkout of the results repository"
+    )
 
     gate_cmd = commands.add_parser(
         "gate",
@@ -190,8 +212,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "native":
         return _native(args)
     if args.command == "index":
-        print(write_index(args.root))
+        try:
+            print(write_index(args.root))
+        except ValueError as error:
+            print(f"index: {error}", file=sys.stderr)
+            return 1
         return 0
+    if args.command == "publish":
+        return publish.publish(args.sources, args.checkout, args.main)
     if args.command == "gate":
         ratio = args.ratio or gate.PARITY
         return gate.report(

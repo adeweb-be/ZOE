@@ -170,6 +170,7 @@ def run(
         "run": {
             "started": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "commit": environment.commit(),
+            "dirty": environment.dirty(),
             "objects": objects,
             "commits": commits,
         },
