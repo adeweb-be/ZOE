@@ -439,3 +439,20 @@ def test_a_commit_that_is_not_the_tree_has_no_record_of_a_clean_tree(monkeypatch
     assert environment.dirty() in (True, False)
     monkeypatch.delenv("ZOE_BENCH_COMMIT")
     assert environment.dirty() in (True, False)
+
+
+@needs_git
+def test_a_directory_that_is_a_symbolic_link_stops_the_publish(
+    tmp_path, checkout, capsys
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (checkout / "results" / "shootout").mkdir(parents=True)
+    (checkout / "results" / "shootout" / "reference").symlink_to(outside)
+    before = snapshot(checkout)
+
+    code, out = run(capsys, DATA / "client.json", checkout=checkout)
+
+    assert code == 1
+    assert "results/shootout/reference is a symbolic link" in out.err
+    assert snapshot(checkout) == before

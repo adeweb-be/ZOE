@@ -136,16 +136,14 @@ def index_entries(root: Path, extra: dict[str, dict] | None = None) -> list[dict
     does not read the old index, so it reads a tree of either version.
 
     Raise ValueError when a file under results/ is not a document that
-    the index can read, or when it is a symbolic link."""
+    the index can read, or when a path there is a symbolic link."""
     extra = extra or {}
     documents = dict(extra)
-    for path in sorted((root / "results").rglob("*.json")):
+    for path in sorted((root / "results").rglob("*")):
         relative = path.relative_to(root).as_posix()
-        if relative in extra:
-            continue
         if path.is_symlink():
             raise ValueError(f"{relative} is a symbolic link")
-        if not path.is_file():
+        if relative in extra or path.suffix != ".json" or not path.is_file():
             continue
         try:
             documents[relative] = json.loads(path.read_text())
