@@ -2,7 +2,9 @@
 
 The runner starts Locust with this file and sets these variables:
 
-- PLONEBENCH_MANIFEST: the manifest of the fixture;
+- PLONEBENCH_MANIFEST: the manifest of the fixture. Locust reads the
+  targets file beside it (`workload.TargetsFile`), which the runner
+  writes when it is missing, and never the manifest itself;
 - PLONEBENCH_CREDENTIALS: the file that holds the password of the accounts;
 - PLONEBENCH_HOSTS: the URLs of the Zope instances, comma separated. A user
   stays on one instance, as behind a sticky load balancer;
@@ -35,7 +37,7 @@ from plonebench import corpus, forms, workload
 from plonebench.ledger import AMBIGUOUS, FAILED, OK, PENDING, REJECTED, Ledger, Record
 
 SCENARIO = workload.SCENARIOS[workload.env("SCENARIO", "browse")]
-TARGETS = workload.Targets.load(workload.env("MANIFEST"))
+TARGETS = workload.TargetsFile.open(workload.targets_path(workload.env("MANIFEST")))
 with open(workload.env("CREDENTIALS")) as _file:
     PASSWORD = json.load(_file)["password"]
 HOSTS = workload.env("HOSTS", "http://127.0.0.1:18080").split(",")
@@ -43,22 +45,18 @@ STEPS = workload.steps_from_env(workload.env("STEPS"))
 THINK = tuple(float(x) for x in workload.env("THINK", "0,0").split(","))
 CLIENT_RETRIES = int(workload.env("CLIENT_RETRIES", "0"))
 SEED = int(workload.env("SEED", "1"))
-SITE = TARGETS.manifest["site"]
+SITE = TARGETS.site
 MAX_USERS = max([users for users, _ in STEPS] or [1])
 ROLES = workload.assign_roles(SCENARIO.mix, MAX_USERS)
 ROLE_COUNTS = {role: ROLES.count(role) for role in SCENARIO.mix}
 LEDGER = Ledger(workload.env("LEDGER", "ledger.jsonl"))
-SEARCH_TERMS = TARGETS.manifest["search_terms"]
-SUBJECTS = TARGETS.manifest["subjects"]
-BROWSABLE = TARGETS.browsable()
-FOLDERS = [i for i in BROWSABLE if i["portal_type"] == "Folder"]
-DOCS = [i for i in BROWSABLE if i["portal_type"] in ("Document", "News Item")]
-FILES = [i for i in BROWSABLE if i["portal_type"] == "File"]
-COLLECTIONS = TARGETS.items(portal_type="Collection")
+SEARCH_TERMS = TARGETS.search_terms
+SUBJECTS = TARGETS.subjects
+COLLECTIONS = TARGETS.collections
 # Titles carry an operation code made of words that the site already
 # holds. A new word in each save would make concurrent saves collide on
 # the word ids of the lexicons, which real edits do far less often.
-CODE_WORDS = corpus.code_words(corpus.plan_site(TARGETS.spec))
+CODE_WORDS = TARGETS.code_words
 
 _counter = itertools.count()
 _state = {"step": 0}
@@ -169,10 +167,10 @@ class PloneUser(HttpUser):
         if kind == corpus.EDITOR:
             self.account, self.section = TARGETS.editor(self.rank)
         elif kind == corpus.MEMBER:
-            members = TARGETS.manifest["users"][corpus.MEMBER]
+            members = TARGETS.users[corpus.MEMBER]
             self.account = members[self.rank % len(members)]
         elif kind in (corpus.MAINTAINER, corpus.IMPORTER):
-            self.account = TARGETS.manifest["users"][kind][0]
+            self.account = TARGETS.users[kind][0]
         if self.account is not None:
             if api == "rest":
                 self.operation("login-rest", self.login_rest)
@@ -323,21 +321,26 @@ class PloneUser(HttpUser):
         return self.judge(response, ok, target=item["path"])
 
     def browse(self):
-        folder = self.rng.choice(FOLDERS)
+        # Each pick draws a number, as a choice from a list of the same
+        # length does, and reads one row of the targets file.
+        folder = TARGETS.folder(self.rng.choice(range(TARGETS.folders)))
         self.operation("view-folder", self.view, folder, "GET folder")
-        children = [i for i in DOCS if i["path"].startswith(folder["path"] + "/")]
-        doc = self.rng.choice(children or DOCS)
+        # A Document or a News Item below the Folder, at any depth, else
+        # any of them.
+        start, stop = folder["start"], folder["stop"]
+        if stop <= start:
+            start, stop = 0, TARGETS.docs
+        doc = TARGETS.doc(self.rng.choice(range(start, stop)))
         name = "GET news item" if doc["portal_type"] == "News Item" else "GET document"
         self.operation(
             "view-" + doc["portal_type"].lower().replace(" ", "-"), self.view, doc, name
         )
         # Up the breadcrumbs, to the parent of the item.
-        parent_path = doc["path"].rpartition("/")[0]
-        parent = next((i for i in FOLDERS if i["path"] == parent_path), None)
-        if parent is not None:
+        if doc["parent"] is not None:
+            parent = TARGETS.folder(doc["parent"])
             self.operation("view-folder", self.view, parent, "GET folder")
-        if FILES and self.rng.random() < 0.2:
-            item = self.rng.choice(FILES)
+        if TARGETS.files and self.rng.random() < 0.2:
+            item = TARGETS.file(self.rng.choice(range(TARGETS.files)))
             # The view of a File; its own URL sends the file itself.
             self.operation("view-file", self.view, item, "GET file view", "/view")
             self.operation("download-file", self.download, item)

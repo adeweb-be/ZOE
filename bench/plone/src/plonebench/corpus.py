@@ -1,8 +1,9 @@
 """The plan of the synthetic site: a pure function of a `SiteSpec`.
 
 This module imports only the standard library. The scripts that run in
-Zope import it to build the site, and Locust imports it to pick its
-targets. So both read the same plan from the same spec.
+Zope import it to build the site. Locust does not plan the site: it reads
+the targets file that `workload.write_targets` writes from the manifest
+of the build, and the words of the spec (`site_words`).
 
 The text is made of generated words, never of a natural language. The
 words follow a Zipf distribution, so a search term has a known frequency.
@@ -635,11 +636,19 @@ def file_bytes(spec: SiteSpec, path: str, size: int) -> bytes:
     return rng.randbytes(size)
 
 
-def code_words(plan: Plan) -> list[str]:
-    """Return the words of the operation codes: words of the vocabulary
-    that the text of the site already holds, so a code adds no new word
-    to the lexicons of the text indexes."""
-    return plan.words[100:1100]
+def site_words(spec: SiteSpec) -> list[str]:
+    """Return the words of the vocabulary of the plan of `spec`, without
+    the rest of the plan. They are the first draw of `plan_site`, so
+    `site_words(spec)` equals `plan_site(spec).words`."""
+    return make_words(random.Random(spec.seed), spec.vocabulary)
+
+
+def code_words(words: list[str]) -> list[str]:
+    """Return the words of the operation codes from the words of the
+    vocabulary (`Plan.words` or `site_words`): words that the text of the
+    site already holds, so a code adds no new word to the lexicons of the
+    text indexes."""
+    return words[100:1100]
 
 
 def op_code(op: str, words: list[str]) -> str:
