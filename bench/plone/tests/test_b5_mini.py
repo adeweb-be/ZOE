@@ -19,9 +19,8 @@ The module builds it when it is missing, for about 4 minutes. The runs
 use a copy of it, `test-today-xlarge-mini-<digest>`, that holds only the
 files that a fixture holds today: so they show that a fixture that exists
 runs with no new build, and that the runner writes what Locust needs
-when it is missing. The runs
-take about 10 minutes and the CPUs of the machine: run nothing else
-beside them. They need `just plone zeo build`, `just plone zoeclient
+when it is missing. The runs take about 3 minutes and the CPUs of the
+machine: run nothing else beside them. They need `just plone zeo build`, `just plone zoeclient
 build` and the release `zoe` (`cargo build --release -p zoe-server --bin
 zoe`, or `ZOE_BINARY`):
 
@@ -45,7 +44,7 @@ from plonebench import corpus, fixture, ledger, runner, stack
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ZOE_BENCH_B5_MINI") != "1",
-    reason="runs B5 on xlarge-mini for about 15 minutes: set ZOE_BENCH_B5_MINI=1",
+    reason="runs B5 on xlarge-mini for about 3 minutes: set ZOE_BENCH_B5_MINI=1",
 )
 
 SCRIPTS = Path(__file__).resolve().parent / "scripts"
