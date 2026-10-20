@@ -385,6 +385,16 @@ def _status(url: str, site: str, password: str, since: float | None = None) -> d
         return json.loads(response.read())
 
 
+def _site(fixture_dir: Path) -> str:
+    """Return the id of the site of the fixture: from its targets file, which
+    a run writes before it starts, else from its manifest."""
+    path = fixture_dir / workload.TARGETS_FILE
+    if path.exists():
+        with workload.TargetsFile.open(path) as targets:
+            return targets.site
+    return json.loads((fixture_dir / "manifest.json").read_text())["site"]
+
+
 def _drain_queue(
     urls: list[str],
     fixture_dir: Path,
@@ -398,8 +408,7 @@ def _drain_queue(
     took to empty after the end of the measured steps, and the status of
     each instance: for the whole run, and for each step."""
     password = json.loads((fixture_dir / "credentials.json").read_text())["password"]
-    with workload.TargetsFile.open(workload.ensure_targets(fixture_dir)) as targets:
-        site = targets.site
+    site = _site(fixture_dir)
     deadline = time.time() + timeout
     drained = None
     last: dict = {}
