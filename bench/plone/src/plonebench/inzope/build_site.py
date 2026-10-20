@@ -4,11 +4,14 @@
 
 SPEC_JSON holds a `SiteSpec`. CREDENTIALS_JSON holds the password of the
 accounts of the benchmark (`{"password": ...}`); it never goes on a command
-line. The script adds the Plone site `Plone`, its users and groups, and the
-items of the plan, with their workflow states, local roles, files and
-collections. It commits every BATCH items. It writes MANIFEST_JSON: the
-plan without the text, with the UID, the state and the versions of each
-item after the build, and the accounts.
+line. The script adds the Plone site `Plone`, the generic indexes and
+metadata columns of the spec, its users and groups, and the items of the
+plan, with their workflow states, local roles, files, collections and
+generic attributes. It commits every BATCH items. When `pack_every` of the
+spec is not 0, it packs the storage after each `pack_every` items, then
+prints a line that starts with PACKED. It writes MANIFEST_JSON: the plan
+without the text, with the UID, the state and the versions of each item
+after the build, and the accounts.
 
 The UIDs and the dates are a function of the spec, so two builds of one
 spec give the same content, the same ids and the same catalog results.
@@ -34,6 +37,10 @@ from plonebench import corpus
 
 SITE_ID = "Plone"
 BATCH = 50
+# The start of the line that the script prints after each pack.
+PACKED = "build_site: packed"
+# The items that the manifest loop reads between two calls of cacheGC.
+GC_EVERY = 100
 # The dates of the items start here and step by one minute.
 EPOCH = DateTime("2024/01/01 08:00:00 UTC")
 
@@ -62,6 +69,16 @@ site = addPloneSite(
 setSite(site)
 transaction.commit()
 print(f"build_site: site added in {time.time() - started:.1f} s", flush=True)
+
+# The generic indexes and metadata columns, when the spec asks for them.
+INDEXES = dict(corpus.catalog_indexes(spec))
+if INDEXES:
+    portal_catalog = api.portal.get_tool("portal_catalog")
+    for index_id, kind in INDEXES.items():
+        portal_catalog.addIndex(index_id, kind)
+    for column in corpus.catalog_columns(spec):
+        portal_catalog.addColumn(column)
+    transaction.commit()
 
 
 def uid_of(path):
@@ -128,6 +145,11 @@ def create(item, index):
     container.invokeFactory(item.portal_type, name, **fields)
     obj = container[name]
     setattr(obj, ATTRIBUTE_NAME, uid_of(item.path))
+    if INDEXES:
+        for attribute, value in corpus.catalog_values(plan, item.path).items():
+            if INDEXES[attribute] == "DateIndex":
+                value = EPOCH + value
+            setattr(obj, attribute, value)
     if item.section >= 0:
         editors = users[corpus.EDITOR]
         owner = editors[item.section % len(editors)]
@@ -155,18 +177,34 @@ def create(item, index):
     obj.reindexObject()
 
 
+packed_at = 0
 for index, item in enumerate(plan.items):
     create(item, index)
     if index % BATCH == BATCH - 1:
         transaction.commit()
         print(f"build_site: {index + 1}/{len(plan.items)} items", flush=True)
+        done = index + 1
+        due = spec.pack_every and done - packed_at >= spec.pack_every
+        if due and done < len(plan.items):
+            # The pack removes the old revisions of the build so far. The
+            # call returns when the server has packed.
+            packing = time.time()
+            app._p_jar.db().pack()
+            packed_at = done
+            print(
+                f"{PACKED} at {done} items in {time.time() - packing:.1f} s",
+                flush=True,
+            )
 transaction.commit()
 
 # The manifest: what Locust and the verification need, without the text.
+# The loop does not commit, so it frees the object cache itself.
 catalog = api.portal.get_tool("portal_catalog")
 repository = api.portal.get_tool("portal_repository")
 entries = []
 for item in plan.items:
+    if len(entries) % GC_EVERY == 0:
+        app._p_jar.cacheGC()
     obj = site.unrestrictedTraverse(item.path)
     try:
         versions = len(repository.getHistoryMetadata(obj) or [])

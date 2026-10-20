@@ -3,7 +3,13 @@ ZOE store with the same content.
 
 `prepare` builds the site on a ZEO server with a new FileStorage, converts
 the `Data.fs` with `zoe convert`, then reads the logical digest of the site
-through each store and compares them. The fixture lives under
+through each store and compares them. When `pack_every` of the spec is not
+0, the build packs the FileStorage through ZEO after each `pack_every`
+items, and `prepare` removes the old files that each pack keeps
+(`Data.fs.old` and `blobstorage.old`). Then `prepare` stops the server and
+packs the FileStorage once more, before the digest and the conversion. So
+the fixture holds no history of its build, and the history of the build
+does not fill the disk. The fixture lives under
 `target/bench/plone/fixtures/<name>`:
 
     spec.json           the SiteSpec
@@ -34,6 +40,9 @@ import time
 from pathlib import Path
 
 from plonebench import corpus, environment, stack
+
+# The start of the line that build_site.py prints after each pack.
+PACKED = "build_site: packed"
 
 
 def fixture_dir(name: str) -> Path:
@@ -82,18 +91,17 @@ def prepare(
         json.dump({"password": secrets.token_urlsafe(18)}, file)
 
     # Build on ZEO.
-    zeo = stack.Stack(stack.STACKS["zeo"], settings, target / "build", target / "store")
+    store = target / "store"
+    zeo = stack.Stack(stack.STACKS["zeo"], settings, target / "build", store)
     started = time.time()
     zeo.start_server()
     try:
         print("plonebench: building the site on ZEO", flush=True)
-        zeo.run_script(
-            "build_site.py",
-            str(target / "spec.json"),
-            str(credentials),
-            str(target / "manifest.json"),
-            name="builder",
-        )
+        _build(zeo, target, credentials)
+        if spec.pack_every:
+            zeo.stop()
+            _pack(store)
+            zeo.start_server()
         zeo.run_script("digest.py", str(target / "digest-zeo.json"), name="digest")
     finally:
         zeo.stop()
@@ -151,6 +159,74 @@ def prepare(
     if not equivalence["equivalent"]:
         raise RuntimeError(f"the stores differ: {equivalence['differences']}")
     return target
+
+
+def _build(zeo: stack.Stack, target: Path, credentials: Path) -> None:
+    """Run build_site.py in a client of the server of `zeo`, as
+    `Stack.run_script` does. After each pack of the build, remove the old
+    files of the pack."""
+    home = zeo.run / "builder"
+    conf = zeo.prepare_home(home, "builder")
+    command = [
+        str(stack.interpreter(zeo.config)),
+        str(stack.INZOPE / "run.py"),
+        str(conf),
+        "build_site.py",
+        str(target / "spec.json"),
+        str(credentials),
+        str(target / "manifest.json"),
+    ]
+    out = home / "log" / "build_site.py.out"
+    err = home / "log" / "build_site.py.err"
+    with open(out, "w") as stdout, open(err, "w") as stderr:
+        process = subprocess.Popen(
+            command,
+            env=stack.clean_environment(),
+            cwd=home,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+        )
+        for line in process.stdout:
+            stdout.write(line)
+            if line.startswith(PACKED):
+                _remove_old(zeo.store)
+                print(f"plonebench: {line.strip()}", flush=True)
+        code = process.wait()
+    if code != 0:
+        tail = "\n".join(err.read_text().splitlines()[-30:])
+        raise RuntimeError(f"build_site.py failed with {code}:\n{tail}")
+
+
+def _remove_old(store: Path) -> None:
+    """Remove the files that a pack of the FileStorage of `store` keeps:
+    the file before the pack, and the blobs that the pack removed."""
+    (store / "filestorage" / "Data.fs.old").unlink(missing_ok=True)
+    shutil.rmtree(store / "blobstorage.old", ignore_errors=True)
+
+
+def _pack(store: Path) -> None:
+    """Pack the FileStorage of `store` to now, with no server on it. The
+    pack keeps no old file."""
+    from ZODB.FileStorage import FileStorage
+    from ZODB.serialize import referencesf
+
+    data_fs = store / "filestorage" / "Data.fs"
+    _remove_old(store)
+    before = data_fs.stat().st_size
+    started = time.time()
+    storage = FileStorage(
+        str(data_fs), blob_dir=str(store / "blobstorage"), pack_keep_old=False
+    )
+    try:
+        storage.pack(time.time(), referencesf)
+    finally:
+        storage.close()
+    print(
+        f"plonebench: packed Data.fs from {before / 1e9:.2f} GB to "
+        f"{data_fs.stat().st_size / 1e9:.2f} GB in {time.time() - started:.1f} s",
+        flush=True,
+    )
 
 
 def _size(path: Path) -> int:
