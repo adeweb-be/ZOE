@@ -178,7 +178,9 @@ def _build(zeo: stack.Stack, target: Path, credentials: Path) -> None:
     ]
     out = home / "log" / "build_site.py.out"
     err = home / "log" / "build_site.py.err"
-    with open(out, "w") as stdout, open(err, "w") as stderr:
+    # The log of stdout gets each line at once, so a long build shows its
+    # progress there.
+    with open(out, "w", buffering=1) as stdout, open(err, "w") as stderr:
         process = subprocess.Popen(
             command,
             env=stack.clean_environment(),
