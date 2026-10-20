@@ -189,11 +189,18 @@ def _build(zeo: stack.Stack, target: Path, credentials: Path) -> None:
             stderr=stderr,
             text=True,
         )
-        for line in process.stdout:
-            stdout.write(line)
-            if line.startswith(PACKED):
-                _remove_old(zeo.store)
-                print(f"plonebench: {line.strip()}", flush=True)
+        try:
+            for line in process.stdout:
+                stdout.write(line)
+                if line.startswith(PACKED):
+                    _remove_old(zeo.store)
+                    print(f"plonebench: {line.strip()}", flush=True)
+        except BaseException:
+            # The caller stops the server next. Stop the build first, so
+            # that it does not write to a server that is gone.
+            process.kill()
+            process.wait()
+            raise
         code = process.wait()
     if code != 0:
         tail = "\n".join(err.read_text().splitlines()[-30:])

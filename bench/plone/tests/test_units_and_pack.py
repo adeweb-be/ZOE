@@ -7,10 +7,15 @@
   path.
 - `fixture._pack` leaves the live records of a FileStorage, and no old
   file of a pack.
+- `fixture._build` stops the build when the caller fails during it.
 """
 
 import json
+import os
 import random
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import transaction
@@ -21,7 +26,7 @@ from ZODB.FileStorage import FileStorage
 from ZODB.serialize import referencesf
 from ZODB.utils import z64
 
-from plonebench import corpus, fixture
+from plonebench import corpus, fixture, stack
 
 
 @pytest.mark.parametrize(
@@ -164,3 +169,42 @@ def test_the_pack_leaves_the_live_records_and_no_old_file(tmp_path):
             assert file.read() == b"second"
     finally:
         db.close()
+
+
+class Stop(BaseException):
+    pass
+
+
+def test_the_build_stops_when_the_caller_fails(tmp_path, monkeypatch):
+    # A run.py that writes its pid, prints the line of a pack, and waits.
+    inzope = tmp_path / "inzope"
+    inzope.mkdir()
+    pid_file = tmp_path / "pid"
+    (inzope / "run.py").write_text(
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        f"print({fixture.PACKED!r}, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(stack, "INZOPE", inzope)
+    monkeypatch.setattr(stack, "interpreter", lambda config: Path(sys.executable))
+
+    def fail(store):
+        raise Stop
+
+    monkeypatch.setattr(fixture, "_remove_old", fail)
+
+    def prepare_home(home, name):
+        (home / "log").mkdir(parents=True)
+        return home / "zope.conf"
+
+    zeo = SimpleNamespace(
+        run=tmp_path / "run",
+        store=tmp_path / "store",
+        config=None,
+        prepare_home=prepare_home,
+    )
+    with pytest.raises(Stop):
+        fixture._build(zeo, tmp_path, tmp_path / "credentials.json")
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)

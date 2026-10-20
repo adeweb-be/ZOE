@@ -13,8 +13,9 @@ prints a line that starts with PACKED. It writes MANIFEST_JSON: the plan
 without the text, with the UID, the state and the versions of each item
 after the build, and the accounts.
 
-The UIDs and the dates are a function of the spec, so two builds of one
-spec give the same content, the same ids and the same catalog results.
+The UIDs, the creation dates and the generic attributes are a function of
+the spec, so two builds of one spec give the same content and the same ids.
+`modified` is the time of the build: `reindexObject` sets it.
 """
 
 import hashlib
