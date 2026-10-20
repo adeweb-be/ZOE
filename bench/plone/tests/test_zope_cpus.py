@@ -10,7 +10,7 @@ import sys
 import jsonschema
 import pytest
 
-from plonebench import report, runner, sampler, showcase, summary
+from plonebench import report, runner, sampler, showcase, stack, summary
 
 RUNS = pathlib.Path(__file__).parent / "data" / "runs"
 ZEO = RUNS / "20260101T000000Z-edit-zeo-r0"
@@ -117,8 +117,45 @@ def test_a_machine_without_the_files_gives_null_never_0():
     assert sampler.zope_cpus(samples, [(0, 2)]) == (3000.0, None)
 
 
+def test_sibling_cpus_count_the_throttle_time_of_their_core_once(sysfs):
+    # CPUs 1 and 2 are the two threads of one core, CPU 3 is on another
+    # core, and CPU 5 has no topology.
+    for cpu, core in ((1, 8), (2, 8), (3, 12)):
+        write(sysfs / f"cpu{cpu}" / "topology" / "physical_package_id", "0\n")
+        write(sysfs / f"cpu{cpu}" / "topology" / "core_id", f"{core}\n")
+    for cpu, ms in ((1, 20_332_177), (2, 20_376_863), (3, 500), (5, 70)):
+        path = sysfs / f"cpu{cpu}" / "thermal_throttle"
+        write(path / "core_throttle_total_time_ms", f"{ms}\n")
+        write(sysfs / f"cpu{cpu}" / "cpufreq" / "scaling_cur_freq", "3000000\n")
+
+    read = sampler.read_cpus((1, 2, 3, 5))
+
+    assert read["throttle_ms"] == {"1": 20_332_177, "3": 500, "5": 70}
+    # Each CPU gives its clock.
+    assert sorted(read["clock_mhz"]) == ["1", "2", "3", "5"]
+
+
+def test_the_sampler_reads_the_cpus_of_the_instances_only():
+    # 2 instances on a set of 4 lists: the instances run on CPUs 1 and 3,
+    # and the idle CPUs 6 and 8 do not count.
+    settings = stack.Settings(instances=2, zope_cpus=("1", "3", "6", "8"))
+    assert runner.sampled_cpus(settings) == (1, 3)
+    wide = stack.Settings(instances=2, zope_cpus=("1,2", "3-4", "6"))
+    assert runner.sampled_cpus(wide) == (1, 2, 3, 4)
+    assert runner.sampled_cpus(stack.Settings()) == (1, 2)
+
+    result = {
+        "stack": {"settings": {"zope_cpus": ["1", "3", "6", "8"], "instances": 2}},
+        "zope_clock_mhz": 4500.0,
+        "zope_throttle_seconds": 0.0,
+    }
+    assert runner.zope_cpus_line(result).startswith("zope CPUs 1;3: ")
+
+
 def test_the_log_of_a_run_gives_the_clock_and_the_throttle_time():
-    result = {"stack": {"settings": {"zope_cpus": ["1", "3", "6", "8"]}}}
+    result = {
+        "stack": {"settings": {"zope_cpus": ["1", "3", "6", "8"], "instances": 4}}
+    }
     line = runner.zope_cpus_line(
         {**result, "zope_clock_mhz": 4321.4, "zope_throttle_seconds": 2.5}
     )

@@ -291,6 +291,12 @@ def cpus_refusal(settings: Settings) -> str | None:
     return None
 
 
+def instance_cpus(settings: Settings) -> tuple[str, ...]:
+    """Return the CPU list of each instance: the first lists of
+    `zope_cpus`, one for each instance."""
+    return tuple(settings.zope_cpus[: settings.instances])
+
+
 def profile_refusal(config: StackConfig) -> str | None:
     """Return why a run of `config` cannot import a profile of `zoe.plone`
     into its store, or None when it can."""
@@ -734,7 +740,7 @@ class Stack:
                     probe_out if self.settings.probe else None,
                 )
             )
-            cpus = self.settings.zope_cpus[index]
+            cpus = instance_cpus(self.settings)[index]
             log = open(home / "log" / "stdout.log", "w")
             self.logs.append(log)
             env = clean_environment(PYTHONPATH=str(PROBE))

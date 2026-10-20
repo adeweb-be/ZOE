@@ -207,7 +207,7 @@ def run(options: RunOptions) -> Path:
     sample = sampler.Sampler(
         run_dir / "samples.jsonl",
         sampler.disk_of(store),
-        zope_cpus=sampler.cpu_numbers(options.settings.zope_cpus),
+        zope_cpus=sampled_cpus(options.settings),
     )
     error = None
     try:
@@ -542,10 +542,18 @@ def _print_summary(result: dict) -> None:
                     )
 
 
+def sampled_cpus(settings: stack.Settings) -> tuple[int, ...]:
+    """Return the CPUs whose clock and throttle time the sampler reads: the
+    CPUs of the lists that the instances run on. A longer list of Zope CPUs
+    leaves out its last lists, so their idle CPUs do not count."""
+    return sampler.cpu_numbers(stack.instance_cpus(settings))
+
+
 def zope_cpus_line(result: dict) -> str:
     """Return the line of the log that gives the clock and the throttle time
     of the Zope CPUs of a run."""
-    cpus = ";".join(result["stack"]["settings"]["zope_cpus"])
+    settings = result["stack"]["settings"]
+    cpus = ";".join(settings["zope_cpus"][: settings["instances"]])
     clock = result.get("zope_clock_mhz")
     throttle = result.get("zope_throttle_seconds")
     return (

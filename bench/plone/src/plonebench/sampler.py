@@ -10,7 +10,12 @@ For the CPUs of the Zope instances, on Linux, the sampler also reads the
 clock that the hardware measured (`cpuinfo_avg_freq`, else
 `scaling_cur_freq`) and the time that the core of each CPU spent
 throttled (`core_throttle_total_time_ms`). `summarize` turns them into
-`zope_clock_mhz` and `zope_throttle_seconds`.
+`zope_clock_mhz` and `zope_throttle_seconds`. Sibling CPUs give the same
+throttle time of their core, so the sampler reads it for one CPU of each
+physical core. The kernel adds an episode of throttle to the counter when
+the episode ends. So an episode that crosses the edge of a window counts
+in the window where it ends, and an episode that is still open after the
+last step does not count.
 
 For the server, on Linux, the sampler also reads the counters of the bytes
 that it writes to its store (`store_counters`). `summarize` turns them into
@@ -235,9 +240,11 @@ def _read_int(path: Path) -> int | None:
 
 def read_cpus(cpus: tuple[int, ...]) -> dict:
     """Return the clock of each CPU of `cpus` in MHz, and the time that
-    its core spent throttled since the boot in ms. A value that the machine
-    does not give is absent."""
+    its core spent throttled since the boot in ms, for the first CPU of
+    `cpus` on each physical core. A CPU without a topology counts as a core
+    of its own. A value that the machine does not give is absent."""
     clock, throttle = {}, {}
+    cores = set()
     for cpu in cpus:
         base = SYS_CPU / f"cpu{cpu}"
         for name in ("cpuinfo_avg_freq", "scaling_cur_freq"):
@@ -245,9 +252,17 @@ def read_cpus(cpus: tuple[int, ...]) -> dict:
             if khz is not None:
                 clock[str(cpu)] = khz / 1000
                 break
+        core = (
+            _read_int(base / "topology" / "physical_package_id"),
+            _read_int(base / "topology" / "core_id"),
+        )
+        if core in cores:
+            continue
         ms = _read_int(base / "thermal_throttle" / "core_throttle_total_time_ms")
         if ms is not None:
             throttle[str(cpu)] = ms
+            if None not in core:
+                cores.add(core)
     return {"clock_mhz": clock, "throttle_ms": throttle}
 
 

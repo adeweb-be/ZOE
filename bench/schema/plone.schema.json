@@ -234,7 +234,7 @@
           "verification": { "description": "The verdict of the verification of the run, or not run.", "enum": ["pass", "fail", "not run"] },
           "violations": { "description": "The violations that the verification found, or null when it did not run.", "type": ["integer", "null"], "minimum": 0 },
           "zope_clock_mhz": { "description": "The mean clock of the CPUs of the Zope instances over the samples of the steps, trim excluded, in MHz; null when the run did not record it.", "type": ["number", "null"], "minimum": 0 },
-          "zope_throttle_seconds": { "description": "The time that the cores of the CPUs of the Zope instances spent throttled during the steps, trim excluded, summed over the CPUs, in seconds; null when the run did not record it.", "type": ["number", "null"], "minimum": 0 }
+          "zope_throttle_seconds": { "description": "The time that the physical cores of the CPUs of the Zope instances spent throttled during the steps, trim excluded, summed over the cores, in seconds; null when the run did not record it.", "type": ["number", "null"], "minimum": 0 }
         }
       }
     }
