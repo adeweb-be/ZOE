@@ -185,7 +185,7 @@ PREPARE_SECONDS = {"small": 90, "medium": 343, "xlarge-mini": 240, "xlarge": 23_
 B5_SECONDS = {
     "small": {"zeo": 15, "zoe": 15},
     "medium": {"zeo": 45, "zoe": 45},
-    "xlarge-mini": {"zeo": 20, "zoe": 20},
+    "xlarge-mini": {"zeo": 10, "zoe": 10},
     "xlarge": {"zeo": 120, "zoe": 180},
 }
 B5_SECONDS_PER_SECOND = 1.25
