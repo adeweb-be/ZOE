@@ -15,6 +15,8 @@ does not fill the disk. The fixture lives under
     spec.json           the SiteSpec
     credentials.json    the password of the accounts (mode 0600)
     manifest.json       the plan, with UIDs, states and versions
+    targets.sqlite      what Locust and the verification read, from the
+                        manifest (`workload.write_targets`)
     store/filestorage/Data.fs, store/blobstorage/   the ZEO store
     store/zoe/          the ZOE store (zoe.redb and blobs/)
     convert.txt         the report of zoe convert
@@ -26,7 +28,8 @@ an older fixture still runs, but its records stay compressed: prepare it again
 with `--force` to measure raw records.
     digest-zeo.json, digest-zoe.json, equivalence.json
 
-A run never opens these stores: it copies them first (`restore`).
+A run never opens these stores: it copies them first (`restore`), and
+syncs the copy to the disk before its server starts.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from plonebench import corpus, environment, stack
+from plonebench import corpus, environment, stack, workload
 
 # The start of the line that build_site.py prints after each pack.
 PACKED = "build_site: packed"
@@ -154,6 +157,7 @@ def prepare(
     }
     (target / "equivalence.json").write_text(json.dumps(equivalence, indent=1))
     shutil.rmtree(target / "build", ignore_errors=True)
+    workload.write_targets(target)
     verdict = "equivalent" if equivalence["equivalent"] else "NOT equivalent"
     print(f"plonebench: fixture {name}: {equivalence['objects']} objects, {verdict}")
     if not equivalence["equivalent"]:
@@ -242,14 +246,27 @@ def _size(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
-def restore(fixture: Path, config: stack.StackConfig, run: Path) -> Path:
-    """Copy the store of the stack from the fixture into the run."""
+def restore(
+    fixture: Path, config: stack.StackConfig, run: Path, record: dict | None = None
+) -> Path:
+    """Copy the store of the stack from the fixture into the run, then
+    sync the copy to the disk. So the kernel writes no page of the copy
+    during the warmup or the steps, where it would compete with the syncs
+    of the commits. When `record` is a dict, it gets the bytes of the copy
+    and the seconds of the copy and of the sync."""
     store = run / "store"
     if store.exists():
         shutil.rmtree(store)
+    started = time.time()
     if config.server == "zeo":
         stack.copy_store(fixture / "store" / "filestorage", store / "filestorage")
         stack.copy_store(fixture / "store" / "blobstorage", store / "blobstorage")
     else:
         stack.copy_store(fixture / "store" / "zoe", store / "zoe")
+    copied = time.time()
+    stack.sync_files(store)
+    if record is not None:
+        record["bytes"] = _size(store)
+        record["copy_seconds"] = copied - started
+        record["sync_seconds"] = time.time() - copied
     return store
