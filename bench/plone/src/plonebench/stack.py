@@ -278,6 +278,19 @@ def split_merges_refusal(config: StackConfig, settings: Settings) -> str | None:
     return None
 
 
+def cpus_refusal(settings: Settings) -> str | None:
+    """Return why the instances of the settings cannot each run on a CPU
+    list of their own, or None when they can. A longer list is valid: the
+    instances take its first lists."""
+    lists = len(settings.zope_cpus)
+    if lists < settings.instances:
+        return (
+            f"--zope-cpus gives {lists} CPU lists for --instances "
+            f"{settings.instances}: give one list for each Zope instance"
+        )
+    return None
+
+
 def profile_refusal(config: StackConfig) -> str | None:
     """Return why a run of `config` cannot import a profile of `zoe.plone`
     into its store, or None when it can."""
@@ -704,6 +717,9 @@ class Stack:
         return conf
 
     def start_instances(self, timeout: float = 300.0) -> None:
+        refusal = cpus_refusal(self.settings)
+        if refusal is not None:
+            raise ValueError(refusal)
         serve = zope_serve_script()
         for index in range(self.settings.instances):
             home = self.instance_home(index)
@@ -718,7 +734,7 @@ class Stack:
                     probe_out if self.settings.probe else None,
                 )
             )
-            cpus = self.settings.zope_cpus[index % len(self.settings.zope_cpus)]
+            cpus = self.settings.zope_cpus[index]
             log = open(home / "log" / "stdout.log", "w")
             self.logs.append(log)
             env = clean_environment(PYTHONPATH=str(PROBE))

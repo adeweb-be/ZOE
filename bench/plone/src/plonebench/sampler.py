@@ -6,6 +6,12 @@ for a CPU. For the machine: the CPU times and the counters of the disk
 under the store. The samples go to a JSON lines file; `summarize` turns a
 window of them into deltas.
 
+For the CPUs of the Zope instances, on Linux, the sampler also reads the
+clock that the hardware measured (`cpuinfo_avg_freq`, else
+`scaling_cur_freq`) and the time that the core of each CPU spent
+throttled (`core_throttle_total_time_ms`). `summarize` turns them into
+`zope_clock_mhz` and `zope_throttle_seconds`.
+
 For the server, on Linux, the sampler also reads the counters of the bytes
 that it writes to its store (`store_counters`). `summarize` turns them into
 `store_write_bytes`. The kernel counter `write_bytes` charges whole
@@ -33,6 +39,7 @@ from pathlib import Path
 DARWIN = sys.platform == "darwin"
 TICKS = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
+SYS_CPU = Path("/sys/devices/system/cpu")
 
 
 def read_process(pid: int) -> dict | None:
@@ -205,6 +212,45 @@ def store_counters(
     return result
 
 
+def cpu_numbers(lists) -> tuple[int, ...]:
+    """Return the CPUs of taskset lists such as `1`, `1,2` or `1-3`. A
+    part of another form gives no CPU."""
+    found = set()
+    for text in lists:
+        for part in str(text).split(","):
+            first, _, last = part.strip().partition("-")
+            try:
+                found.update(range(int(first), int(last or first) + 1))
+            except ValueError:
+                continue
+    return tuple(sorted(found))
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def read_cpus(cpus: tuple[int, ...]) -> dict:
+    """Return the clock of each CPU of `cpus` in MHz, and the time that
+    its core spent throttled since the boot in ms. A value that the machine
+    does not give is absent."""
+    clock, throttle = {}, {}
+    for cpu in cpus:
+        base = SYS_CPU / f"cpu{cpu}"
+        for name in ("cpuinfo_avg_freq", "scaling_cur_freq"):
+            khz = _read_int(base / "cpufreq" / name)
+            if khz is not None:
+                clock[str(cpu)] = khz / 1000
+                break
+        ms = _read_int(base / "thermal_throttle" / "core_throttle_total_time_ms")
+        if ms is not None:
+            throttle[str(cpu)] = ms
+    return {"clock_mhz": clock, "throttle_ms": throttle}
+
+
 def read_cpu() -> dict:
     if DARWIN:
         import psutil
@@ -260,10 +306,17 @@ def read_disk(name: str | None) -> dict | None:
 
 
 class Sampler:
-    def __init__(self, out: Path, disk: str | None, interval: float = 1.0):
+    def __init__(
+        self,
+        out: Path,
+        disk: str | None,
+        interval: float = 1.0,
+        zope_cpus: tuple[int, ...] = (),
+    ):
         self.out = out
         self.disk = disk
         self.interval = interval
+        self.zope_cpus = zope_cpus
         self.pids: dict[str, int] = {}
         self.stores: dict[str, tuple[Path, bool, SentBytes]] = {}
         self._stop = threading.Event()
@@ -292,7 +345,7 @@ class Sampler:
         self._thread.join()
 
     def sample(self) -> dict:
-        return {
+        sample = {
             "t": time.time(),
             "cpu": read_cpu(),
             "disk": read_disk(self.disk),
@@ -300,6 +353,9 @@ class Sampler:
                 name: self.read(name, pid) for name, pid in list(self.pids.items())
             },
         }
+        if self.zope_cpus and not DARWIN:
+            sample["zope_cpus"] = read_cpus(self.zope_cpus)
+        return sample
 
     def _loop(self) -> None:
         with open(self.out, "a") as file:
@@ -344,6 +400,12 @@ def summarize(samples: list[dict], start: float, end: float) -> dict:
         result["disk"] = {
             k: last["disk"][k] - first["disk"].get(k, 0) for k in last["disk"]
         }
+    clocks = _clocks(window)
+    if clocks:
+        result["zope_clock_mhz"] = sum(clocks) / len(clocks)
+    throttle = _throttle_seconds(first, last)
+    if throttle is not None:
+        result["zope_throttle_seconds"] = throttle
     for name in last["processes"]:
         a, b = first["processes"].get(name), last["processes"].get(name)
         if not a or not b:
@@ -376,6 +438,45 @@ def summarize(samples: list[dict], start: float, end: float) -> dict:
             entry["store_write_bytes"] = store
         result["processes"][name] = entry
     return result
+
+
+def _clocks(window: list[dict]) -> list[float]:
+    """Return each clock of the Zope CPUs in the samples of `window`."""
+    return [
+        mhz
+        for sample in window
+        for mhz in sample.get("zope_cpus", {}).get("clock_mhz", {}).values()
+    ]
+
+
+def _throttle_seconds(first: dict, last: dict) -> float | None:
+    """Return the throttle time of the Zope CPUs from `first` to `last`,
+    summed over the CPUs, in seconds. None when no CPU gives it in both."""
+    a = first.get("zope_cpus", {}).get("throttle_ms", {})
+    b = last.get("zope_cpus", {}).get("throttle_ms", {})
+    cpus = [cpu for cpu in b if cpu in a]
+    if not cpus:
+        return None
+    return sum(max(0, b[cpu] - a[cpu]) for cpu in cpus) / 1000
+
+
+def zope_cpus(
+    samples: list[dict], windows: list[tuple[float, float]]
+) -> tuple[float | None, float | None]:
+    """Return the mean clock of the Zope CPUs over the samples of
+    `windows`, in MHz, and their throttle time in the windows, summed, in
+    seconds. Each is None when the samples do not give it."""
+    clocks: list[float] = []
+    throttle = None
+    for start, end in windows:
+        window = [s for s in samples if start <= s["t"] <= end]
+        clocks += _clocks(window)
+        if len(window) >= 2:
+            seconds = _throttle_seconds(window[0], window[-1])
+            if seconds is not None:
+                throttle = (throttle or 0.0) + seconds
+    clock = round(sum(clocks) / len(clocks), 1) if clocks else None
+    return clock, None if throttle is None else round(throttle, 3)
 
 
 def _store_bytes(a: dict, b: dict) -> int | None:
