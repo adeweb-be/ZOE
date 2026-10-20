@@ -1,0 +1,942 @@
+{
+ "options": {
+  "fixtures": [
+   "small",
+   "medium"
+  ],
+  "step_seconds": 60.0,
+  "warmup": 60.0,
+  "trim": 5.0,
+  "client_objects": 1000,
+  "server_cpus": "0",
+  "zope_cpus": [
+   "1",
+   "3"
+  ],
+  "locust_cpus": "6"
+ },
+ "runs": [
+  {
+   "id": "build-zoe",
+   "kind": "build",
+   "target": "zoe"
+  },
+  {
+   "id": "build-plone-zeo",
+   "kind": "build",
+   "target": "plone-zeo"
+  },
+  {
+   "id": "build-plone-zoeclient",
+   "kind": "build",
+   "target": "plone-zoeclient"
+  },
+  {
+   "id": "prepare-small",
+   "kind": "prepare",
+   "fixture": "small-ba01ff255313",
+   "preset": "small"
+  },
+  {
+   "id": "b5-small-browse-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "browse",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-browse-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "browse",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-catalog-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "catalog",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-catalog-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "catalog",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-mixed-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "mixed",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-mixed-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "mixed",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-edit-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "edit",
+   "users": [
+    1,
+    4,
+    8,
+    16,
+    32
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-edit-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "edit",
+   "users": [
+    1,
+    4,
+    8,
+    16,
+    32
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-create-spread-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "create-spread",
+   "users": [
+    1,
+    4,
+    8,
+    16,
+    32
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-create-spread-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "create-spread",
+   "users": [
+    1,
+    4,
+    8,
+    16,
+    32
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-folder-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "contention-folder",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-folder-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "contention-folder",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-fields-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "contention-fields",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-fields-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "contention-fields",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-same-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "contention-same",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-small-contention-same-zeo",
+   "kind": "b5",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "stack": "zeo",
+   "scenario": "contention-same",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "summary-small",
+   "kind": "summary",
+   "fixture": "small-ba01ff255313",
+   "preset": "small",
+   "runs": [
+    "b5-small-browse-zeo",
+    "b5-small-browse-zoe-native-qi-kv",
+    "b5-small-catalog-zoe-native-qi-kv",
+    "b5-small-catalog-zeo",
+    "b5-small-mixed-zeo",
+    "b5-small-mixed-zoe-native-qi-kv",
+    "b5-small-edit-zoe-native-qi-kv",
+    "b5-small-edit-zeo",
+    "b5-small-create-spread-zeo",
+    "b5-small-create-spread-zoe-native-qi-kv",
+    "b5-small-contention-folder-zoe-native-qi-kv",
+    "b5-small-contention-folder-zeo",
+    "b5-small-contention-fields-zeo",
+    "b5-small-contention-fields-zoe-native-qi-kv",
+    "b5-small-contention-same-zoe-native-qi-kv",
+    "b5-small-contention-same-zeo"
+   ]
+  },
+  {
+   "id": "prepare-medium",
+   "kind": "prepare",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium"
+  },
+  {
+   "id": "b5-medium-browse-zeo",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zeo",
+   "scenario": "browse",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-browse-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "browse",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-catalog-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "catalog",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-catalog-zeo",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zeo",
+   "scenario": "catalog",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-edit-zeo",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zeo",
+   "scenario": "edit",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-edit-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "edit",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-create-spread-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "create-spread",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-create-spread-zeo",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zeo",
+   "scenario": "create-spread",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-mixed-zeo",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zeo",
+   "scenario": "mixed",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": null,
+   "switches": {
+    "backends": [],
+    "member_properties": false,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "b5-medium-mixed-zoe-native-qi-kv",
+   "kind": "b5",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "stack": "zoe-native-qi-kv",
+   "scenario": "mixed",
+   "users": [
+    4,
+    16
+   ],
+   "step_seconds": 60.0,
+   "warmup_seconds": 60.0,
+   "trim_seconds": 5.0,
+   "pinning": {
+    "server_cpus": "0",
+    "zope_cpus": [
+     "1",
+     "3"
+    ],
+    "locust_cpus": "6"
+   },
+   "profile": "zoe.plone:default",
+   "switches": {
+    "backends": [
+     "indexing",
+     "locking"
+    ],
+    "member_properties": true,
+    "split_merges": null,
+    "folder_orders": null
+   }
+  },
+  {
+   "id": "summary-medium",
+   "kind": "summary",
+   "fixture": "medium-8ecaa36fc3c4",
+   "preset": "medium",
+   "runs": [
+    "b5-medium-browse-zeo",
+    "b5-medium-browse-zoe-native-qi-kv",
+    "b5-medium-catalog-zoe-native-qi-kv",
+    "b5-medium-catalog-zeo",
+    "b5-medium-edit-zeo",
+    "b5-medium-edit-zoe-native-qi-kv",
+    "b5-medium-create-spread-zoe-native-qi-kv",
+    "b5-medium-create-spread-zeo",
+    "b5-medium-mixed-zeo",
+    "b5-medium-mixed-zoe-native-qi-kv"
+   ]
+  },
+  {
+   "id": "native-3.13",
+   "kind": "native",
+   "python": "3.13"
+  },
+  {
+   "id": "native-3.14t",
+   "kind": "native",
+   "python": "3.14t"
+  },
+  {
+   "id": "client-3.13",
+   "kind": "client",
+   "python": "3.13",
+   "objects": 1000
+  },
+  {
+   "id": "client-3.14t",
+   "kind": "client",
+   "python": "3.14t",
+   "objects": 1000
+  }
+ ]
+}
