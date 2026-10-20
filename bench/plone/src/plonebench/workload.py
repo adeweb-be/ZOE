@@ -225,13 +225,15 @@ class Targets:
         ]
 
     def shared_doc(self, rank: int) -> str:
-        return f"{corpus.BENCH}/{corpus.SHARED}/doc-{rank % self.spec.shared:03d}"
+        folder = corpus.shared_folder(self.spec)
+        return f"{folder}/doc-{rank % self.spec.shared:03d}"
 
     def pair_doc(self, rank: int) -> tuple[str, str]:
         """The Document and the field of a user of contention-fields: users
         2k and 2k+1 share Document k; the first writes the title, the
         second the description."""
-        doc = f"{corpus.BENCH}/{corpus.SHARED}/doc-{(rank // 2) % self.spec.shared:03d}"
+        folder = corpus.shared_folder(self.spec)
+        doc = f"{folder}/doc-{(rank // 2) % self.spec.shared:03d}"
         return doc, ("title" if rank % 2 == 0 else "description")
 
     def hot_doc(self, rank: int) -> str:

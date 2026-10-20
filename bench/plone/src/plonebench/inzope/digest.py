@@ -2,12 +2,13 @@
 
     run.py ZOPE_CONF digest.py OUT_JSON
 
-Read-only: the script never commits. The digest names each content object
-with its type, the hashes of its fields, its workflow state, its UID, its
-local roles, the roles that have View on it, its dates, its versions and
-its workflow history; the users and groups; the size of the catalog and
-the results of a fixed set of queries. Two stores with the same digest
-hold the same site, as Plone sees it.
+Read-only: the script never commits, so it frees the object cache itself
+as it walks. The digest names each content object with its type, the
+hashes of its fields, its workflow state, its UID, its local roles, the
+roles that have View on it, its dates, its versions and its workflow
+history; the users and groups; the size of the catalog and the results of
+a fixed set of queries. Two stores with the same digest hold the same
+site, as Plone sees it.
 """
 
 import hashlib
@@ -23,6 +24,9 @@ from plone.uuid.interfaces import ATTRIBUTE_NAME
 from zope.component.hooks import setSite
 
 SITE_ID = "Plone"
+# The objects of the walk, and the brains, between two calls of cacheGC.
+GC_OBJECTS = 100
+GC_BRAINS = 1_000
 (out_path,) = sys.argv[1:2]
 newSecurityManager(None, system)
 site = app[SITE_ID]
@@ -49,7 +53,9 @@ def walk(container, prefix):
 
 
 objects = {}
-for path, obj in walk(site, ""):
+for count, (path, obj) in enumerate(walk(site, "")):
+    if count % GC_OBJECTS == 0:
+        app._p_jar.cacheGC()
     base = aq_base(obj)
     if not hasattr(base, "portal_type") or path.startswith("portal_"):
         continue
@@ -87,6 +93,15 @@ for path, obj in walk(site, ""):
         }
 
 brains = catalog.unrestrictedSearchResults(path="/" + SITE_ID)
+
+
+def paths(brains):
+    for count, brain in enumerate(brains):
+        if count % GC_BRAINS == 0:
+            app._p_jar.cacheGC()
+        yield brain.getPath()
+
+
 queries = {
     "documents_published": {"portal_type": "Document", "review_state": "published"},
     "private": {"review_state": "private"},
@@ -113,7 +128,7 @@ digest = {
     "counts": counts,
     "catalog": {
         "size": len(brains),
-        "paths": sha("\n".join(sorted(b.getPath() for b in brains))),
+        "paths": sha("\n".join(sorted(paths(brains)))),
         "queries": results,
     },
     "users": users,
