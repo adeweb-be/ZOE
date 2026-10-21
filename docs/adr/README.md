@@ -28,7 +28,7 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0020](0020-record-frame.md) | The record frame: the header, the checksum with its key space, and the codecs | accepted | Record format |
 | [0021](0021-interactive-sessions.md) | Interactive sessions instead of automated loops | merged into 0018 | Process |
 | [0022](0022-narrow-red-zones.md) | Red zones: the on-disk format, pack and the process files | merged into 0018 | Process |
-| [0023](0023-blob-record.md) | The blob record and the blob directory | accepted; the blob directory waits for the confirmation of the human | Blobs |
+| [0023](0023-blob-record.md) | The blob record and the blob directory | accepted | Blobs |
 | [0024](0024-sequences.md) | Sequences: one row per name, reserved in durable blocks of 100 | accepted | |
 | [0025](0025-pack.md) | Pack: what it removes, batches, and the progress record | accepted; one point waits for the confirmation of the human | |
 | [0026](0026-transaction-index.md) | The transaction index: a `(tid, oid)` key space | accepted | |
