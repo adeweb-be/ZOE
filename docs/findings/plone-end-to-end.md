@@ -1,6 +1,26 @@
 # Finding: where ZOE helps a Plone site, and where it does not yet
 
-The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). One repetition of each run, by the choice of the human, in two series: a Linux VM (items 1–9) and an Apple M3 Pro (items 10–29). Never compare numbers across the two series. Every run here predates ADR 0040 and ADR 0041: `zoe serve` synced with `F_FULLFSYNC` on macOS and compressed its records with zstd at level 3. Since then it syncs with `fsync(2)` on macOS and writes raw records by default, so the sync times and the bytes of a commit on `main` differ from the ones below; the harness now gives both servers `fsync(2)` on macOS by default (`--zeo-fsync plain`). Every scenario ran on its stacks with the current harness on macOS, on the small fixture and partly on the medium fixture; every run passed its verification. `docs/handoffs/ZOE-202.md` gives the state and what is left. The commits named here are on the ref of pull request #409: `git fetch origin pull/409/head` gets them.
+The Plone end-to-end benchmark (B5, `just bench plone`, see `bench/README.md`). One repetition of each run, by the choice of the human, in two series: a Linux VM (items 1–9) and an Apple M3 Pro (items 10–29). Never compare numbers across the two series. Every run here predates ADR 0040 and ADR 0041: `zoe serve` synced with `F_FULLFSYNC` on macOS and compressed its records with zstd at level 3. Since then it syncs with `fsync(2)` on macOS and writes raw records by default, so the sync times and the bytes of a commit on `main` differ from the ones below; the harness now gives both servers `fsync(2)` on macOS by default (`--zeo-fsync plain`). Every scenario ran on its stacks with the harness of the series on macOS, on the small fixture and partly on the medium fixture; every run passed its verification. The commits named here are on the ref of pull request #409: `git fetch origin pull/409/head` gets them.
+
+## Method
+
+`bench/README.md` ("The Plone end-to-end benchmark") describes the harness: the scenarios, the ledger, the verification, the probes and the report. The runs of this finding used it as follows.
+
+- **Stacks.** Every setting but the storage section is the same on each stack.
+
+  | Stack | Server | Client |
+  | --- | --- | --- |
+  | `zeo` | ZEO 6.2 `runzeo`, FileStorage, pickle protocol Z5; the server resolves conflicts | `<zeoclient>`: `ZEO.ClientStorage` |
+  | `zoe-native` | `zoe serve` with no option: zstd at level 3, a lock timeout of 10 s, a redb cache of 1 GiB | `<zoeclient>` with the native client, the `sequences` extension and `zoe.plone`, which gives `portal_uidgenerator` its ids from a store sequence |
+  | `zoe-asyncio` | the same | `<zoeclient>` with `native false`: the asyncio client of ZEO with the ZOE extensions |
+  | `zoe-stock` | the same | `<zeoclient>`: the stock client, with no extension |
+
+  On `zoe serve` the clients resolve the conflicts (tier 3). No stack had a merge of tier 1 or tier 2, shadow mode or early write-intent locks: none of them was built.
+- **Constants.** Two Zope instances of two threads each. A ZODB cache of 30,000 objects per connection and a pool of 7. A client cache of 128 MB in memory for each instance, with no persistent cache file. A blob cache for each instance. Zope runs with `debug-mode off`. Plone 6.1.5, Zope 5.14.2, ZODB 6.2, ZEO 6.2, plone.restapi 9.15.6, CPython 3.13 with the GIL. Both servers make a commit durable before `tpc_finish` returns. On Linux, the server runs on CPU 0, the instances on CPUs 1 and 2, and Locust on CPU 3.
+- **Fixtures.** `small-ba01ff255313`: 685 content objects (57 Folders, 468 Documents, 104 News Items, 52 Files of 16 KB, 128 KB and 1 MB, 4 Collections), 48 editors, 32 members, an importer and a maintainer. `Data.fs` holds 31 MB and the blobs 21 MB. `medium-8ecaa36fc3c4`: 4,865 content objects. `zoe convert` copied each `Data.fs` to a store whose logical digest is equal. Both stores hold zstd records.
+- **Steps.** A closed workload with no think time and no client retry. Unless an item says otherwise: steps of 1, 4 and 16 users of 45 s each, the first 5 s of each step left out, and a warmup of 45 s with 8 users that saves no content.
+- **Conflict oids.** A script walked a read-only copy of the fixture: the catalog (metadata, uids, paths, each index down to its buckets and tree sets), the lexicons and three tools. It named the structure that holds each oid of a conflict. An oid that a run created, such as the bucket of a split, needs the store that the run kept (`--keep-store`).
+- **Bytes of a commit** (items 14 and 28). A program outside the workspace replays commits on a copy of the fixture store, through a `Vfs` that counts the writes to `zoe.redb`. Each commit rewrites k existing objects with their own pickles, 100 commits for each case: k objects at random oids, k adjacent oids, or the oid sets of the transactions of the kept ZEO stores.
 
 ## The Linux series
 
