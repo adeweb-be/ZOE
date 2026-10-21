@@ -654,24 +654,8 @@ fn sequence_items(node: &Node) -> Vec<&Node> {
 fn extent(node: &Node) -> (usize, usize) {
     match node {
         Node::Tuple(tuple) => (tuple.items.len(), 0),
-        Node::List(list) => (
-            list.initial.as_ref().map_or(0, Vec::len)
-                + list
-                    .batches
-                    .iter()
-                    .map(|batch| batch.items.len())
-                    .sum::<usize>(),
-            list.batches.len(),
-        ),
-        Node::Dict(dict) => (
-            dict.initial.as_ref().map_or(0, Vec::len)
-                + dict
-                    .batches
-                    .iter()
-                    .map(|batch| batch.items.len())
-                    .sum::<usize>(),
-            dict.batches.len(),
-        ),
+        Node::List(list) => (list.items().count(), list.batches.len()),
+        Node::Dict(dict) => (dict.entries().count(), dict.batches.len()),
         _ => (0, 0),
     }
 }

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Tid, TxnInfo, ZoeError};
 use zoe_loupe::{Folder, HISTORY_LIMIT, Revision, oid_repr, tid_repr};
+use zoe_pickle::decode_class_key;
 
 use crate::ops::ToolError;
 
@@ -54,20 +55,11 @@ fn note(bytes: &[u8]) -> String {
     text
 }
 
-/// Return the class of a record: `module.name` from its class pickle, or
-/// `None` when the class pickle gives no name.
-fn class_of(data: &[u8]) -> Option<String> {
-    match zoe_pickle::decode_class_name(data) {
-        Ok(Some((module, name))) => Some(format!("{module}.{name}")),
-        _ => None,
-    }
-}
-
 /// One record of a transaction: the oid, the class and the size.
 fn object_json(oid: Oid, data: Option<&[u8]>) -> Value {
     json!({
         "oid": oid_repr(oid),
-        "class": data.and_then(class_of),
+        "class": data.and_then(|data| decode_class_key(data).ok().flatten()),
         "size": data.map_or(0, <[u8]>::len),
     })
 }
@@ -187,7 +179,10 @@ fn summary(txn: &TxnInfo) -> Value {
     for record in &txn.records {
         let data = record.data.as_deref();
         let class = match data {
-            Some(data) => class_of(data).unwrap_or_else(|| PackReport::UNKNOWN_CLASS.to_owned()),
+            Some(data) => decode_class_key(data)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| PackReport::UNKNOWN_CLASS.to_owned()),
             None => DELETED.to_owned(),
         };
         *classes.entry(class).or_default() += 1;
@@ -214,7 +209,7 @@ pub(crate) fn recent_writers(folder: &Folder, oid: Oid) -> Result<Value, ToolErr
     revisions.truncate(REVISION_LIMIT);
     // A deletion has no current record, so it has no class.
     let class = match folder.store().load(oid) {
-        Ok((data, _)) => class_of(&data),
+        Ok((data, _)) => decode_class_key(&data).ok().flatten(),
         Err(ZoeError::NotFound { .. }) => None,
         Err(error) => return Err(zoe_loupe::Error::from(error).into()),
     };

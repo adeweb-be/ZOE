@@ -24,6 +24,7 @@ use std::ops::ControlFlow;
 
 use serde::Serialize;
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
+use zoe_pickle::decode_class_key;
 
 use crate::{Error, Result, Snapshot, serialize_oid, serialize_tid, strong_references};
 
@@ -229,15 +230,6 @@ fn report(
     }
 }
 
-/// Return the class key of a record: `module.name` from its class pickle,
-/// or `None` when the class pickle gives no name.
-fn class_of(data: &[u8]) -> Option<String> {
-    match zoe_pickle::decode_class_name(data) {
-        Ok(Some((module, name))) => Some(format!("{module}.{name}")),
-        _ => None,
-    }
-}
-
 /// A record that `space` keeps among the largest: the key of the heap,
 /// from its size and its oid, then its class.
 type Kept = (Reverse<(u64, Reverse<Oid>)>, Option<String>);
@@ -257,7 +249,7 @@ pub(crate) fn space(
     let mut done = 0;
     while let Some(record) = store.record_iternext(next)? {
         let size = record.data.len() as u64;
-        let class = class_of(&record.data);
+        let class = decode_class_key(&record.data).ok().flatten();
         let key = class.as_deref().unwrap_or(PackReport::UNKNOWN_CLASS);
         match space.by_class.get_mut(key) {
             Some(totals) => totals.add(size),
@@ -423,7 +415,9 @@ pub(crate) fn path_space(
     }
     items.truncate(ITEM_LIMIT);
     let class_at = |oid| -> Result<Option<String>> {
-        Ok(view.record(oid)?.and_then(|(data, _)| class_of(&data)))
+        Ok(view
+            .record(oid)?
+            .and_then(|(data, _)| decode_class_key(&data).ok().flatten()))
     };
     let items = items
         .into_iter()

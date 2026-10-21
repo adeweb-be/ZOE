@@ -470,16 +470,11 @@ impl Snapshot<'_> {
 fn strong_references(record: &[u8]) -> std::result::Result<Vec<Oid>, String> {
     let ids = zoe_pickle::persistent_ids(record)
         .map_err(|e| format!("the references do not decode: {e}"))?;
-    ids.into_iter()
-        .filter_map(|id| match id {
-            zoe_pickle::PersistentId::Oid(bytes) => Some(bytes),
-            _ => None,
-        })
-        .map(|bytes| {
-            let bytes: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| "the references do not decode: an oid is not 8 bytes".to_owned())?;
-            Ok(Oid(u64::from_be_bytes(bytes)))
+    ids.iter()
+        .filter_map(zoe_pickle::PersistentId::oid_u64)
+        .map(|oid| {
+            oid.map(Oid)
+                .map_err(|_| "the references do not decode: an oid is not 8 bytes".to_owned())
         })
         .collect()
 }

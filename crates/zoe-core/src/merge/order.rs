@@ -55,13 +55,11 @@ pub(crate) const POS_CLASSES: [&str; 2] = ["BTrees.OIBTree.OIBTree", "BTrees.OIB
 /// Tells if `record` is of the class of the order list. Reads the class
 /// pickle alone.
 pub(crate) fn is_list(record: &[u8]) -> bool {
-    class_of(record).as_deref() == Some(LIST_CLASS)
-}
-
-/// Returns the class of `record` as `module.name`, from its class pickle.
-fn class_of(record: &[u8]) -> Option<String> {
-    let (module, name) = zoe_pickle::decode_class_name(record).ok()??;
-    Some(format!("{module}.{name}"))
+    zoe_pickle::decode_class_key(record)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(LIST_CLASS)
 }
 
 /// Tells if the class pickle of `record` names `class`.

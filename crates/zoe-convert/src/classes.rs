@@ -7,7 +7,7 @@
 //! unpickler runs.
 
 use zoe_core::{Oid, Store, ZoeError};
-use zoe_pickle::{Int, Node, decode_class_name, decode_record};
+use zoe_pickle::{Int, Node, decode_class_key, decode_record};
 
 /// The number of record keys that one read of the walk takes.
 const KEY_CHUNK: usize = 1024;
@@ -61,8 +61,7 @@ pub fn records_of_classes(store: &Store, classes: &[&str]) -> zoe_core::Result<V
 /// Return the class of the record `data` when it is one of `classes` and
 /// the record is not retired.
 fn class_of(data: &[u8], classes: &[&str]) -> Option<String> {
-    let (module, name) = decode_class_name(data).ok()??;
-    let class = format!("{module}.{name}");
+    let class = decode_class_key(data).ok()??;
     if !classes.contains(&class.as_str()) || retired(data) {
         return None;
     }
@@ -78,11 +77,7 @@ fn retired(data: &[u8]) -> bool {
     let Some(Node::Dict(dict)) = tree.resolve(tree.state()) else {
         return false;
     };
-    let mut items = dict
-        .initial
-        .iter()
-        .flatten()
-        .chain(dict.batches.iter().flat_map(|batch| batch.items.iter()));
+    let mut items = dict.entries();
     let (Some((key, _)), None) = (items.next(), items.next()) else {
         return false;
     };

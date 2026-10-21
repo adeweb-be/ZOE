@@ -283,12 +283,7 @@ pub(crate) fn target<'t>(resolver: &Resolver<'t>, pid: &'t Node) -> Option<Targe
 /// Return the items of a list node, in order.
 pub(crate) fn list_items(node: &Node) -> Vec<&Node> {
     match node {
-        Node::List(list) => list
-            .initial
-            .iter()
-            .flatten()
-            .chain(list.batches.iter().flat_map(|batch| &batch.items))
-            .collect(),
+        Node::List(list) => list.items().collect(),
         _ => Vec::new(),
     }
 }
@@ -296,12 +291,7 @@ pub(crate) fn list_items(node: &Node) -> Vec<&Node> {
 /// Return the entries of a dict node, in order.
 pub(crate) fn dict_entries(node: &Node) -> Vec<&(Node, Node)> {
     match node {
-        Node::Dict(dict) => dict
-            .initial
-            .iter()
-            .flatten()
-            .chain(dict.batches.iter().flat_map(|batch| &batch.items))
-            .collect(),
+        Node::Dict(dict) => dict.entries().collect(),
         _ => Vec::new(),
     }
 }

@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
-use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
+use zoe_pickle::{decode_class_key, persistent_ids};
 
 /// The number of record keys that one read of the walk takes.
 const KEY_CHUNK: usize = 1024;
@@ -388,10 +388,10 @@ const DAMAGED_BLOB_FILE: &str =
 /// Count the class of the current record `data` of `oid` at `tid`, and
 /// check its references.
 fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mut Walk) {
-    let class = match decode_class_name(data) {
-        Ok(Some((module, name))) => format!("{module}.{name}"),
-        Ok(None) | Err(_) => PackReport::UNKNOWN_CLASS.to_owned(),
-    };
+    let class = decode_class_key(data)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PackReport::UNKNOWN_CLASS.to_owned());
     *report.classes.entry(class).or_default() += 1;
 
     let ids = match persistent_ids(data) {
@@ -403,15 +403,15 @@ fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mu
         }
     };
     for id in ids {
-        let PersistentId::Oid(bytes) = id else {
-            continue;
+        let target = match id.oid_u64() {
+            None => continue,
+            Some(Ok(target)) => Oid(target),
+            Some(Err(len)) => {
+                let error = format!("a reference has an oid of {len} bytes, not 8");
+                report.pickles.push(PickleProblem { oid, tid, error });
+                continue;
+            }
         };
-        let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-            let error = format!("a reference has an oid of {} bytes, not 8", bytes.len());
-            report.pickles.push(PickleProblem { oid, tid, error });
-            continue;
-        };
-        let target = Oid(u64::from_be_bytes(bytes));
         if target > oid {
             walk.ahead.push((target, oid, tid));
         } else if !walk.has(target) {

@@ -1929,46 +1929,13 @@ impl Stack {
 /// Returns the int of the two's complement bytes of LONG1 or LONG4,
 /// little-endian, if it fits 128 bits.
 fn long(bytes: &[u8]) -> Result<i128, Unsupported> {
-    if bytes.len() > 16 {
-        return Err(Unsupported("an int that does not fit 128 bits"));
-    }
-    let fill = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
-        0xff
-    } else {
-        0
-    };
-    let mut le = [fill; 16];
-    le[..bytes.len()].copy_from_slice(bytes);
-    Ok(i128::from_le_bytes(le))
+    Int::long_to_i128(bytes).ok_or(Unsupported("an int that does not fit 128 bits"))
 }
 
 /// Returns the value of an int node, if it fits 128 bits.
 fn int_value(int: &Int) -> Result<i128, Unsupported> {
-    let too_large = Unsupported("an int that does not fit 128 bits");
-    match int {
-        Int::U8(value) => Ok(i128::from(*value)),
-        Int::U16(value) => Ok(i128::from(*value)),
-        Int::I32(value) => Ok(i128::from(*value)),
-        Int::Long { bytes, .. } => {
-            if bytes.len() > 16 {
-                return Err(too_large);
-            }
-            let fill = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
-                0xff
-            } else {
-                0
-            };
-            let mut le = [fill; 16];
-            le[..bytes.len()].copy_from_slice(bytes);
-            Ok(i128::from_le_bytes(le))
-        }
-        Int::Text(text) => text.trim().parse().map_err(|_| too_large),
-        Int::LongText(text) => text
-            .trim()
-            .trim_end_matches('L')
-            .parse()
-            .map_err(|_| too_large),
-    }
+    int.to_i128()
+        .ok_or(Unsupported("an int that does not fit 128 bits"))
 }
 
 /// The size of a batch of SETITEMS or APPENDS: `BATCHSIZE` of the pickler.
