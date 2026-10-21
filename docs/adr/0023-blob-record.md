@@ -1,73 +1,86 @@
-# 0023. The blob record
+# 0023. The blob record and the blob directory
 
-Status: accepted. ADR 0029 amends the checksum input: the blob-record frame starts with the tag 2 of `blobs`, and the intent frame with the tag 4 of the intent files.
+Status: accepted.
 
 ## Context
 
-F1 asks for `IBlobStorage`. N13 asks for a checksum on every blob, verified on read. N19 and ADR 0016 reserve a BLAKE3 hash in every blob record from the first store written. N1 asks that an acknowledged commit survive a crash at any instruction, blobs included.
+F1 asks for `IBlobStorage`, N13 for a checksum on every blob, verified on read, and N1 for a commit that survives a crash at any instruction, blobs included. ADR 0020 reserves a BLAKE3 hash in every blob record. ZODB tools and ZEO shared blob directories read blob files in ZODB's BushyLayout.
 
-A blob is a file beside the store, immutable per `(oid, tid)`, so that ZODB tools and ZEO shared blob directories can read it. ZODB's BushyLayout is the layout those tools know. The `blobs` row of the data model listed a file name, a size and a checksum, with no byte layout, and the specification gave the path `blobs/<oid hex>/<tid hex>.blob`, which is not BushyLayout.
+The blob file lives in the filesystem and its record in the backend. No single sync makes both durable, so the order of the steps decides what a crash can leave. N7 allows no walk of the blob tree at open: a site can hold hundreds of thousands of blobs.
 
-The blob file lives in the filesystem and its record lives in the backend. No single sync makes both durable, so the order of the steps decides what a crash can leave behind.
+The `blob-dir` key, the acceptance test of `IBlobStorage` and ZODB's blob tests put the blob directory outside the store directory.
 
 ## Decision
 
-**Layout.** The blob store is the directory `blobs/` in the store directory, in ZODB's BushyLayout:
+The blob store as built: specification, "Storage core", "Blobs", and the blob invariants in `crates/zoe-core/CLAUDE.md`.
 
-- `blobs/.layout` holds `bushy`.
-- The file of `(oid, tid)` is `blobs/0xAA/0xBB/…/0xHH/<tid>.blob`: one directory for each of the 8 big-endian bytes of the oid, then the tid as ZODB's `tid_repr` writes it. That is 16 hex digits for every tid that the core allocates.
-- `blobs/tmp/` holds the files of uncommitted blobs and the intent files.
+### Layout
 
-A committed blob file is read-only and never changes. The core creates `blobs/`, `blobs/tmp/` and the layout file with the first blob, so a store without blobs has no blob directory. The layout file is written under a temporary name and renamed into place, so a crash cannot leave a partial one. An open refuses a layout file that does not say `bushy`.
+The blob directory holds the blob files in ZODB's BushyLayout: `.layout` holds `bushy`, and the file of `(oid, tid)` is one directory per big-endian byte of the oid, then the tid as `tid_repr` writes it. `tmp/` holds the uncommitted blob files and the intent files. By default the blob directory is `blobs/` in the store directory. Below, `blobs/` names it, wherever it is.
 
-**The blob record.** The `blobs` key space is a fourth redb table:
+A committed blob file is read-only and never changes. The first blob creates `blobs/`, `blobs/tmp/` and the layout file, so a store without blobs has no blob directory. An open refuses a layout file that does not say `bushy`.
 
-- The key is the 16-byte big-endian `(oid, tid)`, the same key as in `records`.
-- The value is a frame (ADR 0020) with previous serial 0, no flags, codec 0 and no typed-field slots.
-- The payload is 40 bytes: the BLAKE3 hash of the blob file (32 bytes), then the size of the file in bytes as a little-endian `u64`.
+### The blob record
 
-The xxh3 checksum of the frame covers the key, so a damaged hash, or a row stored under another key, is an error and never a wrong hash. The row holds no file name, because the layout gives the name from `(oid, tid)`. A new store gets an empty `blobs` table when it is created, with the other tables. Only a store written before this table gets it at its first blob commit; until then it reads as a store without blob records. So the format name stays `ZOE format 1`.
+The `blobs` key space has the `(oid, tid)` key of `records`. Its value is a frame (ADR 0020, tag 2) whose 40-byte payload is the BLAKE3 hash of the file, then its size as a little-endian `u64`. The row holds no file name: the layout gives it. A new store creates the table; a store without it gets it at its first blob commit.
 
-**The hash goes in the backend transaction.** `WriteTxn::put_blob` stages the blob record in the write transaction that holds the record, and `Backend::load_blob` reads it. So the hash becomes durable in the same commit as the record, never before and never after. These are two new required methods. No existing signature changes.
+### The hash goes in the backend transaction
 
-**Finish.** `store_blob` syncs the temporary file. The hash is computed while the client writes the file, so finish does not read the file again. After finish allocates the tid and before the backend commit, it does these steps in order:
+`WriteTxn::put_blob` stages the blob record in the write transaction that holds the record, and `Backend::load_blob` reads it. Every backend implements both. So the hash is durable in the same commit as the record.
 
-1. It writes the intent file `blobs/tmp/0x<16 hex digits of the tid>.intent`, syncs it and syncs `blobs/tmp/`. The intent is a frame under the 8-byte tid key. Its payload is the oids of the blobs, 8 big-endian bytes each.
-2. For each blob, it creates the missing oid directories one level at a time and syncs the parent of each new one. Then it makes the file read-only, renames it into its place and syncs the oid directory.
-3. It commits the backend write transaction, which holds the records, the blob records, the transaction row and the meta update.
-4. It removes the intent file without a sync.
+### Finish
 
-**Recovery.** Opening a store reads only `blobs/tmp/` and the oid directories that its intent files name. First it syncs, from the top down, the parent of each existing level of each of those oid directories. Then it removes every named blob file that has no blob record, and syncs the directory of each named oid without a blob record, also when the file is already gone: an open that a crash stopped can have removed the file without that sync, and a power loss would bring it back. Last, it removes the intent files and the temporary files and syncs `blobs/tmp/`. It removes only regular files there, and leaves any other entry. An intent file whose frame does not decode was never synced, so its finish created no directory and renamed no file, and the open only removes it. A read-only open, such as the one of Loupe, does none of this: it only checks the layout file. A blob file without its blob record stays invisible to it, because every blob read starts from the blob record, and the next writer open removes the file.
+`store_blob` computes the hash while the client writes the temporary file, then syncs the file. After finish allocates the tid, and before the backend commit, it writes and syncs the intent file `blobs/tmp/0x<16 hex digits of the tid>.intent` and syncs `blobs/tmp/`. The intent file is a frame under the tid key (tag 4) whose payload is the oids of the blobs, 8 big-endian bytes each. Then it creates the missing oid directories, each synced into its parent, and makes each blob file read-only, renames it into place and syncs its directory. Last, it commits and removes the intent file without a sync.
 
-**A directory that exists is not always durable.** A process killed between a mkdir and the sync of its parent leaves, in the page cache, a directory that a later power loss can remove. A new process that finds the directory does not create it again, so it must sync it on its own. The first blob file of a process syncs the parents of `blobs/` and `blobs/tmp/` even when they exist. A finish creates oid directories only after its intent file is durable, and a killed finish leaves its intent file, so the syncs of the open cover every oid directory that a killed process can leave.
+### Recovery
 
-**Reads.** `open_blob` returns a reader that hashes the bytes as it reads them. At the end of the file it compares the size and the hash with the blob record. A mismatch fails that read with `InvalidData`, and the error holds `CorruptBlob { oid, tid }`. `verify_blob` reads the whole file and returns `CorruptBlob`. A missing file is also `CorruptBlob`.
+A writer open runs the recovery only when the layout file exists. It reads only `blobs/tmp/` and the oid directories that its intent files name, so its work does not grow with the store. It removes each named blob file that has no blob record and syncs its directory, then removes the intent files and the temporary files. A read-only open only checks the layout file: a blob file without its blob record stays invisible, because every blob read starts from its record.
 
-## Why a crash at any point is safe
+A directory that exists is not always durable: a killed process can stop between a mkdir and the sync of its parent. So the first blob file of a process, and the recovery, sync the parent directories again even when they exist.
 
-- **Before the intent file is durable.** No file has been renamed yet. The open removes the temporary files. The commit is absent and was not acknowledged.
-- **After the intent file, before the backend commit.** Some blob files can be in place without a blob record. The intent file names them, and the open removes them. The commit is absent and was not acknowledged.
-- **After the backend commit.** Each blob file and its directory entry were synced before the commit, so every blob record has its file. If the intent file is still there, it names files that have their blob records, and the open keeps them.
-- **During the open.** The removals of the orphan files are synced before the removal of their intent file. So a crash during the open leaves either the intent file, and the next open removes the orphans, or no orphan. The next open syncs the directory of each orphan also when the file is gone, because the removal of the stopped open can sit in the page cache only.
-- **A killed process, a restart, then a power loss.** The killed process leaves operations that are not synced. The open and the first blob file of the next process sync the directories that it can leave, so a later commit does not depend on them.
+### Reads
 
-The crash simulation checks this. `MemVfs` records each sync per directory. The acceptance test opens the store on every crash image of a blob commit. Unit tests open every image of a crash during recovery, and every image after a process is killed at a directory sync and the next process commits a blob.
+`open_blob` hashes the bytes as it reads them and checks the size and the hash at the end of the file. A mismatch fails that read with `InvalidData` that holds `CorruptBlob { oid, tid }`. `verify_blob` reads the whole file. A missing file is also `CorruptBlob`.
 
-## Why the open reads only `blobs/tmp/`
+### The blob directory is an option of the core
 
-N7 bounds the startup time of a large store and allows no index rebuild. A walk of the whole blob tree costs time in proportion to the number of blobs, and a content site can hold hundreds of thousands of them. The intent file names exactly the files that a crash can leave without a record. So the work of an open depends only on the finishes that were in progress at the crash, not on the size of the store.
+`Options::blob_dir` gives the blob directory, and `None` keeps `blobs` in the store directory. `zoe.Storage(path, blob_dir=...)` and the `blob-dir` key map to it (specification, "In-process mode", "Opening").
 
-## Alternatives
+**The names do not change.** The crate-private `Relocated` maps `blobs` and its names onto the blob directory, and the store directory `""` onto its parent. Every other name stays in the store directory, which keeps the store lock. All goes through the `Vfs`, so the crash simulation covers it. No `Vfs` or `Backend` signature and no on-disk format changes.
 
-- **The hash in the typed-field slots of the record frame.** The hash would be durable with the record by construction. But `put_record` and `Record` would change, which is a bigger trait change. The typed-field room would also hold blob data, and pack and the S3 store would lose the `blobs` key space that they need.
-- **A hash file beside each blob file.** The traits would not change. But the hash would not be in the data model, the record checksum would not cover it, the blob tree would hold twice as many files, and dedup by hash (F38) could not use it.
-- **A walk of the blob tree at open, with no intent file.** It saves two syncs per blob commit, but it breaks N7 on a large store.
+**The open checks the path first.** Before it creates anything, `Store::open_with` refuses a path that does not end in a UTF-8 name and an existing entry that is not a directory.
+
+**The store does not record its blob directory.** Each open must give the same one, as with FileStorage. A writer open refuses with `MissingBlobDir` a store with blob records (`Backend::has_blobs`) whose blob directory has no layout file, because the first blob makes the layout file durable before any blob record. zoe-py maps it to `StorageError`.
+
+**One open store per blob directory.** A writer takes an exclusive `flock` on the blob directory itself (`Vfs::lock_dir`) before it reads or removes anything there, and keeps it until the store closes. Another holder fails with `Locked`. A filesystem that cannot lock a directory fails the open.
+
+**A blob directory without a layout file is new or foreign.** The first blob writes the layout file before any other file, so a blob directory without it may hold nothing, an empty `tmp/`, or a `tmp/` with only `layout.tmp`. The open and the first blob refuse anything else with `NotBlobDir`, and change nothing in it.
+
+### Why a crash at any point is safe
+
+A crash before the backend commit leaves only temporary files and blob files that an intent file names, and the next writer open removes them. After the commit, every blob record has its synced file. The open syncs its removals before it removes an intent file. The crash simulation checks every crash image of a blob commit and of a recovery.
 
 ## Consequences
 
-- After any crash, every blob record has its file, and a blob file without a record lives only until the next open.
-- A blob commit costs these syncs on top of the backend commit: one for each blob file, one for the intent file, one for `blobs/tmp/`, one for each oid directory, and one for the parent of each new directory. The first blob file of a process adds two directory syncs.
-- A read through `open_blob` verifies the blob. A reader that stops before the end, or a client that opens the path from `blob_path` itself, checks nothing. `verify_blob` and scrub cover those cases.
-- ZODB tools and ZEO shared blob directories can read `blobs/` as it is.
-- The S3 blob store and dedup by hash (F38) can use the hash that is already in every blob record.
-- Every backend implements `put_blob` and `load_blob`.
+- After any crash, every blob record has its file. A blob file without a record lives until the next writer open.
+- A blob commit costs one sync per blob file, one for the intent file, one for `blobs/tmp/`, one per oid directory and one per new directory, on top of the backend commit.
+- A partial read, or a client that opens the path from `blob_path`, checks nothing. `verify_blob` and scrub cover them.
+- The S3 blob store and dedup by hash (F38) can use the hash in every blob record.
+- A copy of a store with another blob directory needs a copy of that directory, as with FileStorage.
+- A wrong or missing `blob_dir` fails the open of a store with blobs, and deletes no blob file.
+- One case stays open: another store that opens by mistake with the blob directory of a crashed store can remove a blob file that the crashed store committed. Only a store identity, a format change, would tell them apart. So each store needs its own blob directory.
+
+## Alternatives
+
+- **The hash in the typed-field slots of the record frame.** A bigger trait change, and pack and the S3 store lose the `blobs` key space.
+- **A hash file beside each blob file.** Outside the data model and its checksum, twice the files, no dedup by hash.
+- **A walk of the blob tree at open, with no intent file.** It saves two syncs per commit but breaks N7.
+- **A symbolic link `<path>/blobs` to another directory.** A copy of the store keeps the link, so its recovery can delete committed blob files of the original. `zope.testing` cannot remove the link.
+- **The blob directory in `meta`.** A data-model change, and a copied store still points at the original.
+- **A lock file in the blob directory.** A format change; the lock on the directory does the same work.
+- **A store identity in the blob directory.** A format change.
+- **Only `<path>/blobs`.** The acceptance test and the configuration need another directory.
+
+## Merged ADRs
+
+- ADR 0027, the blob directory is an option of the core: Decision, "The blob directory is an option of the core", with the default place in "Layout" and the recovery rule in "Recovery".
