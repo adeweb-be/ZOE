@@ -2,18 +2,20 @@
 
 @Antoine Duchêne
 
-This document is the technical specification: what ZOE is and how it works. The way of working, the units of work, the sessions, the roadmap and the project organisation are in ZOE — working methods and roadmap.
+This document is the technical specification: what ZOE is and how it works. The way of working, the units of work, the sessions, the roadmap and the project organisation are in ZOE — working methods and roadmap (`working-methods.md`). The decisions and their reasons are in the ADRs (`docs/adr/`).
+
+The sections describe the design, built or not. The section "Status" says what works today.
 
 ## Summary
 
 ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use unchanged: in-process for a single Zope instance, or behind a tokio server that speaks the existing ZEO wire protocol for a cluster. It aims to be the fastest storage backend available for Plone while staying ACID, and it attacks ConflictError at the storage layer with per-object locking and native conflict resolution.
 
-**Goals**
+### Goals
 
 1. Drop-in for Plone 6: the only configuration change is the storage stanza in `zope.conf` (`<zoe>` or a `<zeoclient>` pointed at the Rust server). No change to application code, `persistent`, `BTrees` or `transaction`. A `<zeoclient>` against `zoe serve` needs the `msgpack` package, because the server speaks only the msgpack protocol `M5` (F2); `zoedb[plone]` installs it.
 2. Fastest measured Plone storage: beats `FileStorage`, ZEO and RelStorage on Postgres on the same `zodbshootout` harness, cold, warm and hot.
 3. Async where it pays: the server is fully asynchronous (tokio), handles pipelined requests per connection, and exposes an async storage interface for future async clients. The ZODB object model stays synchronous.
-4. ACID by construction: atomic two-phase commit, durable on `tpc_finish` (fsync or replicated acknowledgement; the one exception is the deferred restore of the `Data.fs` converter, durable at its next batch sync, see **Tids**), snapshot isolation through MVCC keyed by `(oid, tid)`, and crash recovery without a repair step of ZOE: the last durable commit is the state. After a killed writer, the first writer open repairs the file and can take longer, because redb rebuilds its free-space map.
+4. ACID by construction: atomic two-phase commit, durable on `tpc_finish` (fsync or replicated acknowledgement; the one exception is the deferred restore of the `Data.fs` converter, durable at its next batch sync, see "Tids"), snapshot isolation through MVCC keyed by `(oid, tid)`, and crash recovery without a repair step of ZOE: the last durable commit is the state. After a killed writer, the first writer open repairs the file and can take longer, because redb rebuilds its free-space map.
 5. Fewer ConflictErrors under heavy writes: per-OID commit locks, optional early write-intent locks, and conflict resolution in Rust for structures and for fields, with Python only on the client for the long tail.
 6. Two deployment shapes from one crate: in-process (no server) and clustered (server), same on-disk format, switchable by restarting.
 7. Cloud-native on Kubernetes in three tiers: single-replica StatefulSet, leader/follower with automatic failover, stateless fronts over FoundationDB or TiKV.
@@ -23,60 +25,68 @@ ZOE (Zope Object Engine) is a ZODB storage written in Rust that Plone can use un
 11. AI-native: an MCP server for ops and content agents with Plone's permissions enforced before ranking, and native retrieval with chunked passages, local-by-default embeddings, hybrid BM25 and vector search, and a choice of vector backend, ZOE's own index stored in the DB or Qdrant.
 12. Operations as a feature: a checksum on every record, compression and encryption at rest, repozo-style dumps (continuous backup with point-in-time recovery comes after the roadmap), copy-on-write forks, a public change feed, named storages for mount points, and the data tools (verify, rename-class, export) in Rust.
 
-**Non-goals**
+### Non-goals
 
-- Rewriting `persistent` and `BTrees` in Rust. That is a separate, client-side project (section 8 says what is left there).
+- Rewriting `persistent` and `BTrees` in Rust. That is a separate, client-side project ("What stays on persistent and BTrees" says what is left there).
 - An asynchronous persistent-object API (`await obj.load()`). It would break every Plone add-on; the design keeps lazy loading synchronous.
-- ZODB 5 and ZEO 5. ZOE targets ZODB ≥ 6.0 and ZEO ≥ 6.0, which means Plone 6.1 and later; older clients are not supported.
-- Requiring a new client. `ZEO.ClientStorage` stays supported for the life of the project; the native Rust client of F28 ships in phase 3 as a drop-in, never a requirement; the server replaces `runzeo`.
+- ZODB 5 and ZEO 5. ZOE targets ZODB ≥ 6.0 and ZEO ≥ 6.0, which means Plone 6.1 and later; older clients are not supported (ADR 0006).
+- Requiring a new client. `ZEO.ClientStorage` stays supported for the life of the project; the native Rust client of F28 is a drop-in, never a requirement; the server replaces `runzeo`.
 - Multi-tenancy inside one server. Isolation is by process and by named storage (F22); per-storage quotas are the only shared-server feature.
-- The sixteen features triaged as Won't in the roadmap's Feature triage section, among them agent branches with merge-back, actor-tagged transactions, read replicas with session tokens, WASM plugins, server-side subtree clone and blocks as CRDT documents. Everything else from that triage has a requirement above (F29 to F38, N18, N19) or waits after the roadmap.
+- The sixteen features triaged as Won't in the roadmap's Feature triage section, among them agent branches with merge-back, actor-tagged transactions, read replicas with session tokens, WASM plugins, server-side subtree clone and blocks as CRDT documents. Everything else from that triage has a requirement below (F29 to F38, N18, N19) or waits after the roadmap.
 
-**Success criteria**
+### Success criteria
 
 - Plone 6 test suites (`Products.CMFPlone`, `plone.app.contenttypes`, `plone.restapi`) pass against both modes with no skips attributed to the storage.
 - `ZODB.tests` conformance suites and the ZEO client test suite pass against the server.
-- On the reference benchmark machine, `zodbshootout` shows lower latency and higher throughput than ZEO and RelStorage/Postgres in every scenario, by a margin recorded in section 11.
+- On the reference benchmark machine, `zodbshootout` shows lower latency and higher throughput than ZEO and RelStorage/Postgres in every scenario, by the margins of "Acceptance thresholds".
 - A crash test (`kill -9` or power cut at any point of `tpc_finish`) never loses an acknowledged transaction and never needs manual repair.
 - On a write-heavy replay of production traffic, ConflictErrors raised to Zope drop by at least an order of magnitude against ZEO with the same data.
 
+## Status
+
+What works today, by area. A part of the design that this table does not name is not built.
+
+| Area | Works today | Not built |
+| --- | --- | --- |
+| Storage core | the redb backend; the record frame with its checksums and the codecs raw and zstd; two-phase commit with per-OID locks, group commit and the lock hand-off; the transaction index, the object count, sequences and KV namespaces; online pack, with and without garbage collection, and its dry run; blobs in a directory; undo; the size limits and the slow-lock and slow-transaction logs; the `Vfs` crash simulation | keys of `<zoe>` and `zoe serve` for `staging-memory` and the size limits, which are options of the core only; counters for `lock-warn` and `transaction-warn`; the retention window and incremental pack; the append-only log backend, FoundationDB and TiKV; the S3 blob store; the zstd dictionary; encryption; `zoe scrub` |
+| Conflict resolution | tiers 1, 2 and 3; shadow mode, with the verification of a merge; the resolution log; the posting-dict rule and the first-key rule; the split merge; the order merge; the merge policy; early write-intent locks | a named native merge of tier 2 |
+| In-process storage | `zoe.Storage` with the interfaces of "Python surface"; the `<zoe>` section and `zoe://`; the stop by a signal | the read-only open of the core for `read_only=True`; `IMVCCStorage` |
+| Server | `zoe serve` with the whole protocol matrix; named storages; read-only stores; unix domain sockets; TLS with read-only client certificates; the configuration file and `<zoe-server>`; the admin port with health, readiness and metrics; logs; traces; the extensions `sequences`, `kv`, `lock_intent`, `trace_context` and `server_writes`; the idle and transaction timeouts; the stop on a signal | per-storage quotas; maintenance mode and `zoe admin`; the change feed; the reload of a certificate; the readiness of a replica |
+| Native client | `zoe.zeo.ClientStorage` on `zoe-client`: a pool of connections, the client cache in memory or in a file, blobs in both modes, conflict resolution in the client, reconnects with the verification of the cache, TLS, unix domain sockets, several addresses, and the rest of the storage API of `ZEO.ClientStorage` | the shared cache of a node (F38); call timeouts in `zoe-client`; the awaitables of the async interface; an encrypted client key (`password-function`) and v1 server certificates |
+| `zoe.plone` | the ids of `portal_uidgenerator` from a sequence; the merge policy derived from Dexterity schemas; `WorkflowHistory` and `PrincipalProperties`; the locking, queued indexing and registry backends; the mark of the writes-on-GET report | a session data manager; `zoe.plone.catalog` and `ZoeTextIndex`; the reindex queue of Loupe |
+| Tools | `zoe convert` from and to `Data.fs`; `zoe verify`; `zoe backup` and `zoe restore` with dumps; `zoe pack`, with `--dry-run`; `zoe mcp` with its read-only ops tools and prompts on a store folder, over stdio | the RelStorage and ZOE-to-ZOE converters; `zoe fork`, `zoe feed`, `zoe scrub`, `zoe rename-class`, `zoe export`, `zoe replay` and `zoe admin`; dumps to a bucket, a backup through the server, and continuous backup; `zoe mcp` inside `zoe serve` or against a server, its `tail` resource, its content tools and streamable HTTP |
+| Loupe | folder mode: the object browser, time travel and the space screen | server mode, the live tail, the integrity and operations screens, the editor, the converter screen |
+| Catalog and retrieval | nothing | `zoe-catalog`, the native text index, the projection and `zoe-vectors` |
+| Deployment | the Tier 1 manifests, the systemd and supervisor units, the Grafana dashboard | Tier 2, Tier 3 and the Helm chart |
+| Harness | the conformance suites; `zodbshootout` with `just bench gate`; the native gate; the client benchmark (B7); `zoe-bench`; the Plone end-to-end benchmark (B5) and the log replay (B6); the kill loop; the deterministic simulation; the fuzz targets of `zoe serve` | the power-loss emulation (C3); the `kind` cluster (F); the regression gate of each pull request |
+
 ## Naming
 
-ZOE, the Zope Object Engine, is the project name: an anagram of ZEO, a first name, and an acronym in the ZODB/ZEO/ZRS tradition. The stem for every identifier is `zoe`, written ZOE in prose. The PyPI name `ZOE` is held by an abandoned OpenGL toy and the crates.io name `zoe` by an active CDC genomics crate, so the distribution ships as `zoedb` while a PEP 541 transfer of `ZOE` is requested, and no bare `zoe` crate is published.
+ZOE, the Zope Object Engine, is the project name: an anagram of ZEO, a first name, and an acronym in the ZODB/ZEO/ZRS tradition. The stem for every identifier is `zoe`, written ZOE in prose. The distribution ships as `zoedb`, because other projects hold the PyPI name `ZOE` and the crates.io name `zoe`; a PEP 541 transfer of `ZOE` is requested, and no bare `zoe` crate is published (ADR 0017).
 
-**Candidates**
-
-| Name | Why | Outcome |
-| --- | --- | --- |
-| ZOE — Zope Object Engine | anagram of ZEO; a first name like Jim Fulton's Newt DB; Z-prefixed acronym like ZODB, ZEO, ZRS | chosen |
-| ZEAL — Zope Enterprise Append Log | echoes ZEO's expansion; a real word; close to *zèle* in French | runner-up |
-| rebost | Catalan for pantry, in the Pastanaga/Barceloneta/Volto tradition | not chosen |
-| meuse | the river at Namur; local rather than community | not chosen |
-| keel, ferro, rustzodb | generic, Rust-flavoured or dull | not chosen |
-
-**Conventions derived from the stem `zoe`**
+### Conventions derived from the stem `zoe`
 
 | Thing | Name | Rule |
 | --- | --- | --- |
 | repository | `adeweb-be/ZOE` (the GitHub organisation is `adeweb-be`; the owner is adeweb) | one monorepo: `crates/` for Rust, `python/` for the extension and Python packages, `deploy/` for Helm and manifests |
-| Rust crates | `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py`, zoe-catalog, zoe-vectors, zoe-mcp, `zoe-bench` | hyphens in crate names, `snake_case` modules, newtypes `Oid`, `Tid`, errors `ZoeError`; no bare `zoe` crate (taken on crates.io) |
+| Rust crates | `zoe-core`, `zoe-server`, `zoe-client`, `zoe-py`, `zoe-catalog`, `zoe-vectors`, `zoe-mcp`, `zoe-bench`, `zoe-loupe`, `zoe-pickle`, `zoe-convert` | hyphens in crate names, `snake_case` modules, newtypes `Oid`, `Tid`, errors `ZoeError`; no bare `zoe` crate (taken on crates.io) |
 | Python distribution | `zoedb` on PyPI (`ZOE` pending a PEP 541 transfer) | same version number as the crates; the wheel pins the exact core version |
-| Python import | `zoe` with `zoe.storage`, `zoe.serve`, `zoe.zeo`, `zoe.zodb`, `zoe.asyncio`, `zoe.kv`, `zoe.testing` | no hyphens, PEP 8 inside |
+| Python import | `zoe` with `zoe.storage`, `zoe.serve`, `zoe.zeo`, `zoe.zodb`, `zoe.asyncio`, `zoe.kv`, `zoe.policy`, `zoe.testing` | no hyphens, PEP 8 inside |
 | CLI | `zoe` with subcommands `serve`, `pack`, `backup`, `restore`, `verify`, `scrub`, `convert`, `fork`, `feed`, `rename-class`, `export`, `admin`, `mcp` | one binary, one console script of the same name |
 | `zope.conf` stanza | `<zoe>` after `%import zoe`; keys in kebab-case (`lock-timeout`, `early-locks`); `<zoeclient>` for `zoe.zeo.ClientStorage` | `<zoe>` mirrors `<filestorage>`; `<zoeclient>` takes every key of `<zeoclient>`, `wait-timeout`, `native`, `early-locks`, `early-lock-classes` and an `<ssl>` section |
 | URI scheme | `zoe://` for `zodburi` | path and query mirror the stanza keys |
 | environment | `ZOE_*` in SCREAMING\_SNAKE | every stanza key has an environment twin |
-| protocol extensions | `sequences`, `kv`, `lock_intent`, `trace_context` | snake\_case like ZEO method names |
+| protocol extensions | `sequences`, `kv`, `lock_intent`, `trace_context`, `server_writes` | snake\_case like ZEO method names |
 | metrics | `zoe_*` Prometheus names | histograms in seconds, counters with `_total` |
 | container image | `ghcr.io/adeweb-be/zoe` | tags equal release versions |
-| Kubernetes | `app.kubernetes.io/name: zoe`, role label \`zoe/role: leader | follower\` |
+| Kubernetes | `app.kubernetes.io/name: zoe`, and the label `zoe/role` with the value `leader` or `follower` | |
 | on-disk format | `ZOE format 2` in the store header | bumps only with a migration tool; the first writer open of a store of `ZOE format 1` is the migration to format 2 (ADR 0033) |
 | product name in prose | ZOE, expanded once per document as Zope Object Engine | code identifiers stay lowercase `zoe` |
-| desktop app | Loupe; crate zoe-loupe; bundle identifier dev.adeweb.zoe.loupe; crates zoe-pickle and zoe-convert beside it | the only second product name; "Loupe" in prose, lowercase in identifiers |
-| Plone integration (later) | zoe.plone, an optional extra of the wheel: zoedb\[plone\]; auto-included in Plone through the plone.autoinclude entry point of zoedb, which names the module `zoe.plone` (a z3c.autoinclude entry point would import a module named after the project, `zoedb`) | phase 4 for the merge policy derived from Dexterity schemas, phase 6 for the catalog hook and ZoeTextIndex, phase 7 for the reindex queue of Loupe; the wheel itself never imports Plone, only the extra does |
+| desktop app | Loupe; crate `zoe-loupe`; bundle identifier dev.adeweb.zoe.loupe; crates `zoe-pickle` and `zoe-convert` beside it | the only second product name; "Loupe" in prose, lowercase in identifiers |
+| Plone integration | `zoe.plone`, an optional extra of the wheel: zoedb\[plone\]; auto-included in Plone through the plone.autoinclude entry point of zoedb, which names the module `zoe.plone` (a z3c.autoinclude entry point would import a module named after the project, `zoedb`) | the wheel itself never imports Plone, only the extra does |
 | tags and versions | v0.3.0 for the Cargo workspace and the zoedb wheel together; loupe-v0.1.0 for Loupe | semantic versioning; the on-disk format version is independent of the release version |
-| licences | Apache-2.0 for everything, the Plone extra included | Apache-2.0 is the Rust ecosystem's norm and keeps the door open to the Plone Foundation and to any adopter |
-| documentation site | GitHub Pages of the adeweb-be/ZOE repository, built with mdBook from docs/ on every merge to trunk | docs/ in git is the source of truth: this specification, the working-methods document and the ADRs live there and the documenter keeps them current; nothing is hosted on a private domain |
+| licences | Apache-2.0 for everything, the Plone extra included | ADR 0018 |
+| documentation site | GitHub Pages of the adeweb-be/ZOE repository, built with mdBook from docs/ on every merge to trunk | docs/ in git is the source of truth, and nothing is hosted on a private domain (ADR 0013) |
 
 ## Context
 
@@ -86,10 +96,10 @@ The ZODB stack is mostly Python; the C lives in three client-side packages, and 
 | --- | --- | --- | --- | --- |
 | [ZODB](https://github.com/zopefoundation/ZODB) | Python | 17.6k lines | Connection, DB, FileStorage, MVCC adapter, 2PC | pure Python; thread model is one Connection per thread |
 | [ZEO](https://github.com/zopefoundation/ZEO) 6.3.dev0 | Python + 2 optional Cython modules | 10.3k lines | asyncio client and server, msgpack wire protocol | pure Python |
-| [persistent](https://pypi.org/project/persistent/) 6.8 | C + Python reference impl | 4.1k lines C | `Persistent` base class, pickle cache, LRU ring | compiles on 3.14t, cp314t wheels, `Per_dealloc` crash fixed in 6.6; does not declare `Py_mod_gil_not_used` |
+| [persistent](https://pypi.org/project/persistent/) 6.8 | C + Python reference impl | 4.1k lines C | `Persistent` base class, pickle cache, LRU ring | cp314t wheels; does not declare `Py_mod_gil_not_used` |
 | [BTrees](https://github.com/zopefoundation/BTrees) | C templates + Python reference impl | 10.7k lines C, 21 instantiations | persistent containers, bucket conflict resolution | no free-threading work; uses persistent's C capsule |
 | [zodbpickle](https://github.com/zopefoundation/zodbpickle) | C (fork of CPython `_pickle.c`) | 7.2k lines | `noload`, `binary` shim for py2 data | compiles on 3.14t; does not declare `Py_mod_gil_not_used` |
-| [zope.interface](https://pypi.org/project/zope-interface/) 8.6 | C + Python | — | component architecture | 8.3 declares `Py_mod_gil_not_used`, 8.5 ships cp314t/cp315t wheels; cache races found ([#384](https://github.com/zopefoundation/zope.interface/issues/384)) |
+| [zope.interface](https://pypi.org/project/zope-interface/) 8.6 | C + Python | — | component architecture | declares `Py_mod_gil_not_used` since 8.3; cache races found ([#384](https://github.com/zopefoundation/zope.interface/issues/384)) |
 
 What this means for the design:
 
@@ -97,21 +107,19 @@ What this means for the design:
 - Any extension loaded on 3.14t without `Py_mod_gil_not_used` silently re-enables the GIL. Today `persistent`, `BTrees` and `zodbpickle` all do, so free-threaded parallelism in Zope needs those three declared before ZOE's own declaration matters.
 - `persistent` and `BTrees` ship pure-Python reference implementations with full test suites, which makes a later Rust port of them a differential-testing job rather than a rewrite in the dark.
 
-**Python free-threading timeline.** 3.13 (Oct 2024) experimental; 3.14 (Oct 2025) officially supported under [PEP 779](https://peps.python.org/pep-0779/); 3.15 (Oct 2026) adds the free-threaded stable ABI `abi3t` under [PEP 803](https://peps.python.org/pep-0803). Making it the default is left to a future PEP. PyO3 supports free-threaded builds since 0.23 and assumes modules are thread-safe since 0.28 ([guide](https://pyo3.rs/latest/free-threading.html)).
+### Targets
 
-**Targets.** CPython 3.12, 3.13 and 3.14, with 3.14t as the free-threaded build; 3.13t is not a target and 3.15 joins when it ships. Linux x86-64 and macOS on Apple silicon, and a run on either is evidence (ADR 0038). The release builds for macOS and Windows come later, for the wheels, the server binary and Loupe alike.
+CPython 3.12, 3.13 and 3.14, with 3.14t as the free-threaded build; 3.13t is not a target and 3.15 joins when it ships. Linux x86-64 and macOS on Apple silicon, and a run on either is evidence (ADR 0006). The release builds for macOS and Windows come later, for the wheels, the server binary and Loupe alike.
 
-**Prior art**
+### Prior art
 
-| Project | What it is | What ZOE takes from it |
-| --- | --- | --- |
-| [byteserver](https://github.com/jimfulton/byteserver) (Jim Fulton, 2016–2021) | 3,043 lines of Rust; synchronous `std::net`, two OS threads per client; implements 10 of ZEO's \~35 server methods; no blobs, pack, undo, `checkCurrentSerialInTransaction` or invalidation replay; data treated as opaque; dependencies frozen in 2016 | the per-OID lock manager at vote time; the append-only segment design; the opaque-data server. Not the code. |
-| [filestorage2](https://github.com/jimfulton/filestorage2) (2015–2016) | 11 commits, a format document: aligned segments, `PPPP`→`TTTT` marker flip after fsync, per-segment index, crc32 per record | the crash-safety pattern; candidate for the "fast log" backend |
-| RelStorage on PostgreSQL | mature ZODB storage over SQL, history-preserving or history-free, row locks at vote | the `(zoid, tid)` data model; `zodbshootout`, its benchmark harness; the HA story it gets from Postgres operators |
-| NEO (Nexedi) | distributed ZODB with replication and master election | proof that a global tid sequencer with replicated storage nodes works; its complexity is the warning |
-| ZEO 5 | asyncio client, msgpack protocol, `prefetch`, server-side conflict resolution with Plone eggs installed | the wire protocol and the client, unchanged; the deployment model of "a Python process that hosts the server" |
+- byteserver: a ZEO server in Rust, synchronous, with 10 of ZEO's \~35 server methods. ZOE takes its per-OID lock manager at vote time and its server that treats data as opaque, not its code.
+- filestorage2: a format with aligned segments, a marker flip after the fsync, an index per segment and a CRC per record. It is the crash-safety pattern of the append-only log backend.
+- RelStorage on PostgreSQL: the `(zoid, tid)` data model, `zodbshootout` as the benchmark harness, and high availability from the operators of PostgreSQL.
+- NEO: a distributed ZODB with replication and master election. It shows that a global tid sequencer over replicated storage nodes works, and its complexity is the warning.
+- ZEO 5 and 6: the wire protocol and the client, unchanged. The ZODB API is synchronous, and `prefetch` is the way to overlap I/O: `Connection.prefetch()` exists in ZODB and `ClientStorage.prefetch()` in ZEO.
 
-Jim Fulton said in 2016 that the ZODB API is synchronous and that prefetch is the way to overlap I/O ([talk notes](https://2016.ploneconf.org/maurits.vanrees.org/weblog/archive/2016/10/jim-fulton-the-zodb.html)); by 2019 byteserver had been idle for three years ([thread](https://groups.google.com/g/zodb/c/u_QWRSRR14A)). `Connection.prefetch()` exists in ZODB and `ClientStorage.prefetch()` in ZEO today.
+The links are in "References".
 
 ## Requirements
 
