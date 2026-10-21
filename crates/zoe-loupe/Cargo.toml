@@ -15,5 +15,9 @@ thiserror.workspace = true
 zoe-core.workspace = true
 zoe-pickle.workspace = true
 
+[dev-dependencies]
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

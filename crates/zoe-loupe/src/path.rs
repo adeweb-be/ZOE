@@ -493,26 +493,10 @@ fn reference<'t>(resolver: &Resolver<'t>, node: &'t Node) -> Option<Oid> {
 mod tests {
     use zoe_core::{Store, Tid};
 
+    use zoe_pickle::testing::{record, reference, text};
+
     use super::*;
     use crate::Folder;
-
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
-    }
-
-    /// A persistent reference to `oid` with the class `module.name`.
-    fn reference(oid: u64, module: &str, name: &str) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n");
-        [
-            &b"C\x08"[..],
-            &oid.to_be_bytes(),
-            class.as_bytes(),
-            b"\x86Q",
-        ]
-        .concat()
-    }
 
     /// Write a store whose application holds an `IOBTree` with the key 7.
     fn int_tree_store() -> std::path::PathBuf {
@@ -573,12 +557,6 @@ mod tests {
                 "{path}"
             );
         }
-    }
-
-    /// A text in a pickle.
-    fn text(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
     }
 
     /// A dict state with the text keys and the pickled values of

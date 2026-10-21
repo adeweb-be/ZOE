@@ -31,6 +31,9 @@ mod iterative;
 mod opcode;
 pub mod python;
 mod references;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub mod testing;
 mod text;
 mod tree;
 mod zones;

@@ -477,24 +477,13 @@ mod tests {
         AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
     };
     use zoe_core::{Oid, Store, Tid};
+    use zoe_pickle::testing::{record, text as text_pickle};
 
     use super::*;
 
-    /// A text in a pickle: `BINUNICODE`.
-    fn text_pickle(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
-    }
-
     /// A persistent reference to `oid` with the class `m.C`.
     fn reference(oid: u64) -> Vec<u8> {
-        [&b"C\x08"[..], &oid.to_be_bytes(), b"cm\nC\n\x86Q"].concat()
-    }
-
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
+        zoe_pickle::testing::reference(oid, "m", "C")
     }
 
     /// A record of the class `m.Doc` with a title.

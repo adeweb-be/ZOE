@@ -92,21 +92,11 @@ fn retired(data: &[u8]) -> bool {
 mod tests {
     use zoe_core::vfs::MemVfs;
     use zoe_core::{Oid, Store, Tid};
+    use zoe_pickle::testing::record_with_put as pickle;
 
     use super::{ClassRecord, records_of_classes};
 
     const LIVE: &str = "zoe.plone.properties.PrincipalProperties";
-
-    /// A pickle of an object of `module.name` whose state is the dict
-    /// that the bytes `state` build.
-    fn pickle(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let mut data = b"\x80\x03c".to_vec();
-        data.extend_from_slice(format!("{module}\n{name}\n").as_bytes());
-        data.extend_from_slice(b"q\x00.\x80\x03");
-        data.extend_from_slice(state);
-        data.push(b'.');
-        data
-    }
 
     fn commit(store: &Store, records: &[(u64, Option<Vec<u8>>)]) {
         let tid = Tid(store.last_transaction().0 + 1);

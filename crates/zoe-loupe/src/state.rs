@@ -803,6 +803,8 @@ impl<'r, 't> Converter<'r, 't> {
 
 #[cfg(test)]
 mod tests {
+    use zoe_pickle::testing::{record_with_put, reference_to_put as reference};
+
     use super::*;
 
     /// Decode a record whose class pickle is GLOBAL m C, BINPUT 0, and
@@ -820,12 +822,7 @@ mod tests {
     /// A record whose class pickle is GLOBAL m C, BINPUT 0, with the state
     /// pickle `state` without its STOP.
     fn record(state: &[u8]) -> Vec<u8> {
-        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
-    }
-
-    /// The pickle of a persistent reference to `oid` with class m.C.
-    fn reference(oid: u8) -> Vec<u8> {
-        [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"h\x00\x86Q"].concat()
+        record_with_put("m", "C", state)
     }
 
     fn references(found: &[Reference]) -> Vec<(u64, &str)> {

@@ -294,12 +294,10 @@ fn commit(
 
 const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
+/// A `PersistentMapping` record whose state is the str `text`.
 fn pickle(text: &str) -> Vec<u8> {
-    let mut data = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03X".to_vec();
-    data.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    data.extend_from_slice(text.as_bytes());
-    data.push(b'.');
-    data
+    let state = zoe_pickle::testing::text(text);
+    zoe_pickle::testing::record_with_put("persistent.mapping", "PersistentMapping", &state)
 }
 
 /// Write a store with commits: the root and other objects in several

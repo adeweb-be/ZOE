@@ -20,6 +20,8 @@ zoe-pickle.workspace = true
 # The acceptance test of the batched sync counts the syncs of the database
 # file through a storage backend of redb.
 redb.workspace = true
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -527,6 +527,8 @@ fn serialize_tid<S: Serializer>(tid: &Tid, serializer: S) -> std::result::Result
 
 #[cfg(test)]
 mod tests {
+    use zoe_pickle::testing::{record_with_put, reference_to_put as reference};
+
     use super::*;
 
     #[test]
@@ -695,14 +697,10 @@ mod tests {
         dir
     }
 
-    /// A record of the class `m.C` with the state pickle `state`.
+    /// A record of the class `m.C` with the state pickle `state`. Its
+    /// class pickle has BINPUT 0.
     fn record(state: &[u8]) -> Vec<u8> {
-        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
-    }
-
-    /// A persistent reference to `oid` with the class `m.C`.
-    fn reference(oid: u8) -> Vec<u8> {
-        [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"h\x00\x86Q"].concat()
+        record_with_put("m", "C", state)
     }
 
     #[test]

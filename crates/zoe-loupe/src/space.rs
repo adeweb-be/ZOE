@@ -464,24 +464,14 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
+    use zoe_pickle::testing::{record, text};
+
     use super::*;
     use crate::Folder;
 
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
-    }
-
-    /// A text in a pickle.
-    fn text(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
-    }
-
     /// A persistent reference to `oid` with the class `m.C`.
     fn reference(oid: u64) -> Vec<u8> {
-        [&b"C\x08"[..], &oid.to_be_bytes(), b"cm\nC\n\x86Q"].concat()
+        zoe_pickle::testing::reference(oid, "m", "C")
     }
 
     /// A weak reference to `oid`: `['w', (oid,)]`.

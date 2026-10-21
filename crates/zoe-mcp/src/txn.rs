@@ -226,6 +226,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use zoe_core::Store;
+    use zoe_pickle::testing::{record, text};
 
     use super::*;
 
@@ -252,14 +253,7 @@ mod tests {
 
     /// A record of the class `m.Doc` whose state is the text `title`.
     fn document(title: &str) -> Vec<u8> {
-        let length = u32::try_from(title.len()).unwrap().to_le_bytes();
-        [
-            &b"\x80\x03cm\nDoc\n.\x80\x03X"[..],
-            &length,
-            title.as_bytes(),
-            b".",
-        ]
-        .concat()
+        record("m", "Doc", &text(title))
     }
 
     /// A store in a new folder. Three transactions write oid 1: `create`
