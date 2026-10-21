@@ -19,9 +19,6 @@ use super::{Failure, open_read_only, store_failure};
 /// The seconds in a day.
 const DAY: u64 = 86_400;
 
-/// The database file in the directory of a store.
-const DATABASE: &str = "zoe.redb";
-
 /// The options of `zoe pack`.
 #[derive(Debug, Args)]
 pub(super) struct PackArgs {
@@ -119,7 +116,7 @@ fn days_ago(now: SystemTime, days: u64) -> Tid {
 /// Open the existing store in `path` for writes, with `options`. A
 /// directory without a store fails, and the call creates nothing.
 fn open_existing(path: &Path, options: Options) -> Result<Store, Failure> {
-    if !path.join(DATABASE).is_file() {
+    if !Store::exists(path) {
         return Err(Failure::Message(format!("no store in {}", path.display())));
     }
     Store::open_with(path, options).map_err(|e| store_failure(path, e))

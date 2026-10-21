@@ -33,7 +33,7 @@ pub use backend::{
     RecordMeta, TxnIter, TxnMeta, TxnRecords, TxnStatus, WriteTxn,
 };
 pub use blob::{BlobFile, BlobReader};
-pub use clock::{Clock, SystemClock, Waiter, timestamp};
+pub use clock::{Clock, SystemClock, Waiter, civil_from_days, civil_from_tid, timestamp};
 pub use commit::{Encoded, Finished, IntentLocks, Observer, Txn};
 pub use error::{Result, ZoeError};
 pub use format::{Codec, Compression};

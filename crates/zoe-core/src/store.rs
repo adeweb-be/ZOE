@@ -252,6 +252,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// Tell if the directory `dir` holds a store: its database file is a
+    /// regular file. A read-only open of a directory without one fails.
+    pub fn exists(dir: impl AsRef<Path>) -> bool {
+        dir.as_ref().join(DATABASE).is_file()
+    }
+
     /// Open the store in the directory `dir` with the default options, and
     /// create it if necessary.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -480,6 +486,16 @@ impl Store {
     /// and repaired its database file. Every other open gives false.
     pub fn repaired(&self) -> bool {
         self.repaired
+    }
+
+    /// Return the message of the repair of the store in `dir`, for the
+    /// line that a tool writes when `repaired` is true:
+    /// `<dir>: the store was not closed cleanly: repaired the store`.
+    pub fn repair_message(dir: &Path) -> String {
+        format!(
+            "{}: the store was not closed cleanly: repaired the store",
+            dir.display()
+        )
     }
 
     /// Make a store from an open backend and the directory that holds its

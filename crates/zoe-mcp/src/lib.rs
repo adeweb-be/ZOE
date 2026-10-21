@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use rmcp::service::ServerInitializeError;
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServiceExt};
+use zoe_core::Store;
 use zoe_loupe::Folder;
 
 /// An error of the server.
@@ -83,8 +84,8 @@ pub fn serve_stdio(path: &Path, blob_dir: Option<&Path>) -> Result<(), Error> {
         // failed write of the line does not stop the session.
         let _ = writeln!(
             std::io::stderr(),
-            "zoe mcp: {}: the store was not closed cleanly: repaired the store",
-            path.display()
+            "zoe mcp: {}",
+            Store::repair_message(path)
         );
     }
     // One thread runs the session. The tools run on the blocking pool.

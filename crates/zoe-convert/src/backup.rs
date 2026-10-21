@@ -58,9 +58,6 @@ const CHECK_PREFIX: &str = "zoe-backup-check-";
 /// The number of record keys that one read of the comparison takes.
 const KEY_CHUNK: usize = 1024;
 
-/// The database file in the directory of a store.
-const DATABASE: &str = "zoe.redb";
-
 /// The length of the header: the magic, then two tids.
 const HEADER: usize = 24;
 
@@ -1354,7 +1351,7 @@ fn check_target(target: &Path) -> Result<(), Error> {
     };
     match fs::symlink_metadata(target) {
         Ok(meta) if !meta.is_dir() => refuse("not a directory"),
-        Ok(_) if exists(&target.join(DATABASE))? => {
+        Ok(_) if Store::exists(target) => {
             refuse("holds a store; a restore never writes into a store")
         }
         // The restore builds the store beside the target and renames it,
@@ -1463,14 +1460,6 @@ fn sibling(path: &Path, suffix: &str) -> Result<PathBuf, Error> {
 }
 
 /// Tell if something exists at `path`.
-fn exists(path: &Path) -> Result<bool, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error(path, error)),
-    }
-}
-
 fn damaged(path: &Path, reason: String) -> Error {
     Error::Dump {
         path: path.to_owned(),
@@ -1500,6 +1489,9 @@ mod tests {
 
     /// The record of a blob.
     const BLOB_RECORD: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
+
+    /// The database file in the directory of a store.
+    const DATABASE: &str = "zoe.redb";
 
     /// A record of a `PersistentMapping` that holds `value`, with no
     /// reference.

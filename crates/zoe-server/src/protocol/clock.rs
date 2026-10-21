@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use zoe_core::Tid;
+use zoe_core::{Tid, civil_from_days, civil_from_tid};
 
 /// The days before each month, in a common year and in a leap year.
 const MONTH_DAYS: [[u64; 12]; 2] = [
@@ -23,12 +23,10 @@ const MONTHS: [&str; 12] = [
 /// Return the time of `tid` in seconds since 1970-01-01, as
 /// `TimeStamp(tid).timeTime()` of `persistent` gives it, to the last bit.
 pub(crate) fn tid_time(tid: Tid) -> f64 {
-    let minutes = tid.0 >> 32;
-    let year = minutes / 535_680 + 1900;
-    let month = (minutes % 535_680 / 44_640) as usize;
-    let day = minutes % 44_640 / 1_440;
-    let in_day = minutes % 1_440;
-    let days = year_days(year) + MONTH_DAYS[usize::from(leap(year))][month] as i64 + day as i64;
+    let (year, month, day, hour, minute) = civil_from_tid(tid);
+    let in_day = hour * 60 + minute;
+    let before = MONTH_DAYS[usize::from(leap(year))][(month - 1) as usize];
+    let days = year_days(year) + before as i64 + (day - 1) as i64;
     let whole = days as f64 * 86_400.0 + (in_day * 60) as f64;
     let seconds = (tid.0 & 0xffff_ffff) as f64 * (60.0 / 4_294_967_296.0);
     // The C code of `persistent` adds and subtracts in this order. Another
@@ -114,23 +112,6 @@ fn year_days(year: u64) -> i64 {
 
 fn leap(year: u64) -> bool {
     year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
-}
-
-/// Return the year, month and day of the day `days` after 1970-01-01. A
-/// negative `days` is a day before.
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
-    // The algorithm of Howard Hinnant. The era of 400 years starts on
-    // March 1.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe as i64 + era * 400 + i64::from(month <= 2);
-    (year, month, day)
 }
 
 #[cfg(test)]

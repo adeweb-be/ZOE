@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use zoe_convert::Restored;
-use zoe_core::Tid;
+use zoe_core::{Tid, civil_from_tid};
 
 use super::Failure;
 
@@ -60,16 +60,8 @@ fn write_report(
 }
 
 /// Return the time of `tid` in UTC, as `YYYY-MM-DD HH:MM:SS.mmm UTC`.
-///
-/// The high 32 bits of a tid count the minutes since 1900, in a mixed
-/// radix: the year since 1900, then 12 months, 31 days, 24 hours and 60
-/// minutes. The low 32 bits hold the second in units of 60 / 2^32 seconds.
 fn utc(tid: Tid) -> String {
-    let minutes = tid.0 >> 32;
-    let (minute, hours) = (minutes % 60, minutes / 60);
-    let (hour, days) = (hours % 24, hours / 24);
-    let (day, months) = (days % 31 + 1, days / 31);
-    let (month, year) = (months % 12 + 1, months / 12 + 1900);
+    let (year, month, day, hour, minute) = civil_from_tid(tid);
     // Round to the millisecond, and stay below the next minute.
     let millis = ((((tid.0 & 0xffff_ffff) * 60_000) + (1 << 31)) >> 32).min(59_999);
     let (second, milli) = (millis / 1000, millis % 1000);

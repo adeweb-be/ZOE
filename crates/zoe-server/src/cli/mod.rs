@@ -161,11 +161,7 @@ fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
 /// Return the line of a repair of the store in `path`, for the subcommand
 /// that runs on this thread.
 fn repair_line(path: &Path) -> String {
-    format!(
-        "zoe {}: {}: the store was not closed cleanly: repaired the store",
-        COMMAND.get(),
-        path.display()
-    )
+    format!("zoe {}: {}", COMMAND.get(), Store::repair_message(path))
 }
 
 /// Open the store in `path` read-only, with its blob files in `blob_dir`
