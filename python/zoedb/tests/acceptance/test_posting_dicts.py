@@ -53,12 +53,11 @@ SHAPES = ("IOBucket", "IOBTree")
 def rule(on):
     """Return the environment that switches the posting-dict rule on or off.
 
-    ADR 0042, a checkpoint of the card of the rule, names the key and how a
-    store switches the rule on in both modes. The human approves a change
-    of this function with the ADR. The rule is the key `posting-dicts` of
-    `<zoe>` and of `zoe serve`, a mode, through its environment twin:
-    `<zoe>` reads it in-process, and `zoe serve` reads it as the twin of
-    `--posting-dicts`.
+    ADR 0042 names the key and how a store switches the rule on in both
+    modes. The human approves a change of this function with the ADR. The
+    rule is the key `posting-dicts` of `<zoe>` and of `zoe serve`, a mode,
+    through its environment twin: `<zoe>` reads it in-process, and
+    `zoe serve` reads it as the twin of `--posting-dicts`.
     """
     return {"ZOE_POSTING_DICTS": "on" if on else "off"}
 
