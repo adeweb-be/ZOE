@@ -50,9 +50,9 @@ fn write_report(out: &mut dyn Write, path: &Path, to: &Path, report: &Backup) ->
     let Some(dump) = &report.dump else {
         return writeln!(
             out,
-            "Nothing new: the dumps in {} end at tid {:#018x}, the last tid of the store {}",
+            "Nothing new: the dumps in {} end at tid {}, the last tid of the store {}",
             to.display(),
-            report.last.0,
+            report.last.hex(),
             path.display()
         );
     };
@@ -68,8 +68,8 @@ fn write_report(out: &mut dyn Write, path: &Path, to: &Path, report: &Backup) ->
         to.display()
     )?;
     writeln!(out, "  dump          {} ({kind})", dump.display())?;
-    writeln!(out, "  after tid     {:#018x}", report.after.0)?;
-    writeln!(out, "  last tid      {:#018x}", report.last.0)?;
+    writeln!(out, "  after tid     {}", report.after.hex())?;
+    writeln!(out, "  last tid      {}", report.last.hex())?;
     writeln!(out, "  transactions  {}", report.transactions)?;
     writeln!(out, "  records       {}", report.records)?;
     let (blobs, bytes) = (report.blobs, report.blob_bytes);

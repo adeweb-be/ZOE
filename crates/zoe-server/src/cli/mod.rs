@@ -161,11 +161,7 @@ fn open_read_only(path: &Path, options: Options) -> Result<Store, Failure> {
 /// Return the line of a repair of the store in `path`, for the subcommand
 /// that runs on this thread.
 fn repair_line(path: &Path) -> String {
-    format!(
-        "zoe {}: {}: the store was not closed cleanly: repaired the store",
-        COMMAND.get(),
-        path.display()
-    )
+    format!("zoe {}: {}", COMMAND.get(), Store::repair_message(path))
 }
 
 /// Open the store in `path` read-only, with its blob files in `blob_dir`
@@ -193,10 +189,9 @@ fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failur
 fn blob_dir_failure(path: &Path, error: ZoeError) -> Failure {
     match error {
         ZoeError::MissingBlobDir { path: blobs } => Failure::Message(format!(
-            "{}: the store has blobs, but the blob directory {} has no layout file: \
-             give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+            "{}: {}",
             path.display(),
-            blobs.display()
+            zoe_convert::missing_blob_dir(&blobs)
         )),
         e => store_failure(path, e),
     }

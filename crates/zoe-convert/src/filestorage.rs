@@ -272,7 +272,7 @@ impl Reader {
                     "transaction length {len} is shorter than its header"
                 ))
             } else if tid <= self.last {
-                Some(format!("tid {} is not after the tid before it", hex(tid.0)))
+                Some(format!("tid {} is not after the tid before it", tid.hex()))
             } else {
                 None
             };
@@ -455,7 +455,7 @@ impl Reader {
             if target != oid {
                 return Err(self.corrupt(
                     from,
-                    format!("back pointer {back} leads to oid {}", hex(target.0)),
+                    format!("back pointer {back} leads to oid {}", target.hex()),
                 ));
             }
             if let Some(chain) = cached {
@@ -623,11 +623,6 @@ fn number(bytes: &[u8]) -> u64 {
     let mut buf = [0; NUMBER_LEN as usize];
     buf.copy_from_slice(bytes);
     u64::from_be_bytes(buf)
-}
-
-/// Write an oid or a tid as 16 hex digits.
-pub(crate) fn hex(n: u64) -> String {
-    format!("0x{n:016x}")
 }
 
 #[cfg(test)]

@@ -21,6 +21,8 @@ zoe-pickle.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "rt", "time"] }
+# The record builders of `zoe_pickle::testing`.
+zoe-pickle = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

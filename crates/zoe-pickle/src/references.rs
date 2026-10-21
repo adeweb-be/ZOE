@@ -45,6 +45,22 @@ pub enum PersistentId {
     List,
 }
 
+impl PersistentId {
+    /// Returns the oid of a reference to an object of the same database,
+    /// as a number from its 8 big-endian bytes. Returns `None` for another
+    /// form, and `Some(Err)` with the length of an oid that is not 8 bytes.
+    pub fn oid_u64(&self) -> Option<Result<u64, usize>> {
+        let PersistentId::Oid(bytes) = self else {
+            return None;
+        };
+        Some(
+            <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| bytes.len()),
+        )
+    }
+}
+
 /// Returns the persistent ids of a record, in pickle order, with each
 /// repeat. The class pickle and the state pickle both count, and so do the
 /// parts that the tree keeps as opaque bytes.
@@ -389,11 +405,9 @@ mod tests {
     fn oids(record: &[u8]) -> Vec<u64> {
         persistent_ids(record)
             .unwrap()
-            .into_iter()
-            .filter_map(|id| match id {
-                PersistentId::Oid(oid) => Some(u64::from_be_bytes(oid.try_into().unwrap())),
-                _ => None,
-            })
+            .iter()
+            .filter_map(PersistentId::oid_u64)
+            .map(Result::unwrap)
             .collect()
     }
 

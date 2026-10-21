@@ -39,7 +39,7 @@ pub use space::{
 pub const HISTORY_LIMIT: usize = 1 << 12;
 
 /// The most bytes of the user or the description of a revision.
-const MAX_NOTE: usize = 1 << 12;
+pub const MAX_NOTE: usize = 1 << 12;
 
 /// An error of Loupe.
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +67,7 @@ pub enum Error {
     },
 
     /// zoe-pickle refuses a record that a path goes through.
-    #[error("oid {}: {source}", id_repr(.oid.0))]
+    #[error("oid {}: {source}", .oid.repr())]
     Refused {
         /// The oid of the record.
         oid: Oid,
@@ -81,7 +81,7 @@ pub enum Error {
 
     /// The object has no record at or before the tid of a view. A later
     /// transaction creates it.
-    #[error("oid {}: no record as of tid {}", id_repr(.oid.0), id_repr(.tid.0))]
+    #[error("oid {}: no record as of tid {}", .oid.repr(), .tid.repr())]
     NoRecordAsOf {
         /// The oid of the object.
         oid: Oid,
@@ -470,23 +470,20 @@ impl Snapshot<'_> {
 fn strong_references(record: &[u8]) -> std::result::Result<Vec<Oid>, String> {
     let ids = zoe_pickle::persistent_ids(record)
         .map_err(|e| format!("the references do not decode: {e}"))?;
-    ids.into_iter()
-        .filter_map(|id| match id {
-            zoe_pickle::PersistentId::Oid(bytes) => Some(bytes),
-            _ => None,
-        })
-        .map(|bytes| {
-            let bytes: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| "the references do not decode: an oid is not 8 bytes".to_owned())?;
-            Ok(Oid(u64::from_be_bytes(bytes)))
+    ids.iter()
+        .filter_map(zoe_pickle::PersistentId::oid_u64)
+        .map(|oid| {
+            oid.map(Oid)
+                .map_err(|_| "the references do not decode: an oid is not 8 bytes".to_owned())
         })
         .collect()
 }
 
 /// Return the user or the description of a transaction as text, with at
-/// most `MAX_NOTE` bytes of the record.
-fn note(bytes: &[u8]) -> String {
+/// most `MAX_NOTE` bytes of the record. Bytes that are not UTF-8 become
+/// U+FFFD. A longer text shows its start, cut before a character, and
+/// ends with `…`.
+pub fn note(bytes: &[u8]) -> String {
     if bytes.len() <= MAX_NOTE {
         return String::from_utf8_lossy(bytes).into_owned();
     }
@@ -501,43 +498,25 @@ fn note(bytes: &[u8]) -> String {
     text
 }
 
-/// Return an 8-byte id in ZODB form, as `ZODB.utils.oid_repr` writes it:
-/// `0x`, then the hex digits without leading zeros, padded to an even
-/// count. Zero is `0x00`.
-fn id_repr(id: u64) -> String {
-    let digits = format!("{id:x}");
-    let pad = if digits.len() % 2 == 1 { "0" } else { "" };
-    format!("0x{pad}{digits}")
-}
-
-/// Return `oid` in ZODB form, for example `0x00` or `0x0100`.
+/// Return `oid` in ZODB form, as `ZODB.utils.oid_repr` writes it, for
+/// example `0x00` or `0x0100`.
 pub fn oid_repr(oid: Oid) -> String {
-    id_repr(oid.0)
+    oid.repr()
 }
 
 /// Return `tid` in ZODB form, for example `0x033f2eeca6666666`.
 pub fn tid_repr(tid: Tid) -> String {
-    id_repr(tid.0)
+    tid.repr()
 }
 
 /// Read an oid in ZODB form: `0x` and 1 to 16 hex digits.
 pub fn parse_oid(text: &str) -> Result<Oid> {
-    parse_id(text).map(Oid)
+    Oid::parse(text).ok_or_else(|| Error::BadId(text.to_owned()))
 }
 
 /// Read a tid in ZODB form: `0x` and 1 to 16 hex digits.
 pub fn parse_tid(text: &str) -> Result<Tid> {
-    parse_id(text).map(Tid)
-}
-
-/// Read an 8-byte id in ZODB form: `0x` and 1 to 16 hex digits.
-fn parse_id(text: &str) -> Result<u64> {
-    let digits = text
-        .strip_prefix("0x")
-        .filter(|digits| (1..=16).contains(&digits.len()))
-        .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| Error::BadId(text.to_owned()))?;
-    u64::from_str_radix(digits, 16).map_err(|_| Error::BadId(text.to_owned()))
+    Tid::parse(text).ok_or_else(|| Error::BadId(text.to_owned()))
 }
 
 fn serialize_oid<S: Serializer>(oid: &Oid, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -550,6 +529,8 @@ fn serialize_tid<S: Serializer>(tid: &Tid, serializer: S) -> std::result::Result
 
 #[cfg(test)]
 mod tests {
+    use zoe_pickle::testing::{record_with_put, reference_to_put as reference};
+
     use super::*;
 
     #[test]
@@ -718,14 +699,10 @@ mod tests {
         dir
     }
 
-    /// A record of the class `m.C` with the state pickle `state`.
+    /// A record of the class `m.C` with the state pickle `state`. Its
+    /// class pickle has BINPUT 0.
     fn record(state: &[u8]) -> Vec<u8> {
-        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
-    }
-
-    /// A persistent reference to `oid` with the class `m.C`.
-    fn reference(oid: u8) -> Vec<u8> {
-        [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"h\x00\x86Q"].concat()
+        record_with_put("m", "C", state)
     }
 
     #[test]

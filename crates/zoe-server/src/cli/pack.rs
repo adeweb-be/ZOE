@@ -19,9 +19,6 @@ use super::{Failure, open_read_only, store_failure};
 /// The seconds in a day.
 const DAY: u64 = 86_400;
 
-/// The database file in the directory of a store.
-const DATABASE: &str = "zoe.redb";
-
 /// The options of `zoe pack`.
 #[derive(Debug, Args)]
 pub(super) struct PackArgs {
@@ -89,18 +86,18 @@ pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Re
         let store = open_read_only(path, options)?;
         let report = store.pack_dry_run(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
-            "A pack of the store {} as of tid {:#018x} would remove:",
+            "A pack of the store {} as of tid {} would remove:",
             path.display(),
-            at.0
+            at.hex()
         );
         (report, title)
     } else {
         let store = open_existing(path, options)?;
         let report = store.pack(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
-            "Packed the store {} as of tid {:#018x}. It removed:",
+            "Packed the store {} as of tid {}. It removed:",
             path.display(),
-            at.0
+            at.hex()
         );
         (report, title)
     };
@@ -119,7 +116,7 @@ fn days_ago(now: SystemTime, days: u64) -> Tid {
 /// Open the existing store in `path` for writes, with `options`. A
 /// directory without a store fails, and the call creates nothing.
 fn open_existing(path: &Path, options: Options) -> Result<Store, Failure> {
-    if !path.join(DATABASE).is_file() {
+    if !Store::exists(path) {
         return Err(Failure::Message(format!("no store in {}", path.display())));
     }
     Store::open_with(path, options).map_err(|e| store_failure(path, e))

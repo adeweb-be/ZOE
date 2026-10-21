@@ -121,7 +121,9 @@ impl Clock for ManualClock {
 pub fn timestamp(time: SystemTime) -> Tid {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = since_epoch.as_secs();
-    let (year, month, day) = civil_from_days(secs / 86_400);
+    // The days fit an i64, and a day after 1970 has a year after 1970.
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let year = year as u64;
     let in_day = secs % 86_400;
     let (hour, minute, second) = (in_day / 3_600, in_day % 3_600 / 60, in_day % 60);
 
@@ -132,20 +134,37 @@ pub fn timestamp(time: SystemTime) -> Tid {
 }
 
 /// Return the year, month and day of the day `days` after 1970-01-01, in
-/// the proleptic Gregorian calendar.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    // The algorithm of Howard Hinnant, for days on or after 1970-01-01. The
-    // era of 400 years starts on March 1.
+/// the proleptic Gregorian calendar. A negative `days` is a day before.
+pub fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    // The algorithm of Howard Hinnant. The era of 400 years starts on
+    // March 1.
     let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
+    let year = yoe as i64 + era * 400 + i64::from(month <= 2);
     (year, month, day)
+}
+
+/// Return the year, the month, the day, the hour and the minute of `tid`,
+/// in UTC, as ZODB's `TimeStamp` holds them. The month and the day start
+/// at 1.
+///
+/// The high 32 bits of a tid count the minutes since 1900, in a mixed
+/// radix: the year since 1900, then 12 months, 31 days, 24 hours and 60
+/// minutes. The low 32 bits hold the second in units of 60 / 2^32
+/// seconds.
+pub fn civil_from_tid(tid: Tid) -> (u64, u64, u64, u64, u64) {
+    let minutes = tid.0 >> 32;
+    let (minute, hours) = (minutes % 60, minutes / 60);
+    let (hour, days) = (hours % 24, hours / 24);
+    let (day, months) = (days % 31 + 1, days / 31);
+    let (month, year) = (months % 12 + 1, months / 12 + 1900);
+    (year, month, day, hour, minute)
 }
 
 #[cfg(test)]
@@ -178,6 +197,16 @@ mod tests {
             assert_eq!(tid >> 32, zodb >> 32);
             assert!(tid.abs_diff(zodb) <= 1, "{tid:#x} {zodb:#x}");
         }
+    }
+
+    #[test]
+    fn a_day_and_a_tid_give_their_civil_date() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_tid(Tid(0)), (1900, 1, 1, 0, 0));
+        // The tid of 1709186828 seconds since 1970.
+        assert_eq!(civil_from_tid(at(1_709_186_828, 0)), (2024, 2, 29, 6, 7));
     }
 
     #[test]

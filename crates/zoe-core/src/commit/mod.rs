@@ -631,8 +631,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         if pickle.is_empty() {
             return None;
         }
-        let (module, name) = zoe_pickle::decode_class_name(&pickle).ok()??;
-        Some(format!("{module}.{name}"))
+        zoe_pickle::decode_class_key(&pickle).ok()?
     }
 
     /// Attach `encoded` to the staged record of `oid`, so the finish writes

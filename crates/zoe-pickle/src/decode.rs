@@ -101,6 +101,13 @@ pub fn decode_class_name(bytes: &[u8]) -> Result<Option<(String, String)>, Error
         .map(|(module, name)| (module.to_owned(), name.to_owned())))
 }
 
+/// Returns the class of a record as `module.name`, from the class pickle
+/// alone, as [`decode_class_name`] reads it. Returns `None` when the class
+/// pickle names no class.
+pub fn decode_class_key(bytes: &[u8]) -> Result<Option<String>, Error> {
+    Ok(decode_class_name(bytes)?.map(|(module, name)| format!("{module}.{name}")))
+}
+
 /// One stack entry.
 struct Entry {
     /// The offset where the bytes of the entry start.

@@ -95,21 +95,10 @@ impl BlobDir {
                     path.push(format!("0x{byte:02x}"));
                 }
             }
-            Layout::Lawn => path.push(repr(oid.0)),
+            Layout::Lawn => path.push(oid.repr()),
         }
-        path.push(format!("{}.blob", repr(tid.0)));
+        path.push(format!("{}.blob", tid.repr()));
         path
-    }
-}
-
-/// Write an oid or a tid as ZODB's `oid_repr` does: `0x`, then the hex
-/// digits without leading zeros, padded to an even count. Zero is `0x00`.
-fn repr(n: u64) -> String {
-    let digits = format!("{n:x}");
-    if digits.len() % 2 == 1 {
-        format!("0x0{digits}")
-    } else {
-        format!("0x{digits}")
     }
 }
 
@@ -170,14 +159,6 @@ mod tests {
             assert_eq!(blobs.path(oid, tid), root.join(name));
             assert!(blobs.path(oid, tid).is_file());
         }
-    }
-
-    #[test]
-    fn repr_strips_leading_zeros_to_an_even_count() {
-        assert_eq!(repr(0), "0x00");
-        assert_eq!(repr(0x0b), "0x0b");
-        assert_eq!(repr(0x1ab), "0x01ab");
-        assert_eq!(repr(u64::MAX), "0xffffffffffffffff");
     }
 
     #[test]

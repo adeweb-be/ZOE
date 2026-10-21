@@ -33,7 +33,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zoe_convert::Verification;
+use zoe_convert::{IdForm, Verification};
 use zoe_core::ZoeError;
 use zoe_loupe::{Folder, oid_repr, parse_oid, parse_tid, tid_repr};
 
@@ -78,11 +78,9 @@ pub(crate) enum ToolError {
     NoTransaction(String),
 
     /// The store has blob records, but the blob directory of the open has
-    /// no layout file. The blob directory of the store is elsewhere.
-    #[error(
-        "the store has blobs, but the blob directory {0} has no layout file: \
-         give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)"
-    )]
+    /// no layout file. The blob directory of the store is elsewhere. The
+    /// text is the message of `zoe_convert::missing_blob_dir`.
+    #[error("{0}")]
     BlobDir(String),
 
     /// The result does not convert to JSON.
@@ -409,7 +407,9 @@ fn space_json(folder: &Folder, args: &SpaceArgs) -> Result<Value, ToolError> {
 fn verify_json(folder: &Folder) -> Result<Value, ToolError> {
     let store = folder.store();
     store.check_blob_dir().map_err(|error| match error {
-        ZoeError::MissingBlobDir { path } => ToolError::BlobDir(path.display().to_string()),
+        ZoeError::MissingBlobDir { path } => {
+            ToolError::BlobDir(zoe_convert::missing_blob_dir(&path))
+        }
         error => zoe_loupe::Error::from(error).into(),
     })?;
     Ok(verification_json(&zoe_convert::verify(store, None)))
@@ -421,50 +421,22 @@ fn verify_json(folder: &Folder) -> Result<Value, ToolError> {
 /// count of each list, `findings` their sum, and `walked` the counts of
 /// the walk.
 fn verification_json(report: &Verification) -> Value {
-    fn first<T>(items: &[T], json: impl Fn(&T) -> Value) -> Vec<Value> {
-        items.iter().take(FINDING_LIMIT).map(json).collect()
-    }
-    let checksums = first(&report.checksums, |p| {
-        json!({
-            "oid": p.oid.map(oid_repr),
-            "tid": p.tid.map(tid_repr),
-            "error": p.error,
-        })
+    let mut value = report.to_json(IdForm::Zodb, FINDING_LIMIT);
+    value["findings"] = json!(report.problems());
+    value["totals"] = json!({
+        "checksums": report.checksums.len(),
+        "blobs": report.blob_files.len(),
+        "references": report.references.len(),
+        "pickles": report.pickles.len(),
     });
-    let blobs = first(
-        &report.blob_files,
-        |p| json!({"oid": oid_repr(p.oid), "tid": tid_repr(p.tid), "error": p.error}),
-    );
-    let references = first(
-        &report.references,
-        |d| json!({"oid": oid_repr(d.oid), "tid": tid_repr(d.tid), "missing": oid_repr(d.missing)}),
-    );
-    let pickles = first(
-        &report.pickles,
-        |p| json!({"oid": oid_repr(p.oid), "tid": tid_repr(p.tid), "error": p.error}),
-    );
-    json!({
-        "findings": report.problems(),
-        "totals": {
-            "checksums": report.checksums.len(),
-            "blobs": report.blob_files.len(),
-            "references": report.references.len(),
-            "pickles": report.pickles.len(),
-        },
-        "walked": {
-            "transactions": report.transactions,
-            "sequences": report.sequences,
-            "records": report.records,
-            "objects": report.objects,
-            "blobs": report.blobs,
-        },
-        "checksums": checksums,
-        "blobs": blobs,
-        "references": references,
-        "pickles": pickles,
-        "classes": report.classes,
-        "unknown_classes": report.unknown_classes,
-    })
+    value["walked"] = json!({
+        "transactions": report.transactions,
+        "sequences": report.sequences,
+        "records": report.records,
+        "objects": report.objects,
+        "blobs": report.blobs,
+    });
+    value
 }
 
 #[cfg(test)]
@@ -477,24 +449,13 @@ mod tests {
         AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
     };
     use zoe_core::{Oid, Store, Tid};
+    use zoe_pickle::testing::{record, text as text_pickle};
 
     use super::*;
 
-    /// A text in a pickle: `BINUNICODE`.
-    fn text_pickle(value: &str) -> Vec<u8> {
-        let length = u32::try_from(value.len()).unwrap().to_le_bytes();
-        [&b"X"[..], &length, value.as_bytes()].concat()
-    }
-
     /// A persistent reference to `oid` with the class `m.C`.
     fn reference(oid: u64) -> Vec<u8> {
-        [&b"C\x08"[..], &oid.to_be_bytes(), b"cm\nC\n\x86Q"].concat()
-    }
-
-    /// A record of the class `module.name` with the state pickle `state`.
-    fn record(module: &str, name: &str, state: &[u8]) -> Vec<u8> {
-        let class = format!("c{module}\n{name}\n.");
-        [b"\x80\x03", class.as_bytes(), b"\x80\x03", state, b"."].concat()
+        zoe_pickle::testing::reference(oid, "m", "C")
     }
 
     /// A record of the class `m.Doc` with a title.

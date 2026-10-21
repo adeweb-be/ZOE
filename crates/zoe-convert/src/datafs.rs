@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use zoe_core::{Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::blobs::{BlobDir, is_blob_record};
-use crate::filestorage::{Cut, DataRecord, End, Reader, TxnHeader, hex};
+use crate::filestorage::{Cut, DataRecord, End, Reader, TxnHeader};
 use crate::{Error, ProblemKind, Report};
 
 /// The verification compares the first blob, then one blob in this many,
@@ -333,7 +333,7 @@ fn verify(
             _ => {
                 problems.add(
                     ProblemKind::MissingTransaction,
-                    format!("the store lacks transaction {}", hex(header.tid.0)),
+                    format!("the store lacks transaction {}", header.tid.hex()),
                 );
                 false
             }
@@ -350,7 +350,7 @@ fn verify(
                 without_dir += 1;
                 continue;
             };
-            let at = format!("oid {} at {}", hex(record.oid.0), hex(header.tid.0));
+            let at = format!("oid {} at {}", record.oid.hex(), header.tid.hex());
             let source = blobs.path(record.oid, header.tid);
             let size = match fs::metadata(&source) {
                 Ok(meta) => meta.len(),
@@ -429,7 +429,7 @@ fn not_in_file(txn: Result<TxnInfo, ZoeError>) -> (ProblemKind, String) {
             ProblemKind::MissingTransaction,
             format!(
                 "the store has transaction {}, which the Data.fs does not have",
-                hex(txn.tid.0)
+                txn.tid.hex()
             ),
         ),
         Err(error) => (
@@ -447,7 +447,7 @@ pub(crate) fn compare_txn(
     txn: &TxnInfo,
     problems: &mut Problems,
 ) {
-    let tid = hex(header.tid.0);
+    let tid = header.tid.hex();
     for (name, file, store) in [
         ("user", &header.user, &txn.user),
         ("description", &header.description, &txn.description),
@@ -472,7 +472,7 @@ pub(crate) fn compare_txn(
         .map(|record| (record.oid, record.data.as_deref()))
         .collect();
     for (oid, data) in &file {
-        let oid_hex = hex(oid.0);
+        let oid_hex = oid.hex();
         match store.get(oid) {
             None => problems.add(
                 ProblemKind::MissingRecord,
@@ -490,7 +490,7 @@ pub(crate) fn compare_txn(
             ProblemKind::MissingRecord,
             format!(
                 "transaction {tid}: the store has a record of oid {}, which the Data.fs does not have",
-                hex(oid.0)
+                oid.hex()
             ),
         );
     }
@@ -646,7 +646,7 @@ mod tests {
                 matches!(error, Error::Diverged { last: found } if found == last),
                 "{error:?}"
             );
-            assert!(error.to_string().contains(&hex(last.0)), "{error}");
+            assert!(error.to_string().contains(&last.hex()), "{error}");
             assert_eq!(store.last_transaction(), last);
         }
     }
