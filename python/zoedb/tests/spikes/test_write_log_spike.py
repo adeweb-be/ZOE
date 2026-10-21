@@ -1,5 +1,5 @@
 """Acceptance test of the spike on a write-ahead log with a background
-checkpoint (ZOE-184).
+checkpoint.
 
 The spike measures a prototype of the write path where a commit appends
 its records to a log and syncs only the log, and a checkpoint folds many
