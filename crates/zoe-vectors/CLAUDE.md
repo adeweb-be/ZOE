@@ -2,6 +2,8 @@
 
 Native retrieval: passages, embeddings, the `VectorIndex` trait and hybrid search. Specification: "AI-native: MCP server and retrieval".
 
+Nothing is built yet: `src/lib.rs` holds only its doc comment. The invariants below are for the crate to come.
+
 ## Invariants
 
 - Security filtering by the roles bitmap happens before ranking, in every mode and with every backend.

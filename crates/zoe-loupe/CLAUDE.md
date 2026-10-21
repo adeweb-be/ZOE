@@ -1,10 +1,10 @@
 # zoe-loupe
 
-The Rust side of Loupe, the desktop inspector and editor. Specification: "Loupe: desktop inspector and editor".
+The Rust side of Loupe, the desktop inspector. Loupe reads a store folder. It has no write path, no server mode and no converter: it writes to a store only to repair it at the open (ADR 0032). Specification: "Loupe: desktop inspector and editor".
 
 ## Invariants
 
-- Loupe never opens a `Data.fs`. It converts one.
+- Loupe never opens a `Data.fs`.
 - Folder mode opens a store with `Store::open_read_only_repairing` (`Folder::open`). `Folder::open_with_blob_dir` opens it the same way with a blob directory, for `zoe mcp`; the window of Loupe uses `Folder::open`. It holds the store lock, so a running instance and Loupe never share a store. It writes nothing to a store that was closed cleanly: the acceptance test compares the bytes of every file before and after browsing. A store that a writer left open gets its repair at the open (ADR 0032): the core writes only the database file, and `Folder::store().repaired()` tells the caller, which shows the operator the line of a repair. A failed repair is the store error `RepairFailed`. The open writes nothing in the blob directory or in its parent.
 - Every decode goes through zoe-pickle, with the default node budget (`decode_record`) and one `Tree::resolver()` per record. A record that zoe-pickle refuses gives an `Object` with the refusal in `error`, not an error of the call and not a crash. `persistent_ids` runs only after `decode_record` accepts the record, so its own decode stays inside the default node budget. The first tree is dropped before it, so one tree at a time is in memory.
 - The state of an object is JSON. The module documentation of `src/state.rs` gives the form of each node. A memo get shows the value that it stands for. A get inside its own value is a cycle marker. A dict with a key that starts with `$` is a list of pairs, so no key of the store looks like a tag. So is a dict with a key longer than 256 bytes, because each key is a segment of the pointers below it.
@@ -28,9 +28,3 @@ The Rust side of Loupe, the desktop inspector and editor. Specification: "Loupe:
 - Each long call takes a progress function. The call runs it after each item that it reads: a record, a transaction, an object or a BTree node. When it gives `Break`, the call stops with `Stopped`. The dry run of the core has no steps, so it cannot stop.
 - A walk of a path holds the set of the oids that it reached, so its memory grows with the number of objects, as for the mark of a pack.
 - A path starts at `root["Application"]`. Each segment goes through the key of a BTree or a mapping, the `_tree` item of a folder, or an attribute that holds a reference. A BTree lookup reads the separating keys to pick one child when they have the type of the segment. A BTree with int keys, such as an `IOBTree`, holds only a segment that is an int.
-- Every Loupe write is one ZODB transaction: user `loupe:<operating-system user>`, a description that the operator types, and extension data with the tool name and version.
-- Writes need expert mode for the session.
-- Opaque pickle nodes are not editable.
-- A delete is refused while inbound references exist, unless the operator chooses cascade.
-- Every commit shows the pickle diff first.
-- Credentials live in the operating-system keychain, never in a configuration file.

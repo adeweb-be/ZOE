@@ -828,8 +828,11 @@ deploy command="check":
             ;;
     esac
 
-# Build the documentation site from docs/ into target/book.
+# Check the links of the book, then build the documentation site from docs/
+# into target/book. The check fails on a link to a missing file, and on a
+# link to a page of docs/ that SUMMARY.md does not list.
 docs:
+    docs-linkcheck docs
     mdbook build docs
 
 # Run CI functions locally through Dagger. The default is check, test and docs.

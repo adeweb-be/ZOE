@@ -1,5 +1,5 @@
-//! Converters: `Data.fs` to ZOE, RelStorage to ZOE, ZOE to `Data.fs` and
-//! ZOE to ZOE. Each conversion verifies its result and writes a report.
+//! Converters: `Data.fs` to ZOE and ZOE to `Data.fs`. Each conversion
+//! verifies its result and writes a report.
 //!
 //! [`from_datafs`] converts a `Data.fs` and its blob directory into a ZOE
 //! store. It reads the file as a stream, restores each transaction under
