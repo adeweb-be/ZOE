@@ -490,7 +490,7 @@ fn write_report(
     writeln!(out, "  copied        {}", report.copied)?;
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;
-    writeln!(out, "  last tid      {:#018x}", report.last_tid.0)?;
+    writeln!(out, "  last tid      {}", report.last_tid.hex())?;
     if report.durable_keys > 0 {
         writeln!(
             out,

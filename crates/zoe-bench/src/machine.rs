@@ -6,6 +6,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use zoe_core::civil_from_days;
 
 /// The machine that runs the clients, as the zodbshootout results describe
 /// it, without the disk: the disk of the store is on the server side.
@@ -122,28 +123,13 @@ pub fn slug(text: &str) -> String {
 pub fn utc(time: SystemTime) -> String {
     let seconds = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    let (year, month, day) = civil(days);
+    let (year, month, day) = civil_from_days(days as i64);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         rest / 3600,
         rest % 3600 / 60,
         rest % 60
     )
-}
-
-/// Return the date of a number of days since 1970-01-01, in the proleptic
-/// Gregorian calendar (the algorithm of Howard Hinnant).
-fn civil(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
 }
 
 #[cfg(test)]

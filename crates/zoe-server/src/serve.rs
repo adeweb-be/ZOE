@@ -900,11 +900,7 @@ fn open_read_only(name: &str, path: &Path, options: Options) -> Result<Arc<Store
     let failed = |error| Error::Store(path.to_path_buf(), error);
     let store = Store::open_read_only_repairing(path, options).map_err(failed)?;
     if store.repaired() {
-        tracing::warn!(
-            storage = name,
-            "{}: the store was not closed cleanly: repaired the store",
-            path.display()
-        );
+        tracing::warn!(storage = name, "{}", Store::repair_message(path));
     }
     store.check_blob_dir().map_err(failed)?;
     Ok(Arc::new(store))

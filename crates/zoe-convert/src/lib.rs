@@ -40,7 +40,8 @@ pub use classes::{ClassRecord, records_of_classes};
 pub use datafs::from_datafs;
 pub use to_datafs::to_datafs;
 pub use verify::{
-    BlobProblem, CountProblem, Dangling, FrameProblem, PickleProblem, Verification, verify,
+    BlobProblem, CountProblem, Dangling, FrameProblem, IdForm, PickleProblem, Verification,
+    missing_blob_dir, verify,
 };
 
 /// The report of a conversion.
@@ -203,8 +204,8 @@ pub enum Error {
     /// source. So the store does not hold a part of the source, and the
     /// conversion copies nothing.
     #[error(
-        "the store does not continue the source: its last tid {:#018x} is not a tid of the source",
-        .last.0
+        "the store does not continue the source: its last tid {} is not a tid of the source",
+        .last.hex()
     )]
     Diverged {
         /// The last tid of the store.
@@ -215,9 +216,9 @@ pub enum Error {
     /// last tid is not a tid of the store. So the file does not hold a part
     /// of the store, and the conversion writes nothing.
     #[error(
-        "{}: the Data.fs does not continue the store: its last tid {:#018x} is not a tid of the store",
+        "{}: the Data.fs does not continue the store: its last tid {} is not a tid of the store",
         path.display(),
-        .last.0
+        .last.hex()
     )]
     DataFsDiverged {
         /// The path of the file.
@@ -246,8 +247,8 @@ pub enum Error {
     /// header of a transaction record holds the length of the user, the
     /// description and the extension in 2 bytes each.
     #[error(
-        "transaction {:#018x}: the {field} has {len} bytes, and a Data.fs holds at most 65535",
-        .tid.0
+        "transaction {}: the {field} has {len} bytes, and a Data.fs holds at most 65535",
+        .tid.hex()
     )]
     TooLong {
         /// The tid of the transaction.
@@ -306,10 +307,10 @@ pub enum Error {
     /// does not continue the dumps: they are dumps of another store, or of
     /// another history of this store. The backup writes nothing.
     #[error(
-        "{}: the store does not continue the dumps: their last tid {:#018x} is not a tid of the store; \
+        "{}: the store does not continue the dumps: their last tid {} is not a tid of the store; \
          write a new full dump into a new directory",
         path.display(),
-        .last.0
+        .last.hex()
     )]
     BackupDiverged {
         /// The path of the backup directory.
@@ -322,11 +323,11 @@ pub enum Error {
     /// changed history that the next dump must hold, so the backup writes
     /// nothing.
     #[error(
-        "{}: the store was packed at tid {:#018x}, after the last tid {:#018x} of the dumps; \
+        "{}: the store was packed at tid {}, after the last tid {} of the dumps; \
          write a new full dump into a new directory",
         path.display(),
-        .watermark.0,
-        .last.0
+        .watermark.hex(),
+        .last.hex()
     )]
     BackupPacked {
         /// The path of the backup directory.

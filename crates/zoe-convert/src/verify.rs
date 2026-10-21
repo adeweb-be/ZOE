@@ -18,9 +18,11 @@
 //! yet, which is no finding.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Store, Tid, ZoeError};
-use zoe_pickle::{PersistentId, decode_class_name, persistent_ids};
+use zoe_pickle::{decode_class_key, persistent_ids};
 
 /// The number of record keys that one read of the walk takes.
 const KEY_CHUNK: usize = 1024;
@@ -127,6 +129,15 @@ pub struct Verification {
     pub unknown_classes: Vec<String>,
 }
 
+/// The form of the oids and the tids in the JSON of a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdForm {
+    /// A number, as `zoe verify --format json` gives it.
+    Number,
+    /// A string in ZODB form, such as `0x01`, as `zoe mcp` gives it.
+    Zodb,
+}
+
 impl Verification {
     /// Return the number of findings.
     pub fn problems(&self) -> usize {
@@ -137,6 +148,63 @@ impl Verification {
             + self.unknown_classes.len()
             + usize::from(self.count.is_some())
     }
+
+    /// Return the findings as one JSON object: the lists `checksums`,
+    /// `blobs`, `references` and `pickles`, each with its first `limit`
+    /// findings, then `classes` and `unknown_classes`. The oids and the
+    /// tids have the form `ids`. The caller adds its other keys.
+    pub fn to_json(&self, ids: IdForm, limit: usize) -> Value {
+        let oid = |oid: Oid| match ids {
+            IdForm::Number => json!(oid.0),
+            IdForm::Zodb => json!(oid.repr()),
+        };
+        let tid = |tid: Tid| match ids {
+            IdForm::Number => json!(tid.0),
+            IdForm::Zodb => json!(tid.repr()),
+        };
+        fn first<T>(items: &[T], limit: usize, json: impl Fn(&T) -> Value) -> Vec<Value> {
+            items.iter().take(limit).map(json).collect()
+        }
+        let checksums = first(
+            &self.checksums,
+            limit,
+            |p| json!({"oid": p.oid.map(oid), "tid": p.tid.map(tid), "error": p.error}),
+        );
+        let blobs = first(
+            &self.blob_files,
+            limit,
+            |p| json!({"oid": oid(p.oid), "tid": tid(p.tid), "error": p.error}),
+        );
+        let references = first(
+            &self.references,
+            limit,
+            |d| json!({"oid": oid(d.oid), "tid": tid(d.tid), "missing": oid(d.missing)}),
+        );
+        let pickles = first(
+            &self.pickles,
+            limit,
+            |p| json!({"oid": oid(p.oid), "tid": tid(p.tid), "error": p.error}),
+        );
+        json!({
+            "checksums": checksums,
+            "blobs": blobs,
+            "references": references,
+            "pickles": pickles,
+            "classes": self.classes,
+            "unknown_classes": self.unknown_classes,
+        })
+    }
+}
+
+/// Return the message of a store with blob records whose blob directory
+/// `blobs` has no layout file, for a tool that takes `--blob-dir`. The
+/// blob directory of the store is elsewhere.
+pub fn missing_blob_dir(blobs: &Path) -> String {
+    format!(
+        "the store has blobs, but the blob directory {} has no layout file: \
+         give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+        blobs.display()
+    )
 }
 
 /// Check `store`. `known` lists the classes that the application provides,
@@ -388,10 +456,10 @@ const DAMAGED_BLOB_FILE: &str =
 /// Count the class of the current record `data` of `oid` at `tid`, and
 /// check its references.
 fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mut Walk) {
-    let class = match decode_class_name(data) {
-        Ok(Some((module, name))) => format!("{module}.{name}"),
-        Ok(None) | Err(_) => PackReport::UNKNOWN_CLASS.to_owned(),
-    };
+    let class = decode_class_key(data)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PackReport::UNKNOWN_CLASS.to_owned());
     *report.classes.entry(class).or_default() += 1;
 
     let ids = match persistent_ids(data) {
@@ -403,15 +471,15 @@ fn current(oid: Oid, tid: Tid, data: &[u8], report: &mut Verification, walk: &mu
         }
     };
     for id in ids {
-        let PersistentId::Oid(bytes) = id else {
-            continue;
+        let target = match id.oid_u64() {
+            None => continue,
+            Some(Ok(target)) => Oid(target),
+            Some(Err(len)) => {
+                let error = format!("a reference has an oid of {len} bytes, not 8");
+                report.pickles.push(PickleProblem { oid, tid, error });
+                continue;
+            }
         };
-        let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-            let error = format!("a reference has an oid of {} bytes, not 8", bytes.len());
-            report.pickles.push(PickleProblem { oid, tid, error });
-            continue;
-        };
-        let target = Oid(u64::from_be_bytes(bytes));
         if target > oid {
             walk.ahead.push((target, oid, tid));
         } else if !walk.has(target) {

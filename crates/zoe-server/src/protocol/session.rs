@@ -1653,7 +1653,7 @@ impl Transaction {
         if let Some(&first) = oids.first() {
             tracing::warn!(
                 oids = oids.len(),
-                first = format!("0x{:016x}", first.0),
+                first = first.hex(),
                 held_ms = self.session.storage.intent_hold.as_millis() as u64,
                 "released the intent locks that a client held without tpc_begin"
             );

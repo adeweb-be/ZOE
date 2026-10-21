@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use zoe_convert::{BackupCheck, Verification};
+use zoe_convert::{BackupCheck, IdForm, Verification};
 
 use super::{Failure, closed_by_reader, open_with_blobs};
 
@@ -163,7 +163,7 @@ fn write_backup_text(
         path.display()
     )?;
     writeln!(out, "  dumps            {}", restored.dumps)?;
-    writeln!(out, "  last tid         {}", hex(restored.last_tid.0))?;
+    writeln!(out, "  last tid         {}", restored.last_tid.hex())?;
     writeln!(out, "  transactions     {}", restored.transactions)?;
     writeln!(out, "  records          {}", restored.records)?;
     writeln!(out, "  blobs            {}", restored.blobs)?;
@@ -209,54 +209,28 @@ fn read_classes(path: &Path) -> Result<BTreeSet<String>, Failure> {
         .collect())
 }
 
-/// Return the report as one JSON value.
+/// Return the report as one JSON value, with the oids and the tids as
+/// numbers and every finding.
 fn to_json(report: &Verification) -> Value {
-    let checksums: Vec<Value> = report
-        .checksums
-        .iter()
-        .map(|p| json!({"oid": p.oid.map(|o| o.0), "tid": p.tid.map(|t| t.0), "error": p.error}))
-        .collect();
-    let blobs: Vec<Value> = report
-        .blob_files
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    let references: Vec<Value> = report
-        .references
-        .iter()
-        .map(|d| json!({"oid": d.oid.0, "tid": d.tid.0, "missing": d.missing.0}))
-        .collect();
-    let pickles: Vec<Value> = report
-        .pickles
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    json!({
-        "checksums": checksums,
-        "blobs": blobs,
-        "references": references,
-        "pickles": pickles,
-        "classes": report.classes,
-        "unknown_classes": report.unknown_classes,
-        "object_count": report.object_count,
-        "namespaces": {
-            "ephemeral_keys": report.ephemeral_keys,
-            "durable_keys": report.durable_keys,
-            "expired_keys": report.expired_keys,
-        },
-        "count": report.count.map(|c| json!({"stored": c.stored, "counted": c.counted})),
-    })
+    let mut value = report.to_json(IdForm::Number, usize::MAX);
+    value["object_count"] = json!(report.object_count);
+    value["namespaces"] = json!({
+        "ephemeral_keys": report.ephemeral_keys,
+        "durable_keys": report.durable_keys,
+        "expired_keys": report.expired_keys,
+    });
+    value["count"] = json!(
+        report
+            .count
+            .map(|c| json!({"stored": c.stored, "counted": c.counted}))
+    );
+    value
 }
 
 /// Write the report as one JSON document.
 fn write_json(out: &mut dyn Write, report: &Verification) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut *out, &to_json(report)).map_err(io::Error::from)?;
     writeln!(out)
-}
-
-/// Return an oid or a tid as ZODB prints it.
-fn hex(n: u64) -> String {
-    format!("{n:#018x}")
 }
 
 /// Write the report for a person.
@@ -280,19 +254,19 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
     for p in &report.checksums {
-        let oid = p.oid.map(|o| format!("oid {}, ", hex(o.0)));
-        let tid = p.tid.map(|t| format!("tid {}: ", hex(t.0)));
+        let oid = p.oid.map(|o| format!("oid {}, ", o.hex()));
+        let tid = p.tid.map(|t| format!("tid {}: ", t.hex()));
         let (oid, tid) = (oid.unwrap_or_default(), tid.unwrap_or_default());
         writeln!(out, "    {oid}{tid}{}", p.error)?;
     }
     writeln!(out, "  blob files       {}", report.blob_files.len())?;
     for p in &report.blob_files {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  references       {}", report.references.len())?;
     for d in &report.references {
-        let (oid, tid, missing) = (hex(d.oid.0), hex(d.tid.0), hex(d.missing.0));
+        let (oid, tid, missing) = (d.oid.hex(), d.tid.hex(), d.missing.hex());
         writeln!(
             out,
             "    oid {oid}, tid {tid}: oid {missing} has no current record"
@@ -300,7 +274,7 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     }
     writeln!(out, "  pickles          {}", report.pickles.len())?;
     for p in &report.pickles {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  unknown classes  {}", report.unknown_classes.len())?;

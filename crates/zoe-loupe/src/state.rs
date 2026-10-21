@@ -283,12 +283,7 @@ pub(crate) fn target<'t>(resolver: &Resolver<'t>, pid: &'t Node) -> Option<Targe
 /// Return the items of a list node, in order.
 pub(crate) fn list_items(node: &Node) -> Vec<&Node> {
     match node {
-        Node::List(list) => list
-            .initial
-            .iter()
-            .flatten()
-            .chain(list.batches.iter().flat_map(|batch| &batch.items))
-            .collect(),
+        Node::List(list) => list.items().collect(),
         _ => Vec::new(),
     }
 }
@@ -296,12 +291,7 @@ pub(crate) fn list_items(node: &Node) -> Vec<&Node> {
 /// Return the entries of a dict node, in order.
 pub(crate) fn dict_entries(node: &Node) -> Vec<&(Node, Node)> {
     match node {
-        Node::Dict(dict) => dict
-            .initial
-            .iter()
-            .flatten()
-            .chain(dict.batches.iter().flat_map(|batch| &batch.items))
-            .collect(),
+        Node::Dict(dict) => dict.entries().collect(),
         _ => Vec::new(),
     }
 }
@@ -813,6 +803,8 @@ impl<'r, 't> Converter<'r, 't> {
 
 #[cfg(test)]
 mod tests {
+    use zoe_pickle::testing::{record_with_put, reference_to_put as reference};
+
     use super::*;
 
     /// Decode a record whose class pickle is GLOBAL m C, BINPUT 0, and
@@ -830,12 +822,7 @@ mod tests {
     /// A record whose class pickle is GLOBAL m C, BINPUT 0, with the state
     /// pickle `state` without its STOP.
     fn record(state: &[u8]) -> Vec<u8> {
-        [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat()
-    }
-
-    /// The pickle of a persistent reference to `oid` with class m.C.
-    fn reference(oid: u8) -> Vec<u8> {
-        [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"h\x00\x86Q"].concat()
+        record_with_put("m", "C", state)
     }
 
     fn references(found: &[Reference]) -> Vec<(u64, &str)> {

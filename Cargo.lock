@@ -2451,6 +2451,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "redb",
+ "serde_json",
  "thiserror",
  "xxhash-rust",
  "zoe-core",

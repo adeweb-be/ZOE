@@ -654,24 +654,8 @@ fn sequence_items(node: &Node) -> Vec<&Node> {
 fn extent(node: &Node) -> (usize, usize) {
     match node {
         Node::Tuple(tuple) => (tuple.items.len(), 0),
-        Node::List(list) => (
-            list.initial.as_ref().map_or(0, Vec::len)
-                + list
-                    .batches
-                    .iter()
-                    .map(|batch| batch.items.len())
-                    .sum::<usize>(),
-            list.batches.len(),
-        ),
-        Node::Dict(dict) => (
-            dict.initial.as_ref().map_or(0, Vec::len)
-                + dict
-                    .batches
-                    .iter()
-                    .map(|batch| batch.items.len())
-                    .sum::<usize>(),
-            dict.batches.len(),
-        ),
+        Node::List(list) => (list.items().count(), list.batches.len()),
+        Node::Dict(dict) => (dict.entries().count(), dict.batches.len()),
         _ => (0, 0),
     }
 }
@@ -720,14 +704,14 @@ fn address(node: &Node) -> usize {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use zoe_pickle::testing::{record_with_put, reference_to_put, text};
 
     use super::*;
 
     /// Decode a record whose class pickle is GLOBAL m C, BINPUT 0, and
     /// whose state pickle is `state`.
     fn record(state: &[u8]) -> Tree {
-        let record = [&b"\x80\x03cm\nC\nq\x00.\x80\x03"[..], state, b"."].concat();
-        zoe_pickle::decode_record(&record).unwrap()
+        zoe_pickle::decode_record(&record_with_put("m", "C", state)).unwrap()
     }
 
     /// Return the changes between two state pickles, sorted by path.
@@ -735,16 +719,6 @@ mod tests {
         let mut changes = diff(&record(before), &record(after));
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         changes
-    }
-
-    /// The pickle of a str with BINUNICODE.
-    fn text(value: &str) -> Vec<u8> {
-        [
-            &b"X"[..],
-            &(value.len() as u32).to_le_bytes(),
-            value.as_bytes(),
-        ]
-        .concat()
     }
 
     /// The pickle of a dict that holds `inner` under a key of `size` bytes.
@@ -755,11 +729,10 @@ mod tests {
     /// The pickle of a persistent reference to `oid`, with the class m.C
     /// or without a class.
     fn reference(oid: u8, with_class: bool) -> Vec<u8> {
-        let oid = [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid]].concat();
         if with_class {
-            [&oid[..], b"h\x00\x86Q"].concat()
+            reference_to_put(u64::from(oid))
         } else {
-            [&oid[..], b"Q"].concat()
+            [&b"C\x08\0\0\0\0\0\0\0"[..], &[oid], b"Q"].concat()
         }
     }
 
