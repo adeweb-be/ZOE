@@ -1,6 +1,6 @@
 # 0042. The posting-dict rule, the first-key rule, and the settings of the structural merges
 
-Status: accepted. A checkpoint of ZOE-203: the human approved the rule as written, the key alone until the merge policy of ZOE-205, the names of the keys, and the resolution log as a file key in both modes. On the pull request, the human then asked for the key of the rule as a mode, `posting-dicts`, for the reasons of the rule in the Context, for a shadow mode that a store cannot run without its log in-process, and for posting dicts of int scores only. The first-key rule came after the gate replay of ZOE-208 (#416): the human asked Claude to settle where it goes, Claude put it here, and the human approved it here, under the same key; after the review found the corner of a node inside a tree, the human limited it to a delete by the committed transaction.
+Status: accepted. The posting-dict rule and the first-key rule merge where ZODB's resolver refuses, under one key, `posting-dicts`, off by default. The resolution log is a file key in both modes.
 
 ## Context
 
@@ -47,7 +47,7 @@ A record cannot tell a root from a node inside a tree. `BTree_getstate` writes t
 - When the committed transaction deleted the first key and moved the separator, the new transaction read the node that holds the separator on its path to the bucket. BTrees marks each node of that path as read-current (`PER_READCURRENT` in `_BTree_set` of the C code, `readCurrent` in `_Tree._set` and `_Tree._del` of `_base.py`), so the vote fails with `ReadConflictError` on that node, whatever tier 1 merges: a merge counts only when every read-current serial is still current (`a_stale_read_current_oid_fails_the_vote_after_a_merge_of_tier_1`). When the new transaction wrote that node too, the vote fails with `ConflictError` on it instead. When the separator did not move, it stays a lower bound of the node, and the merge is right.
 - The argument holds for writes that enter the tree at its root, as the API of BTrees does. A write into a node that a program takes from `__getstate__()` marks no node above it, and the rule does not protect it.
 
-`test_a_first_key_delete_in_a_node_inside_a_tree_never_loses_a_key` builds that node and checks both directions. The human chose this form of the rule after the review.
+`test_a_first_key_delete_in_a_node_inside_a_tree_never_loses_a_key` builds that node and checks both directions.
 
 Why it is safe in a root. A tree of one inline bucket is a map or a set whose state holds all of its items, so a merge of the deletes of two different keys gives the map that both transactions mean, as the merge of BTrees does for any other key. On the B5 log of ZOE-208, these refusals are most of what tier 1 refuses with the posting-dict rule on: the `IIBTree`s of the postings of ZCTextIndex for words of more than 10 documents, when a reindex removes the document of the lowest id.
 
