@@ -88,7 +88,7 @@ Both come from the workspace. `zoe-server` with `serve`, `zoe-client` and `zoe-p
 
 `zoe-wire` depends on no crate of ZOE. It is a leaf. So `zoe-core` never depends on it, and it never depends on `zoe-core`. That is why `MAX_TID` is a `u64`: a caller writes `Tid(MAX_TID)`.
 
-`zoe-server` takes `zoe-wire` only under its feature `serve`. The build of `zoe-server` without `serve`, which `zoe-py` uses, does not link it through `zoe-server`. `zoe-py` and `zoe-bench` depend on `zoe-wire` directly, for `MAX_TID` and the names of the extensions. So `cargo tree -p zoe-py -e normal` lists tokio through `zoe-client`, lists `zoe-wire`, and does not list rmcp (ADR 0035).
+`zoe-server` takes `zoe-wire` only under its feature `serve`. The build of `zoe-server` without `serve`, which `zoe-py` uses, does not link it through `zoe-server`. `zoe-py` and `zoe-bench` depend on `zoe-wire` directly, for `MAX_TID` and the names of the extensions. So `cargo tree -p zoe-py -e normal` lists tokio through `zoe-client`, lists `zoe-wire`, and does not list rmcp (ADR 0001, "The extension links zoe-client and tokio, never rmcp").
 
 ### 7. What stays out
 

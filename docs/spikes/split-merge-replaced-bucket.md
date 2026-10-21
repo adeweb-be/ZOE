@@ -36,7 +36,7 @@ Step 1 of the card:
 | **all** | | **1,038** | | | **8** | **20** | **18** | **27.0** | |
 
 - "write" and "read" are the `ConflictError`s that B5 counts in the measured window. "replaced" is the number of read conflicts whose line in the resolution log has the reason "a path child that the other side replaced".
-- The other two read conflicts (r0, 4 users) have the reason "a path child that the other side split": T inserted into the last bucket of `intids.ids` without a split, and the other side split that bucket. This is the case of question 6 of ADR 0048.
+- The other two read conflicts (r0, 4 users) have the reason "a path child that the other side split": T inserted into the last bucket of `intids.ids` without a split, and the other side split that bucket. This is the case of a plain insert into a bucket that the other side split (ADR 0048, Alternatives).
 - In r2 at 16 users the log has three lines "replaced" in the window and B5 counts two read conflicts: B5 counts an operation in the step where its request starts.
 - The write conflicts: five on a `Folder` (two creations in one folder, out of ADR 0048), two on `OOBucket` and one on `OOBucket` through `UniqueIdGeneratorTool` (r0, 4 users).
 - By step: at 4 users 8 `ConflictError`s in 524 operations (15.3 per 1,000), 4 of them "replaced"; at 16 users 20 in 514 (38.9 per 1,000), 14 of them "replaced".
@@ -86,7 +86,7 @@ S2 and S3 read the node before S1, so each one split the same bucket 8b1d and me
 - **Rule 3 keeps Y.** The keys of the range merge as today and go to A and Y; X gets no place. The node keeps its children, so T's write to Y stays in the tree: its read-current node does not change, and its stale Y merges with the record of S2 (tier 1, or the client for the key references of `intids`). On the runs this removes the 18 cases: an estimate of 10 `ConflictError`s in 1,038 operations (9.6 per 1,000) instead of 28. It also removes the garbage of finding 3. It writes Y, a record that S2 did not store, so the vote must lock Y and the client of S2 must drop Y in all its Connections. The vote finds Y in its plan, after it took its locks in oid order, so the lock of Y cannot wait.
 - **Rule 1 merges T into the bucket that replaced Y.** It writes a record that T did not store too, it must follow the chains (4 of 20), and it leaves the garbage.
 - **Rule 3 keeps Y when Y does not change.** 1 merge of 59.
-- **The plain insert into a bucket that the other side split** (2 cases, question 6 of ADR 0048) needs the same machinery: a write of a bucket that the transaction did not store.
+- **The plain insert into a bucket that the other side split** (2 cases; ADR 0048, Alternatives) needs the same machinery: a write of a bucket that the transaction did not store.
 
 ### 5. What the clients of the process that commits see
 
