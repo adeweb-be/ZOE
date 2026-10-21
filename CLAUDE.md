@@ -20,12 +20,13 @@ Enter the environment with `devenv shell`, then run `just <recipe>`. Use recipes
 | `just test` | Rust tests, then the Python tests on CPython 3.12, 3.13, 3.14 and 3.14t, then `just deploy check` |
 | `just tsan` | `zoe-core` tests under ThreadSanitizer, then the canary test, which passes only when ThreadSanitizer reports its deliberate race; builds into `target/tsan`; `just tsan zoe-server FILTER` runs the library tests of `zoe-server` whose name holds FILTER instead |
 | `just fuzz` | builds the fuzz targets of `zoe serve` (`crates/zoe-server/fuzz`) with libFuzzer and AddressSanitizer into `target/fuzz`, then runs them for 60 seconds in all; `just fuzz 3600` runs them for an hour, `just fuzz 600 frame` runs only `frame` |
+| `just crash` | the process kill loop against `zoe serve` for 200 rounds, then the kill loop and the split writers under the simulator; `just crash RUNS SEED` repeats the kill times of a run |
 | `just conformance` | ZODB's storage suites and test modules in-process against `zoe.Storage`, on every interpreter |
 | `just plone` | builds the Plone instance of a scenario under `plone/` into `target/plone` and starts it; `just plone zoe check` creates a Plone site on the zoe scenario by script and reads it over HTTP |
-| `just bench` | benchmarks (not built yet) |
-| `just loupe` | builds and runs Loupe (not built yet) |
+| `just bench` | the benchmarks of `bench/`, which `bench/README.md` describes: the zodbshootout baseline by default; `native` the phase 3 gate (ADR 0039), `client` the client benchmark, `load` and `saturate` through `zoe-bench`, `plone` the Plone end-to-end benchmark (B5), `replay` the log replay (B6), `showcase` the publishable set, `publish` the copy of results into a checkout of the results repository (ADR 0054) |
+| `just loupe` | builds Loupe in release and runs it; `just loupe dev` runs it on the Vite dev server, `just loupe check` lints it, `just loupe e2e` runs its end-to-end tests. They run in the `loupe` profile of the shell: `devenv --profile loupe shell -- just loupe` |
 | `just deploy check` | the tests of `deploy/tests` on the deployment files: the Tier 1 manifests, the host units, the Grafana dashboard; `just test` runs it at its end |
-| `just docs` | builds the documentation site into `target/book` |
+| `just docs` | checks the links of the book, then builds the documentation site into `target/book`; a link to a missing file or to a page of `docs/` that `SUMMARY.md` does not list fails it |
 | `just ci` | runs the Dagger functions `check`, `test` and `docs` locally; `just ci <function>` runs one |
 | `just release` | builds the static `zoe` binary and the server image into `target/dist` through Dagger; `just release binary DIR` builds the binary in the shell; `just release test` runs the tests of `ci/`. Publishing is not built yet |
 
@@ -99,7 +100,7 @@ Definition of Done: acceptance test green; unit tests added; the pull-request ha
 | `python/` | the uv workspace; `python/zoedb/` is the wheel (`zoe` package, extension `zoe._zoe`) |
 | `plone/` | the buildout scenarios for the Plone instances |
 | `apps/loupe/` | the Loupe window code |
-| `deploy/` | manifests and the Helm chart |
+| `deploy/` | the Tier 1 manifests, the systemd and supervisor units, the Grafana dashboard and their tests |
 | `bench/` | the benchmark harness |
 | `ci/` | the Dagger module |
 | `loops/` | the role briefs |
