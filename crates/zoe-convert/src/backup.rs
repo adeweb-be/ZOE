@@ -30,7 +30,6 @@ use zoe_core::{BlobRecord, DurableRow, Oid, Store, Tid, TxnInfo, ZoeError};
 
 use crate::Error;
 use crate::datafs::Problems;
-use crate::filestorage::hex;
 
 /// The first 8 bytes of a dump file that a backup writes: the name of the
 /// format, then its version, 2.
@@ -423,17 +422,17 @@ fn chain(dir: &Path) -> Result<Vec<DumpFile>, Error> {
         let reason = match end {
             None if dump.after != Tid::ZERO => Some(format!(
                 "the full dump is missing: the first dump starts after tid {}",
-                hex(dump.after.0)
+                dump.after.hex()
             )),
             Some(end) if dump.after < end => Some(format!(
                 "the dumps overlap: this dump starts after tid {}, before the end {} of the dump before it",
-                hex(dump.after.0),
-                hex(end.0)
+                dump.after.hex(),
+                end.hex()
             )),
             Some(end) if dump.after > end => Some(format!(
                 "a dump is missing: this dump starts after tid {}, and the dump before it ends at tid {}",
-                hex(dump.after.0),
-                hex(end.0)
+                dump.after.hex(),
+                end.hex()
             )),
             // Only a full dump of an empty store covers no tid.
             _ if dump.last < dump.after || (dump.last == dump.after && end.is_some()) => {
@@ -448,8 +447,8 @@ fn chain(dir: &Path) -> Result<Vec<DumpFile>, Error> {
         if header != (dump.after, dump.last) {
             let reason = format!(
                 "the header names the tids {} and {}, not those of the file name",
-                hex(header.0.0),
-                hex(header.1.0)
+                header.0.hex(),
+                header.1.hex()
             );
             return Err(damaged(&dump.path, reason));
         }
@@ -832,9 +831,9 @@ impl DumpReader {
         if tid <= self.tid || tid > self.last {
             let reason = format!(
                 "transaction {} at offset {at} is not after tid {} and at or before tid {}",
-                hex(tid.0),
-                hex(self.tid.0),
-                hex(self.last.0)
+                tid.hex(),
+                self.tid.hex(),
+                self.last.hex()
             );
             return Err(self.damaged(reason));
         }
@@ -930,8 +929,8 @@ impl DumpReader {
         if *hasher.finalize().as_bytes() != blob.hash {
             let reason = format!(
                 "the blob of oid {} at tid {} does not match its hash",
-                hex(oid.0),
-                hex(self.tid.0)
+                oid.hex(),
+                self.tid.hex()
             );
             return Err(self.damaged(reason));
         }
@@ -1102,7 +1101,7 @@ fn compare(store: &Store, copy: &Store, last: Tid) -> Result<Vec<String>, Error>
             Some(Ok(txn)) => compare_txn(store, copy, &txn, &dumped, packed, &mut problems)?,
             // A pack removed the transaction.
             _ if packed => {}
-            _ => problems.push(format!("the store lacks transaction {}", hex(dumped.tid.0))),
+            _ => problems.push(format!("the store lacks transaction {}", dumped.tid.hex())),
         }
     }
     for txn in ours {
@@ -1116,8 +1115,8 @@ fn compare(store: &Store, copy: &Store, last: Tid) -> Result<Vec<String>, Error>
         problems.summary(format!(
             "the store was packed at tid {}, after the last tid {} of the dumps; \
              write a new full dump into a new directory",
-            hex(watermark.0),
-            hex(last.0)
+            watermark.hex(),
+            last.hex()
         ));
     } else {
         compare_current(store, copy, last, watermark, &mut problems)?;
@@ -1213,7 +1212,7 @@ fn compare_current(
         if restored == Some(oid) {
             restored = theirs.next()?;
         }
-        let at = format!("oid {} at {}", hex(oid.0), hex(last.0));
+        let at = format!("oid {} at {}", oid.hex(), last.hex());
         let current_mine = match current(store, oid, before) {
             Ok(record) => record,
             Err(error) => {
@@ -1282,7 +1281,7 @@ impl<'a> Oids<'a> {
 fn not_in_dumps(tid: Tid) -> String {
     format!(
         "the store has transaction {}, which the dumps do not have",
-        hex(tid.0)
+        tid.hex()
     )
 }
 
@@ -1296,7 +1295,7 @@ fn compare_txn(
     packed: bool,
     problems: &mut Problems,
 ) -> Result<(), Error> {
-    let at = hex(ours.tid.0);
+    let at = ours.tid.hex();
     let meta = |txn: &TxnInfo| {
         (
             txn.user.clone(),
@@ -1309,7 +1308,7 @@ fn compare_txn(
             "transaction {at}: the user, the description or the extension differs"
         ));
     }
-    let lacks = |oid: Oid| format!("oid {} at {at}: the store lacks the record", hex(oid.0));
+    let lacks = |oid: Oid| format!("oid {} at {at}: the store lacks the record", oid.hex());
     let mut theirs = dumped.records.iter().peekable();
     for record in &ours.records {
         while let Some(other) = theirs.next_if(|other| other.oid < record.oid) {
@@ -1317,7 +1316,7 @@ fn compare_txn(
                 problems.push(lacks(other.oid));
             }
         }
-        let oid = hex(record.oid.0);
+        let oid = record.oid.hex();
         match theirs.next_if(|other| other.oid == record.oid) {
             None => problems.push(format!(
                 "oid {oid} at {at}: the store has a record that the dumps do not have"
@@ -2154,7 +2153,7 @@ mod tests {
         for oid in [1, 2, 3, 5] {
             let line = format!(
                 "oid {} at 0x00000000000000c8: the current record differs",
-                hex(oid)
+                Oid(oid).hex()
             );
             assert!(text.contains(&line), "{text}");
         }

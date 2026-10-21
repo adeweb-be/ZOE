@@ -50,8 +50,8 @@ fn write_report(
         from.display()
     )?;
     writeln!(out, "  dumps         {}", report.dumps)?;
-    let (last, time) = (report.last_tid.0, utc(report.last_tid));
-    writeln!(out, "  last tid      {last:#018x} ({time})")?;
+    let (last, time) = (report.last_tid.hex(), utc(report.last_tid));
+    writeln!(out, "  last tid      {last} ({time})")?;
     writeln!(out, "  transactions  {}", report.transactions)?;
     writeln!(out, "  records       {}", report.records)?;
     writeln!(out, "  blobs         {}", report.blobs)?;

@@ -89,18 +89,18 @@ pub(super) fn run(args: &PackArgs, clock: &dyn Clock, out: &mut dyn Write) -> Re
         let store = open_read_only(path, options)?;
         let report = store.pack_dry_run(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
-            "A pack of the store {} as of tid {:#018x} would remove:",
+            "A pack of the store {} as of tid {} would remove:",
             path.display(),
-            at.0
+            at.hex()
         );
         (report, title)
     } else {
         let store = open_existing(path, options)?;
         let report = store.pack(at).map_err(|e| store_failure(path, e))?;
         let title = format!(
-            "Packed the store {} as of tid {:#018x}. It removed:",
+            "Packed the store {} as of tid {}. It removed:",
             path.display(),
-            at.0
+            at.hex()
         );
         (report, title)
     };

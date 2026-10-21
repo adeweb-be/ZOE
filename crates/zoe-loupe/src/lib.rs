@@ -67,7 +67,7 @@ pub enum Error {
     },
 
     /// zoe-pickle refuses a record that a path goes through.
-    #[error("oid {}: {source}", id_repr(.oid.0))]
+    #[error("oid {}: {source}", .oid.repr())]
     Refused {
         /// The oid of the record.
         oid: Oid,
@@ -81,7 +81,7 @@ pub enum Error {
 
     /// The object has no record at or before the tid of a view. A later
     /// transaction creates it.
-    #[error("oid {}: no record as of tid {}", id_repr(.oid.0), id_repr(.tid.0))]
+    #[error("oid {}: no record as of tid {}", .oid.repr(), .tid.repr())]
     NoRecordAsOf {
         /// The oid of the object.
         oid: Oid,
@@ -501,43 +501,25 @@ fn note(bytes: &[u8]) -> String {
     text
 }
 
-/// Return an 8-byte id in ZODB form, as `ZODB.utils.oid_repr` writes it:
-/// `0x`, then the hex digits without leading zeros, padded to an even
-/// count. Zero is `0x00`.
-fn id_repr(id: u64) -> String {
-    let digits = format!("{id:x}");
-    let pad = if digits.len() % 2 == 1 { "0" } else { "" };
-    format!("0x{pad}{digits}")
-}
-
-/// Return `oid` in ZODB form, for example `0x00` or `0x0100`.
+/// Return `oid` in ZODB form, as `ZODB.utils.oid_repr` writes it, for
+/// example `0x00` or `0x0100`.
 pub fn oid_repr(oid: Oid) -> String {
-    id_repr(oid.0)
+    oid.repr()
 }
 
 /// Return `tid` in ZODB form, for example `0x033f2eeca6666666`.
 pub fn tid_repr(tid: Tid) -> String {
-    id_repr(tid.0)
+    tid.repr()
 }
 
 /// Read an oid in ZODB form: `0x` and 1 to 16 hex digits.
 pub fn parse_oid(text: &str) -> Result<Oid> {
-    parse_id(text).map(Oid)
+    Oid::parse(text).ok_or_else(|| Error::BadId(text.to_owned()))
 }
 
 /// Read a tid in ZODB form: `0x` and 1 to 16 hex digits.
 pub fn parse_tid(text: &str) -> Result<Tid> {
-    parse_id(text).map(Tid)
-}
-
-/// Read an 8-byte id in ZODB form: `0x` and 1 to 16 hex digits.
-fn parse_id(text: &str) -> Result<u64> {
-    let digits = text
-        .strip_prefix("0x")
-        .filter(|digits| (1..=16).contains(&digits.len()))
-        .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| Error::BadId(text.to_owned()))?;
-    u64::from_str_radix(digits, 16).map_err(|_| Error::BadId(text.to_owned()))
+    Tid::parse(text).ok_or_else(|| Error::BadId(text.to_owned()))
 }
 
 fn serialize_oid<S: Serializer>(oid: &Oid, serializer: S) -> std::result::Result<S::Ok, S::Error> {

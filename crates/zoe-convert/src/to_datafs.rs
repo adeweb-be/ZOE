@@ -22,7 +22,7 @@ use zoe_core::{Oid, Store, Tid, ZoeError};
 
 use crate::blobs::{BlobDir, LAYOUT_FILE, Layout};
 use crate::datafs::{BLOB_SAMPLE_STRIDE, Problems, check_blob, compare_txn, stop_problem};
-use crate::filestorage::{DataRecord, Reader, TxnHeader, hex};
+use crate::filestorage::{DataRecord, Reader, TxnHeader};
 use crate::writer::{Writer, tail};
 use crate::{Error, ProblemKind, Report};
 
@@ -380,13 +380,13 @@ fn verify(
             }
             _ => differences.add(
                 ProblemKind::MissingTransaction,
-                format!("the Data.fs lacks transaction {}", hex(txn.tid.0)),
+                format!("the Data.fs lacks transaction {}", txn.tid.hex()),
             ),
         }
 
         for record in txn.records.iter().filter(|record| record.data.is_some()) {
             let (oid, tid) = (record.oid, txn.tid);
-            let at = format!("oid {} at {}", hex(oid.0), hex(tid.0));
+            let at = format!("oid {} at {}", oid.hex(), tid.hex());
             match store.blob_path(oid, tid) {
                 Ok(_) => {}
                 Err(ZoeError::NotFound { .. }) => continue,
@@ -449,7 +449,7 @@ fn read_txn(reader: &mut Reader) -> Result<Option<(TxnHeader, Vec<DataRecord>)>,
 fn not_in_store(tid: Tid) -> String {
     format!(
         "the Data.fs has transaction {}, which the store does not have",
-        hex(tid.0)
+        tid.hex()
     )
 }
 
@@ -824,7 +824,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&path, b"evil").unwrap();
 
-        let at = format!("oid 0x0000000000000002 at {}", hex(tid.0));
+        let at = format!("oid 0x0000000000000002 at {}", tid.hex());
         // A first run and a run with nothing to add give the same report.
         for copied in [1, 0] {
             let report = convert(&store, &dir).unwrap();
@@ -871,7 +871,7 @@ mod tests {
             panic!("not a mismatch: {error:?}");
         };
         assert_eq!(path, &data_fs);
-        let txn = format!("transaction {}", hex(tid.0));
+        let txn = format!("transaction {}", tid.hex());
         assert_eq!(
             problems,
             &[
@@ -922,7 +922,7 @@ mod tests {
         );
         let difference = format!(
             "transaction {}: the record of oid 0x0000000000000001 differs",
-            hex(t1.0)
+            t1.hex()
         );
         let error = convert(&s2, &dir).unwrap_err();
         assert!(
@@ -959,7 +959,7 @@ mod tests {
         let Error::Mismatch { problems, .. } = &error else {
             panic!("not a mismatch: {error:?}");
         };
-        let at = format!("oid 0x0000000000000001 at {}", hex(tid.0));
+        let at = format!("oid 0x0000000000000001 at {}", tid.hex());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].starts_with(&format!("{at}: the blob directory has no blob file")),

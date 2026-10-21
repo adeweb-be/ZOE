@@ -163,7 +163,7 @@ fn write_backup_text(
         path.display()
     )?;
     writeln!(out, "  dumps            {}", restored.dumps)?;
-    writeln!(out, "  last tid         {}", hex(restored.last_tid.0))?;
+    writeln!(out, "  last tid         {}", restored.last_tid.hex())?;
     writeln!(out, "  transactions     {}", restored.transactions)?;
     writeln!(out, "  records          {}", restored.records)?;
     writeln!(out, "  blobs            {}", restored.blobs)?;
@@ -254,11 +254,6 @@ fn write_json(out: &mut dyn Write, report: &Verification) -> io::Result<()> {
     writeln!(out)
 }
 
-/// Return an oid or a tid as ZODB prints it.
-fn hex(n: u64) -> String {
-    format!("{n:#018x}")
-}
-
 /// Write the report for a person.
 fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Result<()> {
     writeln!(out, "Verified the store {}", path.display())?;
@@ -280,19 +275,19 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     writeln!(out, "Findings: {}", report.problems())?;
     writeln!(out, "  checksums        {}", report.checksums.len())?;
     for p in &report.checksums {
-        let oid = p.oid.map(|o| format!("oid {}, ", hex(o.0)));
-        let tid = p.tid.map(|t| format!("tid {}: ", hex(t.0)));
+        let oid = p.oid.map(|o| format!("oid {}, ", o.hex()));
+        let tid = p.tid.map(|t| format!("tid {}: ", t.hex()));
         let (oid, tid) = (oid.unwrap_or_default(), tid.unwrap_or_default());
         writeln!(out, "    {oid}{tid}{}", p.error)?;
     }
     writeln!(out, "  blob files       {}", report.blob_files.len())?;
     for p in &report.blob_files {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  references       {}", report.references.len())?;
     for d in &report.references {
-        let (oid, tid, missing) = (hex(d.oid.0), hex(d.tid.0), hex(d.missing.0));
+        let (oid, tid, missing) = (d.oid.hex(), d.tid.hex(), d.missing.hex());
         writeln!(
             out,
             "    oid {oid}, tid {tid}: oid {missing} has no current record"
@@ -300,7 +295,7 @@ fn write_text(out: &mut dyn Write, path: &Path, report: &Verification) -> io::Re
     }
     writeln!(out, "  pickles          {}", report.pickles.len())?;
     for p in &report.pickles {
-        let (oid, tid) = (hex(p.oid.0), hex(p.tid.0));
+        let (oid, tid) = (p.oid.hex(), p.tid.hex());
         writeln!(out, "    oid {oid}, tid {tid}: {}", p.error)?;
     }
     writeln!(out, "  unknown classes  {}", report.unknown_classes.len())?;
