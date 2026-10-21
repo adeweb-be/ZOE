@@ -107,7 +107,7 @@ in
   # The link check of `just docs`. It reads SUMMARY.md and the pages that
   # it lists. It fails on a link to a file that does not exist, and on a
   # link to a .md file of the book that SUMMARY.md does not list. It skips
-  # code, anchors and links with a scheme.
+  # code, anchors, footnotes and links with a scheme.
   scripts.docs-linkcheck = {
     description = "Check the links of the book";
     package = pkgs.python313;
@@ -122,12 +122,12 @@ in
       fence = re.compile(r"^[ \t]*(```+|~~~+).*?^[ \t]*\1", re.M | re.S)
       code = re.compile(r"(`+).+?\1", re.S)
       inline = re.compile(r"\]\(\s*<?([^\s)>]+)")
-      definition = re.compile(r"^ {0,3}\[[^\]]+\]:\s*<?([^\s>]+)", re.M)
+      definition = re.compile(r"^ {0,3}\[(?!\^)[^\]]+\]:\s*<?([^\s>]+)", re.M)
       scheme = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 
 
       def links(page):
-          text = code.sub("", fence.sub("", page.read_text()))
+          text = code.sub("", fence.sub("", page.read_text(encoding="utf-8")))
           for target in inline.findall(text) + definition.findall(text):
               if not target.startswith("#") and not scheme.match(target):
                   yield target, unquote(target.split("#", 1)[0])
@@ -136,8 +136,8 @@ in
       listed = {(root / path).resolve() for _, path in links(summary)}
       errors = []
       for page in [summary, *sorted(listed)]:
+          # The check of the links of SUMMARY.md reports a missing page.
           if not page.is_file():
-              errors.append(f"SUMMARY.md: {page.relative_to(root)}: no such file")
               continue
           for target, path in links(page):
               where = f"{page.relative_to(root)}: {target}"
