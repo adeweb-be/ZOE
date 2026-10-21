@@ -4,12 +4,16 @@
 //! `zoe_pickle::python`. The differential tests against ZODB's resolver are
 //! the acceptance tests `test_native_merges.py` and `test_posting_dicts.py`.
 
+mod support;
+
+use support::Rng;
+use zoe_core::testing::{commit, record};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{
     Mode, Oid, Options, Reason, Resolved, Store, StructuralMerges, SystemClock, Tid, ZoeError,
 };
 use zoe_pickle::btrees::{new_bucket_state, new_tree_state};
-use zoe_pickle::python::{Heap, Pickler, Value};
+use zoe_pickle::python::{Heap, Value};
 
 /// Returns the record of an `IIBucket` of `items`.
 fn ii_bucket(items: &[(i128, i128)]) -> Vec<u8> {
@@ -133,26 +137,12 @@ fn length(value: i128) -> Vec<u8> {
     record(&heap, class, Value::Int(value))
 }
 
-fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-    let mut pickler = Pickler::new(heap);
-    pickler.dump(class).unwrap();
-    pickler.dump(state).unwrap();
-    pickler.into_bytes()
-}
-
 fn open(merges: StructuralMerges) -> Store {
     let options = Options {
         structural_merges: merges,
         ..Options::default()
     };
     Store::open_full(MemVfs::new(), SystemClock, options).unwrap()
-}
-
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
 }
 
 /// Commits `base`, then `committed` over it. Returns the oid and the serial
@@ -690,22 +680,6 @@ fn modes_and_class_modes_parse() {
     assert!(zoe_core::merge::class_mode("BTrees.IOBTree.IOBucket").is_err());
 }
 
-/// A small generator of the xorshift family, so that a failure repeats.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
 /// The records of an `IOBucket` of the metadata of a catalog: each rid maps
 /// to `(title, created, modified, start, Type, created)`, with
 /// `DateTime`s in three zones, `Missing.Value` and `Message`s, as ZODB 6
@@ -845,7 +819,7 @@ fn damaged_records_never_panic_and_a_merge_always_decodes() {
         [length(10), length(12), length(7)],
         [io_postings(base), io_postings(committed), io_postings(new)],
     ];
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15);
     let mut merged = 0;
     for round in 0..20_000 {
         let triple = &triples[round % triples.len()];

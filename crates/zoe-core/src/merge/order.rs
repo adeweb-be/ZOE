@@ -771,10 +771,7 @@ fn self_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        pickle(heap, class, state).ok().unwrap()
-    }
+    use crate::testing::record;
 
     fn list(items: &[&str]) -> Vec<u8> {
         let mut heap = Heap::new();

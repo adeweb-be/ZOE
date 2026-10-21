@@ -3,16 +3,11 @@
 //! iteration and `restore`. They are what ZODB's MVCC adapter,
 //! `zodbconvert` and the backup tools call.
 
-use std::path::PathBuf;
+mod support;
 
+use support::fresh_dir;
+use zoe_core::testing::commit_as;
 use zoe_core::{Oid, Store, Tid, ZoeError};
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-reads-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn pickle(text: &str) -> Vec<u8> {
     let mut data = b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03X".to_vec();
@@ -22,24 +17,20 @@ fn pickle(text: &str) -> Vec<u8> {
     data
 }
 
-/// Commit one transaction that writes `writes` and return its tid.
-fn commit(store: &Store, description: &str, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-    let mut txn = store
-        .tpc_begin(b"someone", description.as_bytes(), b"ext")
-        .unwrap();
-    for (oid, serial, data) in writes {
-        txn.store(*oid, *serial, data).unwrap();
-    }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 #[test]
 fn load_before_returns_the_revision_and_the_next_serial() {
     let store = Store::open(fresh_dir("load-before")).unwrap();
     let oid = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
-    let t2 = commit(&store, "two", &[(oid, t1, pickle("v2"))]);
+    let t1 = commit_as(
+        &store,
+        (b"someone", b"one", b"ext"),
+        &[(oid, Tid::ZERO, pickle("v1"))],
+    );
+    let t2 = commit_as(
+        &store,
+        (b"someone", b"two", b"ext"),
+        &[(oid, t1, pickle("v2"))],
+    );
 
     let old = store.load_before(oid, t2).unwrap().unwrap();
     assert_eq!(old.data, pickle("v1"));
@@ -65,8 +56,16 @@ fn load_before_returns_the_revision_and_the_next_serial() {
 fn load_serial_reads_one_revision() {
     let store = Store::open(fresh_dir("load-serial")).unwrap();
     let oid = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
-    let t2 = commit(&store, "two", &[(oid, t1, pickle("v2"))]);
+    let t1 = commit_as(
+        &store,
+        (b"someone", b"one", b"ext"),
+        &[(oid, Tid::ZERO, pickle("v1"))],
+    );
+    let t2 = commit_as(
+        &store,
+        (b"someone", b"two", b"ext"),
+        &[(oid, t1, pickle("v2"))],
+    );
 
     assert_eq!(store.load_serial(oid, t1).unwrap(), pickle("v1"));
     assert_eq!(store.load_serial(oid, t2).unwrap(), pickle("v2"));
@@ -81,9 +80,21 @@ fn load_serial_reads_one_revision() {
 fn history_lists_revisions_newest_first() {
     let store = Store::open(fresh_dir("history")).unwrap();
     let oid = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
-    let t2 = commit(&store, "two", &[(oid, t1, pickle("v2"))]);
-    let t3 = commit(&store, "three", &[(oid, t2, pickle("v3"))]);
+    let t1 = commit_as(
+        &store,
+        (b"someone", b"one", b"ext"),
+        &[(oid, Tid::ZERO, pickle("v1"))],
+    );
+    let t2 = commit_as(
+        &store,
+        (b"someone", b"two", b"ext"),
+        &[(oid, t1, pickle("v2"))],
+    );
+    let t3 = commit_as(
+        &store,
+        (b"someone", b"three", b"ext"),
+        &[(oid, t2, pickle("v3"))],
+    );
 
     let all = store.history(oid, 10).unwrap();
     let tids: Vec<Tid> = all.iter().map(|r| r.tid).collect();
@@ -102,13 +113,21 @@ fn the_iterator_walks_transactions_in_order_with_their_records() {
     let store = Store::open(fresh_dir("iterator")).unwrap();
     let a = store.new_oid().unwrap();
     let b = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(a, Tid::ZERO, pickle("a1"))]);
-    let t2 = commit(
+    let t1 = commit_as(
         &store,
-        "two",
+        (b"someone", b"one", b"ext"),
+        &[(a, Tid::ZERO, pickle("a1"))],
+    );
+    let t2 = commit_as(
+        &store,
+        (b"someone", b"two", b"ext"),
         &[(a, t1, pickle("a2")), (b, Tid::ZERO, pickle("b1"))],
     );
-    let t3 = commit(&store, "three", &[(b, t2, pickle("b2"))]);
+    let t3 = commit_as(
+        &store,
+        (b"someone", b"three", b"ext"),
+        &[(b, t2, pickle("b2"))],
+    );
 
     let all: Vec<_> = store
         .iterator(None, None)
@@ -147,8 +166,12 @@ fn record_iternext_walks_the_current_records() {
         .iter()
         .map(|&oid| (oid, Tid::ZERO, pickle(&format!("{oid:?}"))))
         .collect();
-    let t1 = commit(&store, "create", &writes);
-    let t2 = commit(&store, "update", &[(oids[1], t1, pickle("changed"))]);
+    let t1 = commit_as(&store, (b"someone", b"create", b"ext"), &writes);
+    let t2 = commit_as(
+        &store,
+        (b"someone", b"update", b"ext"),
+        &[(oids[1], t1, pickle("changed"))],
+    );
 
     let mut seen = Vec::new();
     let mut next = None;
@@ -175,10 +198,14 @@ fn restore_copies_transactions_with_their_tids() {
     let source = Store::open(fresh_dir("restore-source")).unwrap();
     let a = source.new_oid().unwrap();
     let b = source.new_oid().unwrap();
-    let t1 = commit(&source, "one", &[(a, Tid::ZERO, pickle("a1"))]);
-    commit(
+    let t1 = commit_as(
         &source,
-        "two",
+        (b"someone", b"one", b"ext"),
+        &[(a, Tid::ZERO, pickle("a1"))],
+    );
+    commit_as(
+        &source,
+        (b"someone", b"two", b"ext"),
         &[(a, t1, pickle("a2")), (b, Tid::ZERO, pickle("b1"))],
     );
 
@@ -216,7 +243,11 @@ fn restore_copies_transactions_with_their_tids() {
 fn restore_refuses_a_tid_that_is_not_after_the_last_one() {
     let store = Store::open(fresh_dir("restore-order")).unwrap();
     let oid = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
+    let t1 = commit_as(
+        &store,
+        (b"someone", b"one", b"ext"),
+        &[(oid, Tid::ZERO, pickle("v1"))],
+    );
     let result = store.tpc_begin_restore(t1, b"", b"", b"");
     assert!(
         matches!(result, Err(ZoeError::Protocol(_))),
@@ -229,7 +260,11 @@ fn restore_refuses_a_tid_that_is_not_after_the_last_one() {
 fn a_restored_deletion_removes_the_object() {
     let store = Store::open(fresh_dir("restore-delete")).unwrap();
     let oid = store.new_oid().unwrap();
-    let t1 = commit(&store, "one", &[(oid, Tid::ZERO, pickle("v1"))]);
+    let t1 = commit_as(
+        &store,
+        (b"someone", b"one", b"ext"),
+        &[(oid, Tid::ZERO, pickle("v1"))],
+    );
 
     let mut delete = store
         .tpc_begin_restore(Tid(t1.0 + 1), b"", b"undo creation", b"")

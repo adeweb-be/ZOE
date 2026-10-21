@@ -6,10 +6,13 @@
 //! directory, `blobs/tmp/` is the `temporaryDirectory()` of each ZEO
 //! client, so a restart of the server keeps the files of the clients.
 
+mod support;
+
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use support::fresh_dir;
 use zoe_core::vfs::{MemVfs, Vfs};
 use zoe_core::{Options, Store};
 
@@ -119,13 +122,6 @@ fn a_crash_keeps_the_files_of_the_clients() {
     drop(store);
     drop(Store::open_vfs(image.clone()).unwrap());
     assert_eq!(tmp_files(&image), sorted(FOREIGN));
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-blob-tmp-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// Open the store in `dir`/store with its blob directory `dir`/shared, as

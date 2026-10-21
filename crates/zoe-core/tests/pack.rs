@@ -5,14 +5,16 @@
 //! commit and read, and a crash at any point leaves a store that opens and
 //! keeps every reachable revision.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use support::fresh_dir;
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Oid, Store, Tid, Txn, ZoeError};
 
@@ -100,7 +102,7 @@ fn reference(p: &mut Vec<u8>, r: Ref) {
 
 /// Return a protocol-3 record of `class`: the class pickle, then a dict
 /// state that maps each key to its value.
-fn record(class: (&str, &str), state: &[(&str, Value)]) -> Vec<u8> {
+fn dict_record(class: (&str, &str), state: &[(&str, Value)]) -> Vec<u8> {
     let mut p = b"\x80\x03".to_vec();
     global(&mut p, class);
     p.extend_from_slice(b".\x80\x03}");
@@ -145,19 +147,12 @@ const DROPPED: &[u8] = b"dropped blob";
 
 /// A record of class `ITEM` that holds only a title.
 fn item(title: &'static str) -> Vec<u8> {
-    record(ITEM, &[("title", Value::Text(title))])
+    dict_record(ITEM, &[("title", Value::Text(title))])
 }
 
 /// The pickle of a blob record.
 fn blob_record() -> Vec<u8> {
-    record(BLOB, &[])
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-pack-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    dict_record(BLOB, &[])
 }
 
 /// Every record that a test committed.
@@ -321,10 +316,10 @@ fn scenario(store: &Store) -> Scenario {
             ("w", Value::Ref(Ref::Weak(w))),
         ];
         state.extend_from_slice(extra);
-        record(MAPPING, &state)
+        dict_record(MAPPING, &state)
     };
     let holder = |title| {
-        record(
+        dict_record(
             ITEM,
             &[
                 ("c", Value::InTuple(Ref::Typed(c))),
@@ -352,7 +347,7 @@ fn scenario(store: &Store) -> Scenario {
             (m, item("m1")),
             (
                 h,
-                record(
+                dict_record(
                     ITEM,
                     &[
                         ("x", Value::InReduce(Ref::Oid(x1))),
@@ -470,7 +465,7 @@ fn a_pack_removes_the_blob_files_of_the_records_it_removes() {
             .iter()
             .map(|&(name, oid)| (name, Value::Ref(Ref::Typed(oid))))
             .collect();
-        record(MAPPING, &state)
+        dict_record(MAPPING, &state)
     };
 
     let t1 = model.commit(
@@ -566,7 +561,7 @@ fn a_reference_that_cannot_be_read_keeps_its_target() {
 
     // The state of u holds a reference to x, then an opcode that Python
     // refuses.
-    let mut unreadable = record(ITEM, &[]);
+    let mut unreadable = dict_record(ITEM, &[]);
     unreadable.truncate(unreadable.len() - 1);
     unreadable.push(b'(');
     text(&mut unreadable, "x");
@@ -576,7 +571,10 @@ fn a_reference_that_cannot_be_read_keeps_its_target() {
     let t1 = model.commit(
         &store,
         &[
-            (ROOT, record(MAPPING, &[("u", Value::Ref(Ref::Typed(u)))])),
+            (
+                ROOT,
+                dict_record(MAPPING, &[("u", Value::Ref(Ref::Typed(u)))]),
+            ),
             (u, item("u1")),
             (x, item("x1")),
         ],
@@ -606,7 +604,7 @@ fn a_crash_at_any_point_of_a_pack_keeps_every_reachable_revision() {
                 .iter()
                 .map(|&(name, oid)| (name, Value::Ref(Ref::Typed(oid))))
                 .collect();
-            record(MAPPING, &state)
+            dict_record(MAPPING, &state)
         };
         let t1 = model.commit(
             &store,

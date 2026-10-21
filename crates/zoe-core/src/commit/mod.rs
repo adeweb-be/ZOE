@@ -1948,10 +1948,7 @@ impl VoteCheck {
     /// Make the plan of the split merge at the first conflict of the vote,
     /// after a read of the merge policy, and take it into the check. Return
     /// the stale node of a refusal, which fails the vote.
-    fn split_plan<S: Deref<Target = Store>>(
-        &mut self,
-        txn: &mut Txn<S>,
-    ) -> Result<Option<Stale>> {
+    fn split_plan<S: Deref<Target = Store>>(&mut self, txn: &mut Txn<S>) -> Result<Option<Stale>> {
         self.policy(&txn.store)?;
         if self.plan.is_some() {
             return Ok(None);
@@ -1966,10 +1963,7 @@ impl VoteCheck {
 
     /// Make the plan of the order merge at the first conflict of a written
     /// oid. Return the order of a refusal, which fails the vote.
-    fn order_plan<S: Deref<Target = Store>>(
-        &mut self,
-        txn: &mut Txn<S>,
-    ) -> Result<Option<Stale>> {
+    fn order_plan<S: Deref<Target = Store>>(&mut self, txn: &mut Txn<S>) -> Result<Option<Stale>> {
         if self.orders.is_some() {
             return Ok(None);
         }
@@ -2400,17 +2394,10 @@ mod tests {
     use redb::StorageBackend;
 
     use super::*;
-    use crate::clock::{ManualClock, SystemClock};
-    use crate::guard::capture::{Captured, events_of};
+    use crate::clock::SystemClock;
     use crate::store::Options;
+    use crate::testing::{Captured, commit, commit_all, events_of, open_with_clock};
     use crate::vfs::{MemVfs, Vfs};
-
-    fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        txn.store(oid, serial, data).unwrap();
-        txn.vote().unwrap();
-        txn.finish().unwrap()
-    }
 
     /// Begin a restore at `tid` that restores `data` for `oid`, and vote.
     fn voted_restore<'s>(store: &'s Store, tid: Tid, oid: Oid, data: &[u8]) -> Txn<&'s Store> {
@@ -2812,17 +2799,6 @@ mod tests {
         assert_eq!(store.load(oid).unwrap(), (b"b".to_vec(), tid));
         assert!(store.lock_table_is_empty());
         assert_eq!(Arc::strong_count(&store), 1);
-    }
-
-    /// Commit the records of `writes` in one transaction: each is an oid,
-    /// the serial that the transaction read and a pickle.
-    fn commit_all(store: &Store, writes: &[(Oid, Tid, &[u8])]) -> Tid {
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        for &(oid, serial, data) in writes {
-            txn.store(oid, serial, data).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap()
     }
 
     #[test]
@@ -3463,14 +3439,6 @@ mod tests {
             .filter(|e| e.message().contains("transaction-warn"))
             .map(|e| [e.number("duration_ms"), e.number("oid"), e.number("tid")])
             .collect()
-    }
-
-    /// Open a store in memory with `options` and a clock that the test
-    /// moves.
-    fn open_with_clock(options: Options) -> (Store, ManualClock) {
-        let clock = ManualClock::new();
-        let store = Store::open_full(MemVfs::new(), clock.clone(), options).unwrap();
-        (store, clock)
     }
 
     #[test]

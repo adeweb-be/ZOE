@@ -14,27 +14,23 @@
 //! The crash image is a copy of the database file of an open store after
 //! a commit, as a kill of the writer leaves it.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use support::fresh_dir;
+use zoe_core::testing::{Meta, commit_as};
 use zoe_core::{Oid, Options, Store, Tid, ZoeError};
+
+/// The user, the description and the extension of each commit.
+const META: Meta = (b"user", b"description", b"");
 
 /// The database file of a store.
 const DATABASE: &str = "zoe.redb";
 /// The lock file of a store.
 const LOCK: &str = "lock";
-
-/// Return a new empty directory for the test `name`.
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zoe-read-only-repair-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Return every entry under `dir`, by path: the bytes of a file, `None`
 /// for a directory.
@@ -56,19 +52,11 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     entries
 }
 
-/// Commit `data` as the record of `oid` over `serial`. Return the tid.
-fn commit(store: &Store, oid: Oid, serial: Tid, data: &[u8]) -> Tid {
-    let mut txn = store.tpc_begin(b"user", b"description", b"").unwrap();
-    txn.store(oid, serial, data).unwrap();
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 /// Write a store in `dir` and close it cleanly. Return the tid of its
 /// commit.
 fn clean_store(dir: &Path) -> Tid {
     let store = Store::open(dir).unwrap();
-    commit(&store, Oid(0), Tid::ZERO, b"first")
+    commit_as(&store, META, &[(Oid(0), Tid::ZERO, b"first")])
 }
 
 /// Make a store in `root/image` that a writer left open after its last
@@ -79,7 +67,7 @@ fn crash_image(root: &Path) -> (PathBuf, Tid) {
     // The open sets the recovery flag of redb. The commit is durable, and
     // only a clean close writes the allocator state after it.
     let store = Store::open(&live).unwrap();
-    let last = commit(&store, Oid(0), first, b"second");
+    let last = commit_as(&store, META, &[(Oid(0), first, b"second")]);
     fs::create_dir_all(&image).unwrap();
     fs::copy(live.join(DATABASE), image.join(DATABASE)).unwrap();
     fs::write(image.join(LOCK), b"").unwrap();

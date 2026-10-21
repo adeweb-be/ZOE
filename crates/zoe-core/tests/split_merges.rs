@@ -9,19 +9,22 @@
 //! the order of its keys and the chain of its next buckets. The model of
 //! the spike on real BTrees is the Python test `test_zoe_split_merges.py`.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
+use support::CountingClock;
+use zoe_core::testing::{commit_txn, new_oid, record, root, wait_until};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{
-    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, Waiter,
-    ZoeError,
+    Clock, Mode, Observer, Oid, Options, Reason, Resolved, Store, SystemClock, Tid, Txn, ZoeError,
 };
 use zoe_pickle::btrees::{BucketState, TreeState, bucket_state, new_bucket_state, tree_state};
-use zoe_pickle::python::{Heap, Instance, Made, Pickler, Value};
+use zoe_pickle::python::{Heap, Instance, Made, Value};
 
 /// A family of BTrees of the tests: the module and the prefix of its
 /// classes. With `references`, the value of each key is a key reference to
@@ -144,13 +147,6 @@ fn reference(heap: &mut Heap, family: Family, oid: Oid, name: &str) -> Value {
     heap.new_reference(data).unwrap()
 }
 
-fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-    let mut pickler = Pickler::new(heap);
-    pickler.dump(class).unwrap();
-    pickler.dump(state).unwrap();
-    pickler.into_bytes()
-}
-
 /// Returns the items of `keys`, each with its value in `family`.
 fn items(heap: &mut Heap, family: Family, keys: &[Key]) -> Vec<Value> {
     let mut items = Vec::new();
@@ -214,18 +210,6 @@ fn ints(ints: &[i128]) -> Vec<Key> {
     ints.iter().map(|&int| Key::Int(int)).collect()
 }
 
-/// The root of ZODB, a `PersistentMapping` that names the policy at
-/// `policy`, as ZODB writes it.
-fn root(policy: Oid) -> Vec<u8> {
-    [
-        &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\x00\
-           dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-        &policy.0.to_be_bytes(),
-        b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-    ]
-    .concat()
-}
-
 /// Returns the record of a policy that sets `split_merges` to `mode`, when
 /// it is given, and the mode of tier 1 of each class of `tier1`.
 fn policy(mode: Option<&str>, tier1: &[(&str, &str)]) -> Vec<u8> {
@@ -272,19 +256,10 @@ fn open_on(clock: impl Clock + 'static, mode: Option<&str>, tier1: &[(&str, &str
     };
     let store = Store::open_full(MemVfs::new(), clock, options).unwrap();
     let oid = new_oid(&store);
-    let tid = commit(&store, &[(oid, Tid::ZERO, policy(mode, tier1))]);
-    commit(&store, &[(Oid(0), Tid::ZERO, root(oid))]);
+    let tid = commit_txn(writing(&store, &[(oid, Tid::ZERO, policy(mode, tier1))]));
+    commit_txn(writing(&store, &[(Oid(0), Tid::ZERO, root(oid))]));
     assert!(tid > Tid::ZERO);
     store
-}
-
-fn new_oid(store: &Store) -> Oid {
-    loop {
-        let oid = store.new_oid().unwrap();
-        if oid != Oid(0) {
-            return oid;
-        }
-    }
 }
 
 /// Begins a transaction that stores `writes`, each with the serial that
@@ -304,13 +279,6 @@ fn stock<'s>(store: &'s Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Txn<&'s Store>
         txn.store(*oid, *serial, data).unwrap();
     }
     txn
-}
-
-/// Commits `writes` in one transaction.
-fn commit(store: &Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-    let mut txn = writing(store, writes);
-    txn.vote().unwrap();
-    txn.finish().unwrap()
 }
 
 /// A tree of the tests: its root and its buckets in order, each with its
@@ -340,7 +308,7 @@ fn tree(store: &Store, family: Family, keys: &[&[Key]]) -> Tree {
         0,
         (root, Tid::ZERO, leaf_node(family, buckets[0], &children)),
     );
-    let tid = commit(store, &writes);
+    let tid = commit_txn(writing(store, &writes));
     Tree {
         family,
         root,
@@ -450,7 +418,7 @@ fn two_buckets(store: &Store) -> Tree {
 fn split(store: &Store, tree: &Tree, index: usize, left: &[i128], right: &[i128]) -> Oid {
     let new = new_oid(store);
     let writes = split_writes(tree, index, new, left, right);
-    commit(store, &writes);
+    commit_txn(writing(store, &writes));
     new
 }
 
@@ -556,14 +524,14 @@ fn without_server_writes_a_split_of_both_sides_gives_no_answer() {
 fn without_server_writes_a_split_against_a_change_without_a_split_merges() {
     let store = open(Some("on"));
     let tree = two_buckets(&store);
-    commit(
+    commit_txn(writing(
         &store,
         &[(
             tree.buckets[1],
             tree.tid,
             bucket(II, &ints(&[40, 50, 55, 60]), None),
         )],
-    );
+    ));
     let x = new_oid(&store);
     let mut txn = stock(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
     txn.vote().unwrap();
@@ -624,14 +592,14 @@ fn a_split_of_a_bucket_that_the_other_side_changed_without_a_split_merges() {
     let store = open(Some("on"));
     let tree = two_buckets(&store);
     // The other side inserts 55 into the second bucket, without a split.
-    commit(
+    commit_txn(writing(
         &store,
         &[(
             tree.buckets[1],
             tree.tid,
             bucket(II, &ints(&[40, 50, 55, 60]), None),
         )],
-    );
+    ));
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
     txn.vote().unwrap();
@@ -714,8 +682,8 @@ fn a_node_of_rule_1_passes_the_vote_after_the_caller_resolved() {
         let class = heap.new_class("m", "Thing");
         record(&heap, class, Value::Int(n))
     };
-    let read = commit(&store, &[(other, Tid::ZERO, thing(1))]);
-    let committed = commit(&store, &[(other, read, thing(2))]);
+    let read = commit_txn(writing(&store, &[(other, Tid::ZERO, thing(1))]));
+    let committed = commit_txn(writing(&store, &[(other, read, thing(2))]));
     let mut txn = writing(
         &store,
         &[
@@ -741,20 +709,20 @@ fn a_node_of_rule_1_passes_the_vote_after_the_caller_resolved() {
 fn a_split_of_a_root_that_held_its_bucket_inline_merges() {
     let store = open(Some("on"));
     let root = new_oid(&store);
-    let read = commit(
+    let read = commit_txn(writing(
         &store,
         &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
-    );
+    ));
     // The other side splits the inline bucket into two new buckets.
     let (a1, y1) = (new_oid(&store), new_oid(&store));
-    commit(
+    commit_txn(writing(
         &store,
         &[
             (root, read, leaf_node(II, a1, &[(Key::Int(30), y1)])),
             (a1, Tid::ZERO, bucket(II, &ints(&[10, 20]), Some(y1))),
             (y1, Tid::ZERO, bucket(II, &ints(&[30, 40]), None)),
         ],
-    );
+    ));
     let (a, x) = (new_oid(&store), new_oid(&store));
     let mut txn = writing(
         &store,
@@ -788,19 +756,19 @@ fn a_split_of_a_root_that_held_its_bucket_inline_merges() {
 fn without_server_writes_a_split_of_an_inline_root_on_both_sides_gives_no_answer() {
     let store = open(Some("on"));
     let root = new_oid(&store);
-    let read = commit(
+    let read = commit_txn(writing(
         &store,
         &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
-    );
+    ));
     let (a1, y1) = (new_oid(&store), new_oid(&store));
-    commit(
+    commit_txn(writing(
         &store,
         &[
             (root, read, leaf_node(II, a1, &[(Key::Int(30), y1)])),
             (a1, Tid::ZERO, bucket(II, &ints(&[10, 20]), Some(y1))),
             (y1, Tid::ZERO, bucket(II, &ints(&[30, 40]), None)),
         ],
-    );
+    ));
     let (a, x) = (new_oid(&store), new_oid(&store));
     let mut txn = stock(
         &store,
@@ -817,11 +785,14 @@ fn without_server_writes_a_split_of_an_inline_root_on_both_sides_gives_no_answer
 fn a_split_of_an_inline_bucket_that_the_other_side_changed_inline_merges() {
     let store = open(Some("on"));
     let root = new_oid(&store);
-    let read = commit(
+    let read = commit_txn(writing(
         &store,
         &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
-    );
-    commit(&store, &[(root, read, inline(II, &ints(&[5, 10, 20, 30])))]);
+    ));
+    commit_txn(writing(
+        &store,
+        &[(root, read, inline(II, &ints(&[5, 10, 20, 30])))],
+    ));
     let (a, x) = (new_oid(&store), new_oid(&store));
     let mut txn = writing(
         &store,
@@ -877,7 +848,7 @@ fn against(other: impl FnOnce(&Store, &Tree) -> Vec<(Oid, Tid, Vec<u8>)>) -> zoe
     let store = open(Some("on"));
     let tree = two_buckets(&store);
     let writes = other(&store, &tree);
-    commit(&store, &writes);
+    commit_txn(writing(&store, &writes));
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 45], &[50, 60]));
     let voted = txn.vote();
@@ -1026,7 +997,7 @@ fn a_stored_bucket_before_a_replaced_child_refuses_with_reason_0() {
     // The other side replaces `y` by `x`, as a merge of rule 3 writes it,
     // and writes `a` with its new next bucket.
     let x = new_oid(&store);
-    let current = commit(
+    let current = commit_txn(writing(
         &store,
         &[
             (
@@ -1037,7 +1008,7 @@ fn a_stored_bucket_before_a_replaced_child_refuses_with_reason_0() {
             (a, tree.tid, bucket(II, &ints(&[10, 20]), Some(x))),
             (x, Tid::ZERO, bucket(II, &ints(&[30, 35, 40]), Some(b))),
         ],
-    );
+    ));
     // The transaction inserts 15 into `a`, which still names `y`, and marks
     // the root read-current. The vote checks `a` first.
     let mut txn = writing(
@@ -1136,11 +1107,11 @@ fn two_levels_of_nodes_merge_node_by_node() {
         Tid::ZERO,
         node(II, n1, &[(Key::Int(50), n2)], &tree_name, b[0]),
     ));
-    let tid = commit(&store, &writes);
+    let tid = commit_txn(writing(&store, &writes));
     // The other side splits the node n1 into n1 and n3, and the last bucket
     // into b3 and y.
     let (n3, y) = (new_oid(&store), new_oid(&store));
-    commit(
+    commit_txn(writing(
         &store,
         &[
             (
@@ -1164,7 +1135,7 @@ fn two_levels_of_nodes_merge_node_by_node() {
             (b[3], tid, bucket(II, &ints(&[70]), Some(y))),
             (y, Tid::ZERO, bucket(II, &ints(&[80, 90]), None)),
         ],
-    );
+    ));
     // The transaction splits the last bucket too. It marks the root
     // read-current and stores n2.
     let x = new_oid(&store);
@@ -1216,7 +1187,7 @@ fn object_keys(make: fn(u64) -> Key) -> (zoe_core::Result<()>, Vec<i128>) {
         ),
         (y, Tid::ZERO, bucket(OI, &keys(&[60, 70]), None)),
     ];
-    commit(&store, &other);
+    commit_txn(writing(&store, &other));
     let x = new_oid(&store);
     let ours = vec![
         (
@@ -1295,7 +1266,7 @@ fn sides(
     let store = open(Some("on"));
     let tree = two_buckets(&store);
     let writes = other(&store, &tree);
-    commit(&store, &writes);
+    commit_txn(writing(&store, &writes));
     let (writes, read) = ours(&store, &tree);
     let mut txn = writing(&store, &writes);
     for oid in read {
@@ -1311,14 +1282,14 @@ fn a_refusal_fails_on_the_stale_bucket_when_the_node_did_not_change() {
     let store = open(Some("on"));
     let tree = two_buckets(&store);
     // The other side inserts 70 into the second bucket, without a split.
-    let current = commit(
+    let current = commit_txn(writing(
         &store,
         &[(
             tree.buckets[1],
             tree.tid,
             bucket(II, &ints(&[40, 50, 60, 70]), None),
         )],
-    );
+    ));
     // The transaction splits it and inserts 70 too.
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 50], &[60, 70]));
@@ -1365,10 +1336,10 @@ fn splits_of_different_child_nodes_merge_at_the_root() {
         Tid::ZERO,
         node(II, n1, &[(Key::Int(50), n2)], &tree_name, b[0]),
     ));
-    let tid = commit(&store, &writes);
+    let tid = commit_txn(writing(&store, &writes));
     // The other side splits the node n1 into n1 and n3.
     let n3 = new_oid(&store);
-    commit(
+    commit_txn(writing(
         &store,
         &[
             (
@@ -1385,7 +1356,7 @@ fn splits_of_different_child_nodes_merge_at_the_root() {
             (n1, tid, leaf_node(II, b[0], &[])),
             (n3, Tid::ZERO, leaf_node(II, b[1], &[])),
         ],
-    );
+    ));
     // The transaction splits the node n2 into n2 and n4.
     let n4 = new_oid(&store);
     let mut txn = writing(
@@ -1506,7 +1477,10 @@ fn a_refusal_on_a_bucket_whose_tier_1_is_off_fails_as_without_the_switch() {
     let tree = two_buckets(&store);
     // The other side inserts 70 into the second bucket, without a split.
     let other = bucket(II, &ints(&[40, 50, 60, 70]), None);
-    let current = commit(&store, &[(tree.buckets[1], tree.tid, other.clone())]);
+    let current = commit_txn(writing(
+        &store,
+        &[(tree.buckets[1], tree.tid, other.clone())],
+    ));
     // The transaction splits it and inserts 70 too.
     let x = new_oid(&store);
     let mut txn = writing(&store, &split_writes(&tree, 1, x, &[40, 50], &[60, 70]));
@@ -1762,45 +1736,6 @@ fn an_undo_that_runs_with_the_merge_is_never_lost() {
     assert!(store.lock_table_is_empty());
 }
 
-/// A clock of the system that counts the waiters that it gives and the
-/// waits on them. Each wait of the core gets its waiter from the clock of
-/// the store, so the counts tell when a vote waits.
-#[derive(Clone, Default)]
-struct Counting {
-    waiters: Arc<AtomicUsize>,
-    waits: Arc<AtomicUsize>,
-}
-
-impl Clock for Counting {
-    fn now(&self) -> SystemTime {
-        SystemClock.now()
-    }
-
-    fn waiter(&self) -> Arc<dyn Waiter> {
-        self.waiters.fetch_add(1, Ordering::SeqCst);
-        Arc::new(Counted {
-            inner: SystemClock.waiter(),
-            waits: Arc::clone(&self.waits),
-        })
-    }
-}
-
-struct Counted {
-    inner: Arc<dyn Waiter>,
-    waits: Arc<AtomicUsize>,
-}
-
-impl Waiter for Counted {
-    fn wait(&self, timeout: Duration) {
-        self.waits.fetch_add(1, Ordering::SeqCst);
-        self.inner.wait(timeout);
-    }
-
-    fn wake(&self) {
-        self.inner.wake();
-    }
-}
-
 /// A point where the thread of a finish stops while the gate is armed,
 /// until the test opens it.
 #[derive(Default)]
@@ -1839,25 +1774,17 @@ impl Observer for Gates {
     }
 }
 
-fn wait_until(done: impl Fn() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
 #[test]
 fn a_vote_woken_by_the_end_of_a_commit_in_flight_merges_before_the_holder_releases() {
-    let clock = Counting::default();
+    let clock = CountingClock::default();
     let store = open_on(clock.clone(), Some("on"), &[]);
     let gates = Arc::new(Gates::default());
     assert!(store.set_observer(gates.clone()));
     let root = new_oid(&store);
-    let read = commit(
+    let read = commit_txn(writing(
         &store,
         &[(root, Tid::ZERO, inline(II, &ints(&[10, 20, 30])))],
-    );
+    ));
     // S1 splits the inline bucket into two new buckets, and holds the
     // locks of the root and of both buckets after its vote.
     let (a1, y1) = (new_oid(&store), new_oid(&store));

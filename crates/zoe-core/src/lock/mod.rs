@@ -714,7 +714,8 @@ mod tests {
 
     use super::Mode::{Exclusive, Shared};
     use super::*;
-    use crate::clock::{ManualClock, SystemClock};
+    use crate::clock::SystemClock;
+    use crate::testing::ManualClock;
 
     /// A timeout that no test reaches when the code is correct.
     const LONG: Duration = Duration::from_secs(10);

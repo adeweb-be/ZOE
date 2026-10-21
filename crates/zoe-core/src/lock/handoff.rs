@@ -170,7 +170,8 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::clock::{ManualClock, SystemClock};
+    use crate::clock::SystemClock;
+    use crate::testing::ManualClock;
 
     #[test]
     fn a_wait_ends_at_the_end_of_the_commit() {

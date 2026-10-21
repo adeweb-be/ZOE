@@ -6,44 +6,28 @@
 //! store refuse to open, but a read never returns wrong data. Every flip
 //! comes from a seeded generator, so a failure reproduces.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use redb::StorageBackend;
+use support::{Rng, compressible, fresh_dir};
 use zoe_core::testing::{self, Key};
+use zoe_core::testing::{Meta, commit_as};
 use zoe_core::vfs::MemVfs;
 use zoe_core::{Codec, Compression, Oid, Options, Store, SystemClock, Tid, ZoeError};
 
 /// The seed of the flips. A failure message names the byte and the bit.
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// A seeded xorshift generator.
-struct Rng(u64);
-
-impl Rng {
-    fn new() -> Self {
-        Self(SEED)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n as u64) as usize
-    }
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zoe-bit-flips-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+/// The user, the description and the extension of each commit.
+const META: Meta = (b"someone", b"bit flips", b"ext");
 
 /// Open the store in `dir` with zstd at level 3. So `fill` writes records
 /// of both codecs.
@@ -74,17 +58,6 @@ fn small(title: &str) -> Vec<u8> {
     data
 }
 
-/// A record that zstd shrinks, so that the store keeps it compressed.
-fn compressible() -> Vec<u8> {
-    let mut data = b"\x80\x03capp.content\nDocument\nq\x00.\x80\x03}q\x01(".to_vec();
-    for i in 0..500u32 {
-        data.extend_from_slice(b"X\x0b\x00\x00\x00descriptionq\x02X\x05\x00\x00\x00title");
-        data.extend_from_slice(&i.to_le_bytes());
-    }
-    data.extend_from_slice(b"u.");
-    data
-}
-
 const BLOB_PICKLE: &[u8] = b"\x80\x03cZODB.blob\nBlob\nq\x00.\x80\x03N.";
 
 fn content(len: usize) -> Vec<u8> {
@@ -111,28 +84,20 @@ impl Records {
     }
 }
 
-fn commit(store: &Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-    let mut txn = store.tpc_begin(b"someone", b"bit flips", b"ext").unwrap();
-    for (oid, serial, data) in writes {
-        txn.store(*oid, *serial, data).unwrap();
-    }
-    txn.vote().unwrap();
-    txn.finish().unwrap()
-}
-
 /// Write three transactions: a small record in two revisions, a
 /// compressed record, and a record and its deletion.
 fn fill(store: &Store) -> Records {
     let (a, c, d) = (Oid(1), Oid(2), Oid(3));
-    let t1 = commit(
+    let t1 = commit_as(
         store,
+        META,
         &[
             (a, Tid::ZERO, small("a first")),
             (c, Tid::ZERO, compressible()),
             (d, Tid::ZERO, small("d first")),
         ],
     );
-    let t2 = commit(store, &[(a, t1, small("a second"))]);
+    let t2 = commit_as(store, META, &[(a, t1, small("a second"))]);
     let mut delete = store
         .tpc_begin_restore(Tid(t2.0 + 1), b"someone", b"deletion", b"")
         .unwrap();
@@ -227,7 +192,7 @@ fn assert_intact(store: &Store, records: &Records) {
 fn every_flipped_bit_in_a_record_frame_raises_corrupt_record() {
     let store = open_zstd(fresh_dir("records"));
     let records = fill(&store);
-    let mut rng = Rng::new();
+    let mut rng = Rng::new(SEED);
 
     for &(oid, tid) in records.records.keys() {
         let frame = testing::read_frame(&store, Key::Record(oid, tid)).unwrap();
@@ -329,7 +294,7 @@ fn read_txn(store: &Store, tid: Tid, oid: Oid) -> Vec<(&'static str, Result<(), 
 fn every_flipped_bit_in_a_transaction_row_raises_corrupt_txn() {
     let store = open_zstd(fresh_dir("txns"));
     let records = fill(&store);
-    let mut rng = Rng::new();
+    let mut rng = Rng::new(SEED);
 
     for tid in records.txns() {
         let (oid, _) = *records.records.keys().find(|(_, t)| *t == tid).unwrap();
@@ -411,7 +376,7 @@ fn rewrite(path: &Path, bytes: &[u8]) {
 fn every_flipped_bit_in_a_blob_file_raises_corrupt_blob() {
     let store = Store::open(fresh_dir("blob-files")).unwrap();
     let (blobs, tid) = fill_blobs(&store);
-    let mut rng = Rng::new();
+    let mut rng = Rng::new(SEED);
 
     for (oid, bytes) in &blobs {
         let path = store.blob_path(*oid, tid).unwrap();
@@ -458,7 +423,7 @@ fn every_flipped_bit_in_a_blob_file_raises_corrupt_blob() {
 fn every_flipped_bit_in_a_blob_record_raises_corrupt_blob() {
     let store = Store::open(fresh_dir("blob-records")).unwrap();
     let (blobs, tid) = fill_blobs(&store);
-    let mut rng = Rng::new();
+    let mut rng = Rng::new(SEED);
 
     for (oid, bytes) in &blobs {
         let frame = testing::read_frame(&store, Key::Blob(*oid, tid)).unwrap();
@@ -547,7 +512,7 @@ fn flips_in_the_database_file_never_return_wrong_data() {
     };
     let file = database(&vfs);
     let records = std::sync::Arc::new(records);
-    let mut rng = Rng::new();
+    let mut rng = Rng::new(SEED);
 
     // A flip inside a stored frame, in every copy of the frame in the file:
     // the store opens and the read of that record raises `CorruptRecord`.

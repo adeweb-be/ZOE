@@ -561,23 +561,17 @@ pub(super) fn read_shadow(
 #[cfg(test)]
 mod tests {
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use zoe_pickle::btrees::new_bucket_state;
-    use zoe_pickle::python::{Heap, Pickler, Value};
+    use zoe_pickle::python::{Heap, Value};
 
     use crate::error::ZoeError;
     use crate::merge::Resolved;
     use crate::store::Store;
+    use crate::testing::{commit_all, new_oid, record, root, wait_until};
     use crate::types::{Oid, Tid};
     use crate::vfs::MemVfs;
-
-    fn record(heap: &Heap, class: Value, state: Value) -> Vec<u8> {
-        let mut pickler = Pickler::new(heap);
-        pickler.dump(class).unwrap();
-        pickler.dump(state).unwrap();
-        pickler.into_bytes()
-    }
 
     /// Returns a reference to the `IIBucket` `oid`.
     fn reference(heap: &mut Heap, oid: Oid) -> Value {
@@ -632,40 +626,7 @@ mod tests {
             (heap.new_str("split_merges"), heap.new_str(mode)),
         ];
         let state = heap.new_dict(items);
-        let root = [
-            &b"\x80\x03cpersistent.mapping\nPersistentMapping\nq\x00.\x80\x03}q\x01X\x04\x00\x00\
-               \x00dataq\x02}q\x03X\x10\x00\x00\x00zoe.merge_policyq\x04C\x08"[..],
-            &policy.0.to_be_bytes(),
-            b"q\x05czoe.policy\nMergePolicy\nq\x06\x86q\x07Qss.",
-        ]
-        .concat();
-        (record(&heap, class, state), root)
-    }
-
-    fn commit(store: &Store, writes: &[(Oid, Tid, Vec<u8>)]) -> Tid {
-        let mut txn = store.tpc_begin(b"", b"", b"").unwrap();
-        for (oid, serial, data) in writes {
-            txn.store(*oid, *serial, data).unwrap();
-        }
-        txn.vote().unwrap();
-        txn.finish().unwrap()
-    }
-
-    fn new_oid(store: &Store) -> Oid {
-        loop {
-            let oid = store.new_oid().unwrap();
-            if oid != Oid(0) {
-                return oid;
-            }
-        }
-    }
-
-    fn wait_until(done: impl Fn() -> bool) {
-        let start = Instant::now();
-        while !done() {
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
-            thread::sleep(Duration::from_millis(1));
-        }
+        (record(&heap, class, state), root(policy))
     }
 
     /// Two transactions split the two buckets of one node from one
@@ -679,12 +640,12 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, mode);
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let counter = new_oid(&store);
-        let counted = commit(&store, &[(counter, Tid::ZERO, length(0))]);
+        let counted = commit_all(&store, &[(counter, Tid::ZERO, length(0))]);
         let (n, b0, b1) = (new_oid(&store), new_oid(&store), new_oid(&store));
-        let read = commit(
+        let read = commit_all(
             &store,
             &[
                 (n, Tid::ZERO, node(b0, &[(40, b1)])),
@@ -693,7 +654,7 @@ mod tests {
             ],
         );
         if stale_first {
-            commit(&store, &[(counter, counted, length(1))]);
+            commit_all(&store, &[(counter, counted, length(1))]);
         }
         let (y, x) = (new_oid(&store), new_oid(&store));
         let mut first = store.tpc_begin(b"", b"", b"").unwrap();
@@ -781,10 +742,10 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, "on");
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let (n, b0, b1) = (new_oid(&store), new_oid(&store), new_oid(&store));
-        let read = commit(
+        let read = commit_all(
             &store,
             &[
                 (n, Tid::ZERO, node(b0, &[(40, b1)])),
@@ -793,7 +754,7 @@ mod tests {
             ],
         );
         let y = new_oid(&store);
-        let s1 = commit(
+        let s1 = commit_all(
             &store,
             &[
                 (n, read, node(b0, &[(40, b1), (60, y)])),
@@ -930,13 +891,13 @@ mod tests {
         let store = Store::open_vfs(MemVfs::new()).unwrap();
         let policy = new_oid(&store);
         let (policy_record, root) = policy_and_root(policy, "on");
-        commit(&store, &[(policy, Tid::ZERO, policy_record)]);
-        commit(&store, &[(Oid(0), Tid::ZERO, root)]);
+        commit_all(&store, &[(policy, Tid::ZERO, policy_record)]);
+        commit_all(&store, &[(Oid(0), Tid::ZERO, root)]);
         let n = new_oid(&store);
-        let read = commit(&store, &[(n, Tid::ZERO, inline(&[10, 20, 30]))]);
+        let read = commit_all(&store, &[(n, Tid::ZERO, inline(&[10, 20, 30]))]);
         // S1 splits the inline bucket into y1 and y2.
         let (y1, y2) = (new_oid(&store), new_oid(&store));
-        let s1 = commit(
+        let s1 = commit_all(
             &store,
             &[
                 (n, read, node(y1, &[(30, y2)])),
