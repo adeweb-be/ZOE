@@ -189,10 +189,9 @@ fn open_with_blobs(path: &Path, blob_dir: Option<&Path>) -> Result<Store, Failur
 fn blob_dir_failure(path: &Path, error: ZoeError) -> Failure {
     match error {
         ZoeError::MissingBlobDir { path: blobs } => Failure::Message(format!(
-            "{}: the store has blobs, but the blob directory {} has no layout file: \
-             give the blob directory of the store with --blob-dir (ZOE_BLOB_DIR)",
+            "{}: {}",
             path.display(),
-            blobs.display()
+            zoe_convert::missing_blob_dir(&blobs)
         )),
         e => store_failure(path, e),
     }

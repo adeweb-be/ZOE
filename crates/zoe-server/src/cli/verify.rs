@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use zoe_convert::{BackupCheck, Verification};
+use zoe_convert::{BackupCheck, IdForm, Verification};
 
 use super::{Failure, closed_by_reader, open_with_blobs};
 
@@ -209,43 +209,22 @@ fn read_classes(path: &Path) -> Result<BTreeSet<String>, Failure> {
         .collect())
 }
 
-/// Return the report as one JSON value.
+/// Return the report as one JSON value, with the oids and the tids as
+/// numbers and every finding.
 fn to_json(report: &Verification) -> Value {
-    let checksums: Vec<Value> = report
-        .checksums
-        .iter()
-        .map(|p| json!({"oid": p.oid.map(|o| o.0), "tid": p.tid.map(|t| t.0), "error": p.error}))
-        .collect();
-    let blobs: Vec<Value> = report
-        .blob_files
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    let references: Vec<Value> = report
-        .references
-        .iter()
-        .map(|d| json!({"oid": d.oid.0, "tid": d.tid.0, "missing": d.missing.0}))
-        .collect();
-    let pickles: Vec<Value> = report
-        .pickles
-        .iter()
-        .map(|p| json!({"oid": p.oid.0, "tid": p.tid.0, "error": p.error}))
-        .collect();
-    json!({
-        "checksums": checksums,
-        "blobs": blobs,
-        "references": references,
-        "pickles": pickles,
-        "classes": report.classes,
-        "unknown_classes": report.unknown_classes,
-        "object_count": report.object_count,
-        "namespaces": {
-            "ephemeral_keys": report.ephemeral_keys,
-            "durable_keys": report.durable_keys,
-            "expired_keys": report.expired_keys,
-        },
-        "count": report.count.map(|c| json!({"stored": c.stored, "counted": c.counted})),
-    })
+    let mut value = report.to_json(IdForm::Number, usize::MAX);
+    value["object_count"] = json!(report.object_count);
+    value["namespaces"] = json!({
+        "ephemeral_keys": report.ephemeral_keys,
+        "durable_keys": report.durable_keys,
+        "expired_keys": report.expired_keys,
+    });
+    value["count"] = json!(
+        report
+            .count
+            .map(|c| json!({"stored": c.stored, "counted": c.counted}))
+    );
+    value
 }
 
 /// Write the report as one JSON document.
