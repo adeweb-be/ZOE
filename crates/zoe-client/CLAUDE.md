@@ -9,7 +9,7 @@ A Rust client for the ZEO protocol, with the ZOE extensions. `zoe.zeo.ClientStor
 - `src/cache.rs`: `Cache` and `CacheCounts`, the client cache in the layout of ADR 0034: stage 1, one anonymous mapping (`Cache::new`), and stage 2, a file that one process maps (`Cache::open`, in `src/cache/file.rs`). `src/cache/mapping.rs` holds the mapping. `src/cache/tests.rs` holds its unit tests.
 - `src/endpoint.rs`: `Address` (TCP or the path of a unix domain socket) and `Endpoint` (an address, with TLS or without).
 - `src/tls.rs`: `TlsOptions` and `Tls`, the TLS of a client on rustls.
-- `src/protocol/`: the frames and the messages of ZEO 6 with msgpack. It has its own codec: the codec of `zoe-server` is private to that crate.
+- `src/protocol/`: the client side of the frames and the messages of ZEO 6 with msgpack: the calls that the client sends, and the read and the decode of what the server sends. The bytes and the names that both sides share come from `zoe-wire` (ADR 0055): the frame length, the heads of a msgpack bin and array, the constants of the protocol, the class names of the exceptions, the names of the extensions and `MAX_TID`.
 - `src/runtime.rs`: the trait `Runtime` (connect, connect_unix, spawn, sleep) and `Tokio`, its implementation for production.
 - `src/error.rs`: `Error`.
 
