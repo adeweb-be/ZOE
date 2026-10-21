@@ -39,7 +39,7 @@ pub use space::{
 pub const HISTORY_LIMIT: usize = 1 << 12;
 
 /// The most bytes of the user or the description of a revision.
-const MAX_NOTE: usize = 1 << 12;
+pub const MAX_NOTE: usize = 1 << 12;
 
 /// An error of Loupe.
 #[derive(Debug, thiserror::Error)]
@@ -480,8 +480,10 @@ fn strong_references(record: &[u8]) -> std::result::Result<Vec<Oid>, String> {
 }
 
 /// Return the user or the description of a transaction as text, with at
-/// most `MAX_NOTE` bytes of the record.
-fn note(bytes: &[u8]) -> String {
+/// most `MAX_NOTE` bytes of the record. Bytes that are not UTF-8 become
+/// U+FFFD. A longer text shows its start, cut before a character, and
+/// ends with `…`.
+pub fn note(bytes: &[u8]) -> String {
     if bytes.len() <= MAX_NOTE {
         return String::from_utf8_lossy(bytes).into_owned();
     }

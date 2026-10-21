@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 use zoe_core::{Oid, PackReport, Tid, TxnInfo, ZoeError};
-use zoe_loupe::{Folder, HISTORY_LIMIT, Revision, oid_repr, tid_repr};
+use zoe_loupe::{Folder, HISTORY_LIMIT, Revision, note, oid_repr, tid_repr};
 use zoe_pickle::decode_class_key;
 
 use crate::ops::ToolError;
@@ -39,21 +39,6 @@ pub(crate) const REVISION_LIMIT: usize = 32;
 /// looks like it, because a class key is `module.name` or
 /// [`PackReport::UNKNOWN_CLASS`].
 const DELETED: &str = "<deleted>";
-
-/// The most bytes of a user or a description, as in Loupe.
-const MAX_NOTE: usize = 1 << 12;
-
-/// Return the user or the description `bytes` as text, as Loupe shows it.
-/// Bytes that are not UTF-8 become U+FFFD. A text longer than 4 KiB shows
-/// its start and ends with `…`.
-fn note(bytes: &[u8]) -> String {
-    let cut = bytes.len() > MAX_NOTE;
-    let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_NOTE)]).into_owned();
-    if cut {
-        text.push('…');
-    }
-    text
-}
 
 /// One record of a transaction: the oid, the class and the size.
 fn object_json(oid: Oid, data: Option<&[u8]>) -> Value {
@@ -226,6 +211,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use zoe_core::Store;
+    use zoe_loupe::MAX_NOTE;
     use zoe_pickle::testing::{record, text};
 
     use super::*;
@@ -340,6 +326,29 @@ mod tests {
         assert_eq!(deletion["size"], 0);
         assert_eq!(deletion["class"], Value::Null);
         assert_eq!(deletion["after"], Value::Null);
+    }
+
+    #[test]
+    fn explain_keeps_a_character_whole_at_the_cut_of_a_note() {
+        let dir = std::env::temp_dir().join(format!("zoe-mcp-txn-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 4,095 ASCII bytes, then a character of 3 bytes across the cut at
+        // 4 KiB.
+        let description = format!("{}\u{20ac}", "a".repeat(4_095));
+        let store = Store::open(&dir).unwrap();
+        let mut txn = store
+            .tpc_begin(b"admin", description.as_bytes(), b"")
+            .unwrap();
+        txn.store(Oid(0), Tid(0), &document("root")).unwrap();
+        txn.vote().unwrap();
+        let tid = txn.finish().unwrap();
+        drop(store);
+        let folder = Folder::open(&dir).unwrap();
+        let explained = explain(&folder, tid).unwrap();
+        let note = explained["description"].as_str().unwrap();
+        let end: String = note.chars().skip(4_090).collect();
+        assert!(!note.contains('\u{fffd}'), "the note ends with {end:?}");
+        assert_eq!(note, format!("{}\u{2026}", "a".repeat(4_095)));
     }
 
     #[test]
