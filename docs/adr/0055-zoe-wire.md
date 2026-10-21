@@ -1,6 +1,6 @@
 # 0055. zoe-wire: the ZEO frame codec and the TLS certificate reader, written once
 
-Status: proposed. The checkpoint of step 1 of ZOE-260. It adds a crate name, so the human approves it before any code moves. It changes no byte on the wire, no on-disk format and no public Python API. Section "Questions for the human" lists the choices that the card left open; each one has a recommendation.
+Status: accepted. The checkpoint of step 1 of ZOE-260. The human approved it as written, with an answer to each of its four questions: sections 3, 4, 5 and 8 hold the answers as decisions. It adds the crate name `zoe-wire`. It changes no byte on the wire, no on-disk format and no public Python API.
 
 ## Context
 
@@ -46,7 +46,7 @@ A fix in one copy does not reach the other copy.
 
 ### 3. The read loop stays in the callers
 
-*Claude's choice.* The card asks whether the async read loop goes into `zoe-wire` behind a feature, or stays in the callers. It stays in the callers, for four reasons:
+*Claude's choice, approved by the human.* The card asks whether the async read loop goes into `zoe-wire` behind a feature, or stays in the callers. It stays in the callers, for four reasons:
 
 - The two loops differ in policy, not in bytes. The server refuses a frame longer than `--max-frame-size` before it reserves memory. The client has no limit, and it reads a long reply in two parts, so that the bytes of a bin go once from the socket into their own buffer, with the spare buffers of `recycle`.
 - What the loops share is about 20 lines on each side: the read of the 4 bytes of the length, and the read of the payload into a buffer that reserves at most `RESERVE`. `zoe-wire` gives them `frame::length` and `RESERVE`. So the bytes and the bound are written once, and only the loop stays on each side.
@@ -67,13 +67,15 @@ A fix in one copy does not reach the other copy.
 | `zoe_wire::tls` | `Pinned<P>`: the certificates of a CA file that a peer certificate matches byte for byte, each with what a reader of its DER gave; `Validity`, with `check(now)`, which gives the `CertificateError` of rustls for a certificate that is not valid yet or that expired | `Pinned`, `pinned` and `pinned_of`, and the two copies of the check of the period |
 | `zoe_wire::tls::der` | one TLV reader and one date arithmetic, with two readers: `validity`, which reads what the server reads today, and `parts`, which reads what the client reads today (the validity period, the common names of the subject, the subjectAltName extension) | `tls.rs:327-452` of the server and `tls/der.rs` of the client |
 
+The card names four constants: `M5`, `RESERVE`, `ERROR` and `TRACEPARENT`. *Claude's choice, approved by the human:* `HEARTBEAT` and `REPLY` move too, because both sides write them.
+
 Each side keeps its reading of a certificate: the server pins with `validity`, and the client with `parts`. So no certificate pins on a side where it did not pin before.
 
 Each side maps the errors of `zoe-wire` to its own error, with the text of today.
 
 ### 5. Two clear names for an oid or a tid on the wire
 
-*Claude's choice.* `p64(n)` gives the bin of the 8 big-endian bytes of `n`, as `ZODB.utils.p64` does. `u64_of(value)` gives the number in 8 big-endian bytes, as `ZODB.utils.u64` does: it reads a bin or a str of 8 bytes, as the client reads them today, and gives `None` for another value. These are the names of the server and of `zoe-py` today. So the calls of the server (about 300) keep their name, and only the client renames (about 80 calls): its `bin8` becomes `p64`, and its `p64` becomes `u64_of`.
+*Claude's choice, approved by the human.* `p64(n)` gives the bin of the 8 big-endian bytes of `n`, as `ZODB.utils.p64` does. `u64_of(value)` gives the number in 8 big-endian bytes, as `ZODB.utils.u64` does: it reads a bin or a str of 8 bytes, as the client reads them today, and gives `None` for another value. These are the names of the server and of `zoe-py` today. So the calls of the server (about 300) keep their name, and only the client renames (about 80 calls): its `bin8` becomes `p64`, and its `p64` becomes `u64_of`.
 
 The server keeps its own checks on top of `u64_of`, with the texts of its `TypeError`s: an oid or a tid must be a bin ("not bytes", "not 8 bytes"), and a serial can also be a str (`serial_of`). So neither side reads a value in a different way.
 
@@ -100,11 +102,18 @@ Both come from the workspace. `zoe-server` with `serve`, `zoe-client` and `zoe-p
 - The codecs of the tests: `crates/zoe-server/tests/wire/mod.rs` and the helpers of `crates/zoe-client/tests/`. They are a second copy of the bytes, on purpose: a test that builds its frames with `zoe-wire` does not see a change of `zoe-wire`. The rules of the campaign also forbid a change to what a test checks.
 - The names of the extensions in `zoe/zeo.py`. `zoe-wire` is Rust, and the public Python API does not change.
 
+### 8. Two files beside the fence of the card
+
+*A decision of the human.* The pull request of the card also updates two files that describe the crates and the moved code:
+
+- the "Rust crates" row of the naming table of the specification, which adds `zoe-wire`;
+- `crates/zoe-server/CLAUDE.md`, whose lines about `src/protocol/`, `src/tls.rs`, the dependencies of the feature `serve`, the frames and the pinned client certificates name `zoe-wire`.
+
 ## Consequences
 
 - The workspace has 12 crates. The "Names" line of the root `CLAUDE.md` adds `zoe-wire`, in this pull request.
 - The line of `crates/zoe-client/CLAUDE.md` that says that the client keeps its own codec changes, in this pull request: the client takes the shared bytes and names from `zoe-wire`. The line about `tls/der.rs` changes when the DER reader moves (step 3).
-- The lines of `crates/zoe-server/CLAUDE.md` that describe `src/protocol/` and `src/tls.rs` name `zoe-wire` where the code moved.
+- The lines of `crates/zoe-server/CLAUDE.md` that describe the codec and the TLS code name `zoe-wire`, and the "Rust crates" row of the naming table of the specification adds it, in this pull request (section 8).
 - `crates/zoe-wire/CLAUDE.md` holds the invariants of the crate: sans-IO; no tokio; no crate of ZOE as a dependency; a change of a byte that it writes is a change of the wire protocol, so it is a stop-and-ask.
 - The workspace `Cargo.toml` adds `zoe-wire`. `Cargo.lock` and `crates/zoe-server/fuzz/Cargo.lock` add the package. `just check` checks that the lock of the fuzz targets needs no change.
 - The fuzz targets do not change. `frame` enters through `zoe_server::fuzz::read_messages`, which reads the length with `zoe-wire`, and `handshake` reaches it through the server. `just fuzz 600` is a check of the card. A target for the DER reader, or for the head of a long reply, would add a test, so it is not part of this card.
@@ -117,10 +126,7 @@ Both come from the workspace. `zoe-server` with `serve`, `zoe-client` and `zoe-p
 - **Put the code in `zoe-core`.** The core is the synchronous storage engine, and the wire is not its concern. The core would link `rmpv` and `rustls`, and each user of the core (the in-process storage, `zoe-convert`, Loupe) would link a TLS stack that it does not use.
 - **Put the code in `zoe-client`, and let the server depend on it.** The `zoe` binary would link the client: its tokio tasks, its cache with its `unsafe` code, and `rustls-native-certs`, none of which the server runs.
 - **Put the read loop into `zoe-wire` behind a feature `tokio`.** See section 3: tokio in a crate without I/O, two builds to test, and a change to the tokio line of the root `CLAUDE.md`, for about 20 lines on each side.
+- **Two new names for the oid and tid helpers, such as `to_bin8` and `from_bin8`.** About 390 calls change in place of about 80, and the names of ZODB, of the server and of `zoe-py` go away.
+- **Move only the four constants that the card names.** `HEARTBEAT` and `REPLY` then stay in a copy on each side.
+- **Leave the naming table and `crates/zoe-server/CLAUDE.md` to the documenter after the merge.** Until then, they describe a layout that the merge changed.
 
-## Questions for the human
-
-1. **The read loop.** In the callers, with the length and `RESERVE` from `zoe-wire` (section 3), or in `zoe-wire` behind a feature `tokio`? Recommendation: in the callers.
-2. **The names of the oid and tid helpers.** `p64` and `u64_of`, the names of ZODB, of the server and of `zoe-py` (section 5), or two new names such as `to_bin8` and `from_bin8`, which change about 390 calls instead of about 80? Recommendation: `p64` and `u64_of`.
-3. **Two constants more than the card names.** The card names `M5`, `RESERVE`, `ERROR` and `TRACEPARENT`. This ADR also moves `HEARTBEAT` and `REPLY`, which both sides write. Recommendation: move them.
-4. **Two files outside the scope fence.** The "Rust crates" row of the naming table of the specification lists the crates, and `crates/zoe-server/CLAUDE.md` describes the moved code. Recommendation: update both in this pull request.
