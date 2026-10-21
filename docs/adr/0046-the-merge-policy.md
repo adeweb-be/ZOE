@@ -32,7 +32,7 @@ Tier 2 runs at the vote, after tier 1, on a stale written oid whose class is not
 1. `zoe_pickle::python` decodes the three states, old, committed and new, with the instances of other classes. Each must be a dict with `str` keys. A mutable object that two fields share gives no answer: a merge would split it in two (section 10, one walk for sharing).
 2. A field changed on one side when its value does not have the structure of the old value, or when that side added or deleted it. The merge errs toward a conflict.
 3. A field that only one side changed takes that change. A field that both sides changed to equal values takes it.
-4. A field that both sides changed to different values takes the strategy of its entry in `fields`, else `default`: `strict` refuses, `lww` takes the new value, `max` the greater (no answer for values that it cannot order), `sum` adds the two changes of an int, `union` the old items that neither side removed, then the items of the committed side, then those of the new side, each once, and `append` the new items after the committed value when the old value is a prefix of both, else it refuses. In an undo, `lww` refuses as `strict` does, so the undo never drops a later change without a word. A delete against a change refuses.
+4. A field that both sides changed to different values takes the strategy of its entry in `fields`, else `default`: `strict` refuses, `lww` takes the new value, `max` the greater (no answer for values that it cannot order), `sum` adds the two changes of an int, `union`, for lists, tuples, sets and frozensets on all three sides, the old items that neither side removed, then the items of the committed side, then those of the new side, each once, in the kind of the new value, and `append`, for three lists or three tuples, the new items after the committed value when the old value is a prefix of both, else it refuses. Other values give no answer for `union` and `append`. In an undo, `lww` refuses as `strict` does, so the undo never drops a later change without a word. A delete against a change refuses.
 5. When both sides changed fields of one group of `coupled`, the merge refuses, unless they agree on every field of the group.
 6. The merged state is the committed dict with the merged values, then the fields that only the new side added. The record is the class pickle of the new record, then that state, stored over the committed serial as a merge of tier 1.
 
@@ -44,7 +44,7 @@ F30 asks for append-only fields, CRDT sets and registers: the strategies `append
 
 ### 6. Shadow mode, and a shadow mode that verifies
 
-In shadow mode (`tier2: shadow`), tier 2 writes its result to the resolution log, and the conflict goes on as without it. The second vote compares the record of the client with the merge of shadow mode, of tier 1 or tier 2 (specification, "Storage core", the paragraph "The merge policy is a versioned object in the store"). A conflict that the client does not resolve writes no second line: there is nothing to compare.
+In shadow mode (`tier2: shadow`), tier 2 writes its result to the resolution log, and the conflict goes on as without it. The merge keeps the BLAKE3 digest of its record, the hash that the core already links. The second vote compares the record of the client with the merge of shadow mode, of tier 1 or tier 2 (specification, "Storage core", the paragraph "The merge policy is a versioned object in the store"). A conflict that the client does not resolve writes no second line: there is nothing to compare.
 
 ### 7. The resolution log
 
@@ -93,13 +93,13 @@ ZODB gives `PersistentMapping` no `_p_resolveConflict`. Its state has one field,
 1. **The strategy.** `keys` is a strategy of step 4 of section 4. It merges three dicts key by key with the rules of steps 2 and 3. A key that both sides changed differently refuses with `Key of a mapping changed on both sides`, and a delete against a change with `Key of a mapping deleted on one side and changed on the other`.
 2. **No answer.** A value that is not a dict, a key of another kind (point 3), one mutable object under two keys (step 1 of section 4), or a merge past its budget gives no answer.
 3. **The keys.** A `str`, an `int`, a `bytes`, or a tuple of those. A `bool` or a `float` can equal an `int`, and an object can define `__eq__`, so other keys give no answer.
-4. **The merged dict.** The committed keys in their order, then the keys that only the new side added. Each key and value is the object of the side whose change it takes. The record pickles as in step 6 of section 4.
+4. **The merged dict.** The committed keys in their order, then the keys that only the new side added. A key of the committed dict keeps the key object of the committed dict; a key that only the new side added is the key object of the new dict. A value is the object of the side whose change it takes, and the committed object when no side changed it or both gave the same value. The record pickles as in step 6 of section 4, so a Python reference that builds the same objects gives the same bytes.
 5. **Which fields.** Any field whose entry names `keys`, so the core needs no list of mapping classes.
-6. **The resolution log.** `keys` lists the changed keys of the dict in place of the field, written as tier 1 writes a key, so a key never looks like a field name. The ints come first, then the strs, the bytes and the tuples.
+6. **The resolution log.** `keys` lists the changed keys of the dict in place of the field, written as tier 1 writes a key of a bucket: a `str` in double quotes, an `int` in digits, a `bytes` as `b'...'`, a tuple in parentheses, cut after 80 characters. So a key never looks like a field name. The ints come first, then the strs, the bytes and the tuples.
 7. **How a policy marks a mapping class.** An entry gives `data` the strategy `keys`: `{"classes": {"mysite.registry.Registry": {"tier2": "on", "fields": {"data": "keys"}}}}`. A subclass does not take the entry of its base, so a site names a subclass of its own for the mappings whose keys are independent.
 8. **Why a site should not mark the stock classes.** An entry for `persistent.mapping.PersistentMapping` or `Persistence.mapping.PersistentMapping` merges every object of the class, the WebDAV locks of `OFS.Lockable` among them: two transactions that lock one object would both commit. So `zoe.plone` marks no stock class. `zoe.policy.validate` does not refuse such an entry; its documentation warns against it.
 9. **Shadow mode.** A `PersistentMapping` has no `_p_resolveConflict`, so no line `verified` follows a merge of `keys`.
-10. **Undo.** `keys` is `strict` for each key in an undo: a key that a later transaction changed refuses with `UndoError`.
+10. **Undo.** `keys` merges an undo as it merges a vote, so it is `strict` for each key. A key that only the undone transaction changed gets its old value back. A key that only a later transaction changed keeps the later change. A key that the undone transaction and a later one both changed refuses with `UndoError`, unless the later change gave it back its value from before the undone transaction. A key that the undone transaction added and a later one changed refuses too.
 11. **The code.** `merge::policy::Strategy::Keys` reads `"keys"`, and `zoe.policy.STRATEGIES` holds it. Only the model of tier 2 (`Heap::with_instances`) loads tuple keys.
 
 ### 12. The option `state` of `append`: a history that refuses two changes of state from one state
@@ -130,6 +130,7 @@ A DCWorkflow status is a dict that holds the new state under the state variable 
 ## Alternatives
 
 - **A key space or a `meta` key.** A format change, and no history, undo or transaction.
+- **sha256 for the digest of shadow mode.** BLAKE3 is the hash that the core already links.
 - **A policy file, or a server setting.** It differs between modes and does not commit with the profile.
 - **Watch the commits for the oid of the policy.** A check on every commit.
 - **The keys of a nested mapping as fields.** `keys` merges the dict of one field instead.

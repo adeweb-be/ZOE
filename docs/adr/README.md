@@ -36,7 +36,7 @@ The records merge by theme. In a theme, one record holds the current decision, a
 | [0028](0028-the-zoe-command.md) | The zoe command: one binary in zoe-server, one code path for the console script, and tools that repair what they read | accepted | The zoe command |
 | [0029](0029-key-space-in-the-checksum.md) | The frame checksum covers the key space | merged into 0020 | Record format |
 | [0030](0030-dump-files.md) | Dump files: a format of ZOE's own, one file per tid range | accepted | |
-| [0031](0031-the-in-process-storage-closes-its-stores-on-a-signal.md) | The in-process storage closes its stores on SIGTERM and SIGHUP | accepted | |
+| [0031](0031-the-in-process-storage-closes-its-stores-on-a-signal.md) | The in-process storage closes its stores on a signal | accepted | |
 | [0032](0032-a-tool-that-reads-a-store-repairs-it.md) | A tool that reads a store repairs it when a writer left it open | merged into 0028 | The zoe command |
 | [0033](0033-object-count.md) | The store counts its objects: `object_count` in `meta`, ZOE format 2 | accepted | |
 | [0034](0034-the-client-cache-file.md) | The client cache file | accepted | |

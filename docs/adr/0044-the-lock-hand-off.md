@@ -56,7 +56,7 @@ An object of a hot class takes its intent lock when its state loads, and loads t
 
 #### B3. The owner of the intent locks
 
-An intent owner holds the intent locks before `tpc_begin`, which adopts them. `zoe.Storage.lock_intent(oids, owner=None)` and `unlock_intent(owner=None)`, and the same methods of `zoe.zeo.ClientStorage`, use the default owner of the storage. `LockingConnection` binds an owner of its own to the thread around `tpc_begin`, also when it took no lock, so it never adopts the locks of the default owner. The native client leases a pool connection to an owner from its first `lock_intent` to the end of the adopting transaction, so the pool bound of 64 also bounds the owners (`crates/zoe-client/CLAUDE.md`). An end whose `unlock_intent` fails clears its state and logs the failure; the end of the session or the hold bound releases the locks.
+An intent owner holds the intent locks before `tpc_begin`, which adopts them. `zoe.Storage.lock_intent(oids, owner=None)` and `unlock_intent(owner=None)`, and the same methods of `zoe.zeo.ClientStorage`, use the default owner of the storage. `LockingConnection` binds an owner of its own to the thread around `tpc_begin`, also when it took no lock, so it never adopts the locks of the default owner. The native client leases a pool connection to an owner from its first `lock_intent` to the end of the adopting transaction, so the pool bound of 64 also bounds the owners. An owner whose `lock_intent` fails while it holds no lock, or whose connection is lost, gives the connection back at once (`crates/zoe-py/CLAUDE.md`, the early write-intent locks). An end whose `unlock_intent` fails clears its state and logs the failure; the end of the session or the hold bound releases the locks.
 
 #### B4. The order of the locks
 
@@ -107,6 +107,7 @@ The core owner `IntentLocks`, `Store::lock_intent(owner, oids)`, the metrics `zo
 - **Merge in the batch, by the leader, or no lock for the classes of tier 1.** It puts merges under the sequencer, and a refusal fails a member after its vote passed.
 - **The intent lock in `register`.** As many `ConflictError`s as vote-time locks.
 - **Fail fast at the grant.** It saves the work after the change, not the conflict.
+- **A refresh of the object at the grant of a lock in `register`.** The change is often in the state already when `register` runs, so a reload loses it or writes a value from the old state.
 - **Fail fast and keep the lock for the retry.** One `ConflictError` per wait (79 in the model), a lock that outlives its transaction, and a change of the retry of Zope.
 - **A hot set that the client learns from its conflicts.** Its first conflicts still raise.
 - **Every class hot with `early-locks on`.** Every transaction would lock the root at its load.
@@ -114,4 +115,4 @@ The core owner `IntentLocks`, `Store::lock_intent(owner, oids)`, the metrics `zo
 
 ## Merged ADRs
 
-- ADR 0045, early write-intent locks: Decision, part B. Its section N is section BN here, for N from 1 to 11. The changes of its section 12 are in the sections B1, B3, B4, B5, B7 and B11 that hold their subject.
+- ADR 0045, early write-intent locks: Decision, part B. Its section N is section BN here, for N from 1 to 11. The changes of its section 12 are in the sections B1, B3, B4, B5, B7 and B11 that hold their subject, or in the specification: "Storage core", "Early write-intent locks (extension, ADR 0045)", and "ConflictError strategy", "Lever 3: early write-intent locks (ADR 0045)".

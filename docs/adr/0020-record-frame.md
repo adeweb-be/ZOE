@@ -52,7 +52,7 @@ The tag is in the checksum input of `ZOE format 1` and of every later format. A 
 
 ### 5. The codecs
 
-Codec 0 is the data as it is. Codec 1 is one zstd frame that states the data length. Every other value is reserved for a later codec, such as zstd with a dictionary trained on the store. A build refuses an unknown codec as a newer format. The checksum covers the stored bytes, so a read verifies them before it decompresses.
+Codec 0 is the data as it is. Codec 1 is one zstd frame that states the data length. Every other value is reserved for a later codec, such as zstd with a dictionary trained on the store. A build refuses a frame with an unknown codec, any flag that it does not know, or a non-zero reserved byte, as a frame of a newer format: a `Format` error (`FrameError::Unsupported`). The checksum covers the stored bytes, so a read verifies them before it decompresses.
 
 ### 6. Compression is a setting, and records are raw by default
 

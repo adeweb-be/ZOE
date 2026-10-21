@@ -25,7 +25,7 @@ A tier 2 entry for a stock class merges every object of that class (ADR 0046, se
 
 The rule runs in the vote that takes the locks, at its first conflict, with the plan of the split merge. The steps as built: specification, "Storage core", "Conflict resolution dispatch", item 2.
 
-1. **The order.** Each stale written L whose old, committed and new records have the class `persistent.list.PersistentList`.
+1. **The order.** The rule runs on each stale written L whose staged record has the class `persistent.list.PersistentList`. When the old or the committed record of L has another class, the rule gives no answer, with an `undecided` line.
 2. **The folder.** A record that the transaction stored, not of a class of tier 1, whose `__annotations__` names A. The current A is an `OOBTree` with its bucket inline that names L and P. A staged A names the same L and P. Each record of P is an `OIBTree` or an `OIBucket`. Else no answer.
 3. **The list.** Each state is `{'data': [str, ...]}`, o is a prefix of c and of n, and N is not empty. The merged state is `{'data': c + N}`, with the class pickle of the new record.
 4. **The positions that the transaction wrote.** S holds the buckets of P that the transaction stored, its new buckets among them, and the root of P when its old or new state holds its bucket inline. **The union of the new states of S equals the union of the old states of S plus exactly `{N[i]: len(o) + i}`, which the old union does not hold.** The node check: each stored node of P keeps each child of its old state that the transaction did not store. The rule reads only the nodes of P that the transaction stored or marked read-current. So a rename on create rebuilds `pos` and gives no answer in a folder of more than 60 items. With at most 60 items, P holds its bucket inline, and it merges.
@@ -38,7 +38,7 @@ The rule writes no record beyond those that the transaction stored and Y. It tak
 
 ### 3. Which changes merge
 
-Only appends on both sides merge. An id that both sides appended refuses. These give no answer: a delete, a move, a sort or a rename on either side; a rename on create on the committed side in a folder of more than 60 items (`ReadConflict` on the root of P); an empty N, an item that is not a str, an id twice in N or in C, an id of N or C in o; a change of P that fails section 2, step 4; a record of P merged onto a commit in flight (ADR 0044). The rule does not take the first order of a folder or the first item of a meta type in a folder: tier 1 refuses both, and each happens once.
+Only appends on both sides merge. An id that both sides appended refuses. These give no answer: a delete, a move, a sort or a rename on either side; a rename on create on the committed side in a folder of more than 60 items (`ReadConflict` on the root of P); an empty N, an item that is not a str, an id twice in N or in C, an id of N or C in o; a change of P that fails section 2, step 4; a record of P merged onto a commit in flight, or whose commit in flight has not ended (ADR 0044). The rule does not take the first order of a folder or the first item of a meta type in a folder: tier 1 refuses both, and each happens once.
 
 ### 4. The order of the merged items
 
@@ -59,12 +59,12 @@ The profile of `zoe.plone` switches on the entries of `plone.app.contenttypes.co
 - `folder_orders` takes `off` (the default of the core), `shadow` or `on`. `zoe.policy.SWITCHES` holds it. It has no key of `<zoe>`, `zoe.Storage` or `zoe serve`: the policy is a record of the store.
 - `zoe-merge-policy.json` of `zoe.plone:default` sets it `on`, with `split_merges` and the two entries of section 5. The overrides of a site can set it `off`.
 - The rule changes a record of P only where the mode of tier 1 of its class is not `off`, in the lower of the two modes. The vote finds the orders whenever the switch is not `off`.
-- The database keeps the latest mode that each site asked for, in `root['zoe.plone.folder_orders']`, `root['zoe.plone.split_merges']` and `root['zoe.plone.tier2:<class>']`. The policy takes the lowest (`zoe.plone.merges.lowest_mode`). `zoe.plone:uninstall` asks `off` for all four. The warnings and the gone sites: specification, "Storage core", "Conflict resolution dispatch", item 2.
+- The database keeps the latest mode that each site asked for, in `root['zoe.plone.folder_orders']`, `root['zoe.plone.split_merges']` and `root['zoe.plone.tier2:<class>']`. The policy takes the lowest (`zoe.plone.merges.lowest_mode`). `zoe.plone:uninstall` asks `off` for all four. The warnings: specification, "Storage core", "Conflict resolution dispatch", item 2. `update_policy` drops the mode of a site that is gone: the walk of its path from the Zope root stops at an object of the database of the updated site that holds no item of the next id. A walk that stops in another database (below a mount point), meets an object that is not a container, or fails keeps the path. So a removed site loses its mode at the next update of another site, and a renamed or moved site gives its mode under its new path at its own next update.
 - An update logs nothing when the policy holds no mode of the switch. In a BTreeFolder2, `has_key` of the tree confirms a missing item. A `ConflictError` of the walk goes to the caller. A database mounted in a second Zope instance loses, at an update in the first, the modes that the second wrote below its mount point: a site of the first instance then gives the lower mode in its overrides. `del root['zoe.plone.folder_orders'][path]` clears a mode.
 - The switch does not need `split_merges`, but a folder whose `pos` or `_tree` splits does.
 - In mode `shadow` the vote goes on as without the rule. No client resolution verifies it (ADR 0046, section 6): the self-check of section 2, step 7 is the only check.
 - The companions are queued indexing (ADR 0047) and `split_merges`.
-- An older core reads a policy with `folder_orders` as no policy, with a warning (ADR 0046, section 12, point 3). A site updates its servers before it writes the switch.
+- An older core reads a policy with `folder_orders` as no policy, with a warning (ADR 0046, section 2). A site updates its servers before it writes the switch.
 
 ### 7. Why no update is lost
 
@@ -117,13 +117,14 @@ B5 `create-shared` (one folder) and `create-spread`, `--steps 4:60,16:60`, one r
 - With the profile of `zoe.plone`, concurrent creations in one folder of a stock site commit at the first attempt, and the order and `pos` agree.
 - The core knows the annotation keys of plone.folder. A change of them gives no answer, never a wrong merge.
 - A vote can stage again a record that its transaction stored and that is not stale.
-- A `PersistentList` merges only as an order. Tier 2 never merges an order.
+- A `PersistentList` merges in this rule only as an order. Every other `PersistentList` keeps the stock behaviour, or its entry of tier 2. Tier 2 never merges an order.
 - Creations in one folder commit one for each sync: the locks of the `Folder` and its order are never handed off.
 - Deletes, moves, sorts and renames still conflict, as with ZODB.
 
 ## Alternatives
 
 - **A merge of the order list alone**: it marks a stock class, and `pos` stays wrong.
+- **No answer for a transaction that wrote no key of the queue of queued indexing.** The catalog of Plone 6.1 holds no value derived from a position (section 7), so the rule does not depend on queued indexing.
 - **A rebuild of `pos` from the merged order**: it writes buckets that the transaction did not store.
 - **An ordering of `zoe.plone`**: it changes the data of each folder and needs a migration.
 - **Positions that need no renumbering**: they change the meaning of `pos`.

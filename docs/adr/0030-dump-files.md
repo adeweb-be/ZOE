@@ -55,7 +55,7 @@ A reader refuses a file that breaks a rule, a blob that does not match its hash,
 **The commands.** The rules of `zoe backup`, `zoe restore` and `zoe verify --backup`: specification, "Loupe: desktop inspector and editor", "`zoe backup` and `zoe restore`: dumps (N15)". These rules are not in the specification:
 
 - `zoe backup` creates `DIR` when it is missing, and takes the `flock` on a descriptor of `DIR`, so the lock adds no file. It removes the `.tmp` files of a stopped backup. A chain with a missing dump or an overlap fails the backup. The pack watermark never excuses a last tid of the dumps that the store does not have. The backup syncs the dump, renames it, then syncs `DIR`. A failed backup removes its `.tmp` file.
-- `zoe restore` refuses a target that is not a directory. Its hash pass reads no length, so a damaged length allocates nothing. It fails when the work directory `<STORE>.restore` exists. It restores with `tpc_begin_restore`, `restore` and `restore_blob`, and raises each sequence with `Sequence::restore_end`. A crash leaves the work directory, never a store at the target.
+- `zoe restore` refuses a target that is not a directory. Its hash pass reads no length, so a damaged length allocates nothing. It fails when the work directory `<STORE>.restore` exists. It restores with `tpc_begin_restore`, `restore` and `restore_blob`, and raises each sequence with `Sequence::restore_end`. It renames the work directory to the target, then syncs the parent directory. A crash leaves the work directory, never a store at the target.
 - `zoe verify --backup` writes nothing outside the scratch directory. It forgives a current record that the store lacks when its serial is at or before the pack watermark.
 
 ## Consequences

@@ -36,7 +36,7 @@ Step 1 of the card:
 | **all** | | **1,038** | | | **8** | **20** | **18** | **27.0** | |
 
 - "write" and "read" are the `ConflictError`s that B5 counts in the measured window. "replaced" is the number of read conflicts whose line in the resolution log has the reason "a path child that the other side replaced".
-- The other two read conflicts (r0, 4 users) have the reason "a path child that the other side split": T inserted into the last bucket of `intids.ids` without a split, and the other side split that bucket. This is the case of question 6 of ADR 0048.
+- The other two read conflicts (r0, 4 users) have the reason "a path child that the other side split": T inserted into the last bucket of `intids.ids` without a split, and the other side split that bucket. This is the case of a plain insert into a bucket that the other side split (ADR 0048, Alternatives).
 - In r2 at 16 users the log has three lines "replaced" in the window and B5 counts two read conflicts: B5 counts an operation in the step where its request starts.
 - The write conflicts: five on a `Folder` (two creations in one folder, out of ADR 0048), two on `OOBucket` and one on `OOBucket` through `UniqueIdGeneratorTool` (r0, 4 users).
 - By step: at 4 users 8 `ConflictError`s in 524 operations (15.3 per 1,000), 4 of them "replaced"; at 16 users 20 in 514 (38.9 per 1,000), 14 of them "replaced".

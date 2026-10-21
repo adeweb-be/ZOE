@@ -27,7 +27,7 @@ A rule 3 that puts the new bucket X of the transaction in the place of the new b
 
 #### A2. The rules
 
-The rules run where tier 1 runs, after the check of every serial, on each node by itself at any depth. Any other case gives no answer, and the vote goes on as without them (specification, "Storage core", "Conflict resolution dispatch", item 2).
+The rules run where tier 1 runs, after the check of every serial, on each node by itself at any depth. So a split of a child node that the other side did not change merges under rule 2 in its parent; rule 3 merges only buckets. Any other case gives no answer, and the vote goes on as without them (specification, "Storage core", "Conflict resolution dispatch", item 2).
 
 1. **A read-current node that another child split or replaced.** A stale node that the transaction marked read-current and did not store passes when the other side changed it only by splits and replacements, and split or replaced none of its path children, of which it holds at least one. The vote writes nothing for it. A replaced path child gives no answer: the write under it is not stale, so only the check of the node stops it.
 2. **Splits of different children.** In a node that the transaction stored and that both sides changed only by splits of different anchors, the merged node is the committed node with the new children of the transaction right after their anchors.
@@ -129,7 +129,7 @@ Section B1 is in `merge::split`, the lock of Y in `lock/`. Part B changes no `fo
 
 #### B9. The resolution log and the counters
 
-- A and Y give lines `merged` with `split` 3. The `read` and `committed` of Y are the serial that the merge read. The node and X give a line `merged`, `split` 3, no keys and `changed` 0, so `Txn::natively_resolved` lists them.
+- A and Y give lines `merged` with `split` 3. The `read` and `committed` of Y are the serial that the merge read. The node and X give a line `merged`, `split` 3, with the keys and `changed` of the merged range (`merge::split`, `commit::split`), so `Txn::natively_resolved` lists them.
 - A failed call for the lock of Y gives a line of rule 3 on the node or the inline root (`merge::split::LOCKED`): `undecided`, the reason "a bucket of the other side that another transaction locks", mode `on`, `applied` false, beside the line of tier 1 of the node.
 - `zoe_structural_merges_total` counts these lines. No other answer of rules 2 and 3 on a written node gives a line. The rule has no `debug` event.
 
@@ -173,6 +173,7 @@ Without the flag, rule 3 gives no answer when the other side split A or the inli
 - **The switch on by default, or as a key of `<zoe>` and `zoe serve`.** A store opts in, and a policy record is the same in both modes and in a copy.
 - **The order of key references in all of tier 1.** It changes tier 1 outside the switch. **No such order:** `ids` keeps its conflicts.
 - **Replacements of buckets only, or in rules 2 and 3 too.** Nodes follow the same argument, and no measure needs the rest.
+- **A replacement followed by a split of it, as one replacement.** No rule writes such a record.
 - **Other lines of a read conflict**: in mode `on` only (shadow mode cannot tell why a node fails), one for each stale node or where the rules did not run (no reason of rule 1), or with `applied` true (`undecided` does not decide the vote).
 
 ## Merged ADRs

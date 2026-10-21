@@ -35,22 +35,23 @@ One key, `posting-dicts`, switches both rules: `off` (the default), `shadow` or 
 
 - `on` merges with both rules. In `shadow`, the rules write their result in the field `shadow` of the line, and the conflict ends as with the rules off (specification, "Storage core", "Conflict resolution dispatch"). The other merges of tier 1 stay live.
 - The rules run only where the mode of the class is `on` or `shadow`.
-- The switch `posting_dicts` of the merge policy wins over the key (ADR 0046, section 3).
+- The switch `posting_dicts` of the merge policy wins over the key (ADR 0046, section 3). The profile of `zoe.plone` does not set it, so `zoe.plone` leaves the rule off.
 
 A stock client needs nothing: the server merges at the vote and replies with the bare oid.
 
 ### Shadow mode and the mode of each class
 
-- `structural-merges` (`on` by default) is the mode of every class of tier 1, and `structural-merge-class CLASS MODE` the mode of one class (specification, "Storage core", "Conflict resolution dispatch"). `zoe serve` takes `--structural-merge-class CLASS=MODE`, repeated, and a table `[structural-merge-classes]` in its configuration file.
+- `structural-merges` (`on` by default) is the mode of every class of tier 1, and `structural-merge-class CLASS MODE` the mode of one class (specification, "Storage core", "Conflict resolution dispatch"). `zoe serve` takes `--structural-merge-class CLASS=MODE`, repeated, and a table `[structural-merge-classes]` in its configuration file; the twin `ZOE_STRUCTURAL_MERGE_CLASSES` takes `CLASS=MODE` pairs separated by commas.
 - A shadow mode without `resolution-log` tells nobody what it found, so the open refuses it: `ValueError` in-process, a usage error for `zoe serve`.
 
 ### The resolution log
 
 `resolution-log FILE` (`ZOE_RESOLUTION_LOG`, the argument `resolution_log` of `zoe.Storage`, `--resolution-log` of `zoe serve`) names the log. Without it, no line is written.
 
-- Each result of tier 1 writes one line of JSON: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason, `shadow`, whether the outcome was that of the vote, `undo`, the keys that the new transaction changed (at most 20, each cut at 80 characters, and their number), the committed and the read serial, and the user and the description of both transactions.
+- Each result of tier 1 writes one line of JSON: the time, the storage, the oid, the class, the tier, the mode, the outcome, the reason, `shadow`, whether the outcome was that of the vote, `undo` (in an undo, `read` is the undone tid), the keys that the new transaction changed (at most 20, each written close to its Python `repr`: a `str` in double quotes, an `int` in digits, a `bytes` as `b'...'` or a tuple in parentheses, and cut at 80 characters, and their number; with the rules in shadow mode, the keys of the merge of the rules), the committed and the read serial, and the user and the description of both transactions.
 - The file opens in append mode, and each line is written whole. It is never synced, and it is not in the store.
 - The log holds text of the site, which the server log never holds, so the operator turns it on.
+- `zoe serve` counts `zoe_conflicts_resolved_total{path="native"}` and `zoe_structural_merges_total{mode, outcome}` (specification, "Server mode", "Health, metrics, shutdown").
 
 ## Consequences
 

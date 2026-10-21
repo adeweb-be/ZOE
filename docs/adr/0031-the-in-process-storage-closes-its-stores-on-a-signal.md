@@ -16,7 +16,7 @@ The behaviour: specification, "In-process mode", "Stop by a signal". The rules b
 
 **The watcher.** The first install registers the at-fork hook (`os.register_at_fork`) and starts the thread `zoe-signals`. The watcher never attaches to the interpreter: it runs no Python code, takes no GIL and drops no Python reference. So it works on CPython 3.14t and while a thread holds the GIL.
 
-**The close at a signal.** The watcher marks each storage closed as `close` does, so each later call raises the error of a closed storage.
+**The close at a signal.** The watcher marks each storage closed as `close` does, so each later call raises the error of a closed storage. A `tpc_finish` whose commit started before the mark commits, and the commit is durable before the database closes.
 
 **The end.** The watcher restores the default action and raises the signal again (`signal_hook::low_level::emulate_default_handler`), also when a close fails or panics. A second signal during the close changes nothing.
 

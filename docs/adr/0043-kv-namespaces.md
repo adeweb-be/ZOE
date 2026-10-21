@@ -79,7 +79,7 @@ The gate is `every_flipped_bit_of_a_namespace_frame_raises_corrupt_kv` of `crate
 
 #### A8. The backends of `zoe.plone`, and the writes-on-GET report
 
-- **The locking backend.** `zoe.plone:locking.zcml`, or `ZOE_PLONE_BACKENDS=locking`, installs `zoe.plone.locking` (its mechanics: `crates/zoe-py/CLAUDE.md`). One row of the ephemeral namespace `zoe.plone.locks`, under the oid of an object, holds all its locks, with the TTL of its longest valid lock. So the later commit wins for all the locks of one object. A row with no lock is deleted. A lock that is no longer valid reads as absent, and `killinvalids` deletes it, as in OFS. The backend carries no lock over its install or its uninstall: a lock lives for minutes.
+- **The locking backend.** `zoe.plone:locking.zcml`, or `ZOE_PLONE_BACKENDS=locking`, installs `zoe.plone.locking` (its mechanics: `crates/zoe-py/CLAUDE.md`). It acts only on an object that provides `ITTWLockable` and whose storage has namespaces; every other object keeps the stock behaviour. Each savepoint and a hook before the commit stage the row again, for a `LockItem` that changed in place (`refresh`). One row of the ephemeral namespace `zoe.plone.locks`, under the oid of an object, holds all its locks, with the TTL of its longest valid lock. So the later commit wins for all the locks of one object. A row with no lock is deleted. A lock that is no longer valid reads as absent, and `killinvalids` deletes it, as in OFS. The backend carries no lock over its install or its uninstall: a lock lives for minutes.
 - **The install.** The backends install when the ZCML loads (`zcml:customAction` of z3c.zcmlhook), as plone.protect patches Zope.
 - **The test layers.** plone.app.testing turns plone.autoinclude off, so the layer of `zoe.plone.testing` installs the backends that `ZOE_PLONE_BACKENDS` names.
 - **The session data manager.** Not built: Plone 6.1 has no session container (see Context). It waits for a site that needs sessions.
@@ -115,6 +115,7 @@ A record holds a field of plone.registry and a value that can be a tuple, a set,
 #### B4. A read, and the cache
 
 - Each method of the views first runs the check (section B6), a write too.
+- The cache keeps the rows of a namespace as bytes, with a label: the counter of their marker. A view whose registry has a counter at or below the label takes the cached rows; else it scans. A transaction takes the rows once, at its first read, and keeps them to its end, with its own writes over them.
 - The cache is per storage (through a weak reference) and per namespace. A scan that sees the generation change scans again. After 3 tries, it raises `ConflictError`, and Zope retries the request. A scan fills the cache only when its label is above the cached label. The namespace read least recently goes first.
 - Each write changes the counter of the registry object, so ZODB invalidates it in each connection. While nobody writes it, a request makes no storage call for it.
 - A connection at a past time (`db.open(at=...)`) reads the current rows too. A read after the end of a transaction, as in an after-commit hook, joins nothing. An in-place change of a value is not written, as with the stock trees.
@@ -131,7 +132,7 @@ Without `install()`, `move`, `copy_rows` and `reset` raise `RuntimeError`.
 
 #### B6. The check: a registry never reads as empty
 
-A view checks before it reads or writes a row. So a copy without its rows raises at its first read and its first write, and no write reaches the namespace of another registry. A counter of the marker above the counter of the registry passes: a later commit wrote the rows. The message names the registry and the way out: `copy_rows`, `move_back` in the source before a copy, or `reset`. Only `zoe backup` and `zoe restore` give a copy that passes.
+A view checks before it reads or writes a row. It raises `Unsupported` when the registry has no connection, its storage has no namespaces, its namespace has no marker or a marker of another layout version, the marker holds another oid, or the counter of the marker is below the counter of the registry. So a copy without its rows raises at its first read and its first write, and no write reaches the namespace of another registry. A counter of the marker above the counter of the registry passes: a later commit wrote the rows. The message names the registry and the way out: `copy_rows`, `move_back` in the source before a copy, or `reset`. Only `zoe backup` and `zoe restore` give a copy that passes.
 
 **The overlay of a `DemoStorage`** gets the rows after the records. In that moment, another thread can load the new registry and fail the check. Tests run each request in the test thread, so they do not meet it.
 
@@ -152,7 +153,7 @@ Each registry has its own id, namespace, marker and cache entry. So a write or a
 
 #### B9. Pack, undo, backup and the other tools
 
-- **Pack** never reads the rows (section A7).
+- **Pack** never reads the rows (section A1).
 - **Undo** gives back no key (section A7):
   1. **A write of a moved registry.** The undo gives back the old counter, and the rows keep the higher one, so no record changes. The next write takes its counter from the stored marker.
   2. **A stock write before the move.** It changes a bucket that the registry no longer reaches.

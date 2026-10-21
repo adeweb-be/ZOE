@@ -47,6 +47,7 @@ The gate as built: specification, "Performance and testing harness", "B. Perform
 - **Fewer rounds or objects in zodbshootout.** The cost is the start of each value, which stays in minutes.
 - **More values without interleaving.** A drift of the machine falls on one storage.
 - **A margin above 1, such as 1.25.** It asks more than the phase needs.
+- **A batch of one transaction.** It measures each storage after a pause of the length of a batch of the other, which zodbshootout never does.
 - **A fixed number of pairs.** A clear cell waits for the noisy ones, and a near tie gets a verdict by chance.
 
 ## Merged ADRs
