@@ -4,8 +4,9 @@ A load generator that speaks the ZEO protocol. It measures what `zodbshootout` c
 
 ## Layout
 
-- `src/main.rs`: the command, with clap: `conflicts`, `load` and `saturate`.
+- `src/main.rs`: the command, with clap: `conflicts`, `hot`, `load` and `saturate`.
 - `src/conflicts.rs`: the ranking of the ConflictErrors of Zope logs.
+- `src/hot.rs`: `hot`, the writers of one hot object (F7, N5). Each writer increments a `BTrees.Length`, which tier 1 merges, or a `PersistentMapping`, which no tier merges, with vote-time locks or with early write-intent locks (`--early-locks`, ADR 0045). The report gives the commits, the `ConflictError`s, the transactions that gave up, and from `GET /metrics` of the admin port the syncs, the lock hand-offs and the intent locks of the run.
 - `src/load.rs`: `load` and `saturate` on `zoe-client`, and their reports.
 - `src/schedule.rs`: the seeded generator, the Zipf law and the schedule of a client.
 - `src/machine.rs`: the description of the machine and of the run.

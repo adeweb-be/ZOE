@@ -1,6 +1,6 @@
 [package]
 name = "zoe-convert"
-description = "Converters between Data.fs, RelStorage and ZOE stores."
+description = "Converters between Data.fs and ZOE stores, and the verify, backup and restore of a store."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
