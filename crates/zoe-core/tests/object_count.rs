@@ -14,9 +14,9 @@
 //! read-only open of such a store writes nothing and has no count.
 //!
 //! The test makes a store of format 1 with the test hooks
-//! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count against the oids of `Store::record_keys` after
-//! each step, and on every crash image of commits, of a pack and of the
-//! upgrade.
+//! `zoe_core::testing::{remove_meta, write_meta}`. It checks the count
+//! against the oids of `Store::record_keys` after each step, and on every
+//! crash image of commits, of a pack and of the upgrade.
 
 mod support;
 
