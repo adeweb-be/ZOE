@@ -48,7 +48,7 @@ mod handoff;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use crate::clock::{Clock, Waiter};
@@ -102,10 +102,7 @@ impl LockCancel {
     }
 
     fn waiters(&self) -> MutexGuard<'_, Vec<Arc<dyn Waiter>>> {
-        self.0
-            .waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.0.waiters)
     }
 
     /// Make `cancel` wake `waiter` until the guard drops. Call it before
@@ -402,7 +399,7 @@ impl Drop for InQueue<'_> {
 
 impl LockManager {
     fn table(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.table)
     }
 
     /// Lock each oid of `requests` in its mode.

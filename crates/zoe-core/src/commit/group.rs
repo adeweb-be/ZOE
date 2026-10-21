@@ -117,7 +117,7 @@ impl GroupCommit {
     fn lock(&self) -> MutexGuard<'_, Queue> {
         // The queue stays valid after a panic: `Lead` ends the lead when
         // it unwinds.
-        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.queue)
     }
 
     /// Commit `member` in a batch of `store`. Return the member and its

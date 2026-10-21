@@ -393,6 +393,21 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 }
 
+impl Store {
+    /// Release the locks `held`, then log each one held past `lock-warn`.
+    /// The release reads no clock, so the locks are free before the log.
+    pub(crate) fn release_locks(&self, held: &[Held]) {
+        self.locks.release(held);
+        self.log_released(held);
+    }
+
+    /// Log each lock of `held` held past `lock-warn`, once the lock manager
+    /// released it.
+    pub(crate) fn log_released(&self, held: &[Held]) {
+        self.guardrails.locks_released(held, self.clock.now());
+    }
+}
+
 /// The number of oids whose current serials the vote reads in one backend
 /// read.
 const READ_CHUNK: usize = 256;

@@ -66,37 +66,19 @@ pub(super) fn keys(ids: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Returns a line of the order merge, not applied yet.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn line(
-    oid: Oid,
-    class: &str,
-    mode: Mode,
-    version: Option<u64>,
-    outcome: Resolved,
-    shadow: Option<Resolved>,
-    ids: &[String],
-    serials: (Tid, Tid),
-    part: &'static str,
-) -> Resolution {
-    Resolution {
-        oid,
-        tier: 1,
-        class: class.to_owned(),
-        mode,
-        policy: version,
+/// Returns the line of the list of `merge` in mode `on`, not applied yet.
+fn list_line(merge: &Order, version: Option<u64>, outcome: Resolved) -> Resolution {
+    Resolution::new(
+        merge.list,
+        order::LIST_CLASS,
+        Mode::On,
+        version,
         outcome,
-        applied: false,
-        undo: false,
-        keys: keys(ids),
-        changed: ids.len(),
-        committed: serials.0,
-        read: serials.1,
-        shadow,
-        fields: Vec::new(),
-        split: None,
-        order: Some(part),
-    }
+        merge.current,
+        merge.read,
+    )
+    .with_keys(keys(&merge.ids), merge.ids.len())
+    .with_order("list")
 }
 
 /// The reason of a list in mode `shadow`.
@@ -135,19 +117,20 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 if current == read {
                     continue;
                 }
-                let serials = (current, read);
                 let line = |outcome: Resolved, shadow: Option<Resolved>, ids: &[String]| {
-                    line(
+                    let version = rules.version();
+                    Resolution::new(
                         oid,
                         order::LIST_CLASS,
                         mode,
-                        rules.version(),
+                        version,
                         outcome,
-                        shadow,
-                        ids,
-                        serials,
-                        "list",
+                        current,
+                        read,
                     )
+                    .with_keys(keys(ids), ids.len())
+                    .with_shadow(shadow)
+                    .with_order("list")
                 };
                 // In mode `shadow`, the outcome goes to the field `shadow`.
                 let decided = |outcome: Resolved, ids: &[String]| match mode {
@@ -229,17 +212,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
             match self.finish_order(merge, policy, merged, onto, stored_bytes)? {
                 Ok(()) => {}
                 Err(why) => {
-                    let entry = line(
-                        merge.list,
-                        order::LIST_CLASS,
-                        Mode::On,
-                        policy.map(|policy| policy.version),
-                        Resolved::Undecided(why),
-                        None,
-                        &merge.ids,
-                        (merge.current, merge.read),
-                        "list",
-                    );
+                    let version = policy.map(|policy| policy.version);
+                    let entry = list_line(merge, version, Resolved::Undecided(why));
                     self.resolutions.push(entry);
                     return Ok(Some((merge.list, merge.current, merge.read)));
                 }
@@ -327,17 +301,8 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         *stored_bytes = size;
         merged.push((merge.list, merge.current, merge.pickle.clone()));
-        self.resolutions.push(line(
-            merge.list,
-            order::LIST_CLASS,
-            Mode::On,
-            version,
-            Resolved::Merged,
-            None,
-            &merge.ids,
-            (merge.current, merge.read),
-            "list",
-        ));
+        self.resolutions
+            .push(list_line(merge, version, Resolved::Merged));
         for Renumbered { oid, pickle, ids } in renumbered {
             let serial = records
                 .iter()
@@ -357,17 +322,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     let class = self
                         .staged_class_name(oid)
                         .unwrap_or_else(|| order::POS_CLASSES[1].to_owned());
-                    self.resolutions.push(line(
-                        oid,
-                        &class,
-                        Mode::On,
-                        version,
-                        Resolved::Merged,
-                        None,
-                        &ids,
-                        (serial, serial),
-                        "pos",
-                    ));
+                    let outcome = Resolved::Merged;
+                    self.resolutions.push(
+                        Resolution::new(oid, class, Mode::On, version, outcome, serial, serial)
+                            .with_keys(keys(&ids), ids.len())
+                            .with_order("pos"),
+                    );
                 }
             }
         }

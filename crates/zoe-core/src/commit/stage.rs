@@ -37,10 +37,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
     pub fn store(&mut self, oid: Oid, serial: Tid, data: &[u8]) -> Result<()> {
         self.check_store(oid, data)?;
         let stored_bytes = self.check_size(oid, data)?;
-        let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, data, false)?;
-        self.stored_bytes = stored_bytes;
-        Ok(())
+        self.stage(oid, serial, data, false, stored_bytes)
     }
 
     /// Stage a deletion of `oid`: a record with an empty pickle. `serial`
@@ -61,9 +58,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         }
         check_oid(oid)?;
         let stored_bytes = self.check_size(oid, &[])?;
-        let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, &[], false)?;
-        self.stored_bytes = stored_bytes;
+        self.stage(oid, serial, &[], false, stored_bytes)?;
         self.blobs.remove(&oid);
         Ok(())
     }
@@ -114,6 +109,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
         Ok(stored_bytes)
     }
 
+    /// Check a blob of `size` bytes for `oid` against `max-blob-size`. A
+    /// restore transaction checks no size limit.
+    fn check_blob_size(&self, oid: Oid, size: u64) -> Result<()> {
+        if self.is_restore() {
+            return Ok(());
+        }
+        self.store.guardrails.check(SizeLimit::Blob, oid, size)
+    }
+
     /// Tell if this is a restore transaction. A restore transaction copies
     /// records as they are, so it checks no size limit: a copy never
     /// refuses what its source took.
@@ -148,11 +152,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let ttl_ms = kv::ttl_millis(flavour, ttl)?;
         let row = format::kv_key(name.as_bytes(), key);
         let stored_bytes = self.check_kv_size(flavour, &row, value.len())?;
-        let area = &self.store.backend.staging;
-        self.staged
-            .put_kv(area, flavour, row, Some(value), ttl_ms)?;
-        self.stored_bytes = stored_bytes;
-        Ok(())
+        self.stage_kv(flavour, row, Some(value), ttl_ms, stored_bytes)
     }
 
     /// Stage a delete of `key` in the namespace `name` of `flavour`, with
@@ -162,8 +162,40 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.check_kv(name, key)?;
         let row = format::kv_key(name.as_bytes(), key);
         let stored_bytes = self.check_kv_size(flavour, &row, 0)?;
+        self.stage_kv(flavour, row, None, 0, stored_bytes)
+    }
+
+    /// Stage `data` for `oid` with `serial`, and make `stored_bytes` the
+    /// transaction size: the size of the staged pickles with `data`, as
+    /// `check_size` gives it. A stage that fails keeps the size.
+    pub(super) fn stage(
+        &mut self,
+        oid: Oid,
+        serial: Tid,
+        data: &[u8],
+        restored: bool,
+        stored_bytes: u64,
+    ) -> Result<()> {
         let area = &self.store.backend.staging;
-        self.staged.put_kv(area, flavour, row, None, 0)?;
+        self.staged.put(area, oid, serial, data, restored)?;
+        self.stored_bytes = stored_bytes;
+        Ok(())
+    }
+
+    /// Stage a namespace write of `value`, or a delete for `None`, in the
+    /// row `row` of `flavour` with a TTL of `ttl_ms`, and make
+    /// `stored_bytes` the transaction size, as `check_kv_size` gives it. A
+    /// stage that fails keeps the size.
+    fn stage_kv(
+        &mut self,
+        flavour: Flavour,
+        row: Vec<u8>,
+        value: Option<&[u8]>,
+        ttl_ms: u64,
+        stored_bytes: u64,
+    ) -> Result<()> {
+        let area = &self.store.backend.staging;
+        self.staged.put_kv(area, flavour, row, value, ttl_ms)?;
         self.stored_bytes = stored_bytes;
         Ok(())
     }
@@ -285,11 +317,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.check_store(oid, data)?;
         file.check_owner(&self.store.backend)?;
         let stored_bytes = self.check_size(oid, data)?;
-        if !self.is_restore() {
-            self.store
-                .guardrails
-                .check(SizeLimit::Blob, oid, file.size())?;
-        }
+        self.check_blob_size(oid, file.size())?;
         let blob = file.close(&self.store.backend)?;
         self.stage_blob(oid, serial, data, false, stored_bytes, blob)
     }
@@ -315,11 +343,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.check_store(oid, data)?;
         let stored_bytes = self.check_size(oid, data)?;
         let blob = self.store.take_blob_file(path)?;
-        if !self.is_restore() {
-            self.store
-                .guardrails
-                .check(SizeLimit::Blob, oid, blob.record().size)?;
-        }
+        self.check_blob_size(oid, blob.record().size)?;
         self.stage_blob(oid, serial, data, false, stored_bytes, blob)
     }
 
@@ -348,11 +372,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.store
                 .blobs()
                 .take_shared(Arc::downgrade(&self.store.backend), oid, name)?;
-        if !self.is_restore() {
-            self.store
-                .guardrails
-                .check(SizeLimit::Blob, oid, blob.record().size)?;
-        }
+        self.check_blob_size(oid, blob.record().size)?;
         self.stage_blob(oid, serial, data, false, stored_bytes, blob)
     }
 
@@ -369,9 +389,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         stored_bytes: u64,
         blob: PendingBlob,
     ) -> Result<()> {
-        let area = &self.store.backend.staging;
-        self.staged.put(area, oid, serial, data, restored)?;
-        self.stored_bytes = stored_bytes;
+        self.stage(oid, serial, data, restored, stored_bytes)?;
         self.blobs.insert(oid, blob);
         Ok(())
     }

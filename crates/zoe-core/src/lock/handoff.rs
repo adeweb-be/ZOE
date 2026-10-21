@@ -16,7 +16,7 @@
 //! shared request waits. So no request reads the oid from the store while
 //! the store does not hold the last commit of it.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::LockCancel;
@@ -66,7 +66,7 @@ impl InFlight {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.state)
     }
 
     /// Give the commit its tid. The leader of its batch calls it under the

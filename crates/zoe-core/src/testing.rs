@@ -16,7 +16,7 @@ use std::io::{self, Read};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -316,10 +316,7 @@ impl Subscriber for Capture {
             level: *event.metadata().level(),
             fields: fields.0,
         };
-        self.events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(captured);
+        crate::lock(&self.events).push(captured);
     }
 
     fn enter(&self, _: &Id) {}
@@ -332,10 +329,7 @@ impl Subscriber for Capture {
 pub fn events_of<R>(f: impl FnOnce() -> R) -> (R, Vec<Captured>) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let result = tracing::subscriber::with_default(Capture::new(&events), f);
-    let events = events
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
+    let events = crate::lock(&events).clone();
     (result, events)
 }
 
@@ -353,12 +347,9 @@ pub fn capture_events() {
 
 /// Return every event that the capture of `capture_events` kept.
 pub fn events() -> Vec<Captured> {
-    EVENTS.get().map_or_else(Vec::new, |events| {
-        events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    })
+    EVENTS
+        .get()
+        .map_or_else(Vec::new, |events| crate::lock(events).clone())
 }
 
 /// The database file of a store.

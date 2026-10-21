@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::time::Duration;
 
+use super::observer::Stopwatch;
 use super::source::TxnSource;
 use super::vote::Stale;
 use super::{READ_CHUNK, Txn};
@@ -126,16 +127,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
             if handoff.commit.ended().is_some() {
                 continue;
             }
-            let started = store.observer().map(|_| store.clock.monotonic());
+            let watch = Stopwatch::start(store);
             let waited = handoff.commit.wait(
                 oid,
                 self.lock_deadline,
                 &*store.clock,
                 self.lock_cancel.as_ref(),
             );
-            if let Some(started) = started {
-                plan.waited += store.clock.monotonic().saturating_sub(started);
-            }
+            plan.waited += watch.elapsed().unwrap_or_default();
             if matches!(waited, Waited::TimedOut | Waited::Cancelled) {
                 return Ok(plan);
             }
@@ -352,24 +351,17 @@ impl<S: Deref<Target = Store>> Txn<S> {
 /// merged, or of a node that rule 1 lets through, in mode `on`. The vote
 /// marks it applied when it passes.
 fn entry(record: &Written, rule: u8, rules: &Rules<'_>) -> Resolution {
-    Resolution {
-        oid: record.oid,
-        tier: 1,
-        class: record.class.clone(),
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Merged,
-        applied: false,
-        undo: false,
-        keys: record.keys.clone(),
-        changed: record.changed,
-        committed: record.current,
-        read: record.read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    Resolution::new(
+        record.oid,
+        record.class.clone(),
+        Mode::On,
+        rules.version(),
+        Resolved::Merged,
+        record.current,
+        record.read,
+    )
+    .with_keys(record.keys.clone(), record.changed)
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a refusal of `rule` on the
@@ -383,24 +375,17 @@ fn refusal(
     reason: Reason,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
         class,
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Refused(reason),
-        applied: true,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        Mode::On,
+        rules.version(),
+        Resolved::Refused(reason),
+        current,
         read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    )
+    .applied()
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a stale node for which
@@ -417,24 +402,16 @@ pub(super) fn undecided(
     current: Tid,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
-        class: class.to_owned(),
-        mode: Mode::On,
-        policy: rules.version(),
-        outcome: Resolved::Undecided(why),
-        applied: false,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        class,
+        Mode::On,
+        rules.version(),
+        Resolved::Undecided(why),
+        current,
         read,
-        shadow: None,
-        fields: Vec::new(),
-        split: Some(rule),
-        order: None,
-    }
+    )
+    .with_split(rule)
 }
 
 /// Returns the entry of the resolution log of a stale read-current node in
@@ -447,24 +424,17 @@ pub(super) fn read_shadow(
     current: Tid,
     rules: &Rules<'_>,
 ) -> Resolution {
-    Resolution {
+    Resolution::new(
         oid,
-        tier: 1,
-        class: shadow.class.clone(),
-        mode: Mode::Shadow,
-        policy: rules.version(),
-        outcome: Resolved::Undecided("a read-current oid"),
-        applied: false,
-        undo: false,
-        keys: Vec::new(),
-        changed: 0,
-        committed: current,
+        shadow.class.clone(),
+        Mode::Shadow,
+        rules.version(),
+        Resolved::Undecided("a read-current oid"),
+        current,
         read,
-        shadow: Some(shadow.outcome),
-        fields: Vec::new(),
-        split: Some(shadow.rule),
-        order: None,
-    }
+    )
+    .with_shadow(Some(shadow.outcome))
+    .with_split(shadow.rule)
 }
 
 /// Takes a plan of the split merge into the check of a vote: its entries,

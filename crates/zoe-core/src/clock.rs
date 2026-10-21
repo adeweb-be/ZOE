@@ -61,7 +61,7 @@ struct ThreadWaiter {
 
 impl Waiter for ThreadWaiter {
     fn wait(&self, timeout: Duration) {
-        let woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
+        let woken = crate::lock(&self.woken);
         // A timeout past the range of the clock waits without a limit.
         let mut woken = self
             .changed
@@ -72,7 +72,7 @@ impl Waiter for ThreadWaiter {
     }
 
     fn wake(&self) {
-        *self.woken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        *crate::lock(&self.woken) = true;
         self.changed.notify_one();
     }
 }

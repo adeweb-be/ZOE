@@ -118,7 +118,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
             }
         }
         if !own.is_empty() {
-            store.guardrails.locks_released(&own, store.clock.now());
+            store.log_released(&own);
         }
         let finished = finished?;
         self.committed = Some(finished.tid);
@@ -184,9 +184,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         let mut held = self.locks.take().unwrap_or_default();
         held.append(&mut self.intents);
         if !held.is_empty() {
-            let now = self.store.clock.now();
-            self.store.locks.release(&held);
-            self.store.guardrails.locks_released(&held, now);
+            self.store.release_locks(&held);
         }
     }
 }

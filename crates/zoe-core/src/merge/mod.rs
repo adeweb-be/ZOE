@@ -638,6 +638,72 @@ fn json(text: &str) -> String {
 }
 
 impl Resolution {
+    /// Returns an entry of tier 1 for `oid` of the class `class`, not
+    /// applied yet: the outcome `outcome` in `mode`, with the version
+    /// `policy` of the merge policy, over the serial `committed` of the
+    /// committed record and the serial `read` that the transaction read.
+    pub(crate) fn new(
+        oid: Oid,
+        class: impl Into<String>,
+        mode: Mode,
+        policy: Option<u64>,
+        outcome: Resolved,
+        committed: Tid,
+        read: Tid,
+    ) -> Self {
+        Resolution {
+            oid,
+            tier: 1,
+            class: class.into(),
+            mode,
+            policy,
+            outcome,
+            applied: false,
+            undo: false,
+            keys: Vec::new(),
+            changed: 0,
+            committed,
+            read,
+            shadow: None,
+            fields: Vec::new(),
+            split: None,
+            order: None,
+        }
+    }
+
+    /// Returns the entry, applied.
+    pub(crate) fn applied(mut self) -> Self {
+        self.applied = true;
+        self
+    }
+
+    /// Returns the entry with the keys `keys` that the new side changed,
+    /// of `changed` keys in all.
+    pub(crate) fn with_keys(mut self, keys: Vec<String>, changed: usize) -> Self {
+        self.keys = keys;
+        self.changed = changed;
+        self
+    }
+
+    /// Returns the entry with the outcome `shadow` of mode `shadow`.
+    pub(crate) fn with_shadow(mut self, shadow: Option<Resolved>) -> Self {
+        self.shadow = shadow;
+        self
+    }
+
+    /// Returns the entry of the rule `rule` of the split merge.
+    pub(crate) fn with_split(mut self, rule: u8) -> Self {
+        self.split = Some(rule);
+        self
+    }
+
+    /// Returns the entry of the part `part` of the order merge: `list` or
+    /// `pos`.
+    pub(crate) fn with_order(mut self, part: &'static str) -> Self {
+        self.order = Some(part);
+        self
+    }
+
     /// Returns the entry of a merge in `mode` of `oid`, not applied yet.
     pub(crate) fn of(
         oid: Oid,

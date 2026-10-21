@@ -60,26 +60,14 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     let commit = &handoff.commit;
                     let mut resolution = resolution.clone();
                     resolution.committed = commit.tid().unwrap_or(Tid::ZERO);
-                    let context = merge::LogContext {
-                        time,
-                        storage,
-                        user: &self.user,
-                        description: &self.description,
-                        committed_user: Some(&commit.user),
-                        committed_description: Some(&commit.description),
-                    };
+                    let committed = Some((&commit.user[..], &commit.description[..]));
+                    let context = self.log_context(time, storage, committed);
                     return merge::log_line(&resolution, &context);
                 }
-                let committed = self.committed_entry(resolution.oid, resolution.committed);
-                let context = merge::LogContext {
-                    time,
-                    storage,
-                    user: &self.user,
-                    description: &self.description,
-                    committed_user: committed.as_ref().map(|entry| &entry.user[..]),
-                    committed_description: committed.as_ref().map(|entry| &entry.description[..]),
-                };
-                merge::log_line(resolution, &context)
+                let (oid, tid) = (resolution.oid, resolution.committed);
+                self.with_committed(oid, tid, time, storage, |context| {
+                    merge::log_line(resolution, context)
+                })
             })
             .collect()
     }
@@ -97,16 +85,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.verifications
             .iter()
             .map(|verification| {
-                let committed = self.committed_entry(verification.oid, verification.committed);
-                let context = merge::LogContext {
-                    time,
-                    storage,
-                    user: &self.user,
-                    description: &self.description,
-                    committed_user: committed.as_ref().map(|entry| &entry.user[..]),
-                    committed_description: committed.as_ref().map(|entry| &entry.description[..]),
-                };
-                merge::verification_line(verification, &context)
+                let (oid, tid) = (verification.oid, verification.committed);
+                self.with_committed(oid, tid, time, storage, |context| {
+                    merge::verification_line(verification, context)
+                })
             })
             .collect()
     }
@@ -126,6 +108,43 @@ impl<S: Deref<Target = Store>> Txn<S> {
             })
             .map(|resolution| resolution.oid)
             .collect()
+    }
+
+    /// Return the context of a line of the resolution log at `time`, for
+    /// the storage `storage` of a server, with the user and the description
+    /// of the committed transaction, when they are known.
+    fn log_context<'a>(
+        &'a self,
+        time: SystemTime,
+        storage: Option<&'a str>,
+        committed: Option<(&'a [u8], &'a [u8])>,
+    ) -> merge::LogContext<'a> {
+        merge::LogContext {
+            time,
+            storage,
+            user: &self.user,
+            description: &self.description,
+            committed_user: committed.map(|(user, _)| user),
+            committed_description: committed.map(|(_, description)| description),
+        }
+    }
+
+    /// Return the line that `line` writes with the context of `time` and
+    /// `storage`, and the user and the description of the transaction that
+    /// committed `oid` at `tid`, when the store still has that record.
+    fn with_committed(
+        &self,
+        oid: Oid,
+        tid: Tid,
+        time: SystemTime,
+        storage: Option<&str>,
+        line: impl FnOnce(&merge::LogContext<'_>) -> String,
+    ) -> String {
+        let entry = self.committed_entry(oid, tid);
+        let committed = entry
+            .as_ref()
+            .map(|entry| (&entry.user[..], &entry.description[..]));
+        line(&self.log_context(time, storage, committed))
     }
 
     /// Return the history entry of `oid` at `tid`, when the store still has

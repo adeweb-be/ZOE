@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::group;
+use super::observer::Stopwatch;
 use super::split::adopt;
 use super::tier::Tier;
 use super::{READ_CHUNK, Shadowed, Txn, order, split, staging};
@@ -196,10 +197,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
         self.store.writable()?;
         let store: &Store = &self.store;
         let mut requests = self.lock_requests();
-        // A store without an observer does not read the clock. The wait is
-        // measured on the monotonic time of the store clock, as the lock
-        // timeout is, so a simulator gives it on simulated time.
-        let started = store.observer().map(|_| store.clock.monotonic());
+        let watch = Stopwatch::start(store);
         let cancel = self.lock_cancel.as_ref();
         let mut acquired = None;
         // A vote that takes its locks without a wait waits for a commit in
@@ -224,13 +222,10 @@ impl<S: Deref<Target = Store>> Txn<S> {
                     acquired = Some(Ok(locks));
                 }
                 Err(Refused { released, .. }) => {
-                    store
-                        .guardrails
-                        .locks_released(&released, store.clock.now());
+                    store.log_released(&released);
                     let above = self.intents.partition_point(|lock| lock.oid < lowest);
                     let given: Vec<Held> = self.intents.split_off(above);
-                    store.locks.release(&given);
-                    store.guardrails.locks_released(&given, store.clock.now());
+                    store.release_locks(&given);
                     requests.extend(given.iter().map(|lock| (lock.oid, Mode::Exclusive)));
                     requests.sort_by_key(|&(oid, _)| oid);
                 }
@@ -241,7 +236,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 .locks
                 .acquire_cancellable(&requests, store.lock_timeout, &*store.clock, cancel)
         });
-        let waited = started.map(|started| store.clock.monotonic().saturating_sub(started));
+        let waited = watch.elapsed();
         match acquired {
             Ok(mut locks) => {
                 // The vote adds its waits for commits in flight, and gives
@@ -260,8 +255,7 @@ impl<S: Deref<Target = Store>> Txn<S> {
                 if let (Some(observer), Some(waited)) = (store.observer(), waited) {
                     observer.locks_acquired(waited);
                 }
-                let now = store.clock.now();
-                store.guardrails.locks_released(&released, now);
+                store.log_released(&released);
                 Err(error)
             }
         }
@@ -354,13 +348,13 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.staged.put(area, *oid, *serial, pickle, false)?;
         }
         self.stored_bytes = stored_bytes;
-        for resolution in &mut self.resolutions[self.undo_resolutions..] {
-            if resolution.outcome == Resolved::Merged
-                && merged.iter().any(|(oid, _, _)| *oid == resolution.oid)
-            {
-                resolution.applied = true;
-            }
-        }
+        mark_applied(
+            &mut self.resolutions[self.undo_resolutions..],
+            |resolution| {
+                resolution.outcome == Resolved::Merged
+                    && merged.iter().any(|(oid, _, _)| *oid == resolution.oid)
+            },
+        );
         Ok(())
     }
 
@@ -378,11 +372,12 @@ impl<S: Deref<Target = Store>> Txn<S> {
             self.staged.remove(oid);
             self.blobs.remove(&oid);
         }
-        for resolution in &mut self.resolutions[self.undo_resolutions..] {
-            if resolution.outcome == Resolved::Merged && dropping.contains(&resolution.oid) {
-                resolution.applied = true;
-            }
-        }
+        mark_applied(
+            &mut self.resolutions[self.undo_resolutions..],
+            |resolution| {
+                resolution.outcome == Resolved::Merged && dropping.contains(&resolution.oid)
+            },
+        );
     }
 
     /// Return the committed record of `oid` when it is the record at
@@ -511,6 +506,15 @@ impl<S: Deref<Target = Store>> Txn<S> {
     }
 }
 
+/// Mark as applied each entry of `entries` that `applies` selects.
+fn mark_applied(entries: &mut [Resolution], applies: impl Fn(&Resolution) -> bool) {
+    for resolution in entries {
+        if applies(resolution) {
+            resolution.applied = true;
+        }
+    }
+}
+
 /// What the check of an oid that came with a hand-off found.
 enum Handed {
     /// The oid passes.
@@ -619,14 +623,11 @@ impl VoteCheck {
         txn.drop_resolved();
         txn.onto.extend(self.onto);
         // A node that rule 1 let through counts once the vote passes.
-        for resolution in &mut txn.resolutions[txn.undo_resolutions..] {
-            if resolution.split == Some(1)
+        mark_applied(&mut txn.resolutions[txn.undo_resolutions..], |resolution| {
+            resolution.split == Some(1)
                 && resolution.outcome == Resolved::Merged
                 && txn.passed.contains(&resolution.oid)
-            {
-                resolution.applied = true;
-            }
-        }
+        });
         Ok(Check::Passed(self.conflicts))
     }
 
@@ -1052,16 +1053,14 @@ impl VoteCheck {
             }
         }
         let store: &Store = &txn.store;
-        let started = store.observer().map(|_| store.clock.monotonic());
+        let watch = Stopwatch::start(store);
         let outcome = commit.wait(
             oid,
             txn.lock_deadline,
             &*store.clock,
             txn.lock_cancel.as_ref(),
         );
-        let waited = started.map_or(Duration::ZERO, |started| {
-            store.clock.monotonic().saturating_sub(started)
-        });
+        let waited = watch.elapsed().unwrap_or_default();
         match outcome {
             Waited::Durable | Waited::Failed => Ok(Handed::Store { waited }),
             Waited::TimedOut | Waited::Cancelled => Ok(Handed::Late { waited }),
